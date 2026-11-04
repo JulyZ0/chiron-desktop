@@ -13,7 +13,7 @@ pageindex==0.4.4
 fastapi==0.143.0
 uvicorn==0.54.0
 pydantic==2.14.1
-pydantic-settings==2.15.0
+pydantic-settings==2.16.2
 
 # 队列（worker 消费 engine:tasks:kb）+ 数据库（回写索引状态）
 redis==8.1.0
