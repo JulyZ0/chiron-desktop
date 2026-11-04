@@ -89,6 +89,27 @@ const DEFAULT_DEV_URL = 'http://localhost:5173'
  */
 const PARTITION_PREFIX = 'persist:chiron-'
 
+/**
+ * 安装页两个动作的 IPC 通道名。
+ *
+ * 与 `RUNTIME_STAGE_CHANNEL` 一样放在这里而不是各写一份：主进程 handle、preload invoke
+ * 两边名字不一致时不会报错，只会静默失效 —— 用户点了"取消"却什么也没发生。
+ */
+const RUNTIME_CANCEL_CHANNEL = 'desktop:runtime-cancel'
+const RUNTIME_MIRROR_CHANNEL = 'desktop:runtime-mirror'
+
+/**
+ * 可选的 PyPI 镜像源（**只在用户显式点击时才用**）。
+ *
+ * 为什么不写死或自动切换：README/代码里明确约定"不写死任何第三方地址"，自动换源等于
+ * 把用户的依赖装进一个未经其同意的第三方镜像。所以这里只提供候选，由安装页的按钮
+ * 触发；`indexUrl` 为空时 uv 仍走官方 PyPI。
+ */
+const PIP_INDEX_MIRRORS = [
+  { id: 'tuna', label: '清华 TUNA', url: 'https://pypi.tuna.tsinghua.edu.cn/simple' },
+  { id: 'aliyun', label: '阿里云', url: 'https://mirrors.aliyun.com/pypi/simple' },
+]
+
 function partitionFor(mode) {
   // 云端模式已废除：分区名恒为 local。保留入参是为了不打断既有调用点，
   // 但任何传入 'cloud' 的调用都不该再产生第二个分区。
@@ -199,6 +220,9 @@ module.exports = {
   DEVICE_TOKEN_ARG_PREFIX,
   DEFAULT_DEV_URL,
   PARTITION_PREFIX,
+  RUNTIME_CANCEL_CHANNEL,
+  RUNTIME_MIRROR_CHANNEL,
+  PIP_INDEX_MIRRORS,
   partitionFor,
   shouldQuitOnAllWindowsClosed,
   pickDocumentResult,

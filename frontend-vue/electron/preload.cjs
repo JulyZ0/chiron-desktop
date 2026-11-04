@@ -150,4 +150,16 @@ contextBridge.exposeInMainWorld('chironDesktop', {
     ipcRenderer.on('desktop:runtime-stage', handler)
     return () => ipcRenderer.removeListener('desktop:runtime-stage', handler)
   },
+
+  /**
+   * 取消正在进行的运行时安装。
+   *
+   * 安装页必须有这条路：真机现场用户等了十几分钟没有任何反馈，只能关掉整个应用，
+   * 结果下了一半的东西全部作废、下次重来。给它一个能按的取消，至少让"我不想等了"
+   * 变成一个明确动作而不是杀进程。
+   */
+  cancelRuntimeInstall: () => ipcRenderer.invoke(shared.RUNTIME_CANCEL_CHANNEL),
+
+  /** 改用镜像源重试（由用户在安装页显式点击，不自动换源） */
+  retryRuntimeInstallWithMirror: () => ipcRenderer.invoke(shared.RUNTIME_MIRROR_CHANNEL),
 })

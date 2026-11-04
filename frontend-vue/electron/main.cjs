@@ -47,6 +47,9 @@ const {
   partitionFor,
   shouldQuitOnAllWindowsClosed,
   resolveStartupWindow,
+  PIP_INDEX_MIRRORS,
+  RUNTIME_CANCEL_CHANNEL,
+  RUNTIME_MIRROR_CHANNEL,
 } = shared
 /**
  * 本地设备 token 的注入前缀（`--chiron-device-token=<token>`）。
@@ -290,9 +293,18 @@ async function tryStartGoStack(options = {}) {
     // 也永远轮不到装。这里先按需装好 core，装完仍然拿不到启动信息才算这条链路不适用。
     launch = await components.prepareCoreLaunch(options)
   } catch (err) {
-    // 运行时装不起来 / 安装包残缺：这是首启的正常状态，交给旧路径去触发安装流程
+    // **必须把真因抛出去，不能 return null**：回退到 desktop-local core 的那条老路径
+    // 已经随业务层删除（见 startLocalBackend 的注释：这里刻意没有回退分支）。返回 null
+    // 只会让调用方落到「本地网关不可用：未找到 chiron 二进制或本地运行时尚未就绪」这句
+    // 笼统文案上。真机现场就是这么被误导的：实际失败是"装依赖时 PyPI 超时"，界面却说
+    // 二进制的不是，用户照着提示去查安装包完整性，永远查不到问题。
     logMain('info', `引导器运行时不可用：${err?.message || err}`)
-    return null
+    const failure = new Error(err?.message || String(err))
+    // reason 透传：安装失败（runtime-unavailable）与二进制缺失（gateway-unavailable）
+    // 在恢复对话框里是两件完全不同的事，不能被合并成同一句提示。
+    failure.reason = err?.reason || 'runtime-unavailable'
+    failure.runtimeFailure = err
+    throw failure
   }
 
   const dataDir = options.dataDir
@@ -446,12 +458,15 @@ async function startLocalBackend(options = {}) {
   } catch (err) {
     const message = err?.message || String(err)
     logMain('error', `本地网关链路失败：${message}`)
+    // 用户主动取消要能和真正的失败区分开：它的正确反应是"回到界面/再试一次"，
+    // 而不是"排查安装包"。取消时不再弹恢复对话框（见启动循环里的 cancelled 分支）。
+    const cancelled = isAbortError(err) || /安装已被取消|用户取消了这次安装/.test(message)
     return {
       ok: false,
       baseUrl: '',
       token: '',
       dataDir: '',
-      reason: err?.reason || 'stack-failed',
+      reason: cancelled ? 'install-cancelled' : err?.reason || 'stack-failed',
       message,
     }
   }
@@ -529,6 +544,90 @@ function broadcastRuntimeStage(info) {
   } catch {
     /* 窗口正在销毁：进度丢了不影响安装本身 */
   }
+}
+
+/**
+/** 判断一个错误是不是「用户取消」：AbortError 或我们自己的取消文案 */
+function isAbortError(err) {
+  if (!err) return false
+  if (err.name === 'AbortError') return true
+  return err.code === 'ABORT_ERR'
+}
+
+/**
+ * 本轮安装的取消与换源控制器。
+ * 为什么用 AbortController 而不是在 IPC 里直接 `kill` 进程：安装链是
+ * `prepareCoreLaunch → ensureRuntime → runCommand`，中间还夹着 uv 的解析/下载/安装
+ * 三个阶段与引擎那一套。只有让信号沿着这条链一路透传，才能保证"取消"之后**不会**
+ * 又在下一阶段悄悄拉起一个新进程。换源同理：它必须作用在**下一次**尝试上，
+ * 所以先 abort 当前这轮，再由启动循环带着新 indexUrl 重跑。
+ */
+const runtimeInstallControl = {
+  controller: null,
+  indexUrl: '',
+
+  /** 每次启动一轮安装前生成新的 controller；旧的必须已经 abort 掉 */
+  reset() {
+    if (this.controller) {
+      try {
+        this.controller.abort('安装已重新开始')
+      } catch {
+        /* 已经结束 */
+      }
+    }
+    this.controller = new AbortController()
+    return this.controller
+  },
+
+  cancel(reason = '用户取消了这次安装') {
+    const controller = this.controller
+    if (!controller || controller.signal.aborted) return { ok: false, reason: 'not-running' }
+    try {
+      controller.abort(reason)
+    } catch {
+      /* 忽略 */
+    }
+    logMain('info', `运行时安装已取消：${reason}`)
+    return { ok: true }
+  },
+
+  signal() {
+    return this.controller ? this.controller.signal : undefined
+  },
+}
+
+/**
+ * 安装页的"取消"。
+ *
+ * 取消后不退出应用：把进度窗关掉、让启动流程带着"用户取消"的结论往下走，
+ * 于是主窗口的恢复对话框会出现（重试/退出）—— 用户随时能再来一次。
+ */
+function handleRuntimeCancel() {
+  const result = runtimeInstallControl.cancel()
+  if (result.ok) {
+    broadcastRuntimeStage({
+      stage: 'cancelled',
+      message: '已取消安装。可以重试，或改用镜像源后重试。',
+      failed: true,
+      retryableWithMirror: true,
+    })
+  }
+  return result
+}
+
+/**
+ * 安装页的"改用国内镜像重试"。
+ *
+ * 只做两件事：记下用户选的源、中止当前这轮。真正的重跑由启动循环负责 ——
+ * 在 IPC 里直接调 startLocalBackend 会绕过主流程的单实例与状态管理。
+ */
+function handleRuntimeMirrorRetry() {
+  const mirror = PIP_INDEX_MIRRORS[0]
+  if (!mirror) return { ok: false, reason: 'no-mirror' }
+  runtimeInstallControl.indexUrl = mirror.url
+  logMain('info', `运行时安装改用镜像源：${mirror.label} ${mirror.url}`)
+  runtimeInstallControl.cancel(`改用镜像源 ${mirror.label} 重试`)
+  return { ok: true, mirror }
 }
 
 /**
@@ -794,12 +893,24 @@ function restartNow() {
  */
 async function askLocalBackendRecovery(status) {
   const actions = ['retry', 'quit']
+  // 安装失败与二进制缺失要给**不同**的话术。原先两种情况都落到 reason='gateway-unavailable'
+  // 上，文案一律让用户"确认安装包完整（resources/chiron）"—— 真机现场是 PyPI 超时导致
+  // 装依赖失败，用户照着这句去查安装包，永远查不到问题所在。
+  const installFailed =
+    status?.reason === 'runtime-unavailable' || status?.reason === 'install-failed'
+  const message = installFailed
+    ? '本地运行时没能装好，Chiron 打不开主界面'
+    : '本机后端没能启动，Chiron 打不开主界面'
+  const hint = installFailed
+    ? '这是首次启动准备 Python 环境时的失败，通常与网络有关（下载依赖超时）。\n' +
+      '可以重试一次；若反复失败，请检查网络或在安装窗口里切换镜像源。'
+    : '可以重试一次，或退出应用排查安装。'
   try {
     const { response } = await dialog.showMessageBox({
       type: 'warning',
       title: '本地模式未就绪',
-      message: '本机后端没能启动，Chiron 打不开主界面',
-      detail: `${status.message || '未知原因'}\n\n可以重试一次，或退出应用排查安装。`,
+      message,
+      detail: `${status.message || '未知原因'}\n\n${hint}`,
       buttons: ['重试启动', '退出'],
       defaultId: 0,
       cancelId: 2,
@@ -1311,18 +1422,39 @@ if (!gotLock) {
           }
         : {}
 
+      // 每轮都带一个新的取消信号与用户选的源：上一轮被取消/换源之后，
+      // 这里必须拿到干净的状态，否则重试会立刻又一次 abort。
+      const runOnce = () => {
+        const controller = runtimeInstallControl.reset()
+        return startLocalBackend({
+          ...runtimeHooks,
+          signal: controller.signal,
+          indexUrl: runtimeInstallControl.indexUrl || undefined,
+        })
+      }
+
       try {
-        localBackend = await startLocalBackend(runtimeHooks)
+        localBackend = await runOnce()
         let attempts = 0
         // 最多再重试两次；仍失败就继续建窗口，让错误页把原因写在界面上
         while (!localBackend.ok && attempts < 2) {
+          // 失败事件必须标记 failed，安装页据此才露出"换源重试"。
+          // 用户主动取消时不再弹恢复对话框，直接进主界面看错误页。
+          const cancelled = localBackend.reason === 'install-cancelled'
+          broadcastRuntimeStage({
+            stage: 'failed',
+            message: localBackend.message || '安装未完成',
+            failed: true,
+            retryableWithMirror: !cancelled,
+          })
+          if (cancelled) break
           attempts += 1
           const action = await askLocalBackendRecovery(localBackend)
           if (action === 'quit') {
             app.quit()
             return
           }
-          localBackend = await startLocalBackend(runtimeHooks)
+          localBackend = await runOnce()
         }
       } finally {
         // 无论成败都必须关掉：失败时留着它会盖住后面的错误页
@@ -1381,6 +1513,18 @@ if (!gotLock) {
     ipcMain.handle('desktop:test-api-url', (event, url) => {
       assertTrustedSender(event)
       return probe(url)
+    })
+
+    // 安装页的「取消」与「换源重试」。
+    // 只允许安装窗口自己触发：这两个动作会中止本进程里正在跑的 uv，
+    // 从主界面或任何其它页面打过来都该拒绝。
+    ipcMain.handle(RUNTIME_CANCEL_CHANNEL, event => {
+      assertTrustedSender(event)
+      return handleRuntimeCancel()
+    })
+    ipcMain.handle(RUNTIME_MIRROR_CHANNEL, event => {
+      assertTrustedSender(event)
+      return handleRuntimeMirrorRetry()
     })
     ipcMain.handle('desktop:set-api-url', (event, url) => {
       assertTrustedSender(event)

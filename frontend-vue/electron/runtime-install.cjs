@@ -109,6 +109,16 @@ const VENV_TIMEOUT_MS = 10 * 60 * 1000
 const INSTALL_TIMEOUT_MS = 30 * 60 * 1000
 const VERIFY_TIMEOUT_MS = 60000
 
+/**
+ * 无进展超时：这么久没有任何一行新输出就判定为网络阻塞。
+ *
+ * 为什么不是 30 分钟的总超时：真机日志里 uv 对 `pypi.org` 每个请求重试 4 次、
+ * 单次 249.9s，用户盯着一个不动的进度条等了十几分钟才关掉进程。uv 在正常下载时
+ * 会持续输出（Resolve/Downloading/Installing 分段打印），所以"静默 90s"就是
+ * 阻塞的可靠信号，而不是"慢"。
+ */
+const INSTALL_IDLE_TIMEOUT_MS = 90 * 1000
+
 function runtimeRoot(userDataPath, target = 'core') {
   return path.join(userDataPath, 'local', resolveTarget(target).rootName)
 }
@@ -566,11 +576,19 @@ function streamLines(stream, onLine) {
 
 /**
  * 跑一条命令并把最后若干行输出留在错误里（失败时用户/日志能直接看到原因）。
+ *
+ * 除了总时长上限，这里还有一条**无进展超时**（`idleTimeout`）：真机现场是 `uv pip`
+ * 卡在 `https://pypi.org/simple/sqlalchemy/` 上，每 250s 重试一次、30 分钟才等到总超时，
+ * 而进度页从进入 installing-deps 起就再没有新输出。用户看到的正是"卡住不动"，
+ * 分不清是网络阻塞还是应用死了。所以只要有 `idleTimeout` 这么久没有任何一行新输出，
+ * 就立刻判定为网络阻塞并给出可操作的原因，而不是干等到总超时。
  */
 function runCommand(command, args, options = {}) {
   const spawnImpl = options.spawn || childProcess.spawn
   const timeout = options.timeout || INSTALL_TIMEOUT_MS
+  const idleTimeout = options.idleTimeout === undefined ? INSTALL_IDLE_TIMEOUT_MS : options.idleTimeout
   const tailLimit = options.tailLimit || 40
+  const signal = options.signal
 
   return new Promise((resolve, reject) => {
     let child
@@ -586,37 +604,91 @@ function runCommand(command, args, options = {}) {
       return
     }
 
+    let settled = false
+    let idleTimer = null
+
+    const stopChild = () => {
+      try {
+        child.kill()
+      } catch {
+        /* 杀不掉也要走失败分支 */
+      }
+    }
+
+    const bail = error => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (idleTimer) clearTimeout(idleTimer)
+      if (signal && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', onAbort)
+      }
+      stopChild()
+      reject(error)
+    }
+
+    const onAbort = () => {
+      const reason = signal && signal.reason
+      bail(new Error(reason ? String(reason) : '安装已被取消'))
+    }
+
+    // 每来一行输出就把无进展计时器推后一次；下载/解包在推进时不该被误判为卡死。
+    const armIdle = () => {
+      if (!idleTimeout || settled) return
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        stopChild()
+        const seconds = Math.round(idleTimeout / 1000)
+        const err = new Error(
+          `${path.basename(command)} 连续 ${seconds}s 没有任何输出，已判定为网络阻塞并中止` +
+            (tail.length ? `\n\n最后的输出：\n${tail.slice(-5).join('\n')}` : ''),
+        )
+        err.reason = 'network-stalled'
+        err.lastOutput = tail.slice(-5)
+        reject(err)
+      }, idleTimeout)
+      if (typeof idleTimer.unref === 'function') idleTimer.unref()
+    }
+
     const tail = []
     const remember = line => {
       tail.push(line)
       if (tail.length > tailLimit) tail.shift()
       if (typeof options.onLine === 'function') options.onLine(line)
+      armIdle()
     }
     streamLines(child.stdout, remember)
     streamLines(child.stderr, remember)
 
-    let settled = false
     const timer = setTimeout(() => {
-      if (settled) return
-      settled = true
-      try {
-        child.kill()
-      } catch {
-        /* 杀不掉也要走超时分支 */
-      }
-      reject(new Error(`${path.basename(command)} 超时（${Math.round(timeout / 1000)}s）`))
+      bail(new Error(`${path.basename(command)} 超时（${Math.round(timeout / 1000)}s）`))
     }, timeout)
+    if (typeof timer.unref === 'function') timer.unref()
+
+    armIdle()
+
+    if (signal) {
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
+      if (typeof signal.addEventListener === 'function') signal.addEventListener('abort', onAbort)
+    }
 
     child.on('error', err => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      reject(new Error(`无法执行 ${path.basename(command)}：${err && err.message ? err.message : err}`))
+      bail(new Error(`无法执行 ${path.basename(command)}：${err && err.message ? err.message : err}`))
     })
     child.on('close', code => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (idleTimer) clearTimeout(idleTimer)
+      if (signal && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', onAbort)
+      }
       if (code === 0) {
         resolve({ code, tail })
         return
@@ -803,6 +875,10 @@ async function ensureRuntime(options = {}) {
       spawn: options.spawn,
       onLine: options.onLine,
       env: uvEnv(userDataPath, target.id),
+      // 取消信号一路透传到这里：安装窗口点"取消"后 argv 里的 uv 要立刻被杀掉，
+      // 否则用户会以为按钮没反应（实际它还在后台下 340MB）。
+      signal: options.signal,
+      idleTimeout: options.idleTimeout,
     }).catch(err => {
       err.message = `${label}失败：${err.message}`
       throw err

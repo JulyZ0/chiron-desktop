@@ -540,6 +540,11 @@ async function installRuntimeIfPossible(root, options = {}) {
     onStage: typeof options.onRuntimeStage === 'function' ? options.onRuntimeStage : undefined,
     onLine: typeof options.onRuntimeLine === 'function' ? options.onRuntimeLine : undefined,
     force: options.reinstallRuntime === true,
+    // 换源与取消都要能传到 uv：安装页上点"使用镜像"或"取消"时，
+    // 这两项是这个调用唯一还能改动的输入。
+    indexUrl: options.indexUrl,
+    signal: options.signal,
+    idleTimeout: options.idleTimeout,
     // 下载入口必须跟着依赖注入走，否则单测会真的联网取 uv（几十秒 + 拉 15MB）
     fetch: runtime().fetch,
   })
@@ -551,10 +556,11 @@ async function installRuntimeIfPossible(root, options = {}) {
       `本地运行时自动安装失败：${err && err.message ? err.message : err}\n\n` +
         '这是首次启动必须完成的一步，没有它本地功能无法使用。\n' +
         '常见原因：\n' +
-        '  - 网络不通或过慢：可设 CHIRON_PIP_INDEX_URL 指向可用的镜像源后重启；\n' +
+        '  - 网络不通或过慢：在安装窗口点「改用国内镜像重试」，或设 CHIRON_PIP_INDEX_URL 后重启；\n' +
         '  - 磁盘空间不足（运行时约 400MB）：清理后重启应用会自动重试；\n' +
         '  - 安全软件拦截了 uv：请放行后重启。',
     )
+    error.reason = err?.reason === 'network-stalled' ? 'install-network-stalled' : 'runtime-unavailable'
     error.retryable = false
     error.installFailed = true
     throw error
@@ -653,6 +659,9 @@ async function ensureEngineRuntime(options = {}) {
     onStage: typeof options.onRuntimeStage === 'function' ? options.onRuntimeStage : undefined,
     onLine: typeof options.onRuntimeLine === 'function' ? options.onRuntimeLine : undefined,
     force: options.reinstallEngine === true,
+    indexUrl: options.indexUrl,
+    signal: options.signal,
+    idleTimeout: options.idleTimeout,
   })
 
   try {

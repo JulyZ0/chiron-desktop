@@ -1021,3 +1021,89 @@ test('ensureRuntime：minor 版本对不上时不做无用的增量同步，直�
   assert.deepEqual(calls.map(c => c.args[0]), ['venv', 'pip'], '直接重建：先建 venv 再装依赖')
 })
 
+
+/**
+ * 下面三条守的是"装依赖卡住"这一真机故障（日志里 uv 对 pypi.org 每个请求重试 4 次、
+ * 单次 249.9s，进度页从 installing-deps 起再无任何输出，用户只能杀掉进程）。
+ */
+
+/** 一个永不结束、可以随时被 kill 的假子进程 */
+function silentChild() {
+  const EventEmitter = require('node:events')
+  const child = new EventEmitter()
+  child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
+  child.killed = false
+  child.kill = () => {
+    child.killed = true
+    return true
+  }
+  return child
+}
+
+test('runCommand：静默超过 idleTimeout 就判定为网络阻塞并中止', async () => {
+  const child = silentChild()
+  const started = Date.now()
+  await assert.rejects(
+    installer._internal.runCommand('uv.exe', ['pip', 'install'], {
+      spawn: () => child,
+      timeout: 60000,
+      idleTimeout: 120,
+    }),
+    err => {
+      assert.equal(err.reason, 'network-stalled')
+      assert.match(err.message, /没有任何输出/)
+      return true
+    },
+  )
+  assert.ok(child.killed, '判定阻塞后必须真的杀掉 uv，不能让它继续占着进程')
+  assert.ok(Date.now() - started < 5000, '不该等到总超时才失败')
+})
+
+test('runCommand：持续有输出时不被无进展超时误杀', async () => {
+  const child = silentChild()
+  const lines = []
+  const timer = setInterval(() => child.stdout.emit('data', Buffer.from('Downloading x\n')), 40)
+  const pending = installer._internal.runCommand('uv.exe', ['pip', 'install'], {
+    spawn: () => child,
+    timeout: 10000,
+    idleTimeout: 120,
+    onLine: line => lines.push(line),
+  })
+  setTimeout(() => {
+    clearInterval(timer)
+    child.emit('close', 0)
+  }, 500)
+  const result = await pending
+  assert.equal(result.code, 0)
+  assert.ok(!child.killed, '有进展就不该被当成卡死')
+  assert.ok(lines.length >= 3, '输出应逐行进 onLine，这正是进度页的数据来源')
+})
+
+test('runCommand：取消信号立刻中止并杀掉子进程', async () => {
+  const child = silentChild()
+  const controller = new AbortController()
+  const pending = installer._internal.runCommand('uv.exe', ['pip', 'install'], {
+    spawn: () => child,
+    timeout: 60000,
+    idleTimeout: 0,
+    signal: controller.signal,
+  })
+  setTimeout(() => controller.abort('用户取消了这次安装'), 50)
+  await assert.rejects(pending, /用户取消了这次安装/)
+  assert.ok(child.killed, '取消后 uv 必须被真的杀掉，否则它还在后台下几百 MB')
+})
+
+test('pipInstallArgs：用户选了镜像才加 --index-url，默认仍是官方源', () => {
+  const plain = installer._internal.pipInstallArgs('/v/python.exe', '/src', '')
+  assert.ok(!plain.includes('--index-url'), '不写死任何第三方地址：没选就交给 uv 默认')
+
+  const mirrored = installer._internal.pipInstallArgs(
+    '/v/python.exe',
+    '/src',
+    'https://pypi.tuna.tsinghua.edu.cn/simple',
+  )
+  const at = mirrored.indexOf('--index-url')
+  assert.ok(at > 0, '选了镜像要透传给 uv')
+  assert.equal(mirrored[at + 1], 'https://pypi.tuna.tsinghua.edu.cn/simple')
+})
