@@ -334,7 +334,7 @@ jobs:
           exit "$fail"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: chiron-desktop-${{ matrix.platform }}
           if-no-files-found: error
