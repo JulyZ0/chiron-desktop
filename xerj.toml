@@ -1,0 +1,18 @@
+# XERJ 节点配置 —— run.py 以 `xerj -c xerj.toml` 加载。
+#
+# 为什么需要这个文件：xerj 的三个监听器端口是 TOML 里的键，命令行只暴露
+# --bind / --data-dir，没有端口开关。它的默认值是 native REST 8080、
+# gRPC 8081、ES-compat 9200 —— 前两个正好与 Chiron 的 Go 网关（8080）
+# 重叠。Windows 允许 0.0.0.0:8080 与 127.0.0.1:8080 同时共存，于是
+# xerj 会把本机发往网关的流量抢走，且不报错。所以端口必须显式错开。
+#
+# ES-compat 的 9200 保持默认：插件配置里 XERJ_URL 指向它。
+[server]
+rest_port = 9210
+grpc_port = 9211
+es_compat_port = 9200
+
+# 注意：鉴权**不在这里**关。`run.py` 用 `--insecure` 启动，那已经同时关掉
+# TLS 与 API-key 校验；TOML 里再写 `[auth] enabled = false` 只是同义重复，
+# 反而让人以为"不加 --insecure 也安全"。安全边界由 --insecure + loopback
+# 绑定共同保证。

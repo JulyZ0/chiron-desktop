@@ -17,6 +17,7 @@ chiron 一键运行脚本
 import argparse
 import os
 import platform
+import shutil
 import signal
 import socket
 import subprocess
@@ -41,6 +42,35 @@ SERVICES = {
             "STORAGE_BACKEND": "local",
             "STORAGE_ROOT": str(WORKSPACE_DIR),
         },
+    },
+    "xerj": {
+        # XERJ 索引节点（可选）：只读代码/文档检索引擎，agent 经 MCP（`xerj mcp`）消费。
+        # 它不是 agent —— 没有规划与工具调用循环，只提供符号级检索（见答复里的定位分析）。
+        #
+        # **optional=True**：二进制不在 PATH 上时**跳过**而不是让 start 整体失败 ——
+        # 它是检索增强，不是运行前提。安装：https://xerj.org/docs/install
+        #
+        # 安全：`--insecure` 关闭鉴权（本地开发免 admin.key），因此**必须**配合 loopback
+        # 绑定；xerj 自身也会拒绝 `--insecure` + 非 loopback 的组合。数据目录落在
+        # 已被 .gitignore 忽略的 data/ 下。
+        #
+        # 放在 python-engine 之前：引擎的 MCP 连接在启动时建立，节点先就绪才能一次连上
+        # （晚就绪也能靠 pool 轮询自愈，但首次会先报一轮失败）。
+        #
+        # **必须带 `-c`**：xerj 只认 `--config` 或 `XERJ_CONFIG`，**不会**自动读
+        # `./xerj.toml`。而它的端口只能从 TOML 配（命令行没有端口开关），默认
+        # native REST = 8080 与 Go 网关撞车 —— 见 xerj.toml 里的说明。
+        "name": "XERJ 索引节点",
+        "port": 9200,
+        "cmd": [
+            "xerj",
+            "--insecure",
+            "--bind", "127.0.0.1",
+            "--config", str(BASE_DIR / "xerj.toml"),
+            "--data-dir", str(BASE_DIR / "data" / "xerj"),
+        ],
+        "env": {},
+        "optional": True,
     },
     "python-engine": {
         "name": "Python AI 引擎",
@@ -388,6 +418,13 @@ class ServiceManager:
         cwd = svc.get("cwd", str(BASE_DIR))
         env = self._build_env(key)
 
+        # 可选服务：二进制不存在时**跳过并视为成功**。
+        # 可选服务是增强项（如 XERJ 检索），不是运行前提 —— 让它把 `start` 的整体
+        # 退出码拖成失败，会让"没装就该跳过"变成"没装就起不来"。
+        if svc.get("optional") and shutil.which(cmd[0]) is None:
+            print(f"  {name}: {gray('已跳过（未安装，可选）')}")
+            return True
+
         # 检查是否已在运行
         pid = read_pid(key)
         if pid and is_process_running(pid):
@@ -564,6 +601,12 @@ class ServiceManager:
             port = svc["port"]
             pid = read_pid(key)
 
+            # 可选服务未安装：既不是"运行中"也不是"已停止"，报"未安装"才准确
+            # —— 否则用户会以为它该跑却没跑起来，去翻一个根本不存在的日志。
+            if svc.get("optional") and shutil.which(svc["cmd"][0]) is None:
+                print(f"{name:<20} {gray('未安装'):<12} {'-':<10} {port:<8} {gray('可选')}")
+                continue
+
             if pid and is_process_running(pid):
                 port_ok = is_port_open(port)
                 status_text = green("运行中")
@@ -622,6 +665,9 @@ class ServiceManager:
         print(bold("\n═══ 服务访问地址 ═══\n"))
         print(f"  Gateway:      http://localhost:{SERVICES['gateway']['port']}")
         print("  HTTP 引擎:    http://localhost:8000")
+        # 可选服务只在真正装了的时候才展示，避免给出一个点不开的地址
+        if "xerj" in SERVICES and shutil.which(SERVICES["xerj"]["cmd"][0]):
+            print(f"  XERJ 节点:    http://localhost:{SERVICES['xerj']['port']}  (只读检索)")
         print()
         print(f"  日志目录:     {LOG_DIR}")
         print(f"  PID 目录:     {PID_DIR}")

@@ -49,6 +49,16 @@ type MCPPlugin struct {
 	// Approved：**用户级**「每插件一次性授权」——该插件是否已被用户确认可以执行。
 	// 默认 false（未授权，不可执行）；改 command 会重置为 false（旧授权不适用于新命令）。
 	Approved bool `json:"approved,omitempty"`
+	// ReadOnly：该 server 是否**只提供只读操作**。默认 false = fail-closed。
+	//
+	// 引擎侧据此分流（python-engine/app/plugins/pool.py:331）：
+	//   - true  ⇒ 引擎**直连**该 server，工具走进程内连接；
+	//   - false ⇒ 引擎不连，改为注册"经独立 MCP broker 调用"的代理工具。
+	//
+	// 语义是**安全声明而非偏好**：声明 true 等于说"这个 server 的凭据可以留在 agent
+	// 能读到的进程里"。只能对确定不含写/删/外部副作用、且不持有高权限凭据的 server 声明
+	// （例如 xerj 这类只读检索服务）。审计见 app/plugins/audit.py。
+	ReadOnly bool `json:"read_only,omitempty"`
 }
 
 // pluginsFile is the on-disk structure of plugins.json.
@@ -140,6 +150,7 @@ func (h *PluginHandler) Install(w http.ResponseWriter, r *http.Request) {
 		Env         map[string]string `json:"env,omitempty"`
 		Description string            `json:"description"`
 		Version     string            `json:"version"`
+		ReadOnly    bool              `json:"read_only,omitempty"`
 	}
 	if err := DecodeJSON(w, r, &body); err != nil {
 		BadRequest(w, ErrInvalidReq)
@@ -183,6 +194,7 @@ func (h *PluginHandler) Install(w http.ResponseWriter, r *http.Request) {
 	plugin := MCPPlugin{
 		Name: name, Command: body.Command, Args: body.Args, Env: body.Env,
 		Description: body.Description, Version: body.Version, Status: "active",
+		ReadOnly: body.ReadOnly,
 	}
 	plugins = append(plugins, plugin)
 
@@ -268,6 +280,7 @@ func (h *PluginHandler) Update(w http.ResponseWriter, r *http.Request) {
 		Description *string            `json:"description,omitempty"`
 		Version     *string            `json:"version,omitempty"`
 		Status      *string            `json:"status,omitempty"`
+		ReadOnly    *bool              `json:"read_only,omitempty"`
 	}
 	if err := DecodeJSON(w, r, &body); err != nil {
 		BadRequest(w, ErrInvalidReq)
@@ -278,7 +291,8 @@ func (h *PluginHandler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Command == nil && body.Args == nil && body.Env == nil &&
-		body.Description == nil && body.Version == nil && body.Status == nil {
+		body.Description == nil && body.Version == nil && body.Status == nil &&
+		body.ReadOnly == nil {
 		BadRequest(w, "nothing to update")
 		return
 	}
@@ -330,6 +344,9 @@ func (h *PluginHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.Status != nil {
 			plugins[i].Status = *body.Status
+		}
+		if body.ReadOnly != nil {
+			plugins[i].ReadOnly = *body.ReadOnly
 		}
 		updated = true
 		break
