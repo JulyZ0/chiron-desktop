@@ -13,11 +13,13 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AAlert: typeof import('ant-design-vue/es')['Alert']
+    AboutPanel: typeof import('./components/settings/AboutPanel.vue')['default']
     AButton: typeof import('ant-design-vue/es')['Button']
     ACheckbox: typeof import('ant-design-vue/es')['Checkbox']
     AdminTabbedView: typeof import('./components/admin/AdminTabbedView.vue')['default']
     AgentCollabPanel: typeof import('./components/AgentCollabPanel.vue')['default']
     AInput: typeof import('ant-design-vue/es')['Input']
+    AInputPassword: typeof import('ant-design-vue/es')['InputPassword']
     AModal: typeof import('ant-design-vue/es')['Modal']
     AppLayout: typeof import('./components/AppLayout.vue')['default']
     ARadioButton: typeof import('ant-design-vue/es')['RadioButton']
@@ -86,11 +88,13 @@ declare module 'vue' {
 // For TSX support
 declare global {
   const AAlert: typeof import('ant-design-vue/es')['Alert']
+  const AboutPanel: typeof import('./components/settings/AboutPanel.vue')['default']
   const AButton: typeof import('ant-design-vue/es')['Button']
   const ACheckbox: typeof import('ant-design-vue/es')['Checkbox']
   const AdminTabbedView: typeof import('./components/admin/AdminTabbedView.vue')['default']
   const AgentCollabPanel: typeof import('./components/AgentCollabPanel.vue')['default']
   const AInput: typeof import('ant-design-vue/es')['Input']
+  const AInputPassword: typeof import('ant-design-vue/es')['InputPassword']
   const AModal: typeof import('ant-design-vue/es')['Modal']
   const AppLayout: typeof import('./components/AppLayout.vue')['default']
   const ARadioButton: typeof import('ant-design-vue/es')['RadioButton']

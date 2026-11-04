@@ -1,18 +1,18 @@
 {
   "name": "frontend-vue",
   "private": true,
-  "version": "0.1.261025-01",
+  "version": "0.261104.02",
   "type": "module",
   "main": "electron/main.cjs",
   "description": "Chiron Desktop — AI agent workspace (Electron shell)",
   "author": {
-    "name": "Athenavi",
-    "email": "athenavi@users.noreply.github.com"
+    "name": "JulyZ0",
+    "email": "JulyZ0@users.noreply.github.com"
   },
-  "homepage": "https://github.com/Athenavi/chiron",
+  "homepage": "https://github.com/JulyZ0/chiron-desktop",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Athenavi/chiron.git"
+    "url": "https://github.com/JulyZ0/chiron-desktop.git"
   },
   "scripts": {
     "dev": "vite",
