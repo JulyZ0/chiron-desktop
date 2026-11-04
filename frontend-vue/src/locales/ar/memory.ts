@@ -11,6 +11,7 @@ export default {
   click_new_memory_at_the_top_right_to_record_user_preferences_and_long_term_context: "انقر «ذاكرة جديدة» في أعلى اليمين لتسجيل تفضيلات المستخدم والسياق طويل الأمد",
   try_rephrasing_or_create_memory_above_first: "جرّب صياغة أخرى، أو أنشئ ذاكرة أعلاه أولًا",
   memory_2: "ذاكرة",
+  record_user_preferences_and_long_term_context_auto_attached_in_future_conversations: "سجّل تفضيلات المستخدم والسياق طويل الأمد؛ تُرفق تلقائيًا في المحادثات المستقبلية",
   memory_content: "محتوى الذاكرة",
   memory_usage: "استخدام الذاكرة",
   clear_memory: "مسح الذاكرة",

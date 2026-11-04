@@ -89,6 +89,21 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   setMode: (nextMode, opts) => ipcRenderer.invoke('desktop:set-mode', nextMode, opts || {}),
   /** 重启应用（不改模式） */
   restart: () => ipcRenderer.invoke('desktop:restart'),
+  /**
+   * 清空本机数据（不可恢复）：主进程会先做 Windows Hello 确认，再停后端、
+   * 清界面缓存与 token、删 userData/local，最后重启应用。
+   *
+   * 身份核验**只在主进程做** —— 渲染进程说"用户确认过"不算数，
+   * 一个被注入的页面同样能调这个通道。
+   */
+  wipeLocalData: password => ipcRenderer.invoke('desktop:wipe-local-data', { password: password || '' }),
+  /**
+   * 本机 Windows Hello 是否可用。
+   *
+   * 不可用时清空数据必须改验账户密码（主进程不会放行），
+   * 界面据此提前把密码输入框显示出来，而不是等用户点完两次确认才告知。
+   */
+  getHelloAvailability: () => ipcRenderer.invoke('desktop:get-hello-availability'),
   /** 打开连接配置页（改服务地址）：主进程会重建窗口，当前界面随之重载 */
   openSetup: () => ipcRenderer.invoke('desktop:open-setup'),
 

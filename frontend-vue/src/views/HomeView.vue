@@ -4,7 +4,7 @@ import type { Component } from 'vue'
 import { useRouter } from 'vue-router'
 import { Button } from 'ant-design-vue'
 import {
-  MessageOutlined, UserOutlined, ApartmentOutlined, BlockOutlined,
+  MessageOutlined, UserOutlined, HistoryOutlined, BlockOutlined,
   BookOutlined, ThunderboltOutlined, ArrowRightOutlined, ArrowUpOutlined,
 } from '@ant-design/icons-vue'
 import HomeScene3D from '../components/home/HomeScene3D.vue'
@@ -26,7 +26,7 @@ interface Feature {
 const features: Feature[] = [
   { title: t('chat.chat'), en: 'CHAT', desc: t('agent.normal_minimal_ptc_creative_modes_tool_calls_are_fully_visualized'), path: '/chat', icon: markRaw(MessageOutlined) },
   { title: 'Agent', en: 'AGENTS', desc: t('workflow.multi_agent_collaboration_task_dispatch_and_result_tracking'), path: '/agents', icon: markRaw(UserOutlined) },
-  { title: t('workflow.workflow'), en: 'WORKFLOW', desc: t('workflow.visually_orchestrate_multi_step_tasks_with_freely_connected_nodes'), path: '/workflow', icon: markRaw(ApartmentOutlined) },
+  { title: t('memory.memory_2'), en: 'MEMORY', desc: t('memory.record_user_preferences_and_long_term_context_auto_attached_in_future_conversations'), path: '/memory', icon: markRaw(HistoryOutlined) },
   { title: t('agent.skill'), en: 'SKILLS', desc: t('agent.pluggable_skill_marketplace_load_and_unload_on_demand'), path: '/skills', icon: markRaw(BlockOutlined) },
   { title: t('knowledge.knowledge_base'), en: 'KNOWLEDGE', desc: t('agent.document_ingestion_and_vector_retrieval_give_agents_a_solid_basis'), path: '/knowledge', icon: markRaw(BookOutlined) },
   { title: t('common.plugin'), en: 'PLUGINS', desc: t('agent.mcp_service_config_extends_the_agent_s_capability_boundary'), path: '/plugins', icon: markRaw(ThunderboltOutlined) },

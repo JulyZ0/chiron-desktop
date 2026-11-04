@@ -54,6 +54,38 @@ export interface ChironDesktopHost {
    * `%APPDATA%` + ACL 按账户隔离。老外壳没有这个成员，界面要能降级。
    */
   getOsAccount?: () => Promise<string>
+  /**
+   * 清空本机数据（不可恢复）。主进程内部完成 Windows Hello 确认、
+   * 停后端、清缓存与 token、删 `userData/local`，然后重启应用。
+   *
+   * 老外壳没有这个成员，界面要能降级。
+   */
+  wipeLocalData?: (password?: string) => Promise<WipeLocalDataResult>
+  /** 本机 Windows Hello 是否可用；不可用时清空数据必须改验账户密码 */
+  getHelloAvailability?: () => Promise<{ available: boolean; availability?: string }>
+}
+
+/** `wipeLocalData` 的结构化结果：失败也要能区分原因，而不是一律弹「失败了」 */
+export interface WipeLocalDataResult {
+  ok: boolean
+  /** `ok=true` 时表示是否已自动重启（false 时数据仍已清空，只需手动重开） */
+  relaunched?: boolean
+  /**
+   * `not-local` 当前不是本地模式
+   * `needs-password` 没有可用的 Windows Hello，需要账户密码（不是失败，是下一步）
+   * `denied` Hello 上被用户拒绝
+   * `bad-credential` 密码不正确
+   * `account-issue` 账户层面问题（过期/禁用/需改密码）
+   * `verification-unavailable` 验证所需的环境不可用（断网 / 域控不可达）——
+   *   不是用户做错了什么，重试也不会好，界面要给可执行的下一步
+   * `wipe-failed` 清空过程出错
+   */
+  reason?: string
+  message?: string
+  cleaned?: string[]
+  warnings?: string[]
+  /** 验证不可用时由主进程带回的真实数据目录 —— 界面用它给出可执行的手动出路 */
+  dataDir?: string
 }
 
 /** localStorage 镜像键（真相在主进程 config.json，这里只镜像） */
@@ -134,6 +166,8 @@ export const useDeviceStore = defineStore('device', () => {
   const switching = ref(false)
   /** 当前 OS 账户（`DOMAIN\username`）；Web 端或老外壳上为空串 */
   const osAccount = ref('')
+  /** 清空数据正在进行中（防重复点击；主进程成功后应用会重启） */
+  const wiping = ref(false)
 
   /** 是否运行在桌面外壳里（Web 端无法切换模式） */
   const isDesktop = computed(() => isDesktopHost())
@@ -247,6 +281,24 @@ export const useDeviceStore = defineStore('device', () => {
    * 返回 false 表示外壳不支持（老 preload 没有 `openSetup`），由调用方提示用户。
    * 成功时主进程会重建窗口，本页面随之卸载，不需要在这里收尾。
    */
+  /**
+   * 本机 Windows Hello 是否可用。
+   *
+   * 不可用时清空数据必须改验账户密码（主进程不会放行）。界面要**提前**问出来，
+   * 而不是等用户点完两次确认才告知"还需要密码"。
+   * 老外壳没有这个成员时按「不可用」处理：宁可多要一次密码，也不要少一道验证。
+   */
+  async function checkHelloAvailability(): Promise<boolean> {
+    const host = desktopHost()
+    if (!host || typeof host.getHelloAvailability !== 'function') return false
+    try {
+      const result = await host.getHelloAvailability()
+      return Boolean(result && result.available)
+    } catch {
+      return false
+    }
+  }
+
   async function openConnectionSetup(): Promise<boolean> {
     const host = desktopHost()
     if (!host || !host.openSetup) return false
@@ -262,6 +314,32 @@ export const useDeviceStore = defineStore('device', () => {
     const host = desktopHost()
     if (!host || !host.restart) return
     await host.restart()
+  }
+
+  /**
+   * 清空本机数据（不可恢复）。
+   *
+   * 不在这里做任何确认 —— 勾选、手打确认词、Windows Hello 都由调用方与主进程负责。
+   * store 只把结果**原样**交回：`ok=false` 时调用方要能按 `reason` 区分
+   * 「用户没过身份验证」（不该报错）与「清空过程出错」（要给出原因）。
+   *
+   * 外壳不支持时返回 `{ ok: false, reason: 'unsupported' }` 而不是抛错：
+   * 这是能力缺失，不是异常，界面据此禁用按钮即可。
+   */
+  async function wipeLocalData(password = ''): Promise<WipeLocalDataResult> {
+    const host = desktopHost()
+    if (!host || !host.wipeLocalData) {
+      return { ok: false, reason: 'unsupported', message: 'desktop shell does not expose wipeLocalData' }
+    }
+    wiping.value = true
+    try {
+      const result = await host.wipeLocalData(password)
+      return result && typeof result === 'object'
+        ? result
+        : { ok: false, reason: 'wipe-failed', message: 'unexpected response' }
+    } finally {
+      wiping.value = false
+    }
   }
 
   // 首启把解析值写进镜像：下次 preload 读失败时仍有兜底依据
@@ -281,6 +359,9 @@ export const useDeviceStore = defineStore('device', () => {
     refresh,
     setMode,
     restart,
+    wiping,
+    wipeLocalData,
+    checkHelloAvailability,
     openConnectionSetup,
   }
 })

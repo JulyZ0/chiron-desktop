@@ -11,6 +11,7 @@ export default {
   click_new_memory_at_the_top_right_to_record_user_preferences_and_long_term_context: "点击右上角「新建记忆」，记录用户偏好与长期上下文",
   try_rephrasing_or_create_memory_above_first: "换一个说法再试，或先在上方新建记忆",
   memory_2: "记忆",
+  record_user_preferences_and_long_term_context_auto_attached_in_future_conversations: "记录用户偏好与长期上下文，后续对话自动带上",
   memory_content: "记忆的具体内容",
   memory_usage: "内存使用",
   clear_memory: "清空记忆",

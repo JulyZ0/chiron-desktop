@@ -39,6 +39,7 @@ const {
 const shared = require('./shared.cjs')
 const dataDirAcl = require('./data-dir-acl.cjs')
 const windowsHello = require('./windows-hello.cjs')
+const accountVerify = require('./account-verify.cjs')
 const {
   API_URL_ARG_PREFIX,
   MODE_ARG_PREFIX,
@@ -57,6 +58,7 @@ const {
 const DEVICE_TOKEN_ARG_PREFIX = shared.DEVICE_TOKEN_ARG_PREFIX || '--chiron-device-token='
 const { readToken, writeToken, clearToken } = require('./token-store.cjs')
 const { switchMode } = require('./mode-switch.cjs')
+const { wipeLocalData, relaunchAfterWipe } = require('./wipe-data.cjs')
 
 /** 开发模式：`electron . --dev` 时连 Vite dev server，否则加载 dist/ */
 const isDev = process.argv.includes('--dev')
@@ -904,7 +906,11 @@ async function startLocalBackendWithProgress(options = {}) {
  *
  * @returns {Promise<boolean>} 是否继续启动
  */
-async function confirmUnlockWithHello() {
+async function confirmUnlockWithHello(options = {}) {
+  const message = options.message || '确认是您本人正在打开 Chiron'
+  const failTitle = options.failTitle || '未通过身份确认'
+  const failBody =
+    options.failBody || 'Chiron 需要先确认是您本人才能打开。请重新启动应用并完成 Windows Hello 验证。'
   if (process.platform !== 'win32') return true
 
   let availability = null
@@ -921,7 +927,7 @@ async function confirmUnlockWithHello() {
 
   let result = null
   try {
-    result = await windowsHello.requestVerificationResult('确认是您本人正在打开 Chiron')
+    result = await windowsHello.requestVerificationResult(message)
   } catch (err) {
     logMain('warn', `Windows Hello 确认调用失败，跳过：${err?.message || err}`)
     return true
@@ -934,11 +940,82 @@ async function confirmUnlockWithHello() {
 
   // 走到这里说明设备可用、用户却没过：取消或重试耗尽。这是明确的拒绝。
   logMain('warn', `Windows Hello 二次确认未通过（${result || 'unknown'}），退出应用`)
-  dialog.showErrorBox(
-    '未通过身份确认',
-    'Chiron 需要先确认是您本人才能打开。请重新启动应用并完成 Windows Hello 验证。',
-  )
+  dialog.showErrorBox(failTitle, failBody)
   return false
+}
+
+/**
+ * 敏感操作（清空数据）的身份确认。
+ *
+ * 与启动时的 `confirmUnlockWithHello` 关键差别：**Hello 不可用时不放行**，
+ * 而是要求用户输入当前 Windows 账户密码。
+ *
+ * 为什么不能沿用「不可用就跳过」：跳过等于零验证，而清空数据不可逆。
+ * Windows 的 PIN 属于 Hello 体系（配了 PIN 时 CheckAvailability 报 Available），
+ * 所以「Hello 不可用」通常意味着这台机器两者都没配 —— 此时密码是唯一还能
+ * 证明「你是这个账户主人」的东西。
+ *
+ * @returns {Promise<{ok:boolean, reason:string, message:string}>}
+ *   reason: `verified` / `denied`（Hello 上被拒绝）/ `needs-password` /
+ *           `bad-credential` / `account-issue` / `error`
+ */
+async function confirmSensitiveAction(options = {}) {
+  const message = options.message || '确认执行此操作'
+  const password = typeof options.password === 'string' ? options.password : ''
+
+  if (process.platform !== 'win32') {
+    // 非 Windows 没有 Hello 也没有这份密码校验，只能依赖 OS 层面的账户隔离
+    return { ok: true, reason: 'verified', message: '' }
+  }
+
+  let availability = null
+  try {
+    availability = await windowsHello.checkAvailability()
+  } catch (err) {
+    logMain('warn', `Windows Hello 探测失败，转密码验证：${err?.message || err}`)
+    availability = null
+  }
+
+  // ① Hello 可用：先走它。用户明确拒绝就不再给密码这条路（拒绝就是拒绝）
+  if (availability === 'Available') {
+    let result = null
+    try {
+      result = await windowsHello.requestVerificationResult(message)
+    } catch (err) {
+      logMain('warn', `Windows Hello 调用失败，转密码验证：${err?.message || err}`)
+      result = null
+    }
+    if (result === 'Verified') return { ok: true, reason: 'verified', message: '' }
+    if (result === 'Canceled' || result === 'RetriesExhausted') {
+      return { ok: false, reason: 'denied', message: '身份确认未通过' }
+    }
+    // 其他（DeviceBusy / 脚本异常）继续往下降级
+  }
+
+  // ② Hello 不可用：必须给密码。没给就先要一次，别直接执行
+  if (!password) {
+    return {
+      ok: false,
+      reason: 'needs-password',
+      message: '未检测到可用的 Windows Hello，请输入当前 Windows 账户密码以确认身份',
+    }
+  }
+
+  // ③ 验密码（主进程内完成，密码不落库、不进日志、不回传）
+  const account = dataDirAcl.currentAccount()
+  const result = await accountVerify.verifyAccountPassword({ account, password })
+  if (result.ok) return { ok: true, reason: 'verified', message: '' }
+
+  // ④ 验证基础设施本身不可用（断网 / 域控不可达 / RPC 不通）：用户没错，
+  //    这台机器此刻没法完成验证。不能报成「密码错」让人反复重试，
+  //    也不能无声放行 —— 交给调用方给出可诊断的降级出口。
+  if (result.reason === 'unavailable' || result.reason === 'unsupported') {
+    logMain('warn', `账户验证不可用：${result.message || result.reason}`)
+    return { ok: false, reason: 'verification-unavailable', message: result.message }
+  }
+
+  logMain('warn', `账户密码验证未通过：${result.reason}`)
+  return { ok: false, reason: result.reason, message: result.message }
 }
 
 function createWindow() {
@@ -1355,6 +1432,87 @@ if (!gotLock) {
       assertTrustedSender(event)
       restartNow()
       return true
+    })
+
+    /**
+     * 清空本机数据 —— 设置页「运行模式」标签页里唯一的破坏性动作。
+     *
+     * **为什么 Hello 确认放在主进程**：渲染进程只是界面，它说"用户确认过了"
+     * 不等于真的确认过；一个被注入的页面可以照样调这个 IPC。
+     * 所以核对身份的这一步必须在主进程、在真正动手之前完成。
+     *
+     * 分批次的确认（勾选 → 手打确认词）在渲染进程做，那是防误触；
+     * 这里是防冒用，两者不能互相替代。
+     *
+     * 失败返回结构化结果而不是抛错：界面要能区分"用户拒绝"（不该报错弹窗）
+     * 与"清空过程出错"（要给出可读原因）。
+     */
+    /**
+     * 本机 Windows Hello 是否可用。渲染进程据此决定要不要显示密码输入框 ——
+     * 不可用时主进程不会放行清空操作，界面应提前告知，而不是等两次确认后才发现。
+     */
+    ipcMain.handle('desktop:get-hello-availability', async event => {
+      assertTrustedSender(event)
+      if (process.platform !== 'win32') {
+        return { available: false, platform: process.platform }
+      }
+      try {
+        const availability = await windowsHello.checkAvailability()
+        return { available: availability === 'Available', availability: availability || 'unknown' }
+      } catch (err) {
+        logMain('warn', `Windows Hello 可用性探测失败：${err?.message || err}`)
+        return { available: false, availability: 'unknown' }
+      }
+    })
+
+    ipcMain.handle('desktop:wipe-local-data', async (event, payload) => {
+      assertTrustedSender(event)
+
+      // 只有本地模式才有"本机数据"可清
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '当前不是本地模式' }
+      }
+
+      // 破坏性动作：必须验证身份。**Hello 不可用时不再放行**，改要账户密码 ——
+      // 放行等于零验证，而这一步不可逆（见 confirmSensitiveAction 的说明）。
+      // 密码只在本次调用内存在：不写日志、不落盘、不进返回值。
+      const auth = await confirmSensitiveAction({
+        message: '确认清空 Chiron 的全部本机数据',
+        password: payload && typeof payload.password === 'string' ? payload.password : '',
+      })
+      if (!auth.ok) {
+        // 需要密码时把 reason 原样带回，界面据此显示密码输入框。
+        // 验证基础设施不可用时附上数据目录：这是绕开验证的**唯一诚实出路** ——
+        // 用户本来就能在资源管理器里删掉它，应用内假装"验证失败就放行"没有
+        // 任何安全收益，只会让界面对安全状态撒谎。
+        const dataDir = currentMode === 'local'
+          ? path.join(app.getPath('userData'), 'local')
+          : ''
+        return { ok: false, reason: auth.reason, message: auth.message, dataDir }
+      }
+
+      try {
+        const result = await wipeLocalData({
+          electron: { app, session },
+          stopBackend: async () => {
+            if (currentMode === 'local') await stopLocalBackend()
+          },
+          tokenStore: { clearToken },
+          log: logMain,
+        })
+        // 数据已删：重启到干净状态。重启失败不算清空失败 —— 数据已经没了，
+        // 用户手动重开即可，这时报"清空失败"反而是误导。
+        const relaunched = relaunchAfterWipe({ app }, logMain)
+        return {
+          ok: true,
+          relaunched,
+          cleaned: result.cleaned,
+          warnings: result.warnings,
+        }
+      } catch (err) {
+        logMain('error', `wipe local data failed: ${err?.message || err}`)
+        return { ok: false, reason: 'wipe-failed', message: err?.message || String(err) }
+      }
     })
 
     // ── 本地文档选择（契约 §2 的 `pickDocument`）──

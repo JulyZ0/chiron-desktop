@@ -13,6 +13,7 @@ import { SafetyOutlined, MobileOutlined, ExportOutlined, DeleteOutlined, LinkOut
 import EmptyState from '../common/EmptyState.vue'
 import HarnessProfilePanel from './HarnessProfilePanel.vue'
 import RunModePanel from './RunModePanel.vue'
+import AboutPanel from './AboutPanel.vue'
 import ShortcutSettingsPanel from './ShortcutSettingsPanel.vue'
 import LanguageSwitcher from '../common/LanguageSwitcher.vue'
 import { useAuthStore } from '../../stores/auth'
@@ -808,13 +809,21 @@ onUnmounted(() => {
       <HarnessProfilePanel scope="user" />
     </a-tab-pane>
 
-    <!-- ── 运行模式（local / cloud）：仅桌面壳展示；切换代价与确认在面板内告知 ── -->
+    <!-- ── 运行模式：云端已废除，只剩本地；面板内提供「清空本机数据」 ── -->
     <a-tab-pane
       v-if="deviceStore.isDesktop"
       key="mode"
       :tab="$t('settings.run_mode')"
     >
       <RunModePanel />
+    </a-tab-pane>
+
+    <!-- ── 关于：产品定位与源码仓库。纯静态信息，桌面端与 Web 端都展示 ── -->
+    <a-tab-pane
+      key="about"
+      :tab="$t('settings.about_tab')"
+    >
+      <AboutPanel />
     </a-tab-pane>
   </a-tabs>
 </template>

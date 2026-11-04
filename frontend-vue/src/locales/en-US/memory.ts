@@ -11,6 +11,7 @@ export default {
   click_new_memory_at_the_top_right_to_record_user_preferences_and_long_term_context: "Click \"New Memory\" at the top right to record user preferences and long-term context",
   try_rephrasing_or_create_memory_above_first: "Try rephrasing, or create memory above first",
   memory_2: "Memory",
+  record_user_preferences_and_long_term_context_auto_attached_in_future_conversations: "Record user preferences and long-term context; attached automatically in future conversations",
   memory_content: "Memory content",
   memory_usage: "Memory usage",
   clear_memory: "Clear memory",
