@@ -1,6 +1,6 @@
 import type { RouteLocationNormalized, NavigationGuardNext } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
-import { currentDeviceMode } from '../stores/device'
+import { currentDeviceMode, isDevAuthBypassEnabled } from '../stores/device'
 import { requestManager } from '../utils/requestOptimizer'
 
 /**
@@ -70,7 +70,9 @@ export async function authGuard(
 
   if (to.meta.requiresAdmin) {
     const role = auth.user?.role
-    if (role !== 'admin' && role !== 'owner') {
+    // 开发环境绕过：无登录态时 role 恒为 undefined，admin 页会一律被弹回首页。
+    // 该函数在生产构建里恒为 false（编译期 DCE），不构成线上后门。
+    if (role !== 'admin' && role !== 'owner' && !isDevAuthBypassEnabled()) {
       next('/')
       return
     }

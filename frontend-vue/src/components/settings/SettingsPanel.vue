@@ -13,6 +13,7 @@ import { SafetyOutlined, MobileOutlined, ExportOutlined, DeleteOutlined, LinkOut
 import EmptyState from '../common/EmptyState.vue'
 import HarnessProfilePanel from './HarnessProfilePanel.vue'
 import RunModePanel from './RunModePanel.vue'
+import IsolationPanel from './IsolationPanel.vue'
 import AboutPanel from './AboutPanel.vue'
 import ShortcutSettingsPanel from './ShortcutSettingsPanel.vue'
 import LanguageSwitcher from '../common/LanguageSwitcher.vue'
@@ -816,6 +817,15 @@ onUnmounted(() => {
       :tab="$t('settings.run_mode')"
     >
       <RunModePanel />
+    </a-tab-pane>
+
+    <!-- ── 执行隔离：档位查看 / 切换 / 撤销。桌面端才有本机沙箱，Web 端不显示 ── -->
+    <a-tab-pane
+      v-if="deviceStore.isDesktop"
+      key="isolation"
+      :tab="$t('settings.isolation_title')"
+    >
+      <IsolationPanel />
     </a-tab-pane>
 
     <!-- ── 关于：产品定位与源码仓库。纯静态信息，桌面端与 Web 端都展示 ── -->

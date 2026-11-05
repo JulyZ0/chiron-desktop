@@ -193,4 +193,18 @@ func registerProxyRoutes(
 	mux.Handle("GET /v1/memory/conflicts", authMW(rlMW(memP(pathFn("/v1/memory/conflicts")))))
 	mux.Handle("POST /v1/memory/conflicts/{conflict_id}/resolve", authMW(rlMW(memP(pathParamNamed("/v1/memory/conflicts", "conflict_id", "/resolve")))))
 	mux.Handle("DELETE /v1/memory/conflicts/{conflict_id}", authMW(rlMW(memP(pathParamNamed("/v1/memory/conflicts", "conflict_id", "")))))
+
+	// Isolation tier (本机沙箱档位：查询 / 切换 / 撤销)
+	//
+	// 为什么写操作要 admin 权限：档位是**Python 引擎进程级**的全局状态，一个用户
+	// 改了会作用于该引擎上所有后续执行 —— 它不是 per-user 偏好。桌面端是单用户
+	// 本地实例，用户即 owner，不受影响；多租户 SaaS 部署下这个限制是必要的。
+	//
+	// 读也要求 admin：响应里有本机路径（工作区、AppContainer 名）与能力矩阵，
+	// 属于内部运行信息，与同组 /v1/system/health 口径一致。
+	isoP := newProxy("", proxyOpt{logTag: "isolation"})
+	mux.Handle("GET /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminRead)(isoP(pathFn("/v1/system/isolation"))))))
+	mux.Handle("PUT /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation"))))))
+	mux.Handle("DELETE /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation"))))))
+	mux.Handle("POST /v1/system/isolation/revoke", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation/revoke"))))))
 }

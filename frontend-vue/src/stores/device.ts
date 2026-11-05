@@ -104,6 +104,114 @@ export function isDesktopHost(): boolean {
   return Boolean(desktopHost()?.isDesktop)
 }
 
+/**
+ * 开发环境登录绕过标志位的存储键。
+ *
+ * 为什么要这个东西：浏览器直连 `vite`（`:5173`）时**没有** Electron preload，
+ * `resolveDeviceMode()` 只能判成 `cloud`；而 cloud 模式的 `isAuthenticated` 要求
+ * `user` 非空 —— 开发时后端没起、没登录态，于是每个 `requiresAuth` 页都被守卫
+ * 弹回首页，改了界面根本看不到。
+ */
+export const DEV_AUTH_BYPASS_STORAGE_KEY = 'chiron.dev.auth-bypass'
+
+/** 一次性开启用的 URL 参数（`?devAuthBypass=1` / `=0`），命中后写回 localStorage */
+const DEV_AUTH_BYPASS_QUERY = 'devAuthBypass'
+
+/**
+ * 是否启用了「开发环境登录绕过」。
+ *
+ * 三重约束，缺一不可：
+ *   1. **只在 DEV 构建生效** —— `import.meta.env.DEV` 是编译期常量，生产构建里
+ *      整个函数体被 DCE 移除，不可能变成线上后门；
+ *   2. 显式开启：`VITE_DEV_AUTH_BYPASS=1` / localStorage / URL 参数任一；
+ *   3. 判定为 `local` 模式后果最小 —— 本地模式本来就"没有登录这回事"。
+ */
+export function isDevAuthBypassEnabled(): boolean {
+  // 生产构建：这个分支会被整段剔除（不要在这里加任何副作用）
+  if (!import.meta.env.DEV) return false
+
+  if (import.meta.env.VITE_DEV_AUTH_BYPASS === '1') return true
+
+  try {
+    const raw = globalThis.localStorage?.getItem(DEV_AUTH_BYPASS_STORAGE_KEY)
+    return raw === '1'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 从当前 URL 读取绕过标志的原始值（不存在返回 null）。
+ *
+ * 两种路由模式都要覆盖，否则"桌面端开了没反应"会变成一个很难查的哑弹：
+ *   - Web / `vite` 开发服务器：history 路由，参数在 `location.search`；
+ *   - 桌面壳：`file://` 下切 hash 路由，参数落在 `#/chat?devAuthBypass=1` 的 hash 里。
+ */
+function readBypassFlagFromLocation(): string | null {
+  const loc = globalThis.location
+  if (!loc) return null
+  const fromSearch = new URLSearchParams(loc.search || '').get(DEV_AUTH_BYPASS_QUERY)
+  if (fromSearch !== null) return fromSearch
+  const hash = loc.hash || ''
+  const queryStart = hash.indexOf('?')
+  if (queryStart === -1) return null
+  return new URLSearchParams(hash.slice(queryStart + 1)).get(DEV_AUTH_BYPASS_QUERY)
+}
+
+/**
+ * 开发环境自动登录用的凭据（仅在 `?devAuthBypass=1` 且 DEV 构建下被读取）。
+ *
+ * 从 `frontend-vue/.env.local` 读（该文件被 `*.local` 规则忽略，不会进版本库）：
+ *
+ * ```
+ * VITE_DEV_AUTH_EMAIL=owner@local.dev
+ * VITE_DEV_AUTH_PASSWORD=...
+ * ```
+ *
+ * 没有配置时返回 `null` —— 此时绕过只放宽前端守卫、不尝试登录（页面会因为 401
+ * 而空数据，但不会刷错误提示，见 api/index.ts 的 401 分支）。
+ *
+ * 生产构建里整个函数被 DCE 移除，凭据不会进产物。
+ */
+export function devAuthCredentials(): { email: string; password: string } | null {
+  if (!import.meta.env.DEV) return null
+  const email = import.meta.env.VITE_DEV_AUTH_EMAIL
+  const password = import.meta.env.VITE_DEV_AUTH_PASSWORD
+  if (!email || !password) return null
+  return { email, password }
+}
+
+/**
+ * 从 URL 同步绕过标志（命中即写回 localStorage，之后刷新/深链都保持）。
+ *
+ * 必须在任何模式判定**之前**调用一次（`main.ts` 启动时），否则首帧的
+ * `resolveDeviceMode()` 读到的还是旧值。
+ *
+ * 用法：`http://localhost:5173/?devAuthBypass=1` 开启，
+ * `...?devAuthBypass=0` 撤销。
+ */
+export function syncDevAuthBypassFromUrl(): void {
+  if (!import.meta.env.DEV) return
+  try {
+    const value = readBypassFlagFromLocation()
+    if (value === null) return
+    const on = value === '1' || value === 'true'
+    if (on) globalThis.localStorage?.setItem(DEV_AUTH_BYPASS_STORAGE_KEY, '1')
+    else globalThis.localStorage?.removeItem(DEV_AUTH_BYPASS_STORAGE_KEY)
+  } catch {
+    /* 存储不可用（隐私模式）时忽略：标志位本就是开发辅助 */
+  }
+}
+
+/** 仅供开发者手动关闭（控制台 `__chironDisableAuthBypass()`），随后需刷新 */
+export function clearDevAuthBypass(): void {
+  try {
+    globalThis.localStorage?.removeItem(DEV_AUTH_BYPASS_STORAGE_KEY)
+  } catch {
+    /* 同上 */
+  }
+}
+
 /** 读镜像；损坏或非法值一律当作"没有镜像"（不抛错，存储可能被禁用） */
 export function readMirroredMode(): ChironMode | null {
   try {

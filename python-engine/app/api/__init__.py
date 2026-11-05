@@ -8,6 +8,7 @@ from app.api.context import router as context_router
 from app.api.desktop_infer import router as desktop_infer_router
 from app.api.interactions import router as interactions_router
 from app.api.internal_subagent import router as internal_subagent_router
+from app.api.isolation import router as isolation_router
 from app.api.knowledge import router as knowledge_router
 from app.api.memory import router as memory_router
 from app.api.output_controls import router as output_controls_router
@@ -32,3 +33,4 @@ api_router.include_router(desktop_infer_router)
 api_router.include_router(memory_router)
 api_router.include_router(output_controls_router)
 api_router.include_router(system_router)
+api_router.include_router(isolation_router)

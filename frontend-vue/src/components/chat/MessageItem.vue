@@ -10,7 +10,7 @@ import { computed, ref, watch, onMounted, onUpdated, onBeforeUnmount } from 'vue
 import { Input } from 'ant-design-vue'
 import { notify } from '../../utils/notify'
 import { fileTypeBadge, splitFileName, type SplitName } from '../../utils/fileName'
-import { CopyOutlined, CheckOutlined, EditOutlined, ReloadOutlined, LikeOutlined, DislikeOutlined, LikeFilled, DislikeFilled, CommentOutlined, WalletOutlined, BarChartOutlined } from '@ant-design/icons-vue'
+import { CopyOutlined, CheckOutlined, EditOutlined, ReloadOutlined, LikeOutlined, DislikeOutlined, LikeFilled, DislikeFilled, CommentOutlined, BarChartOutlined } from '@ant-design/icons-vue'
 import ReasoningBlock from './ReasoningBlock.vue'
 import { inkCharsFor, inkIndexFor } from './ink'
 import ToolCallCard from './ToolCallCard.vue'
@@ -326,24 +326,15 @@ function retryFailed() {
 
 /**
  * 余额不足 → 去计费页充值。
+/**
+ * 配额耗尽 → 去计费页看用量。
  *
- * 三类失败里只有这一类**用户自己能解决**，所以它必须有一个直达入口：文案写"去计费页"
- * 而旁边只有"重试"按钮，等于把用户推进必然失败的循环。
- * 用 router 而非 <a href>：保持在 SPA 内，返回时对话上下文不丢。
+ * 这是三类失败里唯一"看了页面就知道该找谁"的一类：用量页能回答"我用超了多少"，
+ * 用户据此去和租户管理员沟通。用 router 而非 <a href>：保持在 SPA 内，
+ * 返回时对话上下文不丢。
  */
 function goBilling() {
   router.push('/billing')
-}
-
-/**
- * 模型被拒且原因是"套餐不覆盖"→ 直达套餐页签。
- *
- * 为什么不复用 goBilling：余额不足要充值（balance 页签），模型越界要买套餐
- * （packages 页签）。落到错误的页签等于让用户自己再找一遍 -- 这正是
- * "用不了但没提示"的另一种形态。
- */
-function goBillingPackages() {
-  router.push({ path: '/billing', query: { tab: 'packages' } })
 }
 
 // ── P3-B 长消息折叠 ──
@@ -795,16 +786,6 @@ onUpdated(enhanceContent)
           class="msg-error-banner"
         >
           <span class="error-text">{{ $t('errors.send_failed_msg', { msg: (item as TextItem).errorMsg || $t('errors.network_error_2') }) }}</span>
-          <!-- 余额不足：三类失败里唯一**用户自己能解决**的一类 —— 给直达入口，
-               而不是让他在提示里读到"去计费页"却不知道怎么去 -->
-          <button
-            v-if="(item as TextItem).errorCode === 'insufficient_credits'"
-            class="retry-btn"
-            type="button"
-            @click.stop="goBilling"
-          >
-            <WalletOutlined /> {{ $t('errors.insufficient_credits_action') }}
-          </button>
           <!-- 会话忙：给"修复"而不只是"重试" —— 重试必然再撞同一道闸门 -->
           <button
             v-if="(item as TextItem).errorCode === 'session_busy'"
@@ -828,17 +809,6 @@ onUpdated(enhanceContent)
             @click.stop="goBilling"
           >
             <BarChartOutlined /> {{ $t('errors.quota_exceeded_action') }}
-          </button>
-          <!-- 模型越界（P2-2b）：只有"套餐不覆盖"这一类买了就能解决，所以只在这一种
-               情况给直达套餐页签的按钮。租户策略不允许时买套餐也没用 —— 文案里已写明
-               要找管理员，这里不再放一个点了没去处的按钮。 -->
-          <button
-            v-if="(item as TextItem).errorCode === 'model_not_allowed' && (item as TextItem).errorReason === 'entitlement'"
-            class="retry-btn"
-            type="button"
-            @click.stop="goBillingPackages"
-          >
-            <WalletOutlined /> {{ $t('errors.model_not_allowed_buy_package') }}
           </button>
           <!-- 重试按钮：服务端若显式说 retryable=false，就不该给 —— 那会把用户
                推进一个必然失败的循环。undefined（无结论）时保持原有行为。 -->

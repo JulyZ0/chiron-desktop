@@ -152,4 +152,55 @@ export default {
 
   run_mode_wipe_verify_unavailable: "当前环境下无法完成身份验证（断网或域控不可达）。请联网后重试，或按下方路径手动删除数据目录。",
   run_mode_wipe_offline_hint: "若本机处于离线 / 隔离网络且无法验证账户密码，可退出应用后手动删除下方显示的数据目录。效果与清空相同。",
+
+  // ── 执行隔离（本机沙箱档位）──
+  // 措辞原则：说清楚"挡得住什么、挡不住什么"。用户看到的是真实强度，
+  // 不是一个听起来很安全的档位名字。
+  isolation_title: "执行隔离",
+  isolation_intro: "工具在本机执行时受到的约束强度。档位可随时切换，切换只影响之后启动的进程。",
+  isolation_current: "当前生效",
+  isolation_temp_applied: "（本次运行临时生效，重启后回到配置值）",
+  isolation_degraded_title: "已降级",
+  isolation_degraded_body: "配置请求「{requested}」，本机实际生效「{effective}」。原因：",
+  isolation_below_floor_title: "低于安全底线",
+  isolation_below_floor_body:
+    "当前生效档位低于底线，工具执行会被拒绝。这是预期行为 —— 隔离不可用时宁可拒绝执行，也不退回进程内直跑。请在下方选择一个不低于底线的档位。",
+  isolation_below_floor_hint: "此档位低于安全底线（{floor}），不可选。",
+  isolation_floor_note: "安全底线：{floor}。低于该档位的选择会被自动抬升到底线，不会被静默接受。",
+  isolation_floor_badge: "底线",
+  isolation_active_badge: "生效中",
+  isolation_pick: "选择档位",
+
+  isolation_level_none: "无隔离",
+  isolation_level_none_desc: "工具与主进程同权限直跑。**不提供任何边界**，仅用于排障。",
+  isolation_level_job: "作业对象",
+  isolation_level_job_desc: "限制进程树与资源，可在超时或撤销时整组结束。不限制文件与网络访问。",
+  isolation_level_low_il: "低完整性",
+  isolation_level_low_il_desc:
+    "Windows 低完整性级别：对用户配置文件、凭据等位置的写入被拒绝。可读取同用户文件，挡不住读取。",
+  isolation_level_appcontainer: "应用容器",
+  isolation_level_appcontainer_desc:
+    "最强档位：独立容器身份，文件与网络按授权放行。需要管理员权限预置容器配置，部分环境不可用。",
+
+  isolation_reset: "恢复为配置值",
+  isolation_reset_hint: "只撤销本次运行内的临时切换，不写配置文件，重启后自然恢复。",
+  isolation_reset_done: "已恢复为配置值（当前生效：{level}）。",
+  isolation_reset_noop: "当前没有临时切换，已是配置值。",
+  isolation_reset_failed: "恢复配置值失败。",
+
+  isolation_revoke_title: "清除隔离痕迹",
+  isolation_revoke_body:
+    "删除本机为隔离创建的系统对象：应用容器配置、目录授权、以及工作区上的低完整性标签。不清理会让工作区长期处于低标签状态，影响后续未隔离的使用。",
+  isolation_revoke_button: "清除隔离痕迹",
+  isolation_revoke_confirm: "确认清除本机隔离痕迹？正在运行的隔离进程不受影响。",
+  isolation_revoke_done: "隔离痕迹已清除。",
+  isolation_revoke_partial: "部分痕迹未能清除，请查看详情：{detail}",
+  isolation_revoke_failed: "清除隔离痕迹失败。",
+
+  isolation_load_failed: "读取隔离档位失败。",
+  isolation_changed: "已切换到「{level}」。",
+  isolation_raised_to_floor: "请求「{requested}」低于底线，已自动提升为「{effective}」。",
+  isolation_running_unaffected: "已在运行的进程沿用原档位，新启动的进程使用新档位。",
+  isolation_change_failed: "切换档位失败。",
+  isolation_change_reason: "用户在设置页切换隔离档位",
 }

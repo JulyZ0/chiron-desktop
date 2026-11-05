@@ -152,4 +152,55 @@ export default {
 
   run_mode_wipe_verify_unavailable: "Identity verification cannot complete in this environment (offline, or the domain controller is unreachable). Reconnect and retry, or delete the data directory manually using the path below.",
   run_mode_wipe_offline_hint: "If this machine is offline / on an isolated network and the account password cannot be verified, quit the app and delete the data directory shown below. The effect is identical.",
+
+  // ── Execution isolation (on-device sandbox tiers) ──
+  // Wording rule: state what a tier blocks *and* what it does not. The user should
+  // see the real strength, not a reassuring name.
+  isolation_title: "Execution isolation",
+  isolation_intro: "How tightly tools are constrained when they run on this machine. The tier can be switched at any time; a switch only affects processes started afterwards.",
+  isolation_current: "Currently effective",
+  isolation_temp_applied: "(temporary for this run; reverts to the configured value on restart)",
+  isolation_degraded_title: "Degraded",
+  isolation_degraded_body: "Configured \"{requested}\", actually effective on this machine: \"{effective}\". Reasons:",
+  isolation_below_floor_title: "Below the safety floor",
+  isolation_below_floor_body:
+    "The effective tier is below the floor, so tool execution will be refused. That is intended behaviour: when isolation is unavailable we refuse to run rather than silently falling back to in-process execution. Pick a tier at or above the floor below.",
+  isolation_below_floor_hint: "This tier is below the safety floor ({floor}) and cannot be selected.",
+  isolation_floor_note: "Safety floor: {floor}. Selections below it are raised to the floor rather than accepted silently.",
+  isolation_floor_badge: "Floor",
+  isolation_active_badge: "Active",
+  isolation_pick: "Choose a tier",
+
+  isolation_level_none: "No isolation",
+  isolation_level_none_desc: "Tools run with the same privileges as the main process. **Provides no boundary at all**; for troubleshooting only.",
+  isolation_level_job: "Job object",
+  isolation_level_job_desc: "Limits the process tree and resources so a timeout or revoke can end the whole group. Does not restrict file or network access.",
+  isolation_level_low_il: "Low integrity",
+  isolation_level_low_il_desc:
+    "Windows low integrity level: writes to the user profile, credential stores and similar locations are denied. Files owned by the same user can still be read — it does not block reads.",
+  isolation_level_appcontainer: "App container",
+  isolation_level_appcontainer_desc:
+    "Strongest tier: its own container identity, with file and network access granted per-capability. Requires administrator rights to provision the container profile; unavailable in some environments.",
+
+  isolation_reset: "Reset to configured value",
+  isolation_reset_hint: "Only undoes the temporary switch made during this run. Nothing is written to the config file, so a restart restores it anyway.",
+  isolation_reset_done: "Reset to the configured value (now effective: {level}).",
+  isolation_reset_noop: "No temporary switch is active; already using the configured value.",
+  isolation_reset_failed: "Failed to reset to the configured value.",
+
+  isolation_revoke_title: "Remove isolation artifacts",
+  isolation_revoke_body:
+    "Deletes the system objects created for isolation on this machine: the app container profile, directory grants, and the low-integrity label on the workspace. Leaving them behind keeps the workspace low-labelled, which affects later unisolated use.",
+  isolation_revoke_button: "Remove isolation artifacts",
+  isolation_revoke_confirm: "Remove the on-device isolation artifacts? Running isolated processes are unaffected.",
+  isolation_revoke_done: "Isolation artifacts removed.",
+  isolation_revoke_partial: "Some artifacts could not be removed; see details: {detail}",
+  isolation_revoke_failed: "Failed to remove isolation artifacts.",
+
+  isolation_load_failed: "Failed to read the isolation tier.",
+  isolation_changed: "Switched to \"{level}\".",
+  isolation_raised_to_floor: "\"{requested}\" is below the floor, so it was raised to \"{effective}\".",
+  isolation_running_unaffected: "Processes already running keep the previous tier; newly started processes use the new one.",
+  isolation_change_failed: "Failed to switch the tier.",
+  isolation_change_reason: "User switched the isolation tier in settings",
 }

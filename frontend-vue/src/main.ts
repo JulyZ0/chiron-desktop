@@ -13,6 +13,11 @@ import { api } from './api'
 import { useAuthStore } from './stores/auth'
 import { i18n, applyDocumentLocale } from './i18n'
 import { installLocaleSync } from './utils/localeSync'
+import { syncDevAuthBypassFromUrl } from './stores/device'
+
+// 开发环境登录绕过：URL 参数（`?devAuthBypass=1`）必须先落到 localStorage，
+// 否则首帧的模式/登录态判定读到的还是旧值。生产构建里这个函数是空操作。
+syncDevAuthBypassFromUrl()
 
 // 首屏语言与书写方向必须在 mount 前落到 <html lang/dir>：否则 RTL 语言会先按 LTR
 // 渲染再跳变（可见的重排闪烁）。

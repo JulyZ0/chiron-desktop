@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import enum
+import json
 import logging
 import os
 import sys
@@ -66,6 +67,20 @@ _ORDER = [Level.NONE, Level.JOB, Level.LOW_IL, Level.APPCONTAINER]
 #: 非 Windows 上自然退化为 `none`（POSIX 继续走 setrlimit）。
 DEFAULT_LEVEL = Level.LOW_IL
 
+#: **硬底线**：Windows 上实际生效的档位不得低于此值。
+#:
+#: 与 `DEFAULT_LEVEL` 的区别很关键：默认值可以被配置改掉，底线**不能**。
+#: `SANDBOX_ISOLATION_ALLOW_DOWNGRADE=true` 的语义是"接受稍弱但仍存在的隔离"，
+#: 不是"关掉隔离"。把这两件事分开，是因为一个布尔开关不该有能力抹掉 README 里
+#: 「执行隔离是默认值 / 沙箱不可用时拒绝启动」这条承诺。
+#:
+#: 为什么底线选 `low_il` 而不是 `job`：实测（零提权）`job` 只能拦内存爆炸，
+#: 挡不住写用户目录；`low_il` 是**当前这台机器上唯一既零提权又真能挡写**的档位。
+#: 定在 `job` 等于允许"看起来有隔离"的不隔离。
+#:
+#: 非 Windows 不受此限：Linux 侧保持既有 local 实现（POSIX 走 setrlimit）。
+FLOOR_LEVEL = Level.LOW_IL
+
 
 def parse_level(value: str | None, *, default: Level = DEFAULT_LEVEL) -> Level:
     """把配置值解析成 `Level`。**拼错就报错**，不猜 —— 见 `deps.verify_sandbox_backend`。"""
@@ -80,7 +95,14 @@ def parse_level(value: str | None, *, default: Level = DEFAULT_LEVEL) -> Level:
 
 
 def configured_level() -> Level:
-    """读配置（env 优先，其次 settings），供执行层调用。"""
+    """读配置。优先级：**运行时覆盖 > env > settings > 默认**。
+
+    运行时覆盖放最前，是为了让 ``PUT /v1/system/isolation`` 能立即生效 ——
+    它只在进程内改，不写 .env，所以重启即恢复原值（这正是"随时可撤销"的实现方式：
+    撤销不需要磁盘状态一致，只需要清掉内存变量）。
+    """
+    if _runtime_override is not None:
+        return _runtime_override
     raw = os.getenv(LEVEL_ENV)
     if raw:
         try:
@@ -95,6 +117,42 @@ def configured_level() -> Level:
         return parse_level(raw)
     except Exception:  # noqa: BLE001 — 配置不可读时用默认
         return DEFAULT_LEVEL
+
+
+#: 运行时覆盖（进程内，不落盘）。`None` = 未覆盖，按配置走。
+#:
+#: 为什么不写回 .env：写盘会让"改一下试试"变成持久状态，而撤销要同时回滚文件和
+#: 内存。放在内存里，重启即回到配置文件的值 —— 撤销是免费且必然成功的。
+_runtime_override: Level | None = None
+
+
+def runtime_override() -> Level | None:
+    """当前运行时覆盖值（None = 没有覆盖）。供前端显示"这是临时改动"。"""
+    return _runtime_override
+
+
+def set_runtime_level(level: Level) -> Level | None:
+    """设置运行时档位，返回**被替换掉的旧覆盖值**（供撤销）。
+
+    低于 ``FLOOR_LEVEL`` 的请求在 Windows 上会被抬到底线 —— 这里不抬，
+    因为 ``resolve_level`` 已经统一处理；本函数只负责"记住用户想要什么"，
+    让 ``status()`` 能显示"请求 none、实际 low_il"这段差异。
+    """
+    global _runtime_override
+    previous = _runtime_override
+    _runtime_override = level
+    logger.info("isolation level overridden at runtime: %s -> %s", previous, level)
+    return previous
+
+
+def clear_runtime_level() -> Level | None:
+    """撤销运行时覆盖，返回撤销前的值（None 表示本来就没有覆盖）。"""
+    global _runtime_override
+    previous = _runtime_override
+    _runtime_override = None
+    if previous is not None:
+        logger.info("isolation level runtime override cleared (was %s)", previous)
+    return previous
 
 
 def downgrade_allowed() -> bool:
@@ -118,6 +176,9 @@ class IsolationDecision:
     requested: Level
     effective: Level
     reasons: list[str] = field(default_factory=list)
+    #: 实际档位是否**低于硬底线**（`FLOOR_LEVEL`）。低于底线时**任何配置都不能放行**：
+    #: `allow_downgrade` 管的是"接受稍弱"，不是"接受没有"。
+    below_floor: bool = False
 
     @property
     def degraded(self) -> bool:
@@ -134,21 +195,34 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
     """把"请求的档位"落到"本机真能提供的档位"。
 
     **不静默降级**：降级时 `reasons` 必非空，调用方据此告警或拒绝执行。
+
+    两条不同的约束，别混为一谈：
+
+    * 请求值**低于** `FLOOR_LEVEL`（显式要 `none`/`job`）⇒ Windows 上按底线执行，
+      并在 `reasons` 说明。这是"配置改不动底线"。
+    * 本机机制缺失导致实际档位**落到** `FLOOR_LEVEL` 以下 ⇒ 标记 `below_floor`，
+      `require_or_raise` 会拒绝执行，**不看** `allow_downgrade`。
     """
     want = requested or configured_level()
     reasons: list[str] = []
 
     if not win.IS_WINDOWS:
+        # Linux 侧保持既有 local 实现（POSIX 走 setrlimit），不受硬底线约束。
         return IsolationDecision(want, Level.NONE, ["非 Windows 平台；POSIX 走 setrlimit"])
+
+    # ① 请求值不得低于底线：显式写 `none` 也不能真的关掉隔离。
+    if want.rank < FLOOR_LEVEL.rank:
+        reasons.append(f"请求档位 {want.value} 低于底线 {FLOOR_LEVEL.value}，按底线执行")
+        want = FLOOR_LEVEL
 
     # Job Object 是所有高于 none 的档位共同的地基
     if want.rank >= Level.JOB.rank and not _probe_job():
         reasons.append("Job Object 不可用")
-        return IsolationDecision(want, Level.NONE, reasons)
+        return IsolationDecision(want, Level.NONE, reasons, below_floor=True)
 
     if want.rank >= Level.LOW_IL.rank and not _probe_low_il():
         reasons.append("Low 完整性级别不可设置")
-        return IsolationDecision(want, Level.JOB, reasons)
+        return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
 
     # Low IL 生效的**必需前置**：工作区必须打 Low 完整性标签。
     #
@@ -160,7 +234,7 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
         labeled, lerr = _ensure_workspace_low_label(ws)
         if not labeled:
             reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
-            return IsolationDecision(want, Level.JOB, reasons)
+            return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
 
     if want is Level.APPCONTAINER:
         ok, sid, err = win.ensure_appcontainer(win.appcontainer_name("default"))
@@ -173,7 +247,7 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
             reasons.append(f"AppContainer 路径授权失败: {gerr}")
             return IsolationDecision(want, Level.LOW_IL, reasons)
 
-    return IsolationDecision(want, want, [])
+    return IsolationDecision(want, want, reasons)
 
 
 _job_ok: bool | None = None
@@ -308,16 +382,76 @@ def wrap_async_process(proc: Any, decision: IsolationDecision) -> win.JobObject 
 
 
 def require_or_raise(decision: IsolationDecision) -> None:
-    """fail-closed 帮手：降级且未显式允许时抛错。
+    """fail-closed 帮手：降级未获同意、或落到硬底线以下时抛错。
 
     与 `local_env_profile.adapt()` 的旧行为正相反 —— 那边是"悄悄改成 local 继续跑"，
     这边是"降级必须经你同意"。
+
+    **两种拒绝，别混为一谈**：
+
+    * `below_floor=True`：本机拿不出底线档位（如 Low IL 不可设置）。这**不看**
+      `allow_downgrade` —— 那个开关的语义是"接受稍弱"，不是"接受没有"。降到这里
+      等于没有隔离，而 README 承诺的是"沙箱不可用时拒绝启动"。
+    * 普通 `degraded` 且未允许：`appcontainer → low_il` 这类，可经配置放行。
     """
+    if decision.below_floor:
+        raise RuntimeError(
+            f"拒绝在没有隔离的档位下执行（硬底线 {FLOOR_LEVEL.value}）：{decision.describe()}。"
+            "这一档不受 SANDBOX_ISOLATION_ALLOW_DOWNGRADE 影响 —— 该开关只放宽"
+            "「稍弱的隔离」，不放宽「没有隔离」。修好机制后重启引擎。"
+        )
     if decision.degraded and not downgrade_allowed():
         raise RuntimeError(
             f"拒绝在未达标的隔离下执行：{decision.describe()}。"
             f"修好机制，或显式设 {ALLOW_DOWNGRADE_ENV}=true 表示接受降级。"
         )
+
+
+def record_level_change(
+    *,
+    action: str,
+    requested: str,
+    effective: str,
+    previous: str | None,
+    actor: str = "",
+    reason: str = "",
+) -> None:
+    """记一条档位变更流水到 `logs/isolation_audit.jsonl`（**永不抛异常**）。
+
+    与 `app/plugins/audit.py` 同款契约：审计是安全能力，落盘失败只告警，
+    绝不让"记不上账"变成"改不了档位"。但如果**记不上**，日志里会留下 warning，
+    所以不会静默丢失。
+
+    记什么、不记什么：只记档位与调用者，不记任何路径或凭据 —— 审计文件本身
+    不该成为泄露源。`previous` 为 None 表示"之前没有覆盖"（即走配置文件）。
+    """
+    try:
+        from pathlib import Path
+
+        from app.audit_log import utc_timestamp
+
+        log_dir = Path("logs")
+        try:
+            from app.config import settings
+
+            log_dir = Path(getattr(settings, "log_dir", "") or "logs")
+        except Exception:  # noqa: BLE001 — 配置不可读则用默认目录
+            pass
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": utc_timestamp(),
+            "action": action,
+            "requested": requested,
+            "effective": effective,
+            "previous": previous,
+            "actor": actor,
+            "reason": reason,
+        }
+        with (log_dir / "isolation_audit.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — 审计失败不影响档位变更
+        logger.warning("isolation audit log write failed", exc_info=True)
 
 
 def status() -> dict[str, Any]:
@@ -329,8 +463,12 @@ def status() -> dict[str, Any]:
         "requested": want.value,
         "effective": decision.effective.value,
         "degraded": decision.degraded,
+        "floor": FLOOR_LEVEL.value,
+        "below_floor": decision.below_floor,
         "reasons": decision.reasons,
         "downgrade_allowed": downgrade_allowed(),
+        #: 前端据此决定选项卡是否置灰：低于底线的档位在 Windows 上不可选。
+        "selectable": [lv.value for lv in _ORDER if not win.IS_WINDOWS or lv.rank >= FLOOR_LEVEL.rank],
         "capabilities": caps,
         "appcontainer_name": win.appcontainer_name("default"),
         "appcontainer_workspace": appcontainer_workspace(),
@@ -369,16 +507,21 @@ def revoke_all() -> dict[str, Any]:
 __all__ = [
     "ALLOW_DOWNGRADE_ENV",
     "DEFAULT_LEVEL",
+    "FLOOR_LEVEL",
     "LEVEL_ENV",
     "IsolationDecision",
     "Level",
     "apply_in_child",
+    "clear_runtime_level",
     "configured_level",
     "downgrade_allowed",
     "parse_level",
+    "record_level_change",
     "require_or_raise",
     "resolve_level",
     "revoke_all",
+    "runtime_override",
+    "set_runtime_level",
     "spawn_kwargs",
     "status",
     "wrap_async_process",

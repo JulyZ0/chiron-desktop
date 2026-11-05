@@ -96,6 +96,41 @@ class MCPTool:
     input_schema: dict[str, Any]
     server_name: str
     local_name: str  # Original tool name on the server
+    #: 服务器在 `tools/list` 里声明的 annotations（MCP 规范）：
+    #: `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`。
+    #: 保留原始字典而不是拆成字段 —— 规范还在演进，丢掉未知键就无法在调用阶段
+    #: 做新增维度的判定。
+    annotations: dict[str, Any] = field(default_factory=dict)
+
+
+def is_tool_denied(server: ServerDef, local_name: str) -> bool:
+    """该工具是否被 `deny_tools` 策略拒绝。**注册与调用两处共用这一个判定**。
+
+    为什么要抽出来：如果注册阶段按一套规则过滤、调用阶段另写一套，两者迟早漂移，
+    而漂移的表现是"看起来注册了却调不通"或更糟的"看起来拦了却调得通"。规则只能
+    有**一处**事实来源。
+
+    deny 匹配要容忍两种写法：服务器可能返回裸名（`field_report`），也可能自带
+    命名空间前缀（XERJ 返回的是 `xerj_field_report`）。只按裸名匹配会漏掉后者。
+    """
+    prefix = f"{server.name}_"
+    bare = local_name[len(prefix) :] if local_name.startswith(prefix) else local_name
+    return local_name in server.deny_tools or bare in server.deny_tools
+
+
+def is_tool_destructive(tool: MCPTool) -> bool:
+    """工具是否声明为破坏性。
+
+    **缺省视为破坏性**（fail-closed）：没声明 `readOnlyHint: true` 的工具一律按
+    可能写东西对待。MCP 的 annotations 是自述，服务器可以不填；把"没说"当成
+    "安全"就是把边界交给对方决定。
+    """
+    annotations = tool.annotations or {}
+    if annotations.get("readOnlyHint") is True:
+        return False
+    if annotations.get("destructiveHint") is True:
+        return True
+    return True
 
 
 class HTTPSSEConnection:
@@ -373,28 +408,28 @@ class MCPClient:
         """Register tools from a server response.
 
         - ``deny_tools`` 命中的工具**根本不注册**（不是"隐藏"）：用于剔除出站写操作。
+          判定与调用阶段共用 ``is_tool_denied``，避免两处规则漂移。
         - 命名空间前缀去重：工具的本地名已带 ``{server.name}_`` 前缀时不再叠加，
           否则 XERJ 会得到 ``xerj_xerj_code_search`` 这种双前缀。
+        - ``annotations`` 原样保留：调用阶段要靠 ``readOnlyHint`` 判断破坏性。
         """
         prefix = f"{server.name}_"
         for i, t in enumerate(raw_tools):
             local_name = t.get("name", f"unnamed_{i}")
-            # deny 匹配要容忍两种写法：服务器可能返回裸名（`field_report`），
-            # 也可能自带命名空间前缀（XERJ 返回的是 `xerj_field_report`）。
-            # 只按裸名匹配会漏掉后者 —— 实测就是漏了，出站工具照样被注册。
-            bare = local_name[len(prefix) :] if local_name.startswith(prefix) else local_name
-            if local_name in server.deny_tools or bare in server.deny_tools:
+            if is_tool_denied(server, local_name):
                 logger.info(
                     "MCP tool skipped: %s (denied by %s policy)", local_name, server.name
                 )
                 continue
             namespaced = local_name if local_name.startswith(prefix) else f"{prefix}{local_name}"
+            raw_annotations = t.get("annotations")
             tool = MCPTool(
                 name=namespaced,
                 description=t.get("description", ""),
                 input_schema=t.get("inputSchema", {}),
                 server_name=server.name,
                 local_name=local_name,
+                annotations=raw_annotations if isinstance(raw_annotations, dict) else {},
             )
             self._tools.append(tool)
             logger.info("MCP tool discovered: %s (%s)", tool.name, server.name)
@@ -411,6 +446,19 @@ class MCPClient:
         本地名以**注册时登记的映射**为准，而不是从 ``{server}_{...}`` 反推前缀：
         去重后 ``xerj_code_search`` 的本地名仍是 ``xerj_code_search``（不是 ``code_search``），
         按前缀截断会把名字截错，服务器侧必然报 unknown tool。
+
+        **调用阶段的第二道过滤**（注册阶段已经剔除过 deny_tools，这里是复查）：
+
+        1. ``is_tool_denied`` 再算一次 —— 工具条目可能来自更早的一次注册，
+           期间 server 的 deny 策略被配置热重载改严；只在注册时判一次，
+           改严之后旧条目仍然可调。
+        2. ``read_only`` 的 server 上出现**显式声明破坏性**的工具 ⇒ 拒绝。
+           这是自相矛盾：部署者声明"这个 server 只读"，服务器却说"这工具会写"。
+           两者不能都信，也不能挑软的 —— fail-closed，拒绝并留痕。
+        3. 未声明 ``readOnlyHint`` 的工具**照常执行**，但返回体里带上
+           ``annotations`` 与 ``destructive`` 标记，让上游（确认卡片 / 审计）
+           自己决定要不要拦。不在这里一刀切拒绝：多数 MCP 服务器根本不填
+           annotations，全拒会让插件体系整体不可用。
         """
         for tool in self._tools:
             if tool.name != tool_name:
@@ -418,6 +466,41 @@ class MCPClient:
             server = next((s for s in self._servers if s.name == tool.server_name), None)
             if server is None:
                 return {"error": f"MCP server {tool.server_name} not configured"}
+
+            # 第二道：deny 策略复查（配置可能在注册之后改严）
+            if is_tool_denied(server, tool.local_name):
+                logger.warning(
+                    "MCP tool call refused: %s (denied by %s policy)", tool.local_name, server.name
+                )
+                return {
+                    "error": f"Tool {tool_name} is denied by the {server.name} policy",
+                    "denied": True,
+                }
+
+            # 第二道：只读 server 与破坏性自述矛盾 ⇒ 拒绝并留痕
+            if server.read_only and is_tool_destructive(tool):
+                annotations = tool.annotations or {}
+                if annotations.get("destructiveHint") is True:
+                    logger.error(
+                        "MCP tool call refused: %s declares destructiveHint but server %s "
+                        "is declared read-only — contradictory declarations",
+                        tool.local_name,
+                        server.name,
+                    )
+                    return {
+                        "error": (
+                            f"Tool {tool_name} declares destructiveHint but server "
+                            f"'{server.name}' is declared read-only; refusing to call"
+                        ),
+                        "denied": True,
+                    }
+                # 只是"没说"，不是"说会写"：放行但标注，交上游处置
+                logger.info(
+                    "MCP tool %s/%s has no readOnlyHint; proceeding with annotation flag",
+                    server.name,
+                    tool.local_name,
+                )
+
             conn = self._conns.get(tool.server_name)
             if not conn:
                 return {"error": f"MCP server {tool.server_name} not connected"}
@@ -426,6 +509,26 @@ class MCPClient:
                 {"name": tool.local_name, "arguments": arguments},
             )
         return {"error": f"Tool {tool_name} not found on any MCP server"}
+
+    def annotations_for(self, tool_name: str) -> dict[str, Any]:
+        """该工具的自述注解，附上引擎推断出的 ``destructive``。
+
+        用途是让上层（确认卡片 / 审计 / use_capability）知道"这个工具会不会写东西"。
+        **不塞进 ``call_tool`` 的返回体** —— 那是 MCP 协议响应，往里加字段等于伪造
+        协议内容，而且会让所有既有调用方拿到的形状凭空多一个键。
+
+        没找到该工具时返回空字典：调用方据此按"未知"处理，而不是"安全"。
+        """
+        for tool in self._tools:
+            if tool.name != tool_name:
+                continue
+            destructive = is_tool_destructive(tool)
+            return {
+                **(tool.annotations or {}),
+                "destructive": destructive,
+                "readOnlyHint": not destructive,
+            }
+        return {}
 
     async def close(self) -> None:
         """Shut down all MCP server connections."""

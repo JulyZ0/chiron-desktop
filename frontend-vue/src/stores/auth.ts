@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { api, desktopDeviceToken, loadDesktopToken, setAuthToken } from '../api'
 import { clearPrivateStorage } from '../utils/privateStorage'
-import { useDeviceStore } from './device'
+import { useDeviceStore, isDevAuthBypassEnabled, devAuthCredentials } from './device'
 import { applyServerLocale } from '../utils/localeSync'
 
 export interface User {
@@ -87,6 +87,40 @@ export const useAuthStore = defineStore('auth', () => {
           void ensureLocalSession()
           return
         }
+        // 开发环境绕过：浏览器直连 vite 时既没有 preload、也没有登录页。
+        // 只放宽 `isAuthenticated` 是不够的 —— 业务请求照样 401，页面全是空数据
+        // （上一版就是这样：每个请求都 401、每页弹十几条"登录已失效"）。
+        // 这里用 `.env.local` 里的开发凭据**真登录一次**，拿到真 token。
+        if (isDevAuthBypassEnabled()) {
+          const creds = devAuthCredentials()
+          if (!creds) {
+            console.warn(
+              '[dev-auth-bypass] 已开启绕过，但未配置 VITE_DEV_AUTH_EMAIL / '
+              + 'VITE_DEV_AUTH_PASSWORD（写进 frontend-vue/.env.local，该文件不进版本库）。'
+              + '页面会因 401 显示空数据。',
+            )
+            return
+          }
+          // 超时上限：后端没起时若等 axios 默认的 30s，首屏会白屏半分钟。
+          // 超时后登录仍在后台继续 —— 成功的话 token 稍后落地，后续请求照样带得上。
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const loginPromise = login(creds.email, creds.password)
+          // 竞速结束后这两条 promise 仍可能 settle：各自挂空 catch，避免
+          // unhandled rejection 把控制台刷满真错误。
+          loginPromise.catch(() => {})
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('dev auto-login timeout (5s)')), 5000)
+          })
+          timeoutPromise.catch(() => {})
+          try {
+            await Promise.race([loginPromise, timeoutPromise])
+          } catch (err) {
+            // 后端没起 / 凭据过期时只记录，不阻塞挂载：绕过模式下守卫已放宽，
+            // 界面仍可进入，只是数据为空。
+            console.warn('[dev-auth-bypass] 开发账号自动登录失败：', err)
+          }
+          return
+        }
         const stored = await loadDesktopToken()
         if (stored) applyToken(stored)
       })()
@@ -125,9 +159,20 @@ export const useAuthStore = defineStore('auth', () => {
 
   // 本地模式：没有"登录"这回事，界面一律视为已登录（否则每个 requiresAuth 页都会弹回登录页，
   // 而登录页本身在本地模式是被拦截的云专属路由）。
-  const isAuthenticated = computed(() => (isLocalMode() ? true : !!user.value))
+  //
+  // 开发环境绕过（DEV only）：浏览器直连 vite 时没有 preload，模式只能判成 cloud，
+  // 于是没登录态就进不去任何 requiresAuth 页。`isDevAuthBypassEnabled()` 在生产构建里
+  // 恒为 false（编译期 DCE），这里只是让它把"已登录"这条判断放宽一层。
+  const isAuthenticated = computed(() =>
+    isLocalMode() || isDevAuthBypassEnabled() ? true : !!user.value,
+  )
   // S 修复：owner 角色拥有全部 admin 权限，isAdmin 须同时识别 admin + owner
-  const isAdmin = computed(() => user.value?.role === 'admin' || user.value?.role === 'owner')
+  //
+  // 开发环境绕过：没有登录态时 role 恒为 undefined，`/models`、审计等 admin 页
+  // 会被守卫弹回首页。绕过标志位开启时视同 admin —— 它只在 DEV 构建里可能为 true。
+  const isAdmin = computed(() =>
+    isDevAuthBypassEnabled() || user.value?.role === 'admin' || user.value?.role === 'owner',
+  )
 
   async function login(email: string, password: string, captcha?: { token: string; randstr?: string }) {
     loading.value = true

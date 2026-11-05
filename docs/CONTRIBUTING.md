@@ -1,4 +1,15 @@
 
+## 开发环境登录标志位
+
+根因：浏览器直连 `vite`（`:5173`）时没有 Electron preload，`resolveDeviceMode()` 只能判成 `cloud`；而 cloud 模式的 `isAuthenticated` 要求 `user` 非空，401 拦截器还会清登录态并跳回首页——所以页面根本进不去。
+
+**开启方式（任选其一）**
+```
+http://localhost:5173/?devAuthBypass=1     # URL 参数，写入 localStorage 持久生效
+VITE_DEV_AUTH_BYPASS=1                     # 环境变量
+localStorage.setItem('chiron.dev.auth-bypass', '1')
+```
+**撤销**：`?devAuthBypass=0`，或控制台 `__chironDisableAuthBypass()` 后刷新。
 ## 快速开始
 
 ```bash

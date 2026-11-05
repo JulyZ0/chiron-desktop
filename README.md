@@ -13,13 +13,21 @@
 - **执行隔离是默认值**：工具执行下沉到受限容器；沙箱不可用时**拒绝启动**，不偷偷回退到进程内执行
 - **过程可见**：思考、工具调用、本地用量统计、子智能体运行
 
-> **下载最新版** [Chiron](https://github.com/JulyZ0/chiron-desktop/releases)
-
-> **你想要企业化部署？** 请跳转到 [Chiron AI Agent 多租户 SaaS 平台](https://github.com/Athenavi/chiron)
+> **下载 Windows 最新版** [Chiron](https://github.com/JulyZ0/chiron-desktop/releases)
 
 > **开发文档**  [CONTRIBUTING.md](/docs/CONTRIBUTING.md)
 
+> **企业化部署？** [Chiron AI Agent](https://github.com/Athenavi/chiron)
+## 致谢
+感谢如下项目的设计思想或开源代码：
 
+> **deepseek-harness:super-agents** https://www.bilibili.com/opus/1265361021143351318
+
+> **Loop 思想** https://github.com/KKKKhazix/agent-autoloop
+
+> **核心循环 | UI/UX** https://github.com/esengine/DeepSeek-Reasonix
+
+> **会话地图** https://github.com/liangmianya/dsh-synapse
 ## 许可
 
 MIT（见 [LICENSE](LICENSE)）

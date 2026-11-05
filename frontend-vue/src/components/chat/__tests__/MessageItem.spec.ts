@@ -380,22 +380,15 @@ describe('失败消息的可执行动作', () => {
     global: { plugins: [router] },
   })
 
-  it('★ 余额不足给「去充值」入口，点击后落到 /billing', async () => {
-    const router = makeRouter()
-    await router.push('/chat')
-    await router.isReady()
-
-    const wrapper = mountFailed({ errorCode: 'insufficient_credits' }, router)
+  it('余额不足不再给「去充值」：计费页已无充值入口', async () => {
+    const wrapper = mountFailed({ errorCode: 'insufficient_credits' }, makeRouter())
     await settleAsync()
 
-    const action = wrapper.findAll('.retry-btn').find(b => b.text().includes('去充值'))
-    expect(action, '余额不足必须有一个直达充值页的按钮').toBeTruthy()
-
-    await action!.trigger('click')
-    // 导航是异步的（router.push 返回 promise）：只 await nextTick 不够，
-    // 必须 flush 微任务队列才能看到 currentRoute 变化。
-    await flushPromises()
-    expect(router.currentRoute.value.path).toBe('/billing')
+    // 计费页只剩用量明细，跳过去也解决不了余额不足 —— 给一个点了没去处的按钮
+    // 比不给更糟，所以这一分支整体移除。
+    expect(wrapper.findAll('.retry-btn').some(b => b.text().includes('去充值'))).toBe(false)
+    // 但错误横幅仍在：必须让用户看到失败原因，不能静默咽下
+    expect(wrapper.find('.msg-error-banner').exists()).toBe(true)
   })
 
   it('配额耗尽不给「去充值」：要的是找管理员，不是花钱', async () => {
@@ -463,25 +456,17 @@ describe('失败消息的可执行动作', () => {
   //
   // 同一个 403 有两种归因，动作**相反**：套餐不覆盖 → 买了就能用；
   // 租户策略不允许 → 买套餐也没用。给错按钮的代价是让用户白花钱。
-  it('★ 套餐不覆盖 → 给「去购买套餐」，点击后落到套餐页签', async () => {
-    const router = makeRouter()
-    await router.push('/chat')
-    await router.isReady()
-
+  it('模型不覆盖不再给「去购买套餐」：计费页已无套餐页签', async () => {
     const wrapper = mountFailed(
       { errorCode: 'model_not_allowed', errorReason: 'entitlement' },
-      router,
+      makeRouter(),
     )
     await settleAsync()
 
-    const action = wrapper.findAll('.retry-btn').find(b => b.text().includes('去购买套餐'))
-    expect(action, '套餐不覆盖时必须给一个直达套餐页签的入口').toBeTruthy()
-
-    await action!.trigger('click')
-    await flushPromises()
-    expect(router.currentRoute.value.path).toBe('/billing')
-    // 落到套餐页签而不是充值页：买套餐和充值是两件事
-    expect(router.currentRoute.value.query.tab).toBe('packages')
+    // 套餐页签已移除，这个按钮点过去只会落在一个没有套餐的页面上
+    expect(wrapper.findAll('.retry-btn').some(b => b.text().includes('去购买套餐'))).toBe(false)
+    // 但错误横幅仍在：必须让用户看到"用不了"以及原因，不能静默
+    expect(wrapper.find('.msg-error-banner').exists()).toBe(true)
   })
 
   it('租户策略不允许 → 不给「去购买套餐」（买了也没用）', async () => {

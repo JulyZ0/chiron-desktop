@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import {
   DEVICE_MODE_STORAGE_KEY,
+  DEV_AUTH_BYPASS_STORAGE_KEY,
   currentDeviceMode,
+  isDevAuthBypassEnabled,
   setActiveMode,
+  syncDevAuthBypassFromUrl,
   useDeviceStore,
 } from '../device'
 
@@ -127,5 +130,64 @@ describe('device store', () => {
     expect(currentDeviceMode()).toBe('local')
     installHost({ isDesktop: true, apiUrl: '' })
     expect(currentDeviceMode()).toBe('local')
+  })
+})
+
+/**
+ * 开发环境登录绕过标志位。
+ *
+ * 钉住三件事：
+ *   1) 默认**关闭** —— 不加标志位时行为与改造前完全一致；
+ *   2) URL 参数能一次性开启并持久化（刷新后仍生效），`=0` 能关掉；
+ *   3) 绕过只放宽"登录态/管理员"判定，**不**篡改模式判定 —— 否则 api 层会误判成
+ *      local 模式，把请求打到不存在的本地会话端点上。
+ */
+describe('开发环境登录绕过标志位', () => {
+  const clearUrl = () => {
+    // jsdom 的 location.search 可通过 history 改写
+    globalThis.history.replaceState({}, '', '/')
+  }
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    setActiveMode(null)
+    localStorage.clear()
+    clearUrl()
+    installHost(undefined)
+  })
+
+  it('默认关闭：没有标志位时不绕过', () => {
+    expect(isDevAuthBypassEnabled()).toBe(false)
+  })
+
+  it('localStorage 置 1 后开启', () => {
+    localStorage.setItem(DEV_AUTH_BYPASS_STORAGE_KEY, '1')
+    expect(isDevAuthBypassEnabled()).toBe(true)
+  })
+
+  it('URL 参数 ?devAuthBypass=1 开启并写回 localStorage（刷新后仍生效）', () => {
+    globalThis.history.replaceState({}, '', '/?devAuthBypass=1')
+    syncDevAuthBypassFromUrl()
+
+    expect(localStorage.getItem(DEV_AUTH_BYPASS_STORAGE_KEY)).toBe('1')
+    expect(isDevAuthBypassEnabled()).toBe(true)
+  })
+
+  it('URL 参数 ?devAuthBypass=0 可撤销，随即关闭', () => {
+    localStorage.setItem(DEV_AUTH_BYPASS_STORAGE_KEY, '1')
+    expect(isDevAuthBypassEnabled()).toBe(true)
+
+    globalThis.history.replaceState({}, '', '/?devAuthBypass=0')
+    syncDevAuthBypassFromUrl()
+
+    expect(localStorage.getItem(DEV_AUTH_BYPASS_STORAGE_KEY)).toBeNull()
+    expect(isDevAuthBypassEnabled()).toBe(false)
+  })
+
+  it('绕过不改变模式判定：Web 端仍是 cloud', () => {
+    // 若这里退化成 local，api 层会把请求当成"本地会话"处理并触发 501 路径
+    localStorage.setItem(DEV_AUTH_BYPASS_STORAGE_KEY, '1')
+    expect(isDevAuthBypassEnabled()).toBe(true)
+    expect(currentDeviceMode()).toBe('cloud')
   })
 })

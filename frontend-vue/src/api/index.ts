@@ -5,7 +5,7 @@ import { canAutoRetry, readRetryable, resolveResponseWaitMs, shouldRetryResponse
 import type { WorkstationType } from '../types/workstation'
 
 import { t } from '../i18n'
-import { currentDeviceMode, type ChironMode } from '../stores/device'
+import { currentDeviceMode, isDevAuthBypassEnabled, type ChironMode } from '../stores/device'
 /** 桌面壳（Electron）在 preload 里注入 chironDesktop.apiUrl；Web 端回落到构建期变量 */
 type DesktopHost = {
   apiUrl?: string
@@ -527,6 +527,13 @@ api.interceptors.response.use(
     }
 
     if (status === 401) {
+      // 开发环境登录绕过：`?devAuthBypass=1` 会尝试用开发凭据真登录（见 auth.ts
+      // initToken）。真的登录失败时这里**保持静默** —— 绕过模式下守卫已放宽、不会
+      // 跳转，再弹"登录已失效"只会在一个页面并发十几个请求时刷出十几条同样的提示，
+      // 把真实错误盖掉。需要排查时看控制台（initToken 会 warn）。
+      if (isDevAuthBypassEnabled()) {
+        return Promise.reject(error)
+      }
       // 本地模式没有登录页：token 失效只提示，不清本地会话也不跳 /login
       // （跳过去只会落到本地模式下被拦截的云专属路由）。
       if (getDeviceMode() === 'local') {
@@ -999,5 +1006,87 @@ export async function listPaymentChannels(): Promise<PaymentChannel[]> {
   // 兼容 OK() 包装与裸形态（层级取错会静默变成空列表）
   const d = resp.data?.data ?? resp.data
   return Array.isArray(d?.channels) ? d.channels : []
+}
+
+// ── 本机隔离档位（沙箱强度）──
+
+/** 隔离档位，由弱到强。`none` 在这台机器上不会被真正采用（有硬底线）。 */
+export type IsolationLevel = 'none' | 'job' | 'low_il' | 'appcontainer'
+
+/** 单个档位的能力探测结果 */
+export interface IsolationCapabilities {
+  [key: string]: unknown
+}
+
+export interface IsolationStatus {
+  /** 配置里请求的档位 */
+  requested: IsolationLevel
+  /** 本机实际能提供的档位 —— 与 requested 不同就是发生了降级 */
+  effective: IsolationLevel
+  /** 硬底线：有效档位不得低于它 */
+  floor: IsolationLevel
+  /** 生效档位是否已跌破底线（此时执行会被拒绝） */
+  below_floor: boolean
+  /** 降级原因（人类可读，直接展示） */
+  reasons: string[]
+  downgrade_allowed: boolean
+  /** 前端据此置灰：低于底线的档位不可选 */
+  selectable: IsolationLevel[]
+  capabilities: IsolationCapabilities
+  appcontainer_name: string
+  appcontainer_workspace: string
+  /** 运行时覆盖值；null = 按配置文件走 */
+  runtime_override: IsolationLevel | null
+  /** 切换后已在跑的进程是否不受影响（切换只影响后续 spawn） */
+  running_processes_unaffected?: boolean
+  note?: string
+}
+
+function toIsolationStatus(payload: unknown): IsolationStatus {
+  // 网关 OK() 会包一层 data
+  const d = (payload as { data?: IsolationStatus } | undefined)?.data ?? (payload as IsolationStatus)
+  return d
+}
+
+/** 查询当前隔离档位与能力矩阵。 */
+export async function getIsolationStatus(): Promise<IsolationStatus> {
+  const resp = await api.get('/v1/system/isolation')
+  return toIsolationStatus(resp.data)
+}
+
+/**
+ * 切换隔离档位。
+ *
+ * 只在引擎进程内生效，**不写配置文件** —— 所以重启即恢复原值，撤销是免费的。
+ * 传低于底线的档位不会被拒绝，而是被抬到底线并在 `reasons` 里说明。
+ */
+export async function setIsolationLevel(
+  level: IsolationLevel,
+  reason = '',
+): Promise<IsolationStatus> {
+  const resp = await api.put('/v1/system/isolation', { level, reason })
+  return toIsolationStatus(resp.data)
+}
+
+/** 撤销运行时覆盖，回到配置文件的值。幂等。 */
+export async function clearIsolationLevel(): Promise<IsolationStatus & { cleared: string | null }> {
+  const resp = await api.delete('/v1/system/isolation')
+  return toIsolationStatus(resp.data) as IsolationStatus & { cleared: string | null }
+}
+
+/**
+ * 撤销磁盘上的隔离产物：AppContainer profile、路径授权、工作区完整性标签。
+ *
+ * 与 `clearIsolationLevel` 的区别：那个撤销"我改的设置"，这个撤销"我留下的痕迹"。
+ * 不撤销会让工作区目录一直是 Low 完整性标签，影响后续未隔离使用。
+ */
+export async function revokeIsolationArtifacts(): Promise<{
+  ok: boolean
+  appcontainer_profile: string
+  path_grants: Array<{ path: string; removed: boolean; message: string }>
+  integrity_labels: Array<{ path: string; restored_to: string; ok: boolean; message: string }>
+}> {
+  const resp = await api.post('/v1/system/isolation/revoke')
+  return resp.data?.data ?? resp.data
 }
 
