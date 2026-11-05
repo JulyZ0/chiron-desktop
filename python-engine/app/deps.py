@@ -187,6 +187,46 @@ def verify_sandbox_backend() -> None:
     logger.info("Sandbox backend: service at %s (isolated execution)", url)
 
 
+def verify_isolation_level() -> None:
+    """校验 Windows 原生隔离档位（`SANDBOX_ISOLATION_LEVEL`）。
+
+    为什么单独校验：这是**新增的、真正可用的**隔离层。桌面端不会跑容器，所以
+    `SANDBOX_BACKEND=service` 在本机永远只能是降级路径；实际挡住误伤/恶意代码的是
+    这一层（`app/isolation`）。
+
+    三条规则：
+    * 取值拼错 ⇒ 拒绝启动（一个字母之差等于关掉隔离，不能猜）；
+    * 本机做不到请求的档位 ⇒ 除非 `SANDBOX_ISOLATION_ALLOW_DOWNGRADE=true`，否则拒绝；
+    * 降级被允许时，**把实际生效档位打进日志** —— 降级必须可见，不许静默。
+    """
+    from app.isolation import downgrade_allowed, parse_level, resolve_level
+
+    raw = (os.getenv("SANDBOX_ISOLATION_LEVEL") or "").strip()
+    try:
+        requested = parse_level(raw)
+    except ValueError as exc:
+        logger.error("Refusing to start: %s", exc)
+        raise RuntimeError(str(exc)) from exc
+
+    decision = resolve_level(requested)
+    if decision.degraded:
+        msg = (
+            f"隔离档位降级：请求 {decision.requested.value}，实际 {decision.effective.value}"
+            f"（{'；'.join(decision.reasons) or '原因未知'}）"
+        )
+        if not downgrade_allowed():
+            logger.error(
+                "Refusing to start: %s. 修好机制，或显式设 "
+                "SANDBOX_ISOLATION_ALLOW_DOWNGRADE=true 表示接受降级。",
+                msg,
+            )
+            raise RuntimeError(msg)
+        logger.warning("%s —— 已由 SANDBOX_ISOLATION_ALLOW_DOWNGRADE 显式允许", msg)
+        return
+
+    logger.info("执行隔离: %s（Windows 原生机制）", decision.describe())
+
+
 def verify_media_store() -> None:
     """校验媒体存储后端配置 —— 多副本下媒体文件必须对每个副本可见。
 

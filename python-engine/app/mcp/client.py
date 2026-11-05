@@ -58,6 +58,15 @@ class ServerDef:
     #: 连接守卫）：连接凭据（env / url）会留在引擎进程里，而那正是 agent 能读到的地方。
     #: 未声明默认 False —— fail-closed：宁可工具不可用，也不给引擎高权限凭据。
     read_only: bool = False
+    #: 拒绝装载的工具（**服务器本地名**，即 tools/list 返回的 name）。
+    #: 用于剔除出站写操作 —— 典型是 XERJ 的 `field_report` / `corpus_feedback`：
+    #: 它们 `confirm` 默认 true，省略参数就会把内容发往 xerj.org。只读插件不该持有。
+    #: 在内置清单里声明（app/plugins/builtin.py），注册阶段**根本不注册**。
+    deny_tools: frozenset[str] = frozenset()
+    #: 该命令是否来自**部署者受信的内置清单**（app/plugins/builtin.py）。
+    #: 为 True 时跳过用户级 `PLUGIN_COMMAND_ALLOWLIST`（内置命令由清单自身约束），
+    #: 但**仍**要求 command 是裸 basename / 绝对路径（复用 `_command_path_ok`）。
+    builtin: bool = False
 
 
 def assert_server_connectable(server: ServerDef, *, role: str = "engine") -> None:
@@ -295,9 +304,17 @@ class MCPClient:
     async def _connect_stdio(self, server: ServerDef) -> None:
         """Connect to an MCP server via stdio (subprocess)."""
         # 安全修复（P0-S7）：仅允许 PLUGIN_COMMAND_ALLOWLIST 白名单内的命令被拉起
-        from app.tools.ssrf import command_allowed
+        from app.tools.ssrf import _command_path_ok, command_allowed
 
-        if not command_allowed(server.command):
+        if server.builtin:
+            # 内置插件（app/plugins/builtin.py）由**部署者**清单约束，不走用户级白名单 ——
+            # 否则用户不配 PLUGIN_COMMAND_ALLOWLIST 就用不了随应用分发的能力。
+            # 但"从哪跑"的约束一视同仁：仍拒绝相对穿越 / UNC（见 _command_path_ok）。
+            if not _command_path_ok(server.command):
+                raise PermissionError(
+                    f"内置插件命令 {server.command!r} 不是裸 basename 或绝对路径"
+                )
+        elif not command_allowed(server.command):
             raise PermissionError(
                 f"MCP server command {server.command!r} not allowed: "
                 "set PLUGIN_COMMAND_ALLOWLIST (comma-separated basenames) to enable"
@@ -353,14 +370,31 @@ class MCPClient:
         logger.info("MCP server %s connected (stdio): %d tools", server.name, len(raw_tools))
 
     def _register_tools(self, server: ServerDef, raw_tools: list[dict[str, Any]]) -> None:
-        """Register tools from a server response."""
+        """Register tools from a server response.
+
+        - ``deny_tools`` 命中的工具**根本不注册**（不是"隐藏"）：用于剔除出站写操作。
+        - 命名空间前缀去重：工具的本地名已带 ``{server.name}_`` 前缀时不再叠加，
+          否则 XERJ 会得到 ``xerj_xerj_code_search`` 这种双前缀。
+        """
+        prefix = f"{server.name}_"
         for i, t in enumerate(raw_tools):
+            local_name = t.get("name", f"unnamed_{i}")
+            # deny 匹配要容忍两种写法：服务器可能返回裸名（`field_report`），
+            # 也可能自带命名空间前缀（XERJ 返回的是 `xerj_field_report`）。
+            # 只按裸名匹配会漏掉后者 —— 实测就是漏了，出站工具照样被注册。
+            bare = local_name[len(prefix) :] if local_name.startswith(prefix) else local_name
+            if local_name in server.deny_tools or bare in server.deny_tools:
+                logger.info(
+                    "MCP tool skipped: %s (denied by %s policy)", local_name, server.name
+                )
+                continue
+            namespaced = local_name if local_name.startswith(prefix) else f"{prefix}{local_name}"
             tool = MCPTool(
-                name=f"{server.name}_{t.get('name', f'unnamed_{i}')}",
+                name=namespaced,
                 description=t.get("description", ""),
                 input_schema=t.get("inputSchema", {}),
                 server_name=server.name,
-                local_name=t.get("name", f"unnamed_{i}"),
+                local_name=local_name,
             )
             self._tools.append(tool)
             logger.info("MCP tool discovered: %s (%s)", tool.name, server.name)
@@ -372,22 +406,25 @@ class MCPClient:
     async def call_tool(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        """Call a tool on the appropriate MCP server."""
-        for server in self._servers:
-            prefix = f"{server.name}_"
-            if tool_name.startswith(prefix):
-                local_name = tool_name[len(prefix) :]
-                conn = self._conns.get(server.name)
-                if not conn:
-                    return {"error": f"MCP server {server.name} not connected"}
-                result = await conn.send_jsonrpc(
-                    "tools/call",
-                    {
-                        "name": local_name,
-                        "arguments": arguments,
-                    },
-                )
-                return result
+        """Call a tool on the appropriate MCP server.
+
+        本地名以**注册时登记的映射**为准，而不是从 ``{server}_{...}`` 反推前缀：
+        去重后 ``xerj_code_search`` 的本地名仍是 ``xerj_code_search``（不是 ``code_search``），
+        按前缀截断会把名字截错，服务器侧必然报 unknown tool。
+        """
+        for tool in self._tools:
+            if tool.name != tool_name:
+                continue
+            server = next((s for s in self._servers if s.name == tool.server_name), None)
+            if server is None:
+                return {"error": f"MCP server {tool.server_name} not configured"}
+            conn = self._conns.get(tool.server_name)
+            if not conn:
+                return {"error": f"MCP server {tool.server_name} not connected"}
+            return await conn.send_jsonrpc(
+                "tools/call",
+                {"name": tool.local_name, "arguments": arguments},
+            )
         return {"error": f"Tool {tool_name} not found on any MCP server"}
 
     async def close(self) -> None:
@@ -421,6 +458,11 @@ async def load_mcp_config(config_path: str) -> list[ServerDef]:
                 env=s.get("env", {}),
                 transport=s.get("transport", "stdio"),
                 url=s.get("url", ""),
+                # 之前漏了这一行：`ServerDef.read_only` 默认 False（fail-closed），而
+                # `assert_server_connectable()` 只放行 read_only 的 server ⇒ **任何**
+                # 插件都会被引擎拒连，配置里写 `"read_only": true` 也不生效。
+                # 表现是 `MCP connect xerj failed: not declared read-only`。
+                read_only=bool(s.get("read_only", False)),
             )
         )
     return servers

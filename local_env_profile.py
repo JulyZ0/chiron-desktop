@@ -208,15 +208,25 @@ def adapt(env: dict[str, str]) -> list[str]:
                 env["REDIS_PASSWORD"] = ""
                 notes.append("REDIS_PASSWORD: 目标 Redis 未启用认证 → 已清空（否则 AUTH 必被拒）")
 
-    # ③ sandbox：后端是 service 且服务不可达 ⇒ 单机开发退回进程内隔离。
+    # ③ sandbox：后端是 service 且服务不可达 ⇒ **不再自动退回进程内**。
+    #
+    # 这里曾经是 `env["SANDBOX_BACKEND"] = "local"`。它让 README 的「沙箱不可用时
+    # 拒绝启动，不偷偷回退」彻底失真：`run.py start` 一路绿灯，引擎却带着
+    # `SANDBOX_BACKEND=local` 起在进程内（实测见 logs/python-engine.stderr.log 首行），
+    # 而真正的门禁 `_apply_sandbox_service_branch()` 因为读到 `local` 直接恒等返回、
+    # 连 warning 都不打。
+    #
+    # 现在只**报告**不可达，由引擎自己 fail-closed；桌面端真正的隔离由
+    # `app/isolation`（Windows 原生：Job Object / Low IL / AppContainer）承担。
+    # 要显式退出隔离，用户必须自己写 `SANDBOX_BACKEND=local`。
     backend = (env.get("SANDBOX_BACKEND", "") or "service").lower()
     if backend == "service":
         url = env.get("SANDBOX_SERVICE_URL", "") or "http://sandbox-service:8001"
         host, port = _split_host_port(url)
         if host and port and not _tcp_reachable(host, port):
-            env["SANDBOX_BACKEND"] = "local"
             notes.append(
-                "SANDBOX_BACKEND: service 不可达 → local（仅限单机开发；多副本部署必须修好 sandbox 服务）"
+                f"SANDBOX_BACKEND=service 但 {host}:{port} 不可达 —— 未改写为 local"
+                "（引擎会按 fail-closed 自行处理；桌面端隔离由 SANDBOX_ISOLATION_LEVEL 承担）"
             )
 
     return notes

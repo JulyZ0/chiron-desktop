@@ -127,7 +127,16 @@ def _resolve_worker_cmd() -> list[str] | None:
     """构造启动 _sandbox_worker 子进程的命令。失败时返回 None（触发降级）。"""
     # 优先以模块方式启动：python -m app.tools._sandbox_worker
     # 要求主进程在 python-engine/ 目录下启动（与现有部署一致）
-    return [sys.executable, "-m", "app.tools._sandbox_worker"]
+    cmd = [sys.executable, "-m", "app.tools._sandbox_worker"]
+    # 把本次实际生效的隔离档位传给子进程入口（它会在执行模型代码**之前**自我降级）。
+    # 取 resolve_level 的 effective 而不是 configured：本机做不到的档位不该被谎报。
+    try:
+        from app.isolation import resolve_level
+
+        cmd.append(f"--isolation-level={resolve_level().effective.value}")
+    except Exception as e:  # noqa: BLE001 — 解析失败不阻塞执行，但要留痕
+        logger.warning("resolve isolation level failed, worker runs unhardened: %s", e)
+    return cmd
 
 
 def _run_subprocess_sync(
@@ -174,6 +183,16 @@ def _run_subprocess_sync(
     except Exception as e:  # noqa: BLE001 — 任何启动异常都降级
         logger.warning("subprocess start unexpected error, will fallback: %s", e)
         return None
+
+    # Windows：把子进程挂进 Job Object —— 内存/CPU 上限 + 退出即杀光子孙进程。
+    # 必须持有 job 引用到进程结束（handle 一关 KILL_ON_JOB_CLOSE 立刻生效）。
+    _job = None
+    try:
+        from app.isolation import resolve_level, wrap_async_process
+
+        _job = wrap_async_process(proc, resolve_level())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("job object attach failed (resource limits disabled): %s", e)
 
     deadline = time.time() + timeout
 

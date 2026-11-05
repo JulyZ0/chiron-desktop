@@ -103,6 +103,8 @@ class MCPClientPool:
         self._user_tools: dict[str, set[str]] = {}  # user_id -> 注册的工具名集合
         self._lock = asyncio.Lock()
         self._poll_task: asyncio.Task[Any] | None = None
+        #: 内置插件的连接（随引擎进程生命周期；不参与 reconcile 的用户级回收）
+        self._builtin_clients: list[MCPClient] = []
 
     async def start(self) -> None:
         from app.config import settings as _settings
@@ -126,6 +128,47 @@ class MCPClientPool:
             )
         if self._poll_task is None:
             self._poll_task = asyncio.create_task(self._poll_loop())
+        await self._start_builtin_plugins()
+
+    async def _start_builtin_plugins(self) -> None:
+        """注册**内置插件**（app/plugins/builtin.py）为全局工具。
+
+        与用户插件的三点不同，都在这里体现：
+        - 归属为**全局**（``owner=""``），所有用户可用 —— 否则每个用户都要自己配一遍；
+        - 生命周期跟**引擎进程**走，不参与 reconcile 的活跃度回收（``_user_*`` 里不登记）；
+        - 二进制缺失就**跳过**，不让引擎启动失败（检索增强不是运行前提）。
+
+        失败同样不影响引擎：单个内置插件连不上只记日志，用户插件照常工作。
+        """
+        from app.plugins.builtin import available_builtin_plugins
+
+        for plugin in available_builtin_plugins():
+            command = plugin.resolve_command()
+            if not command:
+                continue
+            server_def = _builtin_to_def(plugin, command)
+            client = MCPClient([server_def])
+            try:
+                await client.start()
+            except Exception as e:  # 内置插件不可用不该拖垮引擎
+                logger.warning("内置插件 %s 连接失败，已跳过：%s", plugin.name, e)
+                try:
+                    await client.close()
+                except Exception:  # noqa: BLE001 — 关闭失败无补救手段
+                    pass
+                continue
+            self._builtin_clients.append(client)
+            for tool in client.tools:
+                registry.register(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.input_schema,
+                    handler=_make_tool_handler(client, tool.name),
+                    source=SOURCE_MCP,
+                )
+            logger.info(
+                "内置插件 %s 已装载：%d 个工具（只读检索）", plugin.name, len(client.tools)
+            )
 
     async def _handle_remote_invocation(self, tool_name: str, args: dict[str, Any]) -> Any:
         """owner 侧入口：执行被其它实例转发的 MCP 工具调用（本地 registry，不再二次转发）。"""
@@ -196,6 +239,13 @@ class MCPClientPool:
             )
 
     async def stop(self) -> None:
+        # 内置插件连接优先关闭：它们不参与 reconcile，不关就会随进程残留子进程。
+        for client in self._builtin_clients:
+            try:
+                await client.close()
+            except Exception as e:  # noqa: BLE001 — 关闭失败无补救手段，只能留痕
+                logger.warning("内置插件关闭失败: %s", e)
+        self._builtin_clients.clear()
         if self._bridge is not None:
             await self._bridge.stop()
             self._bridge = None
@@ -308,6 +358,20 @@ class MCPClientPool:
         await self._release_user_locked(uid)
 
         servers = self._store.active_servers(uid)
+        # 内置插件优先：用户配置里同名的 server 跳过，避免同一插件被拉起两条连接
+        # （内置版带 deny_tools / 只读声明，语义更严格，不能让旧配置盖过它）。
+        from app.plugins.builtin import builtin_names
+
+        _shadowed = builtin_names()
+        if _shadowed:
+            _kept = [s for s in servers if s.name not in _shadowed]
+            if len(_kept) != len(servers):
+                logger.info(
+                    "用户 %s 的插件配置中有 %d 个与内置插件同名，已以内置为准",
+                    uid,
+                    len(servers) - len(_kept),
+                )
+            servers = _kept
         self._user_conns[uid] = set()
         self._user_tools[uid] = set()
         from app.config import settings as _settings
@@ -488,6 +552,26 @@ def _server_to_def(server: ServerConfig) -> Any:
         # 只读声明**必须透传**：漏传会让已声明的 read-only server 也被连接守卫挡住
         # （表现为"MCP 插件明明标了只读却连不上"）。
         read_only=getattr(server, "read_only", False),
+    )
+
+
+def _builtin_to_def(plugin: Any, command: str) -> Any:
+    """内置插件定义 → ServerDef。
+
+    ``builtin=True`` 是关键：它让 ``_connect_stdio`` 跳过用户级
+    ``PLUGIN_COMMAND_ALLOWLIST``（内置命令由部署者清单约束），但"从哪跑"的限制
+    仍然生效。``deny_tools`` 一并透传，出站工具在注册阶段就被剔除。
+    """
+    from app.mcp.client import ServerDef
+
+    return ServerDef(
+        name=plugin.name,
+        command=command,
+        args=list(plugin.args),
+        env=dict(plugin.env),
+        read_only=plugin.read_only,
+        deny_tools=plugin.deny_tools,
+        builtin=True,
     )
 
 

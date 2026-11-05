@@ -377,6 +377,26 @@ class Settings(BaseSettings):
     #: 取值参考 `scripts/bench_sandbox.py` 实测出的"每实例安全并发数"。
     sandbox_service_max_concurrency: int = 0
 
+    #: Windows 原生执行隔离档位（`none` / `job` / `low_il` / `appcontainer`）。
+    #:
+    #: 本仓库是桌面端（Electron + 内嵌 PG/Redis），不该要求用户装 Docker，所以隔离
+    #: 落在 Windows 自带机制上。实测（零提权）：`job` 能拦内存爆炸，`low_il` 还能
+    #: 挡住写用户目录，`appcontainer` 需先给目录授权否则子进程加载不了 DLL。
+    #:
+    #: 空值 ⇒ 默认 `low_il`（Windows 上零提权且真能挡写）；非 Windows 上自然退化为
+    #: `none`，POSIX 继续走 `setrlimit`。**拼错会拒绝启动** —— 一个字母之差就等于
+    #: 关掉隔离，不能猜。
+    sandbox_isolation_level: str = ""
+    #: 内置插件 XERJ 的 ES-compat 入口（MCP stdio 客户端连的地址）。
+    #: 默认值刻意避开 8080/8081 —— 那是 xerj 的 native REST/gRPC 默认端口，本机与
+    #: Go 网关撞车（Windows 允许 0.0.0.0:8080 与 127.0.0.1:8080 共存，会静默抢流量）。
+    #: 端口只能从 `xerj.toml` 配（命令行没有端口开关），两者必须保持一致。
+    xerj_mcp_url: str = "http://127.0.0.1:9200"
+    #: 是否允许隔离档位**降级**后继续执行（默认 False = fail-closed）。
+    #: 本机缺机制时，宁可拒绝执行也不静默退回未隔离状态 —— 与 README 的
+    #: 「沙箱不可用时拒绝启动，不偷偷回退」保持一致。单机开发可设 true。
+    sandbox_isolation_allow_downgrade: bool = False
+
     #: read-before-write **严格模式**（**已拍板：保持默认关**，2026-10-09）。
     #:
     #: * 关（默认）：**兼容旧行为** —— 只拦"读过但已变化"的文件，未读过的文件放行；

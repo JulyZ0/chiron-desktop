@@ -243,8 +243,33 @@ def _run_program(code: str, tool_names: list[str]) -> int:
         return 1
 
 
+def _parse_isolation_level(argv: list[str]) -> str:
+    """从 argv 取 `--isolation-level=<level>`。
+
+    为什么走 argv 而不是环境变量：`sandboxed_env()` 刻意只保留 7 个基础变量，
+    往里加变量等于放宽那层防线；而 argv 本来就由父进程完整控制。
+    """
+    for arg in argv:
+        if arg.startswith("--isolation-level="):
+            return arg.split("=", 1)[1]
+    return ""
+
+
 def main() -> int:
     """子进程入口。"""
+    # 隔离必须在**执行任何模型代码之前**生效 —— 顺序反了就等于没隔离。
+    # Windows: 把自身令牌降到 Low 完整性（零提权可用，实测能挡住写用户目录）。
+    # POSIX:  `_apply_rlimit()` 走 setrlimit 路径。
+    # 注意：这一步失败会 os._exit(9)，不会"带病继续跑"。
+    from app.isolation import apply_in_child, parse_level
+
+    try:
+        _level = parse_level(_parse_isolation_level(sys.argv))
+    except ValueError as e:
+        sys.stderr.write(f"[isolation] FATAL: {e}\n")
+        return 2
+    apply_in_child(_level)
+
     _apply_rlimit()
 
     # 阻塞读 init 消息

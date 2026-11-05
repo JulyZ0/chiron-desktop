@@ -15,7 +15,12 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.config import settings
-from app.deps import verify_media_store, verify_sandbox_backend, verify_sandbox_root
+from app.deps import (
+    verify_isolation_level,
+    verify_media_store,
+    verify_sandbox_backend,
+    verify_sandbox_root,
+)
 from app.session_store import SessionStore
 
 if TYPE_CHECKING:
@@ -290,6 +295,10 @@ def _verify_deployment_preconditions() -> None:
     verify_sandbox_backend()
     verify_sandbox_root()
     verify_media_store()
+    # 桌面端不跑容器 ⇒ `service` 后端在本机只能是降级路径；真正约束执行的是
+    # Windows 原生隔离层（app/isolation）。放进同一组前置校验，让"隔离没生效"
+    # 在启动时就暴露，而不是等到模型跑出一条 rm -rf 才发现。
+    verify_isolation_level()
 
 
 async def _start_file_backend() -> None:
