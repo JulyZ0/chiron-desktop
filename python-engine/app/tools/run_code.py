@@ -128,15 +128,135 @@ def _resolve_worker_cmd() -> list[str] | None:
     # 优先以模块方式启动：python -m app.tools._sandbox_worker
     # 要求主进程在 python-engine/ 目录下启动（与现有部署一致）
     cmd = [sys.executable, "-m", "app.tools._sandbox_worker"]
-    # 把本次实际生效的隔离档位传给子进程入口（它会在执行模型代码**之前**自我降级）。
+    # 把本次**子进程实际能达到**的隔离档位传给子进程入口（它会在执行模型代码之前自我降级）。
     # 取 resolve_level 的 effective 而不是 configured：本机做不到的档位不该被谎报。
+    #
+    # 再套一层 `child_applicable_level`：`restricted` 依赖父进程建令牌，而 worker 是
+    # 普通 `Popen` + 自降级，真实强度只到 `low_il`。若不折算，worker 会收到
+    # `--isolation-level=restricted` 却只做到 low_il —— 日志与子进程报出的档位都比
+    # 实际更强，正是"看起来有隔离"的老问题。
+    #
+    # `restricted` 档下 worker 照样传它能达到的档位（`low_il`）：受限令牌 + 合成 SID
+    # 由父进程在建进程那刻施加，worker 再把自己降到 Low IL 是叠加的纵深防御 ——
+    # `apply_in_child` 改的是**自身进程令牌**的完整性级别，不碰目录 ACE 标签，
+    # 与 `restricted` 的授权机制互不干扰。子进程 stderr 会写明实际档位。
     try:
-        from app.isolation import resolve_level
+        from app.isolation import child_applicable_level, resolve_level
 
-        cmd.append(f"--isolation-level={resolve_level().effective.value}")
+        level = child_applicable_level(resolve_level().effective)
+        cmd.append(f"--isolation-level={level.value}")
     except Exception as e:  # noqa: BLE001 — 解析失败不阻塞执行，但要留痕
         logger.warning("resolve isolation level failed, worker runs unhardened: %s", e)
     return cmd
+
+
+class _RestrictedStdout:
+    """把受限会话的 stdout 排空缓冲适配成 `Popen.stdout.readline()`。"""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._buf = ""
+
+    def readline(self) -> str:
+        while True:
+            nl = self._buf.find("\n")
+            if nl >= 0:
+                line, self._buf = self._buf[: nl + 1], self._buf[nl + 1 :]
+                return line
+            chunk = self._session.take_stream("out")
+            if chunk:
+                self._buf += chunk
+                continue
+            if self._session.returncode is not None:
+                # 进程已退出不等于排空线程已读完：给它一点时间收尾，
+                # 否则最后一条 done/result 消息会被判成 EOF 丢掉。
+                time.sleep(0.05)
+                tail = self._session.take_stream("out")
+                if tail:
+                    self._buf += tail
+                    continue
+                if self._buf:
+                    line, self._buf = self._buf, ""
+                    return line
+                return ""
+            time.sleep(0.01)
+
+
+class _RestrictedStderr:
+    """把受限会话的 stderr 排空缓冲适配成可迭代对象（供 `for line in proc.stderr`）。"""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._buf = ""
+
+    def __iter__(self) -> Any:
+        while True:
+            nl = self._buf.find("\n")
+            if nl >= 0:
+                line, self._buf = self._buf[: nl + 1], self._buf[nl + 1 :]
+                yield line
+                continue
+            chunk = self._session.take_stream("err")
+            if chunk:
+                self._buf += chunk
+                continue
+            if self._session.returncode is not None:
+                time.sleep(0.05)
+                tail = self._session.take_stream("err")
+                if tail:
+                    self._buf += tail
+                    continue
+                if self._buf:
+                    yield self._buf
+                    self._buf = ""
+                return
+            time.sleep(0.01)
+
+
+class _RestrictedWorkerIO:
+    """把 `RestrictedSession` 适配成 `subprocess.Popen` 的最小子集。
+
+    为什么不在 `run_code` 里写两条主循环：执行器围绕 `Popen` 写了一整套
+    「写 init → 逐行读 → 处理 tool_call → kill/wait」。为受限档复制一份，
+    日后修 IPC 就会只修到其中一条 —— 差异收敛在这一层比复制主循环安全。
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self.pid = session.pid
+        self.stdin = session.stdin
+        self.stdout = _RestrictedStdout(session)
+        self.stderr = _RestrictedStderr(session)
+
+    @property
+    def returncode(self) -> int | None:
+        return self._session.returncode
+
+    def kill(self) -> None:
+        self._session.kill()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._session.wait_sync(timeout)
+
+
+def _start_restricted_worker(cmd: list[str]) -> Any | None:
+    """用受限令牌启动 worker。失败返回 None（调用方据此 fail-closed）。"""
+    from app.isolation import win_launch
+    from app.tools.sandbox import sandboxed_env, workspace_dir
+
+    try:
+        session, err = win_launch.open_restricted_session(
+            cmd, cwd=str(workspace_dir()), env=sandboxed_env()
+        )
+    except Exception as e:  # noqa: BLE001 — 任何异常都按"起不来"处理
+        logger.error("restricted worker start raised: %s", e)
+        return None
+    if session is None:
+        # 不退回普通 Popen：那会让"配置声称 restricted、实际 worker 无令牌"静默成立。
+        logger.error("restricted worker 启动失败，拒绝执行模型代码: %s", err)
+        return None
+    logger.info("run_code worker 以受限令牌启动: pid=%s", session.pid)
+    return _RestrictedWorkerIO(session)
 
 
 def _run_subprocess_sync(
@@ -153,36 +273,53 @@ def _run_subprocess_sync(
     registry.execute，避免 Windows ProactorEventLoop 下 asyncio.subprocess
     的 buffering 问题（同步 subprocess 的 stdout 行缓冲更可靠）。
     """
+    # `restricted` 档必须由**父进程在建进程那刻**施加隔离（受限令牌 + 合成 SID +
+    # 独立桌面）；普通 `Popen` + 子进程自降级最多只到 `low_il`。所以这里分两条路径，
+    # 而受限路径起不来就返回 None —— `run_code` 会把 None 当"沙箱不可用"拒绝执行，
+    # 不会退回无令牌的 Popen。
+    restricted = False
+    try:
+        from app.isolation import Level, resolve_level
+
+        restricted = resolve_level().effective is Level.RESTRICTED
+    except Exception as e:  # noqa: BLE001 — 判定失败按普通路径走（它也会自降级）
+        logger.warning("resolve isolation level failed: %s", e)
+
     cmd = _resolve_worker_cmd()
     if cmd is None:
         return None
 
-    try:
-        from app.tools.sandbox import sandboxed_env
+    if restricted:
+        proc = _start_restricted_worker(cmd)
+        if proc is None:
+            return None
+    else:
+        try:
+            from app.tools.sandbox import sandboxed_env
 
-        # S 安全修复:子进程清理宿主 env(API key/JWT_SECRET 等),仅保留基础变量,
-        # 防止沙箱内模型代码 `os.environ` 外带密钥。
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,  # 行缓冲
-            env=sandboxed_env(),
-        )
-        # stdin/stdout 都显式用了 PIPE，这里只是把类型收窄（Popen 的返回类型是
-        # IO[str] | None）。真为 None 时下面的写入本来就会 AttributeError，
-        # 所以断言不改变任何可达路径的行为。
-        assert proc.stdin is not None and proc.stdout is not None
-    except (OSError, FileNotFoundError) as e:
-        logger.warning("subprocess start failed, will fallback to in-process: %s", e)
-        return None
-    except Exception as e:  # noqa: BLE001 — 任何启动异常都降级
-        logger.warning("subprocess start unexpected error, will fallback: %s", e)
-        return None
+            # S 安全修复:子进程清理宿主 env(API key/JWT_SECRET 等),仅保留基础变量,
+            # 防止沙箱内模型代码 `os.environ` 外带密钥。
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,  # 行缓冲
+                env=sandboxed_env(),
+            )
+            # stdin/stdout 都显式用了 PIPE，这里只是把类型收窄（Popen 的返回类型是
+            # IO[str] | None）。真为 None 时下面的写入本来就会 AttributeError，
+            # 所以断言不改变任何可达路径的行为。
+            assert proc.stdin is not None and proc.stdout is not None
+        except (OSError, FileNotFoundError) as e:
+            logger.warning("subprocess start failed, will fallback to in-process: %s", e)
+            return None
+        except Exception as e:  # noqa: BLE001 — 任何启动异常都降级
+            logger.warning("subprocess start unexpected error, will fallback: %s", e)
+            return None
 
     # Windows：把子进程挂进 Job Object —— 内存/CPU 上限 + 退出即杀光子孙进程。
     # 必须持有 job 引用到进程结束（handle 一关 KILL_ON_JOB_CLOSE 立刻生效）。

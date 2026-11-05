@@ -988,30 +988,15 @@ export async function setKBVisibility(id: string, visibility: 'private' | 'tenan
   return resp.data
 }
 
-// ── 支付渠道（可用渠道由后台「支付配置」决定）──
-
-export interface PaymentChannel {
-  id: string
-  /** 结算币种：支付宝/微信为 CNY，PayPal 为 USD */
-  currency: string
-}
-
-/**
- * 查询后台已配置启用的支付渠道。
- * 充值页据此只展示真正可用的渠道 —— 否则用户选中未配置的渠道，
- * 要等下单后才拿到 501。
- */
-export async function listPaymentChannels(): Promise<PaymentChannel[]> {
-  const resp = await api.get('/v1/billing/channels')
-  // 兼容 OK() 包装与裸形态（层级取错会静默变成空列表）
-  const d = resp.data?.data ?? resp.data
-  return Array.isArray(d?.channels) ? d.channels : []
-}
-
 // ── 本机隔离档位（沙箱强度）──
 
-/** 隔离档位，由弱到强。`none` 在这台机器上不会被真正采用（有硬底线）。 */
-export type IsolationLevel = 'none' | 'job' | 'low_il' | 'appcontainer'
+/**
+ * 隔离档位，由弱到强。
+ *
+ * 必须与后端 `app/isolation/__init__.py` 的 `Level` 枚举**逐项对齐**：
+ * 少了哪一档，那一档在界面上就不存在（`restricted` 此前就是这样丢的）。
+ */
+export type IsolationLevel = 'none' | 'job' | 'low_il' | 'restricted' | 'appcontainer'
 
 /** 单个档位的能力探测结果 */
 export interface IsolationCapabilities {
@@ -1088,5 +1073,210 @@ export async function revokeIsolationArtifacts(): Promise<{
 }> {
   const resp = await api.post('/v1/system/isolation/revoke')
   return resp.data?.data ?? resp.data
+}
+
+// ── Super-agent 接管（周期巡检 + 自主推进）──────────────────────────────
+//
+// 后端分两层，前端的取数方式也必须分两层，不能混：
+//
+//   • **配置层**（`/v1/superagent/takeovers`、`/settings`）走网关，落在 PG，
+//     响应被 `OK()` 包成 `{success, data}`。
+//   • **运行时层**（`/status`、`/presence`、`/segment/*`、`/interrupt`）由网关
+//     `ForwardRequest` 直通引擎，响应是引擎的**裸 JSON**，没有 `data` 包装。
+//
+// 把两者当成同一种形状处理，会在运行时端点上取到 `undefined` —— 覆盖层不出现、
+// 心跳静默失效，而界面一切正常，是那种"看起来在跑其实没跑"的故障。
+
+/** 单条接管配置。字段与 `internal/api/routes_superagent.go` 的 JSON 标签一一对应。 */
+export interface SuperagentTakeover {
+  id: string
+  /** 更新时不可修改：换会话等于换一条策略 */
+  session_id: string
+  enabled: boolean
+  schedule_kind: 'once' | 'interval'
+  /** `once` 模式的触发时刻（ISO 字符串） */
+  once_at?: string | null
+  /** `interval` 模式的间隔秒数，下限 900 */
+  interval_seconds: number
+  /** 无人值守的工具授权档位；`yolo` 存进去也会在运行时被降为 `auto` */
+  tools_mode: 'ask' | 'auto' | 'yolo' | string
+  daily_token_budget: number
+  tokens_used_today: number
+  budget_day?: string
+  last_run_at?: string | null
+  /** 上一次判定的结论：`run` / `skip` / `busy` / `user_active` / `idle` … */
+  last_verdict?: string
+  last_reason?: string
+  /** 熔断状态：`""`（正常）/ `errors`（连续失败）/ `budget`（超日预算） */
+  melt_state: string
+  melt_reason?: string
+  cooldown_until?: string | null
+  consecutive_failures: number
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+/** 用户级总开关。 */
+export interface SuperagentSettings {
+  enabled: boolean
+  max_sessions: number
+  day_token_budget: number
+  /** 用户静止多久才认为"可以接管"，分钟 */
+  idle_minutes: number
+  updated_at?: string | null
+}
+
+/** 保存期的软提示（配置成立但可能不符合本意）。 */
+export interface SuperagentSaveResult {
+  takeover: SuperagentTakeover
+  warnings: string[]
+}
+
+/** 引擎侧能力与开关。与用户配置无关。 */
+export interface SuperagentStatus {
+  engine_enabled: boolean
+  tick_seconds: number
+  max_sessions: number
+  min_interval_seconds: number
+  max_once_horizon_seconds: number
+  presence_ttl_seconds: number
+  segment_ttl_seconds: number
+  unattended_tools_mode: string
+  unsafe_tools_mode: string
+}
+
+/** 接管段快照。`known=false` 表示"查不到"，不等于"确认没有接管"。 */
+export interface TakeoverSegment {
+  active: boolean
+  known: boolean
+  session_id: string
+  takeover_id: string
+  started_at?: string | number | null
+}
+
+/** 打断结果。`disabled=true` 表示这条一次性任务已彻底关闭。 */
+export interface TakeoverInterruptResult {
+  ok: boolean
+  session_id: string
+  stopped_run: boolean
+  cooldown_until?: string | null
+  disabled: boolean
+  note: string
+}
+
+/** 解开 `{success, data}` 包装；运行时端点是裸 JSON，原样返回。 */
+function unwrap<T>(payload: unknown): T {
+  return ((payload as { data?: T } | undefined)?.data ?? payload) as T
+}
+
+export async function listTakeovers(): Promise<SuperagentTakeover[]> {
+  const resp = await api.get('/v1/superagent/takeovers')
+  const d = unwrap<SuperagentTakeover[] | null>(resp.data)
+  return Array.isArray(d) ? d : []
+}
+
+export interface TakeoverDraft {
+  session_id: string
+  enabled?: boolean
+  schedule_kind?: 'once' | 'interval'
+  once_at?: string | null
+  interval_seconds?: number
+  tools_mode?: string
+  daily_token_budget?: number
+}
+
+/** 新建接管。返回 `warnings` 时必须展示给用户 —— 那些是"你可能是这么想的"。 */
+export async function createTakeover(body: TakeoverDraft): Promise<SuperagentSaveResult> {
+  const resp = await api.post('/v1/superagent/takeovers', body)
+  return unwrap<SuperagentSaveResult>(resp.data)
+}
+
+/** 更新接管。`session_id` 传了也不会被采纳（后端忽略）。 */
+export async function updateTakeover(
+  id: string,
+  body: Partial<TakeoverDraft> & { clear_melt?: boolean },
+): Promise<SuperagentSaveResult> {
+  const resp = await api.put(`/v1/superagent/takeovers/${encodeURIComponent(id)}`, body)
+  return unwrap<SuperagentSaveResult>(resp.data)
+}
+
+export async function deleteTakeover(id: string): Promise<void> {
+  await api.delete(`/v1/superagent/takeovers/${encodeURIComponent(id)}`)
+}
+
+export async function getTakeoverSettings(): Promise<SuperagentSettings> {
+  const resp = await api.get('/v1/superagent/settings')
+  return unwrap<SuperagentSettings>(resp.data)
+}
+
+export async function saveTakeoverSettings(
+  body: Partial<Omit<SuperagentSettings, 'updated_at'>>,
+): Promise<SuperagentSettings> {
+  const resp = await api.put('/v1/superagent/settings', body)
+  return unwrap<SuperagentSettings>(resp.data)
+}
+
+/** 引擎是否愿意巡检。前端必须据此区分"你关了"与"服务器没开"。 */
+export async function getSuperagentStatus(): Promise<SuperagentStatus> {
+  const resp = await api.get('/v1/superagent/status')
+  return unwrap<SuperagentStatus>(resp.data)
+}
+
+/**
+ * 上报"用户还在这页"。
+ *
+ * 失败**不抛错**：心跳不该让界面弹窗，下一拍会重试。返回值里的 `ok=false`
+ * 只用于内部静默诊断。
+ */
+export async function reportPresence(): Promise<{ ok: boolean; ttl_seconds: number }> {
+  try {
+    const resp = await api.post('/v1/superagent/presence', {})
+    return unwrap<{ ok: boolean; ttl_seconds: number }>(resp.data)
+  } catch {
+    return { ok: false, ttl_seconds: 0 }
+  }
+}
+
+/** 查这个会话是否正在被接管。`known=false` 时调用方不得据此断定"没接管"。 */
+export async function getTakeoverSegment(sessionId: string): Promise<TakeoverSegment> {
+  const resp = await api.get(`/v1/superagent/segment/${encodeURIComponent(sessionId)}`)
+  return unwrap<TakeoverSegment>(resp.data)
+}
+
+/**
+ * 打断本次接管。**不做二次确认**：每多一次往返，run 就多改一个文件。
+ *
+ * 必须与 `POST /v1/agent/interrupt` 一起发（见 `TakeoverOverlay.vue`），
+ * 前者取消接管段，后者停掉正在跑的 run —— 只发一个会留下"锁已撤但 run 还在写"。
+ */
+export async function interruptTakeover(
+  sessionId: string,
+  takeoverId = '',
+  reason = 'user_interrupt',
+): Promise<TakeoverInterruptResult> {
+  const resp = await api.post('/v1/superagent/interrupt', {
+    session_id: sessionId,
+    takeover_id: takeoverId,
+    reason,
+  })
+  return unwrap<TakeoverInterruptResult>(resp.data)
+}
+
+/**
+ * 停掉会话上正在跑的 run。
+ *
+ * 与 `interruptTakeover` 是**两件不同的事**：这条取消 run（服务端真正停止生成），
+ * 那条取消接管段（撤掉锁、写冷却）。打断接管必须两拍齐发 —— 只发前者会留下
+ * "段还在、锁还挂着"，只发后者会留下"锁撤了但 run 仍在写文件"。
+ *
+ * 失败不抛错：run 可能已经自己结束了，那是正常竞态，不是错误。
+ */
+export async function interruptAgentRun(sessionId: string): Promise<boolean> {
+  try {
+    await api.post('/v1/agent/interrupt', { session_id: sessionId })
+    return true
+  } catch {
+    return false
+  }
 }
 

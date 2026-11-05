@@ -66,6 +66,12 @@ AUDITED_BY_CALLER = {
 
 EXEMPT = {
     "agent/prompt_engine.py": "只跑**固定参数**的 git 只读命令（rev-parse/status/log），无外部输入",
+    "isolation/win.py": (
+        "隔离机制**自身的前置配置**，不是 agent 执行的命令：4 处 subprocess.run 全是"
+        "固定子命令的 icacls（/grant、/remove、/setintegritylevel、/grant:r），"
+        "列表形式调用无 shell 解释，子命令由代码常量决定，只有路径来自调用方。"
+        "档位变更本身由 isolation audit（record_level_change）记录，不必混进 exec_audit"
+    ),
 }
 
 #: 已知缺口（**不是豁免**）：目前为空 —— `mcp/client.py` / `skill/manager.py` 已通过

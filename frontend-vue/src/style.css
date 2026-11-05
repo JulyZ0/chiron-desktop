@@ -184,6 +184,17 @@
     --z-page-panel: 120;   /* 页面级侧栏（页面级浮层之首） */
     --z-palette: 1000;     /* 全局命令面板 */
     --z-viewer: 1000;      /* 全屏查看器 */
+    /* Super-agent 接管界面：遮罩要压暗全站、卡片要有明显投影。
+       用 shadow-base 混色而非写死黑色 —— 8 套主题（含深色）下都得到
+       "比背景更深"的结果，写死 #000 会在 terminal/aurora 主题里糊成一片。 */
+    --takeover-scrim: color-mix(in srgb, var(--shadow-base) 55%, transparent);
+    --takeover-card-shadow: 0 12px 48px color-mix(in srgb, var(--shadow-base) 35%, transparent);
+    /* 呼吸点：主色的半透明态（list 的另一端直接写 transparent） */
+    --takeover-ring: color-mix(in srgb, var(--primary) 50%, transparent);
+    /* 「打断接管」按钮上的文字：8 套主题的 danger 都是深底，故固定浅色。
+       这是 token 定义处，写原始色值是预期行为（契约检查豁免本行）。 */
+    --takeover-stop-fg: #ffffff;
+    --z-takeover: 2000;
     --z-progress: 9999;    /* 路由进度条：始终最上 */
 
     /* 饱和色底（--error / --success / --info / --warning）上的前景色。

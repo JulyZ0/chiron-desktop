@@ -126,6 +126,15 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   pickDocument: () => ipcRenderer.invoke('desktop:pick-document'),
 
   /**
+   * 选一个本地文件夹作为**项目根目录**（会话地图改造后新增）。
+   *
+   * 只回 `{ path, name }`，**不校验、不写入**：路径合法性由后端 `validateRootPath`
+   * 判定（绝对路径 / 存在 / 是目录 / 非系统目录），这一层只负责让用户选。
+   * 用户取消时 resolve `null`（不是错误）。
+   */
+  pickDirectory: () => ipcRenderer.invoke('desktop:pick-directory'),
+
+  /**
    * 本地模型配置（provider / 端点 / 模型名 / key）。
    *
    * 读回来的**永远不含明文 key**：只有 `{ active, providers: { <name>: { baseUrl, model, hasKey } } }`。

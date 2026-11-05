@@ -44,6 +44,20 @@ func registerConversationRoutes(
 	mux.Handle("PUT /v1/session-map/workspaces/{id}", authMW(rlMW(http.HandlerFunc(smHandler.SaveWorkspace))))
 	mux.Handle("DELETE /v1/session-map/workspaces/{id}", authMW(rlMW(http.HandlerFunc(smHandler.DeleteWorkspace))))
 	mux.Handle("POST /v1/session-map/workspaces/{id}/fork-node", authMW(rlMW(http.HandlerFunc(smHandler.ForkNode))))
+	// 项目（Workspace 即项目）：会话地图改造后的主要入口，语义见
+	// docs/project-management-design.md。项目 = root_path 非空的 workspace。
+	mux.Handle("GET /v1/session-map/projects", authMW(rlMW(http.HandlerFunc(smHandler.ListProjects))))
+	mux.Handle("POST /v1/session-map/projects", authMW(rlMW(http.HandlerFunc(smHandler.CreateProject))))
+	mux.Handle("PATCH /v1/session-map/projects/{id}", authMW(rlMW(http.HandlerFunc(smHandler.PatchProject))))
+	// 删除项目直接复用 DeleteWorkspace：项目就是 workspace，删它只级联清掉
+	// session_map_nodes（含归属记录），sessions 本身完好（I5）。单独实现一遍只会
+	// 多出一份缓存清理逻辑，两处早晚不一致。
+	mux.Handle("DELETE /v1/session-map/projects/{id}", authMW(rlMW(http.HandlerFunc(smHandler.DeleteWorkspace))))
+	mux.Handle("GET /v1/session-map/projects/{id}/sessions", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectSessions))))
+	mux.Handle("PUT /v1/session-map/projects/{id}/sessions/{sid}", authMW(rlMW(http.HandlerFunc(smHandler.BindProjectSession))))
+	mux.Handle("DELETE /v1/session-map/projects/{id}/sessions/{sid}", authMW(rlMW(http.HandlerFunc(smHandler.UnbindProjectSession))))
+	// 未归入任何项目的会话：存量会话全无归属，没有这个分组它们在改造后会从侧边栏消失。
+	mux.Handle("GET /v1/session-map/unassigned-sessions", authMW(rlMW(http.HandlerFunc(smHandler.ListUnassignedSessions))))
 	// 当前用户的分享列表（数据管理 → 分享管理）；与上面的按会话接口同组、同鉴权。
 	mux.Handle("GET /v1/shares", authMW(rlMW(http.HandlerFunc(shareHandler.List))))
 }

@@ -159,6 +159,23 @@ function pickDocumentResult(result) {
 }
 
 /**
+ * 把 `dialog.showOpenDialog({ properties: ['openDirectory'] })` 的结果翻译成
+ * `pickDirectory` 的返回值。
+ *
+ * 与 `pickDocumentResult` 结构相同但**刻意分开**：两者的语义不同（一个是"要读的文档"，
+ * 一个是"要绑定的项目根目录"），合成一个函数后，将来任一方要加字段（例如目录要回
+ * `isGitRepo`）就会变成"另一个也得跟着改"。取消同样返回 `null` 而非错误。
+ */
+function pickDirectoryResult(result) {
+  if (!result || result.canceled) return null
+  const dir = Array.isArray(result.filePaths) ? result.filePaths[0] : ''
+  if (!dir) return null
+  // 末尾的路径分隔符会让后端 `filepath.Clean` 之外的地方（比较、显示）不一致；
+  // 这里保留原样，规范化交给后端 —— 前端裁剪盘符根目录（`C:\`）会裁成 `C:`。
+  return { path: dir, name: path.basename(dir) || dir }
+}
+
+/**
  * 建窗分流：这次启动该加载哪个页面，以及把哪个地址交给 preload。
  *
  * 抽成纯函数放这里还是那条老理由 —— main.cjs 一 require 就会起 Electron，单测没法直接
@@ -226,6 +243,7 @@ module.exports = {
   partitionFor,
   shouldQuitOnAllWindowsClosed,
   pickDocumentResult,
+  pickDirectoryResult,
   resolveStartupWindow,
   shouldInjectHeaderCsp,
 }

@@ -27,7 +27,6 @@ import pytest
 
 from app.tools import ssrf
 
-
 # ── 变异 1/2：路径守卫（相对穿越 / UNC）必须被 command_allowed 依赖 ──
 #
 # 这两条路径的 basename 都是 npx（白名单命中），只有路径守卫能拦住它们。

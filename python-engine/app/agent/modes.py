@@ -64,10 +64,38 @@ CORE_TOOL_NAMES = frozenset(
 # 极简模式：仅信息读取 + 编辑 + shell（deepseek minimal 的 persistent-bash + str_replace_editor 语义）
 MINIMAL_TOOL_NAMES = frozenset({"read_file", "edit_file", "shell_exec"})
 
+# 编码模式：改代码 + 跑验证的最小闭环，外加检索与版本控制。
+#
+# 与 minimal 的差别不是"工具更多"，而是**能形成闭环**：定位（grep/glob/ls）→ 读
+# （read_file）→ 改（edit_file/write_file）→ 跑（shell_exec/persistent_shell）→
+# 看差异（git_diff/git_status）。minimal 缺定位类工具，改多文件时会退化成
+# 反复 read_file 全量重读，token 成本反而更高。
+#
+# 刻意**不含** `delete_file`：删除不可逆，编码模式里模型最容易在"清理"的
+# 名义下误删；需要删除时用户切到 normal 并走人工确认。
+# `run_code` 保留 —— 批量改动（重命名、跨文件替换）用它一次跑完，比逐个
+# edit_file 省往返，且它在受限沙箱里执行。
+CODE_TOOL_NAMES = frozenset(
+    {
+        "read_file",  # 读文件
+        "write_file",  # 新建/整体覆盖
+        "edit_file",  # 精确替换（改代码主力）
+        "ls",  # 列目录
+        "grep_files",  # 按内容定位
+        "glob_files",  # 按文件名定位
+        "shell_exec",  # 一次性命令（编译、测试）
+        "persistent_shell",  # 长驻 shell（cwd/环境跨调用保持）
+        "run_code",  # 程序化批量操作（沙箱内执行）
+        "git_status",  # 看工作区状态
+        "git_diff",  # 看改动内容
+    }
+)
+
 
 class AgentMode(StrEnum):
     NORMAL = "normal"
     MINIMAL = "minimal"
+    CODE = "code"
 
 
 @dataclass(frozen=True)
@@ -93,6 +121,25 @@ _BASE_MODES: dict[AgentMode, ModeConfig] = {
         include_context=False,
         include_tools=frozenset(MINIMAL_TOOL_NAMES),
         enable_compaction=False,
+    ),
+    AgentMode.CODE: ModeConfig(
+        mode=AgentMode.CODE,
+        persona=(
+            "You are a coding agent working inside a sandboxed workspace.\n\n"
+            "Work in small verified steps: locate (grep_files/glob_files) → read → edit → "
+            "run the check → inspect the diff with git_diff. Never claim a change works "
+            "without running the relevant command; if you cannot verify it, say so plainly.\n\n"
+            "Prefer edit_file for surgical changes and write_file only for new or fully "
+            "rewritten files. Batch mechanical multi-file edits in one run_code program "
+            "instead of many separate round trips.\n\n"
+            "When a command fails, read the actual error before changing anything, and fix "
+            "the root cause rather than the symptom."
+        ),
+        # 保留上下文注入：编码任务必须知道项目约定、既有决策与历史教训，
+        # 否则会在同一个坑里反复踩（这正是 minimal 不适合编码任务的原因之一）。
+        include_context=True,
+        include_tools=frozenset(CODE_TOOL_NAMES),
+        enable_compaction=True,
     ),
 }
 

@@ -42,6 +42,14 @@ const (
 	smCacheTTL    = 24 * time.Hour
 	smFlushPeriod = 3 * time.Second
 	smMaxNodes    = 2000
+
+	// smEdgeKindProject 是「项目归属」的专用边类型，不是画布连线。
+	//
+	// 归属与画布卡片同表（`session_map_nodes`），靠这一列区分。判据**只能是它**，
+	// 不能用 `hidden` —— `hidden` 是用户可切换的显示字段，「显示全部」就会把
+	// 归属记录当成 0,0 的幽灵卡片画出来。
+	// 见 docs/project-management-design.md 的「判据只能是 edge_kind」。
+	smEdgeKindProject = "project"
 )
 
 // SessionMapNode 是地图上的一个节点：对会话的引用 + 布局。
@@ -63,10 +71,17 @@ type SessionMapNode struct {
 	_             struct{} `json:"-"`
 }
 
-// SessionMapWorkspace 是一张画布（含它的节点）。
+// SessionMapWorkspace 是一个 workspace：项目（RootPath 非空）或画布（RootPath 为空）。
 type SessionMapWorkspace struct {
 	ID        string                 `json:"id"`
 	Name      string                 `json:"name"`
+	// RootPath 是项目绑定的本地文件夹。空串 = 旧形态的画布。
+	//
+	// 判定「这是项目还是画布」只能看这个字段：非空即项目。不设第三种形态，
+	// 因为「既像项目又像画布」的中间态会让侧边栏与画布语义同时含糊。
+	RootPath  string                 `json:"root_path"`
+	// SortIndex 供侧边栏排序；同值时按 name 兜底，避免顺序抖动。
+	SortIndex int                    `json:"sort_index"`
 	Viewport  map[string]interface{} `json:"viewport"`
 	Nodes     []SessionMapNode       `json:"nodes"`
 	CreatedAt string                 `json:"created_at,omitempty"`
@@ -390,14 +405,20 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 	// 事务化之后失败即整体回滚，dirty 重试拿到的仍是完整快照。
 	return db.GlobalDBManager.WithTransaction(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx,
-			`UPDATE session_map_workspaces SET name = $2, viewport = $3::jsonb, updated_at = NOW()
-			  WHERE id = $1`, ws.ID, ws.Name, string(viewport)); err != nil {
+			`UPDATE session_map_workspaces
+			    SET name = $2, viewport = $3::jsonb, root_path = $4, sort_index = $5, updated_at = NOW()
+			  WHERE id = $1`, ws.ID, ws.Name, string(viewport), ws.RootPath, ws.SortIndex); err != nil {
 			return err
 		}
 		// 节点全量替换：先删后插，天然处理"节点被移除"的情况。
 		// 节点量有上限（smMaxNodes），一次 DELETE + 批量 INSERT 比逐节点 diff 简单且不易出错。
+		//
+		// **`edge_kind <> 'project'` 不是可选优化，是数据安全边界**：
+		// 归属记录与画布节点共用这张表，若这里不过滤，用户拖一次画布就会把
+		// 该项目的全部会话归属删光，侧边栏项目瞬间变空且无日志可循。
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM session_map_nodes WHERE workspace_id = $1`, ws.ID); err != nil {
+			`DELETE FROM session_map_nodes
+			  WHERE workspace_id = $1 AND edge_kind <> 'project'`, ws.ID); err != nil {
 			return err
 		}
 		for _, n := range ws.Nodes {
@@ -426,13 +447,18 @@ func smLoadFromPG(ctx context.Context, workspaceID, tenant, userID string) (*Ses
 		return nil, nil
 	}
 	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT id, COALESCE(name,''), COALESCE(viewport, '{}'::jsonb)::text
+		`SELECT id, COALESCE(name,''), COALESCE(viewport, '{}'::jsonb)::text,
+		        COALESCE(root_path,''), COALESCE(sort_index,0)
 		   FROM session_map_workspaces
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`, workspaceID, tenant, userID)
 	if err != nil || row == nil {
 		return nil, err
 	}
-	ws := &SessionMapWorkspace{ID: stringOf(row["id"]), Name: stringOf(row["name"]), Nodes: []SessionMapNode{}, TenantID: tenant, UserID: userID}
+	ws := &SessionMapWorkspace{
+		ID: stringOf(row["id"]), Name: stringOf(row["name"]), Nodes: []SessionMapNode{},
+		RootPath: stringOf(row["root_path"]), SortIndex: intOf(row["sort_index"]),
+		TenantID: tenant, UserID: userID,
+	}
 	_ = json.Unmarshal([]byte(stringOf(row["viewport"])), &ws.Viewport)
 	if ws.Viewport == nil {
 		ws.Viewport = map[string]interface{}{}
@@ -442,7 +468,8 @@ func smLoadFromPG(ctx context.Context, workspaceID, tenant, userID string) (*Ses
 		        n.x, n.y, COALESCE(NULLIF(n.title, ''), s.title, '') AS title, COALESCE(n.color, ''), n.collapsed, n.hidden, n.pinned,
 		        COALESCE(n.branch_from_seq, 0), n.created_at, n.updated_at
 		   FROM session_map_nodes n LEFT JOIN sessions s ON s.id = n.session_id
-		  WHERE n.workspace_id = $1 ORDER BY n.created_at`, workspaceID)
+		  WHERE n.workspace_id = $1 AND n.edge_kind <> 'project'
+		  ORDER BY n.created_at`, workspaceID)
 	if err != nil {
 		return ws, nil
 	}
@@ -569,9 +596,14 @@ func (h *SessionMapHandler) ListWorkspaces(w http.ResponseWriter, r *http.Reques
 	}
 	out := []map[string]interface{}{}
 	if db.GlobalDBManager != nil {
+		// 只列**画布**（root_path 为空）。项目与画布同表（见 docs/project-management-design.md），
+		// 而这条端点的唯一消费者是画布选择器 —— 若把项目也列进去，用户在"画布"下拉里
+		// 会看到一堆文件夹名，选中后得到一张永远空白的画布。
+		// 项目有自己的列表端点（`GET /v1/session-map/projects`）。
 		rows, err := db.GlobalDBManager.FetchAll(r.Context(),
 			`SELECT id, COALESCE(name,''), updated_at FROM session_map_workspaces
-			  WHERE tenant_id = $1 AND user_id = $2 ORDER BY updated_at DESC LIMIT 50`,
+			  WHERE tenant_id = $1 AND user_id = $2 AND COALESCE(root_path,'') = ''
+			  ORDER BY updated_at DESC LIMIT 50`,
 			smTenant(claims), claims.UserID)
 		if err == nil {
 			for _, row := range rows {
@@ -667,7 +699,18 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 		BadRequest(w, "invalid request")
 		return
 	}
-	if len(body.Nodes) > smMaxNodes {
+	// 配额只统计**画布节点**。`session_map_nodes` 现在同表存两类记录：画布卡片与
+	// 项目归属（`edge_kind='project'`，见 docs/project-management-design.md）。
+	// 若把归属一起数进来，用户在项目里归几百个会话就会挤爆画布额度 ——
+	// 那时画布明明"空着"却存不进去，且报错说的是"节点太多"，无从排查。
+	canvasNodes := 0
+	for _, n := range body.Nodes {
+		// 空 EdgeKind 是画布节点的常态（前端默认 'manual' 之外的旧数据），必须计入。
+		if n.EdgeKind != smEdgeKindProject {
+			canvasNodes++
+		}
+	}
+	if canvasNodes > smMaxNodes {
 		BadRequest(w, "too many nodes")
 		return
 	}
@@ -685,6 +728,30 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 	}
 	body.TenantID = smTenant(claims)
 	body.UserID = claims.UserID
+	// **root_path 不接受客户端提交的值**。
+	//
+	// 这条端点的语义是「整体保存画布布局」，而 root_path 是项目配置，属于
+	// `PATCH /v1/session-map/projects/{id}` 的职责 —— 那条路径会跑 `validateRootPath`
+	// （绝对路径 / 存在 / 是目录 / 非系统目录）。
+	// 若这里直接信任 body，客户端只要发一个 PUT 就能把项目指向 `C:\Windows`，
+	// 绕过全部校验，后续 P3 接通执行 cwd 时这会是直接的越权入口。
+	// 因此一律沿用库里的现值。
+	if existing, ok := smCacheGet(r.Context(), wsID); ok {
+		body.RootPath = existing.RootPath
+	} else if row, err := db.GlobalDBManager.FetchOne(r.Context(),
+		`SELECT COALESCE(root_path,'') FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
+		body.RootPath = stringOf(row["root_path"])
+	}
+	// **sort_index 同样不接受客户端提交**：它与 root_path 是同一类字段 ——
+	// 排序是项目树（侧边栏）的属性，由 `PATCH /v1/session-map/projects/{id}` 维护。
+	// 若这里信任 body，「保存画布」这个动作就能顺手改项目顺序，而画布保存是
+	// 前端高频自动调用，用户拖动一下卡片就把别人的排序覆盖掉。
+	if existing, ok := smCacheGet(r.Context(), wsID); ok {
+		body.SortIndex = existing.SortIndex
+	} else if row, err := db.GlobalDBManager.FetchOne(r.Context(),
+		`SELECT COALESCE(sort_index,0) FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
+		body.SortIndex = intOf(row["sort_index"])
+	}
 	if db.Redis == nil {
 		// 降级：没有热层就直写 PG（可用性优先，不丢用户拖动）
 		if err := smPersist(r.Context(), &body); err != nil {

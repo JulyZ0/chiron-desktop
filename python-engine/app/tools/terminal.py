@@ -43,7 +43,12 @@ class PersistentTerminal:
     """进程内持久 shell 管理器，按 session key 隔离。"""
 
     def __init__(self) -> None:
-        self._procs: dict[str, asyncio.subprocess.Process] = {}
+        self._procs: dict[str, Any] = {}
+        #: 与 `_procs` 同键的 Job 句柄。**必须持有到进程结束**：句柄一关
+        #: `KILL_ON_JOB_CLOSE` 立刻杀光整棵树，提前 GC 会让 shell 莫名消失。
+        self._jobs: dict[str, Any] = {}
+        #: `restricted` 档下的受限会话（持有进程/线程/管道句柄，必须显式 close）。
+        self._sessions: dict[str, Any] = {}
 
     def _prune_procs(self) -> None:
         """回收已退出的进程条目，防止 _procs 无限累积（S 资源修复）。"""
@@ -54,13 +59,36 @@ class PersistentTerminal:
         ]
         for k in dead:
             self._procs.pop(k, None)
+            session = self._sessions.pop(k, None)
+            if session is not None:
+                # 受限会话持有进程/管道句柄和两个排空线程，必须显式释放，
+                # 否则每轮 `npm test` 都会漏掉一组内核句柄。
+                session.close()
+            job = self._jobs.pop(k, None)
+            if job is not None:
+                job.close()
 
-    async def _get_proc(self, key: str) -> asyncio.subprocess.Process:
+    async def _get_proc(self, key: str) -> Any:
         proc = self._procs.get(key)
         if proc is not None and proc.returncode is None:
             return proc
         # 回收已退出进程，再创建新的（避免累积完成/崩溃的 shell）
         self._prune_procs()
+        # `restricted` 档走**受限常驻会话**（`win_launch.open_restricted_session`）：
+        # 受限令牌 + 独立桌面 + 自建可继承管道。此前的 fail-closed 是因为一次性
+        # `launch_restricted` 无法"常驻 + 增量写 stdin"，那个缺口已由常驻模式补上。
+        #
+        # 注意**不能**在这里退回普通 `create_subprocess_exec`：那会让 persistent_shell
+        # 成为绕过受限令牌的后门 —— "配置声称挡得住写、实际有一条路绕过去"。
+        decision = None
+        try:
+            from app.isolation import Level, resolve_level
+
+            decision = resolve_level()
+        except Exception as exc:  # noqa: BLE001 — 隔离模块异常时按既有路径走
+            logger.warning("persistent_shell: resolve_level failed: %s", exc)
+        if decision is not None and decision.effective is Level.RESTRICTED:
+            return await self._open_restricted(key)
         # S 修复：ws 用局部变量，避免写成实例属性后被并发请求覆盖导致跨会话串 cwd/cd
         ws = str(workspace_dir())
         shell_exe = _shell_command()
@@ -77,6 +105,16 @@ class PersistentTerminal:
             # 现在也有了）。POSIX 下施加 RLIMIT；Windows 无 resource，靠调用方超时兜底。
             **_rlimit_kwargs(),
         )
+        # Windows：把长驻 shell 挂进 Job Object。此前这里**没有任何进程树约束** ——
+        # 模型在持久 shell 里起一个后台任务，调用方超时只能 kill 掉 shell 本身，
+        # 孙进程留在内存里继续跑。job 与 proc 同生命周期（见 `_discard` / `_prune_procs`）。
+        job = None
+        try:
+            from app.isolation import SHELL_LIMITS, resolve_level, wrap_async_process
+
+            job = wrap_async_process(proc, resolve_level(), SHELL_LIMITS)
+        except Exception as exc:  # noqa: BLE001 — 附加失败不应让 shell 起不来
+            logger.warning("persistent_shell: job object attach failed: %s", exc)
         # 首命令 cd 到沙箱 workspace，保证状态持久在隔离目录内（S 安全修复）
         # stdin 显式用了 PIPE，这里只是把类型收窄（Popen 的返回类型是 StreamWriter | None）。
         assert proc.stdin is not None
@@ -88,8 +126,68 @@ class PersistentTerminal:
             await proc.stdin.drain()
         except Exception:
             pass
+        # 同 key 的旧 shell 已被上面的 _prune_procs 清过；若它仍在跑（比如并发替换），
+        # 先关旧 job —— 否则旧句柄泄漏，且旧进程树永远不会被回收。
+        stale = self._jobs.pop(key, None)
+        if stale is not None:
+            stale.close()
         self._procs[key] = proc
+        if job is not None:
+            self._jobs[key] = job
         return proc
+
+    async def _open_restricted(self, key: str) -> Any:
+        """`restricted` 档：起一个受限常驻 shell，再按普通路径的同一套 API 使用。
+
+        `open_restricted_session` 内部是同步 Win32 调用（`CreateProcessAsUserW`
+        等），必须丢线程，否则会卡住事件循环 —— 一次建进程就能拖住所有会话。
+        """
+        from app.isolation import SHELL_LIMITS, win_launch, wrap_async_process
+
+        shell_exe = _shell_command()
+        ws = str(workspace_dir())
+        session, err = await asyncio.to_thread(
+            win_launch.open_restricted_session,
+            [shell_exe],
+            cwd=ws,
+            env=sandboxed_env(),
+        )
+        if session is None:
+            # fail-closed：起不来就拒绝，**不**退回无隔离的普通 shell。
+            # 退回等于让 persistent_shell 成为绕过受限令牌的后门。
+            raise RuntimeError(
+                f"persistent_shell 在 restricted 档下无法启动受限进程：{err}。"
+                "请改用 shell_exec，或把隔离档位调到 low_il。"
+            )
+
+        # Job Object 同样要挂：受限令牌只约束令牌能力，不约束进程树规模。
+        job = None
+        try:
+            from app.isolation import resolve_level
+
+            job = wrap_async_process(session, resolve_level(), SHELL_LIMITS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("persistent_shell(restricted): job attach failed: %s", exc)
+
+        # 首命令 cd：受限 shell 的起始目录已在 cwd 里给了，这里只是让后续
+        # 命令与普通路径保持同样的工作目录语义（用户可能 cd 到子目录）。
+        try:
+            session.stdin.write(f'cd /d "{ws}"\n'.encode())
+            await session.stdin.drain()
+        except Exception:
+            pass
+
+        stale = self._sessions.pop(key, None)
+        if stale is not None:
+            stale.close()
+        stale_job = self._jobs.pop(key, None)
+        if stale_job is not None:
+            stale_job.close()
+        self._procs[key] = session
+        self._sessions[key] = session
+        if job is not None:
+            self._jobs[key] = job
+        return session
 
     async def execute(
         self, key: str, command: str, timeout: int = DEFAULT_TIMEOUT_SECONDS
@@ -108,7 +206,13 @@ class PersistentTerminal:
             }
 
         # 每命令一个临时工作目录：out=输出 / code=退出码 / done=完成哨兵
-        workdir = Path(tempfile.mkdtemp(prefix="chiron_sh_"))
+        #
+        # `restricted` 档下**必须**落在 workspace 内：受限进程只被授权写工作区，
+        # 往系统 `%TEMP%` 写会直接 Access Denied。而哨兵写不出来 ⇒ `done_file`
+        # 永不出现 ⇒ 每条命令都跑满 timeout 才返回"超时"。这是静默的：
+        # 命令本身其实成功了，输出却读不到，看起来像 shell 卡死。
+        base = str(workspace_dir()) if key in self._sessions else None
+        workdir = Path(tempfile.mkdtemp(prefix="chiron_sh_", dir=base))
         out_file = workdir / "out.txt"
         code_file = workdir / "code.txt"
         done_file = workdir / "done.txt"
@@ -193,12 +297,21 @@ class PersistentTerminal:
 
     async def _discard(self, key: str) -> None:
         proc = self._procs.pop(key, None)
+        job = self._jobs.pop(key, None)
+        session = self._sessions.pop(key, None)
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()
                 await proc.wait()
             except Exception:  # noqa: BLE001
                 pass
+        # 先 kill 再关 job：反过来会让 KILL_ON_JOB_CLOSE 抢在 wait() 之前动手，
+        # 那段 await 就永远等不到一个「正常退出」的进程。
+        if job is not None:
+            job.close()
+        # 受限会话的管道/线程句柄必须显式释放（`_procs` 里的同一个对象）。
+        if session is not None:
+            session.close()
 
     async def close_all(self) -> None:
         for key in list(self._procs.keys()):

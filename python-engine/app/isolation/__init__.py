@@ -40,7 +40,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.isolation import win
+from app.isolation import win, win_token
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,7 @@ class Level(enum.StrEnum):
     NONE = "none"
     JOB = "job"
     LOW_IL = "low_il"
+    RESTRICTED = "restricted"
     APPCONTAINER = "appcontainer"
 
     @property
@@ -61,11 +62,18 @@ class Level(enum.StrEnum):
         return _ORDER.index(self)
 
 
-_ORDER = [Level.NONE, Level.JOB, Level.LOW_IL, Level.APPCONTAINER]
+_ORDER = [Level.NONE, Level.JOB, Level.LOW_IL, Level.RESTRICTED, Level.APPCONTAINER]
 
-#: 默认档位。`low_il` 在 Windows 上零提权可用且能挡写，是性价比最高的一档；
+#: 默认档位：`restricted`（受限令牌 + 合成 SID + 一条可撤销 ACE）。
+#:
+#: 为什么默认它而不是 `low_il`：`low_il` 要先给目录授当前用户完全控制才能打 Low
+#: 标签，对用户资产是**实质且不可逆**的改动（`set_path_integrity` 打回去也换不回
+#: 继承来的原始 ACE）。`restricted` 只在根目录加一条 ACE，撤销即删除 —— 同一档
+#: 强度，代价却是可逆的，所以没有理由让默认值停在更脏的那个。
+#:
+#: `low_il` 保留为**可选**档位（老配置、或 restricted 机制在本机不可用时回落）。
 #: 非 Windows 上自然退化为 `none`（POSIX 继续走 setrlimit）。
-DEFAULT_LEVEL = Level.LOW_IL
+DEFAULT_LEVEL = Level.RESTRICTED
 
 #: **硬底线**：Windows 上实际生效的档位不得低于此值。
 #:
@@ -224,17 +232,50 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
         reasons.append("Low 完整性级别不可设置")
         return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
 
-    # Low IL 生效的**必需前置**：工作区必须打 Low 完整性标签。
-    #
-    # 实测（非管理员账户）：不打标签时 Low IL 子进程连 workspace 都写不了
-    # （WRITE/MKDIR 全 DENIED）—— run_code / persistent_shell 会全面失效；
-    # 打标签后工作区可写，而**越界写上级目录仍被拒**，引擎自身（Medium）也照常可写。
-    if want.rank >= Level.LOW_IL.rank:
+    # Low 完整性标签是 `low_il` / `appcontainer` 的必需前置，但**不是** `restricted`
+    # 的前置：受限令牌靠 restricting SIDs 判写，与完整性级别无关。原来这里用
+    # `>= LOW_IL` 会把 `restricted` 也拉进"必须给整目录打 Low 标签"，
+    # 等于把代价更小的方案按更脏的那条实现 —— 所以按档位精确判断。
+    if want in (Level.LOW_IL, Level.APPCONTAINER):
         ws = appcontainer_workspace()
         labeled, lerr = _ensure_workspace_low_label(ws)
         if not labeled:
             reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
             return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
+
+    if want is Level.RESTRICTED:
+        if not _probe_restricted():
+            # 把**具体**原因写进 reasons：`exec_unavailable_reason()` 会说清是
+            # "未以管理员身份运行"还是"令牌造不出来"。只写"不可用"等于让用户
+            # 去查 Win32 错误码才知道该做什么。
+            if win_token.probe():
+                reasons.append(
+                    win_token.exec_unavailable_reason() or "受限令牌执行层不可用（原因未知）"
+                )
+            else:
+                reasons.append("受限令牌无法创建（缺少 logon SID，或 advapi32 不可用）")
+            # 降级到 `low_il` 前**必须**补打 Low 标签：那是 low_il 的必需前置，
+            # 漏掉它会让"降级"变成"降级到一个根本写不了工作区的档位"。
+            labeled, lerr = _ensure_workspace_low_label(appcontainer_workspace())
+            if not labeled:
+                reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
+                return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
+            return IsolationDecision(want, Level.LOW_IL, reasons)
+        ws = appcontainer_workspace()
+        granted, gerr = win_token.grant_path(ws)
+        if not granted:
+            reasons.append(f"工作区无法授权给合成 SID: {gerr}")
+            labeled, lerr = _ensure_workspace_low_label(ws)
+            if not labeled:
+                reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
+                return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
+            return IsolationDecision(want, Level.LOW_IL, reasons)
+        if not win_token.desktop_isolation_ready():
+            # 已知缺口，告警但**不降级**：low_il 要改用户资产，比"缺桌面隔离"更重。
+            # 把丑陋但真实的状态说清楚，好过换一个更脏的档位假装更安全。
+            reasons.append(
+                "受限进程仍运行在默认桌面（官方建议独立桌面以阻断 PostMessage 跨进程攻击）"
+            )
 
     if want is Level.APPCONTAINER:
         ok, sid, err = win.ensure_appcontainer(win.appcontainer_name("default"))
@@ -246,12 +287,19 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
         if not granted:
             reasons.append(f"AppContainer 路径授权失败: {gerr}")
             return IsolationDecision(want, Level.LOW_IL, reasons)
+        # 刚往工作区写了包 SID ACE ⇒ 缓存失效。
+        #
+        # `_ensure_workspace_low_label()` 会缓存"已验证过"的路径并跳过后续检查；
+        # 若不清掉这个键，`appcontainer → low_il` 的切换会跳过残留 ACE 清理，
+        # 于是 low_il 带着一条写不动的 ACL 静默上线（这正是实测到的缺陷）。
+        _labeled_workspaces.discard(uri)
 
     return IsolationDecision(want, want, reasons)
 
 
 _job_ok: bool | None = None
 _low_il_ok: bool | None = None
+_restricted_ok: bool | None = None
 #: 已打过标签的 workspace 路径（避免每次 resolve 都跑一次 icacls）
 _labeled_workspaces: set[str] = set()
 
@@ -273,6 +321,15 @@ def _ensure_workspace_low_label(path: str) -> tuple[bool, str]:
             _os.makedirs(path, exist_ok=True)
         except OSError as exc:
             return False, f"无法创建工作区 {path}: {exc}"
+    # 先清掉**上一个档位**（appcontainer）留下的包 SID ACE。
+    #
+    # 实测：带这条 ACE 的目录上，Low IL 子进程创建/修改文件一律 PermissionError；
+    # `icacls /remove:g *<包SID>` 之后立即恢复可写。也就是说只要切过 appcontainer
+    # 再回头用 low_il，工作区就静默变成"写不了"——配置上看不出来。清理放在打标签
+    # 之前，是因为它和完整性标签互相独立，但缺了它标签就毫无意义。
+    cleaned, sids, cerr = win.remove_appcontainer_aces(path)
+    if not cleaned:
+        return False, f"无法清理残留的 AppContainer 授权: {cerr}"
     ok, err = win.set_path_integrity(path)
     if not ok:
         # 重试一次：先给当前用户授完全控制再打标签。
@@ -311,6 +368,27 @@ def _probe_low_il() -> bool:
     return _low_il_ok
 
 
+def _probe_restricted() -> bool:
+    """`restricted` 档能否**真正执行**（不只是"令牌造得出来"）。
+
+    两个条件缺一不可：
+
+    1. `win_token.probe()` —— 受限令牌能创建（logon SID 与 advapi32 都在）；
+    2. `win_token.exec_ready()` —— 执行层能真的**以该受限令牌拉起进程**
+       并取回 stdout/stderr（`win_launch.smoke_test()` 端到端实测）。
+
+    第 2 条是实测而非开关。本机零点提权的普通账户上它恒为假：
+    `CreateProcessAsUserW` 需要 `SeIncreaseQuotaPrivilege`（未分配，err=5），
+    `CreateProcessWithTokenW` 需要 `SeImpersonatePrivilege`（未分配，err=1314）。
+    此时 `resolve_level` 降级到 `low_il`（仍在底线上，不拒绝启动），
+    并把具体原因（`win_token.exec_unavailable_reason()`）写进 `reasons`。
+    """
+    global _restricted_ok
+    if _restricted_ok is None:
+        _restricted_ok = win_token.probe() and win_token.exec_ready()
+    return _restricted_ok
+
+
 def appcontainer_workspace() -> str:
     """AppContainer 需要授权的那个目录（工作区根）。
 
@@ -327,6 +405,23 @@ def appcontainer_workspace() -> str:
 
 # ── 子进程侧：把自己降级 ────────────────────────────────────────────
 
+def child_applicable_level(level: Level) -> Level:
+    """子进程**实际**能达到的档位（不等于请求档位）。
+
+    为什么需要这个函数：`restricted` 靠 **restricting SID 建令牌**，而那必须发生在
+    `CreateProcessAsUserW` 建进程的那一刻（父进程侧）。子进程自己启动后再怎么改令牌
+    也无法获得 restricting SID —— 所以子进程入口只能做到 Low IL。
+
+    这意味着 `run_code` 的 worker（普通 `Popen` + 子进程自降级）在 `restricted` 档下
+    真实强度是 `low_il`。把它说成 `restricted` 就是谎报：配置、`/v1/system/isolation`、
+    日志三处都会声称比实际更强。所以把"子进程能到哪一档"收成单一事实源，供
+    `apply_in_child()` 与调用方共同引用。
+    """
+    if level is Level.RESTRICTED:
+        return Level.LOW_IL
+    return level
+
+
 def apply_in_child(level: Level) -> None:
     """在**子进程**入口调用，把自身令牌降到 Low 完整性。
 
@@ -334,10 +429,21 @@ def apply_in_child(level: Level) -> None:
     没有撤销 API（这是设计而非缺陷 —— 它保证降级不可逆）。父进程若调用，
     引擎自身就被降级了。
 
+    传入 `RESTRICTED` 时会降到 `LOW_IL`（见 `child_applicable_level` 的说明），
+    并在 stderr 留一行说明 —— 不静默。仍然**高于硬底线**：Low IL 挡得住写工作区
+    之外，所以这不是"退回无隔离"。
+
     失败时不抛异常而是 `os._exit(9)`：一个"以为自己被隔离"的子进程比没有
     隔离更危险。
     """
-    if level.rank < Level.LOW_IL.rank or not win.IS_WINDOWS:
+    applied = child_applicable_level(level)
+    if level is Level.RESTRICTED and applied is not level:
+        sys.stderr.write(
+            "[isolation] restricted 需要父进程建受限令牌，子进程只能做到 low_il；"
+            "按 low_il 执行（仍拒绝写工作区之外）\n"
+        )
+        sys.stderr.flush()
+    if applied.rank < Level.LOW_IL.rank or not win.IS_WINDOWS:
         return
     if not win.set_integrity_level(win.INTEGRITY_LOW):
         sys.stderr.write(
@@ -364,15 +470,45 @@ def spawn_kwargs(decision: IsolationDecision) -> dict[str, Any]:
     return kwargs
 
 
-def wrap_async_process(proc: Any, decision: IsolationDecision) -> win.JobObject | None:
+#: 面向「执行一条命令」的 Job 额度：收束进程树与内存，**不设 CPU 上限**。
+#:
+#: `cpu_seconds=0` 是刻意为之：Job 的 `PerProcessUserTimeLimit` 计的是**CPU 时间**，
+#: 与墙钟超时是两回事。把 CPU 上限压到低于墙钟 timeout，构建类命令会在看起来还有
+#: 充裕时间时被内核杀掉，且退出码不带任何解释 —— 比不设上限更难排查。
+#: 墙钟超时已由调用方的 `asyncio.wait_for` 兜底，这里补它做不到的两件事：
+#: 整棵进程树回收、单进程内存失控拦截。
+COMMAND_LIMITS = win.ResourceLimits(
+    memory_bytes=2 * 1024**3,
+    cpu_seconds=0,
+    active_processes=64,
+)
+
+#: 长驻 shell 的额度。内存放得比一次性命令宽，因为一个 `npm install` 或 dev server
+#: 的峰值远超单次脚本；`KILL_ON_JOB_CLOSE` 保证 session 关闭时不留孤儿进程。
+SHELL_LIMITS = win.ResourceLimits(
+    memory_bytes=4 * 1024**3,
+    cpu_seconds=0,
+    active_processes=64,
+)
+
+
+def wrap_async_process(
+    proc: Any,
+    decision: IsolationDecision,
+    limits: win.ResourceLimits | None = None,
+) -> win.JobObject | None:
     """把刚 spawn 出来的进程挂进 Job Object。返回 job 供调用方持有到进程结束。
 
     必须由调用方持有引用：job 句柄一关，`KILL_ON_JOB_CLOSE` 立刻杀光进程树 ——
     这是**特性**（超时/异常时保证不留孤儿），但提前 GC 会导致子进程莫名被杀。
+
+    `limits` 留空则用 `ResourceLimits` 的默认值（512MB / 60s CPU / 16 进程），
+    那套默认值面向单次脚本执行；长驻 shell 与构建命令需要各自的额度，否则
+    `npm install` 会被 512MB 上限直接打死，而"构建莫名失败"比"没有上限"更难排查。
     """
     if decision.effective.rank < Level.JOB.rank or not win.IS_WINDOWS:
         return None
-    job = win.JobObject()
+    job = win.JobObject(limits)
     if not job.open():
         return None
     pid = getattr(proc, "pid", None)
@@ -506,12 +642,15 @@ def revoke_all() -> dict[str, Any]:
 
 __all__ = [
     "ALLOW_DOWNGRADE_ENV",
+    "COMMAND_LIMITS",
     "DEFAULT_LEVEL",
     "FLOOR_LEVEL",
     "LEVEL_ENV",
+    "SHELL_LIMITS",
     "IsolationDecision",
     "Level",
     "apply_in_child",
+    "child_applicable_level",
     "clear_runtime_level",
     "configured_level",
     "downgrade_allowed",

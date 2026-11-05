@@ -178,14 +178,6 @@ const routes = [
         component: () => import('../views/admin/DiagnosticsView.vue'),
         meta: { title: t('admin.diagnostics') },
       },
-      // ── 平台 ──
-      // D3：用量目录（"花在哪"的构成）—— 与成本中心同域，故相邻。
-      {
-        path: 'api-docs',
-        name: 'AdminApiDocs',
-        component: () => import('../views/admin/ApiDocsView.vue'),
-        meta: { title: t('knowledge.api_documentation') },
-      },
       // ── 旧入口重定向（书签 / 文档 / 告警链接兼容）──
       { path: 'redis', redirect: { path: '/admin/datastores', query: { tab: 'redis' } } },
       { path: 'database', redirect: { path: '/admin/datastores', query: { tab: 'database' } } },

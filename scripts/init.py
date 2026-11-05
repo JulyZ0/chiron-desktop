@@ -448,6 +448,73 @@ def _validate_before_save(env: dict[str, str]) -> bool:
     return True
 
 
+def _is_elevated() -> bool:
+    """当前进程是否持有提权（管理员）令牌。仅 Windows 有意义。
+
+    刻意在这里重写一份而不 import run.py：run.py 在模块级执行 `load_env_file()`
+    并注册 SERVICES，import 它就等于把启动脚本的副作用拖进初始化助手。
+    argtypes 必须显式声明 —— `ctypes.windll` 默认按 int 传参，64 位下 HANDLE 被
+    截断成 32 位，`OpenProcessToken` 会返回 ERROR_INVALID_HANDLE(6)，
+    看起来像权限不足，实际是类型声明错。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        adv.OpenProcessToken.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+        ]
+        adv.OpenProcessToken.restype = wintypes.BOOL
+        adv.GetTokenInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        adv.GetTokenInformation.restype = wintypes.BOOL
+
+        token = wintypes.HANDLE()
+        if not adv.OpenProcessToken(
+            k32.GetCurrentProcess(), 0x0008, ctypes.byref(token)  # TOKEN_QUERY
+        ):
+            return False
+        try:
+            elevated = wintypes.DWORD()
+            size = wintypes.DWORD()
+            if not adv.GetTokenInformation(
+                token, 20, ctypes.byref(elevated),  # TokenElevation
+                ctypes.sizeof(elevated), ctypes.byref(size),
+            ):
+                return False
+            return bool(elevated.value)
+        finally:
+            k32.CloseHandle(token)
+    except Exception:  # noqa: BLE001 — 判定失败按"未提权"处理，提示偏保守
+        return False
+
+
+def _isolation_notice() -> None:
+    """说明 Windows 执行隔离实际能用到哪一档。
+
+    放在自检里而不是只写文档：`restricted` 档（受限令牌 + 独立桌面）需要
+    `SeIncreaseQuotaPrivilege`，该特权只授予提权令牌 —— 未提权时引擎会静默降级到
+    `low_il`。初始化助手是用户配置部署参数的环节，在这里说清前置条件，
+    才不至于让 .env 里写着的档位与实际跑的档位长期不一致。
+    """
+    if sys.platform != "win32":
+        return
+    if _is_elevated():
+        ok("执行隔离：已提权，restricted 档（受限令牌 + 独立桌面）可启用")
+        return
+    warn("执行隔离：当前未以管理员身份运行，restricted 档不可用")
+    info("     将降级为 low_il（仍高于硬底线：写入工作区之外会被拒）。")
+    info("     启用 restricted：以管理员身份打开终端再跑 python run.py start。")
+
+
 def _next_steps() -> None:
     banner("下一步")
     info("1) 执行数据库迁移（若尚未执行）：")
@@ -530,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
     env_ok = _validate_before_save(env)
     env_ok = check_postgres(env.get("POSTGRES_DSN", "")) and env_ok
     check_redis(env)
+    _isolation_notice()
 
     if args.check:
         return 0 if env_ok else 1

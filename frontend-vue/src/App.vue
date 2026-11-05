@@ -7,6 +7,7 @@ import AppLayout from './components/AppLayout.vue'
 import RouteProgressBar from './components/common/RouteProgressBar.vue'
 import ErrorBoundary from './components/common/ErrorBoundary.vue'
 import ImageViewer from './components/common/ImageViewer.vue'
+import TakeoverOverlay from './components/agent/TakeoverOverlay.vue'
 import { useThemeStore } from './stores/theme'
 import { useTypographyStore } from './stores/typography'
 import { languageMeta } from './i18n/languages'
@@ -50,6 +51,9 @@ watchEffect(() => {
     </ErrorBoundary>
     <!-- 全局单例：任何位置的图片都能唤起同一个查看器 -->
     <ImageViewer />
+    <!-- Super-agent 接管段：全站锁 + 唯一出口（打断）。
+         只在已登录布局下挂载 —— 登录页没有会话，挂上去只会每 5 秒打一次 401。 -->
+    <TakeoverOverlay v-if="showLayout" />
   </ConfigProvider>
 </template>
 

@@ -22,6 +22,7 @@ import { listKnowledgeBases, listPlugins, listSkillResources } from '../api'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import ToolPicker from '../components/agent/ToolPicker.vue'
+import TakeoverPanel from '../components/agent/TakeoverPanel.vue'
 import SaveToKnowledgeDialog from '../components/chat/SaveToKnowledgeDialog.vue'
 import { setChatPrefill } from '../components/chat/chatPrefill'
 import { agentResultToMarkdown, parseAgentResult } from '../utils/agentResultMarkdown'
@@ -723,6 +724,15 @@ function toolCount(a: Agent): number {
         </div>
       </TabPane>
 
+      <!-- ── Tab 3：Super-agent 接管 ──
+           放在最后而不是第一个：接管是「配置一次、长期放着」的东西，
+           日常高频操作是前两个 Tab。放在首位会让每次进页面都多一次视觉负担。 -->
+      <TabPane
+        key="takeover"
+        :tab="$t('agent.superagent_title')"
+      >
+        <TakeoverPanel />
+      </TabPane>
     </Tabs>
 
     <!-- ── 新建/编辑 Modal ── -->

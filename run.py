@@ -293,6 +293,81 @@ def gray(text: str) -> str:
     return color(text, "90")
 
 
+# ── 隔离档位可用性（Windows）──────────────────────────────────
+#
+# 为什么放在启动脚本而不是只在引擎里判：引擎侧的降级是"静默"的 —— 它写进
+# `/v1/system/isolation` 的 reasons 与日志，但用户在终端只会看到"启动成功"。
+# 于是出现 README 承诺落空的那类情形：配置写着 restricted，实际跑的是 low_il，
+# 而启动输出里没有任何一句话提醒。启动脚本是唯一必定被看到的位置。
+
+
+def is_elevated() -> bool:
+    """当前进程是否持有提权（管理员）令牌。非 Windows 恒为 False。
+
+    argtypes 必须显式声明：`ctypes.windll` 默认按 int 传参，64 位下 HANDLE 会被
+    截断成 32 位，`OpenProcessToken` 因此返回 ERROR_INVALID_HANDLE(6) —— 一个
+    看起来像"没有权限"、实际是类型声明错的错误。这正是本地探针首次踩的坑。
+    """
+    if not is_windows():
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE),
+        ]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+        token = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(
+            kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)  # TOKEN_QUERY
+        ):
+            return False
+        try:
+            elevated = wintypes.DWORD()
+            size = wintypes.DWORD()
+            if not advapi32.GetTokenInformation(
+                token, 20, ctypes.byref(elevated),  # TokenElevation
+                ctypes.sizeof(elevated), ctypes.byref(size),
+            ):
+                return False
+            return bool(elevated.value)
+        finally:
+            kernel32.CloseHandle(token)
+    except Exception:  # noqa: BLE001 — 判定失败按"未提权"处理，提示偏保守
+        return False
+
+
+def print_isolation_notice() -> None:
+    """启动前说明 Windows 隔离档位实际可用到哪一层。
+
+    **不阻断启动**：未提权时降级到 `low_il` 仍在硬底线之上（写入工作区之外
+    被拒），不是"没有隔离"，所以没有理由拦住服务。但必须把差距说出来 ——
+    让用户以为开了 restricted 而实际没有，比坦白降级糟糕得多。
+    """
+    if not is_windows():
+        return
+    if is_elevated():
+        print(green("  隔离：已提权，restricted 档（受限令牌 + 独立桌面）可启用"))
+        return
+    print(yellow("  隔离：当前终端未以管理员身份运行"))
+    print(gray("     restricted 档不可用（创建受限进程需要 SeIncreaseQuotaPrivilege），"))
+    print(gray("     将降级为 low_il；差距会写进 /v1/system/isolation 的 reasons 与引擎日志。"))
+    print(gray("     启用方式：右键终端「以管理员身份运行」后重跑 python run.py start"))
+
+
 # ── 服务管理 ──────────────────────────────────────────────────
 
 class ServiceManager:
@@ -550,6 +625,9 @@ class ServiceManager:
     def start(self, background: bool = True, services: list = None):
         """启动服务"""
         print(bold("\n═══ chiron 服务启动 ═══\n"))
+
+        # 隔离档位可用性：必须在起任何服务之前说，否则用户只会看到"已启动"
+        print_isolation_notice()
 
         targets = services or list(SERVICES.keys())
 

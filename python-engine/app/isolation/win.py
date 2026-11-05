@@ -33,6 +33,7 @@ import ctypes
 import ctypes.wintypes as wt
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -398,6 +399,78 @@ def remove_appcontainer_path(sid: str, path: str) -> tuple[bool, str]:
 #   * 给 Low IL SID 授写 ACE **无效** —— 完整性检查在 DACL 之前，降级才是正解。
 INTEGRITY_LABEL_LOW = "(OI)(CI)L"
 INTEGRITY_LABEL_MEDIUM = "(OI)(CI)M"
+
+#: AppContainer 包 SID 的前缀。`S-1-15-2-<散列>` 是 Windows 为 profile 包分配的
+#: 身份，与真实用户/组的 SID（`S-1-5-21-...`）在形式上可区分。
+_APPCONTAINER_SID_RE = re.compile(r"S-1-15-2(?:-\d+)+")
+
+
+def remove_appcontainer_aces(path: str) -> tuple[bool, list[str], str]:
+    """移除目录上**残留的 AppContainer 包 SID ACE**，返回 `(成功, SID 列表, 错误)`。
+
+    ## 为什么必须做（本机实测根因）
+
+    `appcontainer` 档位会给工作区加一条显式 ACE（`*(包SID):(OI)(CI)(M)`），这是它
+    能加载可执行文件的前提。问题在于**档位切走之后这条 ACE 不会被清掉**，而它会让
+    后一档 `low_il` 彻底失效 —— 实测：
+
+    * 同一目录，带该 ACE 时 Low IL 子进程创建/修改文件一律 `PermissionError`；
+    * `icacls <dir> /remove:g *<包SID>` 之后，**立即恢复可写**；
+    * 把原 SDDL 写回去，又变回 `PermissionError`（可复现）。
+
+    也就是说 `appcontainer → low_il` 的降级路径会静默产出一个"根本写不了工作区"的
+    档位，而配置上看起来一切正常。这比不降级更糟，所以降级前必须先清干净。
+
+    ## 为什么不碰别人的 ACE
+
+    只删 `S-1-15-2-*` 前缀的项（AppContainer 包身份），用户/系统/组的 ACE 一律不动。
+    用正则从 `icacls` 输出里提取而不是按列切分：`icacls` 会把路径与第一条 ACE
+    打在同一行，按列解析会在路径变化时错位。
+    """
+    if not IS_WINDOWS:
+        return False, [], "非 Windows 平台"
+    try:
+        import subprocess
+
+        listed = subprocess.run(
+            ["icacls", path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, [], f"icacls 列举失败: {exc}"
+    if listed.returncode != 0:
+        return False, [], f"icacls 列举返回 {listed.returncode}"
+
+    # 去重且保序：同一 SID 可能因 OI/CI/IO 拆成多条
+    sids: list[str] = []
+    for m in _APPCONTAINER_SID_RE.findall(listed.stdout or ""):
+        if m not in sids:
+            sids.append(m)
+    if not sids:
+        return True, [], ""
+
+    for sid in sids:
+        try:
+            rm = subprocess.run(
+                ["icacls", path, "/remove:g", f"*{sid}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, sids, f"icacls 移除 {sid} 失败: {exc}"
+        if rm.returncode != 0:
+            return False, sids, f"icacls 移除 {sid} 返回 {rm.returncode}: " + (
+                (rm.stdout or rm.stderr).strip()[:200]
+            )
+    logger.info("removed stale AppContainer ACEs from %s: %s", path, sids)
+    return True, sids, ""
 
 
 def set_path_integrity(path: str, label: str = INTEGRITY_LABEL_LOW) -> tuple[bool, str]:

@@ -519,6 +519,8 @@ export default {
     level: "级别",
     coming_soon: "即将支持",
     minimal_2: "极简",
+    code_mode: "编码",
+    code_mode_desc: "编码闭环：定位/读取/修改/运行/看差异，不含删除；含 Git 状态与差异",
     remember: "记住",
     remember_this: "记住这条",
     continue: "继续",

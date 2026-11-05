@@ -657,6 +657,45 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
         prog, rest = os.environ.get("COMSPEC", "cmd.exe"), ["/d", "/s", "/c", *args]
 
     # S5-2：统一资源限制（POSIX 由 fork 后的子进程施加；Windows 无 resource，靠超时兜底）
+    #
+    # `restricted` 档走**完全不同的创建路径**：受限令牌 + 独立桌面 + 自建可继承管道
+    # （`win_launch.launch_restricted`）。它挡得住写，但也因此不能用
+    # `create_subprocess_exec` —— asyncio 的管道不可继承，句柄传不进子进程。
+    # 该路径是同步阻塞的（ReadFile + WaitForSingleObject），必须丢进线程，
+    # 否则一次 `npm run build` 会卡死整个事件循环。
+    try:
+        from app.isolation import Level, resolve_level
+
+        _decision = resolve_level()
+    except Exception as exc:  # noqa: BLE001 — 探测失败按"无隔离"降级，由下面既有路径兜底
+        logger.warning("shell_exec: resolve_level failed: %s", exc)
+        _decision = None
+
+    if _decision is not None and _decision.effective is Level.RESTRICTED:
+        from app.isolation import win_launch
+
+        result = await asyncio.to_thread(
+            win_launch.launch_restricted,
+            [prog, *rest],
+            cwd=str(workspace_dir()),
+            env=sandboxed_env(),
+            timeout=float(timeout),
+        )
+        if not result.started:
+            # 受限路径起不来就**拒绝执行**，不退回无隔离路径 ——
+            # 悄悄降级正是"看起来有隔离"的老问题。
+            return {
+                "error": f"sandbox unavailable: restricted exec failed — {result.spawn_error}",
+            }
+        stdout_text, stdout_truncated = truncate_execute_output(result.stdout)
+        stderr_text, stderr_truncated = truncate_execute_output(result.stderr)
+        return {
+            "exit_code": result.exit_code,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "truncated": stdout_truncated or stderr_truncated,
+        }
+
     proc = await asyncio.create_subprocess_exec(
         prog,
         *rest,
@@ -666,12 +705,26 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
         stderr=asyncio.subprocess.PIPE,
         **_rlimit_kwargs(),
     )
+    # Windows：挂进 Job Object。这是 `low_il` 以下（含）唯一覆盖**整棵进程树**的
+    # 机制 —— 墙钟 timeout 只能 kill 直接子进程，`cmd /c build.bat` 的孙进程会成孤儿。
+    # job 必须持有到进程结束：句柄一关 KILL_ON_JOB_CLOSE 立刻生效（见 wrap_async_process）。
+    job = None
+    try:
+        from app.isolation import COMMAND_LIMITS, resolve_level, wrap_async_process
+
+        job = wrap_async_process(proc, resolve_level(), COMMAND_LIMITS)
+    except Exception as exc:  # noqa: BLE001 — 隔离附加失败不应让命令跑不起来
+        logger.warning("shell_exec: job object attach failed: %s", exc)
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
         proc.kill()
         await proc.wait()
         return {"error": "timeout", "timeout": timeout}
+    finally:
+        # 必须显式关闭：job 句柄泄漏会累积内核对象，且 KILL_ON_JOB_CLOSE 永远不触发
+        if job is not None:
+            job.close()
     # 批 B 片 5：执行输出按字节上限截断，并**显式标注**截断量（exit_code 不受影响 ——
     # 不能因为输出太大就丢掉"命令到底成功没有"这个最关键的信息）
     stdout_text, stdout_truncated = truncate_execute_output(

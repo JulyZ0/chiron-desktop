@@ -16,7 +16,6 @@ import { createRouter, createMemoryHistory } from 'vue-router'
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
-  listPaymentChannels: vi.fn(),
 }))
 
 // antd 的 Table 走 useBreakpoint → responsiveObserve，jsdom 没有 matchMedia。
@@ -31,7 +30,6 @@ if (!window.matchMedia) {
 
 vi.mock('../../api', () => ({
   api: { get: apiMocks.get, post: apiMocks.post },
-  listPaymentChannels: apiMocks.listPaymentChannels,
 }))
 
 import BillingView from '../BillingView.vue'
@@ -122,7 +120,6 @@ describe('BillingView 用量分摊', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     stubApi()
-    apiMocks.listPaymentChannels.mockResolvedValue([{ id: 'alipay', currency: 'CNY' }])
   })
 
   it('首次加载显式带上默认的 groupBy=day & range=30d', async () => {

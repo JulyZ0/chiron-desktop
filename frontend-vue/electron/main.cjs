@@ -1677,6 +1677,27 @@ if (!gotLock) {
       return shared.pickDocumentResult(result)
     })
 
+    // ── 本地目录选择（项目根目录）──
+    //
+    // 与 `pick-document` 同一套约定：只回 `{ path, name }`，取消返回 `null`，
+    // 不在这里做路径合法性判断 —— 那是后端 `validateRootPath` 的职责
+    //（绝对路径 / 存在 / 是目录 / 非系统目录）。主进程多做一遍只会让两处判据漂移。
+    //
+    // `createDirectory` 允许用户在选择对话框里直接新建文件夹：让用户被迫先到资源管理器
+    // 建目录再回来选，是没必要的往返。
+    ipcMain.handle('desktop:pick-directory', async event => {
+      assertTrustedSender(event)
+      const owner = BrowserWindow.fromWebContents(event.sender)
+      const options = {
+        title: '选择项目文件夹',
+        properties: ['openDirectory', 'createDirectory'],
+      }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return shared.pickDirectoryResult(result)
+    })
+
     // ── 本地模型配置（provider / 端点 / 模型名 / key）──
     //
     // 三个动作都不抛异常给渲染进程：IPC 抛错会被 Electron 包成

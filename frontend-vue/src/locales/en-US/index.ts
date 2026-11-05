@@ -507,6 +507,8 @@ export default {
     level: "Level",
     coming_soon: "Coming soon",
     minimal_2: "Minimal",
+    code_mode: "Code",
+    code_mode_desc: "Coding loop: locate / read / edit / run / diff, no deletes; includes git status and diff",
     remember: "Remember",
     remember_this: "Remember this",
     continue: "Continue",

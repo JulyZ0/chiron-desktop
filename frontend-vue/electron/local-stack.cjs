@@ -745,6 +745,28 @@ function buildEngineEnv(info, options = {}) {
   // 单机模式：放行沙箱门禁，并让 Redis 从"必需"降为"可选"
   env.DEGRADED_MODE = 'true'
 
+  // 桌面端跑的是 **Windows 原生隔离层**（`python-engine/app/isolation`：Job Object /
+  // Low IL / 受限令牌 + 独立桌面），不跑容器。引擎侧 `SANDBOX_BACKEND` 默认 `service`，
+  // 而安装包里并没有 `SANDBOX_SERVICE_URL`。不显式声明 `local`，每次启动的日志都会写
+  // "service but SANDBOX_SERVICE_URL is not set ⇒ 进程内执行"，把真正生效的隔离层
+  // 描述成"没有隔离" —— 用户据此判断安全性时会得出相反的结论。
+  if ((options.env || {}).SANDBOX_BACKEND === undefined) env.SANDBOX_BACKEND = 'local'
+
+  // **必须显式放行隔离档位降级**，否则安装包必然起不来。
+  //
+  // 引擎缺省请求 `restricted`（`isolation.DEFAULT_LEVEL`），它要求
+  // `SeIncreaseQuotaPrivilege` —— 安装包以普通账户启动，`CreateProcessAsUserW`
+  // 恒返回 err=5。于是每次启动都会判定"降级到 low_il"，而
+  // `sandbox_isolation_allow_downgrade` 默认 false ⇒ `deps.verify_isolation_level`
+  // 直接抛错，引擎退出码 3，界面停在"引擎启动失败"（真机事故）。
+  //
+  // 这里放行的只是**降到 low_il**（仍在硬底线 `FLOOR_LEVEL` 之上，仍能挡写用户目录）。
+  // 降到 `job` / `none` 照样会被拒绝启动 —— 那个判断刻意不看这个开关，
+  // 因为它的语义是"接受稍弱"，不是"接受没有"。
+  if ((options.env || {}).SANDBOX_ISOLATION_ALLOW_DOWNGRADE === undefined) {
+    env.SANDBOX_ISOLATION_ALLOW_DOWNGRADE = 'true'
+  }
+
   // 引擎的全部落盘路径：**必须给绝对路径**，理由见 `LOCAL_DATA_SUBDIRS` 上方那段。
   // 这几项之前一个都没下发，于是打包态下引擎的默认值全部相对 cwd（只读的
   // `resources/python-engine`）：导入期 `SkillStore()` 的 mkdir 直接把 import 打挂，

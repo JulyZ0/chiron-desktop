@@ -178,6 +178,9 @@ export default {
   isolation_level_low_il: "低完整性",
   isolation_level_low_il_desc:
     "Windows 低完整性级别：对用户配置文件、凭据等位置的写入被拒绝。可读取同用户文件，挡不住读取。",
+  isolation_level_restricted: "受限令牌",
+  isolation_level_restricted_desc:
+    "受限令牌 + 独立桌面：去掉管理员组与写入类权限，进程只能写工作区。需要引擎以管理员身份运行才能启用；不可用时自动降为低完整性。",
   isolation_level_appcontainer: "应用容器",
   isolation_level_appcontainer_desc:
     "最强档位：独立容器身份，文件与网络按授权放行。需要管理员权限预置容器配置，部分环境不可用。",

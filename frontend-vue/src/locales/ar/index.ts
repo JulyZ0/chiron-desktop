@@ -509,6 +509,8 @@ export default {
     level: "المستوى",
     coming_soon: "قريبًا",
     minimal_2: "بسيط",
+    code_mode: "برمجة",
+    code_mode_desc: "حلقة برمجية: تحديد / قراءة / تعديل / تشغيل / فروقات، بدون حذف",
     remember: "تذكّر",
     remember_this: "تذكّر هذا",
     continue: "متابعة",

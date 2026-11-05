@@ -457,6 +457,18 @@ class Settings(BaseSettings):
     superagent_watchdog_nudge_after: int = 2
     superagent_watchdog_stop_after: int = 4
 
+    # ── Super-agent 接管（定时巡检 + 无人值守推进）──
+    # 与看门狗的区别：看门狗只**观察并提示**，接管会真的起一次 run 去推进任务。
+    # 因为它会花钱、会改文件，默认关；`false` 时 worker **不创建循环任务**。
+    #
+    # 这个开关是**引擎进程级**的，不是用户配置。用户的定时配置在 PG 里
+    # （`superagent_takeovers`），两者是"引擎愿不愿意巡检"与"用户要不要巡检"两道闸。
+    # 引擎关着而用户开着时，API 的 `/v1/superagent/status` 会如实返回，前端据此提示。
+    superagent_takeover_enabled: bool = False
+    #: 巡检节拍（秒，下限 30）。它不等于用户的接管间隔 —— 用户设 15 分钟时，
+    #: 循环仍每 60 秒扫一遍，由 L0 判定"到点没有"。这样到点误差不超过一个节拍。
+    superagent_takeover_tick_seconds: int = 60
+
     # ── 直连引擎的 Bearer JWT 旁路（安全开关）──
     # false（默认）：引擎拒绝 Bearer 直连，只接受带 X-Internal-Token 的网关代理请求。
     # true：允许持任意合法 JWT 的调用方绕过网关直连引擎并自报 tenant_id ——

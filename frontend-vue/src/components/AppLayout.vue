@@ -47,7 +47,10 @@ import {
 } from '../types/workstation'
 
 import { useI18n } from 'vue-i18n'
+import { useTakeoverPresence } from '../composables/useTakeoverPresence'
 const { t: tr } = useI18n()
+// Super-agent 接管的让步信号之一：让引擎知道"我还在这一页"，避免在打字间隙被抢走会话
+useTakeoverPresence()
 const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()

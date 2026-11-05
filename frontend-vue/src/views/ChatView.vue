@@ -738,6 +738,7 @@ function onReasoningLanguageChange(v: unknown) {
 const modeOptions = [
   { label: t('common.normal'), value: 'normal' },
   { label: t('common.minimal_2'), value: 'minimal' },
+  { label: t('common.code_mode'), value: 'code' },
 ]
 /** 默认模式：会话没记（或记了个不认识的值）时回落到它 —— **绝不能沿用上一个会话的模式** */
 const DEFAULT_MODE = 'normal'
@@ -757,6 +758,7 @@ const llmModel = ref('')
 const MODE_PRESETS = computed<Record<string, { temperature: number; note?: string; desc: string }>>(() => ({
   normal: { temperature: 0.6, desc: t('agent.general_assistant_12_core_tools_injects_memory_skill_knowledge_base_context') },
   minimal: { temperature: 0.2, note: t('chat.brief_reply'), desc: t('common.minimal_only_read_file_edit_file_shell_exec_no_context_injection_no_compression') },
+  code: { temperature: 0.1, desc: t('common.code_mode_desc') },
 }))
 
 /** 构建 llm_config：mode + 对应预设 temperature/max_tokens + 模型路由 model（base 已显式携带的字段优先保留） */

@@ -161,3 +161,62 @@ export interface BranchResult {
   copied: number
   condensed: boolean
 }
+
+// ── 项目（Workspace 即项目）──
+//
+// 语义见 `docs/project-management-design.md`：一个 workspace 要么是**项目**
+// （`root_path` 非空，绑定本地文件夹），要么是**画布**（`root_path` 为空，旧形态）。
+// 会话归属不是独立表，而是 `session_map_nodes` 里 `edge_kind='project'` 的行。
+
+/**
+ * `GET /v1/session-map/projects` 的元素。
+ *
+ * `session_count` 与 `last_active_at` 由后端子查询聚合，**前端不重算** ——
+ * 侧边栏只是展示，重算会引入"列表里的数字和点进去看到的不一致"。
+ */
+export interface ProjectSummary {
+  id: string
+  name: string
+  /** 项目绑定的本地文件夹，绝对路径 */
+  root_path: string
+  sort_index: number
+  /** 项目内会话数（`edge_kind='project'` 去重计数） */
+  session_count: number
+  /** 项目内最近活跃会话的更新时间；无会话时为空串 */
+  last_active_at: string
+  updated_at: string
+}
+
+/** 项目内的一条会话（`GET /v1/session-map/projects/{id}/sessions` 的元素）。 */
+export interface ProjectSessionSummary {
+  id: string
+  title: string
+  status: string
+  updated_at: string
+  pinned: boolean
+  /** 归入项目的时间 */
+  bound_at: string
+}
+
+/**
+ * 创建项目 / 局部更新项目时提交的字段。
+ *
+ * 全部可选：`PATCH` 用「字段是否存在」区分「不修改」与「改成空」，
+ * 因此**不要**给未修改的字段填默认值再提交 —— 那会把它们真的改掉。
+ */
+export interface ProjectDraft {
+  name?: string
+  root_path?: string
+  sort_index?: number
+}
+
+/**
+ * 绑定会话失败时的冲突信息（HTTP 409）。
+ *
+ * 后端在 `data` 里给出占用方，前端据此提示「该会话已在「xxx」项目中，是否移动？」，
+ * 用户确认后带 `force=true` 重试。
+ */
+export interface ProjectBindConflict {
+  owner_project_id: string
+}
+

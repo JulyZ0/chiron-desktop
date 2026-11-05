@@ -395,6 +395,12 @@ func NewGatewayRouter(
 	mux.Handle("GET /v1/agents/sessions", authMW(rlMW(http.HandlerFunc(agentHandler.ListSessions))))
 	mux.Handle("GET /v1/agents/sessions/{id}", authMW(rlMW(http.HandlerFunc(agentHandler.GetSession))))
 
+	// Super-agent 接管（见 docs 与 internal/api/routes_superagent.go）：
+	// 配置 CRUD 在网关（身份取自 claims），运行时端点（presence/segment/interrupt/status）
+	// 代理到引擎 —— 那些是只有引擎才知道的事实。
+	superagentHandler := NewSuperagentHandler(pythonClient)
+	superagentHandler.RegisterRoutes(mux, authMW, rlMW)
+
 	// 会话运行时状态与遥测（P1 单一事实源；见 docs/session-runtime-spec.md）
 	sessionRuntimeHandler := NewSessionRuntimeHandler(db.Redis, sessionMgr)
 	mux.Handle("GET /v1/sessions/{session_id}/runtime", authMW(rlMW(http.HandlerFunc(sessionRuntimeHandler.GetRuntime))))

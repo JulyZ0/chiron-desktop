@@ -2,7 +2,10 @@
   "extends": "@vue/tsconfig/tsconfig.dom.json",
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
-    "types": ["vite/client"],
+    /* 含 "node"：src 下的结构守卫测试会读源文件取证
+       （readFileSync(process.cwd() + ...)），需要 node:fs / node:path / process。
+       测试在 tsconfig.app 的 include 范围内，因此类型也必须在这里声明。 */
+    "types": ["vite/client", "node"],
     "allowArbitraryExtensions": true,
     "ignoreDeprecations": "6.0",
     "baseUrl": ".",

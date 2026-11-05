@@ -1,8 +1,26 @@
 """
 Alembic env configuration.
+
 Resolves the database URL from:
   1. DATABASE_DSN environment variable
   2. alembic.ini fallback
+
+**故意不读 `POSTGRES_DSN`** —— 两个变量面向不同对象，不是笔误，也不是待修的缺口：
+
+- ``POSTGRES_DSN``  开发环境用：用户/开发者自备的 PG（本机、Docker、共享实例）。
+  由 ``config/config.go`` 与 ``desktop-local/app/config.py`` 读取，是「连哪个库」的
+  常规配置。
+- ``DATABASE_DSN``  安装包内用：本文件只服务**托管 PG** 的迁移通道。桌面壳拉起
+  embedded PostgreSQL 后，由 ``desktop-local/app/storage/pg.py`` 在
+  ``alembic upgrade head`` 前后**临时写入 / 恢复**该变量，并用 ``_dotenv_noop()``
+  屏蔽 ``.env``，确保迁移只落在自己的实例上（事后还用 ``alembic_version`` 复核）。
+
+所以在开发环境想用 ``.env`` 里的 ``POSTGRES_DSN`` 跑迁移，必须显式转一次名：
+
+    DATABASE_DSN="$POSTGRES_DSN" python -m alembic upgrade head
+
+两条通道分开的理由：托管实例的 DSN 由程序计算（端口、密码每次安装都可能不同），
+不该被用户 ``.env`` 里的开发库地址覆盖；反过来，托管路径也不该改写开发的约定。
 """
 import os
 from logging.config import fileConfig

@@ -16,6 +16,7 @@ import type { ChatItem, ChatSession } from './chat-types'
 import SubAgentPanel from './SubAgentPanel.vue'
 import { mergeTagOptions, normalizeTag, TAG_MAX_LEN } from './sessionTags'
 import SessionStatsPanel from './SessionStatsPanel.vue'
+import ProjectSidebar from '../../views/sessionmap/ProjectSidebar.vue'
 import ThemeSwitcher from '../ThemeSwitcher.vue'
 import LanguageSwitcher from '../common/LanguageSwitcher.vue'
 import SettingsPanel from '../settings/SettingsPanel.vue'
@@ -412,6 +413,38 @@ function onMenuOpenChange(open: boolean, id: string) {
   menuSessionId.value = open ? id : null
 }
 
+/**
+ * 项目树实例。只在「新建会话」后手动刷新它 —— 新建的会话会进入「未归入」分组，
+ * 不刷新的话用户刚建完就看不到它，会以为创建失败。
+ */
+const projectSidebar = ref<{ refresh: () => Promise<void> } | null>(null)
+
+/**
+ * 从项目行里「新建会话」。
+ *
+ * 目前**不带项目上下文**：新建会话的 cwd 归属要等 P3（把 `root_path` 接成执行目录）
+ * 才有意义，现在传过去后端也无处安放。这里显式接收 `projectId` 并留给后续接线，
+ * 而不是直接写 `@create-session="emit('create')"` —— 那种写法会让参数在模板里
+ * 被静默吞掉，将来接 P3 时很难看出这里本就该有参数。
+ */
+function onProjectCreateSession(_projectId: string) {
+  emit('create')
+}
+
+// 会话数量变化即刷新项目树：新建的会话会落进「未归入」分组，删掉的会话会从项目里消失。
+//
+// 为什么不挂在 `emit('create')` 后面：会话由父组件异步创建（要等后端返回 id），
+// 事件发出的那一刻新会话还不存在，立刻刷新只会拿到旧数据。
+// 监听 `sessions.length` 则天然落在数据真正到达之后。
+watch(
+  () => props.sessions.length,
+  () => {
+    // 视图未切到项目时组件未被渲染，ref 为 null，这里静默跳过 ——
+    // 切回去时 ProjectSidebar 自己的 onMounted 会拉一次最新数据。
+    void projectSidebar.value?.refresh()
+  },
+)
+
 // 选中会话：切到该会话轨迹（父级 switchSession 加载消息）
 function pickSession(id: string) {
   emit('switch', id)
@@ -679,8 +712,24 @@ function pickSession(id: string) {
       </div>
     </template>
 
-    <!-- 从视图：会话历史列表（新对话 + 搜索 + 行操作菜单 + 用户） -->
-    <template v-else>
+    <!-- 从视图：项目（主）+ 全部会话（次） -->
+    <template v-else-if="view === 'sessions'">
+      <!--
+        项目分组放在最上方：侧边栏的第一屏应该是"我有哪些项目"，
+        而不是"最近聊过什么"。旧的扁平列表退居其下，仍保留会话级操作
+        （重命名 / 置顶 / 标签 / 分享 / 删除），避免这次改造丢掉既有功能。
+      -->
+      <ProjectSidebar
+        ref="projectSidebar"
+        @open-session="pickSession"
+        @create-session="onProjectCreateSession"
+        @open-canvas="emit('open-map')"
+      />
+
+      <div class="sessions-divider">
+        <span>{{ $t('chat.all_sessions') }}</span>
+      </div>
+
       <div class="sessions-head">
         <Button
           block
@@ -1130,6 +1179,25 @@ function pickSession(id: string) {
 
 /* ── 从视图：会话历史列表 ── */
 .sessions-head { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px 0; }
+/* 项目树与「全部会话」之间的分隔：两者是不同维度（组织 vs 时间），需要视觉断点 */
+.sessions-divider {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.sessions-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-color);
+}
 .session-list { flex: 1; overflow-y: auto; padding: 6px; scrollbar-width: thin; scrollbar-color: var(--text-disabled) transparent; }
 
 /* P3-D: 标签筛选与展示 */

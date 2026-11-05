@@ -199,16 +199,44 @@ def verify_isolation_level() -> None:
     * 本机做不到请求的档位 ⇒ 除非 `SANDBOX_ISOLATION_ALLOW_DOWNGRADE=true`，否则拒绝；
     * 降级被允许时，**把实际生效档位打进日志** —— 降级必须可见，不许静默。
     """
-    from app.isolation import downgrade_allowed, parse_level, resolve_level
+    from app.isolation import configured_level, downgrade_allowed, resolve_level
 
-    raw = (os.getenv("SANDBOX_ISOLATION_LEVEL") or "").strip()
+    # 档位必须走 `configured_level()` 的优先级（运行时覆盖 > env > settings > 默认），
+    # 不能只读 `os.getenv`。
+    #
+    # 此前这里手写 `os.getenv("SANDBOX_ISOLATION_LEVEL")`，于是 `.env` 里配的档位对
+    # **启动门禁完全无效**：用户写了 `SANDBOX_ISOLATION_LEVEL=low_il`，门禁照默认
+    # `restricted` 判定，普通账户下必然"降级"，再被 `allow_downgrade=false` 拒绝启动。
+    # 配置写了却没人读，正是这个仓库反复踩的坑（见 `_apply_sandbox_service_branch` 注释）。
+    #
+    # `configured_level()` 内部已是"拼错就抛"，所以不必在这里重复解析。
     try:
-        requested = parse_level(raw)
-    except ValueError as exc:
+        requested = configured_level()
+    except (ValueError, RuntimeError) as exc:
         logger.error("Refusing to start: %s", exc)
         raise RuntimeError(str(exc)) from exc
 
     decision = resolve_level(requested)
+
+    # 实际档位**落到硬底线以下**时，任何配置都不能放行 —— 包括 `ALLOW_DOWNGRADE`。
+    # 那个开关的语义是"接受稍弱"，不是"接受没有"（见 `IsolationDecision.below_floor`
+    # 与 `require_or_raise` 的注释）。
+    #
+    # 此前这里只判 `decision.degraded`，于是"降到 `job`"也会被 `allow_downgrade` 放过：
+    # 引擎正常启动、日志写着"已允许降级"，但每条命令执行时才被 `require_or_raise`
+    # 拒绝 —— 表现成"服务起来了但什么都不能做"，比启动即失败更难查。
+    if decision.below_floor:
+        msg = (
+            f"隔离档位低于硬底线：请求 {decision.requested.value}，"
+            f"实际 {decision.effective.value}（{'；'.join(decision.reasons) or '原因未知'}）"
+        )
+        logger.error(
+            "Refusing to start: %s. 这一档不受 SANDBOX_ISOLATION_ALLOW_DOWNGRADE 影响 —— "
+            "该开关只放宽到稍弱的隔离，不放行没有隔离。修好机制后重试。",
+            msg,
+        )
+        raise RuntimeError(msg) from None
+
     if decision.degraded:
         msg = (
             f"隔离档位降级：请求 {decision.requested.value}，实际 {decision.effective.value}"

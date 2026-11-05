@@ -37,8 +37,6 @@ import {
   PayCircleOutlined,
   ReconciliationOutlined,
   ControlOutlined,
-  
-  FileTextOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   BulbOutlined,
@@ -104,12 +102,6 @@ const menuGroups = computed(() => [
       { key: '/admin/datastores', label: t('common.data_storage'), icon: () => h(DatabaseOutlined) },
       // D1：自诊断 —— 与设置/数据存储同属"系统"类：都是"让部署正确运转"的操作面。
       { key: '/admin/diagnostics', label: t('admin.diagnostics'), icon: () => h(MedicineBoxOutlined) },
-    ],
-  },
-  {
-    key: 'g-platform', label: t('common.platform'),
-    children: [
-      { key: '/admin/api-docs', label: t('knowledge.api_documentation'), icon: () => h(FileTextOutlined) },
     ],
   },
 ])

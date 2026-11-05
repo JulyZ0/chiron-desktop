@@ -528,3 +528,55 @@ describe('ChatView 交互级：提交 → SSE 帧 → transcript', () => {
     }
   })
 })
+
+/**
+ * 模式选择器的接线（`normal` / `minimal` / `code`）。
+ *
+ * 存在的理由：`code` 模式曾在两处漏接过 —— ① 后端 `_BASE_MODES` 没有条目时，
+ * `get_mode_config` 会**静默回退 normal**；② 前端 `MODE_PRESETS` 漏条目时，
+ * `preset` 为 `undefined`，temperature 不生效、切换提示退化成通用文案。
+ * 两者都不会报错，只会让用户觉得「切了没变化」—— 与 2026-09 那次实测暴露的问题同型。
+ *
+ * 因此断言落在**真正下发的东西**上：`ChatInput` 收到的选项，以及 `/submit` 请求体里的
+ * `llm_config`。只断言 `mode` 会漏掉 temperature 那半边。
+ */
+describe('ChatView 模式选择器：code 模式的端到端接线', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    stream.onMessages = []
+    stream.onError = null
+    stream.closed = 0
+    apiMocks.api.get.mockImplementation(apiMocks.emptyList)
+    apiMocks.getChatSessionMessages.mockImplementation(apiMocks.emptyList)
+    // 与上面的 describe 同理：`clearAllMocks` 不清实现，列表被改成空会让发送被 `ensureModel()` 拦下。
+    apiMocks.listModels.mockImplementation(() => Promise.resolve([
+      { provider: 'test-provider', name: 'test-model', display_name: 'Test Model', context_window: 8192 },
+    ]))
+  })
+
+  it('ChatInput 拿到 code 选项（否则用户根本选不到）', async () => {
+    const wrapper = mount(ChatView, { global: { plugins: [router], stubs: STUBS } })
+    await flushPromises()
+
+    const opts = wrapper.findComponent(ChatInput).props('modeOptions') as
+      Array<{ label: string; value: string }>
+    expect(opts.map(o => o.value)).toContain('code')
+  })
+
+  it('选中 code 后提交 ⇒ llm_config 同时带 mode=code 与 temperature=0.1', async () => {
+    const wrapper = mount(ChatView, { global: { plugins: [router], stubs: STUBS } })
+    await flushPromises()
+
+    wrapper.findComponent(ChatInput).vm.$emit('update:mode', 'code')
+    await flushPromises()
+    wrapper.findComponent(ChatInput).vm.$emit('send', '改个 bug', [])
+    await flushPromises()
+
+    const submit = apiMocks.api.post.mock.calls.find(c => c[0] === '/submit')
+    expect(submit).toBeTruthy()
+    const cfg = (submit?.[1] as { llm_config: Record<string, unknown> }).llm_config
+    expect(cfg.mode).toBe('code')
+    // 这一条才是「漏加 MODE_PRESETS 条目」的探针：缺条目时 temperature 会留空。
+    expect(cfg.temperature).toBe(0.1)
+  })
+})

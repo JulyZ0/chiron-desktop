@@ -95,9 +95,9 @@ export const useAuthStore = defineStore('auth', () => {
           const creds = devAuthCredentials()
           if (!creds) {
             console.warn(
-              '[dev-auth-bypass] 已开启绕过，但未配置 VITE_DEV_AUTH_EMAIL / '
-              + 'VITE_DEV_AUTH_PASSWORD（写进 frontend-vue/.env.local，该文件不进版本库）。'
-              + '页面会因 401 显示空数据。',
+              '[dev-auth-bypass] enabled but VITE_DEV_AUTH_EMAIL / VITE_DEV_AUTH_PASSWORD '
+              + 'are not set (put them in frontend-vue/.env.local, which is not committed). '
+              + 'Pages will show empty data due to 401.',
             )
             return
           }
@@ -117,7 +117,7 @@ export const useAuthStore = defineStore('auth', () => {
           } catch (err) {
             // 后端没起 / 凭据过期时只记录，不阻塞挂载：绕过模式下守卫已放宽，
             // 界面仍可进入，只是数据为空。
-            console.warn('[dev-auth-bypass] 开发账号自动登录失败：', err)
+            console.warn('[dev-auth-bypass] dev auto-login failed:', err)
           }
           return
         }

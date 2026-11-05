@@ -42,8 +42,8 @@ const loadError = ref('')
 /** 待切换的档位（提交前先记下来，避免提交中状态抖回旧值） */
 const pendingLevel = ref<IsolationLevel | null>(null)
 
-/** 档位由弱到强，与后端 `_ORDER` 一致 */
-const ALL_LEVELS: IsolationLevel[] = ['none', 'job', 'low_il', 'appcontainer']
+/** 档位由弱到强，与后端 `_ORDER` 严格一致 */
+const ALL_LEVELS: IsolationLevel[] = ['none', 'job', 'low_il', 'restricted', 'appcontainer']
 
 const currentEffective = computed(() => status.value?.effective ?? null)
 
@@ -72,12 +72,36 @@ function levelDescription(level: IsolationLevel): string {
   return t(`settings.isolation_level_${level}_desc`)
 }
 
+/**
+ * 鉴权未就绪时的自愈：先补建本机会话，再重试一次。
+ *
+ * 为什么必须在面板这一层兜：`initToken()` 里本地分支是 `void ensureLocalSession()`
+ * —— **刻意不 await**，为了让首帧不被本地后端拖住。设置页若在这之前就挂载，
+ * `requestToken()` 返回空串，网关在 `ValidateToken` 之前就判 `tokenStr == ""`，
+ * 于是回一句 `missing authorization`（英文原文，且与"权限不足"毫无关系）。
+ * 这里补一次会话再重试，正常路径下用户根本看不到这个错误。
+ */
 async function load() {
   loading.value = true
   loadError.value = ''
   try {
     status.value = await getIsolationStatus()
   } catch (err) {
+    const status401 = (err as { response?: { status?: number } })?.response?.status === 401
+    if (status401) {
+      const ready = await authStore.ensureLocalSession(true)
+      if (ready) {
+        try {
+          status.value = await getIsolationStatus()
+          return
+        } catch (retryErr) {
+          loadError.value = serverErrorMessage(retryErr, t('settings.isolation_auth_pending'))
+          return
+        }
+      }
+      loadError.value = t('settings.isolation_auth_pending')
+      return
+    }
     loadError.value = serverErrorMessage(err, t('settings.isolation_load_failed'))
   } finally {
     loading.value = false
@@ -359,7 +383,7 @@ onMounted(load)
   background: var(--bg-card, transparent);
   color: var(--text-primary);
   cursor: pointer;
-  transition: border-color 0.15s, background-color 0.15s;
+  transition: border-color var(--dur-fast), background-color var(--dur-fast);
 }
 .iso-level:hover:not(.iso-level--disabled) { border-color: var(--primary); }
 .iso-level--active { border-color: var(--primary); background: var(--primary-bg, rgba(0, 0, 0, 0.02)); }

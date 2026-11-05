@@ -178,6 +178,9 @@ export default {
   isolation_level_low_il: "Low integrity",
   isolation_level_low_il_desc:
     "Windows low integrity level: writes to the user profile, credential stores and similar locations are denied. Files owned by the same user can still be read — it does not block reads.",
+  isolation_level_restricted: "Restricted token",
+  isolation_level_restricted_desc:
+    "Restricted token plus a dedicated desktop: admin groups and write-capable privileges are removed, so the process can only write the workspace. Requires the engine to run as administrator; falls back to Low integrity when unavailable.",
   isolation_level_appcontainer: "App container",
   isolation_level_appcontainer_desc:
     "Strongest tier: its own container identity, with file and network access granted per-capability. Requires administrator rights to provision the container profile; unavailable in some environments.",
