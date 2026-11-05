@@ -154,6 +154,7 @@ async def execute_tool_job(
     from app.tools.sandbox import (
         _rlimit_kwargs,
         check_shell_command,
+        isolation_exec_argv,
         sandboxed_env,
         workspace_dir,
     )
@@ -173,9 +174,20 @@ async def execute_tool_job(
         return {"job_id": job_id, "status": "blocked", "output": msg, "exit_code": -1}
 
     await _write_meta(redis, job_id, "running")
+    # 按档位包装：后台命令跑得比前台久得多（JOB_TIMEOUT 是 1 小时），若这里不降级，
+    # 它就是绕开隔离档位最长的一条路。装不上隔离层时 fail-closed（记 blocked），
+    # 不退回无隔离开启。
+    try:
+        exec_argv = isolation_exec_argv([*_shell_cmd(), command])
+    except Exception as exc:  # noqa: BLE001
+        msg = f"[blocked: isolation unavailable] {exc}"
+        await _write_meta(redis, job_id, "completed")
+        await _write_result(redis, job_id, "blocked", msg, -1)
+        _audit_job(command, OUTCOME_BLOCKED, started=started, reason=msg)
+        return {"job_id": job_id, "status": "blocked", "output": msg, "exit_code": -1}
+
     proc = await asyncio.create_subprocess_exec(
-        *_shell_cmd(),
-        command,
+        *exec_argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=str(workspace_dir()),

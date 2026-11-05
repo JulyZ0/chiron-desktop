@@ -168,3 +168,115 @@ async def test_sync_once_writes_nothing_when_no_source_answers(
     written, disagreements = await s.sync_once()
 
     assert written == 0 and disagreements == []
+
+
+# ── PriceToken（2026-11-06 实测响应形状）──
+
+
+def test_pricetoken_per_million_becomes_usd_per_1k() -> None:
+    """字段名是 ``*PerMTok`` ⇒ USD/1k = per_million / 1000。"""
+    payload = {
+        "data": [
+            {
+                "modelId": "claude-haiku-4-5-20251001",
+                "provider": "anthropic",
+                "inputPerMTok": 1,
+                "outputPerMTok": 5,
+                "status": "active",
+            }
+        ]
+    }
+
+    prices = s.parse_pricetoken(payload)
+
+    key = s.normalize_model("claude-haiku-4-5-20251001")
+    assert prices[key].input_per_1k == pytest.approx(0.001)
+    assert prices[key].output_per_1k == pytest.approx(0.005)
+    assert prices[key].provider == "anthropic"
+
+
+def test_pricetoken_skips_non_active_models() -> None:
+    """退役/预览模型不写进价格表：否则界面会显示一个已经不能用的模型的价格。"""
+    payload = {
+        "data": [
+            {"modelId": "old-model", "provider": "openai", "inputPerMTok": 1,
+             "outputPerMTok": 2, "status": "deprecated"},
+            {"modelId": "new-model", "provider": "openai", "inputPerMTok": 1,
+             "outputPerMTok": 2, "status": "active"},
+        ]
+    }
+
+    prices = s.parse_pricetoken(payload)
+
+    assert s.normalize_model("old-model") not in prices
+    assert s.normalize_model("new-model") in prices
+
+
+# ── Portkey 多厂商文件：provider 必须跟着文件走 ──
+
+
+def test_portkey_provider_follows_the_file() -> None:
+    """同一个解析器跑 4 份厂商文件；provider 若写死 "openai"，
+    写进 `model_prices` 的 anthropic 模型会全部被标成 openai。"""
+    payload = {
+        "claude-3-5-sonnet-20241022": {
+            "pricing_config": {
+                "pay_as_you_go": {
+                    "request_token": {"price": 0.0003},
+                    "response_token": {"price": 0.0015},
+                }
+            }
+        }
+    }
+
+    prices = s.parse_portkey(payload, provider="anthropic")
+
+    key = s.normalize_model("claude-3-5-sonnet-20241022")
+    assert prices[key].provider == "anthropic"
+
+
+def test_portkey_skips_all_zero_placeholder() -> None:
+    """各厂商文件都有一个 ``"default"`` 全零占位键，必须被跳过。"""
+    payload = {
+        "default": {
+            "pricing_config": {
+                "pay_as_you_go": {"request_token": {"price": 0}, "response_token": {"price": 0}}
+            }
+        }
+    }
+
+    assert s.parse_portkey(payload) == {}
+
+
+# ── 源目录：同一解析器的多份文件不能互相覆盖 ──
+
+
+async def test_sync_once_keeps_every_portkey_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`portkey` 在源目录里出现多次（按厂商分文件）。
+
+    若用解析器名做 `fetched` 的键，四次拉取会互相覆盖 —— 表现是"价格表里只剩最后一个
+    厂商"。这里断言各厂商的模型都进到了交叉验证的输入里。
+    """
+    seen_urls: list[str] = []
+
+    async def _fake(name: str, url: str, *, provider: str = "", **_kw: object):
+        seen_urls.append(url)
+        if name != "portkey" or not provider:
+            return None
+        model = f"{provider}-only"
+        return {model: _price(model, 0.001, 0.002)}
+
+    captured: dict[str, object] = {}
+
+    def _fake_cross(per_source, **_kw):
+        captured["keys"] = sorted(per_source)
+        return [], []
+
+    monkeypatch.setattr(s, "_fetch_source", _fake)
+    monkeypatch.setattr(s, "cross_validate", _fake_cross)
+
+    await s.sync_once()
+
+    keys = captured["keys"]
+    # 4 个 portkey 文件各自一个唯一键（解析器名:provider）
+    assert keys == ["portkey:anthropic", "portkey:deepseek", "portkey:google", "portkey:openai"]

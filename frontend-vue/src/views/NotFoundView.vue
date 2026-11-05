@@ -31,7 +31,7 @@ const router = useRouter()
 
 <style scoped>
 .nf-page {
-  min-height: 100dvh;
+  min-height: var(--app-height);
   display: flex;
   flex-direction: column;
   align-items: center;

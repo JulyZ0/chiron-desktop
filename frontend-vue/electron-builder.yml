@@ -138,6 +138,26 @@ extraResources:
       - "!data/**"
   - from: ../alembic.ini
     to: alembic.ini
+  # pageindex-service：知识库的**索引与检索实现方**。
+  #
+  # 与 python-engine 并列而不是放进 resources/components/：它是随包源码（不是
+  # 应用内下载的二进制组件），且有自己的 requirements.txt —— 解释器由
+  # `runtime-install.cjs` 的 `pageindex` 目标单独建 venv（与引擎的 openai 版本冲突，
+  # 不能合并）。
+  #
+  # 缺了它的表现是：知识库能建库、能上传，建索引永远停在 indexing ——
+  # `startLocalStack` 把知识库服务当可选组件，起不来不会阻断本地栈，
+  # 所以这类缺失不会在启动时报错，只会在这里悄悄丢能力。
+  - from: ../pageindex-service
+    to: pageindex-service
+    filter:
+      - "**/*"
+      - "!**/__pycache__/**"
+      - "!**/.pytest_cache/**"
+      - "!**/*.egg-info/**"
+      - "!**/.venv/**"
+      - "!tests/**"
+      - "!Dockerfile"
   # **安装包携带一份 CPython 与 uv**（都不是运行时依赖的替代品，而是必需品）：
   #   - `resources/python-runtime/<platform>/cpython-*/`：受管解释器，由
   #     `desktop-local/scripts/prepare_python.py` 在打包前就位（约 66MB）；

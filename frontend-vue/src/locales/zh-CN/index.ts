@@ -45,6 +45,13 @@ export default {
     // 浏览器标签页标题：由 `src/i18n/index.ts` 的 `applyDocumentLocale()` 写到 `document.title`。
     // 此前只有 `index.html` 里写死的中文标题 ⇒ 切到 en-US/ar 后标签页仍是中文。
     appTitle: 'Chiron AI Agent 工作平台',
+    // 自绘标题栏的窗口按钮（见 components/shell/TitleBar.vue）。
+    // 独立的 key 而不是复用 common.close：关闭**窗口**与关闭**面板**是不同的动作，
+    // 屏幕阅读器上要能听出区别。
+    windowMinimize: '最小化',
+    windowMaximize: '最大化',
+    windowRestore: '向下还原',
+    windowClose: '关闭窗口',
     // 中断留痕（notice 行）：断线 / 会话取消 / 超时这三种中断此前在界面上**毫无痕迹**，
     // 用户主动停止才有 `stopped` 标记（且那个标记不入库、刷新即消失）。
     turnInterrupted: '本回合被中断（连接断开或会话被取消）—— 已生成的内容保留在上方',

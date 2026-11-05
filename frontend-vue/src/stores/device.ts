@@ -46,8 +46,7 @@ export interface ChironDesktopHost {
   setMode?: (mode: ChironMode, opts?: { deleteLocalData?: boolean }) => Promise<void>
   restart?: () => Promise<void>
   /** 打开主进程的连接配置页（改服务地址）；老外壳没有这个成员 */
-  openSetup?: () => Promise<unknown>
-  /**
+  openSetup?: () => Promise<unknown>  /**
    * 当前 OS 账户的 `DOMAIN\username`。
    *
    * 本地模式下它就是"应用用户"：一个 OS 账户 = 一个应用用户，数据目录由
@@ -63,6 +62,49 @@ export interface ChironDesktopHost {
   wipeLocalData?: (password?: string) => Promise<WipeLocalDataResult>
   /** 本机 Windows Hello 是否可用；不可用时清空数据必须改验账户密码 */
   getHelloAvailability?: () => Promise<{ available: boolean; availability?: string }>
+  /**
+   * 用系统默认程序打开本地路径，或在文件管理器里定位（`reveal: true`）。
+   *
+   * 只接受**绝对路径**；主进程会先确认存在再交给系统。老外壳没有这个成员，
+   * 调用点必须能降级（例如复制路径并提示用户自己打开）。
+   */
+  openPath?: (payload: { path: string; reveal?: boolean }) => Promise<OpenPathResult>
+  /**
+   * 自绘标题栏的窗口控制（frameless 窗口里没有系统按钮，只能由页面提供）。
+   *
+   * 老外壳没有这个成员 —— 那时窗口仍然是系统框，页面不该画标题栏，
+   * 所以 `titleBar` 缺失就等价于 `mode: 'native'`。
+   */
+  titleBar?: WindowTitleBarApi
+}
+
+/** 标题栏形态：`custom` 自绘（Windows/Linux）、`inset` 原生红绿灯（macOS）、`native` 保留系统框 */
+export type TitleBarMode = 'custom' | 'inset' | 'native'
+
+/** 窗口可视状态：决定最大化和还原两个图标画哪一个 */
+export interface WindowState {
+  maximized: boolean
+  fullScreen: boolean
+  focused: boolean
+}
+
+/** preload 暴露的 `chironDesktop.titleBar`（见 electron/preload.cjs） */
+export interface WindowTitleBarApi {
+  mode: TitleBarMode
+  minimize: () => Promise<boolean>
+  toggleMaximize: () => Promise<WindowState>
+  close: () => Promise<boolean>
+  getState: () => Promise<WindowState>
+  /** 订阅最大化/全屏变化，返回取消订阅函数 */
+  onStateChange: (callback: (state: WindowState) => void) => () => void
+}
+
+/** `openPath` 的结构化结果：失败要能区分原因 */
+export interface OpenPathResult {
+  ok: boolean
+  /** `empty-path` / `not-absolute` / `missing` / `open-failed` */
+  reason?: string
+  message?: string
 }
 
 /** `wipeLocalData` 的结构化结果：失败也要能区分原因，而不是一律弹「失败了」 */

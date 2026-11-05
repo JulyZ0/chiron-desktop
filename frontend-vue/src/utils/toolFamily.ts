@@ -100,3 +100,35 @@ export function toolSummary(toolName: string, rawArgs: string, maxLen = 60): str
 
   return clip(rawArgs || '', maxLen)
 }
+
+/**
+ * 工具参数里的**目标路径**（工具调用要动/要看哪个文件）。
+ *
+ * 与 `toolSummary` 一样查 `SUMMARY_FIELDS` 的同一张表，**不新增第二套工具名清单**：
+ * 摘要显示哪个字段，这里就取哪个字段 —— 界面上看到 "read_file src/a.ts" 时，
+ * 点它打开的就该是 `src/a.ts`，两者不可能漂移。
+ *
+ * 只认**路径类**字段：`shell_exec` 的 `command` 也是字符串，但把整条命令行
+ * 当路径去打开文件是错的（`SUMMARY_FIELDS` 里它排第一，所以这里单独白名单）。
+ * 返回 `''` 表示"这个工具没有可打开的目标"。
+ */
+const PATH_FIELD_NAMES = new Set(['path', 'file_path', 'file', 'dir', 'directory'])
+
+export function toolTargetPath(toolName: string, rawArgs: string): string {
+  const fields = SUMMARY_FIELDS[toolName]
+  if (!fields) return ''
+  let parsed: Record<string, unknown> | null = null
+  try {
+    const value = JSON.parse(rawArgs || '{}')
+    parsed = value && typeof value === 'object' ? (value as Record<string, unknown>) : null
+  } catch {
+    return ''
+  }
+  if (!parsed) return ''
+  for (const key of fields) {
+    if (!PATH_FIELD_NAMES.has(key)) continue
+    const value = parsed[key]
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return ''
+}

@@ -396,6 +396,22 @@ func InjectSessionRuntime(r *http.Request, body map[string]interface{}) bool {
 		llmConfig["provider"] = cfg.provider.Value
 	}
 	body["llm_config"] = llmConfig
+
+	// `@路径` 引用：前端只发路径 token，文件内容在这里读取并展开。
+	//
+	// 这是「内容不进请求体」的落点之一（另一处是 SSE 链路的 HandleSubmit）。
+	// 展开失败一律静默跳过 —— `@` 在自然语言里本来就有别的含义（邮箱、人名），
+	// 不能因为一个 token 没匹配上文件就让整条消息发不出去。
+	//
+	// **只展开引擎实际会读的那一个**：引擎侧是
+	// `body.get("message") or body.get("user_input")`（unified_executor.py），
+	// 按同一优先级挑一次即可。两个都展开会在两者同时存在时把同一批文件读两遍，
+	// 而第二份根本不会进入 prompt。
+	if text, ok := body["message"].(string); ok && text != "" {
+		body["message"] = expandFileRefs(r.Context(), sessionID, text)
+	} else if text, ok := body["user_input"].(string); ok && text != "" {
+		body["user_input"] = expandFileRefs(r.Context(), sessionID, text)
+	}
 	return true
 }
 

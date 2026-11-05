@@ -294,6 +294,23 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
         # 于是 low_il 带着一条写不动的 ACL 静默上线（这正是实测到的缺陷）。
         _labeled_workspaces.discard(uri)
 
+        # **执行层尚未接入，所以这里必须降级，不能声称 appcontainer 生效。**
+        #
+        # 建 AppContainer 进程要 attribute-list（`PROC_THREAD_ATTRIBUTE_SECURITY_
+        # CAPABILITIES`），`subprocess` 与 `asyncio.create_subprocess_exec` 都表达
+        # 不了，必须 `UpdateProcThreadAttribute` + `CreateProcessW` 走独立路径
+        # （`spawn_kwargs` 里那个 `_appcontainer` 键至今没有任何调用方消费）。
+        #
+        # 原来这里直接 `return IsolationDecision(want, want, reasons)`，于是
+        # `/v1/system/isolation`、前端面板与审计日志一致声称 appcontainer 生效，
+        # 而实际执行的仍是 low_il —— 正是 `child_applicable_level` 文档点名的
+        # "配置、状态、日志三处谎报"。
+        reasons.append(
+            "AppContainer 执行层尚未接入（建进程需要进程属性列表，subprocess 表达不了）；"
+            "按 low_il 执行"
+        )
+        return IsolationDecision(want, Level.LOW_IL, reasons)
+
     return IsolationDecision(want, want, reasons)
 
 
@@ -455,6 +472,50 @@ def apply_in_child(level: Level) -> None:
 
 
 # ── 父进程侧：统一 spawn ────────────────────────────────────────────
+
+def child_launch_argv(
+    decision: IsolationDecision,
+    command: list[str],
+) -> list[str]:
+    """把「要在某个档位下执行的命令」包成真正能生效的 argv。
+
+    ## 为什么需要这一层
+
+    `low_il` 只能由**子进程自己**降级（完整性级别改的是当前进程令牌，且不可撤销）。
+    但 `shell_exec` 原来只是把进程挂进 Job Object —— 那一步对 `job` / `low_il` /
+    `appcontainer` 三档**完全一样**（都只判 `rank < Level.JOB`）。结果就是用户切了
+    档位、`/v1/system/isolation` 也如实报告了新档位，可实际执行强度一点没变。
+
+    这里把档位变成**命令行的差异**：`low_il` 及更高档位走自降级入口，`job`/`none`
+    保持原样。这样"切换档位"与"执行路径改变"是同一件事。
+
+    ## 各档的落点
+
+    * `none` / `job`：原样返回，只挂 Job Object。
+    * `low_il`：走 `_low_il_launcher`，子进程先降到 Low 完整性级别再 exec。
+    * `restricted` / `appcontainer`：**赢不过它们各自的父侧机制**，见下。
+
+    `restricted` 由 `shell_exec` 的独立路径（`win_launch.launch_restricted`）处理，
+    调用方在进入本函数前已分流；`appcontainer` 的执行层尚未接入，
+    `resolve_level` 会先如实降级到 `low_il`，因此到这里只会看到 `low_il`。
+    """
+    if decision.effective.rank < Level.LOW_IL.rank:
+        return list(command)
+    if not command:
+        return list(command)
+    # 用**文件路径**而不是 `-m app.isolation._low_il_launcher`：沙箱子进程的
+    # `cwd` 是工作区、`sandboxed_env()` 又清空了 `PYTHONPATH`，`-m` 会解析不到
+    # `app` 包（表现为"命令报 ImportError 而不是被隔离执行"）。文件路径不受这两者
+    # 影响，入口自己负责把引擎根目录放回 `sys.path`。
+    launcher = os.path.join(os.path.dirname(__file__), "_low_il_launcher.py")
+    return [
+        sys.executable,
+        launcher,
+        f"--level={decision.effective.value}",
+        "--",
+        *command,
+    ]
+
 
 def spawn_kwargs(decision: IsolationDecision) -> dict[str, Any]:
     """给 `asyncio.create_subprocess_exec` / `subprocess.Popen` 的额外参数。
@@ -651,6 +712,7 @@ __all__ = [
     "Level",
     "apply_in_child",
     "child_applicable_level",
+    "child_launch_argv",
     "clear_runtime_level",
     "configured_level",
     "downgrade_allowed",

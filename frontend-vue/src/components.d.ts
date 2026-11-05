@@ -83,10 +83,12 @@ declare module 'vue' {
     TakeoverOverlay: typeof import('./components/agent/TakeoverOverlay.vue')['default']
     TakeoverPanel: typeof import('./components/agent/TakeoverPanel.vue')['default']
     ThemeSwitcher: typeof import('./components/ThemeSwitcher.vue')['default']
+    TitleBar: typeof import('./components/shell/TitleBar.vue')['default']
     TodoPanel: typeof import('./components/chat/TodoPanel.vue')['default']
     ToolCallCard: typeof import('./components/chat/ToolCallCard.vue')['default']
     ToolPicker: typeof import('./components/agent/ToolPicker.vue')['default']
     ToolResultBlock: typeof import('./components/chat/ToolResultBlock.vue')['default']
+    WorkbenchPanel: typeof import('./components/workbench/WorkbenchPanel.vue')['default']
     WorkstationNav: typeof import('./components/WorkstationNav.vue')['default']
   }
 }
@@ -164,9 +166,11 @@ declare global {
   const TakeoverOverlay: typeof import('./components/agent/TakeoverOverlay.vue')['default']
   const TakeoverPanel: typeof import('./components/agent/TakeoverPanel.vue')['default']
   const ThemeSwitcher: typeof import('./components/ThemeSwitcher.vue')['default']
+  const TitleBar: typeof import('./components/shell/TitleBar.vue')['default']
   const TodoPanel: typeof import('./components/chat/TodoPanel.vue')['default']
   const ToolCallCard: typeof import('./components/chat/ToolCallCard.vue')['default']
   const ToolPicker: typeof import('./components/agent/ToolPicker.vue')['default']
   const ToolResultBlock: typeof import('./components/chat/ToolResultBlock.vue')['default']
+  const WorkbenchPanel: typeof import('./components/workbench/WorkbenchPanel.vue')['default']
   const WorkstationNav: typeof import('./components/WorkstationNav.vue')['default']
 }

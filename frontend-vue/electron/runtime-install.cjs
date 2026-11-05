@@ -81,6 +81,7 @@ const RUNTIME_TARGETS = Object.freeze({
     sourcesDir: 'desktop-local',
     manifest: 'pyproject.toml',
     label: '本地核心',
+    entry: 'launcher.py',
   }),
   engine: Object.freeze({
     id: 'engine',
@@ -88,6 +89,18 @@ const RUNTIME_TARGETS = Object.freeze({
     sourcesDir: 'python-engine',
     manifest: 'requirements.txt',
     label: 'AI 引擎',
+    entry: 'main.py',
+  }),
+  // PageIndex 必须**单独一份 venv**：pageindex → litellm 要求 openai<3，而引擎固定
+  // openai 3.x，两者的依赖树在同一个环境里 pip 直接 ResolutionImpossible。共用一份
+  // 环境的后果不是"装得慢"，而是**装不上**——所以这里不是优化，是唯一可行的形态。
+  pageindex: Object.freeze({
+    id: 'pageindex',
+    rootName: 'pageindex',
+    sourcesDir: 'pageindex-service',
+    manifest: 'requirements.txt',
+    label: '知识库索引服务',
+    entry: 'search_api.py',
   }),
 })
 
@@ -397,14 +410,16 @@ function resolveUv(userDataPath, resourcesPath = process.resourcesPath) {
  * 判据是各自的模块入口存在 —— 光有目录不算，那可能是个空壳：
  *   - `desktop-local` = `app/launcher.py`（数据栈引导器；`app/main.py` 已随业务层删除）
  *   - `python-engine` = `app/main.py`（FastAPI 引擎）
+ *   - `pageindex-service` = `app/search_api.py`（检索服务）
  *
- * 两个目标入口名不同，故按 target 分派，不能再一条判据两边通用。
+ * 入口名由 `RUNTIME_TARGETS[].entry` 给出：三个目标各不相同，硬编码分支每加一个
+ * 目标就要多一处 if，而漏掉的后果是"源码明明在、却被判成没装"。
  */
 function sourcesFor(target, resourcesPath = process.resourcesPath) {
   if (!resourcesPath) return ''
-  const candidate = path.join(resourcesPath, resolveTarget(target).sourcesDir)
-  const entry = target === 'engine' ? 'main.py' : 'launcher.py'
-  return fs.existsSync(path.join(candidate, 'app', entry)) ? candidate : ''
+  const spec = resolveTarget(target)
+  const candidate = path.join(resourcesPath, spec.sourcesDir)
+  return fs.existsSync(path.join(candidate, 'app', spec.entry)) ? candidate : ''
 }
 
 /** 本地 core 源码目录（打包态在 resources/desktop-local） */

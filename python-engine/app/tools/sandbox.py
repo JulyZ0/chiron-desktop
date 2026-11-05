@@ -66,6 +66,26 @@ def workspace_dir() -> Path:
     return d
 
 
+def _sandbox_tmp_dir() -> Path:
+    """沙箱子进程的 `TEMP`/`TMP`。
+
+    **必须位于 workspace 之内**：`low_il` 子进程受 Windows no-write-up 约束，
+    写不了 Medium 目录，而 `get_sandbox_dir()`（workspace 的父层）仍是 Medium ——
+    实测在该目录建文件直接 `PermissionError(13)`。给 workspace 打 Low 标签的是
+    `isolation._ensure_workspace_low_label()`，它只作用于 workspace 本身。
+
+    git / ffmpeg / python 都会往 TEMP 写临时文件；TEMP 不可写会表现为"命令能启动、
+    一写临时文件就失败"，报错离真正原因很远。
+    """
+    d = workspace_dir() / ".tmp"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as e:  # noqa: BLE001 — 建不出来时退回 workspace 根，不阻断执行
+        logger.warning("sandbox tmp dir create failed: %s", e)
+        return workspace_dir()
+    return d
+
+
 def safe_join(rel: str) -> Path:
     """将相对路径 clamp 到 workspace，拒绝逃逸（绝对路径/../）。"""
     # ⚠ **跨平台**：`C:/Windows/win.ini` 这类 Windows 风格绝对路径在 **Linux** 上会被
@@ -107,14 +127,44 @@ def sandboxed_env() -> dict[str, str]:
     env.pop("PYTHONSTARTUP", None)
     env["HOME"] = str(workspace_dir())
     env["USERPROFILE"] = str(workspace_dir())
-    env["TEMP"] = str(get_sandbox_dir())
-    env["TMP"] = str(get_sandbox_dir())
+    # TEMP/TMP 必须落在 **workspace 内部**，不能用 `get_sandbox_dir()`。
+    #
+    # Windows 的完整性检查是 no-write-up：`low_il` 子进程写不了 Medium 目录。
+    # `_ensure_workspace_low_label()` 只给 workspace 本身打 Low 标签，它的**父层**
+    # （`get_sandbox_dir()`）仍是 Medium —— 实测 low_il 子进程在该目录建文件直接
+    # PermissionError(13)。而 git / ffmpeg / python 都会往 TEMP 写临时文件，
+    # 于是"命令能启动、一写临时文件就失败"，报错还离真正原因很远。
+    env["TEMP"] = str(_sandbox_tmp_dir())
+    env["TMP"] = str(_sandbox_tmp_dir())
     # 沙箱子进程只跑模型代码（`run_code` 的 worker / 插件命令 / 钩子命令），**不需要**工具
     # 注册表 ⇒ 短路 `app/tools/__init__.py` 的 35 个 eager import。否则以
     # `python -m app.tools._sandbox_worker` 启动时会先把整条引擎依赖链拉进这个被清空的
     # env（其中 `logfire` 在 import 期调 `Path.home()`，缺 HOME 即 RuntimeError）。
     env["CHIRON_TOOLS_SKIP_REGISTRY"] = "1"
     return env
+
+
+# ── 隔离档位：把命令变成真正会降级的 argv ──────────────────────────
+
+
+def isolation_exec_argv(command: list[str]) -> list[str]:
+    """按**当前生效的隔离档位**包装命令，使其真正按该档执行。
+
+    这是 `shell_exec` / `persistent_shell` / 后台命令 / `git_*` / ffmpeg 共用的
+    入口。为什么必须有这一层：Windows 的完整性级别只能改**当前进程**的令牌，
+    且没有撤销 API —— 父进程一旦调用，被降级的是引擎自己。所以降级只能发生在
+    真正执行命令的子进程里，父进程负责把它请起来并带上档位。
+
+    此前各工具都是直接把命令交给 `create_subprocess_exec`，而父侧唯一的档位判据
+    （`wrap_async_process`）只判 `rank < Level.JOB`，于是 `job` / `low_il` /
+    `appcontainer` 三档的执行措施完全相同：切档位只是改了个显示值。实测已确认
+    `low_il` 包装后子进程完整性从 Medium(0x2000) 降到 Low(0x1000)。
+
+    异常**不外理**：调用方拿到异常应拒绝执行（fail-closed），不能退回无隔离路径。
+    """
+    from app.isolation import child_launch_argv, resolve_level
+
+    return child_launch_argv(resolve_level(), command)
 
 
 # 被禁止的 shell 逃逸模式（S 安全修复：cwd 锁定无法阻止命令内绝对路径访问宿主）
@@ -696,9 +746,27 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
             "truncated": stdout_truncated or stderr_truncated,
         }
 
+    # **按档位改变执行路径**：`low_il` 及以上必须由**子进程自己**降级 —— 完整性级别
+    # 改的是当前进程令牌，且 Windows 没有撤销 API，父进程一旦调用会连引擎一起降级。
+    #
+    # 原来这里直接把 `prog` 交给 `create_subprocess_exec`，于是 `job` / `low_il` /
+    # `appcontainer` 三档走的是**同一行代码**（`wrap_async_process` 只判
+    # `rank < Level.JOB`），用户切档位、状态接口也如实报告新档位，实际执行强度却
+    # 一点没变。`child_launch_argv` 把档位变成 argv 的差异，让"切换档位"真正
+    # 等于"改变执行路径"。
+    exec_argv = [prog, *rest]
+    if _decision is not None:
+        try:
+            from app.isolation import child_launch_argv
+
+            exec_argv = child_launch_argv(_decision, exec_argv)
+        except Exception as exc:  # noqa: BLE001
+            # fail-closed：需要隔离却装不上隔离层时拒绝执行，不退回无隔离路径。
+            # 悄悄降级正是"看起来有隔离"的老问题（与上面 restricted 分支同一口径）。
+            return {"error": f"sandbox unavailable: isolation launcher failed — {exc}"}
+
     proc = await asyncio.create_subprocess_exec(
-        prog,
-        *rest,
+        *exec_argv,
         cwd=str(workspace_dir()),
         env=sandboxed_env(),
         stdout=asyncio.subprocess.PIPE,

@@ -44,10 +44,22 @@ DEFAULT_TOLERANCE = 0.05
 
 DEFAULT_INTERVAL_SECONDS = 1800  # 30min（用户拍板）
 
-#: 源的目录：(名字, URL)。URL 必须能经 `assert_safe_url`（公网 HTTPS）。
-SOURCES: tuple[tuple[str, str], ...] = (
-    ("portkey", "https://configs.portkey.ai/pricing/openai.json"),
-    ("llmrates", "https://www.llmrates.ai/api/dataset"),
+#: 源的目录：(解析器名, URL, 归属 provider)。
+#:
+#: provider 决定写进 `model_prices.provider` —— portkey 按厂商分文件，同一个解析器
+#: 要跑多份；llmrates / pricetoken 是跨厂商聚合，provider 由载荷自带，这里留空。
+#:
+#: **只收实测可达的源**（2026-11-06 逐个 curl 验过）：portkey 的 openai/anthropic/
+#: google/deepseek 均 200，mistral 403（需认证，不入目录）；llmrates 与 pricetoken 200。
+#: `product.aiprice.store/api/models` 实测 404 —— 接口已不存在，**不接入**：
+#: 挂一个死源只会让每轮同步多一条 fetch_failed 告警，覆盖率一点也不会涨。
+SOURCES: tuple[tuple[str, str, str], ...] = (
+    ("portkey", "https://configs.portkey.ai/pricing/openai.json", "openai"),
+    ("portkey", "https://configs.portkey.ai/pricing/anthropic.json", "anthropic"),
+    ("portkey", "https://configs.portkey.ai/pricing/google.json", "google"),
+    ("portkey", "https://configs.portkey.ai/pricing/deepseek.json", "deepseek"),
+    ("llmrates", "https://www.llmrates.ai/api/dataset", ""),
+    ("pricetoken", "https://pricetoken.ai/api/v1/text", ""),
 )
 
 
@@ -86,11 +98,18 @@ def _to_float(raw: Any) -> float:
     return value if value > 0 else 0.0
 
 
-def parse_portkey(payload: dict[str, Any], *, provider: str = "openai") -> dict[str, ModelPrice]:
+def parse_portkey(
+    payload: dict[str, Any], *, provider: str = "openai"
+) -> dict[str, ModelPrice]:
     """Portkey 的定价 JSON：``{model: {pricing_config: {pay_as_you_go: {...}}}}``。
 
     单位是**美分 / token**（文档自陈）⇒ 换算：``usd_per_1k = price_cents * 10``
     （1 美分 = 0.01 美元；per token → per 1k 乘 1000 ⇒ 0.01 × 1000 = 10）。
+
+    同一个解析器要跑 4 份（openai/anthropic/google/deepseek 各自一个文件），
+    所以 ``provider`` 由调用方按文件归属传入，而不是在这里写死 ``openai``。
+
+    文件里的 ``"default"`` 键是全零占位，会被 ``req <= 0 and resp <= 0`` 跳过。
     """
     out: dict[str, ModelPrice] = {}
     for model, entry in payload.items():
@@ -107,12 +126,17 @@ def parse_portkey(payload: dict[str, Any], *, provider: str = "openai") -> dict[
     return out
 
 
-def parse_llmrates(payload: dict[str, Any]) -> dict[str, ModelPrice]:
+def parse_llmrates(
+    payload: dict[str, Any], *, provider: str = ""
+) -> dict[str, ModelPrice]:
     """LLMRates 的数据集：``{"models": [{name, provider:{slug}, prices:[{...}]}]}``。
 
     单位是**每百万 token + 原生货币**（`priceUnit`）⇒ 换算：``usd_per_1k = per_million / 1000``。
     ⚠ **非 USD 的条目一律跳过**：本仓不做汇率换算（汇率是另一个会漂移的外部量，且价格表不参与
     计费，没有必须换算的压力）。跳过时打点，让"某个源大部分是 CNY"这件事可见。
+
+    ``provider`` 参数只为与其它解析器签名一致（``_fetch_source`` 统一传入）；
+    本源的 provider 由载荷自带，参数仅在载荷缺失时兜底。
     """
     out: dict[str, ModelPrice] = {}
     skipped_currency = 0
@@ -122,7 +146,7 @@ def parse_llmrates(payload: dict[str, Any]) -> dict[str, ModelPrice]:
         name = str(entry.get("name") or "")
         if not name:
             continue
-        provider = str((entry.get("provider") or {}).get("slug") or "")
+        entry_provider = str((entry.get("provider") or {}).get("slug") or "") or provider
         for price in entry.get("prices") or []:
             if not isinstance(price, dict):
                 continue
@@ -134,7 +158,10 @@ def parse_llmrates(payload: dict[str, Any]) -> dict[str, ModelPrice]:
             if inp <= 0 and outp <= 0:
                 continue
             out[normalize_model(name)] = ModelPrice(
-                model=name, provider=provider, input_per_1k=inp / 1000, output_per_1k=outp / 1000
+                model=name,
+                provider=entry_provider,
+                input_per_1k=inp / 1000,
+                output_per_1k=outp / 1000,
             )
             break  # 一个模型取第一条 USD 价格（后面的通常是其它 tier/模态）
     if skipped_currency:
@@ -142,10 +169,45 @@ def parse_llmrates(payload: dict[str, Any]) -> dict[str, ModelPrice]:
     return out
 
 
+def parse_pricetoken(
+    payload: dict[str, Any], *, provider: str = ""
+) -> dict[str, ModelPrice]:
+    """PriceToken 的文本模型价格：``{"data": [{modelId, provider, inputPerMTok, ...}]}``。
+
+    单位是**每百万 token 的美元**（字段名即 ``PerMTok``，响应无币种字段 ⇒ 按美元读）
+    ⇒ 换算：``usd_per_1k = per_million / 1000``。
+
+    **只收 active**：``deprecated`` / ``preview`` 的条目照样有价格，但把退役模型写进
+    价格表会让人以为还能用，且它们是同一模型名在跨源比对里的噪声来源。
+    """
+    out: dict[str, ModelPrice] = {}
+    for entry in payload.get("data") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("status") or "active").lower() != "active":
+            continue
+        name = str(entry.get("modelId") or entry.get("displayName") or "")
+        if not name:
+            continue
+        inp = _to_float(entry.get("inputPerMTok"))
+        outp = _to_float(entry.get("outputPerMTok"))
+        if inp <= 0 and outp <= 0:
+            continue
+        out[normalize_model(name)] = ModelPrice(
+            model=name,
+            provider=str(entry.get("provider") or ""),
+            input_per_1k=inp / 1000,
+            output_per_1k=outp / 1000,
+        )
+    return out
+
+
 #: 源名 → 解析函数。加新源只需在这里加一行 + 一个解析函数（各自负责换算到 UNIT）。
-PARSERS: dict[str, Any] = {"portkey": parse_portkey, "llmrates": parse_llmrates}
-
-
+PARSERS: dict[str, Any] = {
+    "portkey": parse_portkey,
+    "llmrates": parse_llmrates,
+    "pricetoken": parse_pricetoken,
+}
 def _close_enough(a: ModelPrice, b: ModelPrice, tolerance: float) -> bool:
     """两条价格在容差内一致（**两轴都要**：只比输入会让"输出价差一倍"溜过去）。"""
     for x, y in ((a.input_per_1k, b.input_per_1k), (a.output_per_1k, b.output_per_1k)):
@@ -186,8 +248,13 @@ def cross_validate(
     return agreed, disagreements
 
 
-async def _fetch_source(name: str, url: str, *, timeout: float = 20.0) -> dict[str, Any] | None:
-    """拉一个源并解析。任何失败都返回 ``None``（调用方按"这个源这轮没数据"处理）。"""
+async def _fetch_source(
+    name: str, url: str, *, provider: str = "", timeout: float = 20.0
+) -> dict[str, Any] | None:
+    """拉一个源并解析。任何失败都返回 ``None``（调用方按"这个源这轮没数据"处理）。
+
+    ``provider`` 由源目录给出（portkey 按厂商分文件）；解析器自己决定要不要用它。
+    """
     import httpx
 
     from app.tools.ssrf import fetch_url_safe
@@ -209,7 +276,7 @@ async def _fetch_source(name: str, url: str, *, timeout: float = 20.0) -> dict[s
         MODEL_PRICE_SYNC.labels(outcome="bad_payload", source=name).inc()
         return None
     try:
-        parsed = parser(payload)
+        parsed = parser(payload, provider=provider)
     except Exception as exc:  # noqa: BLE001 — 源改了结构 = 解析失败，按"这轮没数据"处理
         MODEL_PRICE_SYNC.labels(outcome="parse_failed", source=name).inc()
         logger.warning("model price parse failed (%s): %s", name, str(exc)[:160])
@@ -228,11 +295,16 @@ async def sync_once() -> tuple[int, list[str]]:
     ⚠ **至少要有两个源成功**才做交叉验证：只有一个源时 :func:`cross_validate` 会把所有模型
     都判成 `single_source` ⇒ 一行都不写（这是**正确**的降级：宁可这轮不更新，也不写入未验证值）。
     """
+    # 键必须是**每个 URL 唯一**的：`portkey` 在源目录里出现 4 次（按厂商分文件），
+    # 若直接用解析器名做键，四次拉取会互相覆盖，最后只剩最后一个厂商的文件生效 ——
+    # 表象是"价格表里只有 deepseek 的模型"，而代码看不出任何丢弃动作。
     fetched: dict[str, dict[str, ModelPrice]] = {}
-    for name, url in SOURCES:
-        prices = await _fetch_source(name, url)
+    base_sources: set[str] = set()
+    for name, url, provider in SOURCES:
+        prices = await _fetch_source(name, url, provider=provider)
         if prices:
-            fetched[name] = prices
+            fetched[f"{name}:{provider}" if provider else name] = prices
+            base_sources.add(name)
     if not fetched:
         MODEL_PRICE_SYNC.labels(outcome="no_source", source="-").inc()
         return 0, []
@@ -242,7 +314,7 @@ async def sync_once() -> tuple[int, list[str]]:
         # 不静默：分歧要么是源过期、要么是我们对齐错了 —— 两种都需要人看一眼。
         logger.warning("model price disagreements (%d): %s", len(disagreements), "; ".join(disagreements[:5]))
 
-    written = await _upsert(agreed, sources=sorted(fetched))
+    written = await _upsert(agreed, sources=sorted(base_sources))
     return written, disagreements
 
 

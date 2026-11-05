@@ -315,7 +315,7 @@ const userInitial = computed(() => authStore.user?.name?.charAt(0)?.toUpperCase(
 
 <style scoped>
 /* ── 设计系统接入：Sider 使用 CSS 变量，不再硬编码颜色 ── */
-.admin-root { height: 100vh; height: 100dvh; background: var(--bg-page); }
+.admin-root { height: var(--app-height); background: var(--bg-page); }
 
 .admin-sider {
   background: var(--bg-card) !important;

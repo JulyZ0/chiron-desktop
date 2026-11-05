@@ -418,6 +418,50 @@ func (h *SessionMapHandler) UnbindProjectSession(w http.ResponseWriter, r *http.
 	OK(w, map[string]interface{}{"unbound": true})
 }
 
+// SessionProject 反查一个会话所属的项目（`@` 引用文件要知道搜哪个目录）。
+//
+// 为什么需要它：ChatView 手里只有 `activeSessionId`，而项目文件端点认的是 project id。
+// 没有这条反查，前端只能遍历全部项目再逐个拉会话列表 —— 项目一多就是 N+1 次请求，
+// 而这件事在 SQL 里是一行 join。
+//
+// 不属于任何项目时返回 `project: null` 而不是 404：那是**正常状态**（未归组的会话），
+// 前端据此让文件那一源整体缺席，而不是弹一个"找不到"的错误。
+func (h *SessionMapHandler) SessionProject(w http.ResponseWriter, r *http.Request) {
+	claims := auth.GetClaims(r.Context())
+	if claims == nil {
+		Unauthorized(w, ErrAuthRequired)
+		return
+	}
+	sessionID := strings.TrimSpace(r.PathValue("sid"))
+	if sessionID == "" || db.GlobalDBManager == nil {
+		BadRequest(w, "session id is required")
+		return
+	}
+	// 归属条件写在**同一条查询**里（w.tenant_id / w.user_id），而不是先查再验：
+	// 分开写就有"查出别人的项目再拒绝"的中间态，而这里连那一步都不该发生。
+	row, err := db.GlobalDBManager.FetchOne(r.Context(),
+		`SELECT w.id, COALESCE(w.name,''), COALESCE(w.root_path,'')
+		   FROM session_map_nodes n
+		   JOIN session_map_workspaces w ON w.id = n.workspace_id
+		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
+		    AND w.tenant_id = $2 AND w.user_id = $3
+		  LIMIT 1`, sessionID, smTenant(claims), claims.UserID)
+	if err != nil {
+		slog.Error("session project lookup failed", "error", err)
+	}
+	if row == nil {
+		OK(w, map[string]interface{}{"project": nil})
+		return
+	}
+	OK(w, map[string]interface{}{
+		"project": map[string]interface{}{
+			"id":        stringOf(row["id"]),
+			"name":      stringOf(row["name"]),
+			"root_path": stringOf(row["root_path"]),
+		},
+	})
+}
+
 // ListUnassignedSessions 列出不属于任何项目的会话，作为侧边栏的兜底分组。
 //
 // 存量会话全都没有归属，没有这个分组它们在改造后就会从侧边栏消失。

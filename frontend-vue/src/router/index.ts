@@ -55,6 +55,14 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    // 价格一览表：只读参考价（多源交叉验证后写入 model_prices），**不参与计费**。
+    // 单独一页而不是塞进计费页：它是"各模型单价清单"，与"我用掉了多少"是两个问题。
+    path: '/billing/prices',
+    name: 'BillingPrices',
+    component: () => import('../views/PricesView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/profile',
     name: 'Profile',
     component: () => import('../views/ProfileView.vue'),

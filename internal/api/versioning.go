@@ -10,7 +10,6 @@
 //   - /metrics, /docs/         — Prometheus / API 文档，不参与版本化
 //   - /ws/{sessionId}, /ws/rpa — WebSocket 升级，不参与版本化
 //   - /media/s/{assetID}       — 签名媒体 URL，不参与版本化
-//   - /api/editor/             — 编辑器文件 API（向后兼容，待迁移至 /v1/editor/）
 //
 // 二、Legacy 路由兼容
 //

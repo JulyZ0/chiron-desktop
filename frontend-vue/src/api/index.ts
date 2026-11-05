@@ -469,6 +469,15 @@ api.interceptors.response.use(
   async (error) => {
     // 静默请求：原样 reject，不进任何全局提示分支
     if (error.config?.__silent === true) return Promise.reject(error)
+    // 取消的请求不是失败：调用方主动放弃（如 `@` 输入框里的旧搜索、页面卸载），
+    // 目标已经不存在，任何提示都是噪音。
+    //
+    // **必须放在最前面**：取消错误没有 `error.response`（请求根本没回来），
+    // 会落进末尾的 `!error.response` 分支并被报成"网络连接失败，请检查网络"——
+    // 用户每敲一个字就弹一次，且指向一个根本不存在的问题。
+    if (axios.isCancel(error) || error.code === 'ERR_CANCELED') {
+      return Promise.reject(error)
+    }
     const status: number | undefined = error.response?.status
     // 服务端显式结论（`APIResponse.retryable`）：有就听它的，没有（undefined）才回退到状态码。
     const retryable = readRetryable(error.response?.data?.retryable)

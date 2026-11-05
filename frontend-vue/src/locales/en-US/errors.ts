@@ -39,6 +39,11 @@ export default {
   model_not_allowed_entitlement: 'This model requires a package that covers it. Buy or renew a package under Billing → Packages to use it.',
   model_not_allowed_policy: 'Your tenant policy does not allow this model. Ask your tenant administrator to update the allow-list.',
   model_not_allowed_buy_package: 'Buy a package',
+  // Project files (read-only browsing): the two failures need different actions —
+  // fix the project path vs. pick another file / open it with a system app. Merging
+  // them into one "failed" message would send the user to the wrong place.
+  project_root_unavailable: 'The folder this project points to is not available — it may have been moved, renamed, or deleted. Pick the folder again in the project settings.',
+  file_too_large: 'This file is too large to preview here. Open it with a system app instead.',
   // Network & client-side (fallback when backend sends no code)
   timeout: 'Request timed out. Please try again.',
   network_error: 'Network connection failed. Please check your connection and try again.',

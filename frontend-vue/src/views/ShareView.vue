@@ -176,7 +176,7 @@ function formatDate(iso: string): string {
 </template>
 
 <style scoped>
-.share-page { min-height: 100vh; display: flex; flex-direction: column; background: var(--bg-page); color: var(--text-primary); }
+.share-page { min-height: var(--app-height); display: flex; flex-direction: column; background: var(--bg-page); color: var(--text-primary); }
 .share-header { height: 52px; display: flex; align-items: center; padding: 0 24px; border-bottom: var(--hairline-width) solid var(--border); background: var(--bg-card); }
 .share-brand { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); }
 .share-brand-mark { width: 22px; height: 22px; border-radius: var(--radius-md); background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: var(--on-solid); font-weight: var(--fw-bold); font-size: var(--fs-xs); display: inline-flex; align-items: center; justify-content: center; }

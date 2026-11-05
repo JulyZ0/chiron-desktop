@@ -50,6 +50,8 @@ const {
   PIP_INDEX_MIRRORS,
   RUNTIME_CANCEL_CHANNEL,
   RUNTIME_MIRROR_CHANNEL,
+  TITLEBAR_ARG_PREFIX,
+  WINDOW_CHANNELS,
 } = shared
 /**
  * 本地设备 token 的注入前缀（`--chiron-device-token=<token>`）。
@@ -69,6 +71,21 @@ const DEV_URL = process.env.CHIRON_DEV_URL || DEFAULT_DEV_URL
 
 /** 窗口底色取 --bg-page 的浅色值：主进程拿不到 CSS 变量，只能写字面值。 */
 const WINDOW_BACKGROUND = '#f9f9f7'
+
+/**
+ * 是否用自绘标题栏（`frame: false`）。
+ *
+ * Windows 的默认窗口框是一条 1px 的系统描边 + 系统标题栏，放在这套纸色界面里
+ * 显得像另一个程序；而 macOS 的系统红绿灯反而是用户预期的一部分。所以：
+ *   - Windows / Linux：`frame: false`，标题栏、拖拽区、最小化/最大化/关闭全部自绘
+ *     （见 src/components/shell/TitleBar.vue 与 preload 的 windowControls）；
+ *   - macOS：`titleBarStyle: 'hiddenInset'`，保留原生红绿灯，只把内容上移到
+ *     标题栏区域，双击缩放等系统行为不变。
+ *
+ * 抽成常量而不是内联三元：建窗有两处（主窗口 / 安装窗口），漏掉一处就会
+ * 出现"一个窗口有边框、另一个没有"的割裂感。
+ */
+const USE_CUSTOM_TITLEBAR = process.platform !== 'darwin'
 
 let mainWindow = null
 
@@ -244,6 +261,76 @@ function assertTrustedSender(event) {
 }
 
 /**
+ * 窗口当前的"可视状态"。
+ *
+ * 渲染进程要靠它画最大化/还原图标（自绘标题栏的图标不能靠页面自己猜：
+ * 用户也可能用 Win+↑、Aero Snap 或系统菜单改变窗口状态，页面完全收不到点击事件）。
+ */
+function windowStateOf(win) {
+  return {
+    maximized: win.isMaximized(),
+    fullScreen: win.isFullScreen(),
+    focused: win.isFocused(),
+  }
+}
+
+/**
+ * 把窗口状态变化推给自绘标题栏。
+ *
+ * 监听 resize 是必须的：Windows 的 Aero Snap（拖到屏幕边缘 / Win+方向键）只会
+ * 触发 resize，不一定先派发 maximize。只听 maximize 的话，贴边半屏之后图标
+ * 还停在"最大化"，用户点一下反而把窗口缩小了。
+ */
+function attachWindowStateBroadcast(win) {
+  const push = () => {
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+    win.webContents.send(WINDOW_CHANNELS.state, windowStateOf(win))
+  }
+  for (const evt of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen', 'focus', 'blur', 'resize']) {
+    win.on(evt, push)
+  }
+}
+
+/**
+ * 自绘标题栏的四个 IPC。
+ *
+ * 目标是 `BrowserWindow.fromWebContents(event.sender)` 而不是模块级的 `mainWindow`：
+ * 安装进度窗（openInstallWindow）在 createWindow 之前就存在，主界面重建时旧窗口
+ * 也还在关闭途中；用 mainWindow 可能作用到另一个窗口，甚至作用在已销毁的窗口上
+ * 直接抛错 —— 而这条链路上用户已经没有系统标题栏可以兜底了。
+ */
+function registerWindowControlIpc() {
+  const windowFor = event => {
+    assertTrustedSender(event)
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win || win.isDestroyed()) throw new Error('no-window')
+    return win
+  }
+
+  ipcMain.handle(WINDOW_CHANNELS.minimize, event => {
+    windowFor(event).minimize()
+    return true
+  })
+
+  ipcMain.handle(WINDOW_CHANNELS.toggleMaximize, event => {
+    const win = windowFor(event)
+    // 对话框（配置页/错误页）不可最大化：直接回当前状态，让按钮维持原样，
+    // 而不是 throw —— 页面没必要为"这个窗口不能最大化"弹一个错误。
+    if (!win.isMaximizable()) return windowStateOf(win)
+    if (win.isMaximized()) win.unmaximize()
+    else win.maximize()
+    return windowStateOf(win)
+  })
+
+  ipcMain.handle(WINDOW_CHANNELS.close, event => {
+    windowFor(event).close()
+    return true
+  })
+
+  ipcMain.handle(WINDOW_CHANNELS.getState, event => windowStateOf(windowFor(event)))
+}
+
+/**
  * 可选模块接线：components.cjs / secrets.cjs / inference-proxy.cjs 由另一个
  * worktree 实现并按需发布。本文件只 require + try/catch 接线，绝不在这里写它们的实现，
  * 模块不存在时安静降级（未安装本地组件是用户的正常状态）。
@@ -316,6 +403,12 @@ async function tryStartGoStack(options = {}) {
   // 装失败会抛 —— 由 startLocalBackend 转成可读状态，这里不吞。
   const engineLaunch = await prepareEngine(components, options)
 
+  // 知识库检索服务（pageindex-service）**不是强依赖**：解释器没就位就传 undefined，
+  // 本地栈照常起来，只是知识库的建索引/检索会报"服务不可用"。这里不抛错。
+  const knowledgeLaunch = components.resolveKnowledgeServiceLaunch({
+    userDataPath: app.getPath('userData'),
+  })
+
   try {
     const port =
       Number(options.gatewayPort) > 0 ? Number(options.gatewayPort) : await components.pickFreePort()
@@ -327,6 +420,7 @@ async function tryStartGoStack(options = {}) {
       port,
       appSecret: ensureAppSecret(dataDir),
       engine: engineLaunch || undefined,
+      knowledge: knowledgeLaunch || undefined,
       onEngineExit: notifyEngineExit,
     })
 
@@ -510,7 +604,7 @@ function openInstallWindow() {
       nodeIntegration: false,
       sandbox: false,
       // 进度页也用 preload 的订阅能力；模式按 local 注入，与它实际服务的东西一致
-      additionalArguments: [`${MODE_ARG_PREFIX}local`],
+      additionalArguments: [`${MODE_ARG_PREFIX}local`, `${TITLEBAR_ARG_PREFIX}native`],
     },
   })
   installWindow.once('ready-to-show', () => {
@@ -1146,6 +1240,11 @@ function createWindow() {
   // 配置页与本机错误页都是单栏布局，主界面才用大窗口
   const isDialog = target !== 'app'
 
+  // 只有主界面自绘标题栏：setup/error.html 是独立静态页，没有标题栏组件，
+  // 去掉系统框之后用户既拖不动也关不掉窗口，所以它们一律保留原生窗口框。
+  const frameless = USE_CUSTOM_TITLEBAR && target === 'app'
+  const windowChrome = target !== 'app' ? {} : frameless ? { frame: false } : { titleBarStyle: 'hiddenInset' }
+
   // 每次创建窗口现传模式 / 地址 / token：渲染进程的 process.env 是启动时继承的，
   // 用户保存新地址后旧 env 不会更新。
   const additionalArguments = [`${MODE_ARG_PREFIX}${currentMode}`]
@@ -1154,6 +1253,11 @@ function createWindow() {
   if (currentMode === 'local' && localBackend.token) {
     additionalArguments.push(`${DEVICE_TOKEN_ARG_PREFIX}${localBackend.token}`)
   }
+  // 标题栏形态（custom / inset / native）：页面据此决定是否画自绘控制按钮。
+  // 必须与上面的 windowChrome 用同一个判断 —— 两者各自按平台推算的话，
+  // 一旦有一边改了口径，页面就会在没有系统标题栏的窗口里不画按钮（窗口关不掉）。
+  const titleBarMode = target !== 'app' ? 'native' : frameless ? 'custom' : 'inset'
+  additionalArguments.push(`${TITLEBAR_ARG_PREFIX}${titleBarMode}`)
 
   mainWindow = new BrowserWindow({
     width: isDialog ? 520 : 1440,
@@ -1164,6 +1268,13 @@ function createWindow() {
     backgroundColor: WINDOW_BACKGROUND,
     show: false, // 等首帧就绪再显示，避免白屏闪一下
     autoHideMenuBar: true,
+    // 去掉系统窗口框：Windows 上那圈 1px 描边 + 系统标题栏与这套界面不同源，
+    // 放在一起像嵌套了另一个程序。标题栏改由页面自绘（TitleBar.vue）。
+    //
+    // 只有主界面（target === 'app'）自绘：setup / error 是独立的单栏静态页，
+    // 里面没有标题栏组件，frameless 之后既拖不动也关不掉，所以它们保留系统框。
+    // macOS 一律保留原生红绿灯，只让内容顶到标题栏区域。
+    ...windowChrome,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       // 双模式各用一个持久分区：cookie / localStorage / IndexedDB 互不可见；
@@ -1179,6 +1290,9 @@ function createWindow() {
   })
 
   mainWindow.once('ready-to-show', () => mainWindow.show())
+
+  // 自绘标题栏要跟着窗口状态（最大化/全屏）换图标，事件源必须在建窗时就挂上
+  attachWindowStateBroadcast(mainWindow)
 
   // 外部链接交给系统浏览器：壳内不该出现第二个浏览器的地址栏
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -1515,6 +1629,11 @@ if (!gotLock) {
       return probe(url)
     })
 
+    // 自绘标题栏的三个动作。target 一律从 event.sender 反查窗口，而不是用
+    // 模块级的 mainWindow：安装窗口（openInstallWindow）也建在 createWindow 之前，
+    // 用 mainWindow 会作用到错误的窗口，或者干脆什么都没发生。
+    registerWindowControlIpc()
+
     // 安装页的「取消」与「换源重试」。
     // 只允许安装窗口自己触发：这两个动作会中止本进程里正在跑的 uv，
     // 从主界面或任何其它页面打过来都该拒绝。
@@ -1810,6 +1929,40 @@ if (!gotLock) {
       } catch (err) {
         return { ok: false, reason: 'restart-failed', message: err?.message || String(err) }
       }
+    })
+
+    /**
+     * 用系统默认程序打开一个本地路径，或在文件管理器里定位它。
+     *
+     * 这里不判"这个路径该不该给用户看"（那是后端 `validateRootPath` 的职责，主进程
+     * 再判一遍只会让两处判据漂移），但必须挡住"渲染层随手把任意字符串丢给 shell"：
+     * 只接受**已存在的绝对路径**。`shell.openPath` 对不存在的路径只回一个无意义的
+     * 错误码，对 UNC / 断开的网络共享则会挂起到超时 —— 先 access 一次能把这两种情况
+     * 在进入系统调用之前分开。
+     *
+     * 回结构化结果而不是抛错：调用方要能区分"文件没了"与"没有关联程序"。
+     */
+    ipcMain.handle('desktop:open-path', async (event, payload) => {
+      assertTrustedSender(event)
+      const target = payload && typeof payload === 'object' ? String(payload.path || '') : ''
+      const reveal = Boolean(payload && payload.reveal)
+      if (!target) return { ok: false, reason: 'empty-path', message: '路径为空' }
+      if (!path.isAbsolute(target)) {
+        return { ok: false, reason: 'not-absolute', message: '只能打开绝对路径' }
+      }
+      try {
+        await fs.promises.access(target, fs.constants.F_OK)
+      } catch {
+        return { ok: false, reason: 'missing', message: '路径不存在' }
+      }
+      if (reveal) {
+        shell.showItemInFolder(target)
+        return { ok: true }
+      }
+      // openPath 用空串表示成功，非空串是系统给出的错误描述
+      const failure = await shell.openPath(target)
+      if (failure) return { ok: false, reason: 'open-failed', message: failure }
+      return { ok: true }
     })
 
     createWindow()

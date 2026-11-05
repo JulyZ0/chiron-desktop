@@ -184,6 +184,12 @@
     --z-page-panel: 120;   /* 页面级侧栏（页面级浮层之首） */
     --z-palette: 1000;     /* 全局命令面板 */
     --z-viewer: 1000;      /* 全屏查看器 */
+
+    /* 自绘标题栏在视口顶部占掉的高度。
+       TitleBar.vue 在桌面壳里把它写成实际像素（28/36px），其它环境保持 0 —— 于是
+       fixed 定位的顶栏 / 停靠坞、以及 #app 的可用高度全都不必再判断平台。 */
+    --app-titlebar-h: 0px;
+    --app-height: calc(100dvh - var(--app-titlebar-h));
     /* Super-agent 接管界面：遮罩要压暗全站、卡片要有明显投影。
        用 shadow-base 混色而非写死黑色 —— 8 套主题（含深色）下都得到
        "比背景更深"的结果，写死 #000 会在 terminal/aurora 主题里糊成一片。 */
@@ -1310,7 +1316,7 @@ body {
 
 #app {
     width: 100%;
-    height: 100dvh;
+    height: var(--app-height);
     min-width: 320px;
 }
 

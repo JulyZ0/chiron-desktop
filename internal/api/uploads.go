@@ -43,7 +43,9 @@ func NewUploadHandler(a *auth.Authenticator, storageRoot string, store *storage.
 
 const defaultChunkSize = 2 << 20 // 2MB
 
-// maxKBDocSize 限制 kb_doc 文档大小（防 finalizeKBDoc 整文件读入内存导致 OOM）。
+// maxKBDocSize 限制 kb_doc 文档大小。finalizeKBDoc 已改流式写对象存储，不再整文件
+// 驻留内存；这个上限仍保留 —— 它同时是"单份知识库原文最大多大"的产品口径，
+// 也让 Init 阶段就能挡掉超大文件，而不是传到一半才失败。
 const maxKBDocSize int64 = 64 << 20 // 64MB
 
 // validUploadNameRe 用于文件名净化：拒绝路径分隔符与目录穿越序列。
@@ -508,7 +510,41 @@ func (h *UploadHandler) finalizeMedia(r *http.Request, tenantID string, up struc
 	return assetID, "/" + objectKey, nil
 }
 
-// finalizeKBDoc 合并文件内容落 knowledge_documents（content bytea 供 RAG 构建，按当前租户）。
+// kbBlobPrefix 是知识库原文在存储后端里的目录前缀。
+//
+// 网关的 FileStore 以 `STORAGE_ROOT` 为根，引擎/pageindex-worker 的 blob 根是
+// `KNOWLEDGE_LOCAL_PATH`；桌面端把两者挂在同一个 dataDir 下
+// （`electron/local-stack.cjs`），所以 `STORAGE_ROOT/knowledge/<key>` 与
+// `KNOWLEDGE_LOCAL_PATH/<key>` 是同一批文件。S3 后端同理（worker 用
+// `KNOWLEDGE_S3_PREFIX`，默认同为 `knowledge/`）。
+const kbBlobPrefix = "knowledge/"
+
+// kbUnsafeNameRe 与 Python 侧 `app/knowledge/blob.py::_UNSAFE_NAME_RE` 逐字一致：
+// 两侧必须算出**同一个** key，否则 worker 会读不到网关写下的原文。
+var kbUnsafeNameRe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// kbStorageKey 生成与 `blob.build_key` 同形的 key：
+// `<tenant>/<kb_id>/<doc_id>/<safe_name>`。
+func kbStorageKey(tenantID int16, kbID, docID, name string) string {
+	safe := strings.Trim(kbUnsafeNameRe.ReplaceAllString(name, "_"), "._")
+	if safe == "" {
+		safe = "file"
+	}
+	if len(safe) > 180 {
+		safe = safe[:180]
+	}
+	return fmt.Sprintf("%d/%s/%s/%s", tenantID, kbID, docID, safe)
+}
+
+// finalizeKBDoc 把原文写进对象存储，并在 knowledge_documents 落一条 pending 记录。
+//
+// **原文不进 PG**：`knowledge_documents` 表上没有 `content` 列
+// （见 migrations/versions/0001_authoritative_baseline.py，只留 `storage_key`）。
+// 旧实现往 `content` 插字节，列不存在 ⇒ 每次 kb_doc 上传都 500；而且为了拼参数
+// 必须把整份文件读进内存。这里改成流式写对象存储、库里只存 `storage_key`，
+// 与 Python 侧（`app/knowledge/blob.py`）和 pageindex-worker
+// （`app/runtime.py::BlobReader`）的 key 布局对齐 —— 索引任务就是靠这个 key
+// 去取原文，写偏一个字段，库能建但索引永远读不到文件。
 func (h *UploadHandler) finalizeKBDoc(r *http.Request, tenantID string, up struct {
 	ID        string
 	UserID    string
@@ -531,13 +567,6 @@ func (h *UploadHandler) finalizeKBDoc(r *http.Request, tenantID string, up struc
 		`SELECT user_id FROM knowledge_bases WHERE id = $1 AND tenant_id = $2`, up.ParentID, tenantID).Scan(&owner); err != nil || owner != up.UserID {
 		return "", fmt.Errorf("knowledge base not found or not owned")
 	}
-	content, err := io.ReadAll(io.LimitReader(stream, maxKBDocSize+1))
-	if err != nil {
-		return "", err
-	}
-	if int64(len(content)) > maxKBDocSize {
-		return "", fmt.Errorf("kb_doc content exceeds 64MB limit")
-	}
 	ext := strings.TrimPrefix(filepath.Ext(up.Name), ".")
 	if ext == "" {
 		ext = "txt"
@@ -546,11 +575,23 @@ func (h *UploadHandler) finalizeKBDoc(r *http.Request, tenantID string, up struc
 	if err != nil {
 		return "", err
 	}
+	tenant := parseTenantID(tenantID)
+	// 与 Python `blob.build_key` 同形的 key；前缀 `knowledge/` 对齐
+	// `KNOWLEDGE_LOCAL_PATH` / `KNOWLEDGE_S3_PREFIX` 的存储根。
+	storageKey := kbStorageKey(tenant, up.ParentID, docID, up.Name)
+	objectPath := kbBlobPrefix + storageKey
+	// 流式写入：不再把整份文件读进内存（旧实现为拼 SQL 参数必须整体驻留）。
+	if err := h.store.WriteStream(r.Context(), objectPath, stream, up.Size, 0o644); err != nil {
+		return "", fmt.Errorf("store knowledge blob: %w", err)
+	}
 	_, err = db.GlobalDBManager.Exec(r.Context(),
-		`INSERT INTO knowledge_documents (id, tenant_id, knowledge_base_id, user_id, name, file_type, file_size_bytes, status, content, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, NOW(), NOW())`,
-		docID, tenantID, up.ParentID, up.UserID, up.Name, ext, up.Size, content)
+		`INSERT INTO knowledge_documents (id, tenant_id, knowledge_base_id, user_id, name, file_type, file_size_bytes, storage_key, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
+		docID, tenantID, up.ParentID, up.UserID, up.Name, ext, up.Size, storageKey)
 	if err != nil {
+		// 落库失败就把刚写的原文删掉，否则对象存储里会攒下没有行引用的孤儿文件
+		// （没有任何路径能再找到它们，只能靠离线巡检）。
+		_ = h.store.Delete(r.Context(), objectPath)
 		return "", err
 	}
 	// 重算 KB 统计（带 tenant_id 限制）

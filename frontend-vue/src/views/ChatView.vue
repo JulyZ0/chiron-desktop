@@ -27,6 +27,9 @@ import MessageItem from '../components/chat/MessageItem.vue'
 import ChatEmptyHero from '../components/chat/ChatEmptyHero.vue'
 import { addToOutbox, bumpRetryCount, clearOutbox, readOutbox, removeFromOutbox, type OutboxEntry } from '../components/chat/failedOutbox'
 import ChatInput from '../components/chat/ChatInput.vue'
+import WorkbenchPanel from '../components/workbench/WorkbenchPanel.vue'
+import { toggleWorkbench, workbenchOpen } from '../components/workbench/useWorkbench'
+import { collectAgentWrittenPaths } from '../components/workbench/agentTouched'
 import SessionMapView from './sessionmap/SessionMapView.vue'
 import { pickStreamPreview } from './sessionmap/streamPreview'
 import ChatSetupTour from '../components/chat/ChatSetupTour.vue'
@@ -347,6 +350,43 @@ const sessions = ref<ChatSession[]>([])
 const activeSessionId = ref('')
 
 /**
+ * 当前会话所属的项目（session-map project id），`@` 引用项目文件要用。
+ *
+ * 为什么反查而不是从 props 拿：项目归属是**会话的属性**，而 ChatView 只知道
+ * `activeSessionId`。让侧边栏把"用户点了哪个项目"传进来会被后续的自动绑定、
+ * 从 URL 直达等情况撕裂成两个事实源。
+ *
+ * 失败时保持空串 = "没有项目文件可引用"，不弹错 —— 用户在打字，这不是他此刻
+ * 要处理的事；真正需要报错的是打开预览面板的时候。
+ */
+const activeProject = ref<{ id: string; name: string } | null>(null)
+const activeProjectId = computed(() => activeProject.value?.id || '')
+
+/**
+ * 工作台里点「加入对话」：走的是输入框**同一条附件通道**。
+ *
+ * 不在 ChatView 里另读一次文件再 push 附件，是因为那样就有两处构造 `data:` URL
+ * 的逻辑（编码方式、id 去重、二进制处理各一份），而它们一旦漂移，模型收到的
+ * 内容就取决于用户是"@ 选的"还是"面板点的"。
+ */
+function onWorkbenchReference(payload: { path: string; name: string }) {
+  void chatInputRef.value?.attachProjectFile?.(payload.path, payload.name)
+}
+watch(activeSessionId, async (sid) => {
+  activeProject.value = null
+  if (!sid) return
+  try {
+    const { sessionProject } = await import('../views/sessionmap/projectsApi')
+    const project = await sessionProject(sid)
+    // 期间切走了会话：晚到的结果属于上一个会话，写进去会让 `@` 搜错目录。
+    if (activeSessionId.value !== sid) return
+    activeProject.value = project ? { id: project.id, name: project.name || project.root_path } : null
+  } catch {
+    activeProject.value = null
+  }
+})
+
+/**
  * 任务清单面板（长任务防跑偏）。
  *
  * **刻意不放进 `items`**：`items` 是消息流投影，切会话/重放历史/`/clear` 都会整体
@@ -478,6 +518,15 @@ const items = computed<ChatItem[]>({
     ;(writingRun.value ?? currentRun.value).items = v
   },
 })
+
+/**
+ * 本次会话里 agent 写过的文件路径 —— 工作台「改动」页签的第二数据源。
+ *
+ * 为什么由 ChatView 算而不是工作台自己去读会话：工作台只拿到 projectId，没有
+ * 时间线；而时间线本来就是这一层的状态。摘取逻辑本身在 `agentTouched.ts` 里做成
+ * 纯函数，那里写明了两条数据源为什么要分开。
+ */
+const agentWrittenPaths = computed(() => collectAgentWrittenPaths(items.value))
 let activeSSE: SSEHandle | null = null
 // 每个会话最后收到的 SSE 事件 id（服务端 id: 行 → event.lastEventId）。
 // 跨轮重建 SSE 时回传（last_event_id），服务端从缓冲流补发上一轮断线缺口（见 api/index.ts createSSEConnection）
@@ -1817,16 +1866,31 @@ async function loadSessions() {
   sortSessions()
 }
 
-async function createSession() {
+async function createSession(projectId?: string) {
   let session: ChatSession | null = null
   try {
     const res = await api.post('/v1/conversations', { title: t('chat.new_conversation'), llm_config: buildPersistLlmConfig() })
     const data = res.data?.data || res.data
     if (data?.id) session = { id: data.id, title: data.title || t('chat.new_conversation'), created_at: data.created_at, updated_at: data.updated_at }
   } catch { /* fallback */ }
+  // 后端没建成时下面会退回本地 id：那个会话在服务端并不存在，归属自然也写不进去。
+  // 记下这个区别，否则用户会把"会话创建失败"看成"归入项目失败"。
+  const persisted = Boolean(session)
   if (!session) {
     const id = crypto.randomUUID()
     session = { id, title: t('chat.new_conversation'), created_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+  }
+  // 从项目行里新建：先把归属写进后端，再切过去 ——
+  // `switchSession` 会触发 activeProject 的查询，顺序反了就会先拉到"无项目"，
+  // 工作台与 `@` 引用都指向错误目录，直到下一次刷新才纠正。
+  // 归属失败不中断：会话已经建好，只是落进了「未归入」，那比丢掉会话好。
+  if (projectId && persisted) {
+    try {
+      const { bindSession } = await import('../views/sessionmap/projectsApi')
+      await bindSession(projectId, session.id)
+    } catch {
+      notify.error(t('chat.projects_bind_failed'))
+    }
   }
   sessions.value.unshift(session); persistSessions()
   panelView.value = 'trajectory'
@@ -2650,6 +2714,22 @@ function continueGeneration() {
     <!-- 分屏 6a：**只读参考栏**（左侧）。
          布局本身是 flex，所以加一栏不需要改任何 CSS；它自己滚动，
          不会把主会话的滚动位置带跑（与主列表的滚动锚定互不干扰）。 -->
+    <!-- 工作台（项目文件树 + 只读预览）。默认在最左：它看的是"这个项目里有什么"，
+         是比会话内容更外围的信息，放在主会话右侧会与侧面板抢注意力。
+         与分屏参考栏可以同时开 —— 两者宽度上限各取容器一半。
+
+         交换布局（侧边栏进左）时它**必须跟着移到最右**：否则左侧同时挤着
+         侧边栏与工作台，而 `is-swapped` 本来就是为了把主会话还给中间。
+         移动只改 `order` 与 `handle-side` —— DOM 位置不动，手柄仍贴着真正的窗口边缘。 -->
+    <WorkbenchPanel
+      v-if="workbenchOpen"
+      :project-id="activeProjectId"
+      :project-name="activeProject?.name || ''"
+      :agent-written-paths="agentWrittenPaths"
+      :handle-side="layoutSwapped ? 'left' : 'right'"
+      @close="toggleWorkbench()"
+      @reference="onWorkbenchReference"
+    />
     <SessionPreviewPane
       v-if="splitSessionId"
       :session-id="splitSessionId"
@@ -2697,6 +2777,16 @@ function continueGeneration() {
               @click="toggleSplit()"
             >
               {{ splitSessionId ? $t('common.collapse_reference') : $t('common.split_view') }}
+            </button>
+            <!-- 工作台开关：与分屏一样是"并排看别的东西"的维度，所以并排放在这里 -->
+            <button
+              type="button"
+              class="toolbar-mode"
+              :class="{ active: workbenchOpen }"
+              :title="$t('chat.workbench_title')"
+              @click="toggleWorkbench()"
+            >
+              {{ $t('chat.workbench_title') }}
             </button>
             <button
               type="button"
@@ -2958,6 +3048,7 @@ function continueGeneration() {
             :loading-earlier="loadingEarlier"
             :earlier-load-failed="earlierLoadFailed"
             :session-key="activeSessionId"
+            :project-id="activeProjectId"
             @load-earlier="loadEarlier"
             @quote-text="onQuoteText"
             @retry-from="retryFromUserMessage"
@@ -3100,6 +3191,7 @@ function continueGeneration() {
         :language="language"
         :reasoning-language="reasoningLanguage"
         :context-chips="contextChips"
+        :project-id="activeProjectId"
         @send="sendMessage"
         @stop="stopGeneration"
         @steer="onSteer"
@@ -3397,13 +3489,17 @@ function continueGeneration() {
    用 flex `order` 而不是改 DOM —— 组件的挂载位置不动，只是视觉顺序变化，
    所以不影响任何依赖 DOM 顺序的逻辑（焦点流、SSR、既有测试）。
    .side-panel 默认在 DOM 末尾（order 0 → 靠右），给它 -1 就排到最左；
-   .preview-pane 默认在 DOM 最前（order 0 → 靠左），给它 1 就排到最右。 */
+   默认左边依次是 workbench、preview-pane、主会话。交换后要镜像成
+   「侧边栏 | 主会话 | 分屏 | 工作台」，所以 workbench 取 2、preview-pane 取 1 ——
+   少了这一组，左侧会同时挤着侧边栏与工作台，而 `is-swapped` 要的正是把
+   主会话让回中间。 */
 /* ⚠️ 必须用 :deep() —— 这是这个按钮一开始"点了没反应"的原因。
    .side-panel 与 .preview-pane 都是**子组件的根元素**，带的是它们自己的
    data-v 作用域 id。父组件 scoped 里直写 `.chat-layout.is-swapped .side-panel`
    会被编译成 `.chat-layout.is-swapped .side-panel[data-v-父]`，**永不匹配**。
    :deep() 让作用域 id 落在 .chat-layout（父组件自己的元素）上，从而真正命中。 */
 .chat-layout.is-swapped :deep(.side-panel) { order: -1; }
+.chat-layout.is-swapped :deep(.workbench-panel) { order: 2; }
 .chat-layout.is-swapped :deep(.preview-pane) { order: 1; }
 .chat-body { position: relative; flex: 1; display: flex; flex-direction: column; min-height: 0; }
 /* 任务清单挂在输入区正上方：与输入框留一点呼吸，但不占满整行宽度 */

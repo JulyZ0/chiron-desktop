@@ -57,6 +57,17 @@ const (
 	// （`params.reason`）—— 套餐权益不覆盖 → 去买/续套餐；租户策略不允许 →
 	// 买套餐也没用，得找管理员。合成一句"没有权限"会让用户白花钱买套餐。
 	CodeModelNotAllowed = "model_not_allowed"
+	// CodeProjectRootUnavailable 表示项目绑定的本地文件夹此刻不可用（被删、改名、
+	// 换了挂载点）。
+	//
+	// 单独成码而不是复用 not_found：用户要做的不是"换个请求"，而是去修项目的路径，
+	// 或把文件夹放回原处。文案必须指向那个动作，否则只会看到"资源不存在"然后反复刷新。
+	CodeProjectRootUnavailable = "project_root_unavailable"
+	// CodeFileTooLarge 表示文件超过预览上限。
+	//
+	// 属于用户可自行解决的一类（换个小文件、或改用系统程序打开），所以要带上实际
+	// 大小与上限；只报"失败"会让用户以为文件坏了。
+	CodeFileTooLarge = "file_too_large"
 )
 
 // knownMessageCodes 已知文案 → 错误码（键为小写原文）。

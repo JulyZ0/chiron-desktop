@@ -725,6 +725,55 @@ function resolveEngineLaunch(options = {}) {
   return { command: explicit || 'python', args: ['-m', 'app.main'], cwd: dev, kind: 'dev' }
 }
 
+/** 开发态的知识库服务目录（仓库根下的 pageindex-service） */
+function devKnowledgeServiceDir() {
+  const candidate = path.join(repoRoot(), 'pageindex-service')
+  return fs.existsSync(path.join(candidate, 'app', 'search_api.py')) ? candidate : ''
+}
+
+/** 打包态的知识库服务目录（resources/pageindex-service） */
+function packagedKnowledgeServiceDir() {
+  if (!process.resourcesPath) return ''
+  const candidate = path.join(process.resourcesPath, 'pageindex-service')
+  return fs.existsSync(path.join(candidate, 'app', 'search_api.py')) ? candidate : ''
+}
+
+/**
+ * 知识库检索服务（pageindex-service）的启动信息。
+ *
+ * **不能复用引擎的解释器**：pageindex → litellm 要求 `openai<3`，而引擎固定
+ * `openai 3.x`，同一份 venv 里 pip 直接 ResolutionImpossible。所以它有自己的
+ * `runtime-install` target（`<userData>/local/pageindex/venv`），显式覆盖用
+ * `CHIRON_PAGEINDEX_PYTHON` 而不是引擎那个 `CHIRON_PYTHON`。
+ *
+ * 返回 null 的含义与引擎一致：这台机器上没有可用的服务源码或解释器，**不猜**。
+ */
+function resolveKnowledgeServiceLaunch(options = {}) {
+  const explicit = String(process.env.CHIRON_PAGEINDEX_PYTHON || '').trim()
+  const args = ['-m', 'uvicorn', 'app.search_api:app', '--host', '127.0.0.1']
+
+  const packaged = packagedKnowledgeServiceDir()
+  if (packaged) {
+    let userData = String(options.userDataPath || '')
+    if (!userData) {
+      try {
+        userData = userDataDir()
+      } catch {
+        return null
+      }
+    }
+    const installer = require('./runtime-install.cjs')
+    const venv = installer.venvPython(userData, 'pageindex')
+    const command = explicit || (fs.existsSync(venv) ? venv : '')
+    if (!command) return null
+    return { command, args, cwd: packaged, kind: 'packaged' }
+  }
+
+  const dev = devKnowledgeServiceDir()
+  if (!dev) return null
+  return { command: explicit || 'python', args, cwd: dev, kind: 'dev' }
+}
+
 /**
  * 组装 core 的环境变量：进程环境 → 调用方覆盖 → 契约名 + config.py 真名。
  * 空值不下发（pydantic 会把 `""` 当成显式值，反而盖掉合理默认）。
@@ -861,6 +910,8 @@ module.exports = {
   inspectEngineRuntime,
   ensureEngineRuntime,
   resolveEngineLaunch,
+  /** 知识库检索服务（pageindex-service）的启动信息：与引擎**不同 venv** */
+  resolveKnowledgeServiceLaunch,
   packagedEngineDir,
   _setDeps,
   _resetDeps,

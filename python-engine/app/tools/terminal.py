@@ -49,6 +49,31 @@ class PersistentTerminal:
         self._jobs: dict[str, Any] = {}
         #: `restricted` 档下的受限会话（持有进程/线程/管道句柄，必须显式 close）。
         self._sessions: dict[str, Any] = {}
+        #: 每个 shell 启动时**实际**生效的档位。`execute()` 要据此决定哨兵文件落在
+        #: 哪里：`low_il` 及以上写不了 Medium 目录（含系统 `%TEMP%`），哨兵写不出来
+        #: 就永远等不到完成标记 ⇒ 每条命令都跑满 timeout，看起来像 shell 卡死。
+        self._levels: dict[str, Any] = {}
+
+    def _needs_workspace_scratch(self, key: str) -> bool:
+        """该 key 下的 shell 是否只能写在 workspace 内。
+
+        判据取自**上次启动该 shell 时实际生效的档位**，而不是当前配置值 ——
+        配置可以在 shell 存活期间被热切（`PUT /isolation`），但已经起来的进程
+        令牌不会变。按配置值判断会在切换后让老 shell 的哨兵落到它写不了的目录。
+
+        `low_il` 及以上都返回 True：完整性检查是 no-write-up，Low IL 进程写不了
+        Medium 目录（系统 `%TEMP%` 即是）；`restricted` 的受限令牌更是只授权了
+        工作区。无记录（未启动过 / 走了异常分支）时按 False 处理，保持原行为。
+        """
+        level = self._levels.get(key)
+        if level is None:
+            return key in self._sessions
+        try:
+            from app.isolation import Level
+
+            return level.rank >= Level.LOW_IL.rank
+        except Exception:  # noqa: BLE001 — 判不出来时退回旧判据，不阻断命令执行
+            return key in self._sessions
 
     def _prune_procs(self) -> None:
         """回收已退出的进程条目，防止 _procs 无限累积（S 资源修复）。"""
@@ -59,6 +84,7 @@ class PersistentTerminal:
         ]
         for k in dead:
             self._procs.pop(k, None)
+            self._levels.pop(k, None)
             session = self._sessions.pop(k, None)
             if session is not None:
                 # 受限会话持有进程/管道句柄和两个排空线程，必须显式释放，
@@ -92,8 +118,24 @@ class PersistentTerminal:
         # S 修复：ws 用局部变量，避免写成实例属性后被并发请求覆盖导致跨会话串 cwd/cd
         ws = str(workspace_dir())
         shell_exe = _shell_command()
+        # **按档位改变执行路径**：`low_il` 及以上必须由子进程自己降级（完整性级别
+        # 改的是当前进程令牌且不可撤销，父进程一动手连引擎一起降）。此前这里直接
+        # 起 shell，于是 `job` / `low_il` / `appcontainer` 拿到的隔离措施完全相同 ——
+        # 用户切档位、面板也如实显示新档位，实际强度却没变。
+        shell_argv = [shell_exe]
+        if decision is not None:
+            try:
+                from app.isolation import child_launch_argv
+
+                shell_argv = child_launch_argv(decision, shell_argv)
+            except Exception as exc:  # noqa: BLE001
+                # fail-closed：需要隔离却装不上隔离层时拒绝起 shell，不退回无隔离路径
+                # （否则 persistent_shell 会变成绕过档位的后门）。
+                raise RuntimeError(
+                    f"persistent_shell 无法按 {decision.effective.value} 档启动：{exc}"
+                ) from exc
         proc = await asyncio.create_subprocess_exec(
-            shell_exe,
+            *shell_argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
@@ -132,6 +174,7 @@ class PersistentTerminal:
         if stale is not None:
             stale.close()
         self._procs[key] = proc
+        self._levels[key] = decision.effective if decision is not None else None
         if job is not None:
             self._jobs[key] = job
         return proc
@@ -142,7 +185,7 @@ class PersistentTerminal:
         `open_restricted_session` 内部是同步 Win32 调用（`CreateProcessAsUserW`
         等），必须丢线程，否则会卡住事件循环 —— 一次建进程就能拖住所有会话。
         """
-        from app.isolation import SHELL_LIMITS, win_launch, wrap_async_process
+        from app.isolation import SHELL_LIMITS, Level, win_launch, wrap_async_process
 
         shell_exe = _shell_command()
         ws = str(workspace_dir())
@@ -185,6 +228,7 @@ class PersistentTerminal:
             stale_job.close()
         self._procs[key] = session
         self._sessions[key] = session
+        self._levels[key] = Level.RESTRICTED
         if job is not None:
             self._jobs[key] = job
         return session
@@ -207,11 +251,19 @@ class PersistentTerminal:
 
         # 每命令一个临时工作目录：out=输出 / code=退出码 / done=完成哨兵
         #
-        # `restricted` 档下**必须**落在 workspace 内：受限进程只被授权写工作区，
-        # 往系统 `%TEMP%` 写会直接 Access Denied。而哨兵写不出来 ⇒ `done_file`
-        # 永不出现 ⇒ 每条命令都跑满 timeout 才返回"超时"。这是静默的：
-        # 命令本身其实成功了，输出却读不到，看起来像 shell 卡死。
-        base = str(workspace_dir()) if key in self._sessions else None
+        # **必须落在 workspace 内**，只要 shell 的档位在 `low_il` 及以上：
+        #
+        # * `restricted`：受限进程只被授权写工作区；
+        # * `low_il`：Windows 的完整性检查是 no-write-up —— Low IL 进程写不了 Medium
+        #   目录，而系统 `%TEMP%` 正是 Medium。此前这里只看 `key in self._sessions`
+        #   （即只照顾 restricted），于是 `low_il` 档下 `mkdtemp` 建在 `%TEMP%`，哨兵
+        #   写不出来 ⇒ `done_file` 永不出现 ⇒ 每条命令都跑满 timeout 才返回"超时"。
+        #   命令本身其实成功了，输出却读不到，看起来像 shell 卡死。
+        #
+        # 实测依据：low_il 子进程在打了 Low 标签的 workspace 内 mkdtemp + 写
+        # out/code/done 三个文件全部成功，写 `%TEMP%`（sandbox_dir 父层之外）则
+        # PermissionError(13)。
+        base = str(workspace_dir()) if self._needs_workspace_scratch(key) else None
         workdir = Path(tempfile.mkdtemp(prefix="chiron_sh_", dir=base))
         out_file = workdir / "out.txt"
         code_file = workdir / "code.txt"
@@ -299,6 +351,7 @@ class PersistentTerminal:
         proc = self._procs.pop(key, None)
         job = self._jobs.pop(key, None)
         session = self._sessions.pop(key, None)
+        self._levels.pop(key, None)
         if proc is not None and proc.returncode is None:
             try:
                 proc.kill()

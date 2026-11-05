@@ -56,8 +56,24 @@ func registerConversationRoutes(
 	mux.Handle("GET /v1/session-map/projects/{id}/sessions", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectSessions))))
 	mux.Handle("PUT /v1/session-map/projects/{id}/sessions/{sid}", authMW(rlMW(http.HandlerFunc(smHandler.BindProjectSession))))
 	mux.Handle("DELETE /v1/session-map/projects/{id}/sessions/{sid}", authMW(rlMW(http.HandlerFunc(smHandler.UnbindProjectSession))))
+	// 项目文件（只读）：浏览与读取用户绑定的那个文件夹。
+	//
+	// 挂在项目下而不是做成全局的 /v1/files：路径的合法性完全由「这个项目绑的是哪个
+	// 目录」决定，脱离项目谈一个绝对路径，就等于给了一个读任意目录的入口。
+	// 见 internal/api/project_files.go 开头的说明。
+	mux.Handle("GET /v1/session-map/projects/{id}/files", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectFiles))))
+	// 按名字跨目录搜索：`@` 引用的数据源。与 files 分开是因为它的语义是
+	// "我大概记得叫什么"，而不是"列出这里有什么" —— 两者的排序与预算都不同。
+	mux.Handle("GET /v1/session-map/projects/{id}/files/search", authMW(rlMW(http.HandlerFunc(smHandler.SearchProjectFiles))))
+	mux.Handle("GET /v1/session-map/projects/{id}/file", authMW(rlMW(http.HandlerFunc(smHandler.ReadProjectFile))))
+	mux.Handle("GET /v1/session-map/projects/{id}/file/raw", authMW(rlMW(http.HandlerFunc(smHandler.RawProjectFile))))
+	// 项目改动（只读 Git 视图）：与文件端点同组、同鉴权 —— 它读的是同一个项目根，
+	// 只是经 git 而不是文件系统。只执行只读子命令，见 project_git.go 开头。
+	mux.Handle("GET /v1/session-map/projects/{id}/changes", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectChanges))))
 	// 未归入任何项目的会话：存量会话全无归属，没有这个分组它们在改造后会从侧边栏消失。
 	mux.Handle("GET /v1/session-map/unassigned-sessions", authMW(rlMW(http.HandlerFunc(smHandler.ListUnassignedSessions))))
+	// 会话 → 项目反查：`@` 引用项目文件需要知道搜哪个目录（见 SessionProject 的注释）。
+	mux.Handle("GET /v1/session-map/sessions/{sid}/project", authMW(rlMW(http.HandlerFunc(smHandler.SessionProject))))
 	// 当前用户的分享列表（数据管理 → 分享管理）；与上面的按会话接口同组、同鉴权。
 	mux.Handle("GET /v1/shares", authMW(rlMW(http.HandlerFunc(shareHandler.List))))
 }

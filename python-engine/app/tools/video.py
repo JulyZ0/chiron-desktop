@@ -97,12 +97,24 @@ async def _extract_frames(
         OUTCOME_TIMEOUT,
         record_execution,
     )
-    from app.tools.sandbox import sandboxed_env
+    from app.tools.sandbox import isolation_exec_argv, sandboxed_env
 
     args = ffmpeg_args(binary, source, out_dir, start=start, fps=fps, max_frames=max_frames)
     started = time.monotonic()
+    # 按隔离档位包装：ffmpeg 能读任意源路径，是模型可触达的起进程路径。
+    try:
+        exec_argv = isolation_exec_argv(args)
+    except Exception as exc:  # noqa: BLE001 — fail-closed，不退回无隔离执行
+        record_execution(
+            tool="video_analyze",
+            command=" ".join(args),
+            outcome=OUTCOME_ERROR,
+            reason=f"isolation unavailable: {exc}",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"isolation unavailable: {exc}"}
     proc = await asyncio.create_subprocess_exec(
-        *args,
+        *exec_argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=sandboxed_env(),  # 清理环境变量，防止宿主密钥泄露给子进程

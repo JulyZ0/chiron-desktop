@@ -328,13 +328,21 @@ func (h *SubmitHandler) HandleSubmit(ctx context.Context, userID, sessionID, con
 	}
 
 	msg := content
+	// `@路径` 引用：把正文里的路径展开成文件内容块 —— **只发给引擎**，落库的
+	// `content` 仍是用户打的那一行。否则刷新会话会看到满屏文件内容，而用户
+	// 从没打过它们。
+	//
+	// 只展开首轮：续跑轮的正文是系统指令（goalEnforcePrompt），不含引用；
+	// 每轮重读一次文件既慢，又会让模型以为用户又发了一遍。
+	engineMsg := expandFileRefs(ctx, sessionID, content)
 	wb := workbenchCtx
 	// 附件只随**用户那条消息**走（首轮）。续跑轮是系统指令（goalEnforcePrompt），
 	// 再带一次附件只会让模型以为用户又发了一遍同样的文件。
 	atts := attachments
 	for {
-		report := h.submitOnce(ctx, userID, sessionID, msg, llmConfig, wb, atts)
+		report := h.submitOnce(ctx, userID, sessionID, msg, engineMsg, llmConfig, wb, atts)
 		atts = nil
+		engineMsg = ""
 		if report == nil {
 			// 引擎不可达 / 去重命中：目标**不推进**（否则会把"没跑起来"误判成"没完成"，
 			// 白烧一轮续跑）。原样结束。
@@ -394,7 +402,7 @@ func (h *SubmitHandler) saveGoal(ctx context.Context, g agentgoal.Goal) {
 //
 // workbenchCtx 是前端组装的工作台上下文（kb_id / agent / skill_names / workflow_id），
 // 透传给引擎消费 —— 网关不再丢弃它。
-func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}) *agentgoal.Report {
+func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content, engineContent string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}) *agentgoal.Report {
 	// P1 修复：与 Python 引擎 5min 客户端超时对齐，避免长任务被 180s 硬超时截断
 	ctx, cancel := context.WithTimeout(ctx, DefaultAgentTimeout)
 	defer cancel()
@@ -457,6 +465,10 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		slog.Warn("turn: generate id failed, turn tracking disabled", "error", turnIDErr)
 		turnID = ""
 	}
+	// 回合计时锚点：遥测里的 `duration_ms` 用「引擎流开始 → 收尾」的墙钟差。
+	// 放在这里而不是函数入口：之前的时间花在鉴权/配置解析/历史加载上，
+	// 那些不属于这一轮 LLM 对话的耗时。
+	turnStarted := time.Now()
 	// 消息来源：证据判定驱动的续跑轮必须带来源标记 —— 前端据此渲染成系统卡片，
 	// 而不是伪装成一条用户提问。
 	msgSource := ""
@@ -509,10 +521,16 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 			defaultMaxTurns = int(mt)
 		}
 	}
+	// 发给引擎的正文：首轮是展开过 `@路径` 的那份，续跑轮退回原文
+	// （`engineContent` 为空表示"这一轮不重新展开"）。
+	engineText := engineContent
+	if engineText == "" {
+		engineText = content
+	}
 	pythonReq := map[string]interface{}{
 		"session_id": sessionID,
 		"user_id":    userID,
-		"content":    content,
+		"content":    engineText,
 		"history":    histMsgs,
 		"max_turns":  defaultMaxTurns,
 		// M19：run 与 `turns` 的**唯一**对应关系。引擎自己生成的 task id 是内部标识，
@@ -781,10 +799,27 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		// 无文本无工具：仅用户消息已由 SaveUserMessage 持久化
 	}
 
+	// 回合终态收敛：取消(断开/超时) -> cancelled；引擎报错 -> failed；否则 completed。
+	// 提到用量记录之前：成本与遥测都要带上终态。
+	turnStatus := "completed"
+	switch {
+	case ctx.Err() != nil:
+		turnStatus = "cancelled"
+	case streamErr != "":
+		turnStatus = "failed"
+	}
+
 	// 用量明细（usage_events）：**只记录、不参与扣费**，供"钱花在哪个模型上"的统计。
 	//
 	// 写入失败只告警（见 RecordUsageEvent），不影响已完成的回合。
+	//
+	// `CostCents` 此前**从未被赋值**（字段只有声明点和读点），于是计费页与
+	// 会话遥测里的花费恒为 0。这里按 `model_prices` 的单价换算：取不到价格就写
+	// NULL（"不知道"），而不是 0（"免费"）—— 两者在汇总里都是 0，但在明细里
+	// 不该互相冒充。
+	var costCents *int
 	if usage.input > 0 || usage.output > 0 {
+		costCents = usageCostCents(storeCtx, turnModel, usage.input, usage.output, usage.cached)
 		RecordUsageEvent(storeCtx, UsageEvent{
 			TenantID:     tenantID,
 			UserID:       userID,
@@ -795,17 +830,32 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 			InputTokens:  usage.input,
 			OutputTokens: usage.output,
 			CachedTokens: usage.cached,
+			CostCents:    costCents,
 		})
 	}
 
-	// 回合终态收敛：取消(断开/超时) -> cancelled；引擎报错 -> failed；否则 completed。
-	turnStatus := "completed"
-	switch {
-	case ctx.Err() != nil:
-		turnStatus = "cancelled"
-	case streamErr != "":
-		turnStatus = "failed"
+	// 会话遥测实时层：读端（`GET /v1/sessions/{id}/metrics`）早就存在，
+	// 但**写入端从来没有** —— 热层永远为空，每次请求都落到 `turns` + `usage_events`
+	// 两张表的聚合回落上。这里补上写入，让热层真正生效。
+	if turnID != "" {
+		cost := 0
+		if costCents != nil {
+			cost = *costCents
+		}
+		RecordSessionMetrics(storeCtx, tenantID, sessionID, SessionTurnMetrics{
+			TurnID:       turnID,
+			Model:        turnModel,
+			Status:       turnStatus,
+			InputTokens:  usage.input,
+			OutputTokens: usage.output,
+			CachedTokens: usage.cached,
+			// `aggregateMetrics` 用 `== true` 比较，这里必须写 bool，不能写 1 / "true"
+			CacheHit:   usage.cached > 0,
+			CostCents:  cost,
+			DurationMs: time.Since(turnStarted).Milliseconds(),
+		})
 	}
+
 	if turnID != "" {
 		h.sessionMgr.FinishTurn(storeCtx, turnID, turnStatus, streamErr, turnModel, usage.input, usage.output, usage.cached)
 	}

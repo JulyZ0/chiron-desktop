@@ -27,12 +27,25 @@ async def _run_git(*args: str, timeout: int = 30) -> dict[str, Any]:
         OUTCOME_TIMEOUT,
         record_execution,
     )
-    from app.tools.sandbox import sandboxed_env, workspace_dir
+    from app.tools.sandbox import isolation_exec_argv, sandboxed_env, workspace_dir
 
     started = time.monotonic()
     cmd = ["git", *args]
+    # 按隔离档位包装：git 能改工作区外的一切（`-C`、hooks、`core.pager`），
+    # 不包装就等于给了一条绕过档位的执行入口。
+    try:
+        exec_argv = isolation_exec_argv(cmd)
+    except Exception as exc:  # noqa: BLE001 — fail-closed，不退回无隔离执行
+        record_execution(
+            tool="git",
+            command=" ".join(cmd),
+            outcome=OUTCOME_ERROR,
+            reason=f"isolation unavailable: {exc}",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"isolation unavailable: {exc}"}
     proc = await asyncio.create_subprocess_exec(
-        *cmd,
+        *exec_argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(workspace_dir()),

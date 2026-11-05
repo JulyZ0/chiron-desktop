@@ -215,7 +215,7 @@ async def list_knowledge_bases(user_id: str, tenant_id: int = 0) -> dict[str, An
 
     rows = await pool.fetch(
         """SELECT id, name, COALESCE(description, '') AS description, provider, visibility, status,
-                  document_count, total_size_bytes, credits_consumed, config, error_message,
+                  document_count, total_size_bytes, config, error_message,
                   created_at, updated_at
              FROM knowledge_bases
             WHERE user_id = $1
@@ -284,7 +284,7 @@ async def get_knowledge_base(kb_id: str, user_id: str, tenant_id: int = 0) -> di
     pool = get_pool()
     row = await pool.fetchrow(
         """SELECT id, name, COALESCE(description, '') AS description, provider, visibility, status,
-                  document_count, total_size_bytes, credits_consumed, config, error_message,
+                  document_count, total_size_bytes, config, error_message,
                   created_at, updated_at
              FROM knowledge_bases
             WHERE id = $1
@@ -753,7 +753,7 @@ async def admin_list_knowledge_bases() -> dict[str, Any]:
 
     rows = await pool.fetch(
         """SELECT id, name, COALESCE(description, '') AS description, provider, visibility, status,
-                  document_count, total_size_bytes, credits_consumed, config, error_message,
+                  document_count, total_size_bytes, config, error_message,
                   created_at, updated_at
              FROM knowledge_bases
             WHERE visibility = 'public'

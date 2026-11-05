@@ -72,6 +72,15 @@ EXEMPT = {
         "列表形式调用无 shell 解释，子命令由代码常量决定，只有路径来自调用方。"
         "档位变更本身由 isolation audit（record_level_change）记录，不必混进 exec_audit"
     ),
+    "isolation/win_token.py": (
+        "同 win.py：2 处 subprocess.run 是固定子命令的 icacls（/grant、/remove），"
+        "用于给合成 SID 授权与撤销，不是 agent 执行的命令"
+    ),
+    "isolation/_low_il_launcher.py": (
+        "隔离机制**自身的执行入口**，不是独立命令来源：它只执行父进程传进来的 argv，"
+        "而父进程（sandbox/terminal/job_runner/git_tools/video）已在启动前完成准入检查"
+        "并写 exec_audit。此处再记一笔会与实际执行重复计数"
+    ),
 }
 
 #: 已知缺口（**不是豁免**）：目前为空 —— `mcp/client.py` / `skill/manager.py` 已通过

@@ -150,6 +150,68 @@ describe('MessageItem（正文链接处理）', () => {
   })
 })
 
+/**
+ * 正文里的项目路径可点（P3）。
+ *
+ * 最脆的一点不是"能不能认出来"，而是**项目是异步解析出来的**：`projectId` 通常晚于
+ * 正文首帧到达，而 `v-html` 之后不再重渲染 ⇒ `onUpdated` 不会因为 props 变化再跑一次。
+ * 所以这里必须有"先空、后补"的用例，否则键盘可达会静默失效。
+ */
+describe('MessageItem（正文路径可点）', () => {
+  const withPath = '改动见 `src/api/index.ts` 这个文件'
+
+  it('行内代码里的路径被标记，且带上原始路径', async () => {
+    const wrapper = mount(MessageItem, { props: { item: assistant(withPath), projectId: 'p1' } })
+    await settleAsync()
+
+    const el = wrapper.find('.msg-text .msg-path')
+    expect(el.exists()).toBe(true)
+    expect(el.attributes('data-path')).toBe('src/api/index.ts')
+  })
+
+  it('不是路径的行内代码不会被标记（命令/表达式）', async () => {
+    const wrapper = mount(MessageItem, { props: { item: assistant('跑 `npm run build` 就行'), projectId: 'p1' } })
+    await settleAsync()
+
+    expect(wrapper.find('.msg-text .msg-path').exists()).toBe(false)
+    expect(wrapper.findAll('.msg-text code')).toHaveLength(1)
+  })
+
+  it('没有项目时不标 role/tabindex —— 点了也没有"相对哪个根"的答案', async () => {
+    const wrapper = mount(MessageItem, { props: { item: assistant(withPath), projectId: '' } })
+    await settleAsync()
+
+    const el = wrapper.find('.msg-text .msg-path')
+    expect(el.exists()).toBe(true)                       // 仍然认得出这是路径
+    expect(el.attributes('role')).toBeUndefined()        // 但不宣称自己能按
+    expect(el.attributes('tabindex')).toBeUndefined()
+  })
+
+  it('★ projectId 后到：语义要补上，不能停在首帧的判断', async () => {
+    const wrapper = mount(MessageItem, { props: { item: assistant(withPath), projectId: '' } })
+    await settleAsync()
+    expect(wrapper.find('.msg-text .msg-path').attributes('role')).toBeUndefined()
+
+    await wrapper.setProps({ projectId: 'p1' })          // 会话 → 项目映射此时才回来
+    await settleAsync()
+
+    const el = wrapper.find('.msg-text .msg-path')
+    expect(el.attributes('role')).toBe('link')
+    expect(el.attributes('tabindex')).toBe('0')
+  })
+
+  it('项目被解除绑定时收回语义（否则留下一个按不动的链接）', async () => {
+    const wrapper = mount(MessageItem, { props: { item: assistant(withPath), projectId: 'p1' } })
+    await settleAsync()
+    expect(wrapper.find('.msg-text .msg-path').attributes('role')).toBe('link')
+
+    await wrapper.setProps({ projectId: '' })
+    await settleAsync()
+
+    expect(wrapper.find('.msg-text .msg-path').attributes('role')).toBeUndefined()
+  })
+})
+
 describe('MessageItem（消息操作）', () => {
   it('可以把整条消息引用到输入框', async () => {
     const wrapper = mountText('一段较长的回复正文')

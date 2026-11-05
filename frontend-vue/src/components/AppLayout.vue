@@ -126,7 +126,11 @@ const currentLabel = computed(() => {
 
 const selectedKeys = computed(() => {
   const exact = menuItems.value.find(m => route.path === m.key)
-  return [exact?.key ?? route.path]
+  if (exact) return [exact.key]
+  // 子页面（如 /billing/prices）高亮它的父菜单项：否则进到子页左侧导航会整列失焦，
+  // 看起来像"当前在哪一节"都不见了。与上面 currentLabel 用同一套前缀判定。
+  const parent = menuItems.value.find(m => route.path.startsWith(m.key + '/'))
+  return [parent?.key ?? route.path]
 })
 
 function handleMenuClick(info: { key: string | number }) {
@@ -384,7 +388,8 @@ async function runQuickCommand() {
 <style scoped>
 .app-shell {
   position: relative;
-  height: 100vh;
+  /* 自绘标题栏在视口顶部占一条，可用高度由 --app-height 统一给出（其它环境为 100dvh） */
+  height: var(--app-height);
   background: var(--bg-page);
   color: var(--text-primary);
   --dock-w: 60px;
@@ -399,7 +404,9 @@ async function runQuickCommand() {
 /* ── 左上角浮动品牌胶囊 ── */
 .topbar {
   position: fixed;
-  top: 12px;
+  /* 12px 是设计留白；var(--app-titlebar-h) 是自绘标题栏在顶部占掉的高度，
+     非桌面壳里是 0。两者相加才能保证胶囊不被标题栏压住。 */
+  top: calc(12px + var(--app-titlebar-h));
   left: 12px;
   z-index: var(--z-drawer);
   height: 40px;
@@ -468,7 +475,7 @@ async function runQuickCommand() {
 /* ── 顶栏右侧操作组 ── */
 .topbar-actions {
   position: fixed;
-  top: 12px;
+  top: calc(12px + var(--app-titlebar-h));
   right: 12px;
   z-index: var(--z-drawer);
   display: flex;
@@ -554,7 +561,7 @@ async function runQuickCommand() {
 }
 
 .app-content {
-  height: 100vh;
+  height: var(--app-height);
   overflow-y: auto;
   overflow-x: hidden;
 }
@@ -562,7 +569,8 @@ async function runQuickCommand() {
 /* ── 工作台停靠坞 ── */
 .dock {
   position: fixed;
-  top: 64px;
+  /* 64px = 顶栏胶囊的 12 + 40 + 12 留白；标题栏高度另加 */
+  top: calc(64px + var(--app-titlebar-h));
   left: 10px;
   bottom: 10px;
   z-index: var(--z-dropdown);

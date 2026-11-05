@@ -6,7 +6,7 @@
  */
 const { contextBridge, ipcRenderer } = require('electron')
 const shared = require('./shared.cjs')
-const { API_URL_ARG_PREFIX, MODE_ARG_PREFIX } = shared
+const { API_URL_ARG_PREFIX, MODE_ARG_PREFIX, TITLEBAR_ARG_PREFIX } = shared
 
 /**
  * 设备 token 的注入前缀，必须与 main.cjs 的 DEVICE_TOKEN_ARG_PREFIX 完全一致。
@@ -50,6 +50,18 @@ const deviceToken = deviceTokenFromArgv
     mode === 'local'
     ? process.env.CHIRON_DEVICE_TOKEN || ''
     : ''
+
+/**
+ * 标题栏形态：主进程按 `(平台, 加载目标)` 算好了再从 argv 传进来。
+ *
+ * 为什么不在渲染层自己按 `platform` 判断：同一台机器上，主界面是 frameless、
+ * setup.html 却保留系统框 —— 平台判断在这里是**错**的，只有主进程知道
+ * 当前窗口到底是哪一个。缺失时回落到 `native`（宁可多一组系统按钮，
+ * 也不能画出一组点了没用的按钮）。
+ */
+const titleBarFromArgv = process.argv.find(a => a.startsWith(TITLEBAR_ARG_PREFIX))
+const rawTitleBar = titleBarFromArgv ? titleBarFromArgv.slice(TITLEBAR_ARG_PREFIX.length) : ''
+const titleBarMode = rawTitleBar === 'custom' || rawTitleBar === 'inset' ? rawTitleBar : 'native'
 
 // 主进程用 safeStorage 加密保存；读取是异步的（Electron 45 的 async API），
 // 由 store 在首屏挂载前 await，避免首屏请求缺少 Bearer token。
@@ -135,6 +147,14 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   pickDirectory: () => ipcRenderer.invoke('desktop:pick-directory'),
 
   /**
+   * 用系统默认程序打开本地路径，或在文件管理器里定位（`reveal: true`）。
+   *
+   * 只接受绝对路径，合法性判断留给后端。返回 `{ ok, reason?, message? }` ——
+   * 页面要能区分"文件已经不在了"与"没有关联程序"，而不是一律说"打开失败"。
+   */
+  openPath: (payload) => ipcRenderer.invoke('desktop:open-path', payload || {}),
+
+  /**
    * 本地模型配置（provider / 端点 / 模型名 / key）。
    *
    * 读回来的**永远不含明文 key**：只有 `{ active, providers: { <name>: { baseUrl, model, hasKey } } }`。
@@ -171,4 +191,37 @@ contextBridge.exposeInMainWorld('chironDesktop', {
 
   /** 改用镜像源重试（由用户在安装页显式点击，不自动换源） */
   retryRuntimeInstallWithMirror: () => ipcRenderer.invoke(shared.RUNTIME_MIRROR_CHANNEL),
+
+  /**
+   * 自绘标题栏的窗口控制。
+   *
+   * 窗口是 frameless 的，系统标题栏不再存在：最小化 / 最大化 / 关闭 / 拖拽
+   * 全部由页面自己提供。这里只暴露**这四个**动作，不暴露任意 IPC 通道 ——
+   * 页面不能借这条路过问窗口以外的东西。
+   *
+   * `mode` 由主进程注入（见 main.cjs 的 TITLEBAR_ARG_PREFIX）：
+   *   - `custom`：无系统标题栏（Windows/Linux），页面必须画完整的控制条；
+   *   - `inset` ：macOS，原生红绿灯保留，页面只画拖拽区，按钮位置让出左侧；
+   *   - `native`：保留系统框（setup/error 等静态页），页面不应画标题栏。
+   */
+  titleBar: {
+    mode: titleBarMode,
+    minimize: () => ipcRenderer.invoke(shared.WINDOW_CHANNELS.minimize),
+    /** 切换最大化/还原，resolve 出切换后的 `{ maximized, fullScreen, focused }` */
+    toggleMaximize: () => ipcRenderer.invoke(shared.WINDOW_CHANNELS.toggleMaximize),
+    close: () => ipcRenderer.invoke(shared.WINDOW_CHANNELS.close),
+    /** 当前窗口状态；首帧用它把图标画对（页面不知道上一个进程留下的状态） */
+    getState: () => ipcRenderer.invoke(shared.WINDOW_CHANNELS.getState),
+    /**
+     * 订阅窗口状态变化，返回取消订阅函数。
+     * 拖到屏幕边缘（Aero Snap）、Win+方向键、F11 都会改变状态，页面收不到任何点击，
+     * 只能靠这个事件跟住。
+     */
+    onStateChange: callback => {
+      if (typeof callback !== 'function') return () => {}
+      const handler = (_event, state) => callback(state)
+      ipcRenderer.on(shared.WINDOW_CHANNELS.state, handler)
+      return () => ipcRenderer.removeListener(shared.WINDOW_CHANNELS.state, handler)
+    },
+  },
 })

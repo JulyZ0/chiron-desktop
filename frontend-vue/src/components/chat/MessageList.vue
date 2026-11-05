@@ -50,6 +50,13 @@ const props = defineProps<{
   residentTailTurns?: number
   /** 会话身份：折叠状态按会话持久化（切会话重读，避免继承上一会话的展开态）。 */
   sessionKey?: string
+  /**
+   * 当前会话所属项目 id；空串 = 不在项目里。
+   *
+   * 正文里的路径只在有项目时才标记成可点（没有"相对哪个根"的答案），
+   * 所以这个值必须一路传到 `MessageItem`。
+   */
+  projectId?: string
   /** 行数超过该值才启用窗口化（小会话直接全量渲染，无风险）。 */
   windowingMinRows?: number
 }>()
@@ -636,6 +643,7 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
             v-else-if="(node as any).row.item.kind !== 'kb_hits'"
             :item="(node as any).row.item"
             :session-id="props.sessionKey"
+            :project-id="props.projectId"
             :anchor-key="isUserAnchor((node as any).row.item) ? (node as any).row.index : undefined"
             :highlighted="highlightIndex === (node as any).row.index"
             :entering="enteringIds.has((node as any).row.item.id ?? '')"

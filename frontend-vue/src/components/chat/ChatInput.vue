@@ -38,6 +38,10 @@ const props = defineProps<{
   /** 已带入本次对话的上下文（知识库 / Agent / 技能 / 工作流 / 插件 / 记忆分类）。
       对齐 reasonix 的 `composer-context`：绑定是"沉默生效"的，不显式呈现就是幽灵行为。 */
   contextChips?: ContextChip[]
+  /** 当前会话所属的项目（session-map project id）。
+      `@` 引用文件需要它来定位搜索范围；为空时文件那一源整体缺席（而不是报错）——
+      不属于任何项目的会话，本来就没有"项目文件"可言。 */
+  projectId?: string
   /** 发送失败、已暂存在本地的消息条数。>0 时在操作行上方出现横幅
       （对应 CDS 2.0 §2.3 的 ChatComposerQueuedMessages）。 */
   failedQueueCount?: number
@@ -390,10 +394,34 @@ const mentionIndex = ref(0)
 const mentionLoading = ref(false)
 const mentionItems = ref<{ type: string; id: string; name: string }[]>([])
 
+/**
+ * 项目文件搜索结果（`@` 引用文件的第二个数据源）。
+ *
+ * 与 `mentionItems` 分开而不是并进一个数组：那五个资源类是**一次加载完**的静态清单，
+ * 而文件必须跟着查询串重新搜索（用户敲 `@ha` 时后端就要重新匹配）。混在一起会逼迫
+ * 加载函数区分"这一项什么时候该刷新"，而那正是这类面板变难改的起点。
+ *
+ * 另一个差异是**懒**：没有 `projectId` 时（会话不属于任何项目）这一源恒为空，
+ * 面板里也就不会出现"文件"分组 —— 而不是显示一个永远搜不到东西的空分组。
+ */
+const fileMentionItems = ref<{ type: string; id: string; name: string }[]>([])
+let fileSearchTimer: ReturnType<typeof setTimeout> | null = null
+/** 丢弃过期响应：快速输入时后发的请求可能先回来，晚到的旧结果会把列表打回上一轮 */
+let fileSearchSeq = 0
+/**
+ * 上一次仍在飞行中的搜索。
+ *
+ * 只靠 `fileSearchSeq` 丢弃结果是不够的：服务端那侧已经把整棵项目树递归完了，
+ * 白白消耗 CPU 与磁盘 —— 输入 `main.ts` 会触发 2~3 次全量遍历。取消请求才能真正
+ * 让后端在做不下去时提前退出（`r.Context()` 在网关侧被取消）。
+ */
+let fileSearchAbort: AbortController | null = null
+
 /** `@` 提及的类型标签；写成函数以便每次渲染取当前语言（模块级 `tr` 不具响应式）。 */
 function mentionLabel(type: string): string {
   const map: Record<string, string> = {
     kb: tr('knowledge.knowledge_base'), agent: 'Agent', skill: tr('agent.skill'), workflow: tr('workflow.workflow'), plugin: tr('common.plugin'),
+    file: tr('media.file'),
   }
   return map[type] || type
 }
@@ -403,11 +431,15 @@ const filteredMentions = computed(() => {
   const list = q
     ? mentionItems.value.filter(m => `${m.name} ${m.id}`.toLowerCase().includes(q))
     : mentionItems.value
-  return list.slice(0, 20)
+  // 资源类先占位、文件补在后面：用户敲 `@` 时多数是想选知识库/技能，
+  // 文件是"这次要指一个具体文件"的补充。反过来会让文件把资源挤出可视区。
+  const CAP = 20
+  const head = list.slice(0, CAP)
+  return [...head, ...fileMentionItems.value.slice(0, Math.max(0, CAP - head.length))]
 })
 
 /** 分类的固定展示顺序（不按数量抖动 —— 用户对"知识库在最上"有稳定预期） */
-const MENTION_TYPE_ORDER = ['kb', 'agent', 'skill', 'workflow', 'plugin']
+const MENTION_TYPE_ORDER = ['kb', 'agent', 'skill', 'workflow', 'plugin', 'file']
 
 /**
  * 按资源类型分组。
@@ -460,6 +492,41 @@ async function loadMentionItems() {
   }
 }
 
+/** 文件搜索：跟着查询串重新匹配（后端递归 + 预算截断），带 180ms 防抖 */
+function scheduleFileSearch(query: string) {
+  if (fileSearchTimer) clearTimeout(fileSearchTimer)
+  // 每次重新排期都先取消上一发：防抖只能省掉"还没发出去"的那些，已经发出去的
+  // 请求若不取消，服务端会照样把整棵树递归完。
+  fileSearchAbort?.abort()
+  fileSearchAbort = null
+  const pid = props.projectId
+  // 空查询不搜文件：刚敲下 `@` 时用户还没表达意图，塞 12 个文件进来只会
+  // 把知识库/技能挤出可视区（它们是 `@` 的主用途）。一敲字符就开始搜。
+  if (!pid || !query.trim()) {
+    fileMentionItems.value = []
+    return
+  }
+  const seq = ++fileSearchSeq
+  fileSearchTimer = setTimeout(async () => {
+    const controller = new AbortController()
+    fileSearchAbort = controller
+    try {
+      const { searchProjectFiles } = await import('../../api/projectFiles')
+      const { files } = await searchProjectFiles(pid, query, 12, controller.signal)
+      // 只认最新一次查询的结果：快速输入时旧请求可能后到，把列表打回上一轮。
+      if (seq !== fileSearchSeq) return
+      fileMentionItems.value = files.map(f => ({ type: 'file', id: f.path, name: f.path }))
+    } catch {
+      // 主动取消（用户又敲了一个字符）走这里，但结果本来就要丢弃，不必区分。
+      // 项目路径失效等真实错误也在这里：不弹提示 —— 用户此刻在打字，打断他更糟。
+      // 预览面板那边打开文件时会给出明确的失败原因（那里才是他会采取行动的地方）。
+      if (seq === fileSearchSeq) fileMentionItems.value = []
+    } finally {
+      if (fileSearchAbort === controller) fileSearchAbort = null
+    }
+  }, 180)
+}
+
 /** 尾随标点（含 CJK 全角）。它意味着"这次提及已经写完"，不该并进查询串。 */
 const TRAILING_PUNCT = /[.,;:!?'"、。，；：！？…]+$/
 
@@ -490,6 +557,7 @@ function syncMention() {
   mentionIndex.value = 0
   mentionOpen.value = true
   void loadMentionItems()
+  scheduleFileSearch(query)
 }
 
 /** 选中一项：把 `@query` 从文本里摘掉，引用交给父组件（chips 体系） */
@@ -500,8 +568,54 @@ function pickMention(item: { type: string; id: string; name: string }) {
   if (at >= 0) input.value = input.value.slice(0, at) + input.value.slice(caret)
   mentionOpen.value = false
   saveDraft()
+  if (item.type === 'file') {
+    // 文件引用**只写 `@路径` token**，内容由网关在提交时按项目根读取。
+    //
+    // 早期实现是"在这里把整个文件读出来、base64 成 data: URL 当附件"。那有两个
+    // 硬伤：请求体体积随文件大小线性增长（`DecodeJSON` 有 1MB 上限，稍大的源码
+    // 文件就会整个提交失败），以及"读文件"这件事散落在前后端两处、边界不一致。
+    // 现在与 Reasonix 同口径：前端只发路径，读取与截断只发生在网关一处。
+    insertFileRefToken(item.id, at)
+    return
+  }
   emit('mention-add', { type: item.type, id: item.id, name: item.name })
   nextTick(() => textareaRef.value?.focus?.())
+}
+
+/**
+ * 转义 `@token` 里的边界字符。
+ *
+ * 只转义空格与制表符 —— 它们是 token 的分隔符，不转义会让 `@my file.ts` 被解析成
+ * 两个 token。反斜杠本身不动：Windows 路径里的 `\` 必须原样保留，网关的解析器
+ * 只在反斜杠紧跟空格/制表符时才把它当转义符。
+ */
+function escapeFileRefPath(path: string): string {
+  return /[ \t]/.test(path) ? path.replace(/[ \t]/g, m => `\\${m}`) : path
+}
+
+/**
+ * 把 `@路径` 插进输入框。
+ *
+ * `at` 是刚才被摘掉的 `@query` 起点：在**原位**插回引用，用户接着打的字就自然
+ * 落在它后面。`at < 0`（没有 `@` 可替换）时追加到末尾，用于工作台的「加入对话」。
+ */
+function insertFileRefToken(relPath: string, at = -1) {
+  if (!relPath) return
+  const token = `@${escapeFileRefPath(relPath)} `
+  if (at >= 0 && at <= input.value.length) {
+    input.value = input.value.slice(0, at) + token + input.value.slice(at)
+  } else {
+    const sep = input.value && !/\s$/.test(input.value) ? ' ' : ''
+    input.value = `${input.value}${sep}${token}`
+  }
+  mentionOpen.value = false
+  saveDraft()
+  nextTick(() => textareaRef.value?.focus?.())
+}
+
+/** 把项目文件引用交给对话（只插 token，不读内容）。 */
+function attachFileReference(relPath: string, _name: string) {
+  insertFileRefToken(relPath)
 }
 
 /**
@@ -972,7 +1086,7 @@ function setDraft(text: string) {
   nextTick(() => textareaRef.value?.focus?.())
 }
 
-defineExpose({ insertText, setCommandDraft, setDraft })
+defineExpose({ insertText, setCommandDraft, setDraft, attachProjectFile: attachFileReference })
 </script>
 
 <template>

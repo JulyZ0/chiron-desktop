@@ -17,6 +17,8 @@ import ToolCallCard from './ToolCallCard.vue'
 import ToolResultBlock from './ToolResultBlock.vue'
 import { renderMermaidBlocks } from './mermaidRenderer'
 import { highlightCodeBlocks } from './codeHighlighter'
+import { isLikelyProjectPath } from './pathLink'
+import { revealInWorkbench } from '../workbench/useWorkbench'
 import { openLightboxFrom, openLightboxFromList } from '../common/lightboxTransition'
 import type { ChatItem, ToolCallItem, ToolResultItem, TextItem, ChatAttachment } from './chat-types'
 import { formatSize } from './chat-types'
@@ -31,6 +33,13 @@ const props = defineProps<{
   highlighted?: boolean
   /** 当前会话 id：工具结果按需拉全文时要用（见 ToolResultBlock） */
   sessionId?: string
+  /**
+   * 当前会话所属项目 id；空串 = 不在项目里。
+   *
+   * 正文里的路径只在**有项目**时才标记成可点：没有项目就没有"相对哪个根"的答案，
+   * 标了也只能点出一个错误提示 —— 那不如保持普通文本。
+   */
+  projectId?: string
   /** 是否播放一次入场动效。由父组件按「新到的 id」门控 ——
    *  transcript 是窗口化的，滚出再滚回会重新挂载行，不门控就会反复重播。 */
   entering?: boolean
@@ -415,6 +424,24 @@ md.renderer.rules.fence = (tokens, idx) => {
 /** 超过该行数默认折叠：长代码会挤掉整屏消息，先给一段可读的预览 */
 const CODE_COLLAPSE_LINES = 28
 
+/**
+ * 行内代码里看起来像项目路径的，标成可点。
+ *
+ * 只在**行内代码**上做（理由见 `pathLink.ts` 头部）：正文里的路径通常是作者用反引号
+ * 包起来的字面量，这是唯一可靠信号；扫全文会把普通英文词也变成链接。
+ *
+ * 这里只产 `class` + `data-path`，**不写 `role` / `tabindex`**：渲染产物进的是模块级
+ * LRU 缓存，同一条正文可能被"有项目"和"没项目"的会话共用。可交互语义必须由
+ * `enhanceContent` 按**当前** props 补上去，否则缓存会把这个判断固化成第一次渲染时
+ * 的样子。
+ */
+md.renderer.rules.code_inline = (tokens, idx) => {
+  const text = tokens[idx]?.content || ''
+  const safe = md.utils.escapeHtml(text)
+  if (!isLikelyProjectPath(text)) return `<code>${safe}</code>`
+  return `<code class="msg-path" data-path="${md.utils.escapeHtml(text)}">${safe}</code>`
+}
+
 // P 性能：图片懒加载（长列表/历史中大量图片不阻塞首屏，滚动到才加载）
 md.renderer.rules.image = (tokens, idx) => {
   const token = tokens[idx]
@@ -546,6 +573,14 @@ function handleMsgClick(e: MouseEvent) {
     }).catch(() => { /* clipboard not available */ })
     return
   }
+  // 正文里的**项目路径**（行内代码被标记成 `.msg-path`）→ 在工作台打开。
+  // 只在有项目时响应：没有项目就没有"相对哪个根"，标记阶段已撤掉 role/tabindex，
+  // 这里再判一次是为了兜住"标记之后项目被解绑"的中间态。
+  const pathEl = target.closest('.msg-path') as HTMLElement | null
+  if (pathEl?.dataset.path) {
+    if (props.projectId) revealInWorkbench(pathEl.dataset.path)
+    return
+  }
   // 正文里的图片（markdown 图片由 v-html 生成，挂不上 Vue 事件）交查看器放大。
   // 把被点的 <img> 一起传进去：灯箱的共享元素形变要从它长出来（CDS v1 §5.2.2）。
   const img = target.closest('img') as HTMLImageElement | null
@@ -563,6 +598,21 @@ function handleMsgClick(e: MouseEvent) {
   }
 }
 
+/**
+ * 键盘可达：`.msg-path` 带 `role="link"` + `tabindex="0"`（由 `applyPathLinks` 按当前
+ * 是否有项目补上），必须能用 Enter / Space 触发 —— 只标 role 不响应按键，对屏幕阅读器
+ * 用户就是一个会说话但按不动的链接。
+ *
+ * 事件委托在消息根上，只有焦点真的落在 `.msg-path` 上才处理，不影响其它按键。
+ */
+function handleMsgKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Enter' && e.key !== ' ') return
+  const pathEl = (e.target as HTMLElement | null)?.closest?.('.msg-path') as HTMLElement | null
+  if (!pathEl?.dataset.path) return
+  e.preventDefault()
+  if (props.projectId) revealInWorkbench(pathEl.dataset.path)
+}
+
 /** 附件缩略图 → 灯箱：图片附件构成图集，音频/文件附件不参与切换。 */
 function openAttachment(att: ChatAttachment, e: MouseEvent) {
   const el = e.currentTarget as HTMLElement
@@ -574,8 +624,10 @@ function openAttachment(att: ChatAttachment, e: MouseEvent) {
 }
 
 /**
- * 正文增强（图表渲染 + 代码高亮）：只在 DOM 完成 patch 后触发，内容变化由 onUpdated 覆盖。
- * 两者都是纯增强 —— 加载或渲染失败时正文保持可读，不影响消息本身。
+ * 正文增强（图表渲染 + 代码高亮 + 路径可点）：只在 DOM 完成 patch 后触发，
+ * 内容变化由 onUpdated 覆盖。
+ *
+ * 三者都是纯增强 —— 加载或渲染失败时正文保持可读，不影响消息本身。
  */
 function enhanceContent() {
   const host = msgTextRef.value
@@ -584,10 +636,46 @@ function enhanceContent() {
   const dark = document.documentElement.classList.contains('dark')
   void renderMermaidBlocks(host, { dark })
   void highlightCodeBlocks(host)
+  applyPathLinks(host)
+}
+
+/**
+ * 按**当前**是否在项目里，给 `.msg-path` 补/撤可交互语义。
+ *
+ * 为什么不在渲染时一次写死：`renderMarkdown` 有模块级 LRU 缓存，同一条正文会被不同
+ * 会话共用；写进 HTML 就等于把"第一次渲染时有没有项目"永久固化。这里只改 DOM 属性，
+ * 不重渲染正文。
+ */
+function applyPathLinks(host: HTMLElement) {
+  const clickable = Boolean(props.projectId)
+  for (const el of Array.from(host.querySelectorAll<HTMLElement>('.msg-path'))) {
+    if (clickable) {
+      el.setAttribute('role', 'link')
+      el.setAttribute('tabindex', '0')
+    } else {
+      el.removeAttribute('role')
+      el.removeAttribute('tabindex')
+    }
+  }
 }
 
 onMounted(enhanceContent)
 onUpdated(enhanceContent)
+
+/**
+ * `projectId` 是**异步**到达的（会话 → 项目映射要走一次请求），通常晚于正文首帧。
+ *
+ * 只靠 `onUpdated` 不够：`renderedHtml` 之后不再变化，Vue 不会因为父组件传下来的
+ * `projectId` 变了就重渲染这段 `v-html`，`onUpdated` 也就不会触发 —— 路径会永远停在
+ * "没有项目"的语义上，键盘用户按不动。这里显式补一次。
+ */
+watch(
+  () => props.projectId,
+  () => {
+    const host = msgTextRef.value
+    if (host) applyPathLinks(host)
+  },
+)
 </script>
 
 <template>
@@ -600,6 +688,7 @@ onUpdated(enhanceContent)
     data-time-hover-root
     data-click-delegate
     @click="handleMsgClick"
+    @keydown="handleMsgKeydown"
   >
     <div
       class="msg-content"
@@ -1103,6 +1192,19 @@ onUpdated(enhanceContent)
 .msg-text :deep(th) { background: var(--bg-secondary); font-weight: var(--fw-semibold); }
 .msg-text :deep(img) { max-width: 100%; border-radius: var(--sig-radius-code); }/* 行内代码（deepseek markdown-inline-code：bluish-100 底） */
 .msg-text :deep(code) { font-family: var(--font-mono); font-size: 0.9em; background: var(--bg-secondary); padding: 2px 6px; border-radius: var(--sig-radius-button); }
+/* 项目路径：默认可点样式（下划线暗示"能按"），无项目时 applyPathLinks 已撤掉
+   role/tabindex，但仍保留视觉提示 —— 提示的是"这是个路径"，不是"一定能打开"。 */
+.msg-text :deep(.msg-path) {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+.msg-text :deep(.msg-path:hover) { background: var(--bg-surface-hover); }
+.msg-text :deep(.msg-path:focus-visible) {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
 /* 代码块：12px 圆角 + banner（deepseek CodeBlock） */
 .msg-text :deep(.code-block-wrapper) { margin: 16px 0; background: var(--bg-code); border-radius: var(--sig-radius-code); overflow: hidden; }
 .msg-text :deep(.code-block-header) { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 14px; background: var(--bg-secondary); }

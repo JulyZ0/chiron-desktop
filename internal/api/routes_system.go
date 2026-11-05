@@ -7,26 +7,19 @@ import (
 	"github.com/athenavi/chiron/internal/db"
 )
 
-// routes_system.go —— 系统（编辑器/工具/健康/追踪）的路由注册。
-// 由 gateway_router.go 按业务域拆分而来（纯移动：函数签名、函数体、调用点一字未改）。
+// routes_system.go —— 系统（工具/健康/追踪）的路由注册。
+// 由 gateway_router.go 按业务域拆分而来。编辑器路由曾在此组，已随
+// `/api/editor/*` 退役整体移除（读能力由 project_files.go 按项目根提供）。
 
-// ── System (editor / tools / health / trace) ──
+// ── System (tools / health / trace) ──
 
 func registerSystemRoutes(
 	mux *http.ServeMux,
 	authMW, rlMW, sanitizeMW routeMiddleware,
-	editorHandler *EditorHandler,
 	toolHandler *ToolHandler,
 	systemHandler *SystemHandler,
 	traceHandler *TraceHandler,
 ) {
-	// Editor (admin 权限 + rate limited)
-	// S 安全修复：编辑器直接读写共享服务器工作区（含沙箱/分片/插件数据），
-	// 仅限管理员（列表/读=PermAdminRead，写=PermAdminWrite），普通 user 无权访问。
-	mux.Handle("GET /api/editor/files", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(editorHandler.ListFiles)))))
-	mux.Handle("GET /api/editor/read", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(editorHandler.ReadFile)))))
-	mux.Handle("POST /api/editor/write", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(http.HandlerFunc(editorHandler.WriteFile)))))
-
 	// Tools (rate limited, proxies to Python)
 	// 工具面属于内部信息（含 MCP 注入工具名/描述/完整入参 schema），
 	// 未认证即可枚举等于免费交付攻击面清单。同组 /v1/tools/execute 早有 authMW。

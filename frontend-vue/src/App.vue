@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ConfigProvider, theme } from 'ant-design-vue'
 import AppLayout from './components/AppLayout.vue'
+import TitleBar from './components/shell/TitleBar.vue'
 import RouteProgressBar from './components/common/RouteProgressBar.vue'
 import ErrorBoundary from './components/common/ErrorBoundary.vue'
 import ImageViewer from './components/common/ImageViewer.vue'
@@ -45,6 +46,9 @@ watchEffect(() => {
     :locale="antdLocale"
   >
     <RouteProgressBar />
+    <!-- 自绘标题栏：挂在布局之外，登录页/错误页同样需要能拖、能关。
+         它在非桌面壳、以及保留系统框的窗口里自己渲染成空，不留高度。 -->
+    <TitleBar />
     <ErrorBoundary>
       <AppLayout v-if="showLayout" />
       <router-view v-else />
@@ -66,7 +70,7 @@ html, body, #app {
 }
 
 #app {
-  min-height: 100dvh;
+  min-height: var(--app-height);
   background: var(--bg-page);
   color: var(--text-primary);
   transition: background-color var(--dur-slow) var(--ease-out),

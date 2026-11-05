@@ -46,6 +46,8 @@ const LOCAL_DATA_SUBDIRS = {
   SKILL_STORE_PATH: 'skills',
   MEDIA_STORE_PATH: 'media',
   KNOWLEDGE_LOCAL_PATH: 'knowledge',
+  /** pageindex 的索引产物根（`KNOWLEDGE_SELFHOSTED_ROOT`），与原文分开存 */
+  KNOWLEDGE_SELFHOSTED_ROOT: 'knowledge_index',
   PLUGIN_DATA_DIR: 'plugins',
   SANDBOX_ROOT: 'sandbox',
   /** 审计日志根：四处 `*_audit.py` 读 `Settings.log_dir`（env 名 `LOG_DIR`） */
@@ -162,6 +164,15 @@ const ENGINE_HEALTH_PATH = '/healthz'
 const ENGINE_TIMEOUT_MS = 120_000
 
 /**
+ * 知识库检索服务（pageindex-service）的健康检查路径与启动超时。
+ *
+ * 超时比引擎短得多：它只 import fastapi/uvicorn/pageindex，没有引擎那串重依赖；
+ * 60s 内起不来说明是环境问题，多等没有意义。
+ */
+const KNOWLEDGE_SERVICE_HEALTH_PATH = '/healthz'
+const KNOWLEDGE_SERVICE_TIMEOUT_MS = 60_000
+
+/**
  * 端口冲突时最多尝试几次（含首次）。与 `components.cjs` 的 `CORE_PORT_ATTEMPTS` 一致。
  *
  * 为什么必须重试：`pickFreePort()` / `find_free_port()` 都只是**借号**——它们 listen 到
@@ -178,6 +189,8 @@ const state = {
   launcher: null,
   /** python-engine 进程记录 */
   engine: null,
+  /** 知识库检索服务（pageindex-service）进程记录；可为空（组件未装） */
+  knowledge: null,
   /** Go 网关进程记录 */
   gateway: null,
   /**
@@ -206,6 +219,7 @@ function _resetState() {
   state.launcher = null
   state.engine = null
   state.engineFailure = null
+  state.knowledge = null
   state.gateway = null
   state.attached = null
   state.ownedDataDir = ''
@@ -804,6 +818,16 @@ function buildEngineEnv(info, options = {}) {
     env.GATEWAY_INTERNAL_URL = `http://${DEFAULTS.DEFAULT_HOST}:${gatewayPort}`
   }
 
+  // **知识库检索服务**（pageindex-service）的地址。
+  //
+  // 缺了它，引擎侧的 `RemoteProvider` 会在每次检索时抛
+  // "KNOWLEDGE_SERVICE_URL 未配置" —— 知识库页面能建库、能上传，
+  // 但一建索引就失败。地址由 `startLocalStack` 先起服务再拿到端口，所以只能在这里注入。
+  const kbServicePort = Number(options.knowledgeServicePort)
+  if (isValidPort(kbServicePort)) {
+    env.KNOWLEDGE_SERVICE_URL = `http://${DEFAULTS.DEFAULT_HOST}:${kbServicePort}`
+  }
+
   const redisAddr = String(info.redisAddr || '').trim()
   if (redisAddr) {
     // 引导器给的是 host:port，引擎要的是 URI。已经带 scheme 时原样用，避免拼成
@@ -812,6 +836,226 @@ function buildEngineEnv(info, options = {}) {
   }
 
   return env
+}
+
+/**
+ * 知识库检索服务（pageindex-service）的环境变量。
+ *
+ * 与引擎的差异只有三处，其余同口径：
+ *   - 库/缓存沿用 `POSTGRES_DSN` / `REDIS_URL`（worker 要读原文与队列）；
+ *   - `KNOWLEDGE_SELFHOSTED_ROOT` 是**索引产物**目录，必须与原文的
+ *     `KNOWLEDGE_LOCAL_PATH` 分开 —— 混在一处后原文清理会顺手删掉索引；
+ *   - `INTERNAL_TOKEN` 必须与引擎派生值一致，否则引擎每次调用都被 401 顶回来
+ *     （表现是"知识库检索不可用"，而不是一眼能看出的鉴权问题）。
+ */
+function buildKnowledgeServiceEnv(info, options = {}) {
+  const env = { ...process.env, ...(options.env || {}) }
+
+  const appSecret = String(options.appSecret || '').trim()
+  if (appSecret) {
+    env.APP_SECRET = appSecret
+    applyLocalModeSecrets(env, appSecret)
+  }
+
+  const pgDsn = String((info && info.pgDsn) || '').trim()
+  if (pgDsn) env.POSTGRES_DSN = pgDsn
+
+  const redisAddr = String((info && info.redisAddr) || '').trim()
+  if (redisAddr) {
+    env.REDIS_URL = redisAddr.includes('://') ? redisAddr : `redis://${redisAddr}`
+  }
+
+  const port = Number(options.port)
+  if (isValidPort(port)) env.PAGEINDEX_PORT = String(port)
+
+  const dataPaths = localDataPaths(options.dataDir)
+  for (const name of ['KNOWLEDGE_LOCAL_PATH', 'KNOWLEDGE_SELFHOSTED_ROOT']) {
+    if (dataPaths[name] && (options.env || {})[name] === undefined) env[name] = dataPaths[name]
+  }
+
+  // **模型与 LLM 连接**：`Config.selfhosted_ready()` 要求 `index_model` 与 `chat_model`
+  // 同时非空，缺一个 `/healthz` 就回 `ok:false` —— 进程起来了、端口也通，但引擎侧的
+  // `RemoteProvider.probe()` 会判"知识库服务不可用"，于是建索引全部失败。
+  //
+  // 桌面本地模式只有**一份**模型配置（用户没理由为索引单独再配一遍），所以从引擎那套
+  // 变量映射过来；引擎自己也是这条口径（`config.py` 的 LLM_* 回退到 OPENAI_*）。
+  // 显式给了 `KNOWLEDGE_SELFHOSTED_*` 的一律不覆盖。
+  const pickEnv = (...names) => {
+    for (const name of names) {
+      const value = String((options.env || {})[name] ?? process.env[name] ?? '').trim()
+      if (value) return value
+    }
+    return ''
+  }
+  const chatModel = pickEnv('OPENAI_MODEL', 'LLM_MODEL')
+  if (chatModel) {
+    if (!env.KNOWLEDGE_SELFHOSTED_CHAT_MODEL) env.KNOWLEDGE_SELFHOSTED_CHAT_MODEL = chatModel
+    if (!env.KNOWLEDGE_SELFHOSTED_INDEX_MODEL) env.KNOWLEDGE_SELFHOSTED_INDEX_MODEL = chatModel
+  }
+  const llmBaseUrl = pickEnv('LLM_BASE_URL', 'OPENAI_BASE_URL')
+  if (llmBaseUrl && !env.KNOWLEDGE_SELFHOSTED_LLM_BASE_URL) {
+    env.KNOWLEDGE_SELFHOSTED_LLM_BASE_URL = llmBaseUrl
+  }
+  const llmApiKey = pickEnv('LLM_API_KEY', 'OPENAI_API_KEY')
+  if (llmApiKey && !env.KNOWLEDGE_SELFHOSTED_LLM_API_KEY) {
+    env.KNOWLEDGE_SELFHOSTED_LLM_API_KEY = llmApiKey
+  }
+  return env
+}
+
+/** 起一个子进程并把 stdout/stderr 尾部攒进记录：失败时唯一能定位原因的证据 */
+function spawnTracked(command, args, options = {}) {
+  const { spawn: spawnImpl } = runtime()
+  const child = spawnImpl(command, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: options.cwd || process.cwd(),
+    windowsHide: true,
+    env: options.env,
+  })
+  const record = {
+    child,
+    stderrTail: '',
+    stdoutTail: '',
+    exited: false,
+    exitCode: null,
+    stopping: false,
+    startedAt: new Date().toISOString(),
+  }
+  if (child.stdout) {
+    child.stdout.on('data', chunk => {
+      record.stdoutTail = tailOf(`${record.stdoutTail}${chunk.toString('utf8')}`, 8192)
+    })
+  }
+  if (child.stderr) {
+    child.stderr.on('data', chunk => {
+      record.stderrTail = tailOf(`${record.stderrTail}${chunk.toString('utf8')}`, 8192)
+    })
+  }
+  child.once('error', err => {
+    record.exited = true
+    record.spawnError = (err && err.message) || String(err)
+  })
+  child.once('exit', code => {
+    record.exited = true
+    record.exitCode = code
+  })
+  return record
+}
+
+/**
+ * 起知识库检索服务（uvicorn）+ 索引 worker。
+ *
+ * **它是可选组件**：装不上、起不来都**不能**让本地模式整体失败 —— 聊天、记忆、
+ * 技能与知识库的"建库/上传"都不依赖它，只有"建索引/检索"依赖。所以这里一律返回
+ * `{ok:false, reason}` 而不抛，由 `startLocalStack` 决定怎么降级。
+ *
+ * 两个进程缺一不可：服务负责应答引擎的检索请求，worker 消费 `engine:tasks:kb`
+ * 把文档真正切开入树。只起服务时界面上传成功、状态永远停在 `indexing`。
+ */
+async function startKnowledgeService(info, options = {}) {
+  const launch = options.knowledge
+  if (!launch || !launch.command) {
+    return { ok: false, reason: 'not-installed', message: '知识库检索服务未安装' }
+  }
+
+  const attempts = options.retryPortConflict === false ? 1 : PORT_ATTEMPTS
+  let last = null
+
+  for (let index = 0; index < attempts; index += 1) {
+    const port = index === 0 ? Number(options.port) : await components.pickFreePort()
+    const result = await spawnKnowledgeServiceOnce(info, { ...options, port })
+    if (result.ok) return result
+
+    last = result
+    // **失败必先收干净**：超时那条路径里进程还活着，端口被自己占着，
+    // 不杀就换号重试也白搭，而且会在 state 里留一个没人管的活进程。
+    // 对已退出的记录它是幂等的（只看 `exited`），所以这里无条件调。
+    await stopKnowledgeService()
+    if (!DEFAULTS.isPortConflict(`${result.stderrTail || ''}\n${result.message || ''}`)) break
+  }
+  return last
+}
+
+/** 单次尝试：换号重试与最终判定由 `startKnowledgeService` 负责。 */
+async function spawnKnowledgeServiceOnce(info, options = {}) {
+  const launch = options.knowledge
+  const port = Number(options.port)
+  const env = buildKnowledgeServiceEnv(info, { ...options, port })
+  const baseUrl = `http://${DEFAULTS.DEFAULT_HOST}:${port}`
+
+  let service
+  try {
+    service = spawnTracked(launch.command, [...(launch.args || []), '--port', String(port)], {
+      cwd: launch.cwd,
+      env,
+    })
+  } catch (err) {
+    return { ok: false, reason: 'spawn-failed', message: (err && err.message) || 'spawn 出错' }
+  }
+  state.knowledge = { service, worker: null, port, baseUrl }
+
+  const deadline = Date.now() + (options.timeoutMs || KNOWLEDGE_SERVICE_TIMEOUT_MS)
+  while (Date.now() < deadline) {
+    if (service.exited) {
+      return {
+        ok: false,
+        reason: 'exited',
+        message: `知识库服务启动后立即退出（退出码 ${service.exitCode}）`,
+        stderrTail: service.stderrTail,
+      }
+    }
+    if (await probeHttp(baseUrl, KNOWLEDGE_SERVICE_HEALTH_PATH)) {
+      // worker 失败**不算**服务失败：检索仍可用，界面会显示"索引未完成"，
+      // 这比整个知识库 503 更接近事实。
+      const worker = (() => {
+        try {
+          return spawnTracked(launch.command, ['-m', 'app.index_worker'], { cwd: launch.cwd, env })
+        } catch {
+          return null
+        }
+      })()
+      state.knowledge.worker = worker
+      return { ok: true, port, baseUrl, address: `${DEFAULTS.DEFAULT_HOST}:${port}` }
+    }
+    await sleep(options.intervalMs || 500)
+  }
+
+  return {
+    ok: false,
+    reason: 'timeout',
+    message: `知识库服务在 ${Math.round((options.timeoutMs || KNOWLEDGE_SERVICE_TIMEOUT_MS) / 1000)}s 内未开始监听`,
+    stderrTail: service.stderrTail,
+  }
+}
+
+/** 停知识库服务与 worker。调用方通常在停引擎**之后**调它（引擎还在用时不能先断）。 */
+async function stopKnowledgeService() {
+  const record = state.knowledge
+  if (!record) return false
+  state.knowledge = null
+
+  for (const proc of [record.worker, record.service]) {
+    if (!proc) continue
+    proc.stopping = true
+    if (!proc.child || proc.exited) continue
+    try {
+      proc.child.kill('SIGTERM')
+    } catch {
+      /* 已消失 */
+    }
+    if (await waitExit(proc.child, 5000)) continue
+    try {
+      components.killProcessTree(proc.child)
+    } catch {
+      try {
+        proc.child.kill('SIGKILL')
+      } catch {
+        /* 已消失 */
+      }
+    }
+    await waitExit(proc.child, 3000)
+  }
+  return true
 }
 
 /**
@@ -1022,10 +1266,20 @@ async function startLocalStack(options = {}) {
     // 反方向同理，而且更硬：引擎回调网关用的 `GATEWAY_INTERNAL_URL` 只能在 spawn 时给全，
     // 所以网关端口必须在这里就定下来，不能等 `startGateway` 自己去挑。
     const gatewayPort = isValidPort(options.port) ? Number(options.port) : await components.pickFreePort()
+    // 知识库检索服务必须先于引擎：`KNOWLEDGE_SERVICE_URL` 只能在 spawn 时给全，
+    // 而引擎起来之后改不了（与 GATEWAY_INTERNAL_URL 同理）。它只是**可选组件**，
+    // 起不来就把地址留空 —— 引擎照常启动，知识库的建索引/检索报"服务不可用"。
+    const knowledgePort = options.knowledge
+      ? options.knowledgePort || (await components.pickFreePort())
+      : 0
+    const knowledgeResult = options.knowledge
+      ? await startKnowledgeService(launcherResult.info, { ...options, port: knowledgePort })
+      : { ok: false, reason: 'not-installed' }
     const engineResult = await startEngine(launcherResult.info, {
       ...options,
       port: enginePort,
       gatewayPort,
+      knowledgeServicePort: knowledgeResult.ok ? knowledgeResult.port : 0,
     })
     if (!engineResult.ok) {
       // 强依赖：没有引擎就没有可用的本地模式（聊天/知识库/记忆全在引擎侧）
@@ -1108,9 +1362,10 @@ async function stopLocalStack() {
     return { gatewayStopped: false, engineStopped: false, launcherStopped: false, detached: true }
   }
 
-  // 与启动相反：先网关，再引擎，最后数据栈
+  // 与启动相反：先网关，再引擎（它还在用知识库服务），最后数据栈
   const gatewayStopped = await stopGateway()
   const engineStopped = await stopEngine()
+  const knowledgeStopped = await stopKnowledgeService()
   const launcherStopped = await stopLauncher()
   // 自己拉起的栈已经停了，状态文件必须删掉：留着会让下一个实例去连一堆死端口，
   // 白白多等一轮探测超时。
@@ -1118,7 +1373,7 @@ async function stopLocalStack() {
     runtimeState.clearRuntimeState(state.ownedDataDir)
     state.ownedDataDir = ''
   }
-  return { gatewayStopped, engineStopped, launcherStopped }
+  return { gatewayStopped, engineStopped, knowledgeStopped, launcherStopped }
 }
 
 function getStackState() {
@@ -1146,6 +1401,8 @@ module.exports = {
   GATEWAY_HEALTH_PATH,
   GATEWAY_READY_PATH,
   ENGINE_HEALTH_PATH,
+  KNOWLEDGE_SERVICE_HEALTH_PATH,
+  KNOWLEDGE_SERVICE_TIMEOUT_MS,
   LAUNCHER_TIMEOUT_MS,
   LAUNCHER_EXIT_GRACE_MS,
   GATEWAY_TIMEOUT_MS,
@@ -1163,6 +1420,10 @@ module.exports = {
   stopLauncher,
   startEngine,
   stopEngine,
+  /** 知识库检索服务（pageindex-service）：可选组件，失败不阻断本地栈 */
+  startKnowledgeService,
+  stopKnowledgeService,
+  buildKnowledgeServiceEnv,
   startGateway,
   stopGateway,
   startLocalStack,

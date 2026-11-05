@@ -43,6 +43,10 @@ export default {
   model_not_allowed_entitlement: '这个模型需要套餐覆盖，可到「计费 → 套餐包」购买或续期后使用',
   model_not_allowed_policy: '你的租户策略未开放这个模型，请联系租户管理员调整白名单',
   model_not_allowed_buy_package: '去购买套餐',
+  // 项目文件（只读浏览）：两处失败的动作完全不同 —— 前者要去修项目路径，
+  // 后者换个文件或改用系统程序打开。合并成一句"失败"会让用户做错事。
+  project_root_unavailable: '项目绑定的文件夹现在打不开，可能已被移动、重命名或删除。请在项目设置里重新选择文件夹',
+  file_too_large: '这个文件太大，无法在这里预览。可以改用系统程序打开它',
   // 网络与客户端（后端未给 code 时的兜底）
   timeout: '请求超时，请重试',
   network_error: '网络连接失败，请检查网络后重试',

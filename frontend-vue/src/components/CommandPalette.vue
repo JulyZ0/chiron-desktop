@@ -561,7 +561,7 @@ onUnmounted(() => {
 /* ── 面板：玻璃拟态，居中顶部 ── */
 .palette-panel {
   width: min(620px, 100%);
-  max-height: min(560px, calc(100vh - 160px));
+  max-height: min(560px, calc(var(--app-height) - 160px));
   display: flex;
   flex-direction: column;
   border-radius: var(--sig-radius-card);
@@ -763,7 +763,7 @@ onUnmounted(() => {
     padding: 8vh 10px 16px;
   }
   .palette-panel {
-    max-height: calc(100vh - 16vh - 32px);
+    max-height: calc(var(--app-height) - 16vh - 32px);
   }
   .palette-footer-tip { display: none; }
 }

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import dayjs from 'dayjs'
-import { Card, Spin, Radio, Table, message } from 'ant-design-vue'
+import { Card, Spin, Radio, Table, Button, message } from 'ant-design-vue'
+import { useRouter } from 'vue-router'
 import EmptyState from '../components/common/EmptyState.vue'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import { errorMessageText } from '../utils/apiError'
@@ -13,6 +14,7 @@ import { api } from '../api'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
+const router = useRouter()
 
 // ── 类型 ──
 
@@ -195,6 +197,14 @@ function onUsageQueryChange() {
     <div class="billing-header">
       <CreditCardOutlined style="font-size: 26px; color: var(--warning)" />
       <h1>{{ $t('billing.billing_management') }}</h1>
+      <!-- 价格一览表：与"我用掉了多少"是两件事，独立成页，这里只放入口 -->
+      <Button
+        class="billing-header-action"
+        size="small"
+        @click="router.push('/billing/prices')"
+      >
+        {{ $t('billing.prices_title') }}
+      </Button>
     </div>
 
     <div
@@ -347,6 +357,8 @@ function onUsageQueryChange() {
 .billing-container { padding: 24px; max-width: 1080px; margin: 0 auto; }
 .billing-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
 .billing-header h1 { margin: 0; font-size: 24px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+/* 入口按钮推到最右：标题区左对齐、动作右对齐，窄屏折行时不挤压标题 */
+.billing-header-action { margin-inline-start: auto; }
 .loading-state { padding: 0; }
 
 /* 使用统计：auto-fill 自适应列数（窄屏自动降列） */

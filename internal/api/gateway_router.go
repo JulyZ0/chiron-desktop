@@ -281,9 +281,6 @@ func NewGatewayRouter(
 	// Search (auth + rate limited)
 	searchHandler := NewSearchHandler()
 
-	// Editor
-	editorHandler := NewEditorHandler(cfg.StorageRoot)
-
 	// Conversation
 	conversationHandler := NewConversationHandler(authenticator, sessionMgr)
 	shareHandler := NewShareHandler(authenticator, sessionMgr)
@@ -369,7 +366,7 @@ func NewGatewayRouter(
 	mux.Handle("POST /v1/conversations/{id}/branch/retry", authMW(rlMW(BranchRetryHandler(sessionMgr, pythonClient))))
 	registerAuthRoutes(mux, authHandler, authMW, rlMW)
 
-	registerSystemRoutes(mux, authMW, rlMW, sanitizeMW, editorHandler, toolHandler, systemHandler, traceHandler)
+	registerSystemRoutes(mux, authMW, rlMW, sanitizeMW, toolHandler, systemHandler, traceHandler)
 	// 六大工作台互联：跨台最近活动聚合（租户+用户隔离）
 	mux.Handle("GET /v1/activities", authMW(rlMW(http.HandlerFunc(handleActivities))))
 	registerConversationRoutes(mux, conversationHandler, shareHandler, authMW, rlMW)
@@ -406,6 +403,12 @@ func NewGatewayRouter(
 	mux.Handle("GET /v1/sessions/{session_id}/runtime", authMW(rlMW(http.HandlerFunc(sessionRuntimeHandler.GetRuntime))))
 	mux.Handle("PUT /v1/sessions/{session_id}/runtime", authMW(rlMW(http.HandlerFunc(sessionRuntimeHandler.PutRuntime))))
 	mux.Handle("GET /v1/sessions/{session_id}/metrics", authMW(rlMW(http.HandlerFunc(sessionRuntimeHandler.GetMetrics))))
+
+	// 用量分摊（计费页）：`usage_events` 是计费域删除后唯一还在写的用量事实源。
+	// 此前这条路由从未注册，前端每进一次计费页就 404 —— 页面只剩一句加载失败。
+	mux.Handle("GET /v1/billing/usage", authMW(rlMW(http.HandlerFunc(GetUsage))))
+	// 价格一览表：多源交叉验证后的参考价（**不参与计费**，见 billing_prices.go 注释）。
+	mux.Handle("GET /v1/billing/prices", authMW(rlMW(http.HandlerFunc(ListModelPrices))))
 	// dispatch 保留 Python 代理（agent 工具链内部调用，非页面主链路）
 	// 安全：必须经过 authMW，否则未认证可触发工具执行
 	mux.Handle("POST /v1/agents/dispatch", authMW(rlMW(sanitizeMW(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

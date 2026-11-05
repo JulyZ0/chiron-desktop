@@ -135,3 +135,25 @@ export function bindConflictOwner(error: unknown): string | null {
   const owner = err.response.data?.data?.owner_project_id
   return typeof owner === 'string' && owner ? owner : null
 }
+
+/**
+ * 反查一个会话属于哪个项目。
+ *
+ * 返回 `null` 表示**不属于任何项目**（未归组的会话），那是正常状态而不是错误 ——
+ * 调用方据此让"项目文件"那一源整体缺席，而不是弹一个"找不到"。
+ */
+export async function sessionProject(
+  sessionId: string,
+): Promise<{ id: string; name: string; root_path: string } | null> {
+  if (!sessionId) return null
+  const { data } = await api.get(
+    `/v1/session-map/sessions/${encodeURIComponent(sessionId)}/project`,
+  )
+  const p = data?.data?.project
+  if (!p || typeof p.id !== 'string' || !p.id) return null
+  return {
+    id: p.id,
+    name: typeof p.name === 'string' ? p.name : '',
+    root_path: typeof p.root_path === 'string' ? p.root_path : '',
+  }
+}

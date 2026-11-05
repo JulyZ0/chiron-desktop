@@ -101,7 +101,7 @@ const emit = defineEmits<{
   (e: 'update:view', view: 'trajectory' | 'sessions' | 'agents' | 'stats'): void
   /** 打开会话地图（整屏大窗格；由 ChatView 渲染，不在侧栏内嵌） */
   (e: 'open-map'): void
-  (e: 'create'): void
+  (e: 'create', projectId?: string): void
   (e: 'switch', id: string): void
   (e: 'delete', id: string): void
   (e: 'rename', id: string, currentTitle: string): void
@@ -422,13 +422,12 @@ const projectSidebar = ref<{ refresh: () => Promise<void> } | null>(null)
 /**
  * 从项目行里「新建会话」。
  *
- * 目前**不带项目上下文**：新建会话的 cwd 归属要等 P3（把 `root_path` 接成执行目录）
- * 才有意义，现在传过去后端也无处安放。这里显式接收 `projectId` 并留给后续接线，
- * 而不是直接写 `@create-session="emit('create')"` —— 那种写法会让参数在模板里
- * 被静默吞掉，将来接 P3 时很难看出这里本就该有参数。
+ * 透传 `projectId`：调用方据此把新会话归入该项目。早先这里丢弃参数，
+ * 从项目里新建的会话会掉进「未归入」——用户刚在某项目下点了新建，回来却
+ * 在别处找不到它，看上去就像"项目的新建按钮坏了"。
  */
-function onProjectCreateSession(_projectId: string) {
-  emit('create')
+function onProjectCreateSession(projectId: string) {
+  emit('create', projectId)
 }
 
 // 会话数量变化即刷新项目树：新建的会话会落进「未归入」分组，删掉的会话会从项目里消失。

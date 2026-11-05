@@ -99,6 +99,32 @@ const RUNTIME_CANCEL_CHANNEL = 'desktop:runtime-cancel'
 const RUNTIME_MIRROR_CHANNEL = 'desktop:runtime-mirror'
 
 /**
+ * 主进程建窗时把「这个窗口有没有系统标题栏」告诉 preload。
+ *
+ * 取值 `custom` | `inset` | `native`（见 preload 的 titleBar.mode 注释）。
+ * 页面靠它决定画不画最小化/最大化/关闭 —— 猜错的后果很具体：在 setup.html 这种
+ * 保留系统框的窗口里画一排自绘按钮，用户会看到两组关闭按钮。
+ */
+const TITLEBAR_ARG_PREFIX = '--chiron-titlebar='
+
+/**
+ * 自绘标题栏的窗口控制通道。
+ *
+ * 窗口是 frameless 的（Windows/Linux 上没有系统标题栏与边框），最小化 / 最大化 /
+ * 关闭三个动作只能由渲染进程发起。通道名必须在主进程与 preload 之间**逐字一致**：
+ * 拼错不会报错，只会让按钮点了没反应 —— 而那时用户已经没有系统标题栏可用了，
+ * 等于窗口既关不掉也拖不动。所以和另外几个共享常量一起钉在这里。
+ */
+const WINDOW_CHANNELS = {
+  minimize: 'desktop:window-minimize',
+  toggleMaximize: 'desktop:window-toggle-maximize',
+  close: 'desktop:window-close',
+  getState: 'desktop:window-get-state',
+  /** 主进程 → 渲染进程：最大化 / 全屏状态变化 */
+  state: 'desktop:window-state',
+}
+
+/**
  * 可选的 PyPI 镜像源（**只在用户显式点击时才用**）。
  *
  * 为什么不写死或自动切换：README/代码里明确约定"不写死任何第三方地址"，自动换源等于
@@ -239,6 +265,8 @@ module.exports = {
   PARTITION_PREFIX,
   RUNTIME_CANCEL_CHANNEL,
   RUNTIME_MIRROR_CHANNEL,
+  TITLEBAR_ARG_PREFIX,
+  WINDOW_CHANNELS,
   PIP_INDEX_MIRRORS,
   partitionFor,
   shouldQuitOnAllWindowsClosed,
