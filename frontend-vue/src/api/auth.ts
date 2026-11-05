@@ -71,28 +71,6 @@ export interface AuthUser {
   tenant_id: number
 }
 
-export interface UserIdentity {
-  id: string
-  provider_name: string
-  provider_type: string
-  subject: string
-  email: string
-  created_at: string
-}
-
-export async function listIdentities(): Promise<UserIdentity[]> {
-  const { data } = await api.get('/v1/auth/sso/identities')
-  return data?.data ?? []
-}
-
-export async function deleteIdentity(id: string): Promise<void> {
-  await api.delete(`/v1/auth/sso/identities/${encodeURIComponent(id)}`)
-}
-
-export async function setPassword(body: { current_password?: string; new_password: string }): Promise<void> {
-  await api.post('/v1/auth/password', body)
-}
-
 export interface SsoProvider {
   id: string
   name: string
@@ -180,20 +158,6 @@ export async function smsLogin(body: {
 }): Promise<{ token: string; user: AuthUser }> {
   const { data } = await api.post('/v1/auth/sms/login', body)
   return data?.data
-}
-
-/** 当前绑定手机号 */
-export async function getSmsBind(): Promise<{ phone: string; bound: boolean }> {
-  const { data } = await api.get('/v1/auth/sms/bind')
-  return data?.data
-}
-
-export async function bindPhone(body: { phone: string; code: string }): Promise<void> {
-  await api.post('/v1/auth/sms/bind', body)
-}
-
-export async function unbindPhone(): Promise<void> {
-  await api.delete('/v1/auth/sms/bind')
 }
 
 export interface SmsAdminConfig {

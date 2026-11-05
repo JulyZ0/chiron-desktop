@@ -29,9 +29,11 @@ import {
   type IsolationLevel,
   type IsolationStatus,
 } from '../../api'
+import { useAuthStore } from '../../stores/auth'
 import { serverErrorMessage } from '../../utils/apiError'
 
 const { t } = useI18n()
+const authStore = useAuthStore()
 
 const loading = ref(false)
 const saving = ref(false)
