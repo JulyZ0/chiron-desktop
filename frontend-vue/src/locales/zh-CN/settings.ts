@@ -201,6 +201,7 @@ export default {
   isolation_revoke_failed: "清除隔离痕迹失败。",
 
   isolation_load_failed: "读取隔离档位失败。",
+  isolation_auth_pending: "本机会话尚未就绪，暂时读不到隔离档位。确认本地服务已启动后重试。",
   isolation_changed: "已切换到「{level}」。",
   isolation_raised_to_floor: "请求「{requested}」低于底线，已自动提升为「{effective}」。",
   isolation_running_unaffected: "已在运行的进程沿用原档位，新启动的进程使用新档位。",

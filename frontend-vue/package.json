@@ -1,7 +1,7 @@
 {
   "name": "frontend-vue",
   "private": true,
-  "version": "0.261104.02",
+  "version": "0.261105.01",
   "type": "module",
   "main": "electron/main.cjs",
   "description": "Chiron Desktop — AI agent workspace (Electron shell)",

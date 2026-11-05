@@ -19,18 +19,6 @@ const apiMocks = vi.hoisted(() => ({
   delete: vi.fn(),
 }))
 
-const authApiMocks = vi.hoisted(() => ({
-  listIdentities: vi.fn(),
-  deleteIdentity: vi.fn(),
-  listPublicSsoProviders: vi.fn(),
-  ssoLoginURL: vi.fn((id: string, mode: string) => `https://sso.test/${id}?mode=${mode}`),
-  getSmsBind: vi.fn(),
-  bindPhone: vi.fn(),
-  unbindPhone: vi.fn(),
-  sendSmsCode: vi.fn(),
-  isValidPhone: vi.fn(() => true),
-}))
-
 const authStoreMock = vi.hoisted(() => ({
   user: { name: 'Alice', email: 'alice@example.com', settings: {} as Record<string, unknown> },
   fetchProfile: vi.fn(async () => {}),
@@ -67,7 +55,6 @@ if (!window.matchMedia) {
 }
 
 vi.mock('../../../api', () => ({ api: apiMocks }))
-vi.mock('../../../api/auth', () => authApiMocks)
 vi.mock('../../../stores/auth', () => ({ useAuthStore: () => authStoreMock }))
 vi.mock('../../../stores/theme', () => ({ useThemeStore: () => themeStoreMock }))
 vi.mock('../../../stores/device', () => ({ useDeviceStore: () => deviceStoreMock }))
@@ -101,7 +88,6 @@ vi.mock('../../../utils/tallyCache', () => ({
 }))
 
 import SettingsPanel from '../SettingsPanel.vue'
-import EmptyState from '../../common/EmptyState.vue'
 import { i18n } from '../../../i18n'
 
 const tr = (key: string, args?: Record<string, unknown>): string =>
@@ -126,137 +112,54 @@ function buttonByText(wrapper: ReturnType<typeof mountAccount>, text: string) {
   return hit
 }
 
-/**
- * 「基本资料」区块。
- *
- * 必须限定作用域：antd Tabs 在测试环境未被解析，所有 pane 的内容都同时存在于 DOM 里，
- * 直接 `findAll('input')[0]` 拿到的是「通用」页签的强调色输入框，不是姓名框。
- */
-function profileBlock(wrapper: ReturnType<typeof mountAccount>) {
-  const hit = wrapper
+function accountBlocks(wrapper: ReturnType<typeof mountAccount>) {
+  return wrapper
     .findAll('.setting-block')
-    .find(b => b.text().includes(tr('settings.basic_profile')))
-  if (!hit) throw new Error('找不到「基本资料」区块')
-  return hit
+    .filter(b => b.text().includes(tr('settings.os_account')))
 }
 
-/**
- * 「三方账号绑定」区块。同理必须限定：`EmptyState` 全文出现 5 次、`Popconfirm` 4 次，
- * 不限定作用域时 `findComponent` 取的是 DOM 里第一个，可能落在「通用」页签上。
- */
-function bindingsBlock(wrapper: ReturnType<typeof mountAccount>) {
-  const hit = wrapper
-    .findAll('.setting-block')
-    .find(b => b.text().includes(tr('auth.third_party_account_binding')))
-  if (!hit) throw new Error('找不到「三方账号绑定」区块')
-  return hit
-}
-
-describe('SettingsPanel 账户资料', () => {
+describe('SettingsPanel 账户页签', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    apiMocks.put.mockResolvedValue({ data: { data: {} } })
+    deviceStoreMock.osAccount = 'CORPlice'
   })
 
-  it('挂载后姓名与邮箱取自当前登录用户', async () => {
+  it('只保留系统账户块', async () => {
     const wrapper = mountAccount()
     await flushPromises()
 
-    const inputs = profileBlock(wrapper).findAll('input')
-    expect((inputs[0].element as HTMLInputElement).value).toBe('Alice')
-    expect((inputs[1].element as HTMLInputElement).value).toBe('alice@example.com')
+    expect(accountBlocks(wrapper)).toHaveLength(1)
   })
 
-  it('邮箱是只读的（改邮箱要走验证流程，不在此处）', async () => {
+  it('基本资料 / 三方绑定 / 手机号 / 设置密码 已移除', async () => {
+    const wrapper = mountAccount()
+    await flushPromises()
+    const text = wrapper.text()
+
+    // 这四块是云端租户概念的残留在桌面端毫无意义，删掉后不应再出现在 DOM 里
+    expect(text).not.toContain(tr('settings.basic_profile'))
+    expect(text).not.toContain(tr('auth.third_party_account_binding'))
+    expect(text).not.toContain(tr('auth.set_password'))
+    // 手机号：文案键与「验证码」同时消失才算真删干净
+    expect(text).not.toContain(tr('auth.verificationCode'))
+  })
+
+  it('不再为已删除的三方绑定发请求', async () => {
+    mountAccount()
+    await flushPromises()
+
+    // 删块之前 onMounted 会打 SSO 身份 + 可绑定列表；删块之后这两次请求必须一起消失，
+    // 否则只是把界面藏起来、后端照样被无意义地打一遍。
+    const paths = apiMocks.get.mock.calls.map(c => String(c[0]))
+    expect(paths.some(p => p.includes('/auth/sso/'))).toBe(false)
+    expect(paths.some(p => p.includes('/auth/sms/'))).toBe(false)
+  })
+
+  it('系统账户为空时整块隐藏（Web 构建拿不到 OS 账户）', async () => {
+    deviceStoreMock.osAccount = ''
     const wrapper = mountAccount()
     await flushPromises()
 
-    expect((profileBlock(wrapper).findAll('input')[1].element as HTMLInputElement).disabled).toBe(true)
-  })
-
-  it('点保存把当前表单值原样提交，成功后刷新用户资料', async () => {
-    const wrapper = mountAccount()
-    await flushPromises()
-    authStoreMock.fetchProfile.mockClear()
-
-    await profileBlock(wrapper).findAll('input')[0].setValue('Alice Chen')
-    await buttonByText(wrapper, tr('common.save_changes')).trigger('click')
-    await flushPromises()
-
-    expect(apiMocks.put).toHaveBeenCalledWith('/v1/auth/profile', {
-      name: 'Alice Chen',
-      email: 'alice@example.com',
-    })
-    expect(authStoreMock.fetchProfile).toHaveBeenCalled()
-  })
-
-  it('提交失败不刷新资料（避免用旧值覆盖界面上已改的内容）', async () => {
-    apiMocks.put.mockRejectedValueOnce(new Error('boom'))
-    const wrapper = mountAccount()
-    await flushPromises()
-    authStoreMock.fetchProfile.mockClear()
-
-    await buttonByText(wrapper, tr('common.save_changes')).trigger('click')
-    await flushPromises()
-
-    expect(authStoreMock.fetchProfile).not.toHaveBeenCalled()
-  })
-})
-
-describe('SettingsPanel 三方账号绑定', () => {
-  beforeEach(() => {
-    vi.clearAllMocks()
-    authApiMocks.listIdentities.mockResolvedValue([])
-    authApiMocks.listPublicSsoProviders.mockResolvedValue([])
-  })
-
-  it('既没绑定也没可绑定时显示空态', async () => {
-    const wrapper = mountAccount()
-    await flushPromises()
-
-    expect(bindingsBlock(wrapper).findComponent(EmptyState).exists()).toBe(true)
-  })
-
-  it('已绑定的 provider 不再出现在可绑定列表里', async () => {
-    authApiMocks.listIdentities.mockResolvedValue([
-      { id: 'i1', provider_name: 'GitHub', provider_type: 'oidc', email: 'a@x.com', subject: 's' },
-    ])
-    authApiMocks.listPublicSsoProviders.mockResolvedValue([
-      { id: 'p1', name: 'github', display_name: 'GitHub' },
-      { id: 'p2', name: 'gitlab', display_name: 'GitLab' },
-    ])
-
-    const wrapper = mountAccount()
-    await flushPromises()
-
-    const rows = wrapper.findAll('.identity-row')
-    expect(rows).toHaveLength(1)
-    expect(rows[0].text()).toContain('GitHub')
-
-    // 只剩 GitLab 可绑：GitHub 已被过滤掉，避免点了重复绑定
-    const bindButtons = wrapper.findAll('.bind-buttons button')
-    expect(bindButtons).toHaveLength(1)
-    expect(bindButtons[0].text()).toContain('GitLab')
-  })
-
-  it('解绑后重新拉取列表（不能只删本地一行，后端可能还有别的变化）', async () => {
-    authApiMocks.listIdentities.mockResolvedValue([
-      { id: 'i1', provider_name: 'GitHub', provider_type: 'oidc', email: 'a@x.com', subject: 's' },
-    ])
-    authApiMocks.deleteIdentity.mockResolvedValue(undefined)
-
-    const wrapper = mountAccount()
-    await flushPromises()
-    const callsBefore = authApiMocks.listIdentities.mock.calls.length
-
-    // Popconfirm 的确认在 jsdom 里不弹层，直接走它绑定的事件。
-    // 必须限定在绑定区块内：全文有 4 个 Popconfirm，全局取第一个会解绑错东西。
-    const popconfirm = bindingsBlock(wrapper).findComponent({ name: 'APopconfirm' })
-    expect(popconfirm.exists()).toBe(true)
-    await popconfirm.vm.$emit('confirm')
-    await flushPromises()
-
-    expect(authApiMocks.deleteIdentity).toHaveBeenCalledWith('i1')
-    expect(authApiMocks.listIdentities.mock.calls.length).toBeGreaterThan(callsBefore)
+    expect(accountBlocks(wrapper)).toHaveLength(0)
   })
 })

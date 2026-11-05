@@ -435,10 +435,40 @@ export async function getPublicShare(shareId: string): Promise<PublicShare> {
 
 // 鉴权凭 httpOnly cookie 自动携带（withCredentials），无需请求拦截器设置 Authorization。
 
+/**
+ * 静默请求标记：后台轮询的失败不该弹成全局 toast。
+ *
+ * 有些请求是**用户没在等**的后台探测（接管段轮询、健康检查）。它们的失败调用方
+ * 自己已经 `.catch()` 兜住并按"维持现状"处理了，拦截器再派发一次 `api:error`，
+ * 用户看到的是一串与当前操作毫无关系的提示 —— 接管轮询每 5 秒一条。
+ */
+declare module 'axios' {
+  export interface AxiosRequestConfig {
+    /** 置 true 时拦截器不派发 `api:error`（错误仍原样 reject 给调用方） */
+    __silent?: boolean
+  }
+}
+
+/**
+ * 401 的「已处理」闸门：同一时间窗内只提示 / 清理 / 跳转一次。
+ *
+ * 为什么必须有：一次凭据失效会引发**雪崩**。下面 cloud 分支的动作是
+ * 「清 token → 弹提示 → 跳回首页」，而跳转会重新挂载页面、重新发请求、
+ * 又 401 —— 于是跳转与弹窗互相驱动，再加上全局轮询持续打同一个 401，
+ * 用户看到的是一秒钟几十条同样提示加页面反复跳。
+ *
+ * 收敛不等于忽略：窗口内仍把错误 reject 给调用方（页面各处的 catch 照常生效），
+ * 只是不再重复弹出同一句话、不再反复清 token 与跳转。
+ */
+const AUTH_EXPIRED_NOTICE_MS = 10_000
+let lastAuthExpiredAt = 0
+
 // 响应拦截器：处理错误
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
+    // 静默请求：原样 reject，不进任何全局提示分支
+    if (error.config?.__silent === true) return Promise.reject(error)
     const status: number | undefined = error.response?.status
     // 服务端显式结论（`APIResponse.retryable`）：有就听它的，没有（undefined）才回退到状态码。
     const retryable = readRetryable(error.response?.data?.retryable)
@@ -534,14 +564,23 @@ api.interceptors.response.use(
       if (isDevAuthBypassEnabled()) {
         return Promise.reject(error)
       }
+
+      // 闸门：窗口内已经提示过就不再重复。见 `AUTH_EXPIRED_NOTICE_MS` 上方那段。
+      const now = Date.now()
+      const alreadyNoticed = now - lastAuthExpiredAt < AUTH_EXPIRED_NOTICE_MS
+      lastAuthExpiredAt = now
+
       // 本地模式没有登录页：token 失效只提示，不清本地会话也不跳 /login
       // （跳过去只会落到本地模式下被拦截的云专属路由）。
       if (getDeviceMode() === 'local') {
-        window.dispatchEvent(new CustomEvent('api:error', {
-          detail: { message: t('errors.auth_required') },
-        }))
+        if (!alreadyNoticed) {
+          window.dispatchEvent(new CustomEvent('api:error', {
+            detail: { message: t('errors.auth_required') },
+          }))
+        }
         return Promise.reject(error)
       }
+      if (alreadyNoticed) return Promise.reject(error)
       // Cookie/token 过期：清本地登录态并回首页（登录页已随云端模式删除）
       localStorage.removeItem('user')
       setAuthToken('')
@@ -1169,8 +1208,10 @@ function unwrap<T>(payload: unknown): T {
   return ((payload as { data?: T } | undefined)?.data ?? payload) as T
 }
 
-export async function listTakeovers(): Promise<SuperagentTakeover[]> {
-  const resp = await api.get('/v1/superagent/takeovers')
+export async function listTakeovers(options: { silent?: boolean } = {}): Promise<SuperagentTakeover[]> {
+  // 默认静默：这条由 `TakeoverOverlay` 每 5 秒轮询一次，失败由调用方维持现状。
+  // 走全局提示的话，一次凭据问题就会变成每 5 秒一条 toast。
+  const resp = await api.get('/v1/superagent/takeovers', { __silent: options.silent !== false })
   const d = unwrap<SuperagentTakeover[] | null>(resp.data)
   return Array.isArray(d) ? d : []
 }
@@ -1238,8 +1279,14 @@ export async function reportPresence(): Promise<{ ok: boolean; ttl_seconds: numb
 }
 
 /** 查这个会话是否正在被接管。`known=false` 时调用方不得据此断定"没接管"。 */
-export async function getTakeoverSegment(sessionId: string): Promise<TakeoverSegment> {
-  const resp = await api.get(`/v1/superagent/segment/${encodeURIComponent(sessionId)}`)
+export async function getTakeoverSegment(
+  sessionId: string,
+  options: { silent?: boolean } = {},
+): Promise<TakeoverSegment> {
+  // 与 `listTakeovers` 同理：它是接管段轮询的第二跳，路径一样每 5 秒一次。
+  const resp = await api.get(`/v1/superagent/segment/${encodeURIComponent(sessionId)}`, {
+    __silent: options.silent !== false,
+  })
   return unwrap<TakeoverSegment>(resp.data)
 }
 

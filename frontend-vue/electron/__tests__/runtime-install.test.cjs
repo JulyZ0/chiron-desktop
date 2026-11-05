@@ -488,15 +488,18 @@ test('ensureRuntime：依赖声明变更时走全量重建，不做增量同步'
 test('ensureRuntime：增量同步失败时自动落到全量重建，不让首次启动直接死掉', async t => {
   const userData = makeUserData(t)
   const { sources, uv } = makeResources(t)
+  const { PIP_INDEX_MIRRORS } = require('../shared.cjs')
   createVenvPython(userData)
   installer.writeManifest(userData, {
     dependencyFingerprint: installer.dependencyFingerprint(sources),
   })
 
-  // 第一次 pip（同步）失败，之后的 pip（重建里的安装）成功
+  // 同步阶段让**每一个候选源**都失败（换源也救不回来），之后的 pip（重建里的安装）成功。
+  // 只让第一次失败是不够的：换源重试会把它救回来，那就测不到"落到重建"这条路径了。
+  const candidateCount = PIP_INDEX_MIRRORS.length + 1
   let pipCount = 0
   const { spawn, calls, progress } = fakeSpawn(t, {
-    failOn: sub => sub === 'pip' && pipCount++ === 0,
+    failOn: sub => sub === 'pip' && pipCount++ < candidateCount,
     onVenv: () => createVenvPython(userData),
   })
   // 重建时的 uv venv 会重造解释器；这里让它保持"能探测通过"
@@ -511,11 +514,48 @@ test('ensureRuntime：增量同步失败时自动落到全量重建，不让首�
 
   assert.equal(result.ok, true)
   assert.equal(result.reinstalled, true)
-  assert.deepEqual(
-    calls.map(c => c.args[0]),
-    ['pip', 'venv', 'pip'],
-    '顺序应是：先试同步，失败后重建再装',
+
+  const subcommands = calls.map(c => c.args[0])
+  assert.equal(subcommands[0], 'pip', '先试增量同步，而不是一上来就重建')
+  const venvAt = subcommands.indexOf('venv')
+  assert.ok(venvAt > 0, '所有源都同步失败后必须重建环境')
+  assert.equal(subcommands[subcommands.length - 1], 'pip', '重建后还要装依赖')
+  assert.ok(
+    subcommands.filter(s => s === 'pip').length > candidateCount,
+    `同步阶段应把 ${candidateCount} 个候选源都试过，再去重建`,
   )
+})
+
+test('ensureRuntime：换源后增量同步成功就不重建（省掉 340MB 重装）', async t => {
+  const userData = makeUserData(t)
+  const { sources } = makeResources(t)
+  const { PIP_INDEX_MIRRORS } = require('../shared.cjs')
+  createVenvPython(userData)
+  installer.writeManifest(userData, {
+    dependencyFingerprint: installer.dependencyFingerprint(sources),
+  })
+
+  // 只让第一个源的 pip 失败，换源后成功
+  let pipCount = 0
+  const { spawn, calls, progress } = fakeSpawn(t, {
+    failOn: sub => sub === 'pip' && pipCount++ === 0,
+    onVenv: () => createVenvPython(userData),
+  })
+
+  const result = await installer.ensureRuntime({
+    pythonMirror: '',
+    userDataPath: userData,
+    sources,
+    spawn,
+    probe: probeByProgress(progress),
+  })
+
+  assert.equal(result.ok, true)
+  assert.equal(result.reinstalled, false, '换源救回来了就不该白删 venv 重装')
+  assert.equal(result.repaired, true)
+  const subcommands = calls.map(c => c.args[0])
+  assert.ok(!subcommands.includes('venv'), '没重建就不该出现 uv venv')
+  assert.ok(calls[0].args.includes(PIP_INDEX_MIRRORS[0].url), '第一次尝试用首选镜像')
 })
 
 test('ensureRuntime：安装成功后写入清单，下次启动才敢走增量同步', async t => {
@@ -1106,4 +1146,75 @@ test('pipInstallArgs：用户选了镜像才加 --index-url，默认仍是官方
   const at = mirrored.indexOf('--index-url')
   assert.ok(at > 0, '选了镜像要透传给 uv')
   assert.equal(mirrored[at + 1], 'https://pypi.tuna.tsinghua.edu.cn/simple')
+})
+
+test('indexCandidates：默认镜像优先、官方兜底（真机实测官方源 100s 无输出）', () => {
+  const { indexCandidates } = installer._internal
+  const { PIP_INDEX_MIRRORS } = require('../shared.cjs')
+  const list = indexCandidates('')
+
+  assert.ok(PIP_INDEX_MIRRORS.length > 0, '至少要有内置镜像')
+  assert.equal(list[0], PIP_INDEX_MIRRORS[0].url, '首选必须是镜像：官方源在受限网络下必然触发 90s 无进展超时')
+  assert.equal(list[list.length - 1], '', '末位空串 = 不加 --index-url，即 uv 自带的官方源')
+  const lastMirror = PIP_INDEX_MIRRORS[PIP_INDEX_MIRRORS.length - 1].url
+  assert.equal(list[list.length - 2], lastMirror, '所有镜像都要排在官方源之前')
+})
+
+test('indexCandidates：用户显式指定源时只试它一个，不擅自替换', () => {
+  const { indexCandidates } = installer._internal
+  const explicit = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+  assert.deepEqual(indexCandidates(explicit), [explicit], '用户的选择不该被兜底逻辑改写')
+  assert.deepEqual(indexCandidates(`  ${explicit}  `), [explicit], '首尾空白要裁掉')
+})
+
+test('ensureRuntime：首个镜像失败时自动换下一个源，而不是直接判死', async t => {
+  // 这条守的是真机事故：官方源卡死 90s → 安装失败 → 本地栈起不来 → 前端全场 401，
+  // 而"改用镜像重试"的按钮用户从没点过（日志里出现 0 次）。补救不能靠人点按钮。
+  const EventEmitter = require('node:events')
+  const { PIP_INDEX_MIRRORS } = require('../shared.cjs')
+  const userData = makeUserData(t)
+  const { sources } = makeResources(t)
+  const progress = { venv: false, pip: false }
+  const pipIndexes = []
+
+  const spawn = (command, args) => {
+    const child = new EventEmitter()
+    child.stdout = new EventEmitter()
+    child.stderr = new EventEmitter()
+    child.kill = () => true
+    const sub = args[0]
+    const at = args.indexOf('--index-url')
+    const indexUrl = at >= 0 ? args[at + 1] : ''
+
+    setImmediate(() => {
+      if (sub === 'venv') {
+        progress.venv = true
+        createVenvPython(userData)
+        child.emit('close', 0)
+        return
+      }
+      pipIndexes.push(indexUrl)
+      // 第一个源模拟阻塞失败，第二个源成功
+      if (indexUrl === PIP_INDEX_MIRRORS[0].url) {
+        child.stderr.emit('data', 'error: network stalled\n')
+        child.emit('close', 1)
+        return
+      }
+      progress.pip = true
+      child.emit('close', 0)
+    })
+    return child
+  }
+
+  const result = await installer.ensureRuntime({
+    userDataPath: userData,
+    sources,
+    spawn,
+    probe: probeByProgress(progress),
+  })
+
+  assert.equal(result.ok, true, '第一个源失败不该让首次启动直接判死')
+  assert.equal(pipIndexes[0], PIP_INDEX_MIRRORS[0].url, '第一个尝试的必须是镜像')
+  assert.ok(pipIndexes.length >= 2, '第一个源失败后要换下一个源重试')
+  assert.notEqual(pipIndexes[1], PIP_INDEX_MIRRORS[0].url, '重试不能原地重打同一个源')
 })

@@ -201,6 +201,8 @@ export default {
   isolation_revoke_failed: "Failed to remove isolation artifacts.",
 
   isolation_load_failed: "Failed to read the isolation tier.",
+  isolation_auth_pending:
+    "The local session is not ready yet, so the isolation tier cannot be read. Make sure the local service is running, then retry.",
   isolation_changed: "Switched to \"{level}\".",
   isolation_raised_to_floor: "\"{requested}\" is below the floor, so it was raised to \"{effective}\".",
   isolation_running_unaffected: "Processes already running keep the previous tier; newly started processes use the new one.",

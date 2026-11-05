@@ -203,6 +203,8 @@ export default {
   isolation_revoke_failed: "فشلت إزالة آثار العزل.",
 
   isolation_load_failed: "تعذّرت قراءة مستوى العزل.",
+  isolation_auth_pending:
+    "جلسة الجهاز المحلي ليست جاهزة بعد، لذا يتعذّر قراءة مستوى العزل. تأكّد من تشغيل الخدمة المحلية ثم أعد المحاولة.",
   isolation_changed: "تم التبديل إلى «{level}».",
   isolation_raised_to_floor: "«{requested}» أدنى من الحد، فرُفع إلى «{effective}».",
   isolation_running_unaffected: "العمليات العاملة تحتفظ بالمستوى السابق؛ العمليات الجديدة تستخدم المستوى الجديد.",

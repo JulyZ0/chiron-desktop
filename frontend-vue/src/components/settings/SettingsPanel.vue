@@ -7,9 +7,8 @@
  * 组件本身不含容器（无 header、无尺寸），由调用方决定是页面还是弹窗。
  */
 import { ref, onMounted, onUnmounted } from 'vue'
-import { useRoute } from 'vue-router'
 import { Button, Input, Form, FormItem, message, Popconfirm, Tag, Spin, Slider } from 'ant-design-vue'
-import { SafetyOutlined, MobileOutlined, ExportOutlined, DeleteOutlined, LinkOutlined } from '@ant-design/icons-vue'
+import { ExportOutlined, DeleteOutlined, LinkOutlined } from '@ant-design/icons-vue'
 import EmptyState from '../common/EmptyState.vue'
 import HarnessProfilePanel from './HarnessProfilePanel.vue'
 import RunModePanel from './RunModePanel.vue'
@@ -21,12 +20,7 @@ import { useAuthStore } from '../../stores/auth'
 import { useThemeStore } from '../../stores/theme'
 import { useDeviceStore } from '../../stores/device'
 import { api } from '../../api'
-import {
-  setPassword,
-} from '../../api/auth'
-import { useSettingsBindings } from '../../composables/useSettingsBindings'
 import { useSettingsConversations } from '../../composables/useSettingsConversations'
-import { useSettingsPhone } from '../../composables/useSettingsPhone'
 import { useSettingsShares } from '../../composables/useSettingsShares'
 import { useSpeech } from '../../composables/useSpeech'
 import { ACCENT_PRESETS, DEFAULT_ACCENT } from '../../utils/accentPresets'
@@ -36,93 +30,12 @@ import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
 const props = withDefaults(defineProps<{ initialTab?: string }>(), { initialTab: 'general' })
 
-const route = useRoute()
 const authStore = useAuthStore()
 const themeStore = useThemeStore()
 // 运行模式只在桌面壳里可切（Web 构建是纯云模式），据此决定是否展示该标签页
 const deviceStore = useDeviceStore()
 
 const activeTab = ref(props.initialTab)
-
-// ── 账户资料 ──
-
-const loading = ref(false)
-const form = ref({ name: '', email: '' })
-
-async function handleUpdateProfile() {
-  loading.value = true
-  try {
-    await api.put('/v1/auth/profile', form.value)
-    message.success(t('settings.profile_updated'))
-    await authStore.fetchProfile()
-  } catch (error) {
-    message.error((error instanceof Error ? error.message : '') || t('errors.update_failed'))
-  } finally {
-    loading.value = false
-  }
-}
-
-// ── 三方账号绑定：状态与逻辑见 `composables/useSettingsBindings.ts` ──
-const {
-  identities,
-  bindable,
-  bindingsLoading,
-  unbinding,
-  loadBindings,
-  openBindings,
-  startBind,
-  handleUnbind,
-} = useSettingsBindings()
-
-// ── 手机号绑定（短信验证码）：状态与逻辑见 `composables/useSettingsPhone.ts` ──
-const {
-  phone,
-  phoneBound,
-  phoneLoading,
-  phoneForm,
-  phoneBinding,
-  unbindingPhone,
-  sendingCode,
-  phoneCountdown,
-  loadPhone,
-  handleSendBindCode,
-  handleBindPhone,
-  handleUnbindPhone,
-} = useSettingsPhone()
-
-// ── 设置密码（SSO 建号用户首设免旧密码）──
-
-const pwdForm = ref({ current_password: '', new_password: '', confirm: '' })
-const pwdLoading = ref(false)
-
-async function handleSetPassword() {
-  const { current_password, new_password, confirm } = pwdForm.value
-  if (new_password.length < 8 || new_password.length > 128) {
-    message.warning(t('auth.new_password_must_be_8_128_characters'))
-    return
-  }
-  if (new_password !== confirm) {
-    message.warning(t('auth.the_two_new_password_entries_do_not_match'))
-    return
-  }
-  pwdLoading.value = true
-  try {
-    await setPassword({ current_password: current_password || undefined, new_password })
-    message.success(t('auth.password_set'))
-    pwdForm.value = { current_password: '', new_password: '', confirm: '' }
-  } catch (e) {
-    const apiErr = serverErrorMessage(e, '')
-    if (apiErr === 'current_password is required') {
-      message.error(t('auth.this_account_already_has_a_password_please_enter_the_current_password_first'))
-    } else if (apiErr === 'invalid current password') {
-      message.error(t('auth.current_password_is_incorrect'))
-    } else {
-      message.error(apiErr || t('errors.failed_to_set'))
-    }
-  } finally {
-    pwdLoading.value = false
-  }
-}
 
 // ── 朗读音色 ──
 // 走浏览器原生 speechSynthesis（见 composables/useSpeech.ts）；偏好写回后端
@@ -199,22 +112,14 @@ const {
 let cancelTally: Array<() => void> = []
 
 onMounted(async () => {
-  if (authStore.user) {
-    form.value.name = authStore.user.name || ''
-    form.value.email = authStore.user.email || ''
-  }
-  // 绑定成功回跳（bindURL=/profile?bind=ok）；弹窗入口不会带该参数
-  if (route.query.bind === 'ok') {
-    message.success(t('auth.third_party_account_bound_successfully'))
-  }
   loadSpeechPrefs()
   // 系统账户：本地模式下它就是"应用用户"，账户页要显示（Web 端为空，整块隐藏）
   void deviceStore.ensureReady()
-  // 本地模式没有租户/三方绑定/短信/会话分享与会话列表接口（本地后端第一批没实现），
+  // 本地模式没有租户/会话分享与会话列表接口（本地后端第一批没实现），
   // 不做这几次必然 501 的请求：与其弹一堆"本地模式暂不支持"，不如让这些云侧页签留空。
   if (deviceStore.isLocal()) return
 
-  // 打开面板即触发的这几次只读请求，逐个按**成本**决定是否接进延后 + TTL 缓存：
+  // 打开面板即触发的只读请求，逐个按**成本**决定是否接进延后 + TTL 缓存：
   //
   // · `GET /v1/conversations`（列表）——**昂贵**，走缓存。`List` 之后是
   //   `session.Manager.ListSessions`：`SELECT … FROM sessions WHERE user_id = $1
@@ -227,23 +132,10 @@ onMounted(async () => {
   //   `SELECT … FROM conversation_shares WHERE user_id = $1 AND revoked_at IS NULL
   //   AND expires_at > NOW() ORDER BY created_at DESC LIMIT 200`，同样**没有 user_id 索引**
   //   （基线只有 `conversation_shares_pkey`），扫完还要 `array_length` 聚合每行的消息数。
-  // · `GET /v1/auth/sso/identities`（三方绑定）——**昂贵**，走缓存：它 JOIN
-  //   `ent_user_identities` 与 `ent_oidc_providers` 且 `ent_user_identities` 上
-  //   **只有主键索引**（基线 0001 的索引清单里没有 user_id 上的任何索引），按 user_id 过滤即扫表。
-  //   与它打包的 `GET /v1/auth/sso/providers`（可绑定列表）是 `ent_oidc_providers` 按
-  //   `tenant_id` 的小查询、数量个位数，本身很便宜 —— 但它只随上面的身份列表一起用，
-  //   跟着同一份缓存值走，不额外发就是最优，不值得为它单独做一套。
-  //
-  // **明确排除**：`GET /v1/auth/sms/bind`（`loadPhone`）。`SmsHandler.GetBind` 是
-  //   `SELECT phone FROM users WHERE id = $1` —— 主键单行，是这批里最便宜的一个，
-  //   缓存它只会带来"刚绑定完还显示未绑定"的风险（而它必须随账户页签即时反映）。
-  //   所以它保持原样：打开面板即发、不延后、不缓存。
   cancelTally = [
-    openBindings(),
     openShares(),
     openConversations(),
   ]
-  loadPhone()
 })
 
 onUnmounted(() => {
@@ -436,128 +328,6 @@ onUnmounted(() => {
             {{ $t('settings.os_account_hint') }}
           </p>
         </div>
-      </div>
-
-      <div class="setting-block">
-        <div class="setting-title">
-          {{ $t('auth.phone') }}
-        </div>
-        <Spin :spinning="phoneLoading">
-          <div
-            v-if="phoneBound"
-            class="identity-row"
-          >
-            <div class="identity-info">
-              <Tag color="green">
-                <MobileOutlined />
-              </Tag>
-              <span class="identity-name">{{ phone }}</span>
-              <span class="identity-meta">{{ $t('auth.can_be_used_for_sms_verification_login') }}</span>
-            </div>
-            <Popconfirm
-              :title="$t('common.confirm_unbinding_this_phone_number')"
-              :ok-text="$t('common.unbind')"
-              :cancel-text="$t('common.cancel')"
-              @confirm="handleUnbindPhone"
-            >
-              <Button
-                danger
-                :loading="unbindingPhone"
-              >
-                {{ $t('common.unbind') }}
-              </Button>
-            </Popconfirm>
-          </div>
-          <Form
-            v-else
-            :model="phoneForm"
-            layout="vertical"
-            class="setting-form"
-          >
-            <FormItem :label="$t('auth.phone')">
-              <Input
-                v-model:value="phoneForm.phone"
-                :placeholder="$t('common.please_enter_phone_number')"
-                :maxlength="21"
-              >
-                <template #prefix>
-                  <MobileOutlined />
-                </template>
-              </Input>
-            </FormItem>
-            <FormItem :label="$t('auth.verificationCode')">
-              <Input
-                v-model:value="phoneForm.code"
-                :placeholder="$t('auth.sms_verification_code')"
-                :maxlength="6"
-              >
-                <template #suffix>
-                  <Button
-                    size="small"
-                    type="link"
-                    :disabled="phoneCountdown > 0 || sendingCode"
-                    :loading="sendingCode"
-                    @click="handleSendBindCode"
-                  >
-                    {{ phoneCountdown > 0 ? $t('common.resend_in_n_s', { n: phoneCountdown }) : $t('auth.get_verification_code') }}
-                  </Button>
-                </template>
-              </Input>
-            </FormItem>
-            <FormItem>
-              <Button
-                type="primary"
-                :loading="phoneBinding"
-                @click="handleBindPhone"
-              >
-                {{ $t('common.bind_phone_number') }}
-              </Button>
-            </FormItem>
-          </Form>
-        </Spin>
-      </div>
-
-      <div class="setting-block">
-        <div class="setting-title">
-          {{ $t('auth.set_password') }}
-          <span class="setting-hint"><SafetyOutlined /> {{ $t('auth.third_party_account_setting_a_password_for_the_first_time_does_not_require_the_current_password') }}</span>
-        </div>
-        <Form
-          :model="pwdForm"
-          layout="vertical"
-          class="setting-form"
-        >
-          <FormItem :label="$t('auth.current_password_leave_empty_on_first_set')">
-            <Input
-              v-model:value="pwdForm.current_password"
-              type="password"
-              :placeholder="$t('auth.required_for_accounts_that_have_set_a_password')"
-            />
-          </FormItem>
-          <FormItem :label="$t('auth.new_password')">
-            <Input
-              v-model:value="pwdForm.new_password"
-              type="password"
-              :placeholder="$t('common.8_128_characters')"
-            />
-          </FormItem>
-          <FormItem :label="$t('auth.confirm_new_password')">
-            <Input
-              v-model:value="pwdForm.confirm"
-              type="password"
-              :placeholder="$t('auth.enter_the_new_password_again')"
-            />
-          </FormItem>
-          <FormItem>
-            <Button
-              type="primary"
-              :loading="pwdLoading"
-              @click="handleSetPassword"
-            >
-              {{ $t('auth.save_password') }}
-            </Button>
-          </FormItem>
-        </Form>
       </div>
     </a-tab-pane>
 

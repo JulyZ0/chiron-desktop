@@ -39,6 +39,7 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const childProcess = require('node:child_process')
 const { probeRuntime } = require('./runtime-probe.cjs')
+const { PIP_INDEX_MIRRORS } = require('./shared.cjs')
 
 /** 受管 CPython 版本。desktop-local 的 `requires-python` 是 >=3.11，3.12 与 CI 一致。 */
 const RUNTIME_PYTHON_VERSION = '3.12'
@@ -723,6 +724,30 @@ function pipInstallArgs(vpython, sources, indexUrl, target = 'core') {
   return args
 }
 
+/**
+ * 依赖源候选顺序：**先镜像、再官方**。
+ *
+ * 这个顺序是被真机日志推翻后改的。原设计和注释都假设"默认官方、慢了自己换源"，
+ * 但实测（同一台机器、同一个 uv 0.13.6）差距是量级级别的：
+ *   - `--index-url https://pypi.org/simple`：100s 超时，一行输出都没有；
+ *   - `--index-url https://mirrors.aliyun.com/pypi/simple`：177ms 解析、35ms 下载。
+ * 而 `INSTALL_IDLE_TIMEOUT_MS` 判"卡死"的阈值是 90s —— 官方源在这台机器上
+ * **必然**触发它。于是本地运行时永远装不上、本地栈起不来、前端全场 401。
+ *
+ * 更要命的是失败后的补救路径没人走：日志里「改用镜像源」出现 0 次，
+ * 用户连试三次都是"90s 无输出 → 失败 → 再试"，因为他没点那个按钮。
+ * 补救不该依赖用户看懂提示去点按钮，所以把镜像提前成首选。
+ *
+ * 显式指定 `indexUrl`（设置页"改用国内镜像"或 `CHIRON_PIP_INDEX_URL`）时
+ * **只**试它一个：那是用户的明确选择，不该在它失败后偷偷换成别的源。
+ */
+function indexCandidates(explicitIndexUrl) {
+  const explicit = String(explicitIndexUrl || '').trim()
+  if (explicit) return [explicit]
+  // 末位空串表示"不加 --index-url"，即 uv 自带的默认官方源
+  return [...PIP_INDEX_MIRRORS.map(entry => entry.url), '']
+}
+
 function uvEnv(userDataPath, target = 'core') {
   // 解释器是随包 CPython 的绝对路径，uv 不需要下载任何东西；
   // 保留 UV_PYTHON_INSTALL_DIR 只是让 uv 若真要用受管解释器时落在 userData 里。
@@ -884,15 +909,43 @@ async function ensureRuntime(options = {}) {
       throw err
     })
 
+  /**
+   * 装依赖：按候选源依次尝试，前一个源卡住/失败才换下一个。
+   *
+   * 只在**没装成**时换源：一旦某个源成功就停，不会重复装。
+   * 全部失败时抛出**最后一个**错误并附上试过哪些源 —— 用户据此能判断
+   * 是网络问题还是依赖清单问题，而不是只看到"90s 无输出"。
+   */
+  const installWithSources = async (label, timeout) => {
+    const tried = []
+    let lastError = null
+    for (const candidate of indexCandidates(indexUrl)) {
+      const sourceName = candidate ? (PIP_INDEX_MIRRORS.find(m => m.url === candidate)?.label || candidate) : '官方源'
+      tried.push(sourceName)
+      try {
+        if (candidate) {
+          notice(`[runtime] ${label}使用源：${sourceName}`)
+        } else {
+          notice(`[runtime] ${label}使用源：PyPI 官方`)
+        }
+        await runUv(pipInstallArgs(vpython, sources, candidate, target.id), timeout, label)
+        return
+      } catch (err) {
+        lastError = err
+        // 用户取消不该被当成"这个源不行，换下一个" —— 直接冒泡
+        if (options.signal && options.signal.aborted) throw err
+      }
+    }
+    const err = lastError || new Error(`${label}失败`)
+    err.message = `${err.message}\n已尝试的依赖源：${tried.join(' → ')}`
+    throw err
+  }
+
   // —— 路径 2：增量同步。venv 在、依赖没变，只重装依赖 ——
   if (trySync) {
     stage(INSTALL_STAGES.syncingDeps, `同步${target.label}依赖${probeNote}`)
     try {
-      await runUv(
-        pipInstallArgs(vpython, sources, indexUrl, target.id),
-        INSTALL_TIMEOUT_MS,
-        '同步依赖',
-      )
+      await installWithSources('同步依赖', INSTALL_TIMEOUT_MS)
       stage(INSTALL_STAGES.verifying, `验证${target.label}环境`)
       const afterSync = inspectRuntime({ ...options, target: target.id, userDataPath, sources })
       if (afterSync.ready) {
@@ -959,7 +1012,7 @@ async function ensureRuntime(options = {}) {
   }
 
   stage(INSTALL_STAGES.installingDeps, `安装${target.label}依赖`)
-  await runUv(pipInstallArgs(vpython, sources, indexUrl, target.id), INSTALL_TIMEOUT_MS, '安装依赖')
+  await installWithSources('安装依赖', INSTALL_TIMEOUT_MS)
 
   stage(INSTALL_STAGES.verifying, `验证${target.label}环境`)
   const verified = inspectRuntime({ ...options, target: target.id, userDataPath, sources })
@@ -1007,6 +1060,7 @@ module.exports = {
   _internal: {
     runCommand,
     pipInstallArgs,
+    indexCandidates,
     homeForRuntime,
     interpreterUnderHome,
     minorVersion,
