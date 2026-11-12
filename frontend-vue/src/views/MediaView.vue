@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, watch, onUnmounted, markRaw } from 'vue'
 import {
   Button, Input, Select, Segmented, Pagination, Table, message,
-  Drawer, Modal, Popconfirm, Upload, Checkbox, Tree, Tag, Progress,
+  Drawer, Modal, Popconfirm, Upload, Checkbox, Tree, Tag, Progress, Spin,
 } from 'ant-design-vue'
 import {
   SearchOutlined, CloudUploadOutlined, FolderOutlined, FileOutlined,
@@ -295,10 +295,28 @@ const shareUrl = ref('')
 const shareExpires = ref('')
 const shareLoading = ref(false)
 
-function openPreview(item: MediaItem) {
+const previewUrl = ref('')
+const previewFailed = ref(false)
+
+async function openPreview(item: MediaItem) {
   previewItem.value = item
   showPreview.value = true
-  if ((item.file_url || '').startsWith('/media/')) void resolveItemUrl(item)
+  previewFailed.value = false
+  // 预览**必须等签名 URL 就绪**再渲染。
+  // `/media/` 公开路径在后端已被移除（见 routes_media.go：只剩 /media/s/{assetID} 签名路径），
+  // 而 `itemUrl()` 在未解析时回退到原 file_url = `/media/...` ⇒ FileViewer 拿到死链，
+  // 表现为 "Failed to fetch"。这里先清空、拿到可用 URL 再交给它。
+  previewUrl.value = ''
+  const url = await resolveMediaUrl({ id: item.id, file_url: item.file_url })
+  const resolved = normalizeResolved(url, item)
+  // 以 /media/ 开头的资源必须拿到签名 URL（形如 /media/s/...）才算成功；
+  // 否则说明签名失败、resolved 仍是已被移除的公开路径 —— 不喂给 FileViewer。
+  const needsSignature = (item.file_url || '').startsWith('/media/')
+  if (!resolved || (needsSignature && !resolved.includes('/media/s/'))) {
+    previewFailed.value = true
+    return
+  }
+  previewUrl.value = resolved
 }
 
 async function downloadItem(item: MediaItem) {
@@ -1717,10 +1735,23 @@ onUnmounted(() => {
         v-if="previewItem"
         class="preview-shell"
       >
+        <!-- 只有拿到签名 URL 才渲染查看器；否则给可读提示，
+             而不是让 FileViewer 去 fetch 已被移除的 /media/ 公开路径（表现为 Failed to fetch） -->
         <file-viewer
-          :url="itemUrl(previewItem)"
+          v-if="previewUrl && !previewFailed"
+          :url="previewUrl"
           :options="{ preset: allPreset, rendererMode: 'replace', theme: 'light', toolbar: { position: 'auto' } }"
         />
+        <EmptyState
+          v-else-if="previewFailed"
+          :description="$t('errors.failed_to_load_preview')"
+        />
+        <div
+          v-else
+          class="preview-loading"
+        >
+          <Spin />
+        </div>
       </div>
     </Modal>
     <!-- 上传（拖拽 + 多文件 + 进度） -->

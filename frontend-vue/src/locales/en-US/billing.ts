@@ -26,6 +26,10 @@ export default {
   usage_breakdown_truncated: "Showing the top {shown} of {total} items only; the totals above still cover everything.",
 
   prices_title: "Model price list",
+  prices_sync_now: "Sync now",
+  prices_sync_done: "Sync complete — updated prices for {n} models",
+  prices_sync_empty: "No prices written this round (network unreachable, or no two sources agreed)",
+  prices_sync_disabled: "Price sync is disabled (MODEL_PRICE_SYNC=off)",
   prices_hint: "Prices come from cross-validation across multiple public data sources, quoted in USD / 1k tokens. For cost reference only — not used for billing.",
   prices_search_placeholder: "Search model name",
   prices_col_model: "Model",

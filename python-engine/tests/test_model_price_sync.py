@@ -133,10 +133,18 @@ def test_model_names_that_do_not_align_become_single_source() -> None:
 # ── 开关 ──
 
 
-def test_sync_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sync_is_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认**开**：默认不产生任何数据的机制等于没接（价格表会一直空）。"""
     monkeypatch.delenv("MODEL_PRICE_SYNC", raising=False)
 
-    assert s.sync_enabled() is False
+    assert s.sync_enabled() is True
+
+
+def test_sync_can_be_disabled_explicitly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """需要彻底禁用的部署显式设 off/0/false/no 才关。"""
+    for raw in ("0", "off", "false", "no", "OFF", " False "):
+        monkeypatch.setenv("MODEL_PRICE_SYNC", raw)
+        assert s.sync_enabled() is False, raw
 
 
 def test_interval_falls_back_on_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -150,8 +158,8 @@ def test_interval_falls_back_on_garbage(monkeypatch: pytest.MonkeyPatch) -> None
 async def test_start_price_sync_returns_immediately_when_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """默认关 ⇒ 调用方可以无条件 await 它，不必自己判开关。"""
-    monkeypatch.delenv("MODEL_PRICE_SYNC", raising=False)
+    """显式关闭 ⇒ 调用方可以无条件 await 它，不必自己判开关。"""
+    monkeypatch.setenv("MODEL_PRICE_SYNC", "off")
 
     await s.start_price_sync()  # 不会挂起
 

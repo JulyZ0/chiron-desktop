@@ -16,6 +16,8 @@ const props = defineProps<{
   contextLimit?: number | null
   /** 压缩触发比例（引擎下发，租户/模式可覆盖）。前端不写死 —— 常量写两处必漂移 */
   compactRatio?: number | null
+  /** `contextUsed` 是否为引擎估算（服务商没回报 usage 时的兜底），需在提示里标明 */
+  contextEstimated?: boolean | null
   /** 上下文分段（各类别的估算 token）：回答"上下文被谁占满了" */
   breakdown?: Record<string, number> | null
   /** 占用最大的几条（只含类别/角色/大小，**不含消息内容**）：回答"是哪一条占的" */
@@ -39,6 +41,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'toggle-subagents'): void
   (e: 'toggle-stats'): void
+  /** 点「已连接」展开逐组件健康/内存明细（pg/redis/engine/gateway） */
+  (e: 'toggle-health'): void
 }>()
 
 const hasUsage = computed(() => Boolean(props.stats && (props.stats.inputTokens || props.stats.outputTokens)))
@@ -126,6 +130,7 @@ const cacheWarnText = computed(() => {
       :used="contextUsed ?? null"
       :limit="contextLimit ?? null"
       :compact-ratio="compactRatio ?? null"
+      :estimated="contextEstimated ?? false"
       :breakdown="breakdown ?? null"
       :largest="largest ?? null"
     />
@@ -153,14 +158,17 @@ const cacheWarnText = computed(() => {
       <BarChartOutlined />
       <span>{{ $t('common.statistics') }}</span>
     </button>
-    <span
-      class="cs-item cs-conn"
+    <button
+      type="button"
+      class="cs-item cs-trigger cs-conn"
       :class="{ offline: !online }"
+      :title="$t('common.component_health_and_memory_click_for_details')"
+      @click="emit('toggle-health')"
     >
       <CloudServerOutlined v-if="online" />
       <DisconnectOutlined v-else />
       <span>{{ online ? $t('chat.status.online') : $t('chat.status.offline') }}</span>
-    </span>
+    </button>
   </div>
 </template>
 

@@ -147,3 +147,23 @@ describe('ChatInput（运行中补充指令 steer）', () => {
     expect(localStorage.getItem(HISTORY_KEY)).toBeNull()
   })
 })
+
+describe('ChatInput（`@` 提及触发条件）', () => {
+  it('中文紧邻 `@` 也打开面板（中文句子词间不写空格）', async () => {
+    const wrapper = mountInput()
+    await wrapper.find('textarea').setValue('看看@')
+    expect(wrapper.find('.mention-menu').exists()).toBe(true)
+  })
+
+  it('邮箱形态的 `@` 不打开面板（ASCII 词字符紧邻）', async () => {
+    const wrapper = mountInput()
+    await wrapper.find('textarea').setValue('user@')
+    expect(wrapper.find('.mention-menu').exists()).toBe(false)
+  })
+
+  it('查询里出现空格即视为提及结束，面板收起', async () => {
+    const wrapper = mountInput()
+    await wrapper.find('textarea').setValue('看看@文件 ')
+    expect(wrapper.find('.mention-menu').exists()).toBe(false)
+  })
+})

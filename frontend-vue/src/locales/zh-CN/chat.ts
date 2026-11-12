@@ -362,7 +362,7 @@ export default {
   workbench_list_truncated: "条目过多，仅显示前一部分",
   workbench_copy_path: "复制相对路径",
   workbench_reference: "加入对话",
-  workbench_reference_hint: "在输入框插入 @路径，内容由网关在提交时读取",
+  workbench_reference_hint: "在输入框插入 {'@'}路径，内容由网关在提交时读取",
   workbench_binary_hint: "二进制文件，无法预览；可以复制路径后用系统程序打开",
   workbench_path_outside_project: "「{path}」不在当前项目目录内，无法打开",
   workbench_file_not_found: "项目里找不到「{path}」",

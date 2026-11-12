@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { Card, Input, Table, Tag, message } from 'ant-design-vue'
+import { Card, Input, Table, Tag, message, Button } from 'ant-design-vue'
 import type { TableColumnsType } from 'ant-design-vue'
 import { DollarOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
@@ -155,6 +155,35 @@ async function load() {
 }
 
 onMounted(load)
+
+/**
+ * 手动触发一轮价格同步。
+ *
+ * 后台循环 30min 一轮，新装或换模型后不该干等；点一下就跑同一套多源交叉验证
+ * （后端复用 `sync_once()`），完成后重新加载表，让用户立刻看到结果。
+ * `written === 0` 不当作成功：可能是网络不可达或只有一个源应答，据实提示。
+ */
+const syncing = ref(false)
+
+async function refreshPrices() {
+  syncing.value = true
+  try {
+    const resp = await api.post('/v1/billing/prices/sync', {})
+    const data = resp.data?.data as { ok?: boolean; written?: number; reason?: string } | undefined
+    if (data?.ok === false) {
+      message.warning(data.reason || t('billing.prices_sync_disabled'))
+    } else if ((data?.written ?? 0) > 0) {
+      message.success(t('billing.prices_sync_done', { n: data?.written ?? 0 }))
+    } else {
+      message.warning(t('billing.prices_sync_empty'))
+    }
+    await load()
+  } catch (error) {
+    message.error(errorMessageText(error, t('errors.request_failed')))
+  } finally {
+    syncing.value = false
+  }
+}
 </script>
 
 <template>
@@ -181,6 +210,13 @@ onMounted(load)
         </template>
       </Input>
       <span class="prices-count">{{ $t('billing.prices_total', { n: total }) }}</span>
+      <Button
+        size="small"
+        :loading="syncing"
+        @click="refreshPrices"
+      >
+        {{ $t('billing.prices_sync_now') }}
+      </Button>
     </div>
 
     <Card class="prices-card">

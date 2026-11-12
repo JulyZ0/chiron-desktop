@@ -504,9 +504,9 @@ func (h *SessionRuntimeHandler) metricsFromRedis(ctx context.Context, tenant, se
 	if h.rdb == nil {
 		return nil, ""
 	}
-	if _, err := h.hashAll(ctx, sessionMetricsKey(tenant, sessionID)); err != nil {
-		return nil, ""
-	}
+	// 只读一次：以前这里调了两遍 hashAll（第一遍只为"先探错"），
+	// 白跑一次往返，而且两遍之间热层可能已经变了 —— 真出错时第二遍就会拿到
+	// 与第一遍不同的结果，"探测"本身没有意义。
 	pairs, err := h.hashAll(ctx, sessionMetricsKey(tenant, sessionID))
 	if err != nil || len(pairs) == 0 {
 		return nil, ""
@@ -551,9 +551,10 @@ func (h *SessionRuntimeHandler) metricsFromDB(ctx context.Context, sessionID str
 		"cache_hits":    intOf(row["cache_hits"]),
 		"cost_cents":    cost,
 	}
-	turns := intOf(row["turns"])
-	if turns > 0 {
-		totals["cache_hit_rate"] = float64(intOf(row["cache_hits"])) / float64(turns)
+	// 命中率口径必须与实时层一致：**命中 token / 输入 token**。
+	// 若这里用 hits/turns，同一会话在 Redis 过期前后会给出两个不同的"命中率"。
+	if in := intOf(row["input_tokens"]); in > 0 {
+		totals["cache_hit_rate"] = float64(intOf(row["cached_tokens"])) / float64(in)
 	}
 	// 最近若干轮的时序（供前端画趋势）
 	if rows, err := db.GlobalDBManager.FetchAll(ctx, `
@@ -604,8 +605,12 @@ func aggregateMetrics(turns []map[string]any, source string) map[string]any {
 		"turns": len(turns), "input_tokens": in, "output_tokens": out,
 		"cached_tokens": cached, "cache_hits": hits, "cost_cents": cost,
 	}
-	if len(turns) > 0 {
-		totals["cache_hit_rate"] = float64(hits) / float64(len(turns))
+	// 命中率用 **token 口径**（命中 token / 输入 token），不是"有多少轮发生过命中"。
+	// 后者在轮次少时给出 88.9% 这类看着精确、实则什么都没说的数字：
+	// 9 轮里 8 轮命中就是 88.9%，哪怕那 8 轮的命中量都趋近于 0。
+	// 分母为 0（没拿到任何输入 token）时**不给这个字段**，前端显示"—"。
+	if in > 0 {
+		totals["cache_hit_rate"] = float64(cached) / float64(in)
 	}
 	result := map[string]any{"source": source, "totals": totals, "turns": turns}
 	if len(durations) > 0 {

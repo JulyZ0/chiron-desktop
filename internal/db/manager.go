@@ -146,8 +146,8 @@ func (m *DBManager) FetchOne(ctx context.Context, sql string, args ...interface{
 	}
 
 	result := make(map[string]interface{})
-	for i, col := range columns {
-		result[col.Name] = values[i]
+	if err := scanIntoRow(columns, values, result); err != nil {
+		return nil, err
 	}
 
 	if err := rows.Err(); err != nil {
@@ -155,6 +155,32 @@ func (m *DBManager) FetchOne(ctx context.Context, sql string, args ...interface{
 	}
 
 	return result, nil
+}
+
+// scanIntoRow 把一行按**列名**写进 map，遇到重复列名直接报错。
+//
+// **为什么重名必须报错，而不是后者覆盖前者**：这张 map 是按列名取值的唯一通道
+// （调用方写 `row["root_path"]`），重名列会让其中一个**静默消失**，取值方拿到 nil
+// 之后通常会当成"该字段是空的"继续往下走。
+//
+// 真实事故：`SELECT COALESCE(name,''), COALESCE(root_path,'')` 没写 AS 别名时，
+// Postgres 给这两列的名字都是 `coalesce`。于是 `row["root_path"]` 永远是 nil，
+// 项目被判定成"没有绑定文件夹"，界面一直显示「无法加载项目文件列表」，
+// 而且日志里一片安静 —— 查了很久才发现是列名的问题。
+//
+// 报错会把这类遗漏变成一次立刻可见的失败，而不是一个看起来正常、实际丢数据的响应。
+func scanIntoRow(columns []pgconn.FieldDescription, values []interface{}, row map[string]interface{}) error {
+	for i, col := range columns {
+		if _, exists := row[col.Name]; exists {
+			return fmt.Errorf(
+				"scan failed: duplicate column name %q in result set — "+
+					"give the expression an alias (e.g. `COALESCE(x,'') AS x`)",
+				col.Name,
+			)
+		}
+		row[col.Name] = values[i]
+	}
+	return nil
 }
 
 // FetchAll 执行查询并返回所有结果（用于 Python 引擎调用）
@@ -185,8 +211,8 @@ func (m *DBManager) FetchAll(ctx context.Context, sql string, args ...interface{
 		}
 
 		row := make(map[string]interface{})
-		for i, col := range columns {
-			row[col.Name] = values[i]
+		if err := scanIntoRow(columns, values, row); err != nil {
+			return nil, err
 		}
 		results = append(results, row)
 	}

@@ -79,15 +79,21 @@ async def _run_git(*args: str, timeout: int = 30) -> dict[str, Any]:
 
 
 async def _ensure_sandbox_repo() -> dict[str, Any] | None:
-    """校验当前 workspace 的 git repo 根未逃逸出沙箱（S 安全修复）。
+    """校验 git 仓库根没有**向上穿透**到工作根之外。
 
-    sandbox 若位于宿主 git 仓库内，git 命令会向上穿透到宿主 .git——
-    这里用 rev-parse --show-toplevel 检查 repo 根必须在 workspace 内。
+    两种工作根，同一条断言：
+
+    - 未绑定项目时，工作根是沙箱 workspace。沙箱若位于宿主 git 仓库内，git 命令
+      会向上穿透到宿主 `.git` —— 这里用 `rev-parse --show-toplevel` 挡住。
+    - 绑定了项目时，工作根就是**用户的项目目录**。此时要求仓库根**恰好等于**工作根：
+      若项目根是 monorepo 的子目录，`top` 会落在父层，git 操作会作用到整个仓库 ——
+      这正是 D6「当前仅适配单仓库目录」要拒绝的形态。
+
     返回 None 表示通过；否则返回错误 dict。
     """
     import os
 
-    from app.tools.sandbox import workspace_dir
+    from app.tools.sandbox import project_root, workspace_dir
 
     ws = os.path.normpath(str(workspace_dir()))
     check = await _run_git("rev-parse", "--show-toplevel")
@@ -97,8 +103,15 @@ async def _ensure_sandbox_repo() -> dict[str, Any] | None:
     top = os.path.normpath(check["stdout"].strip())
     if not top:
         return None
-    if top != ws and not top.startswith(ws + os.sep):
-        return {"error": f"git repository root escapes sandbox: {top}"}
+    if top != ws:
+        # 绑定项目时要求仓库根**恰为**项目根：项目根若落在 monorepo 子目录，top 会
+        # 升到父层，git 操作将作用到整个仓库 —— 这是 D6「仅适配单仓库目录」要拒的。
+        # 沙箱模式保留旧行为：agent 在 workspace 的子目录里自建仓库是合法的，
+        # 需要拦的只是"向上穿透到 workspace 之外"。
+        if project_root() is not None or not top.startswith(ws + os.sep):
+            return {
+                "error": f"git repository root does not match workspace: {top} != {ws}"
+            }
     return None
 
 

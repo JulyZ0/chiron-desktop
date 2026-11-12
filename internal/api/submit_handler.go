@@ -591,6 +591,28 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		llmConfig["provider"] = agentCfg.provider.Value
 	}
 	pythonReq["llm_config"] = llmConfig
+	// 项目根注入：agent 的文件/git 工具必须作用在**用户选中的项目目录**上，
+	// 而不是沙箱副本。引擎侧读 `context.root_path` 设置工具工作根。
+	//
+	// 查库复用 `file_refs.go` 的 `projectRootForSession` —— 与 `@路径` 展开用的是
+	// 同一条关联链（会话 → 项目 → root_path），两处各写一遍迟早会不一致。
+	//
+	// 必须**复制**再改：`workbenchCtx` 是调用方传入的 map，`HandleSubmit` 在续跑轮
+	// 会复用它 —— 就地写入会把上一轮的项目根带到下一轮。
+	//
+	// fail-soft：查不到（画布会话、DB 不可用、无 claims）就不注入，引擎回退到沙箱。
+	// 提交本身绝不能因为"找不到项目根"而失败。
+	// 注：目录是否存在不在这里判断 —— `file_refs.go` 的 `projectRootForSession` 只判空串。
+	// 路径可用性由引擎侧 `sandbox.project_root()` 复核（绝对路径 + 确实是目录），
+	// 因为那才是真正使用路径的地方。
+	if root, ok := projectRootForSession(ctx, sessionID); ok && root != "" {
+		wb := make(map[string]interface{}, len(workbenchCtx)+1)
+		for k, v := range workbenchCtx {
+			wb[k] = v
+		}
+		wb["root_path"] = root
+		workbenchCtx = wb
+	}
 	// 工作台上下文原样透传：引擎侧决定如何消费（RAG 注入、技能装配、Agent 覆盖）
 	if len(workbenchCtx) > 0 {
 		pythonReq["context"] = workbenchCtx
@@ -809,6 +831,11 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		turnStatus = "failed"
 	}
 
+	// 结算本轮用量：`done` 的整轮累计优先；它没带 token 时（取消/断线/旧引擎）
+	// 回落到逐次 `usage` 增量之和 —— 否则整轮会被记成 0，用户看到"输入 0 / 输出 0"，
+	// 计费也会漏掉这一轮。两者互斥，不会重复计。
+	usage = usage.settled()
+
 	// 用量明细（usage_events）：**只记录、不参与扣费**，供"钱花在哪个模型上"的统计。
 	//
 	// 写入失败只告警（见 RecordUsageEvent），不影响已完成的回合。
@@ -820,19 +847,27 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	var costCents *int
 	if usage.input > 0 || usage.output > 0 {
 		costCents = usageCostCents(storeCtx, turnModel, usage.input, usage.output, usage.cached)
-		RecordUsageEvent(storeCtx, UsageEvent{
-			TenantID:     tenantID,
-			UserID:       userID,
-			SessionID:    sessionID,
-			TurnID:       turnID,
-			Model:        turnModel,
-			Provider:     agentCfg.provider.Value,
-			InputTokens:  usage.input,
-			OutputTokens: usage.output,
-			CachedTokens: usage.cached,
-			CostCents:    costCents,
-		})
 	}
+	// **每个回合都记一行**，不再只在有 token 时写。
+	//
+	// 为什么：此前 `usage_events` 只收 `input>0 || output>0` 的回合，于是引擎没回报
+	// 用量的回合在这张表里**根本不存在**。计费页的「调用次数」与「tokens」若同源于此表
+	// 就必然自相矛盾 —— 用户看到「9 次调用 / 0 tokens」这种无法解释的组合。
+	// 现在零 token 回合也落库：调用次数 = 真实回合数，tokens = 真实用量，
+	// 二者同源、可对账（tokens 为 0 只表示"这一轮没拿到用量"，不是"没发生调用"）。
+	// `costCents` 仍只在有 token 时按价换算，取不到价格写 NULL（"不知道"）而非 0（"免费"）。
+	RecordUsageEvent(storeCtx, UsageEvent{
+		TenantID:     tenantID,
+		UserID:       userID,
+		SessionID:    sessionID,
+		TurnID:       turnID,
+		Model:        turnModel,
+		Provider:     agentCfg.provider.Value,
+		InputTokens:  usage.input,
+		OutputTokens: usage.output,
+		CachedTokens: usage.cached,
+		CostCents:    costCents,
+	})
 
 	// 会话遥测实时层：读端（`GET /v1/sessions/{id}/metrics`）早就存在，
 	// 但**写入端从来没有** —— 热层永远为空，每次请求都落到 `turns` + `usage_events`

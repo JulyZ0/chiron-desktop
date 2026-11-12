@@ -405,6 +405,8 @@ const mentionItems = ref<{ type: string; id: string; name: string }[]>([])
  * 面板里也就不会出现"文件"分组 —— 而不是显示一个永远搜不到东西的空分组。
  */
 const fileMentionItems = ref<{ type: string; id: string; name: string }[]>([])
+/** 文件搜索是否在飞行中：让面板在首次 `@`（空查询）时显示加载，而不是一片空白 */
+const fileMentionLoading = ref(false)
 let fileSearchTimer: ReturnType<typeof setTimeout> | null = null
 /** 丢弃过期响应：快速输入时后发的请求可能先回来，晚到的旧结果会把列表打回上一轮 */
 let fileSearchSeq = 0
@@ -500,9 +502,13 @@ function scheduleFileSearch(query: string) {
   fileSearchAbort?.abort()
   fileSearchAbort = null
   const pid = props.projectId
-  // 空查询不搜文件：刚敲下 `@` 时用户还没表达意图，塞 12 个文件进来只会
-  // 把知识库/技能挤出可视区（它们是 `@` 的主用途）。一敲字符就开始搜。
-  if (!pid || !query.trim()) {
+  // 空查询也搜：后端 `searchProjectFiles` 对空 query 的语义就是"列出根目录下
+  // 的文件"，作为用户挑选的**起点**（见 project_files.go 的注释）。
+  //
+  // 早先这里主动跳过空查询，理由是"别把知识库/技能挤出可视区"。代价是：知识库与
+  // Agent 都还没配好时（新装用户的常态），敲下 `@` 面板一片空白，看起来像功能坏了。
+  // 现在交给后端列根目录，条数给少一些（见下面的 limit），资源类仍然排在前面。
+  if (!pid) {
     fileMentionItems.value = []
     return
   }
@@ -510,6 +516,7 @@ function scheduleFileSearch(query: string) {
   fileSearchTimer = setTimeout(async () => {
     const controller = new AbortController()
     fileSearchAbort = controller
+    fileMentionLoading.value = true
     try {
       const { searchProjectFiles } = await import('../../api/projectFiles')
       const { files } = await searchProjectFiles(pid, query, 12, controller.signal)
@@ -523,6 +530,7 @@ function scheduleFileSearch(query: string) {
       if (seq === fileSearchSeq) fileMentionItems.value = []
     } finally {
       if (fileSearchAbort === controller) fileSearchAbort = null
+      if (seq === fileSearchSeq) fileMentionLoading.value = false
     }
   }, 180)
 }
@@ -549,7 +557,12 @@ function syncMention() {
   const query = before.slice(at + 1)
   // 尾随标点（含 CJK 全角）= 这次提及已经写完。若把它并进查询串，
   // `@知识库，` 会变成查询 "知识库，"，结果是 0 匹配、面板不关、还吃掉了 Enter 发送。
-  if (!/\s/.test(prev) || /\s/.test(query) || TRAILING_PUNCT.test(query)) {
+  //
+  // 前一个字符只拦 **ASCII 词字符**（邮箱 `user@host`、标识符 `foo@bar`）：
+  // 原来要求"必须是空白"，导致中文里最常见的 `看看@文件` 完全不触发 —— 中文句子
+  // 词与词之间不写空格，这条规则等于把提及功能对中文用户关掉了。
+  // 中文/全角字符紧邻 `@` 是正常的书写，不该当成"提及还没开始"。
+  if (/[A-Za-z0-9_.+-]/.test(prev) || /\s/.test(query) || TRAILING_PUNCT.test(query)) {
     mentionOpen.value = false
     return
   }
@@ -1136,7 +1149,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, attachProjectFile: attachF
         :aria-label="$t('common.reference_resource')"
       >
         <div
-          v-if="mentionLoading"
+          v-if="mentionLoading || fileMentionLoading"
           class="slash-item"
         >
           {{ $t('common.loading') }}

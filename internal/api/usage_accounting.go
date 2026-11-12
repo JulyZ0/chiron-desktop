@@ -19,6 +19,16 @@ type usageTotals struct {
 	input  int
 	output int
 	cached int
+
+	// 逐次调用增量之和：**只在 `done` 完全没带 token 时兜底**。
+	//
+	// 它绝不能与 `input/output/cached` 相加 —— 那就是重复计费。它存在的理由是：
+	// `done` 在若干异常路径上没有 token（引擎旧版本、被取消、流被截断），
+	// 此时整轮用量会**静默变成 0**，用户在统计面板上看到"输入 0 / 输出 0"，
+	// 而 `usage` 增量其实一路上都有。
+	fallbackInput  int
+	fallbackOutput int
+	fallbackCached int
 }
 
 // withEvent 把一条事件里的用量并入累计。
@@ -35,9 +45,17 @@ type usageTotals struct {
 //     这里就会**静默地**把子 Agent 的花费算进父 turn 的账单并扣到租户头上。宁可在唯一
 //     的入账入口把它挡死，也不要留一个"靠对端不出错"的约定。
 func (t usageTotals) withEvent(eventType string, input, output, cached int) usageTotals {
-	if eventType == usageEventType || strings.HasPrefix(eventType, subagentEventPrefix) {
+	if strings.HasPrefix(eventType, subagentEventPrefix) {
 		return t
 	}
+	// `usage` 是按次增量：不进主累计（会重复计费），只单独攒起来当兜底。
+	if eventType == usageEventType {
+		t.fallbackInput += input
+		t.fallbackOutput += output
+		t.fallbackCached += cached
+		return t
+	}
+	// `done` 携带整轮累计，走下面的通用累加；`usage` 已在上方单独处理。
 	if input > 0 {
 		t.input += input
 	}
@@ -48,4 +66,26 @@ func (t usageTotals) withEvent(eventType string, input, output, cached int) usag
 		t.cached += cached
 	}
 	return t
+}
+
+// settled 返回**该入账**的用量：`done` 的累计优先，缺失时才用增量之和兜底。
+//
+// 为什么需要它（用户可见的 bug）：`done` 在异常路径上可能不带 token
+// （引擎旧版本、被取消、流被截断），此时 `input/output/cached` 全是 0，
+// 统计面板上就显示"输入 0 / 输出 0 / 费用 $0.0000"——而 `usage` 增量
+// 其实一路都在。这既让用户看不到真实消耗，也让**计费漏掉**这些回合。
+//
+// 兜底是**互斥**的：只要 `done` 给了任一非零用量，就完全信任它，
+// 绝不把增量再加一遍。所以不存在重复计费。
+func (t usageTotals) settled() usageTotals {
+	if t.input > 0 || t.output > 0 || t.cached > 0 {
+		return usageTotals{input: t.input, output: t.output, cached: t.cached}
+	}
+	// 走到这里说明 `done` 没给任何 token —— 无论它是"给了 0"还是"根本没到"，
+	// 增量之和都是唯一能拿到的量。
+	return usageTotals{
+		input:  t.fallbackInput,
+		output: t.fallbackOutput,
+		cached: t.fallbackCached,
+	}
 }

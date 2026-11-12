@@ -30,6 +30,9 @@ const visible = mode !== 'native'
  */
 const heightPx = mode === 'inset' ? 28 : 36
 
+/** 窗口按钮宽度，必须与样式里 `.titlebar-btn { width }` 一致（发布给页面躲让用） */
+const CONTROL_BTN_W = 46
+
 const maximized = ref(false)
 const fullScreen = ref(false)
 
@@ -67,6 +70,12 @@ let unsubscribe: (() => void) | undefined
 onMounted(async () => {
   if (!visible) return
   document.documentElement.style.setProperty('--app-titlebar-h', `${heightPx}px`)
+  // 自绘模式右侧三个按钮各 46px：页面右上角的操作组（语言/主题/用户）必须躲开它们，
+  // 否则会被压在下面点不到。inset 模式红绿灯在左，右侧不占位，故发布 0。
+  document.documentElement.style.setProperty(
+    '--app-titlebar-controls-w',
+    mode === 'custom' ? `${CONTROL_BTN_W * 3}px` : '0px',
+  )
   if (!titleBar) return
   try {
     applyState(await titleBar.getState())
@@ -80,7 +89,10 @@ onBeforeUnmount(() => {
   unsubscribe?.()
   unsubscribe = undefined
   // 卸载必须收回变量：残留的高度会凭空在顶部留一条空白，且没有标题栏去解释它
-  if (visible) document.documentElement.style.removeProperty('--app-titlebar-h')
+  if (visible) {
+    document.documentElement.style.removeProperty('--app-titlebar-h')
+    document.documentElement.style.removeProperty('--app-titlebar-controls-w')
+  }
 })
 
 /** 最大化时按钮语义变成「还原」，图标与文案同步换 */

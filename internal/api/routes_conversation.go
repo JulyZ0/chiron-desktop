@@ -70,6 +70,9 @@ func registerConversationRoutes(
 	// 项目改动（只读 Git 视图）：与文件端点同组、同鉴权 —— 它读的是同一个项目根，
 	// 只是经 git 而不是文件系统。只执行只读子命令，见 project_git.go 开头。
 	mux.Handle("GET /v1/session-map/projects/{id}/changes", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectChanges))))
+	// 检查点时间线（只读）：回答"过去哪些时刻可以回滚回去"。
+	// 与 /changes 分开是因为数据源不同 —— 那条读用户仓库，这条读 Chiron 自己记的表。
+	mux.Handle("GET /v1/session-map/projects/{id}/checkpoints", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectCheckpoints))))
 	// 未归入任何项目的会话：存量会话全无归属，没有这个分组它们在改造后会从侧边栏消失。
 	mux.Handle("GET /v1/session-map/unassigned-sessions", authMW(rlMW(http.HandlerFunc(smHandler.ListUnassignedSessions))))
 	// 会话 → 项目反查：`@` 引用项目文件需要知道搜哪个目录（见 SessionProject 的注释）。

@@ -240,9 +240,13 @@ function inspectLocalRuntime() {
       probe: probeBundledRuntime,
     }),
   )
+  // 知识库检索服务（pageindex）是**可选**组件：缺了不影响聊天/记忆/建库，所以它
+  // 不参与下面的 ready 判定。但它决定「要不要开安装进度窗」—— 首次启动若静默
+  // 下载几百 MB，用户只会看到"点开没反应"。故单独作为 knowledge 字段带出去。
+  const knowledge = keep(inspectKnowledgeServiceRuntime({ userDataPath: userData }))
   // 先报 core：缺 uv / 缺解释器这类问题两套环境是同一个原因，先把这一环修好，下一轮才轮到引擎
-  if (!core.ready) return { ...core, rebinds }
-  return { ...keep(inspectEngineRuntime(userData)), rebinds }
+  if (!core.ready) return { ...core, rebinds, knowledge }
+  return { ...keep(inspectEngineRuntime(userData)), rebinds, knowledge }
 }
 
 /**
@@ -686,6 +690,116 @@ async function ensureEngineRuntime(options = {}) {
 }
 
 /**
+ * **按需**准备知识库检索服务（pageindex-service）的依赖。
+ *
+ * 为什么必须有这一层：`resolveKnowledgeServiceLaunch` 只**查**解释器在不在，
+ * 从不安装。结果就是首启时 `<userData>/local/pageindex/venv` 不存在 → 返回 null →
+ * 检索服务根本没起 → 引擎那边 `KNOWLEDGE_SERVICE_URL` 为空 → 用户在选择"自托管"
+ * 后看到一句「KNOWLEDGE_SERVICE_URL 未配置」。而那是个**内部变量名**，用户既不知道
+ * 它是什么，也没有任何可做的动作 —— 界面上表现为"选了自托管但用不了"。
+ *
+ * 与 `ensureEngineRuntime` 的两处关键差异：
+ *  1. **失败不抛**：知识库检索是可选能力，装不上不该让整个本地模式起不来
+ *     （聊天/记忆/技能、建库与上传都不依赖它）。失败如实返回，由上层决定怎么提示。
+ *  2. 开发态直接跳过：仓库里那份由开发者本机环境负责，壳不该去动它。
+ */
+let knowledgeInstallInFlight = null
+
+async function ensureKnowledgeServiceRuntime(options = {}) {
+  const sources = packagedKnowledgeServiceDir()
+  if (!sources) return { ok: true, reason: 'dev', venvPython: '', installed: false }
+
+  let userData = String(options.userDataPath || '')
+  if (!userData) {
+    try {
+      userData = userDataDir()
+    } catch {
+      return { ok: false, reason: 'no-userdata', message: '无法确定本地数据目录' }
+    }
+  }
+
+  const installer = require('./runtime-install.cjs')
+  const inspect = () =>
+    installer.inspectRuntime({
+      target: 'pageindex',
+      userDataPath: userData,
+      sources,
+      probe: probeBundledRuntime,
+    })
+
+  const current = inspect()
+  if (current.ready) {
+    return { ok: true, reason: 'ok', venvPython: current.venvPython, installed: false }
+  }
+
+  if (knowledgeInstallInFlight) {
+    await knowledgeInstallInFlight
+    const after = inspect()
+    return {
+      ok: after.ready,
+      reason: after.ready ? 'reused-install' : 'reused-install-failed',
+      venvPython: after.venvPython,
+      installed: true,
+      message: after.message,
+    }
+  }
+
+  knowledgeInstallInFlight = installer.ensureRuntime({
+    target: 'pageindex',
+    userDataPath: userData,
+    sources,
+    probe: probeBundledRuntime,
+    onStage: typeof options.onRuntimeStage === 'function' ? options.onRuntimeStage : undefined,
+    onLine: typeof options.onRuntimeLine === 'function' ? options.onRuntimeLine : undefined,
+    force: options.reinstallKnowledge === true,
+    indexUrl: options.indexUrl,
+    signal: options.signal,
+    idleTimeout: options.idleTimeout,
+  })
+
+  try {
+    const result = await knowledgeInstallInFlight
+    // 与引擎同理：装完清缓存，否则"缺依赖"那次结论还在，会立刻再失败一次
+    runtimeProbeCache.clear()
+    return { ok: true, reason: 'installed', venvPython: result.venvPython, installed: true }
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err)
+    return {
+      ok: false,
+      reason: 'knowledge-deps-install-failed',
+      message:
+        `知识库索引服务的依赖没能装好：${message}\n\n` +
+        '没装好时，知识库仍可创建与上传文档，但"建立索引"和"检索"不可用。\n' +
+        '常见原因：网络不通或过慢（可设 CHIRON_PIP_INDEX_URL 指向镜像源后重启）、' +
+        '磁盘空间不足（该环境约需 400MB）、安全软件拦截了 uv。',
+    }
+  } finally {
+    knowledgeInstallInFlight = null
+  }
+}
+
+/** 只读查询：知识库检索服务的环境能不能直接用（不触发安装） */
+function inspectKnowledgeServiceRuntime(options = {}) {
+  const sources = packagedKnowledgeServiceDir()
+  if (!sources) return { ready: true, reason: 'dev', message: '' }
+  let userData = String(options.userDataPath || '')
+  if (!userData) {
+    try {
+      userData = userDataDir()
+    } catch {
+      return { ready: false, reason: 'no-userdata', message: '无法确定本地数据目录' }
+    }
+  }
+  const installer = require('./runtime-install.cjs')
+  return installer.inspectRuntime({
+    target: 'pageindex',
+    userDataPath: userData,
+    sources,
+    probe: probeBundledRuntime,
+  })
+}
+
+/**
  * 起 python-engine 该用哪个解释器 —— 以及它到底能不能起。
  *
  * **打包态只认引擎自己那份 venv**（外加显式的 `CHIRON_PYTHON`）。这里刻意不留回退链：
@@ -912,6 +1026,10 @@ module.exports = {
   resolveEngineLaunch,
   /** 知识库检索服务（pageindex-service）的启动信息：与引擎**不同 venv** */
   resolveKnowledgeServiceLaunch,
+  /** 知识库检索服务环境：只读查询 / 按需安装（失败不抛，属可选能力） */
+  inspectKnowledgeServiceRuntime,
+  ensureKnowledgeServiceRuntime,
+  packagedKnowledgeServiceDir,
   packagedEngineDir,
   _setDeps,
   _resetDeps,

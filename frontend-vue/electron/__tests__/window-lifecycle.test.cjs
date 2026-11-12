@@ -82,3 +82,66 @@ test('main.cjs 的 window-all-closed 必须走这个闸门，而不是自己判�
     '闸门之外的兜底 app.quit() 会绕过所有保护',
   )
 })
+
+/**
+ * 回归：「从最小化还原后应用卡死」。
+ *
+ * 现场：最小化 → 窗口收进托盘 → 从托盘还原，窗口框回来了，但内容是一片冻住的
+ * 旧画面，点哪里都没反应。
+ *
+ * 根因：最小化后调用了 `hide()`，窗口同时处于「已最小化」和「已隐藏」两个状态。
+ * Windows 认为它仍是最小化的，Chromium 又认为它被遮挡、停止合成 —— 恢复时
+ * `show()` 只把窗口框拿出来，最小化状态还在，页面因此不重绘。
+ *
+ * 正确做法是**不 hide()**：让窗口保持普通的最小化状态，只 `setSkipTaskbar(true)`
+ * 摘掉任务栏按钮，恢复走标准 `restore()`。两边状态始终一致。
+ *
+ * 这两条断言锁的是"别改回 hide()"和"恢复别加 isMinimized() 守卫"——两种改法都
+ * 会让卡死重现，而且都不会让任何一条既有测试变红。
+ */
+test('★ 回归：托盘最小化不得 hide()，只摘任务栏按钮', () => {
+  const fs = require('node:fs')
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.cjs'), 'utf8')
+
+  const start = source.indexOf("mainWindow.on('minimize'")
+  assert.ok(start > 0, '找不到 minimize 事件的注册')
+  const end = source.indexOf("mainWindow.on('restore'", start)
+  assert.ok(end > start, 'minimize 之后应当跟着 restore 的注册')
+  const handler = source.slice(start, end)
+
+  assert.match(handler, /setSkipTaskbar\(true\)/, '最小化时必须摘掉任务栏按钮')
+  assert.doesNotMatch(
+    handler,
+    /\.hide\(\)/,
+    '在 minimize 里 hide() 会让窗口处于「最小化+隐藏」的复合态，还原后内容冻住',
+  )
+  // 托盘图标缺失时不能摘任务栏按钮：否则窗口既没有任务栏按钮、也没有托盘入口
+  assert.match(handler, /if \(!tray/, '没有托盘时不能动任务栏')
+})
+
+test('★ 回归：从托盘恢复必须无条件 restore()，不能加 isMinimized() 守卫', () => {
+  const fs = require('node:fs')
+  const source = fs.readFileSync(path.join(__dirname, '..', 'main.cjs'), 'utf8')
+
+  const start = source.indexOf('function showMainWindow(')
+  assert.ok(start > 0, '找不到 showMainWindow 的定义')
+  const end = source.indexOf('\n}', start)
+  assert.ok(end > start, '找不到 showMainWindow 的结尾')
+  // 只断言代码：注释里**必须**能写「别用 isMinimized() 做守卫」，
+  // 否则这段说明下次就会被人删掉，然后照着删掉的思路把守卫加回来。
+  const body = source
+    .slice(start, end)
+    .replace(/^\s*\/\/.*$/gm, '')
+
+  assert.match(body, /\.restore\(\)/, '必须调用 restore()，show() 不会清除最小化状态')
+  assert.doesNotMatch(
+    body,
+    /isMinimized\(\)/,
+    '用 isMinimized() 做守卫时一旦判断失误就跳过 restore()，窗口会带着最小化状态被 show()',
+  )
+  // restore 必须发生在 show 之前：顺序反了等于先显示再还原，中间会闪一下空窗
+  assert.ok(
+    body.indexOf('.restore()') < body.indexOf('.show()'),
+    'restore() 必须在 show() 之前',
+  )
+})

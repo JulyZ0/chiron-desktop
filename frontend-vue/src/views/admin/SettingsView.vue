@@ -19,14 +19,6 @@ const rateLimitConfig = ref({
   user: 100,
 })
 
-const degradationConfig = ref({
-  enabled: true,
-  lightThreshold: 500000,
-  mediumThreshold: 700000,
-  heavyThreshold: 900000,
-  vipPriority: true,
-})
-
 const cacheConfig = ref({
   l1Capacity: 2048,
   l2Ttl: 3600,
@@ -46,18 +38,6 @@ async function saveRateLimit() {
   try {
     await saveSettings('rate_limit', rateLimitConfig.value)
     message.success(t('common.rate_limit_config_saved'))
-  } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
-  } finally {
-    saving.value = false
-  }
-}
-
-async function saveDegradation() {
-  saving.value = true
-  try {
-    await saveSettings('degradation', degradationConfig.value)
-    message.success(t('errors.failover_config_saved'))
   } catch (err) {
     message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
   } finally {
@@ -101,7 +81,6 @@ onMounted(async () => {
   loading.value = true
   try {
     mergeConfig(rateLimitConfig, await getSettings('rate_limit'))
-    mergeConfig(degradationConfig, await getSettings('degradation'))
     mergeConfig(cacheConfig, await getSettings('cache'))
     mergeConfig(apiKeyConfig, await getSettings('api_key'))
   } catch {
@@ -160,57 +139,6 @@ onMounted(async () => {
           <div class="config-note">
             {{ $t('common.takes_effect_immediately_after_saving_hot_reload') }}
           </div>
-        </Card>
-      </Col>
-
-      <!-- 降级配置 -->
-      <Col
-        :xs="24"
-        :sm="12"
-      >
-        <Card :title="$t('errors.failover_config')">
-          <Form
-            :model="degradationConfig"
-            layout="vertical"
-          >
-            <FormItem :label="$t('errors.enable_failover')">
-              <Switch v-model:checked="degradationConfig.enabled" />
-            </FormItem>
-            <FormItem :label="$t('common.mild_overload_threshold')">
-              <InputNumber
-                v-model:value="degradationConfig.lightThreshold"
-                :min="10000"
-                :max="1000000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('common.moderate_overload_threshold')">
-              <InputNumber
-                v-model:value="degradationConfig.mediumThreshold"
-                :min="50000"
-                :max="1000000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('common.severe_overload_threshold')">
-              <InputNumber
-                v-model:value="degradationConfig.heavyThreshold"
-                :min="100000"
-                :max="1000000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('common.vip_priority')">
-              <Switch v-model:checked="degradationConfig.vipPriority" />
-            </FormItem>
-          </Form>
-          <Button
-            type="primary"
-            :loading="saving"
-            @click="saveDegradation"
-          >
-            {{ $t('common.save') }}
-          </Button>
         </Card>
       </Col>
 

@@ -700,7 +700,11 @@ func projectRootOf(r *http.Request, wsID string, claims *auth.Claims) (string, e
 		return "", errors.New("database unavailable")
 	}
 	row, err := db.GlobalDBManager.FetchOne(r.Context(),
-		`SELECT COALESCE(root_path,'') FROM session_map_workspaces
+		// **必须写 AS root_path**：FetchOne 用**列名**建 map，而 `COALESCE(x,'')`
+		// 不带别名时 Postgres 给的列名就是 `coalesce`。少了别名，下面
+		// `row["root_path"]` 永远取不到值 → 每个项目都被判成"没有绑定文件夹" →
+		// 工作台一直显示「无法加载项目文件列表」。
+		`SELECT COALESCE(root_path,'') AS root_path FROM session_map_workspaces
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
 		wsID, smTenant(claims), claims.UserID)
 	if err != nil || row == nil {

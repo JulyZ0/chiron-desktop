@@ -228,6 +228,22 @@ def _restrict_tools_to_plugins(
     return kept
 
 
+def _project_root_of(workbench_context: dict[Any, Any] | None) -> str:
+    """读本次对话绑定的项目根（Go 网关注入的 ``context.root_path``）。
+
+    只收非空字符串：形状不对时返回空串，让工具侧回退沙箱，而不是把某个结构体
+    当成路径传下去（那会在工具层炸出一个与真实原因无关的错误）。
+    路径合法性（绝对、存在、是目录）由 ``sandbox.project_root()`` 复核 —— 那是
+    真正使用路径的地方，校验必须贴着使用点。
+    """
+    if not isinstance(workbench_context, dict):
+        return ""
+    raw = workbench_context.get("root_path")
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip()
+
+
 def _plugin_names_of(workbench_context: dict[Any, Any] | None) -> list[str]:
     """读本次对话选中的插件名（MCP server 名）；未选或形状不对时返回空。"""
     if not isinstance(workbench_context, dict):
@@ -865,9 +881,25 @@ class AgentRuntime:
 
     @staticmethod
     def _context_breakdown(
-        messages: list[dict[str, Any]], model: str = "", *, top_n: int = 5
+        messages: list[dict[str, Any]],
+        model: str = "",
+        *,
+        top_n: int = 5,
+        tools: list[dict[str, Any]] | None = None,
     ) -> tuple[dict[str, int], list[dict[str, Any]]]:
-        """按**消息类别**给上下文分段，并给出占用最大的几条。
+        """按**上下文组成部分**给占用量分段，并给出占用最大的几条。
+
+        五类对应界面上用户能理解的五个来源：
+
+        - `system`     系统提示（人设、技能目录、记忆注入…）
+        - `tools`      工具定义本身（JSON schema 也占输入 token，而且常常不小）
+        - `user`       你发过的消息
+        - `assistant`  模型回复过的内容
+        - `tool_results` 工具返回（读文件、跑命令的输出，最容易失控的一类）
+
+        早先这里按**时间位置**分段（`history` / `current`），回答不了"是什么占的"：
+        历史里的用户消息和模型回复被混成一桶，工具定义干脆没算 —— 于是用户看到
+        总额很高却找不到任何一处能削减的地方。
 
         返回 `(每类合计, 最大的 top_n 条)`，两者出自**同一遍遍历** —— 分两处算必然漂移。
         `largest` 只报类别、角色与估算大小，**不含消息内容**：这份数据要送到前端，而消息
@@ -875,23 +907,35 @@ class AgentRuntime:
         """
         buckets: dict[str, int] = {
             "system": 0,
-            "history": 0,
+            "tools": 0,
+            "user": 0,
+            "assistant": 0,
             "tool_results": 0,
-            "current": 0,
         }
         items: list[dict[str, Any]] = []
-        last = len(messages) - 1
-        for i, m in enumerate(messages):
+
+        # 工具定义：不是消息，单独估。用同一套估算器（包成一条伪消息）以保证口径一致 ——
+        # 换一个估算公式就会出现"分项之和对不上 used"的老问题。
+        if tools:
+            tools_tokens = _estimate_tokens(
+                [{"role": "system", "content": json.dumps(tools, ensure_ascii=False, default=str)}],
+                model,
+            )
+            buckets["tools"] = tools_tokens
+            items.append({"class": "tools", "role": "tools", "tokens": tools_tokens})
+
+        for m in messages:
             role = m.get("role", "")
             n = _estimate_tokens([m], model)
             if role == "system":
                 cls = "system"
             elif role == "tool":
                 cls = "tool_results"
-            elif i == last:
-                cls = "current"
+            elif role == "assistant":
+                cls = "assistant"
             else:
-                cls = "history"
+                # user 以及任何未知角色：都算"你的输入"，宁可归到用户侧也不隐藏。
+                cls = "user"
             buckets[cls] += n
             items.append({"class": cls, "role": str(role or ""), "tokens": n})
         items.sort(key=lambda x: int(x["tokens"]), reverse=True)
@@ -943,6 +987,7 @@ class AgentRuntime:
         mode_cfg: ModeConfig,
         llm_config: dict[str, Any],
         messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """上下文占用快照：`used`/`limit` + **压缩阈值** + 分段。
 
@@ -956,10 +1001,19 @@ class AgentRuntime:
         breakdown: dict[str, int] = {}
         largest: list[dict[str, Any]] = []
         if messages:
-            breakdown, largest = self._context_breakdown(messages, model)
+            breakdown, largest = self._context_breakdown(messages, model, tools=tools)
+        # `used` 正常来自服务商回报的 input_tokens，最权威。但取消、断线、或某些兼容层
+        # 压根不回传 usage 时它就是 0 —— 环只能显示"—"，用户看不到任何占用数据
+        # （这就是"上下文占用没有任何数据"的第二个成因，与分项为空是两回事）。
+        # 此时用分项之和兜底，并**明确标成估算**：估算值绝不能伪装成服务商回报。
+        estimated = False
+        if used <= 0 and breakdown:
+            used = sum(int(v) for v in breakdown.values())
+            estimated = used > 0
         return {
             "used": used,
             "limit": limit,
+            "estimated": estimated,
             "compact_ratio": float(getattr(comp_cfg, "threshold_ratio", 0.0) or 0.0)
             if comp_cfg is not None
             else 0.0,
@@ -1331,6 +1385,14 @@ class AgentRuntime:
         # M7：交互闸门的簿记是实例级的，而实例是**每会话**复用的 ⇒ 每轮开头清一次。
         self._reset_interaction_state()
 
+        # 回合起点检查点（fail-open）：钩子内部吞掉所有异常，未绑定项目时直接跳过。
+        # 放在这里而不是工具执行前，是因为"这一轮开始前的状态"才是回滚目标。
+        from app.agent import checkpoint_hooks
+
+        checkpoint_hooks.turn_checkpoint(
+            "pre_turn", state_dir=checkpoint_hooks.checkpoint_state_dir()
+        )
+
         start_time = time.time()
         total_input_tokens = 0
         total_output_tokens = 0
@@ -1459,6 +1521,10 @@ class AgentRuntime:
                 session_id=task.session_id,
                 user_id=task.user_id,
                 tenant_id=task.tenant_id,
+                # 项目根：Go 网关按会话归属的项目查到 `root_path` 后放进 context 透传。
+                # 工具侧（`sandbox.workspace_dir()`）据此把工作根从沙箱切到用户项目；
+                # 为空时回退沙箱。**只有字符串才收**，避免把结构体当成路径。
+                project_root=_project_root_of(task.workbench_context),
                 # M19：网关的 turn id（提交载荷透传）。checkpoint 的 `turn_id` 一格与
                 # 子 Agent 的归属都从这里取；此前**没有任何地方设置它**，于是
                 # `agent_runs.turn_id` 恒空、对账无法把 run 与已计费回合对应起来。
@@ -2793,6 +2859,7 @@ class AgentRuntime:
                     mode_cfg=mode_cfg,
                     llm_config=task.llm_config,
                     messages=messages,
+                    tools=tools,
                 ),
                 cache=self._prefix_change(messages, tools),
                 trace_id=trace_id,
@@ -2916,6 +2983,19 @@ class AgentRuntime:
                     )
                 except Exception:
                     logger.exception("Durable history append on exit failed")
+
+        # 回合终点检查点（fail-open）。放在所有退出路径的补写之后，是为了让检查点
+        # 记录到的是"这一轮的全部产物"。
+        #
+        # 覆盖范围要说清楚：这里只覆盖**正常结束**。异常退出时检查点不会建 —— 但这
+        # 不是漏洞，因为下一次 `pre_turn` 会记录当时的工作区状态，被中断的那一轮
+        # 的产物仍落在那次快照里。反过来（在 finally 里建）会让每个异常路径都多一次
+        # 可能失败的 git 操作，收益低于风险。
+        from app.agent import checkpoint_hooks
+
+        checkpoint_hooks.turn_checkpoint(
+            "post_turn", state_dir=checkpoint_hooks.checkpoint_state_dir()
+        )
 
     def _build_messages(self, task: AgentTask) -> list[dict[str, Any]]:
         """构建 LLM 消息列表（system + history + 当前用户消息）。

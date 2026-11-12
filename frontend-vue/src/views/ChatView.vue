@@ -12,6 +12,8 @@ import { getSessionMetrics, getSessionRuntime, putSessionRuntime, type SessionRu
 import FloatingPanel from '../components/common/FloatingPanel.vue'
 import SubAgentPanel from '../components/chat/SubAgentPanel.vue'
 import SessionStatsPanel from '../components/chat/SessionStatsPanel.vue'
+import ChatHealthPanel from '../components/chat/ChatHealthPanel.vue'
+import { fetchComponentsHealth, isComponentUp, type ComponentsHealth } from '../api/systemHealth'
 import SessionPreviewPane from '../components/chat/SessionPreviewPane.vue'
 import { useAuthStore } from '../stores/auth'
 import { privateKey } from '../utils/privateStorage'
@@ -361,6 +363,15 @@ const activeSessionId = ref('')
  */
 const activeProject = ref<{ id: string; name: string } | null>(null)
 const activeProjectId = computed(() => activeProject.value?.id || '')
+/**
+ * 反查项目**失败**的原因（空串 = 没失败）。
+ *
+ * 必须与 `activeProject === null` 分开记：两者在工作台上完全是两件事 ——
+ * "这个会话没归入项目"是正常状态，而"归属查不出来"（网关 404 / 网络断 / 401）
+ * 是故障。合并成一个 null 的话，故障会被显示成「当前会话未归入任何项目」，
+ * 而用户刚在侧边栏把它拖进项目了 —— 一句自相矛盾的话，且没有任何线索。
+ */
+const activeProjectError = ref('')
 
 /**
  * 工作台里点「加入对话」：走的是输入框**同一条附件通道**。
@@ -372,19 +383,48 @@ const activeProjectId = computed(() => activeProject.value?.id || '')
 function onWorkbenchReference(payload: { path: string; name: string }) {
   void chatInputRef.value?.attachProjectFile?.(payload.path, payload.name)
 }
-watch(activeSessionId, async (sid) => {
+/**
+ * 重新解析"当前会话属于哪个项目"。
+ *
+ * **不能只在 `activeSessionId` 变化时跑**：用户在侧边栏把**当前正在聊的这个会话**
+ * 拖进项目（或移出项目）时，会话 id 一个字都没变，watch 不会被触发 —— 工作台
+ * 于是继续显示「当前会话未归入任何项目」，而此刻后端已经有归属了。刷新按钮
+ * 也救不了它，因为整页重建才会重跑 watch。
+ */
+async function refreshActiveProject() {
+  const sid = activeSessionId.value
   activeProject.value = null
+  activeProjectError.value = ''
   if (!sid) return
   try {
     const { sessionProject } = await import('../views/sessionmap/projectsApi')
     const project = await sessionProject(sid)
     // 期间切走了会话：晚到的结果属于上一个会话，写进去会让 `@` 搜错目录。
     if (activeSessionId.value !== sid) return
-    activeProject.value = project ? { id: project.id, name: project.name || project.root_path } : null
-  } catch {
-    activeProject.value = null
+    // **`root_path` 为空不算项目**：那是旧形态的「画布」，没有绑定本地文件夹。
+    // 后端 `projectRootOf` 对这种 id 回的是 404 `not_found`（不是 409
+    // `project_root_unavailable` —— 那个才是"文件夹被删了"），于是工作台把一句
+    // "请求的资源不存在"糊在用户脸上，而真相是"这个会话本来就没有项目文件"。
+    // 判据务必与 `ListProjects` 一致：`root_path <> ''` 才是项目。
+    activeProject.value =
+      project && project.root_path
+        ? { id: project.id, name: project.name || project.root_path }
+        : null
+  } catch (e) {
+    if (activeSessionId.value !== sid) return
+    // 查询失败**不能**当成"没有项目"：那会让工作台显示「未归入任何项目」，
+    // 而用户可能刚把会话拖进项目。留原文，让面板说明是哪一步坏了。
+    activeProjectError.value = describeApiError(e)
   }
-})
+}
+
+/**
+ * 会话切换时重新解析。
+ *
+ * 侧边栏改归属（绑定 / 移出 / 移动）走 `@binding-changed` 单独触发一次 —— 那条路径
+ * 会话 id 不变，只有显式通知能救。
+ */
+watch(activeSessionId, () => { void refreshActiveProject() })
 
 /**
  * 任务清单面板（长任务防跑偏）。
@@ -635,7 +675,7 @@ const budgetSnapshot = ref<Record<string, { used?: number; limit?: number }> | n
 const sessionCostCents = ref<number | null>(null)
 // 上下文快照（引擎 `done` 带 `context={used, limit, compact_ratio}`）。阈值也由引擎给出，
 // 前端不写死常量 —— 它可被租户/模式覆盖。
-const contextSnapshot = ref<{ used?: number; limit?: number; compact_ratio?: number; breakdown?: Record<string, number>; largest?: Array<{ class?: string; role?: string; tokens?: number }> } | null>(null)
+const contextSnapshot = ref<{ used?: number; limit?: number; compact_ratio?: number; breakdown?: Record<string, number>; largest?: Array<{ class?: string; role?: string; tokens?: number }>; estimated?: boolean } | null>(null)
 // 前缀缓存诊断（引擎 `done` 带 `cache={prefix_changed: ["system"|"tools"]}`）。空数组 = 逐字未变。
 const cacheSnapshot = ref<{ prefix_changed?: string[]; first_turn?: boolean } | null>(null)
 
@@ -1665,8 +1705,8 @@ useKeyboardShortcuts({
     },
     {
       ...specOf('close-overlays'),
-      when: () => subagentsOpen.value || statsOpen.value,
-      handler: () => { subagentsOpen.value = false; statsOpen.value = false },
+      when: () => subagentsOpen.value || statsOpen.value || healthOpen.value,
+      handler: () => { subagentsOpen.value = false; statsOpen.value = false; healthOpen.value = false },
       // 原实现这两层都不拦默认行为：走到这里说明没有更需要抢占的语义了
       preventDefault: false,
     },
@@ -1693,6 +1733,8 @@ onMounted(async () => {
   // 监听网络在线/离线状态
   window.addEventListener('online', onOnline)
   window.addEventListener('offline', onOffline)
+  // 逐组件健康轮询：状态栏的「已连接」要有后端依据，而不是只看浏览器是否在线
+  startHealthPolling()
   // 全局键盘快捷键由 useKeyboardShortcuts 自行注册/注销（见文件上方）
   // 新用户引导（P0-3）：首次进入会话页时按服务端进度决定要不要弹。
   // 不 await：引导是可选的，不该拖慢会话加载；接口失败在 composable 里静默吞掉。
@@ -1705,6 +1747,7 @@ onUnmounted(() => {
   closeSubagentStream()
   if (unifiedDoneTimer) { clearTimeout(unifiedDoneTimer); unifiedDoneTimer = null }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null }
   window.removeEventListener('online', onOnline)
   window.removeEventListener('offline', onOffline)
 })
@@ -1713,6 +1756,37 @@ onUnmounted(() => {
 const isOnline = ref(navigator.onLine)
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 let reconnectAttempts = 0
+
+/**
+ * 逐组件健康态（pg / redis / engine / gateway）。
+ *
+ * 为什么不能只信 `navigator.onLine`：浏览器有网 ≠ 后端可用。postgres、redis、
+ * 引擎任一挂掉时，旧逻辑仍然显示「已连接」，用户接着提问就一路失败，
+ * 却不知道是哪个组件的问题。这里每 30s 拉一次聚合健康态，
+ * 状态栏的「已连接」以**全部组件可用**为准，并能点开看明细。
+ */
+const componentsHealth = ref<ComponentsHealth | null>(null)
+const healthOpen = ref(false)
+let healthTimer: ReturnType<typeof setInterval> | null = null
+
+/** 全部关键组件都可用才算「已连接」。取不到数据（null）时**不**改变原判定，避免误报离线。 */
+const componentsUp = computed(() => {
+  const c = componentsHealth.value
+  if (!c) return true
+  return isComponentUp(c.postgres) && isComponentUp(c.redis) && isComponentUp(c.engine)
+})
+
+async function loadComponentsHealth() {
+  const next = await fetchComponentsHealth()
+  // 拉取失败保留上次结果：一次抖动不该让状态栏在「在线/离线」之间闪
+  if (next) componentsHealth.value = next
+}
+
+function startHealthPolling() {
+  if (healthTimer) return
+  void loadComponentsHealth()
+  healthTimer = setInterval(() => { void loadComponentsHealth() }, 30000)
+}
 
 function onOffline() {
   isOnline.value = false
@@ -2391,7 +2465,7 @@ function onSSEMessage(raw: unknown, sid: string) {
       ? (d.budget as Record<string, { used?: number; limit?: number }>)
       : null
     contextSnapshot.value = (d.context && typeof d.context === 'object')
-      ? (d.context as { used?: number; limit?: number; compact_ratio?: number; breakdown?: Record<string, number>; largest?: Array<{ class?: string; role?: string; tokens?: number }> })
+      ? (d.context as { used?: number; limit?: number; compact_ratio?: number; breakdown?: Record<string, number>; largest?: Array<{ class?: string; role?: string; tokens?: number }>; estimated?: boolean })
       : null
     cacheSnapshot.value = (d.cache && typeof d.cache === 'object')
       ? (d.cache as { prefix_changed?: string[]; first_turn?: boolean })
@@ -2725,10 +2799,12 @@ function continueGeneration() {
       v-if="workbenchOpen"
       :project-id="activeProjectId"
       :project-name="activeProject?.name || ''"
+      :project-error="activeProjectError"
       :agent-written-paths="agentWrittenPaths"
       :handle-side="layoutSwapped ? 'left' : 'right'"
       @close="toggleWorkbench()"
       @reference="onWorkbenchReference"
+      @retry-project="refreshActiveProject"
     />
     <SessionPreviewPane
       v-if="splitSessionId"
@@ -3213,9 +3289,10 @@ function continueGeneration() {
       <ChatStatusBar
         :model="llmModel"
         :stats="lastTurnStats"
-        :context-used="lastTurnStats?.inputTokens ?? null"
+        :context-used="contextSnapshot?.used ?? lastTurnStats?.inputTokens ?? null"
         :context-limit="contextWindow"
         :compact-ratio="contextSnapshot?.compact_ratio ?? null"
+        :context-estimated="contextSnapshot?.estimated ?? false"
         :breakdown="contextSnapshot?.breakdown ?? null"
         :largest="contextSnapshot?.largest ?? null"
         :cache="cacheSnapshot"
@@ -3223,9 +3300,10 @@ function continueGeneration() {
         :budget="budgetSnapshot"
         :cost-cents="sessionCostCents"
         :subagent-active-count="subagentActiveCount"
-        :online="isOnline && !connectionLost"
+        :online="isOnline && !connectionLost && componentsUp"
         @toggle-subagents="subagentsOpen = !subagentsOpen"
         @toggle-stats="statsOpen = !statsOpen"
+        @toggle-health="healthOpen = !healthOpen"
       />
 
       <!-- 观测浮层：
@@ -3252,6 +3330,18 @@ function continueGeneration() {
         @close="statsOpen = false"
       >
         <SessionStatsPanel :session-id="activeSessionId" />
+      </FloatingPanel>
+
+      <!-- 组件健康 / 内存明细：点状态栏的「已连接」展开。
+           回答"到底哪个组件挂了、内存去哪了"，而状态栏 26px 只放得下结论。 -->
+      <FloatingPanel
+        :open="healthOpen"
+        :title="$t('common.component_health_and_memory')"
+        :width="380"
+        :bottom-inset="floatingBottomInset"
+        @close="healthOpen = false"
+      >
+        <ChatHealthPanel :components="componentsHealth" />
       </FloatingPanel>
 
       <ChatDisplaySettings v-model:open="displaySettingsOpen" />
@@ -3341,6 +3431,7 @@ function continueGeneration() {
       @tag="setSessionTag"
       @remove-context="removeContextChip"
       @clear-context="clearContext"
+      @binding-changed="refreshActiveProject"
     />
 
     <!-- 会话地图：同一 SPA 内的一个视图（不再是 public/sessionmap/ 的 iframe）。
@@ -3627,7 +3718,9 @@ function continueGeneration() {
 .approval-btn.danger { background: var(--bg-hover); color: var(--text-primary); }
 .approval-btn.danger:hover { background: var(--danger-bg, rgba(239,68,68,.12)); color: var(--danger, var(--error)); }
 .connection-banner {
-  position: fixed; top: 0; left: 0; right: 0; z-index: var(--z-page-bar);
+  /* 让开自绘标题栏：它是 fixed 且层级更高（--z-page-bar > --z-drawer），
+     贴 top:0 会把最小化/关闭那一栏一起盖住，窗口按钮直接点不到。 */
+  position: fixed; top: var(--app-titlebar-h); left: 0; right: 0; z-index: var(--z-page-bar);
   padding: 4px 12px; text-align: center;
   font-size: 12px; line-height: 18px;
   background: var(--error); color: var(--on-solid);

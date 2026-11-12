@@ -35,9 +35,18 @@ async function load() {
 }
 watch(() => props.sessionId, load, { immediate: true })
 
-const fmtInt = (n?: number) => (n ?? 0).toLocaleString()
-const fmtCost = (cents?: number) => `$${((cents ?? 0) / 100).toFixed(4)}`
-const fmtRate = (r?: number) => (r === undefined || r === null ? '—' : `${(r * 100).toFixed(1)}%`)
+/**
+ * 未提供的数字显示 `—`，而不是 0。
+ *
+ * 这两者含义完全不同：`0` 是"确实没有消耗"，`—` 是"没拿到这个数"。
+ * 早先这里用 `(n ?? 0)`，后端字段缺失时面板照样打印 0，
+ * 于是"输入 0 / 输出 0 / 费用 $0.0000"看起来像一份真实账单 —— 用户无法分辨
+ * 到底是真没花钱，还是根本没收上来。
+ */
+const fmtInt = (n?: number) => (typeof n === 'number' ? n.toLocaleString() : '—')
+const fmtCost = (cents?: number) =>
+  typeof cents === 'number' ? `$${(cents / 100).toFixed(4)}` : '—'
+const fmtRate = (r?: number) => (typeof r === 'number' ? `${(r * 100).toFixed(1)}%` : '—')
 const fmtMs = (ms?: number) => (ms ? `${Math.round(ms)} ms` : '—')
 const fmtTps = (tps?: number) => (tps ? `${tps.toFixed(1)} tok/s` : '—')
 

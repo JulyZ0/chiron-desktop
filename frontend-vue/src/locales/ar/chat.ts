@@ -361,7 +361,7 @@ export default {
   workbench_list_truncated: "عدد العناصر كبير — يُعرض الجزء الأول فقط",
   workbench_copy_path: "نسخ المسار النسبي",
   workbench_reference: "أضف إلى المحادثة",
-  workbench_reference_hint: "إدراج @المسار في الرسالة — تقرأ البوابة الملف عند الإرسال",
+  workbench_reference_hint: "إدراج {'@'}المسار في الرسالة — تقرأ البوابة الملف عند الإرسال",
   workbench_binary_hint: "ملف ثنائي — لا تتوفر معاينة؛ انسخ مساره وافتحه بتطبيق النظام",
   workbench_path_outside_project: "«{path}» خارج مجلد المشروع الحالي ولا يمكن فتحه",
   workbench_file_not_found: "لم يُعثر على «{path}» في هذا المشروع",

@@ -447,8 +447,10 @@ func smLoadFromPG(ctx context.Context, workspaceID, tenant, userID string) (*Ses
 		return nil, nil
 	}
 	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT id, COALESCE(name,''), COALESCE(viewport, '{}'::jsonb)::text,
-		        COALESCE(root_path,''), COALESCE(sort_index,0)
+		// 每个 COALESCE 都要 AS 别名：FetchOne 用列名建 map，无别名时列名是
+		// `coalesce`，多个同名列互相覆盖 → row["name"/"root_path"/...] 全取不到。
+		`SELECT id, COALESCE(name,'') AS name, COALESCE(viewport, '{}'::jsonb)::text AS viewport,
+		        COALESCE(root_path,'') AS root_path, COALESCE(sort_index,0) AS sort_index
 		   FROM session_map_workspaces
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`, workspaceID, tenant, userID)
 	if err != nil || row == nil {
@@ -464,9 +466,14 @@ func smLoadFromPG(ctx context.Context, workspaceID, tenant, userID string) (*Ses
 		ws.Viewport = map[string]interface{}{}
 	}
 	rows, err := db.GlobalDBManager.FetchAll(ctx,
-		`SELECT n.id, COALESCE(n.session_id,''), COALESCE(n.parent_node_id,''), COALESCE(n.edge_kind,'manual'),
-		        n.x, n.y, COALESCE(NULLIF(n.title, ''), s.title, '') AS title, COALESCE(n.color, ''), n.collapsed, n.hidden, n.pinned,
-		        COALESCE(n.branch_from_seq, 0), n.created_at, n.updated_at
+		// COALESCE 全部带 AS 别名：无别名时列名都是 `coalesce`，多个同名列会互相
+		// 覆盖，`r["session_id"]` 之类全取不到值（见 SessionProject 的注释）。
+		`SELECT n.id, COALESCE(n.session_id,'') AS session_id,
+		        COALESCE(n.parent_node_id,'') AS parent_node_id,
+		        COALESCE(n.edge_kind,'manual') AS edge_kind,
+		        n.x, n.y, COALESCE(NULLIF(n.title, ''), s.title, '') AS title,
+		        COALESCE(n.color, '') AS color, n.collapsed, n.hidden, n.pinned,
+		        COALESCE(n.branch_from_seq, 0) AS branch_from_seq, n.created_at, n.updated_at
 		   FROM session_map_nodes n LEFT JOIN sessions s ON s.id = n.session_id
 		  WHERE n.workspace_id = $1 AND n.edge_kind <> 'project'
 		  ORDER BY n.created_at`, workspaceID)
@@ -601,7 +608,8 @@ func (h *SessionMapHandler) ListWorkspaces(w http.ResponseWriter, r *http.Reques
 		// 会看到一堆文件夹名，选中后得到一张永远空白的画布。
 		// 项目有自己的列表端点（`GET /v1/session-map/projects`）。
 		rows, err := db.GlobalDBManager.FetchAll(r.Context(),
-			`SELECT id, COALESCE(name,''), updated_at FROM session_map_workspaces
+			// COALESCE 带 AS 别名，见 SessionProject 的注释。
+			`SELECT id, COALESCE(name,'') AS name, updated_at FROM session_map_workspaces
 			  WHERE tenant_id = $1 AND user_id = $2 AND COALESCE(root_path,'') = ''
 			  ORDER BY updated_at DESC LIMIT 50`,
 			smTenant(claims), claims.UserID)
@@ -739,7 +747,8 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 	if existing, ok := smCacheGet(r.Context(), wsID); ok {
 		body.RootPath = existing.RootPath
 	} else if row, err := db.GlobalDBManager.FetchOne(r.Context(),
-		`SELECT COALESCE(root_path,'') FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
+		// AS root_path 不可省：无别名时列名是 `coalesce`，row["root_path"] 取不到。
+		`SELECT COALESCE(root_path,'') AS root_path FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
 		body.RootPath = stringOf(row["root_path"])
 	}
 	// **sort_index 同样不接受客户端提交**：它与 root_path 是同一类字段 ——
@@ -749,7 +758,7 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 	if existing, ok := smCacheGet(r.Context(), wsID); ok {
 		body.SortIndex = existing.SortIndex
 	} else if row, err := db.GlobalDBManager.FetchOne(r.Context(),
-		`SELECT COALESCE(sort_index,0) FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
+		`SELECT COALESCE(sort_index,0) AS sort_index FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
 		body.SortIndex = intOf(row["sort_index"])
 	}
 	if db.Redis == nil {

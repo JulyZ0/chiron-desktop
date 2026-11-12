@@ -13,6 +13,7 @@ import {
 import { api, resolveMediaUrl } from '../api'
 import { errorDetail } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
+import { kbAcceptAttr, isSupportedKbFile } from '../config/kbFileTypes'
 import type { UploadProps } from 'ant-design-vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import KBDocumentPreview from '../components/KBDocumentPreview.vue'
@@ -160,6 +161,29 @@ const filteredDocs = computed(() => {
   return documents.value.filter(d => (d.name || '').toLowerCase().includes(q) || (d.file_type || '').toLowerCase().includes(q))
 })
 
+/** 当前库的 provider —— 决定接受哪些扩展名（自托管只吃 PDF，cloud 还有 Office） */
+const kbProvider = computed(() => kb.value?.provider)
+
+/** `<input accept>` 的属性值，随 provider 变化 */
+const kbAccept = computed(() => kbAcceptAttr(kbProvider.value))
+
+/**
+ * 选择文件时先挡一次不受支持的类型。
+ *
+ * 这里不是安全边界（真正的判定在网关 Init），纯粹是 UX：批量选 20 个文件时，
+ * 与其让它们全部传完再报 20 次错，不如在点击「打开」的那一刻就说清楚。
+ * 返回 false 只拦截该文件，同批次里合法的文件继续上传。
+ */
+const beforeKbUpload: NonNullable<UploadProps['beforeUpload']> = (file) => {
+  const name = typeof file === 'string' ? file : file.name
+  if (isSupportedKbFile(kbProvider.value, name)) return true
+  message.error(t('knowledge.unsupported_file_type', {
+    name,
+    supported: kbAccept.value.replace(/,/g, ' '),
+  }))
+  return false
+}
+
 async function deleteDoc(id: string) {
   try {
     await api.delete(`/v1/kb/${kbId}/documents`, { params: { doc_id: id } })
@@ -261,18 +285,76 @@ const filteredMediaFiles = computed(() => {
 })
 
 // 上传文档：全局分片（purpose kb_doc → complete 落 knowledge_documents）
+//
+// 批量支持：antd 的 customRequest 是**逐文件**调用的（即使 multiple 也一样），
+// 所以"批量"必须在两个地方补：
+//   1. 模板上加 multiple（否则文件选择框只能选一个）；
+//   2. 这里做批次聚合（否则选 10 个文件会弹 10 条提示、触发 10 次列表重载）。
+//
+// 并发也要限：每个文件内部已有 3 路分片并发，一次选 50 个文件就是 150 个
+// 在途请求，弱网下会把连接池占满、拖垮同一页面的其他请求。
+const MAX_PARALLEL_UPLOADS = 3
+let activeUploads = 0
+const uploadQueue: Array<() => void> = []
+
+function acquireUploadSlot(): Promise<void> {
+  if (activeUploads < MAX_PARALLEL_UPLOADS) {
+    activeUploads++
+    return Promise.resolve()
+  }
+  return new Promise<void>((resolve) => {
+    uploadQueue.push(() => {
+      activeUploads++
+      resolve()
+    })
+  })
+}
+
+function releaseUploadSlot(): void {
+  activeUploads--
+  uploadQueue.shift()?.()
+}
+
+/** 本批次统计：inFlight 归零时才汇总提示 + 刷新列表 */
+const uploadBatch = { inFlight: 0, ok: 0, failed: 0 }
+
 async function handleUpload(info: UploadRequestOptions) {
   // antd 的 file 允许多态（string/Blob，用于受控 fileList）；本视图只接真实上传文件
   const { file } = info
   if (!(file instanceof File)) return
+
+  uploadBatch.inFlight++
+  await acquireUploadSlot()
   try {
     const handle = await createChunkUpload(file, { purpose: 'kb_doc', parentId: kbId })
     await handle.done
-    message.success(t('knowledge.document_uploaded_successfully'))
+    uploadBatch.ok++
+    info.onSuccess?.({})
+  } catch (error) {
+    uploadBatch.failed++
+    // 失败必须点名是哪个文件：批量时"上传失败"这四个字没法定位问题
+    const reason = kbErrorText(error, '') || errorDetail(error, t('errors.upload_failed'))
+    message.error(`${file.name}：${reason}`)
+    info.onError?.(error instanceof Error ? error : new Error(String(error)))
+  } finally {
+    releaseUploadSlot()
+    uploadBatch.inFlight--
+    if (uploadBatch.inFlight === 0) await flushUploadBatch()
+  }
+}
+
+/** 一个批次结束：汇总提示 + 刷新一次列表（而不是每个文件各刷一次） */
+async function flushUploadBatch() {
+  const { ok, failed } = uploadBatch
+  uploadBatch.ok = 0
+  uploadBatch.failed = 0
+  if (ok > 0) {
+    message.success(t('knowledge.uploaded_n_files_to_the_knowledge_base', { n: ok }))
     await loadKnowledgeBase()
     await loadDocuments()
-  } catch (error) {
-    message.error(kbErrorText(error, '') || errorDetail(error, t('errors.upload_failed')))
+  }
+  if (failed > 0) {
+    message.error(t('errors.n_files_failed_to_upload', { n: failed }))
   }
 }
 
@@ -616,9 +698,11 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
                 {{ $t('common.pick_from_media_library') }}
               </Button>
               <Upload
+                multiple
                 :show-upload-list="false"
                 :custom-request="handleUpload"
-                accept=".pdf,.md,.txt,.csv,.docx"
+                :before-upload="beforeKbUpload"
+                :accept="kbAccept"
               >
                 <Button
                   type="primary"

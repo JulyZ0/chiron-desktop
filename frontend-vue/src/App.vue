@@ -62,15 +62,17 @@ watchEffect(() => {
 </template>
 
 <style>
-html, body, #app {
+html, body {
   width: 100%;
   height: 100%;
   margin: 0;
   padding: 0;
 }
 
+/* 尺寸（含顶部给自绘标题栏让位的 padding-top）全部交给 style.css 的 #app 规则，
+   这里只负责表面色。**刻意不写 `padding: 0` 简写** —— 那会抹掉那边的
+   padding-top: var(--app-titlebar-h)，而谁赢取决于两份样式表的注入顺序。 */
 #app {
-  min-height: var(--app-height);
   background: var(--bg-page);
   color: var(--text-primary);
   transition: background-color var(--dur-slow) var(--ease-out),

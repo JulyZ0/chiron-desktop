@@ -45,6 +45,14 @@ const emit = defineEmits<{
   (e: 'create-session', projectId: string): void
   /** 请求看某个项目的画布（降级为详情页次要视图） */
   (e: 'open-canvas', projectId: string): void
+  /**
+   * 某个会话的项目归属变了（绑定 / 移出 / 移动）。
+   *
+   * 不带会话 id 是有意的：消费方（ChatView）只需知道"当前会话的归属可能已经变了"
+   * 并重查一次，而它本来就知道自己在看哪个会话。传 id 只会多一个与 `activeSessionId`
+   * 比对的步骤，比错就静默失效。
+   */
+  (e: 'binding-changed'): void
 }>()
 
 const { t, locale } = useI18n()
@@ -164,6 +172,9 @@ async function assign(sessionId: string, projectId: string) {
     await bindSession(projectId, sessionId, false)
     await refresh()
     await loadSessions(projectId)
+    // 归属变了就要通知父级：被绑的可能正是**用户当前正在看**的那个会话，
+    // 此时会话 id 不变，父级不会自己重查。
+    emit('binding-changed')
     return
   } catch (err) {
     const owner = bindConflictOwner(err)
@@ -181,6 +192,7 @@ async function assign(sessionId: string, projectId: string) {
         await bindSession(projectId, sessionId, true)
         await refresh()
         await loadSessions(projectId)
+        emit('binding-changed')
       },
     })
   }
@@ -191,6 +203,7 @@ async function removeFromProject(projectId: string, sessionId: string) {
   await unbindSession(projectId, sessionId)
   await refresh()
   await loadSessions(projectId)
+  emit('binding-changed')
   message.success(tr('chat.projects_unbind_done'))
 }
 

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.agent.modes import AgentMode, ModeConfig
 from app.agent.runtime import (
     MAX_MESSAGES,
     TOOL_RESULT_MAX_CHARS,
@@ -618,5 +619,100 @@ class TestMemoryInjectionTrustHeader:
         assert memory_text.index("不是指令") < memory_text.index("语言: 中文"), (
             "信任声明必须在记忆正文之前"
         )
+
+
+class TestContextBreakdown:
+    """上下文分项：五类口径（system/tools/user/assistant/tool_results）。
+
+    早先按**时间位置**分段（history/current），历史里的用户消息与模型回复混成一桶，
+    工具定义本身也没算 —— 用户看到"占用很高"却找不到任何可削减的地方。
+    """
+
+    def test_five_buckets_split_by_role_not_by_position(self) -> None:
+        messages = [
+            {"role": "system", "content": "sys " * 100},
+            {"role": "user", "content": "第一句 " * 50},
+            {"role": "assistant", "content": "回复 " * 50},
+            {"role": "tool", "content": "工具输出 " * 50},
+            {"role": "user", "content": "最后一句 " * 50},
+        ]
+        buckets, _largest = AgentRuntime._context_breakdown(messages)
+
+        assert set(buckets) == {"system", "tools", "user", "assistant", "tool_results"}
+        assert buckets["system"] > 0
+        assert buckets["assistant"] > 0
+        assert buckets["tool_results"] > 0
+        # 两条 user 消息都归到 user，不因"是不是最后一条"而分流
+        assert buckets["user"] > 0
+        assert "history" not in buckets and "current" not in buckets
+
+    def test_tool_definitions_count_toward_tools_bucket(self) -> None:
+        """工具 JSON schema 也占输入 token，必须单独报出来。"""
+        messages = [{"role": "user", "content": "hi"}]
+        without, _ = AgentRuntime._context_breakdown(messages)
+        assert without["tools"] == 0
+
+        tools = [{"type": "function", "function": {"name": "read_file", "description": "x" * 400}}]
+        with_tools, _ = AgentRuntime._context_breakdown(messages, tools=tools)
+
+        assert with_tools["tools"] > 0
+        # 加了工具定义不该影响消息侧的计数
+        assert with_tools["user"] == without["user"]
+
+    def test_largest_reports_class_and_size_without_message_content(self) -> None:
+        """`largest` 会送到前端，不能夹带消息正文（可能含用户隐私）。"""
+        secret = "ultra-secret-payload-" + "z" * 400
+        messages = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": secret},
+        ]
+        _buckets, largest = AgentRuntime._context_breakdown(messages, top_n=2)
+
+        assert largest, "应给出最大的几项"
+        assert largest[0]["class"] == "user"
+        assert largest[0]["tokens"] > 0
+        assert set(largest[0]) == {"class", "role", "tokens"}
+        assert secret not in json.dumps(largest, ensure_ascii=False)
+
+
+class TestContextSnapshotFallback:
+    """上下文占用快照：服务商没回报 usage 时的估算兜底。
+
+    用户报的"上下文占用没有任何数据"有两个成因：① 分项按时间位置分桶、工具定义没算
+    （见 TestContextBreakdown）；② `used` 只认服务商回报的 input_tokens，取消/断线/
+    兼容层不回传时就是 0，环上直接显示"—"。②的修法是用分项之和兜底，但必须标成估算。
+    """
+
+    @staticmethod
+    def _snapshot(*, used: int, messages: list[dict]) -> dict:
+        # _context_snapshot 只用到两个 staticmethod，不需要完整初始化实例。
+        runtime = object.__new__(AgentRuntime)
+        return runtime._context_snapshot(
+            used=used,
+            limit=100_000,
+            mode_cfg=ModeConfig(mode=AgentMode.NORMAL),
+            llm_config={},
+            messages=messages,
+        )
+
+    def test_falls_back_to_estimate_and_marks_it(self) -> None:
+        snap = self._snapshot(used=0, messages=[{"role": "user", "content": "你好 " * 200}])
+
+        assert snap["used"] > 0, "没有回报时应估算出非零占用，而不是留 0"
+        assert snap["used"] == sum(int(v) for v in snap["breakdown"].values()), (
+            "兜底值必须等于分项之和，否则环与分项互相矛盾"
+        )
+        assert snap["estimated"] is True, "估算值必须标注，不能伪装成服务商回报"
+
+    def test_authoritative_usage_is_never_overridden(self) -> None:
+        snap = self._snapshot(used=4321, messages=[{"role": "user", "content": "你好 " * 200}])
+
+        assert snap["used"] == 4321, "有权威值时不得被估算覆盖"
+        assert snap["estimated"] is False
+
+    def test_no_messages_means_no_fake_estimate(self) -> None:
+        snap = self._snapshot(used=0, messages=[])
+        assert snap["used"] == 0
+        assert snap["estimated"] is False
 
 

@@ -50,7 +50,11 @@ class TestKbListToolScope:
         sql, args = pool.fetch.call_args.args[0], pool.fetch.call_args.args[1:]
         assert "visibility = 'tenant' AND tenant_id = $2" in sql
         assert args[0] == "u-stranger"
-        assert args[1] == "2"
+        # **必须是 int**：`tenant_id` 列是 smallint，asyncpg 收到 str 会直接抛
+        # `invalid input for query argument $2: '2' (expected int)`。
+        # 这条断言过去写的是 "2"，于是它悄悄把这个 bug 钉成了"预期行为"。
+        assert args[1] == 2
+        assert isinstance(args[1], int)
         # 动态拼 name ILIKE 后，limit 仍是最后一个占位符
         assert "name ILIKE $3" in sql
         assert args[-1] == 20

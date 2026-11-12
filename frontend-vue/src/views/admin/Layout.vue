@@ -14,9 +14,7 @@ import {
   Breadcrumb,
   BreadcrumbItem,
   Button,
-  Badge,
   Dropdown,
-  Avatar,
 } from 'ant-design-vue'
 import {
   DashboardOutlined,
@@ -25,7 +23,6 @@ import {
   ThunderboltOutlined,
   SettingOutlined,
   ClockCircleOutlined,
-  BellOutlined,
   UserOutlined,
   LogoutOutlined,
   TeamOutlined,
@@ -141,8 +138,6 @@ async function handleUserAction(info: MenuClickInfo) {
     themeStore.toggleTheme()
   }
 }
-
-const userInitial = computed(() => authStore.user?.name?.charAt(0)?.toUpperCase() || 'A')
 </script>
 
 <template>
@@ -157,13 +152,6 @@ const userInitial = computed(() => authStore.user?.name?.charAt(0)?.toUpperCase(
       :collapsed-width="72"
       class="admin-sider"
     >
-      <div class="sider-brand">
-        <span class="sider-logo">MC</span>
-        <span
-          v-if="!collapsed"
-          class="sider-name"
-        >Chiron Admin</span>
-      </div>
       <div class="sider-menu">
         <Menu
           mode="inline"
@@ -200,13 +188,6 @@ const userInitial = computed(() => authStore.user?.name?.charAt(0)?.toUpperCase(
       class="admin-sider admin-sider--drawer"
       :class="{ 'admin-sider--drawer-open': drawerOpen }"
     >
-      <div class="sider-brand">
-        <span class="sider-logo">MC</span>
-        <span
-          v-if="drawerOpen"
-          class="sider-name"
-        >Chiron Admin</span>
-      </div>
       <div class="sider-menu">
         <Menu
           mode="inline"
@@ -262,37 +243,20 @@ const userInitial = computed(() => authStore.user?.name?.charAt(0)?.toUpperCase(
           </Breadcrumb>
         </div>
         <div class="header-actions">
-          <Badge
-            :count="0"
-            :overflow-count="99"
-          >
-            <Button
-              type="text"
-              class="header-btn"
-              :title="$t('settings.notification')"
-              :aria-label="$t('settings.notification')"
-            >
-              <template #icon>
-                <BellOutlined />
-              </template>
-            </Button>
-          </Badge>
+          <!-- 通知与用户头像按要求移除；用户菜单（资料/主题/登出）保留为纯图标入口，
+               否则登出与主题切换会失去可达路径。 -->
           <Dropdown
             :menu="{ items: userMenuItems, onClick: handleUserAction }"
             placement="bottomRight"
           >
-            <div
-              class="header-user"
+            <button
+              type="button"
+              class="header-btn"
               :title="$t('admin.user_menu')"
+              :aria-label="$t('admin.user_menu')"
             >
-              <Avatar
-                :size="30"
-                :style="{ backgroundColor: 'var(--primary)', color: 'var(--on-solid)' }"
-              >
-                {{ userInitial }}
-              </Avatar>
-              <span class="header-user-name">{{ authStore.user?.name || 'Admin' }}</span>
-            </div>
+              <UserOutlined />
+            </button>
           </Dropdown>
         </div>
       </LayoutHeader>
@@ -340,39 +304,6 @@ const userInitial = computed(() => authStore.user?.name?.charAt(0)?.toUpperCase(
   inset: 0;
   background: var(--bg-overlay);
   z-index: var(--z-overlay);
-}
-
-/* 品牌区 */
-.sider-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  height: 56px;
-  padding: 0 18px;
-  border-bottom: var(--hairline-width) solid var(--border);
-  flex-shrink: 0;
-}
-.sider-logo {
-  width: 28px; height: 28px;
-  border-radius: 7px;
-  /* 原为 var(--primary-dark) —— 该变量**从未定义**，而含无效色标的
-     linear-gradient 会被整体丢弃，logo 实际没有背景。用同色系更深一档的
-     --primary-active 代替。 */
-  background: linear-gradient(135deg, var(--primary), var(--primary-active));
-  color: var(--on-solid);
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-bold);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.sider-name {
-  font-size: 15px;
-  font-weight: var(--fw-semibold);
-  color: var(--text-primary);
-  letter-spacing: -0.01em;
-  white-space: nowrap;
 }
 
 /* 菜单滚动区 */
@@ -460,25 +391,6 @@ const userInitial = computed(() => authStore.user?.name?.charAt(0)?.toUpperCase(
   color: var(--text-secondary);
 }
 .header-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
-
-.header-user {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px 4px 4px;
-  border-radius: var(--radius-full);
-  cursor: pointer;
-  transition: background var(--dur-fast) ease;
-}
-.header-user:hover { background: var(--bg-hover); }
-.header-user-name {
-  font-size: 13px;
-  color: var(--text-secondary);
-  white-space: nowrap;
-}
-@media (max-width: 480px) {
-  .header-user-name { display: none; }
-}
 
 /* ── Content ── */
 .admin-content {

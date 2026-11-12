@@ -35,8 +35,18 @@ const CATALOG = [
     customizable: false,
   },
   {
-    id: 'open-session-list',
+    id: 'open-command-palette',
     defaultKeys: 'mod+k',
+    labelKey: 'settings.shortcut_open_command_palette',
+    group: 'navigation',
+  },
+  {
+    // **不能是 `mod+k`**：命令面板（CommandPalette）一直硬编码占用 Ctrl/⌘+K，而两者
+    // 都监听 window、`preventDefault` 互相拦不住 —— 同一个键会同时弹出命令面板和
+    // 会话列表，用户看到两个浮层叠在一起。命令面板保留 mod+k（VS Code / Linear 的
+    // 通用直觉），这里让到 mod+shift+k。
+    id: 'open-session-list',
+    defaultKeys: 'mod+shift+k',
     labelKey: 'settings.shortcut_open_session_list',
     group: 'navigation',
   },
@@ -76,6 +86,41 @@ const CATALOG = [
     defaultKeys: 'escape',
     labelKey: 'settings.shortcut_close_panel',
     group: 'panel',
+  },
+  // ── 工作台切换 ──
+  // 这五个按钮在标题栏里只有图标（32px），没有文字也没有键盘通路；
+  // 给它们 mod+1..5 之后，不用瞄准 32px 的小方块也能切工作台。
+  // 键位对齐 VS Code 的 Ctrl+1..9 直觉；五个都在同一个域内，用户改一个就会
+  // 在设置页看到冲突提示（`conflictOf` 按组合键比对）。
+  {
+    id: 'goto-workspace-dialogue',
+    defaultKeys: 'mod+1',
+    labelKey: 'settings.shortcut_goto_dialogue',
+    group: 'navigation',
+  },
+  {
+    id: 'goto-workspace-agent',
+    defaultKeys: 'mod+2',
+    labelKey: 'settings.shortcut_goto_agent',
+    group: 'navigation',
+  },
+  {
+    id: 'goto-workspace-skill',
+    defaultKeys: 'mod+3',
+    labelKey: 'settings.shortcut_goto_skill',
+    group: 'navigation',
+  },
+  {
+    id: 'goto-workspace-knowledge',
+    defaultKeys: 'mod+4',
+    labelKey: 'settings.shortcut_goto_knowledge',
+    group: 'navigation',
+  },
+  {
+    id: 'goto-workspace-plugin',
+    defaultKeys: 'mod+5',
+    labelKey: 'settings.shortcut_goto_plugin',
+    group: 'navigation',
   },
 ] as const satisfies readonly ShortcutSpec[]
 

@@ -14,6 +14,8 @@ import { useThemeStore } from '../stores/theme'
 import { useAuthStore } from '../stores/auth'
 import { api } from '../api'
 import EmptyState from './common/EmptyState.vue'
+import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
+import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
 import {
   WORKSTATION_DESCRIPTIONS,
   WORKSTATION_LABELS,
@@ -357,18 +359,38 @@ function onPaletteKeydown(e: KeyboardEvent) {
   }
 }
 
-// 全局 Ctrl/Cmd+K（preventDefault 屏蔽浏览器行为）；打开后 Esc 也可关闭
+// 打开后 Esc 关闭（输入框内的 Esc 由 onPaletteKeydown 处理；这里兜住焦点在别处的情况）
 function onGlobalKeydown(e: KeyboardEvent) {
-  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
-    e.preventDefault()
-    togglePalette()
-    return
-  }
   if (e.key === 'Escape' && open.value) {
     e.preventDefault()
     closePalette()
   }
 }
+
+/**
+ * 打开命令面板的快捷键走注册表，不再在这里硬编码 Ctrl/⌘+K。
+ *
+ * 硬编码的代价是**用户改不了，而且会与注册表撞车**：`shortcutCatalog` 里
+ * "打开会话列表"原本也是 `mod+k`，两边都监听 window，`preventDefault` 拦不住
+ * 对方，按一次同时弹出命令面板和会话列表。接进注册表后，键位唯一、可改、
+ * 冲突在设置页就被 `conflictOf` 拦住。
+ */
+function specOfPalette(id: ShortcutId) {
+  const spec = SHORTCUT_CATALOG.find(s => s.id === id)
+  // 目录是常量，走到这里说明目录本身写错了；开发者错误信息用英文，不进 UI
+  if (!spec) throw new Error(`shortcutCatalog is missing "${id}"`)
+  return spec
+}
+
+useKeyboardShortcuts({
+  userId: authStore.user?.id ?? null,
+  bindings: [
+    {
+      ...specOfPalette('open-command-palette'),
+      handler: () => { togglePalette() },
+    },
+  ],
+})
 
 // 输入防抖触发远程搜索
 watch(query, (q) => {

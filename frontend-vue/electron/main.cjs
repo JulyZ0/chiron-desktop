@@ -20,7 +20,7 @@
  * 安全基线：contextIsolation 开、nodeIntegration 关、preload 只暴露明确的几个动作，
  * 外部链接一律交给系统浏览器。
  */
-const { app, BrowserWindow, shell, Menu, ipcMain, session, dialog } = require('electron')
+const { app, BrowserWindow, shell, Menu, ipcMain, session, dialog, Tray, nativeImage } = require('electron')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
 const path = require('node:path')
@@ -149,6 +149,67 @@ function holdingWindowQuota(fn) {
 }
 
 /**
+ * 系统托盘：最小化时把窗口收进托盘，而不是留在任务栏。
+ *
+ * 为什么需要：这个应用是常驻型工作台（本地后端与引擎都跑在后台），用户点最小化
+ * 多半是"先收起来，等会儿还要用"。留在任务栏占一格，直接关掉又要重等后端启动 ——
+ * 托盘是这两者之间唯一合理的落点。
+ *
+ * 只在主界面启用：setup / error 是单栏对话框，收进托盘后没有任何能恢复它的入口
+ * （用户不会想到去托盘里找一个配置窗口）。
+ */
+let tray = null
+
+/**
+ * 创建托盘图标（只创建一次；createWindow 会被 relaunch* 多次调用）。
+ *
+ * 图标缺失时**不建托盘也不报错退出**：托盘是增强功能，缺它只是退化成
+ * "最小化仍留在任务栏"，不该让整个应用起不来。
+ */
+function createTray() {
+  if (tray || process.platform !== 'win32') return
+  const iconPath = path.join(__dirname, 'resources', 'icon-32.png')
+  const image = nativeImage.createFromPath(iconPath)
+  if (image.isEmpty()) {
+    logMain('warn', `tray icon missing or unreadable: ${iconPath}`)
+    return
+  }
+  tray = new Tray(image)
+  tray.setToolTip('Chiron')
+  tray.on('click', () => showMainWindow())
+  tray.on('double-click', () => showMainWindow())
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示主窗口', click: () => showMainWindow() },
+      { type: 'separator' },
+      {
+        label: '退出 Chiron',
+        click: () => app.quit(),
+      },
+    ]),
+  )
+}
+
+/**
+ * 从托盘恢复主窗口。
+ *
+ * 窗口并没有被 hide()，只是最小化 + 摘掉了任务栏按钮，所以标准 restore() 就是
+ * 正确的恢复路径 —— 不要换成 show()：对最小化窗口，show() 不会清除最小化状态。
+ */
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  // 无条件 restore()：窗口的最小化状态是系统在管的，restore() 对正常窗口是 no-op。
+  // 反过来用 `if (isMinimized())` 做守卫会踩坑 —— 守卫一旦判断失误就跳过 restore()，
+  // 窗口带着最小化的内部状态被 show() 出来，表现为"框在、内容冻住点不动"。
+  mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+/**
  * 首次启动安装进度窗口。安装发生在 createWindow 之前，没有窗口就没有任何东西
  * 能显示进度 —— 用户只会看到"点了图标没反应"。装完立刻关掉，主界面照旧走 createWindow。
  */
@@ -223,7 +284,13 @@ function buildCsp() {
     `connect-src ${connect.join(' ')}`,
     `worker-src ${local} blob:`,
     `child-src ${local} blob:`,
-    `frame-src ${local}`,
+    // frame-src 必须与 child-src 同样放行 blob:。
+    //
+    // PDF 预览走的是 `<iframe src="blob:…">`（raw 端点要 Bearer 鉴权，而 iframe
+    // 带不了请求头，只能先取字节再转 objectURL —— 见 projectFiles.ts）。frame-src
+    // 一旦存在就会**覆盖** child-src 对 frame 的授权，只写 child-src 等于没写：
+    // 图片能看、PDF 一片空白，且控制台只报一句 CSP 违规，很容易被当成后端坏了。
+    `frame-src ${local} blob:`,
     "object-src 'none'",
     "base-uri 'none'",
     `form-action ${local}`,
@@ -403,11 +470,35 @@ async function tryStartGoStack(options = {}) {
   // 装失败会抛 —— 由 startLocalBackend 转成可读状态，这里不吞。
   const engineLaunch = await prepareEngine(components, options)
 
-  // 知识库检索服务（pageindex-service）**不是强依赖**：解释器没就位就传 undefined，
-  // 本地栈照常起来，只是知识库的建索引/检索会报"服务不可用"。这里不抛错。
-  const knowledgeLaunch = components.resolveKnowledgeServiceLaunch({
-    userDataPath: app.getPath('userData'),
-  })
+  // 知识库检索服务（pageindex-service）**也要按需装**，理由同引擎：它有自己的 venv
+  // （pageindex → litellm 要求 openai<3，与引擎的 openai 3.x 无法共存）。
+  //
+  // 这里原来是直接 `resolveKnowledgeServiceLaunch()` —— 那个函数**只查不装**，于是
+  // 首启必然返回 null，检索服务从没起来过，引擎侧 `KNOWLEDGE_SERVICE_URL` 为空，
+  // 用户在"自托管"下看到的是一句内部变量名。现在先装再用。
+  //
+  // 它不是强依赖：装不上也继续，只是知识库的建索引/检索不可用（建库与上传照常）。
+  let knowledgeLaunch = null
+  try {
+    const knowledgeRuntime = await components.ensureKnowledgeServiceRuntime({
+      userDataPath: app.getPath('userData'),
+      onRuntimeStage: options.onRuntimeStage,
+      onRuntimeLine: options.onRuntimeLine,
+      indexUrl: options.indexUrl,
+      signal: options.signal,
+    })
+    if (!knowledgeRuntime.ok) {
+      // 只记日志：这条链没有会把该状态渲染出去的消费者，凭空虚设一个字段等于留死代码。
+      // 用户侧看到的是知识库页的"服务不可用"，而定位问题看这行日志。
+      logMain('warn', `知识库索引服务未就绪：${knowledgeRuntime.message || knowledgeRuntime.reason}`)
+    }
+    knowledgeLaunch = components.resolveKnowledgeServiceLaunch({
+      userDataPath: app.getPath('userData'),
+    })
+  } catch (err) {
+    // 安装器本身出错也不该拖垮本地模式
+    logMain('warn', `知识库索引服务准备失败：${err?.message || err}`)
+  }
 
   try {
     const port =
@@ -1071,8 +1162,16 @@ function notifyEngineExit(info = {}) {
  */
 async function startLocalBackendWithProgress(options = {}) {
   const runtime = inspectLocalRuntime()
-  if (runtime.ready) return startLocalBackend(options)
-  logMain('info', `local runtime not ready (${runtime.reason}): ${runtime.message || ''}`)
+  // 与首启那条判定保持一致：知识库环境缺失也算"需要装"，否则升级上来的用户会在
+  // 主界面里静默下载几百 MB，且没有任何进度提示。
+  const knowledgeNeedsInstall = Boolean(runtime.knowledge) && runtime.knowledge.ready === false
+  if (runtime.ready && !knowledgeNeedsInstall) return startLocalBackend(options)
+  logMain(
+    'info',
+    runtime.ready
+      ? `knowledge runtime not ready (${runtime.knowledge?.reason}): ${runtime.knowledge?.message || ''}`
+      : `local runtime not ready (${runtime.reason}): ${runtime.message || ''}`,
+  )
   openInstallWindow()
   try {
     return await startLocalBackend({
@@ -1285,11 +1384,40 @@ function createWindow() {
       // preload 要读 process.argv / versions，故不开 sandbox；
       // contextIsolation 已经隔离了页面与 preload 的执行上下文。
       sandbox: false,
+      // PDF 预览依赖 Chromium 内置的 PDF 查看器，而它是**以插件形式**注册的：
+      // 不开这个开关，`<iframe src="blob:…pdf">` 只会得到一片空白（图片不受影响，
+      // 因为 <img> 不走插件），用户看到的就是「图片能看、PDF 打不开」。
+      plugins: true,
       additionalArguments,
     },
   })
 
   mainWindow.once('ready-to-show', () => mainWindow.show())
+
+  // 主界面最小化即收进托盘（原因见 createTray 的说明）。
+  //
+  // 用 'minimize' 而不是拦截标题栏按钮：自绘标题栏、系统快捷键（Win+↓）、
+  // 任务栏右键都会走到同一个窗口事件，只挂在标题栏上会漏掉后两条。
+  // setup / error 不做 —— 它们收起来就没有恢复入口。
+  if (target === 'app') {
+    createTray()
+    // 最小化即"收进托盘"：只摘掉任务栏按钮，**不做 hide()**。
+    //
+    // hide() 会让窗口进入「已最小化 + 已隐藏」的复合态：Windows 认为它仍是最小化的，
+    // Chromium 又认为它被遮挡，从托盘恢复时两边的状态对不上 —— 窗口框回来了，内容
+    // 却是冻住的旧画面，点哪都没反应（用户报的"还原后卡死"）。
+    // 让窗口保持为普通的最小化状态、只摘任务栏按钮，恢复就走标准的 restore()，
+    // 两边状态始终一致。托盘图标缺失时不动任务栏：否则窗口最小化后既没有任务栏
+    // 按钮、也没有托盘入口，等于把它弄丢了。
+    mainWindow.on('minimize', () => {
+      if (!tray || !mainWindow || mainWindow.isDestroyed()) return
+      mainWindow.setSkipTaskbar(true)
+    })
+    mainWindow.on('restore', () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return
+      mainWindow.setSkipTaskbar(false)
+    })
+  }
 
   // 自绘标题栏要跟着窗口状态（最大化/全屏）换图标，事件源必须在建窗时就挂上
   attachWindowStateBroadcast(mainWindow)
@@ -1488,9 +1616,9 @@ if (!gotLock) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (!mainWindow) return
-    if (mainWindow.isMinimized()) mainWindow.restore()
-    mainWindow.focus()
+    // 走 showMainWindow 而不是只 focus()：窗口可能正最小化在托盘里，
+    // 单靠 focus() 不会把它从最小化状态里拉回来。
+    showMainWindow()
   })
 
   app.whenReady().then(async () => {
@@ -1522,9 +1650,18 @@ if (!gotLock) {
       // 所以先弹一个进度窗口 —— 否则用户看到的是"点了图标，什么都没有"。
       // 已就绪就完全不建这个窗口，避免正常启动时闪一下。
       const runtimeState = inspectLocalRuntime()
-      const needsInstall = !runtimeState.ready
+      // 知识库索引服务（pageindex）的依赖是**可选但会静默下载几百 MB** 的那一类：
+      // 老用户升级上来时它必然缺失。若只按 core/引擎判定，进度窗不会打开，那几百 MB
+      // 就在后台默默下载 —— 用户看到的是"自托管用不了"，且没有任何进度提示。
+      // 所以把它一并纳入判定（它 miss 不影响主栈启动，只影响窗口要不要出现）。
+      const knowledgeNeedsInstall =
+        Boolean(runtimeState.knowledge) && runtimeState.knowledge.ready === false
+      const needsInstall = !runtimeState.ready || knowledgeNeedsInstall
       if (needsInstall) {
-        logMain('info', `local runtime not ready (${runtimeState.reason}): ${runtimeState.message || ''}`)
+        const why = runtimeState.ready
+          ? `knowledge runtime not ready (${runtimeState.knowledge?.reason}): ${runtimeState.knowledge?.message || ''}`
+          : `local runtime not ready (${runtimeState.reason}): ${runtimeState.message || ''}`
+        logMain('info', why)
         openInstallWindow()
       }
 
@@ -2001,6 +2138,12 @@ if (!gotLock) {
   // "只停一次"的标记由 stopLocalBackend 自己维护：它一进门就清空 localBackend 的归属，
   // 这里若再置一次，等于在壳里留第二个状态真值来源。
   app.on('before-quit', event => {
+    // Windows 上不销毁托盘图标会在通知区留下一个点不动的幽灵图标，
+    // 直到用户把鼠标划过去才消失。这里先摘掉，再走后面的停后端流程。
+    if (tray) {
+      tray.destroy()
+      tray = null
+    }
     if (currentMode !== 'local' || localBackendStopped || !localBackend.ok) return
     event.preventDefault()
     void stopLocalBackend().finally(() => app.quit())

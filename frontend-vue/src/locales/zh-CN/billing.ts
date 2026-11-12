@@ -27,6 +27,10 @@ export default {
 
   prices_title: "模型价格一览",
   prices_hint: "价格来自多个公开数据源的交叉验证，单位 USD / 1k tokens。仅作成本参考，不作为扣费依据。",
+  prices_sync_now: "立即同步",
+  prices_sync_done: "同步完成，更新 {n} 个模型的价格",
+  prices_sync_empty: "本轮没有可写入的价格（网络不可达，或没有两个源给出一致报价）",
+  prices_sync_disabled: "价格同步已被关闭（MODEL_PRICE_SYNC=off）",
   prices_search_placeholder: "搜索模型名",
   prices_col_model: "模型",
   prices_col_provider: "厂商",

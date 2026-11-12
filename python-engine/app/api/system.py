@@ -65,3 +65,28 @@ async def get_current_log_level() -> dict[str, Any]:
         "root_level": root_level,
         "app_level": app_level
     }
+
+
+@router.post("/price-sync")
+async def trigger_price_sync() -> dict[str, Any]:
+    """立即执行一轮模型价格同步（手动触发）。
+
+    为什么需要它：后台循环是 30min 一轮，用户新增/更换模型后想立刻看到价格，
+    不该干等到下一轮。这里直接复用 `sync_once()`，与定时任务**同一套**拉取与
+    交叉验证逻辑，不存在"手动走另一条捷径"导致写入未经校验价格的风险。
+
+    返回写入行数与分歧条数。`written == 0` 有多种原因（网络不可达、只有一个源
+    应答、库未迁移），因此把分歧数一并回传，便于前端提示而不是假装成功。
+    """
+    from app.pricing.sync import sync_enabled, sync_once
+
+    if not sync_enabled():
+        return {"ok": False, "reason": "price sync disabled (MODEL_PRICE_SYNC=off)", "written": 0}
+
+    written, disagreements = await sync_once()
+    return {
+        "ok": True,
+        "written": written,
+        "disagreements": len(disagreements),
+        "detail": disagreements[:5],
+    }

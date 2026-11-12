@@ -27,7 +27,6 @@ import {
   ThunderboltOutlined,
   CreditCardOutlined,
   SettingOutlined,
-  DownOutlined,
   HistoryOutlined,
   RobotOutlined,
   AppstoreOutlined,
@@ -35,6 +34,7 @@ import {
   ApiOutlined,
 } from '@ant-design/icons-vue'
 import CommandPalette from './CommandPalette.vue'
+import BrandMark from './shell/BrandMark.vue'
 import ThemeSwitcher from './ThemeSwitcher.vue'
 import LanguageSwitcher from './common/LanguageSwitcher.vue'
 import SettingsPanel from './settings/SettingsPanel.vue'
@@ -48,6 +48,8 @@ import {
 
 import { useI18n } from 'vue-i18n'
 import { useTakeoverPresence } from '../composables/useTakeoverPresence'
+import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
+import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
 const { t: tr } = useI18n()
 // Super-agent 接管的让步信号之一：让引擎知道"我还在这一页"，避免在打字间隙被抢走会话
 useTakeoverPresence()
@@ -192,6 +194,31 @@ function goDock(key: string) {
   if (route.path !== key) router.push(key)
 }
 
+/**
+ * 工作台切换快捷键（mod+1..5）。
+ *
+ * 这五个按钮在标题栏里只剩 32px 图标，鼠标点选要瞄准；给键盘通路后才好切。
+ * 绑定放在布局层而不是各页面：切换目标是**路由**，与会话状态无关，
+ * 放在这里才不会出现"某个页面里快捷键失效"。
+ */
+function specOfDock(id: ShortcutId) {
+  const spec = SHORTCUT_CATALOG.find(s => s.id === id)
+  // 目录是常量，走到这里说明目录本身写错了；开发者错误信息用英文，不进 UI
+  if (!spec) throw new Error(`shortcutCatalog is missing "${id}"`)
+  return spec
+}
+
+useKeyboardShortcuts({
+  userId: authStore.user?.id ?? null,
+  bindings: [
+    { ...specOfDock('goto-workspace-dialogue'), handler: () => goDock(WORKSTATION_ROUTES.dialogue) },
+    { ...specOfDock('goto-workspace-agent'), handler: () => goDock(WORKSTATION_ROUTES.agent) },
+    { ...specOfDock('goto-workspace-skill'), handler: () => goDock(WORKSTATION_ROUTES.skill) },
+    { ...specOfDock('goto-workspace-knowledge'), handler: () => goDock(WORKSTATION_ROUTES.knowledge) },
+    { ...specOfDock('goto-workspace-plugin'), handler: () => goDock(WORKSTATION_ROUTES.plugin) },
+  ],
+})
+
 // ── 停靠坞快速命令弹层 ──
 const quickOpen = ref(false)
 const quickInput = ref('')
@@ -253,7 +280,9 @@ async function runQuickCommand() {
 
 <template>
   <div class="app-shell">
-    <!-- 左上角浮动品牌胶囊 -->
+    <!-- 标题栏行内的左侧区：品牌胶囊 + 工作台菜单按钮。
+         两者都在自绘标题栏那一条里（与右侧最小化/最大化/关闭同高），
+         不再是浮在内容上方的独立胶囊 —— 那样会遮挡页面顶部操作。 -->
     <header
       :title="currentLabel || $t('common.navigation_menu')"
       class="topbar"
@@ -265,11 +294,12 @@ async function runQuickCommand() {
         <button
           class="brand-btn"
           :title="$t('common.navigation_menu')"
+          :aria-label="$t('common.navigation_menu')"
           type="button"
         >
-          <span class="brand-logo">MC</span>
-          <span class="brand-name">Chiron</span>
-          <DownOutlined class="brand-caret" />
+          <!-- 整个按钮就是一个 SVG 品牌图形：不再是「MC 方块 + Chiron 文字 + 箭头」。
+               图形内部全用 currentColor，父级 color 走主题变量 ⇒ 配色随明暗主题自动变化。 -->
+          <BrandMark :label="$t('common.navigation_menu')" />
         </button>
         <template #overlay>
           <Menu
@@ -280,15 +310,14 @@ async function runQuickCommand() {
           />
         </template>
       </Dropdown>
-    </header>
 
-    <!-- 工作台停靠坞 -->
-    <nav
-      v-if="showDock"
-      :aria-label="$t('common.workstation_dock')"
-      class="dock"
-    >
-      <div class="dock-items">
+      <!-- 工作台切换：原左侧竖排停靠坞的五个按钮，挪进标题栏当菜单按钮。
+           停靠坞整条移除后内容区不再需要左边距 —— 那 82px 留白原本只是为了让开它。 -->
+      <nav
+        v-if="showDock"
+        :aria-label="$t('common.workstation_dock')"
+        class="dock"
+      >
         <button
           v-for="item in dockItems"
           :key="item.key"
@@ -310,8 +339,8 @@ async function runQuickCommand() {
             <span class="dock-tip-desc">{{ item.desc }}</span>
           </span>
         </button>
-      </div>
-    </nav>
+      </nav>
+    </header>
 
     <!-- 右上角用户胶囊（聊天页隐藏，理由见 isChatPage 的注释） -->
     <div
@@ -392,33 +421,35 @@ async function runQuickCommand() {
   height: var(--app-height);
   background: var(--bg-page);
   color: var(--text-primary);
-  --dock-w: 60px;
-  --dock-h: 56px;
-  --dock-gap: 12px;
   --panel-bg: var(--bg-elevated);
   --panel-border: var(--border-default);
   --hover-bg: var(--bg-surface-hover);
   --sidebar-bg: var(--bg-sidebar);
 }
 
-/* ── 左上角浮动品牌胶囊 ── */
+/* ── 标题栏行内的左侧区（品牌胶囊 + 工作台菜单按钮） ──
+ *
+ * 这一块**不再是自己浮在内容上方的一枚胶囊**：它与右侧最小化/最大化/关闭同在
+ * 自绘标题栏那一条里，`--app-titlebar-h` 就是那条的高度。浮起来（原 12px 下移）
+ * 会盖住页面顶部的操作按钮 —— 那正是要修的问题。
+ *
+ * 高度取 `max(..., 32px)`：桌面壳里 `--app-titlebar-h` 是 36px（Windows）/28px
+ * （macOS inset），浏览器预览里是 0（没有自绘标题栏），必须留一个能放下按钮的底。
+ */
 .topbar {
   position: fixed;
-  /* 12px 是设计留白；var(--app-titlebar-h) 是自绘标题栏在顶部占掉的高度，
-     非桌面壳里是 0。两者相加才能保证胶囊不被标题栏压住。 */
-  top: calc(12px + var(--app-titlebar-h));
-  left: 12px;
+  top: 0;
+  inset-inline-start: 0;
   z-index: var(--z-drawer);
-  height: 40px;
+  height: max(var(--app-titlebar-h), 32px);
   display: flex;
   align-items: center;
-  padding: 0 6px 0 4px;
-  border-radius: var(--sig-radius-input);
-  background: var(--comp-header-bg);
-  backdrop-filter: blur(var(--sig-blur-header));
-  -webkit-backdrop-filter: blur(var(--sig-blur-header));
-  border: var(--hairline-width) solid var(--border-default);
-  box-shadow: var(--sig-shadow-card);
+  gap: 6px;
+  padding-inline: 6px;
+  /* 容器仍是拖拽区：这样品牌胶囊与按钮之间的空隙照样能拖动窗口 ——
+     整块设 no-drag 会把标题栏左半截变成"死区"，那里既不能拖也不能点。
+     真正要点击的按钮各自退出拖拽（见 .brand-btn / .dock-item）。 */
+  -webkit-app-region: drag;
 }
 
 .brand-btn {
@@ -432,55 +463,32 @@ async function runQuickCommand() {
   background: transparent;
   cursor: pointer;
   transition: background var(--dur-fast) ease;
+  /* 落在标题栏拖拽区里：不退出拖拽的话按下会被当成拖动窗口，菜单永远弹不出来 */
+  -webkit-app-region: no-drag;
 }
 
 .brand-btn:hover {
   background: var(--hover-bg);
 }
 
-.brand-logo {
-  width: 24px;
-  height: 24px;
-  border-radius: var(--sig-radius-button);
-  background: linear-gradient(135deg, var(--primary), var(--accent));
-  color: var(--on-solid);
-  font-weight: var(--fw-bold);
-  font-size: var(--fs-xs);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: var(--sig-shadow-card);
-  flex-shrink: 0;
-}
-
-.brand-name {
-  font-size: 14px;
-  font-weight: var(--fw-semibold);
-  color: var(--text-primary);
-  letter-spacing: -0.01em;
-  white-space: nowrap;
-}
-
-.brand-caret {
-  font-size: var(--fs-xs);
-  color: var(--text-tertiary);
-}
-
-@media (max-width: 480px) {
-  .brand-name {
-    display: none;
-  }
-}
-
-/* ── 顶栏右侧操作组 ── */
+/* ── 标题栏行内的右侧操作组（语言 / 主题 / 用户） ──
+ *
+ * 与左侧区同一套：贴 0 顶、高度跟随标题栏那一行。
+ * `--app-titlebar-controls-w` 由 TitleBar 发布 —— 自绘模式下右侧三个窗口按钮
+ * 各 46px 占了 138px，不躲开就会被压在下面；inset 模式（macOS 红绿灯在左）
+ * 它是 0，这里就自然贴边。
+ */
 .topbar-actions {
   position: fixed;
-  top: calc(12px + var(--app-titlebar-h));
-  right: 12px;
+  top: 0;
+  inset-inline-end: calc(var(--app-titlebar-controls-w, 0px) + 6px);
   z-index: var(--z-drawer);
+  height: max(var(--app-titlebar-h), 32px);
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 标题栏那条是拖拽区，按钮必须退出拖拽才能收到点击 */
+  -webkit-app-region: no-drag;
 }
 
 .user-fab {
@@ -566,45 +574,26 @@ async function runQuickCommand() {
   overflow-x: hidden;
 }
 
-/* ── 工作台停靠坞 ── */
+/* ── 工作台菜单按钮组（标题栏行内，原左侧竖排停靠坞） ──
+ *
+ * 现在是标题栏那一条里的横向按钮组，不再是浮在内容左侧的竖排抽屉 ——
+ * 抽屉会一直占掉内容区 82px，而它的全部内容就是这五个按钮。
+ *
+ * **刻意不写 `overflow-x: auto`**：横向滚动会把 `overflow-y` 一并变成 auto，
+ * 从而裁掉下方弹出的提示气泡（`.dock-tip` 用绝对定位挂在按钮外）。
+ */
 .dock {
-  position: fixed;
-  /* 64px = 顶栏胶囊的 12 + 40 + 12 留白；标题栏高度另加 */
-  top: calc(64px + var(--app-titlebar-h));
-  left: 10px;
-  bottom: 10px;
-  z-index: var(--z-dropdown);
-  width: var(--dock-w);
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 8px;
-  padding: 10px 8px;
-  border-radius: var(--sig-radius-card);
-  background: var(--panel-bg);
-  backdrop-filter: blur(calc(var(--sig-blur-header) + 4px));
-  -webkit-backdrop-filter: blur(calc(var(--sig-blur-header) + 4px));
-  border: var(--hairline-width) solid var(--panel-border);
-  box-shadow: var(--sig-shadow-card);
-  overflow-y: auto;
-  scrollbar-width: none;
-}
-
-.dock::-webkit-scrollbar {
-  display: none;
-}
-
-.dock-items {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
+  gap: 2px;
+  min-width: 0;
 }
 
 .dock-item {
   position: relative;
-  width: 44px;
-  height: 44px;
+  width: 32px;
+  height: 32px;
+  flex: none;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -614,6 +603,8 @@ async function runQuickCommand() {
   color: var(--text-secondary);
   cursor: pointer;
   transition: background var(--dur-fast) ease, color var(--dur-fast) ease, transform var(--dur-fast) ease;
+  /* 同 .brand-btn：落在标题栏拖拽区里，必须退出拖拽才点得到 */
+  -webkit-app-region: no-drag;
 }
 
 .dock-item:hover {
@@ -638,35 +629,38 @@ async function runQuickCommand() {
   box-shadow: 0 4px 14px var(--primary-bg), inset 0 1px 1px var(--on-viewer-faint);
 }
 
+/* 活动指示条：竖排抽屉里是左侧竖条，横排进标题栏后改成**下边缘的短横条** ——
+   竖条在标题栏里会悬在按钮左外侧，看着像一条孤立的分隔线。 */
 .dock-item.active::before {
   content: '';
   position: absolute;
-  left: -9px;
-  top: 50%;
-  width: 2px;
-  height: 20px;
+  left: 50%;
+  bottom: 3px;
+  width: 16px;
+  height: 2px;
   border-radius: 1px;
-  background: var(--primary);
-  transform: translateY(-50%) scaleY(0);
+  background: var(--on-solid);
+  transform: translateX(-50%) scaleX(0);
   transform-origin: center;
   animation: dockBarIn var(--dur-normal) ease-out forwards;
 }
 
 @keyframes dockBarIn {
   to {
-    transform: translateY(-50%) scaleY(1);
+    transform: translateX(-50%) scaleX(1);
   }
 }
 
 .dock-icon {
-  font-size: 18px;
+  font-size: 16px;
 }
 
+/* 提示气泡：抽屉里弹在右侧，标题栏里改弹在下方 —— 上方是窗口边缘，右侧会盖住别的按钮 */
 .dock-tip {
   position: absolute;
-  left: calc(100% + 10px);
-  top: 50%;
-  transform: translateY(-50%) translateX(-4px);
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%) translateY(-4px);
   display: flex;
   flex-direction: column;
   gap: 1px;
@@ -700,7 +694,7 @@ async function runQuickCommand() {
 
 .dock-item:hover .dock-tip {
   opacity: 1;
-  transform: translateY(-50%) translateX(0);
+  transform: translateX(-50%) translateY(0);
 }
 
 @media (hover: none) {
@@ -850,77 +844,22 @@ async function runQuickCommand() {
   transform: translateY(4px);
 }
 
+/* 停靠坞整条移除后，内容区不再需要为它留左边距 —— 那 82px 原本只是让开竖排抽屉。
+   class 仍由模板按 showDock 挂上（令牌脚本与存量样式依赖它），故保留为空规则并注明。 */
 .app-content--docked {
-  margin-inline-start: calc(10px + var(--dock-w) + var(--dock-gap));
+  margin-inline-start: 0;
 }
 
+/* 窄窗口下同一条标题栏继续用，只做两处收口：按钮缩到 28px，并禁用悬浮气泡
+   （空间不够时气泡会挡住相邻按钮，而 aria-label 仍然可读）。 */
 @media (max-width: 768px) {
-  .dock {
-    top: auto;
-    left: 10px;
-    right: 10px;
-    bottom: calc(10px + env(safe-area-inset-bottom, 0px));
-    width: auto;
-    height: var(--dock-h);
-    flex-direction: row;
-    align-items: center;
-    gap: 4px;
-    padding: 8px 10px;
-    border-radius: var(--sig-radius-card);
-  }
-
-  .dock-items {
-    flex: 1;
-    flex-direction: row;
-    justify-content: space-around;
-    gap: 2px;
-    min-width: 0;
-  }
-
   .dock-item {
-    width: 40px;
-    height: 40px;
-  }
-
-  .dock-item.active::before {
-    left: 50%;
-    top: -7px;
-    width: 20px;
-    height: 2px;
-    transform: translateX(-50%) scaleX(0);
-    animation-name: dockBarInX;
-  }
-
-  @keyframes dockBarInX {
-    to {
-      transform: translateX(-50%) scaleX(1);
-    }
+    width: 28px;
+    height: 28px;
   }
 
   .dock-tip {
     display: none;
-  }
-
-  .dock-command {
-    margin-top: 0;
-  }
-
-  .dock-command-btn {
-    width: 40px;
-    height: 40px;
-  }
-
-  .dock-popover {
-    position: absolute;
-    left: auto;
-    right: 0;
-    bottom: calc(100% + 10px);
-    width: min(340px, calc(100vw - 44px));
-  }
-
-  .app-content--docked {
-    margin-inline-start: 0;
-    padding-bottom: calc(10px + var(--dock-h) + var(--dock-gap) + env(safe-area-inset-bottom, 0px));
   }
 }
 

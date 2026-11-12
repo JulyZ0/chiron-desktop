@@ -364,8 +364,17 @@ async def _upsert(prices: list[ModelPrice], *, sources: list[str]) -> int:
 
 
 def sync_enabled() -> bool:
-    """开关：``MODEL_PRICE_SYNC=on`` 才跑。**默认关** —— 新增机制默认什么都不做。"""
-    return (os.getenv("MODEL_PRICE_SYNC") or "").strip().lower() in ("1", "on", "true", "yes")
+    """开关：默认**开**；``MODEL_PRICE_SYNC=off``（或 ``0``/``false``/``no``）才关。
+
+    原设计默认关（"新增机制默认什么都不做"），但实际后果是价格表长期为空、
+    「价格一览」页面永远是空表 —— 一个默认不产生任何数据的机制等于没接。
+
+    默认开启的风险面很小：价格是慢变量（日更），且这张表**只做参考、不参与计费**
+    （见模块头），即使拉到错误价格也不会影响账单。需要彻底禁用的部署显式设
+    ``MODEL_PRICE_SYNC=off`` 即可。
+    """
+    raw = (os.getenv("MODEL_PRICE_SYNC") or "").strip().lower()
+    return raw not in ("0", "off", "false", "no")
 
 
 def sync_interval_seconds() -> int:
@@ -379,18 +388,22 @@ def sync_interval_seconds() -> int:
 
 
 async def start_price_sync() -> None:
-    """后台循环：先等一个间隔再拉（启动瞬间不抢资源），之后每 ``interval`` 秒一轮。
+    """后台循环：**启动先拉一轮**，之后每 ``interval`` 秒一轮。
 
-    与 `main.py` 既有的 lifespan 循环同形（`while True: sleep; work`）。**未启用时直接返回** ——
-    调用方可以无条件 await 它，不必自己判开关。
+    为什么先拉后睡：原实现是先 sleep 再 work，意味着新装/重启后要等整整 30 分钟
+    价格表才第一次有数据 —— 用户在此期间看到的是空表，会认为功能坏了。价格表为空
+    时"立刻拉一次"的收益远大于那点出站开销。
+
+    与 `main.py` 既有的 lifespan 循环同形。**未启用时直接返回** —— 调用方可以
+    无条件 await 它，不必自己判开关。
     """
     if not sync_enabled():
+        logger.info("model price sync disabled (MODEL_PRICE_SYNC=off)")
         return
     interval = sync_interval_seconds()
-    logger.info("model price sync started (every %ss)", interval)
+    logger.info("model price sync started (immediate first run, then every %ss)", interval)
     while True:
         try:
-            await asyncio.sleep(interval)
             written, disagreements = await sync_once()
             logger.info("model price sync: wrote %d rows, %d disagreements", written, len(disagreements))
         except asyncio.CancelledError:
@@ -398,3 +411,7 @@ async def start_price_sync() -> None:
         except Exception as exc:  # noqa: BLE001 — 一轮失败不该让循环死掉
             MODEL_PRICE_SYNC.labels(outcome="cycle_failed", source="-").inc()
             logger.warning("model price sync cycle failed: %s", str(exc)[:160])
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise

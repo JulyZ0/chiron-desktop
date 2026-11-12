@@ -3,8 +3,11 @@ package db
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // errorRow implements pgx.Row for error-path testing.
@@ -88,6 +91,45 @@ func TestDBManager_FetchAll_Error(t *testing.T) {
 	_, err := m.FetchAll(context.Background(), "SELECT 1")
 	if !errors.Is(err, ErrDatabaseNotAvailable) {
 		t.Errorf("expected ErrDatabaseNotAvailable, got %v", err)
+	}
+}
+
+// scanIntoRow 是 FetchOne/FetchAll 按列名建 map 的唯一通道。这条测试钉住它的
+// **重名列必须报错**语义 —— 否则 `COALESCE(name,''), COALESCE(root_path,'')`
+// 这类没写 AS 别名的查询会让其中一列静默消失，取值方拿到 nil 后当成"字段是空的"
+// 继续往下走（真实事故：项目 root_path 永远读成空串，界面显示"无法加载项目文件列表"）。
+func TestScanIntoRow_RejectsDuplicateColumnNames(t *testing.T) {
+	columns := []pgconn.FieldDescription{
+		{Name: "id"},
+		{Name: "coalesce"}, // 两个 COALESCE 都没别名时，Postgres 给的正是这个名字
+		{Name: "coalesce"},
+	}
+	row := make(map[string]interface{})
+	err := scanIntoRow(columns, []interface{}{"a", "resume", "D:\\desket\\resume"}, row)
+	if err == nil {
+		t.Fatal("重名列必须报错，否则其中一列会静默覆盖另一列")
+	}
+	if !strings.Contains(err.Error(), "duplicate column name") {
+		t.Errorf("错误信息应点明是重名列，实际：%v", err)
+	}
+	if !strings.Contains(err.Error(), "coalesce") {
+		t.Errorf("错误信息应带上肇事列名，实际：%v", err)
+	}
+}
+
+// 正常情况（列名互不相同）必须原样通过，且按列名取得到值。
+func TestScanIntoRow_KeepsDistinctColumns(t *testing.T) {
+	columns := []pgconn.FieldDescription{
+		{Name: "id"},
+		{Name: "name"},
+		{Name: "root_path"},
+	}
+	row := make(map[string]interface{})
+	if err := scanIntoRow(columns, []interface{}{"a", "resume", "D:\\desket\\resume"}, row); err != nil {
+		t.Fatalf("不该报错：%v", err)
+	}
+	if row["root_path"] != "D:\\desket\\resume" {
+		t.Errorf("root_path 取错了：%v", row["root_path"])
 	}
 }
 

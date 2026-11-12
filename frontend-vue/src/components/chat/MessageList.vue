@@ -368,6 +368,34 @@ const questionKeys = computed(() => new Set(questions.value.map(q => q.key)))
 /** 当前视口内最靠上的提问（未进入视口时为 null） */
 const activeQuestionKey = ref<string | null>(null)
 
+/**
+ * 鼠标/焦点落在第几条锚点上（null = 没有）。
+ *
+ * 用来做「近长远短」的律动：每条锚点的长度由它到悬停点的**距离**决定。
+ * 纯 CSS 的 `:hover ~` 只能影响到后面的兄弟，做不出两侧对称的波形，
+ * 所以距离必须在 JS 里算 —— 这点状态是唯一的代价。
+ */
+const railHoverIndex = ref<number | null>(null)
+
+/**
+ * 锚点长度：**近长远短**。
+ *
+ * 悬停某条时，它的波形以悬停点为中心向两侧衰减 —— 最近的最长、越远越短，
+ * 读起来像一条被拨动的音轨。用 `1 + d * 0.6` 而不是线性 `1 + d`：
+ * 线性衰减到第三条就完全看不出差别了，而 0.6 的系数让前三条仍有明显的层次。
+ *
+ * 没有悬停时所有非激活锚点等长；激活项（当前视口内的提问）略长，
+ * 让"读到哪儿了"在不悬停时也看得见。
+ */
+function railWidth(index: number, active: boolean): string {
+  const base = active ? 16 : 10
+  const hover = railHoverIndex.value
+  if (hover === null) return `${base}px`
+  const peak = active ? 26 : 24
+  const d = Math.abs(index - hover)
+  return `${Math.round(base + (peak - base) / (1 + d * 0.6))}px`
+}
+
 function syncActiveQuestion() {
   const el = scrollRef.value
   if (!el || questions.value.length < 2) {
@@ -702,15 +730,20 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
       <nav
         class="question-rail"
         :aria-label="$t('common.question_navigation')"
+        @mouseleave="railHoverIndex = null"
+        @focusout="railHoverIndex = null"
       >
         <button
-          v-for="q in questions"
+          v-for="(q, i) in questions"
           :key="q.key"
           class="rail-dot"
           :class="{ active: q.key === activeQuestionKey }"
           type="button"
+          :style="{ width: railWidth(i, q.key === activeQuestionKey) }"
           :title="q.preview"
           :aria-label="$t('common.jump_to_question_preview', { preview: q.preview })"
+          @mouseenter="railHoverIndex = i"
+          @focus="railHoverIndex = i"
           @click="jumpToRow(q.rowIndex)"
         />
       </nav>
@@ -790,29 +823,45 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
 .back-fade-enter-active, .back-fade-leave-active { transition: opacity var(--dur-normal), transform var(--dur-normal); }
 .back-fade-enter-from, .back-fade-leave-to { opacity: 0; transform: translateY(8px); }
 
-/* 提问导航条：零高度宿主 + sticky，浮在滚动容器中部而不占内容流空间 */
+/* 提问导航条：零高度宿主 + sticky，浮在滚动容器中部而不占内容流空间。
+ *
+ * 宿主 bottom:50% 把**锚点条的底边**钉在视口中线，锚点条自己再上移一半高度
+ * （translateY(-50%)）⇒ 整体垂直居中。这一步是必须的：高度为 0 的宿主里，
+ * flex 子项默认从宿主顶部向下排，锚点一多就整体压到下半屏、顶部被裁掉 ——
+ * 之前的 46vh 上限正是为了掩盖这个现象，代价是提问多于约 8 条就看不全。 */
 .question-rail-host { position: sticky; bottom: 50%; height: 0; display: flex; justify-content: flex-end; pointer-events: none; z-index: var(--z-sticky); }
 .question-rail {
   pointer-events: auto;
-  display: flex; flex-direction: column; align-items: center; gap: 7px;
-  max-height: 46vh; overflow-y: auto;
-  margin-inline-end: 8px; padding: 8px 7px;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  /* 上限跟着视口走：留下上下各 70px 给标题栏与输入区，锚点再多也完整可见 */
+  max-height: min(72vh, calc(100dvh - 140px));
+  overflow-y: auto;
+  transform: translateY(50%);
+  margin-inline-end: 8px; padding: 8px 6px;
   border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-full);
   background: color-mix(in srgb, var(--bg-card) 88%, transparent);
   box-shadow: var(--sig-shadow-card);
   scrollbar-width: none;
+  /* 进出场：锚点条是浮层，出现/消失要跟上界面节奏，不能突然弹出 */
+  transition: opacity var(--dur-fast) var(--ease-out);
 }
+.question-rail:focus-within { background: var(--bg-card); }
 .question-rail::-webkit-scrollbar { display: none; }
+/* 小横条：高度固定、**宽度由 JS 按到悬停点的距离算**（近长远短）。
+   宽度写在行内样式里，这里只给不悬停时的兜底值与过渡。 */
 .rail-dot {
-  flex: none; width: 8px; height: 8px; padding: 0;
-  border: none; border-radius: 50%;
+  flex: none; width: 10px; height: 3px; padding: 0;
+  border: none; border-radius: var(--radius-full);
   background: var(--text-disabled);
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease-out), transform var(--dur-fast) var(--ease-out);
+  transition: width var(--dur-fast) var(--ease-out),
+              background var(--dur-fast) var(--ease-out);
 }
-.rail-dot:hover { background: var(--text-secondary); transform: scale(1.35); }
-.rail-dot.active { background: var(--primary); transform: scale(1.35); }
+.rail-dot:hover { background: var(--text-secondary); }
+.rail-dot.active { background: var(--primary); }
 .rail-dot:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-ring-offset); }
+/* 减少动效偏好：律动是装饰，关掉过渡但这不改变「已读/未读」的表达 */
+@media (prefers-reduced-motion: reduce) { .rail-dot { transition: none; } }
 @media (max-width: 768px) { .question-rail { display: none; } }   /* 窄屏优先保证内容宽度 */
 
 /* 选中文本操作菜单：贴在选区上方（放不下则翻到下方） */

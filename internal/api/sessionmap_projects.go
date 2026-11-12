@@ -20,6 +20,7 @@ package api
 // 归属的读写频率低（用户手工归会话），直写 PG 的延迟完全可以接受。
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -90,6 +91,56 @@ func validateRootPath(raw string) (string, string) {
 	return cleaned, ""
 }
 
+// rootPathTaken 判断当前用户是否已有一个绑定同一目录的项目。
+//
+// **为什么必须由服务端拒绝**：前端的路径选择器只做即时提示，而 `/projects`
+// 与 `/projects/{id}` 两个端点都能被直接调用。判据集中在这一处，两个入口都调它，
+// 才不会出现"新建拦住了、改名漏了"。
+//
+// **为什么把比对放在 Go 侧而不是 SQL 的 `lower(root_path) = lower($3)`**：
+// Postgres 的 `lower()` 依赖数据库 locale，对非 ASCII 字符的行为可能与文件系统
+// 不一致；而 `sameRootPath` 是可单测的纯函数，判据只有一处、且能直接断言。
+// 代价是把该用户的项目读出来（个数级个位），开销可忽略。
+//
+// excludeID 传自身的 id（改名场景），使"只改名字、路径不动"不会被自己挡住。
+func rootPathTaken(ctx context.Context, tenant, userID, rootPath, excludeID string) (bool, error) {
+	if db.GlobalDBManager == nil || rootPath == "" {
+		return false, nil
+	}
+	rows, err := db.GlobalDBManager.FetchAll(ctx,
+		`SELECT id, COALESCE(root_path,'') AS root_path
+		   FROM session_map_workspaces
+		  WHERE tenant_id = $1 AND user_id = $2 AND COALESCE(root_path,'') <> ''`,
+		tenant, userID)
+	if err != nil {
+		return false, err
+	}
+	for _, row := range rows {
+		if stringOf(row["id"]) == excludeID {
+			continue
+		}
+		if sameRootPath(stringOf(row["root_path"]), rootPath) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// sameRootPath 判断两个项目根是否指向同一目录。
+//
+// 两条规则，都来自文件系统的实际行为：
+//   - **大小写不敏感**：Windows 与 macOS 默认如此。若按原样比对，用户把
+//     `D:\Repo` 换成 `d:\repo` 就能建出第二个项目，而两个项目会对同一个 `.git`
+//     各自建检查点，时间线互相污染。
+//   - **规范化后再比**：`filepath.Clean` 吃掉尾分隔符、`.`、以及 `..`。
+//     用户从系统对话框选出的路径与手输的路径常常在这些细节上不同。
+func sameRootPath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+}
+
 // smTimeOf 把驱动返回的时间值渲染成 RFC3339；nil 给空串。
 //
 // 不同驱动可能给 time.Time 或 string，统一处理避免各端点各写一套。
@@ -118,7 +169,10 @@ func (h *SessionMapHandler) ListProjects(w http.ResponseWriter, r *http.Request)
 	out := []map[string]interface{}{}
 	if db.GlobalDBManager != nil {
 		rows, err := db.GlobalDBManager.FetchAll(r.Context(),
-			`SELECT w.id, COALESCE(w.name,''), COALESCE(w.root_path,''), COALESCE(w.sort_index,0), w.updated_at,
+			// 每个 COALESCE 都带 AS 别名：FetchOne/FetchAll 用列名建 map，
+			// 无别名时列名是 `coalesce`，多个同名列会互相覆盖（见 SessionProject 的注释）。
+			`SELECT w.id, COALESCE(w.name,'') AS name, COALESCE(w.root_path,'') AS root_path,
+			        COALESCE(w.sort_index,0) AS sort_index, w.updated_at,
 			        (SELECT COUNT(DISTINCT n.session_id) FROM session_map_nodes n
 			          WHERE n.workspace_id = w.id AND n.edge_kind = 'project'
 			            AND n.session_id IS NOT NULL) AS session_count,
@@ -170,6 +224,23 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 	rootPath, why := validateRootPath(body.RootPath)
 	if why != "" {
 		JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})
+		return
+	}
+	// 同一目录只允许建一个项目。两个项目绑定同一 `.git` 会各自建检查点，
+	// 时间线互相污染，回滚时看到的是对方的快照。
+	//
+	// 查重失败时**拒绝**而不是放行：放行会重新引入"重复项目"，
+	// 而这正是要修的问题；代价只是用户重试一次。
+	taken, err := rootPathTaken(r.Context(), smTenant(claims), claims.UserID, rootPath, "")
+	if err != nil {
+		slog.Error("check duplicate project root failed", "error", err)
+		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "create failed"})
+		return
+	}
+	if taken {
+		JSON(w, http.StatusConflict, APIResponse{
+			Success: false, Error: "a project already uses this folder",
+		})
 		return
 	}
 	name := strings.TrimSpace(body.Name)
@@ -248,6 +319,20 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})
 			return
 		}
+		// 与 CreateProject 同一条判据：把项目改指到另一个项目已在用的目录同样要拒。
+		// excludeID 传自身，否则「只改名字、路径不动」会被自己挡住。
+		taken, err := rootPathTaken(r.Context(), smTenant(claims), claims.UserID, rp, wsID)
+		if err != nil {
+			slog.Error("check duplicate project root failed", "error", err)
+			JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "update failed"})
+			return
+		}
+		if taken {
+			JSON(w, http.StatusConflict, APIResponse{
+				Success: false, Error: "a project already uses this folder",
+			})
+			return
+		}
 		sets = append(sets, "root_path = "+arg(rp))
 	}
 	if body.SortIndex != nil {
@@ -294,8 +379,9 @@ func (h *SessionMapHandler) ListProjectSessions(w http.ResponseWriter, r *http.R
 	}
 	out := []map[string]interface{}{}
 	rows, err := db.GlobalDBManager.FetchAll(r.Context(),
-		`SELECT s.id, COALESCE(NULLIF(s.title,''), ''), COALESCE(s.status,''),
-		        s.updated_at, COALESCE(s.pinned,false), n.created_at AS bound_at
+		// COALESCE 全部带 AS 别名，理由见 SessionProject 的注释（重名列互相覆盖）。
+		`SELECT s.id, COALESCE(NULLIF(s.title,''), '') AS title, COALESCE(s.status,'') AS status,
+		        s.updated_at, COALESCE(s.pinned,false) AS pinned, n.created_at AS bound_at
 		   FROM session_map_nodes n
 		   JOIN sessions s ON s.id = n.session_id
 		  WHERE n.workspace_id = $1 AND n.edge_kind = 'project'
@@ -440,7 +526,11 @@ func (h *SessionMapHandler) SessionProject(w http.ResponseWriter, r *http.Reques
 	// 归属条件写在**同一条查询**里（w.tenant_id / w.user_id），而不是先查再验：
 	// 分开写就有"查出别人的项目再拒绝"的中间态，而这里连那一步都不该发生。
 	row, err := db.GlobalDBManager.FetchOne(r.Context(),
-		`SELECT w.id, COALESCE(w.name,''), COALESCE(w.root_path,'')
+		// **每个 COALESCE 都必须带 AS 别名**：FetchOne 用列名建 map，而
+		// `COALESCE(x,'')` 不带别名时列名就是 `coalesce` —— 两个列都叫这个，
+		// 后写的一个会把前一个覆盖掉，于是 row["name"] / row["root_path"]
+		// 一律取不到值（都成空串）。这正是「会话明明绑定了项目、界面却说未归入」的根因。
+		`SELECT w.id, COALESCE(w.name,'') AS name, COALESCE(w.root_path,'') AS root_path
 		   FROM session_map_nodes n
 		   JOIN session_map_workspaces w ON w.id = n.workspace_id
 		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
@@ -474,8 +564,9 @@ func (h *SessionMapHandler) ListUnassignedSessions(w http.ResponseWriter, r *htt
 	out := []map[string]interface{}{}
 	if db.GlobalDBManager != nil {
 		rows, err := db.GlobalDBManager.FetchAll(r.Context(),
-			`SELECT s.id, COALESCE(NULLIF(s.title,''),''), COALESCE(s.status,''), s.updated_at,
-			        COALESCE(s.pinned,false)
+			// COALESCE 全部带 AS 别名，见 SessionProject 的注释。
+			`SELECT s.id, COALESCE(NULLIF(s.title,''),'') AS title, COALESCE(s.status,'') AS status,
+			        s.updated_at, COALESCE(s.pinned,false) AS pinned
 			   FROM sessions s
 			  WHERE s.tenant_id = $1 AND s.user_id = $2
 			    AND NOT EXISTS (

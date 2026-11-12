@@ -16,7 +16,12 @@ const props = defineProps<{
   limit?: number | null
   /** 压缩触发比例（0~1，引擎下发）。>0 时在 title 里提示"到多少会被压缩" */
   compactRatio?: number | null
-  /** 上下文分段（`system`/`history`/`tool_results`/`current` 的估算 token） */
+  /**
+   * `used` 是否为**估算值**（服务商没回报 usage 时由引擎用分项之和兜底）。
+   * 必须在 title 里说明：估算与真实回报的可信度不同，不能长得一样。
+   */
+  estimated?: boolean | null
+  /** 上下文分段（`system`/`tools`/`user`/`assistant`/`tool_results` 的估算 token） */
   breakdown?: Record<string, number> | null
   /** 占用最大的几条（只含类别/角色/大小，**不含消息内容**） */
   largest?: Array<{ class?: string; role?: string; tokens?: number }> | null
@@ -53,19 +58,25 @@ const fmtK = (n?: number) => (n ? `${(n / 1000).toFixed(1)}k` : '0')
 const title = computed(() => {
   if (percent.value === null) return t('common.context_usage_no_data')
   const parts = [t('common.context_usage_label_last_request_used_tokens_limit_limit', { label: label.value, used: props.used, limit: props.limit })]
+  // 估算值必须自报家门：服务商没回报 usage 时引擎用分项之和兜底，
+  // 这个数与"服务商回报的真实数"可信度不同，不能让它们长得一模一样。
+  if (props.estimated) parts.push(t('common.context_usage_estimated'))
   if (remaining.value !== null) parts.push(t('common.context_remaining_tokens', { n: remaining.value }))
   // 压缩阈值由**引擎**下发（租户/模式可覆盖），前端不复制常量
   if (props.compactRatio && props.compactRatio > 0) {
     parts.push(t('common.context_compacts_at', { pct: Math.round(props.compactRatio * 100) }))
   }
-  // 分段：回答"上下文被谁占满了"。用**一个**带参数的键覆盖四类，避免四份易漂的独立文案。
+  // 分段：回答"上下文被谁占满了"。用一个带参数的键覆盖五类，避免五份易漂的文案。
+  // 五类与引擎 `_context_breakdown` 的桶名一一对应：
+  // system/tools/user/assistant/tool_results。
   const b = props.breakdown
-  if (b && (b.system || b.history || b.tool_results || b.current)) {
+  if (b && (b.system || b.tools || b.user || b.assistant || b.tool_results)) {
     parts.push(t('common.context_breakdown', {
       system: fmtK(b.system),
-      history: fmtK(b.history),
-      tools: fmtK(b.tool_results),
-      current: fmtK(b.current),
+      tools: fmtK(b.tools),
+      user: fmtK(b.user),
+      assistant: fmtK(b.assistant),
+      tool_results: fmtK(b.tool_results),
     }))
   }
   // 最大的几项：引擎只给类别/角色/大小，**不含消息内容**（隐私）；"是谁占的"这就够了。

@@ -25,7 +25,7 @@ from app.config import DEFAULT_TENANT_ID
 from app.kb_access import kb_access_allowed
 from app.knowledge.errors import KnowledgeError
 from app.knowledge.service import answer_question
-from app.tools.context import get_tenant_id, get_tenant_id_int, get_user_id
+from app.tools.context import get_tenant_id_int, get_user_id
 from app.tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,11 @@ async def kb_list(query: str = "", limit: int = 20) -> dict[str, Any]:
     except RuntimeError as e:
         return {"error": str(e)}
 
-    params: list[Any] = [user_id, get_tenant_id() or DEFAULT_TENANT_ID]
+    # `tenant_id` 是 smallint：asyncpg 收到 str 会直接抛
+    # `invalid input for query argument $2: '1' (expected int)`，而不是返回空列表。
+    # 用 `get_tenant_id_int()` 而不是 `get_tenant_id()`（后者是给格式化场景用的 str）。
+    tenant_id = get_tenant_id_int() or DEFAULT_TENANT_ID
+    params: list[Any] = [user_id, tenant_id]
     where = (
         "(user_id = $1 OR visibility = 'public'"
         " OR (visibility = 'tenant' AND tenant_id = $2))"

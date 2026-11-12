@@ -66,3 +66,53 @@ describe('MessageList 提问导航条', () => {
     expect(el.scrollTop).toBe(96)                              // 1 × 96px（text 估计值）
   })
 })
+
+/** 从行内 style 读宽度（px 数值），用于断言律动。
+ *  入参是 DOMWrapper（findAll 的返回值），不是原生元素 —— 前者要取 .element。 */
+function widthOf(w: { element: Element }): number {
+  return Number.parseFloat((w.element as HTMLElement).style.width || '0')
+}
+
+describe('MessageList 锚点律动（近长远短）', () => {
+  const threeQuestions = (): ChatItem[] => [
+    user('u1', '问一'), assistant('a1'),
+    user('u2', '问二'), assistant('a2'),
+    user('u3', '问三'), assistant('a3'),
+  ]
+
+  it('未悬停时所有锚点等长（激活项略长），不出现律动', async () => {
+    const wrapper = await mountList({ items: threeQuestions(), ...base })
+    const widths = wrapper.findAll('.rail-dot').map(widthOf)
+    expect(widths.length).toBe(3)
+    // 等长基值：未激活 10px；第一条在视口内被标 active 时是 16px。
+    // 关键断言是"只有两种取值"，即没有被悬停带出的衰减层次。
+    expect(new Set(widths).size).toBeLessThanOrEqual(2)
+  })
+
+  it('悬停某条时以它为中心向两侧衰减：最近最长，越远越短', async () => {
+    const wrapper = await mountList({ items: threeQuestions(), ...base })
+    const dots = wrapper.findAll('.rail-dot')
+
+    await dots[1]!.trigger('mouseenter')
+    await settle()
+    const w = dots.map(widthOf)
+    // 中心（下标 1）最长，两侧对称地变短
+    expect(w[1]).toBeGreaterThan(w[0])
+    expect(w[1]).toBeGreaterThan(w[2])
+    expect(w[0]).toBe(w[2])
+  })
+
+  it('悬停移出后恢复等长', async () => {
+    const wrapper = await mountList({ items: threeQuestions(), ...base })
+    const dots = wrapper.findAll('.rail-dot')
+
+    await dots[0]!.trigger('mouseenter')
+    await settle()
+    const hovered = dots.map(widthOf)
+    expect(new Set(hovered).size).toBeGreaterThan(1)
+
+    await wrapper.find('.question-rail').trigger('mouseleave')
+    await settle()
+    expect(new Set(dots.map(widthOf)).size).toBeLessThanOrEqual(2)
+  })
+})

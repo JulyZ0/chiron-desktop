@@ -2,10 +2,11 @@
 import { ref, onMounted, computed, markRaw } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  Button, Modal, Input, Radio, Tag, Popconfirm, message,
+  Alert, Button, Modal, Input, Radio, Tag, Popconfirm, message,
 } from 'ant-design-vue'
 import { BookOutlined, PlusOutlined, DeleteOutlined, SearchOutlined, EditOutlined, FileTextOutlined, DatabaseOutlined, TeamOutlined, LockOutlined } from '@ant-design/icons-vue'
 import { api, listAgents, setKBVisibility } from '../api'
+import { getKnowledgeSettings } from '../api/knowledge'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import { collectKbUsage, kbUsageOf, type KbUsage } from '../utils/kbUsage'
@@ -76,7 +77,32 @@ function usageTitle(kbId: string): string {
 onMounted(() => {
   void loadKnowledgeBases()
   void loadKbUsage()
+  void loadProviderState()
 })
+
+/**
+ * 用户是否已经选过知识库 provider。
+ *
+ * 后端 `create_knowledge_base` 只在**保存时**才发现没选 provider，回 400
+ * 「请先在知识库设置中选择 provider」—— 用户那时已经填完表单，还要自己找到
+ * 另一个页面。这里提前查一次，把「去哪里改」直接摆在页面上。
+ *
+ * 查询失败按"已就绪"处理：这条横幅是引导，不该因为设置接口偶发失败就误报。
+ */
+const providerReady = ref(true)
+
+async function loadProviderState() {
+  try {
+    const settings = await getKnowledgeSettings()
+    providerReady.value = Boolean(settings.provider)
+  } catch {
+    providerReady.value = true
+  }
+}
+
+function goKnowledgeSettings() {
+  void router.push('/knowledge/settings')
+}
 
 const filtered = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
@@ -236,6 +262,25 @@ function statusLabel(status: string): string {
         </template>
       </Input>
     </div>
+
+    <!-- 没选 provider 时创建必然失败（后端 400）。提前说清楚并给出出口，
+         而不是等用户填完表单、点完创建才弹一条没有下一步的 toast。 -->
+    <Alert
+      v-if="!providerReady"
+      type="warning"
+      show-icon
+      class="kb-provider-hint"
+      :message="$t('knowledge.provider_not_configured')"
+    >
+      <template #action>
+        <Button
+          size="small"
+          @click="goKnowledgeSettings"
+        >
+          {{ $t('knowledge.go_to_knowledge_settings') }}
+        </Button>
+      </template>
+    </Alert>
 
     <!-- 加载骨架（替代 Spin 空白） -->
     <PageSkeleton

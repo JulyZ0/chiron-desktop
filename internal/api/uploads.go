@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -160,6 +161,24 @@ func (h *UploadHandler) Init(w http.ResponseWriter, r *http.Request) {
 	if body.Purpose == "kb_doc" && body.Size > maxKBDocSize {
 		BadRequest(w, "kb_doc upload too large (max 64MB)")
 		return
+	}
+	// 知识库文档的类型门禁**在 Init 阶段就问**：此时只传了文件名，还没传任何分片。
+	// 等 Complete 才拒的话，用户要白传整个文件（最大 64MB）才看到报错 ——
+	// 而且前端分片上传会先把文件切完再发，观感上就是"卡很久然后失败"。
+	if body.Purpose == "kb_doc" {
+		if body.ParentID == "" {
+			BadRequest(w, "kb_doc upload requires parent_id (kb_id)")
+			return
+		}
+		provider, ok := kbProviderOfRequest(r, body.ParentID, tenantStr(claims.TenantID))
+		if !ok {
+			BadRequest(w, "knowledge base not found")
+			return
+		}
+		if !kbSuffixAllowed(provider, body.Name) {
+			BadRequest(w, kbTypeRejection(provider, body.Name))
+			return
+		}
 	}
 	chunkSize := body.ChunkSize
 	if chunkSize <= 0 {
@@ -369,6 +388,13 @@ func (h *UploadHandler) Complete(w http.ResponseWriter, r *http.Request) {
 		fileURL, err = h.finalizeGeneric(up, stream)
 	}
 	if err != nil {
+		// 类型不支持是用户可修正的 400，不是服务器故障。旧实现一律当 500 返回，
+		// 前端只能显示"服务器错误"，用户再怎么换文件也不会好。
+		var typeErr kbUnsupportedTypeError
+		if errors.As(err, &typeErr) {
+			BadRequest(w, typeErr.Error())
+			return
+		}
 		logAndRespond(w, err, http.StatusInternalServerError, "finalize upload failed")
 		return
 	}
@@ -561,16 +587,19 @@ func (h *UploadHandler) finalizeKBDoc(r *http.Request, tenantID string, up struc
 	if up.ParentID == "" {
 		return "", fmt.Errorf("kb_doc upload requires parent_id (kb_id)")
 	}
-	// 校验 KB 存在且归属当前租户当前用户
-	var owner string
+	// 校验 KB 存在且归属当前租户当前用户，同时取出 provider 用于类型校验
+	var owner, provider string
 	if err := db.GlobalDBManager.QueryRow(r.Context(),
-		`SELECT user_id FROM knowledge_bases WHERE id = $1 AND tenant_id = $2`, up.ParentID, tenantID).Scan(&owner); err != nil || owner != up.UserID {
+		`SELECT user_id, provider FROM knowledge_bases WHERE id = $1 AND tenant_id = $2`, up.ParentID, tenantID).Scan(&owner, &provider); err != nil || owner != up.UserID {
 		return "", fmt.Errorf("knowledge base not found or not owned")
 	}
-	ext := strings.TrimPrefix(filepath.Ext(up.Name), ".")
-	if ext == "" {
-		ext = "txt"
+	// 类型必须在**落库前**拒绝（原因见 kb_file_types.go 顶部）：
+	// 这条路径不经过 Python 引擎，provider.supports() 管不到这里。
+	// 旧的 `ext == "" → txt` 兜底也一并去掉 —— 它等于给任意文件开后门。
+	if !kbSuffixAllowed(provider, up.Name) {
+		return "", kbUnsupportedTypeError{msg: kbTypeRejection(provider, up.Name)}
 	}
+	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(up.Name)), ".")
 	docID, err := id.UUID()
 	if err != nil {
 		return "", err

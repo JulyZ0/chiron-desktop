@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -236,6 +237,168 @@ func systemScore(m map[string]interface{}) int {
 		return 85 // Running > 1h
 	}
 	return 80
+}
+
+// ComponentsHealth 逐组件返回实时健康态（pg / redis / engine / gateway）。
+//
+// 与 `/v1/system/health`（健康评分）的区别：评分是"整体算个分"，回答不了
+// "到底哪个组件挂了"。客户端状态栏此前只显示浏览器 `navigator.onLine`，
+// 后端全挂时仍显示"已连接"，用户因此被误导。这里对每个依赖单独给出
+// available/healthy 与失败原因，让"连接状态"有真实依据。
+func (h *SystemHandler) ComponentsHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	engineResult := map[string]interface{}{
+		"healthy": false,
+		"error":   "python engine not configured",
+	}
+	if h.pythonClient != nil {
+		engineResult = h.pythonClient.HealthCheck(ctx)
+	}
+
+	snap := monitor.Snapshot()
+	OK(w, map[string]interface{}{
+		"postgres": db.GlobalDBManager.HealthCheck(ctx),
+		"redis":    db.GlobalRedisManager.HealthCheck(ctx),
+		"engine":   engineResult,
+		// gateway = 本进程自身，恒为 up；这里给的是内存/协程等可观测明细
+		"gateway": map[string]interface{}{
+			"healthy":            true,
+			"uptime_seconds":     snap["uptime_seconds"],
+			"memory_alloc_bytes": snap["go_memory_alloc_bytes"],
+			"memory_sys_bytes":   snap["go_memory_sys_bytes"],
+			"goroutines":         snap["go_goroutines"],
+			"gc_runs":            snap["go_gc_runs"],
+		},
+		// 各组件**内存占用明细**：回答"内存去哪了"。
+		// 取不到的组件直接省略该键 —— 前端据此显示 "—"，绝不用 0 冒充。
+		"memory": h.componentMemory(ctx),
+	})
+}
+
+// componentMemory 采集各依赖的内存/体积明细（字节）。取不到的键**不出现**。
+//
+// 为什么分散在三个地方：pg 的库体积只有 SQL 能问（`pg_database_size`）、
+// redis 的 `used_memory` 只在 `INFO memory` 里、引擎进程 RSS 只暴露在
+// Prometheus `/metrics`（`process_memory_rss_bytes`）。三者在 Go 侧都没有现成
+// 封装，所以各自单独探测，任一项失败只影响自己那一项。
+func (h *SystemHandler) componentMemory(ctx context.Context) map[string]interface{} {
+	out := map[string]interface{}{}
+
+	// Postgres：库体积 + 当前连接数
+	if db.GlobalDBManager.IsAvailable() {
+		pgCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		var sizeBytes int64
+		var conns int
+		errSize := db.GlobalDBManager.QueryRow(pgCtx, "SELECT pg_database_size(current_database())").Scan(&sizeBytes)
+		errConns := db.GlobalDBManager.QueryRow(pgCtx, "SELECT count(*) FROM pg_stat_activity").Scan(&conns)
+		cancel()
+		pg := map[string]interface{}{}
+		if errSize == nil {
+			pg["database_bytes"] = sizeBytes
+		}
+		if errConns == nil {
+			pg["connections"] = conns
+		}
+		if len(pg) > 0 {
+			out["postgres"] = pg
+		}
+	}
+
+	// Redis：used_memory（字节）
+	if db.GlobalRedisManager.IsAvailable() {
+		if client, err := db.GlobalRedisManager.GetClient(); err == nil && client != nil {
+			rdCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			info, err := client.Do(rdCtx, "INFO", "memory").Text()
+			cancel()
+			if err == nil {
+				if v, ok := parseRedisUsedMemory(info); ok {
+					out["redis"] = map[string]interface{}{"used_memory_bytes": v}
+				}
+			}
+		}
+	}
+
+	// 引擎：进程 RSS（Prometheus 文本）
+	if h.pythonClient != nil {
+		if text, err := h.pythonClient.GetText(ctx, "/metrics"); err == nil {
+			if v, ok := parsePromGauge(text, "process_memory_rss_bytes"); ok {
+				out["engine"] = map[string]interface{}{"rss_bytes": v}
+			}
+		}
+	}
+
+	// 网关自身：Go 堆（Alloc）与系统保留（Sys）
+	snap := monitor.Snapshot()
+	out["gateway"] = map[string]interface{}{
+		"heap_bytes": snap["go_memory_alloc_bytes"],
+		"sys_bytes":  snap["go_memory_sys_bytes"],
+	}
+
+	return out
+}
+
+// parseRedisUsedMemory 从 `INFO memory` 文本里取 `used_memory:<n>`。
+// 用行前缀精确匹配，不用正则模糊搜 —— `used_memory_human`、
+// `used_memory_peak`、`used_memory_rss` 都含同前缀，模糊匹配会取错。
+func parseRedisUsedMemory(info string) (int64, bool) {
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, "used_memory:")
+		if !ok {
+			continue
+		}
+		if n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// parsePromGauge 从 Prometheus 文本里取某指标的值（跳过 `#` 注释行）。
+//
+// 标签形态（`name{...} 123`）也接受：同一指标可能带 label 多次出现，
+// 此时取**第一条**即可 —— 引擎单进程单实例，不存在多值求和的问题。
+func parsePromGauge(text, name string) (float64, bool) {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, name) {
+			continue
+		}
+		rest := line[len(name):]
+		// 下一个字符必须是 ' ' 或 '{'，否则是 `xxx_total` 之类的前缀误命中
+		if rest == "" || (rest[0] != ' ' && rest[0] != '{') {
+			continue
+		}
+		if i := strings.LastIndex(rest, " "); i >= 0 {
+			if v, err := strconv.ParseFloat(strings.TrimSpace(rest[i+1:]), 64); err == nil {
+				return v, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// PriceSync 立即触发一轮模型价格同步（转发到引擎 `/v1/system/price-sync`）。
+//
+// 为什么放在网关而不是让前端直连引擎：前端只认网关，引擎不直接对外。
+// 为什么要求 PermAdminWrite：这一步会**出站拉取外部数据并写库**（`model_prices`），
+// 是写操作而非查询；同组 log-level 也是这个权限口径。
+func (h *SystemHandler) PriceSync(w http.ResponseWriter, r *http.Request) {
+	if h.pythonClient == nil {
+		InternalError(w, "python engine not available")
+		return
+	}
+	var resp map[string]interface{}
+	if err := h.pythonClient.PostJSON(r.Context(), "/v1/system/price-sync", map[string]interface{}{}, &resp); err != nil {
+		logAndRespond(w, err, http.StatusBadGateway, "python engine error")
+		return
+	}
+	OK(w, resp)
 }
 
 // DatabaseHealth 数据库健康检查端点（供 Python 引擎调用）

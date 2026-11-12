@@ -59,6 +59,7 @@ function fakeTitleBar(mode: 'custom' | 'inset' | 'native', state: WindowState = 
 afterEach(() => {
   delete (globalThis as { chironDesktop?: ChironDesktopHost }).chironDesktop
   document.documentElement.style.removeProperty('--app-titlebar-h')
+  document.documentElement.style.removeProperty('--app-titlebar-controls-w')
 })
 
 describe('TitleBar · 渲染条件', () => {
@@ -87,6 +88,8 @@ describe('TitleBar · 渲染条件', () => {
     expect(wrapper.find('.titlebar--custom').exists()).toBe(true)
     expect(wrapper.findAll('.titlebar-btn')).toHaveLength(3)
     expect(document.documentElement.style.getPropertyValue('--app-titlebar-h')).toBe('36px')
+    // 三个 46px 的窗口按钮占右侧 138px，页面右上角的操作组要靠这个值躲开
+    expect(document.documentElement.style.getPropertyValue('--app-titlebar-controls-w')).toBe('138px')
   })
 
   it('mode: inset（macOS 红绿灯）只画拖拽带，不画按钮', async () => {
@@ -98,6 +101,8 @@ describe('TitleBar · 渲染条件', () => {
     expect(wrapper.find('.titlebar--inset').exists()).toBe(true)
     expect(wrapper.findAll('.titlebar-btn')).toHaveLength(0)
     expect(document.documentElement.style.getPropertyValue('--app-titlebar-h')).toBe('28px')
+    // 红绿灯在左，右侧不占位：必须发布 0，否则右上角操作组会凭空左移
+    expect(document.documentElement.style.getPropertyValue('--app-titlebar-controls-w')).toBe('0px')
   })
 })
 

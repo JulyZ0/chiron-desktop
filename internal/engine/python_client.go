@@ -407,6 +407,27 @@ func (c *PythonClient) GetJSON(ctx context.Context, path string, out any) error 
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// GetText 取纯文本响应（如 Prometheus `/metrics`）。JSON 方法解不了文本端点，
+// 而进程内存（process_memory_rss_bytes）只在 Prometheus 指标里暴露。
+func (c *PythonClient) GetText(ctx context.Context, path string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.pickAddress()+path, nil)
+	if err != nil {
+		return "", err
+	}
+	c.injectInternalToken(req)
+	resp, err := c.do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("python GET %s returned %d: %s", path, resp.StatusCode, string(b))
+	}
+	b, err := io.ReadAll(resp.Body)
+	return string(b), err
+}
+
 // PostJSON performs a POST request with JSON body and decodes JSON into out.
 func (c *PythonClient) PostJSON(ctx context.Context, path string, in any, out any) error {
 	body, err := json.Marshal(in)

@@ -358,7 +358,7 @@ export default {
   workbench_list_truncated: "Too many entries — only the first part is shown",
   workbench_copy_path: "Copy relative path",
   workbench_reference: "Add to chat",
-  workbench_reference_hint: "Insert an @path into the message — the gateway reads the file when you send it",
+  workbench_reference_hint: "Insert an {'@'}path into the message — the gateway reads the file when you send it",
   workbench_binary_hint: "Binary file — no preview available; copy its path and open it with a system app",
   workbench_path_outside_project: "\"{path}\" is outside the current project and cannot be opened",
   workbench_file_not_found: "\"{path}\" was not found in this project",

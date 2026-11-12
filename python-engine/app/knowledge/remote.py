@@ -66,7 +66,10 @@ class RemoteProvider:
 
         base = self._base_url()
         if not base:
-            raise ProviderUnavailableError("KNOWLEDGE_SERVICE_URL 未配置（知识库服务不可用）")
+            # 前缀是给用户看的，括号里是给排查看的 —— 只留变量名时用户完全无从下手
+            raise ProviderUnavailableError(
+                "知识库索引服务未就绪（KNOWLEDGE_SERVICE_URL 未配置），请重启应用让它自动安装"
+            )
         token = str(getattr(settings, "internal_token", "") or "")
         if not token:
             raise ProviderUnavailableError("INTERNAL_TOKEN 未配置，无法调用知识库服务")
@@ -116,9 +119,17 @@ class RemoteProvider:
         对每个用户发一次网络请求会把"某用户 key 失效"变成服务启动延迟。
         """
         if not self._base_url():
-            return HealthResult(False, STATUS_DISABLED, "KNOWLEDGE_SERVICE_URL 未配置")
+            # 这句话会原样显示在「知识库设置」的自托管卡片上，所以先说人话，
+            # 括号里留变量名给排查用 —— 只给变量名时用户完全无从下手。
+            return HealthResult(
+                False,
+                STATUS_DISABLED,
+                "知识库索引服务未就绪（KNOWLEDGE_SERVICE_URL 未配置），重启应用会自动安装",
+            )
         if not str(getattr(settings, "internal_token", "") or ""):
-            return HealthResult(False, STATUS_DISABLED, "INTERNAL_TOKEN 未配置")
+            return HealthResult(
+                False, STATUS_DISABLED, "内部凭据未就绪（INTERNAL_TOKEN 未配置），重启应用后重试"
+            )
         if self._mode == "cloud" and not self._api_key:
             return HealthResult(False, STATUS_DISABLED, "未配置 PageIndex Cloud API key")
         return HealthResult(True, STATUS_READY, "")
@@ -129,7 +140,11 @@ class RemoteProvider:
 
         base = self._base_url()
         if not base:
-            return HealthResult(False, STATUS_DISABLED, "KNOWLEDGE_SERVICE_URL 未配置")
+            return HealthResult(
+                False,
+                STATUS_DISABLED,
+                "知识库索引服务未就绪（KNOWLEDGE_SERVICE_URL 未配置），重启应用会自动安装",
+            )
         try:
             async with httpx.AsyncClient(base_url=base, timeout=10.0) as client:
                 resp = await client.get("/healthz")

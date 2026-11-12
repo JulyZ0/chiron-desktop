@@ -56,8 +56,41 @@ def get_sandbox_dir() -> Path:
     return d
 
 
+def project_root() -> Path | None:
+    """当前会话绑定的项目根（= 用户选中的真实项目目录）。
+
+    来源是 ``app/tools/context.py`` 的会话级上下文键 ``project_root``，由上层
+    （Go 网关 / 回合启动）注入。**未设置或不可用时返回 ``None``**，调用方回退到
+    沙箱 workspace —— 回退是刻意的：宁可让 agent 在沙箱里工作，也不要因为一个
+    坏路径让所有工具直接报错。
+
+    只接受**绝对路径且确实存在的目录**。相对路径会被解析成进程 cwd 下的子目录，
+    那是"看起来能用其实指错地方"的典型故障，因此一律拒绝。
+    """
+    from app.tools.context import get_tool_context
+
+    raw = get_tool_context("project_root")
+    if not raw:
+        return None
+    try:
+        candidate = Path(str(raw))
+        if not candidate.is_absolute() or not candidate.is_dir():
+            return None
+        return candidate.resolve()
+    except OSError:
+        return None
+
+
 def workspace_dir() -> Path:
-    """agent 文件操作的唯一根目录。"""
+    """agent 文件操作的唯一根目录。
+
+    优先返回会话项目根（D6 单仓库模式）；没有项目根时回退到沙箱 workspace。
+    ``safe_join`` / ``git_tools`` / ``run_code`` 等都以此为边界，因此这一处切换
+    就决定了"agent 改的是用户的项目，还是沙箱里的副本"。
+    """
+    root = project_root()
+    if root is not None:
+        return root
     d = get_sandbox_dir() / "workspace"
     try:
         d.mkdir(parents=True, exist_ok=True)
@@ -77,7 +110,10 @@ def _sandbox_tmp_dir() -> Path:
     git / ffmpeg / python 都会往 TEMP 写临时文件；TEMP 不可写会表现为"命令能启动、
     一写临时文件就失败"，报错离真正原因很远。
     """
-    d = workspace_dir() / ".tmp"
+    # **不能**用 ``workspace_dir() / ".tmp"``：切换项目根之后那会在**用户的仓库里**
+    # 建一个 .tmp 目录 —— 既污染 git 状态，也可能被检查点当成未跟踪文件收进去。
+    # 临时目录始终留在沙箱侧，与"agent 在哪里改代码"无关。
+    d = get_sandbox_dir() / "workspace" / ".tmp"
     try:
         d.mkdir(parents=True, exist_ok=True)
     except OSError as e:  # noqa: BLE001 — 建不出来时退回 workspace 根，不阻断执行

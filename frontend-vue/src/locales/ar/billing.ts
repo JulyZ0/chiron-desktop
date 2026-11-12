@@ -26,6 +26,10 @@ export default {
   usage_breakdown_truncated: "يُعرض أعلى {shown} عنصرًا فقط من أصل {total}؛ الإجماليات أعلاه ما زالت تشمل كل شيء.",
 
   prices_title: "قائمة أسعار النماذج",
+  prices_sync_now: "مزامنة الآن",
+  prices_sync_done: "اكتملت المزامنة — تم تحديث أسعار {n} نموذجًا",
+  prices_sync_empty: "لم تُكتب أي أسعار هذه الجولة (تعذّر الوصول للشبكة، أو لم يتفق مصدران)",
+  prices_sync_disabled: "مزامنة الأسعار معطّلة (MODEL_PRICE_SYNC=off)",
   prices_hint: "تأتي الأسعار من التحقق المتقاطع بين عدة مصادر بيانات عامة، بوحدة USD / 1k tokens. للاسترشاد بالتكلفة فقط — ولا تُستخدم في الفوترة.",
   prices_search_placeholder: "ابحث باسم النموذج",
   prices_col_model: "النموذج",

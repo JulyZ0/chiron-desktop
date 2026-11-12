@@ -39,6 +39,14 @@ const props = withDefaults(
     projectId?: string
     /** 项目名（头部展示，让用户确认"我看的是哪个项目"） */
     projectName?: string
+    /**
+     * 反查会话归属**失败**的原因（空串 = 没失败）。
+     *
+     * 与 `projectId` 为空是两件事：空 id 是"这会话确实没归入项目"（正常状态），
+     * 而查询失败是故障。若把后者也渲染成「未归入任何项目」，用户刚拖进项目的
+     * 会话就会显示成没归入 —— 自相矛盾且没有线索。
+     */
+    projectError?: string
     /** 分栏手柄贴哪条边：由父布局的 `is-swapped` 决定 */
     handleSide?: 'left' | 'right'
     /**
@@ -59,6 +67,13 @@ const emit = defineEmits<{
   (e: 'close'): void
   /** 把文件交给对话（父组件转成附件）；`path` 是相对项目根的 POSIX 路径 */
   (e: 'reference', payload: { path: string; name: string }): void
+  /**
+   * 重新反查会话归属。
+   *
+   * 归属查询失败时面板只能显示错误，**重试必须由父组件执行** —— 项目归属是
+   * ChatView 的状态（`activeProject`），面板拿不到会话 id，自己重试也无处可写。
+   */
+  (e: 'retry-project'): void
 }>()
 
 // ── 分栏宽度（与 SessionPreviewPane 同一套交互约定） ──
@@ -168,6 +183,16 @@ const childrenOf = ref<Record<string, ProjectFileEntry[]>>({})
 const expanded = ref<Set<string>>(new Set())
 const loadingDirs = ref<Set<string>>(new Set())
 const treeError = ref('')
+/**
+ * 树的代次：每次 `reload()` 自增。
+ *
+ * 为什么需要它：`loadDir` 是异步的，而 `reload()` 会把 `childrenOf` 清空后重新拉根。
+ * 用户切项目时，上一个项目那几个正在飞的请求回来得晚，直接写进 `childrenOf` 就会
+ * 让新项目的树里混着旧项目的文件 —— 而且树看着不为空，用户不会想到去刷新。
+ * 更糟的是 `loadingDirs` 也得跟着清，否则新的 `loadDir('')` 会被
+ * `loadingDirs.has('')` 直接挡掉，新项目永远停在"加载中"。
+ */
+let treeGeneration = 0
 /**
  * 被截断的目录集合。
  *
@@ -313,9 +338,17 @@ async function openChange(row: ChangeRow) {
 async function loadDir(path: string) {
   if (!props.projectId) return
   if (loadingDirs.value.has(path)) return
+  // 代次 + 项目 id 都取值**再 await**：请求飞在路上时用户可能切了项目，那时
+  // `props.projectId` 已经是新值，拿它去写结果就会把新项目的 id 安在旧数据上。
+  const generation = treeGeneration
+  const projectId = props.projectId
   loadingDirs.value = new Set(loadingDirs.value).add(path)
   try {
-    const listing = await listProjectFiles(props.projectId, path, { hidden: showHidden.value })
+    const listing = await listProjectFiles(projectId, path, { hidden: showHidden.value })
+    // 期间 reload 过（切项目 / 切隐藏开关 / 手动刷新）：这份结果属于上一棵树，
+    // 写进去就是"新项目的树里混着旧项目的文件"，而且树看着不是空的，
+    // 用户根本不会想到去点刷新。丢弃比落盘安全。
+    if (generation !== treeGeneration) return
     rootPath.value = listing.root || rootPath.value
     childrenOf.value = { ...childrenOf.value, [path]: listing.entries }
     // 截断状态**每次刷新都重算**：之前被截断的目录这次可能没截断（文件被删了），
@@ -348,8 +381,14 @@ function toggleDir(entry: ProjectFileEntry) {
 
 /** 重置整棵树（切项目/切隐藏开关/手动刷新） */
 function reload() {
+  // 代次先自增：下面 `loadDir('')` 之后每一个在飞的旧请求都会因代次不符而被丢弃。
+  treeGeneration += 1
   childrenOf.value = {}
   expanded.value = new Set()
+  // `loadingDirs` 必须一起清。不清的话，切项目时若上一个根目录请求还在飞，
+  // 下面那句 `loadDir('')` 会被 `loadingDirs.has('')` 挡掉并直接返回 ——
+  // 新项目的树永远不加载，面板停在"加载中"，而刷新按钮又走同一条死路。
+  loadingDirs.value = new Set()
   truncatedDirs.value = new Set()
   treeError.value = ''
   selected.value = null
@@ -614,8 +653,23 @@ async function openWithSystem(entry: ProjectFileEntry) {
       {{ tr('chat.workbench_readonly_hint') }}
     </div>
 
+    <!-- 反查归属失败（网关 404 / 401 / 网络断）与"确实没归入项目"必须分开说：
+         合并的话，故障会被显示成「未归入任何项目」，而用户可能刚把会话拖进项目 ——
+         一句自相矛盾的话，且把真正的原因（接口不可用）藏了起来。 -->
     <div
-      v-if="!projectId"
+      v-if="projectError"
+      class="wb-error"
+    >
+      {{ projectError }}
+      <button
+        type="button"
+        class="wb-btn"
+        @click="emit('retry-project')"
+      >{{ tr('common.retry') }}</button>
+    </div>
+
+    <div
+      v-else-if="!projectId"
       class="wb-empty"
     >
       {{ tr('chat.workbench_no_project') }}
@@ -822,8 +876,17 @@ async function openWithSystem(entry: ProjectFileEntry) {
           </template>
           <div
             v-else-if="previewBinary"
-            class="wb-empty"
-          >{{ tr('chat.workbench_binary_hint') }}</div>
+            class="wb-empty wb-empty-action"
+          >
+            <span>{{ tr('chat.workbench_binary_hint') }}</span>
+            <!-- 提示语写着"用系统程序打开"，那就必须真的能点：
+                 否则用户读到的是一句无法执行的建议。 -->
+            <button
+              type="button"
+              class="wb-btn"
+              @click="openWithSystem(selected)"
+            >{{ tr('chat.workbench_open_system') }}</button>
+          </div>
           <template v-else>
             <pre class="wb-text">{{ previewText }}</pre>
           </template>
@@ -878,6 +941,9 @@ async function openWithSystem(entry: ProjectFileEntry) {
 .wb-caret { flex: none; width: 10px; color: var(--text-tertiary); font-size: 10px; }
 .wb-name { overflow: hidden; text-overflow: ellipsis; }
 .wb-empty { padding: 10px 12px; font-size: 12px; color: var(--text-tertiary); }
+/* 带操作的提示（如二进制文件）：文字与按钮并排，按钮不继承提示的灰色文字 */
+.wb-empty-action { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wb-empty-action > span { flex: 1; min-width: 0; }
 .wb-error { padding: 10px 12px; font-size: 12px; color: var(--danger); }
 .wb-preview { flex: none; max-height: 55%; display: flex; flex-direction: column; border-top: var(--hairline-width) solid var(--border-subtle); }
 .wb-preview-head {

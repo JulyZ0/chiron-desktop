@@ -113,6 +113,8 @@ const emit = defineEmits<{
   (e: 'remove-context', type: ContextChip['type'], value: string): void
   /** 清空全部上下文（父级同步清空路由 query） */
   (e: 'clear-context'): void
+  /** 项目归属发生变化（侧边栏绑定 / 移出 / 移动），父级需重查当前会话的项目 */
+  (e: 'binding-changed'): void
 }>()
 
 const router = useRouter()
@@ -723,6 +725,7 @@ function pickSession(id: string) {
         @open-session="pickSession"
         @create-session="onProjectCreateSession"
         @open-canvas="emit('open-map')"
+        @binding-changed="emit('binding-changed')"
       />
 
       <div class="sessions-divider">

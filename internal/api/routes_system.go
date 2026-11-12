@@ -32,10 +32,16 @@ func registerSystemRoutes(
 	// 任意登录用户可读会泄漏平台内部状态。此前 health 与 metrics 漏了权限，与同组
 	// spans/traces 口径不一致（metrics 更矛盾：公开的 Prometheus /metrics 反而要求 admin）。
 	mux.Handle("GET /v1/system/health", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(systemHandler.HealthScores)))))
+	// 逐组件健康态：客户端状态栏需要它把"已连接"落到实处（此前只看 navigator.onLine）。
+	// 回的是各依赖的可用性与失败原因，不含全局计数/评分，故按登录用户开放即可。
+	mux.Handle("GET /v1/system/components", authMW(rlMW(http.HandlerFunc(systemHandler.ComponentsHealth))))
 	mux.Handle("GET /v1/system/spans", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(systemHandler.Spans)))))
 	mux.Handle("GET /v1/system/traces", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(systemHandler.Traces)))))
 	mux.Handle("GET /v1/metrics", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(systemHandler.Metrics)))))
 	mux.Handle("POST /v1/admin/log-level", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(http.HandlerFunc(systemHandler.SetLogLevel)))))
+	// 手动触发一轮模型价格同步：后台循环 30min 一轮，新装/换模型后不该干等。
+	// 写操作（出站拉取 + 写 model_prices），与 log-level 同权限口径。
+	mux.Handle("POST /v1/billing/prices/sync", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(http.HandlerFunc(systemHandler.PriceSync)))))
 
 	// Trace (user-level call chain tracing, tenant-isolated)
 	if traceHandler != nil {

@@ -1,6 +1,8 @@
 package api
 
 import (
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -8,6 +10,33 @@ import (
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/engine"
 )
+
+// decodeOptionalJSON 解析代理请求里**可选**的 JSON 请求体。
+//
+// 空 body 是合法的：`POST /v1/kb/{id}/build` 就是不带 body 的语义（重建索引，
+// 没有参数）。旧实现对空 body 直接走 DecodeJSON，它返回 io.EOF，于是被当成
+// "请求体非法" —— 前端一点「构建索引」就收到 `invalid request body`，
+// 而请求本身完全正常。
+//
+// 只放行 io.EOF（真正的空 body）；语法错误、类型不符仍然 400 —— 把全部解码
+// 错误都吞掉会掩盖前端参数写错，那类问题会变成"请求被静默忽略"，更难查。
+func decodeOptionalJSON(w http.ResponseWriter, r *http.Request) (map[string]interface{}, bool) {
+	body := map[string]interface{}{}
+	if r.ContentLength == 0 {
+		return body, true
+	}
+	if err := DecodeJSON(w, r, &body); err != nil {
+		if errors.Is(err, io.EOF) {
+			return map[string]interface{}{}, true
+		}
+		BadRequest(w, ErrInvalidReq)
+		return nil, false
+	}
+	if body == nil {
+		body = map[string]interface{}{}
+	}
+	return body, true
+}
 
 // routes_proxy.go —— Python 引擎代理（图/工作流/知识库）的路由注册。
 // 由 gateway_router.go 按业务域拆分而来（纯移动：函数签名、函数体、调用点一字未改）。
@@ -55,9 +84,8 @@ func registerProxyRoutes(
 				case "GET":
 					err = pythonClient.GetJSON(r.Context(), proxiedPath, &resp)
 				case "POST":
-					var body map[string]interface{}
-					if err2 := DecodeJSON(w, r, &body); err2 != nil {
-						BadRequest(w, ErrInvalidReq)
+					body, ok := decodeOptionalJSON(w, r)
+					if !ok {
 						return
 					}
 					if opt.mutateBody != nil && !opt.mutateBody(r, body) {
@@ -68,9 +96,8 @@ func registerProxyRoutes(
 					}
 					err = pythonClient.PostJSON(r.Context(), proxiedPath, body, &resp)
 				case "PUT":
-					var body map[string]interface{}
-					if err2 := DecodeJSON(w, r, &body); err2 != nil {
-						BadRequest(w, ErrInvalidReq)
+					body, ok := decodeOptionalJSON(w, r)
+					if !ok {
 						return
 					}
 					if opt.mutateBody != nil && !opt.mutateBody(r, body) {

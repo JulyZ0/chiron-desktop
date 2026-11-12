@@ -1316,8 +1316,17 @@ body {
 
 #app {
     width: 100%;
-    height: var(--app-height);
+    height: 100%;
     min-width: 320px;
+    /* 自绘标题栏（TitleBar.vue）是 `position: fixed` 在视口顶部的一条，不参与文档流：
+       只改 #app 的高度而不让位，页面自己的顶部内容（聊天工具条、首页 hero 等）就会
+       从 y=0 开始，被那条压住 —— 而它整条是 `-webkit-app-region: drag`，连点击都被
+       系统吞掉，按钮看着在、按不动。
+       用 padding 让整块界面下移；全局 box-sizing 是 border-box，所以这 36/28px
+       从 height: 100%（= 100dvh）里扣，内容框仍正好等于 --app-height，子元素
+       （.app-shell / .app-content / admin 布局）不必再各减一次，也不产生滚动条。
+       fixed 定位的顶栏胶囊 / 停靠坞不受 padding 影响，它们自己读同一个变量偏移。 */
+    padding-top: var(--app-titlebar-h);
 }
 
 .nums,
