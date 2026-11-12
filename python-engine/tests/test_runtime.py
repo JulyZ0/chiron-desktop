@@ -130,6 +130,43 @@ class TestCompactionConfig:
             msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 2000})
         return msgs
 
+    def test_auto_does_not_prune_well_below_window(self):
+        """消息条数不再是常态触发点。
+
+        回归：`MAX_MESSAGES` 曾是 16，而一次工具回合天然产出 2 条
+        （assistant(tool_calls) + tool 结果）—— "读几个文件 + 跑一次测试"就突破上限，
+        压缩在**远未接近窗口**时反复触发，用户感受就是"对话频繁被压缩、上下文总是丢"。
+        预算轴必须是 token；条数只在异常形状下兜底。
+        """
+        msgs = self._long_tool_msgs(20)  # 40 条，合计约 24K 字符
+        cfg = CompactionConfig(max_context_tokens=200_000)
+        assert _compact_messages(msgs, cfg) == msgs
+
+    def test_auto_still_prunes_at_token_threshold(self):
+        """放宽条数上限不能变成"永不压缩"：接近窗口时仍按 token 阈值裁剪。"""
+        msgs = self._long_tool_msgs(20)
+        cfg = CompactionConfig(max_context_tokens=8_000)
+        out = _compact_messages(msgs, cfg)
+        assert len(out) < len(msgs)
+
+    def test_prune_tail_budget_follows_window_not_count(self):
+        """原样尾部按窗口比例给预算（对齐 Reasonix 的 recentTailBudgetRatio）。
+
+        条数相同而体积差两个数量级时，只按条数裁剪要么裁得太狠、要么根本没让出空间。
+        """
+        msgs: list[dict] = []
+        for i in range(30):
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": [{"id": f"c{i}", "type": "function",
+                                         "function": {"name": "read_file", "arguments": "{}"}}]})
+            msgs.append({"role": "tool", "tool_call_id": f"c{i}", "content": "x" * 5000})
+        out = _prune_messages(msgs, CompactionConfig(
+            strategy="prune", max_messages=200, max_context_tokens=200_000))
+        # 尾部预算 = 200K × 10% = 20K tokens ≈ 80K 字符，远小于 150K 总字符
+        assert 2 < len(out) < len(msgs)
+        # 保留的必须是**最近的**那些（尾部对齐当前回合）
+        assert out[-1]["tool_call_id"] == "c29"
+
     def test_strategy_none_keeps_all(self):
         msgs = self._long_tool_msgs(12)
         cfg = CompactionConfig(strategy="none", max_messages=4)
@@ -139,7 +176,12 @@ class TestCompactionConfig:
         msgs = self._long_tool_msgs(12)
         cfg = CompactionConfig(strategy="prune", max_messages=6)
         out = _compact_messages(msgs, cfg)
-        assert len(out) <= 6 + 1  # 系统消息数为 0，保留最近预算内 + 配对补齐
+        # 预算内消息 + 配对补齐 + **两条**通知：裁剪提示（含 ref 契约）与恢复简报
+        # （用户要求 / 已用工具 / 上一轮结论）。后者是新增的接续上下文，不是正文，
+        # 因此不计入 `max_messages` —— 但必须显式写进断言，免得下次又靠"多 1 条"蒙过去。
+        assert len(out) <= 6 + 1 + 2
+        brief = [m for m in out if "接续工作" in str(m.get("content") or "")]
+        assert len(brief) == 1, "被裁掉的内容应留下一条恢复简报"
 
     def test_strategy_snipe_only_truncates_tool_results(self):
         msgs = self._long_tool_msgs(3)

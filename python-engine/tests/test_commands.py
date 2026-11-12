@@ -121,8 +121,37 @@ async def test_context_command(ctx):
 
 @pytest.mark.asyncio
 async def test_compact(ctx):
-    """/compact should summarise and clear history."""
+    """/compact 必须真的压：不再是"清空 + 塞一条占位摘要"。"""
+    # 造一段够长的历史（旧实现无论多长都只回一句 "Compacted N messages"）
+    ctx.history[:] = [
+        {"role": "user", "content": f"问题 {i}：" + "很长的描述。" * 200}
+        if i % 2 == 0
+        else {"role": "assistant", "content": f"回答 {i}：" + "细节说明。" * 200}
+        for i in range(40)
+    ]
+    before_count = len(ctx.history)
     result = await registry.execute("/compact", ctx)
     assert "Compacted" in result
-    assert len(ctx.history) == 1  # replaced by summary
-    assert "Compacted" in ctx.history[0]["content"]
+    assert "tokens" in result
+    # 真的变短了，且历史里不再有那条伪造的 `[Compacted summary of ...]` 占位
+    assert len(ctx.history) < before_count
+    assert not any(
+        "[Compacted summary of" in str(m.get("content", "")) for m in ctx.history
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_reports_when_nothing_to_do(ctx):
+    """历史很短：必须如实说"没可压的"，不能假装压过。"""
+    ctx.history[:] = [{"role": "user", "content": "hi"}]
+    result = await registry.execute("/compact", ctx)
+    assert "没有可压缩" in result
+    assert len(ctx.history) == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_empty_history():
+    """/compact 在空历史上仍然是"没得压"，不该抛异常。"""
+    empty = CommandContext(history=[], model="test-model")
+    result = await registry.execute("/compact", empty)
+    assert "No conversation to compact." in result

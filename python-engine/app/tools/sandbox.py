@@ -123,20 +123,59 @@ def _sandbox_tmp_dir() -> Path:
 
 
 def safe_join(rel: str) -> Path:
-    """将相对路径 clamp 到 workspace，拒绝逃逸（绝对路径/../）。"""
-    # ⚠ **跨平台**：`C:/Windows/win.ini` 这类 Windows 风格绝对路径在 **Linux** 上会被
-    # `(base / rel)` 当成**相对路径**（`C:` 不是驱动器）⇒ clamp 出一个无害但**语义错**的
-    # 子目录，而不是本节承诺的"拒绝绝对路径"。CI（Linux）上
-    # `test_safe_join_rejects_escape` 就是这么红的（本机 Windows 绿：那里它确实是绝对路径）。
-    # UNC（`\\\\host\\share`）在 Linux 上同理 —— 一并拒。规则与 `app/tools/ssrf.py` 的
-    # `_command_path_ok` 一致（同一条"哪条路径可以碰"的判据，两处各写一遍就要同款）。
-    if re.match(r"^[A-Za-z]:[\\/]", rel) or rel.startswith(("\\\\", "//")):
-        raise ValueError(f"path escapes sandbox: {rel}")
+    """把路径解析到 workspace 内，拒绝逃逸。
+
+    **语义是"必须在 workspace 之内"，不是"必须是相对路径"。** 早先这里一律拒绝
+    Windows 驱动器前缀，于是模型/用户拿到工作区根之后传**根内的绝对路径**
+    （`D:\\proj\\src\\a.py`）会被判成 `path escapes sandbox` —— 明明在圈内却报逃逸，
+    表现就是"grep/read 工具被沙箱莫名拦住"，而文件其实完全可读。判据应当是
+    **包含关系**（与 Reasonix 的 `within()` 同一个口径：`filepath.Rel` 后看有没有
+    `..` 前缀），而不是路径的书写形态。
+
+    绝对路径（驱动器前缀 / UNC）先按绝对路径解析，落在 base 内则放行，否则拒绝；
+    相对路径仍走原来的 clamp。
+
+    跨平台细节：`C:/Windows/win.ini` 在 **Linux** 上 `Path` 不认它是绝对路径
+    （`C:` 不是驱动器），所以这里**显式**按驱动器形态判定并直接拒绝 —— 否则
+    `(base / rel)` 会把它拼成一个无害但语义错的内层子目录，等于"看着拦了其实没拦"。
+    这条也保证 Linux CI 上 `test_safe_join_rejects_escape` 与 Windows 行为一致。
+    """
     base = workspace_dir().resolve()
-    target = (base / rel).resolve()
-    if target != base and not str(target).startswith(str(base) + os.sep):
-        raise ValueError(f"path escapes sandbox: {rel}")
+    raw = str(rel or "")
+    if re.match(r"^[A-Za-z]:[\\/]", raw) or raw.startswith(("\\\\", "//")):
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            # Linux 上认不出的驱动器/UNC 形态：当作"圈外绝对路径"拒绝
+            raise ValueError(f"path escapes sandbox: {rel}")
+        target = candidate.resolve()
+        raise_if_outside(base, target, rel)
+        return target
+    target = (base / raw).resolve()
+    raise_if_outside(base, target, rel)
     return target
+
+
+def raise_if_outside(base: Path, target: Path, shown: str) -> None:
+    """包含关系判定：`target` 必须落在 `base` 之内，否则拒绝。
+
+    用 `os.path.normcase` 折掉大小写/分隔符差异：Windows 上 `d:\\proj` 与 `D:\\proj`
+    指向同一个目录，而纯字符串 `startswith` 会把它们判成两个 —— 于是"工作区根自己"
+    也算逃逸。这正是"工具被沙箱莫名拦住"的第二个来源（第一个是拒绝绝对路径）。
+
+    `os.path.commonpath` 而不是 `startswith(base)`：后者会把 `/work-evil` 当成
+    `/work` 的子目录（Reasonix 的 `within()` 注释里点名过同一个坑）。
+    """
+    base_s = os.path.normcase(str(base))
+    target_s = os.path.normcase(str(target))
+    if base_s == target_s:
+        return
+    try:
+        if os.path.commonpath([base_s, target_s]) == base_s:
+            return
+    except ValueError:
+        # 不同驱动器 / 不同盘符前缀 ⇒ 必然在圈外
+        pass
+    raise ValueError(f"path escapes sandbox: {shown}")
 
 
 def sandboxed_env() -> dict[str, str]:

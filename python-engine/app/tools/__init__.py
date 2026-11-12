@@ -34,6 +34,7 @@ else:
     import app.tools.ask_user  # noqa: F401 — ask_user（占位 handler，真逻辑在 runtime）
     import app.tools.best_of_n  # noqa: F401 — 差距D：多候选 + judge 选优
     import app.tools.browser  # noqa: F401
+    import app.tools.compact  # noqa: F401 — compact_conversation（模型主动整理上下文）
     import app.tools.core  # noqa: F401
     import app.tools.edit_file  # noqa: F401
     import app.tools.fs_tools  # noqa: F401 — ls（列目录）

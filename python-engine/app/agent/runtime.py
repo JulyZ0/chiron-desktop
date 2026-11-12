@@ -54,6 +54,9 @@ from app.agent.compaction import (
     _estimate_tokens as _estimate_tokens,
 )
 from app.agent.compaction import (
+    _input_budget as _input_budget,
+)
+from app.agent.compaction import (
     _prune_messages as _prune_messages,
 )
 from app.agent.compaction import (
@@ -64,6 +67,9 @@ from app.agent.compaction import (
 )
 from app.agent.compaction import (
     _to_chat_messages as _to_chat_messages,
+)
+from app.agent.compaction import (
+    _tools_tokens as _tools_tokens,
 )
 from app.agent.compaction import (
     _truncate_text as _truncate_text,
@@ -118,6 +124,10 @@ APPROVAL_TTL_SECONDS = 300.0
 #: ask_user 的答案回收与审批同构（同样的 TTL 与单次消费语义）。
 #: 工具名必须与 app/tools/ask_user.py 的 ASK_USER_TOOL 一致 —— runtime 靠它识别提问调用。
 ASK_USER_TOOL = "ask_user"
+#: 模型自主压缩（`app/tools/compact.py`）。与 `ask_user` 同一模式：工具只在列表里露面，
+#: 真正的动作在 runtime 的工具循环里特判 —— 压缩要改的是 runtime 手里的 `messages`，
+#: 工具 handler 拿不到它。
+COMPACT_TOOL = "compact_conversation"
 ASK_ANSWER_TTL_SECONDS = 300.0
 #: 跨副本审批/回答的兜底轮询间隔（秒）。唤醒频道只是**加速器**，不是仲裁者：
 #: 写入方 SET 决策/答案键后 PUBLISH 一条 per-tc 唤醒，等待副本收到即提前 GET+DEL；
@@ -462,6 +472,11 @@ def _split_tool_batch(
        （借鉴 deepagents 的 `_parallel_file_mutation_error`：它为同一问题在文件工具里
        加了"同路径并发写"拒绝）。
 
+    另有一条**只看名字**的硬排除：`compact_conversation`。它虽然登记为 read 级（不碰
+    文件、不触外部），但它要**就地改写 `messages`** —— 与同一批里任何一次工具结果追加
+    都会打架，并发跑会出现"压缩基于的 messages 被杀掉一半"这种不可复现的结果。
+    分级表管的是"要不要人确认"，不是"能不能并发"，所以这条不能靠分级表达。
+
     其余一律进串行组：**宁可少并发，也不让顺序变得不可预测**。
     """
     from app.agent.tool_policy import READ, tool_level
@@ -470,7 +485,11 @@ def _split_tool_batch(
     serial: list[dict[str, Any]] = []
     for call in tool_calls:
         name = str(call.get("name", ""))
-        if name == ASK_USER_TOOL or tool_level(name, _parse_tool_args(call)) != READ:
+        if (
+            name == ASK_USER_TOOL
+            or name == COMPACT_TOOL
+            or tool_level(name, _parse_tool_args(call)) != READ
+        ):
             serial.append(call)
             continue
         candidates.append(call)
@@ -738,6 +757,11 @@ class AgentRuntime:
         self._pending_approvals: dict[str, asyncio.Future[Any]] = {}
         # 待回答的 ask_user 调用 future（外部经 submit_answer 回填答案，值为 str）
         self._pending_answers: dict[str, asyncio.Future[Any]] = {}
+        # `/compact` 的"已受理"标记。斜杠命令拦截发生在**历史加载之前**（0.55 早于 1.），
+        # 那时根本没有对话可压 —— 旧实现在这里读 `ctx.history`（永远为空）→ 恒回
+        # "No conversation to compact."，一条命令等于不存在。真正压缩必须等历史就位，
+        # 所以这里只记意图，动作放到请求前压缩之后（见 `run()` 里的 `_compact_requested` 分支）。
+        self._compact_requested: bool = False
         # 工具授权模式（ask/auto/yolo）：随请求携带（llm_config.tools_mode），
         # `run()` 开始时采用一次，供每次工具调用裁决使用（见 guards.resolve_tools_mode）
         self._current_mode: str = SESSION_MODE_AUTO
@@ -791,9 +815,12 @@ class AgentRuntime:
         llm_config: dict[str, Any],
         *,
         window: int = 0,
+        max_output: int = 0,
+        tools: list[dict[str, Any]] | None = None,
         model: str = "",
         dropped: list[tuple[str, str]] | None = None,
         folds: list[dict[str, Any]] | None = None,
+        force: bool = False,
     ) -> tuple[list[dict[str, Any]], AgentEvent | None]:
         """压缩上下文；**真的压缩了**才返回一个 compaction 事件（否则 None）。
 
@@ -805,22 +832,51 @@ class AgentRuntime:
         因为显式配置是租户/模式的明确口径，而常量只是"查不到时的兜底"。
         """
         comp_cfg = self._resolve_compaction(mode_cfg, llm_config)
+        # 窗口预算先扣掉输出额度与估算余量（`_input_budget`）：窗口是输入输出共用的，
+        # 按整窗排满等于把不存在的空间算成可用 —— 那正是"还没到压缩线就先溢出"的来源。
         budget = (
-            (comp_cfg.max_context_tokens if comp_cfg else 0) or window or MAX_CONTEXT_TOKENS
+            (comp_cfg.max_context_tokens if comp_cfg else 0)
+            or _input_budget(window, max_output)
+            or MAX_CONTEXT_TOKENS
         )
+        # 工具表也是输入的一部分。此前判定只数消息，工具多时系统性偏乐观。
+        tools_tokens = _tools_tokens(tools, model)
         comp_cfg = (
-            replace(comp_cfg, max_context_tokens=budget, model=model)
+            replace(comp_cfg, max_context_tokens=budget, model=model, tools_tokens=tools_tokens)
             if comp_cfg is not None
-            else CompactionConfig(max_context_tokens=budget, model=model)
+            else CompactionConfig(
+                max_context_tokens=budget, model=model, tools_tokens=tools_tokens
+            )
         )
+        if force:
+            # 手动入口（`/compact` 与模型的 `compact_conversation`）语义是"**现在**就整理"，
+            # 而不是"等占用到了再整理" —— 阈值压到 0 即必走 PRUNE。
+            # 刻意**不**沿用 `_force_compact` 的降级砍半：那是溢出后的抢救手段，
+            # 用户/模型主动整理时不该被多丢一截上下文。
+            #
+            # 只压阈值还不够：`max_messages` 仍是 200，一段几十条的对话在预算内就一条都不会
+            # 被裁，用户敲完 `/compact` 只会收到"没有可压缩的内容"。所以保留条数同时收紧到
+            # "最近一半"（至少 4 条）—— 与既有上限取更紧者，既不越权丢掉配置允许之外的历史，
+            # 又保证这一步真的腾出空间。
+            comp_cfg = replace(
+                comp_cfg,
+                threshold_ratio=0.0,
+                snipe_ratio=0.0,
+                strategy="auto",
+                max_messages=min(
+                    comp_cfg.max_messages, max(4, len(messages) // 2)
+                ),
+            )
         # 与判定**同源**：`_compact_messages` 用的是校准后的估算（`cfg.model` → model_window
         # 按 provider 回报反推的分词密度），这里若用无 model 的粗略近似，同一轮里就会出现
         # "判定用的数字"与"报给前端的数字"两套口径 —— 前端显示的占用与触发线对不上，
         # 用户无从判断还差多少才到压缩线。
-        tokens_before = _estimate_tokens(messages, comp_cfg.model)
+        tokens_before = _estimate_tokens(messages, comp_cfg.model) + tools_tokens
         count_before = len(messages)
         compacted = _compact_messages(messages, comp_cfg, dropped=dropped, folds=folds)
-        tokens_after = _estimate_tokens(compacted, comp_cfg.model)
+        # 压缩只动消息、不动工具表，两边加同一个常量不改变差值；但报出去的绝对值
+        # 必须与判定同口径，否则"占用了多少"会被少报一截。
+        tokens_after = _estimate_tokens(compacted, comp_cfg.model) + tools_tokens
         if tokens_after >= tokens_before:
             return compacted, None
         report = {
@@ -844,6 +900,8 @@ class AgentRuntime:
         llm_config: dict[str, Any],
         *,
         window: int = 0,
+        max_output: int = 0,
+        tools: list[dict[str, Any]] | None = None,
         model: str = "",
         dropped: list[tuple[str, str]] | None = None,
         folds: list[dict[str, Any]] | None = None,
@@ -858,7 +916,9 @@ class AgentRuntime:
         """
         comp_cfg = self._resolve_compaction(mode_cfg, llm_config)
         budget = (
-            (comp_cfg.max_context_tokens if comp_cfg else 0) or window or MAX_CONTEXT_TOKENS
+            (comp_cfg.max_context_tokens if comp_cfg else 0)
+            or _input_budget(window, max_output)
+            or MAX_CONTEXT_TOKENS
         )
         forced = replace(
             comp_cfg or CompactionConfig(),
@@ -867,10 +927,19 @@ class AgentRuntime:
             snipe_ratio=0.0,
             strategy="auto",
             model=model,
+            tools_tokens=_tools_tokens(tools, model),
         )
         compacted = _compact_messages(messages, forced, dropped=dropped, folds=folds)
-        if len(compacted) >= len(messages):
-            # prune 没让出空间（消息数没超上限、或只剩 system）→ 直接砍消息数上限
+        # 判"有没有让出空间"必须按 **token**，不能按消息**条数**。
+        #
+        # snipe 把一条工具结果从 16000 字符截到 2000 时，条数**一条都没少**，按条数判
+        # 就会认定"没压缩"，于是再砍一刀 `max_messages` —— 已经省下来的空间白扔，
+        # 还多折叠一段本来能保住的上下文。deepagents 的 `_check_reduction` 同样是
+        # 比 token（并据此拒绝一次"没变小的重试"）。
+        before_tokens = _estimate_tokens(messages, forced.model)
+        after_tokens = _estimate_tokens(compacted, forced.model)
+        if after_tokens >= before_tokens:
+            # 真没让出空间（消息数没超上限、或只剩 system）→ 直接砍消息数上限
             compacted = _prune_messages(
                 messages,
                 replace(forced, max_messages=max(2, forced.max_messages // 2)),
@@ -1059,6 +1128,15 @@ class AgentRuntime:
                 )
             task.content = last_user
             return None
+        if name == "compact":
+            # `/compact` 同理是**动作**。引擎侧 `_compact` 读的是 `ctx.history`，而拦截点
+            # （0.55）在历史加载（1.）**之前** —— 那份 history 永远为空，旧实现因此恒回
+            # "No conversation to compact."，命令等于不存在。
+            # 这里只记意图、返回 None 照常进循环：历史就位后由 `run()` 执行真正的压缩，
+            # 并把 `/compact` 三个字从用户消息里剔掉（它是命令，不是要对模型说的话）。
+            self._compact_requested = True
+            task.content = ""
+            return None
         ctx = CommandContext(
             model=str((task.llm_config or {}).get("model", "")),
             # session_id 也进 metadata：命令若不走工具上下文也能拿到会话身份
@@ -1193,6 +1271,59 @@ class AgentRuntime:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("compaction folds persist failed: %s", exc)
+
+    async def _upgrade_fold_digests(
+        self, folds: list[dict[str, Any]], *, model: str = ""
+    ) -> None:
+        """把同步层写下的**提取式**摘要换成模型摘要（写库之前，就地改写）。
+
+        为什么必须在这里做：`_prune_messages` 是同步纯函数（还被当作 `on_overflow`
+        同步回调传入），调不了模型；而 `digest` 会**顶替原文**参与此后每一次上下文
+        重建 —— 提取式摘要（每条取首行）告诉模型"这段在谈什么"，却讲不出"为什么这么
+        决定、还差什么没做"。这正是"压缩后像换了个人"的主因。
+
+        **失败一律保留提取式**：旁路调用失败、超时、摘要过短、命中占位/套话、不含
+        任何原文锚点（`_validate_digest`），统统不改写。`digest_model` 是读方判断
+        可信度的字段，所以只有真的换成了模型摘要才改它。
+
+        `_source` 无论成败都在这里 pop 掉：它是区间原文，留在 dict 里会让日志、
+        异常回溯、调试输出意外带上整段历史。
+        """
+        if not folds:
+            return
+        # 串行做多条摘要会累加首 token 延迟；一次裁剪通常只产生一条 fold，
+        # 真出现多条时（overflow 连发）也只升级最新的那条，其余保留提取式。
+        for fold in folds[:-1]:
+            fold.pop("_source", None)
+        fold = folds[-1]
+        source = fold.pop("_source", None)
+        if not source or self._gateway is None:
+            return
+
+        from app.agent.bounded_llm import call_bounded
+        from app.agent.compaction import _digest_prompt, _validate_digest
+
+        target_model = model or settings.default_model
+        result = await call_bounded(
+            self._gateway,
+            messages=_digest_prompt(source),
+            model=target_model,
+            # 摘要上限 300 词（见 compaction 的 system prompt），800 足够且能夹住跑题。
+            max_tokens=800,
+            # 比旁路默认 30s 更短：这段跑在"用户已经在等"的路径上。
+            timeout=20.0,
+            purpose="compaction-digest",
+        )
+        if not result.ok:
+            logger.info("compaction digest kept extractive: %s", result.error[:120])
+            return
+        digest = _validate_digest(result.text, source)
+        if not digest:
+            logger.info("compaction digest rejected by shape check, kept extractive")
+            return
+        fold["digest"] = digest
+        fold["digest_model"] = target_model
+        fold["digest_prompt"] = "prune-model"
 
     async def _project_over_budget(
         self, messages: list[dict[str, Any]], task: AgentTask, model: str
@@ -1823,19 +1954,42 @@ class AgentRuntime:
                 # 真压缩了会带回事件 → 立刻让前端"看得见"（问题 4）。
                 compaction_dropped: list[tuple[str, str]] = []
                 compaction_folds: list[dict[str, Any]] = []
+                # `/compact` 走到这里才真正生效：斜杠拦截（0.55）早于历史加载，
+                # 那里只能记意图，此刻 `messages` 才是真对话。
+                force_compact = self._compact_requested
+                self._compact_requested = False
                 messages, compaction_notice = self._compact_with_notice(
                     messages,
                     mode_cfg,
                     llm_config,
                     window=context_window,
+                    # 窗口是输入输出共用的：不扣输出额度就按整窗排满，等于把不存在的
+                    # 空间算成可用（"还没到压缩线先溢出"）。
+                    max_output=max_tokens,
+                    # 工具表也是输入：几十个工具的 schema 轻易上万 token。
+                    tools=tools,
                     model=model,
                     dropped=compaction_dropped,
                     folds=compaction_folds,
+                    force=force_compact,
                 )
                 await self._persist_dropped(compaction_dropped, task)
+                # 摘要升级必须在写库**之前**：`digest` 会顶替原文参与此后每次上下文重建，
+                # 而提取式摘要只说得清"这段在谈什么"、说不出"为什么这么决定"。
+                await self._upgrade_fold_digests(compaction_folds, model=str(model))
                 await self._persist_folds(compaction_folds, task)
                 if compaction_notice is not None:
                     yield compaction_notice
+                elif force_compact:
+                    # 手动压缩却没压出东西（历史太短 / 已在预算内）：必须回一句话，
+                    # 否则用户敲了 `/compact` 却毫无反馈，等于命令不存在。
+                    yield AgentEvent(
+                        type="text",
+                        content=(
+                            "当前对话没有可压缩的内容（历史很短，或已在预算内）。"
+                        ),
+                        trace_id=trace_id,
+                    )
 
             # 推理循环
             _thinking_last_flushed = (
@@ -2077,6 +2231,8 @@ class AgentRuntime:
                         mode_cfg,
                         llm_config,
                         window=context_window,
+                        max_output=max_tokens,
+                        tools=tools,
                         model=model,
                         dropped=compaction_dropped,
                     )
@@ -2140,6 +2296,8 @@ class AgentRuntime:
                         mode_cfg,
                         llm_config,
                         window=context_window,
+                        max_output=max_tokens,
+                        tools=tools,
                         model=model,
                         dropped=overflow_dropped,
                         folds=overflow_folds,
@@ -2246,6 +2404,7 @@ class AgentRuntime:
                         span_name="compaction",
                     )
                 await self._persist_dropped(overflow_dropped, task)
+                await self._upgrade_fold_digests(overflow_folds, model=str(model))
                 await self._persist_folds(overflow_folds, task)
 
                 # C3：**本次调用**的用量（增量）走独立事件 —— 与 `done` 的**整轮累计**分开，
@@ -2412,6 +2571,8 @@ class AgentRuntime:
                     batch_results: dict[str, dict[str, Any]] = {}
                     #: 真正执行过工具的调用 id（供收尾阶段的"无进展"判定；被 ask/护栏拦下的不算）
                     executed_ids: set[str] = set()
+                    #: 本批里模型请求的压缩（只受理、不即时执行，见下）
+                    compact_call_ids: list[str] = []
 
                     if parallel_calls:
                         # 并发组只含"读级 + 无交互语义"的调用，因此**不产生中间事件**
@@ -2422,7 +2583,17 @@ class AgentRuntime:
                         executed_ids.update(call["id"] for call in parallel_calls)
 
                     for call in serial_calls:
-                        if call.get("name") == ASK_USER_TOOL:
+                        if call.get("name") == COMPACT_TOOL:
+                            # 只**受理**、不当场执行。压缩要改写 `messages`，而本批其余调用的
+                            # tool 结果还没写进去 —— 此刻压缩会裁掉"正在进行的这一批"的配对消息
+                            # （assistant.tool_calls 还在、对应的 tool 消息被裁走 ⇒ 下一次请求
+                            # 就是非法序列）。真正压缩放在本批 tool 消息全部落完之后。
+                            compact_call_ids.append(call["id"])
+                            tool_result = {
+                                "accepted": True,
+                                "note": "本批工具结果写入后立即整理上下文",
+                            }
+                        elif call.get("name") == ASK_USER_TOOL:
                             # M7：先取"上一轮挂起期间已经得到的回答"—— 取到了就**不再发问**
                             # （重复问一遍会把用户答过的东西变成一次新的等待）。
                             answered = await self._take_ask_grant(call, task)
@@ -2590,6 +2761,30 @@ class AgentRuntime:
                         len(tool_calls),
                         len(messages),
                     )
+
+                    # ── 模型自主压缩：本批 tool 消息已全部落完，此刻才安全 ──
+                    # 受理点在串行执行段（只记 id），真正的压缩放这里 —— 见那里的注释：
+                    # 在批内压缩会裁掉"正在进行"的 assistant.tool_calls / tool 配对。
+                    if compact_call_ids and mode_cfg.enable_compaction:
+                        _mc_dropped: list[tuple[str, str]] = []
+                        _mc_folds: list[dict[str, Any]] = []
+                        messages, _mc_notice = self._compact_with_notice(
+                            messages,
+                            mode_cfg,
+                            llm_config,
+                            window=context_window,
+                            max_output=max_tokens,
+                            tools=tools,
+                            model=model,
+                            dropped=_mc_dropped,
+                            folds=_mc_folds,
+                            force=True,
+                        )
+                        await self._persist_dropped(_mc_dropped, task)
+                        await self._upgrade_fold_digests(_mc_folds, model=str(model))
+                        await self._persist_folds(_mc_folds, task)
+                        if _mc_notice is not None:
+                            yield _mc_notice
 
                     if self._awaiting_input is not None:
                         # M7：**先**把"这一步在等你"写进历史与事件，**再**落 checkpoint ——

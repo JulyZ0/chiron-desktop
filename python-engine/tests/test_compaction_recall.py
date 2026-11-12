@@ -14,11 +14,14 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.agent.compaction import (
     RECALL_BLOCK_MAX_CHARS,
     CompactionConfig,
+    _apply_folds,
+    _merge_progress,
     _prune_messages,
     _serialize_for_recall,
 )
@@ -280,3 +283,226 @@ def test_no_fold_when_seq_is_missing():
     _prune_messages(messages, CompactionConfig(max_messages=2), folds=folds)
 
     assert folds == []
+
+
+# ── 恢复简报：裁剪后模型还知道"我在干什么" ──
+#
+# 计数提示只说"你少了 N 条"，模型据此无法恢复任何可用状态：开头定下的约束、
+# 已经做完的动作、上一轮的结论，全都要靠猜。以下三条锁死简报的内容契约。
+
+
+def _pruned_note_and_brief(messages: list[dict[str, Any]], **cfg_kwargs: Any) -> tuple[str, str]:
+    """裁剪后取出（提示, 简报）两条通知文本。"""
+    out = _prune_messages(messages, CompactionConfig(**cfg_kwargs))
+    note = next(m["content"] for m in out if "were pruned" in str(m.get("content") or ""))
+    brief = next(
+        (m["content"] for m in out if "接续工作" in str(m.get("content") or "")), ""
+    )
+    return note, brief
+
+
+def test_resume_brief_carries_earlier_constraints():
+    """用户开头说过的硬约束必须出现在简报里 —— 这是"重复犯同一个错"的根因。"""
+    messages = [
+        _msg("system", "你是助手"),
+        _msg("user", "这个仓库绝不要动 vendor/ 目录"),
+        _msg("assistant", "明白，不动 vendor/。"),
+        _msg("user", "问题 1"),
+        _msg("assistant", "回答 1"),
+        _msg("user", "问题 2"),
+        _msg("assistant", "回答 2"),
+    ]
+    note, brief = _pruned_note_and_brief(messages, max_messages=3)
+
+    assert "were pruned" in note
+    assert brief, "被裁掉 user/assistant 时必须留下简报"
+    assert "vendor/" in brief, "开头定下的约束在简报里丢失"
+    assert "接续工作" in brief, "简报要标明自己的身份，否则模型会当成用户新指令"
+
+
+def test_resume_brief_lists_actions_already_taken():
+    """已经用过哪些工具必须能看见，否则压缩后整段重做。"""
+    messages = [
+        _msg("system", "sys"),
+        _msg("user", "修一下测试"),
+        _msg(
+            "assistant",
+            "",
+            tool_calls=[{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}],
+        ),
+        _msg("tool", "文件内容", tool_call_id="c1"),
+        _msg(
+            "assistant",
+            "",
+            tool_calls=[{"id": "c2", "type": "function", "function": {"name": "grep_files", "arguments": "{}"}}],
+        ),
+        _msg("tool", "命中", tool_call_id="c2"),
+        _msg("user", "继续"),
+        _msg("assistant", "好的"),
+    ]
+    _, brief = _pruned_note_and_brief(messages, max_messages=3)
+
+    assert "read_file" in brief
+    assert "grep_files" in brief
+    # 同一工具用过多次不重复列（简报不是调用日志）
+    assert brief.count("read_file") == 1
+
+
+def test_resume_brief_absent_when_nothing_but_tools_dropped():
+    """被裁的全是工具结果时不该硬凑一段简报：没有用户原话可提取。"""
+    messages = [
+        _msg("system", "sys"),
+        _msg("tool", "x" * 100, tool_call_id="c0"),
+        _msg("tool", "y" * 100, tool_call_id="c1"),
+        _msg("tool", "z" * 100, tool_call_id="c2"),
+    ]
+    out = _prune_messages(messages, CompactionConfig(max_messages=2))
+
+    assert not any("接续工作" in str(m.get("content") or "") for m in out)
+
+
+# ── 已完成工作投影：折叠后模型不该重复劳动 ──
+#
+# Reasonix 的 `foldProgress` 从**工具收据**（不是摘要措辞）派生"改过哪些文件、
+# 哪些检查通过了"，并给每条检查打 stale 标记（此后又有变更 ⇒ 那次验证不再作数）。
+# 以下几条锁死 chiron 的等价物 `_fold_progress` / `_merge_progress` / 投影路径。
+
+
+def _call(call_id: str, name: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+    }
+
+
+def _tool_round(
+    call_id: str, name: str, args: dict[str, Any], result: str
+) -> list[dict[str, Any]]:
+    """一轮工具调用：assistant(tool_calls) + tool 结果。"""
+    return [
+        _msg("assistant", "", tool_calls=[_call(call_id, name, args)]),
+        _msg("tool", result, tool_call_id=call_id),
+    ]
+
+
+def test_progress_lists_files_already_changed():
+    """改过的文件必须留在简报里，否则压缩后重改一遍或以为文件还是原样。"""
+    messages: list[dict[str, Any]] = [_msg("system", "sys"), _msg("user", "改一下 a.py")]
+    messages += _tool_round(
+        "c1", "edit_file", {"path": "src/a.py", "old": "x", "new": "y"}, '{"ok": true}'
+    )
+    messages += [_msg("user", "继续"), _msg("assistant", "好的")]
+
+    _, brief = _pruned_note_and_brief(messages, max_messages=2)
+
+    assert "Files already changed" in brief
+    assert "src/a.py" in brief
+
+
+def test_progress_marks_checks_stale_when_mutated_afterwards():
+    """先跑测试、后改文件 ⇒ 那次验证**不再作数**，必须标 stale。
+
+    没有这个标记，"已跑过测试"会变成一句过期承诺：模型据此相信代码仍然是验证过
+    的那个版本，从而跳过重跑 —— 这比不记更糟。
+    """
+    messages: list[dict[str, Any]] = [_msg("system", "sys"), _msg("user", "先测后改")]
+    messages += _tool_round(
+        "c1", "shell_exec", {"command": "python -m pytest tests/ -q"}, "12 passed"
+    )
+    messages += _tool_round("c2", "edit_file", {"path": "src/b.py"}, '{"ok": true}')
+    messages += [_msg("assistant", "改完了")]
+
+    _, brief = _pruned_note_and_brief(messages, max_messages=2)
+
+    assert "Checks already run" in brief
+    assert "pytest" in brief
+    assert "stale" in brief, "变更之后的验证必须标 stale"
+
+
+def test_progress_keeps_check_passing_when_nothing_changed_after():
+    """变更之后才跑的检查就是**当前代码**上的结论，不该被标 stale。"""
+    messages: list[dict[str, Any]] = [_msg("system", "sys"), _msg("user", "先改后测")]
+    messages += _tool_round("c1", "edit_file", {"path": "src/b.py"}, '{"ok": true}')
+    messages += _tool_round(
+        "c2", "shell_exec", {"command": "python -m pytest tests/ -q"}, "12 passed"
+    )
+    messages += [_msg("assistant", "测过了")]
+
+    _, brief = _pruned_note_and_brief(messages, max_messages=2)
+
+    assert "(passed)" in brief
+    assert "stale" not in brief
+
+
+def test_failed_tool_calls_are_not_counted_as_progress():
+    """失败的工具调用不算成果 —— 记成成果会让模型跳过重做。"""
+    messages: list[dict[str, Any]] = [_msg("system", "sys"), _msg("user", "写文件")]
+    messages += _tool_round(
+        "c1", "write_file", {"path": "src/c.py"}, '{"error": "permission denied"}'
+    )
+    messages += [_msg("assistant", "失败了")]
+
+    _, brief = _pruned_note_and_brief(messages, max_messages=2)
+
+    assert "Files already changed" not in brief
+    assert "src/c.py" not in brief
+
+
+def test_code_tools_are_mutations_not_verifications():
+    """`run_code` 的参数是**代码**而不是命令，不能拿它当验证收据。
+
+    如果把代码里的 `pytest` 字样认成"跑过测试"，模型会相信一份根本不存在的结果。
+    """
+    messages: list[dict[str, Any]] = [_msg("system", "sys"), _msg("user", "跑脚本")]
+    messages += _tool_round(
+        "c1", "run_code", {"code": "import pytest\nprint('pytest')"}, "pytest"
+    )
+    messages += [_msg("assistant", "跑完了")]
+
+    _, brief = _pruned_note_and_brief(messages, max_messages=2)
+
+    assert "Checks already run" not in brief
+
+
+def test_projection_carries_progress_from_folded_ranges():
+    """跨副本投影（`_apply_folds`）也要带进度，否则同一份信息在重建后凭空消失。"""
+    messages: list[dict[str, Any]] = [
+        _msg("system", "sys"),
+        _msg("user", "改 a.py", id="m1", seq=1),
+        {
+            "role": "assistant",
+            "content": "",
+            "id": "m2",
+            "seq": 2,
+            "tool_calls": [_call("c1", "write_file", {"path": "src/a.py"})],
+        },
+        _msg("tool", '{"ok": true}', tool_call_id="c1", id="m3", seq=3),
+        _msg("user", "继续", id="m4", seq=4),
+        _msg("assistant", "好的", id="m5", seq=5),
+    ]
+    folds = [
+        {"covered_from": 1, "covered_to": 4, "body_suffix": 2, "digest": "- 用户要求改 a.py"}
+    ]
+
+    out = _apply_folds(messages, folds)
+
+    assert out is not None
+    joined = "\n".join(str(m.get("content") or "") for m in out)
+    assert "src/a.py" in joined, "投影后丢失了已改文件清单"
+
+
+def test_merge_progress_flags_checks_stale_across_folds():
+    """跨 fold 的 stale 重算：后一段折叠里发生过变更，前一段的"已通过"同样作废。"""
+    first = {
+        "changed": ["a.py"],
+        "changed_omitted": 0,
+        "checks": [("python -m pytest", False)],
+        "checks_omitted": 0,
+    }
+    second = {"changed": ["b.py"], "changed_omitted": 0, "checks": [], "checks_omitted": 0}
+
+    merged = _merge_progress([first, second])
+
+    assert merged["changed"] == ["a.py", "b.py"]
+    assert merged["checks"] == [("python -m pytest", True)]

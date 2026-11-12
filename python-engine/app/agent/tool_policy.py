@@ -54,6 +54,10 @@ _READ_TOOLS: frozenset[str] = frozenset(
         "kb_list", "kb_search", "knowledge",
         "memory_search", "recall",
         "skill_list", "skill_discover", "skill_run",
+        # 压缩上下文：只改本 run 的 messages（被裁原文进 result_store 可召回），
+        # 不碰文件、不触外部 ⇒ read 级。放 write 会让模型每次整理都要人点确认，
+        # 而它本就是"给上下文腾地方"的低风险动作。
+        "compact_conversation",
         "read_subagent_result", "read_tool_result", "read_archive", "list_subagent_runs", "job_output", "stderr_drain",
         "requirement_validate", "task_decompose", "tech_design", "prd_generate",
         "vision_analyze", "speech_to_text", "video_analyze",

@@ -66,6 +66,9 @@ var toolLevelTable = func() map[string]ToolLevel {
 		"kb_list", "kb_search", "knowledge",
 		"memory_search", "recall",
 		"skill_list", "skill_discover", "skill_run",
+		// 压缩上下文：只改引擎本 run 的 messages（原文进 result_store 可召回），
+		// 不碰文件、不触外部 ⇒ read 级。与 python-engine/app/agent/tool_policy.py 同构。
+		"compact_conversation",
 		"graph_templates",
 		"read_subagent_result", "read_tool_result", "read_archive", "list_subagent_runs", "job_output", "stderr_drain",
 		"requirement_validate", "task_decompose", "tech_design", "prd_generate",

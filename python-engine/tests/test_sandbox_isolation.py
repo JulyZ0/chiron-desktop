@@ -53,6 +53,39 @@ class TestSandboxLocation:
             safe_join("C:/Windows/win.ini")
         assert safe_join("a/b.txt").is_relative_to(workspace_dir())
 
+    def test_safe_join_accepts_absolute_path_inside_workspace(self):
+        """圈内的**绝对路径**必须放行 —— 判据是包含关系，不是书写形态。
+
+        历史缺陷：任何带驱动器前缀的路径都被判成逃逸，于是模型拿到工作区根之后
+        用 `D:\\proj\\src\\a.py` 读自己的文件会收到 `path escapes sandbox`，
+        表现成"grep / read 被沙箱莫名拦住"，而文件完全可读。
+        """
+        from app.tools.sandbox import safe_join
+
+        set_tool_context(session_id="s", user_id="u1", tenant_id="t1", gateway=None)
+        inside = workspace_dir() / "sub" / "a.txt"
+        assert safe_join(str(inside)) == inside.resolve()
+        # 工作区根本身也可用（"." 的绝对写法）
+        assert safe_join(str(workspace_dir())) == workspace_dir().resolve()
+
+    def test_safe_join_rejects_absolute_path_outside_workspace(self):
+        """圈外的绝对路径仍然必须被拒（包含关系那一侧不能松）。"""
+        from app.tools.sandbox import safe_join
+
+        set_tool_context(session_id="s", user_id="u1", tenant_id="t1", gateway=None)
+        outside = workspace_dir().parent.parent / "outside.txt"
+        with pytest.raises(ValueError, match="escapes"):
+            safe_join(str(outside))
+
+    def test_safe_join_does_not_confuse_sibling_prefix(self):
+        """`/work-evil` 不是 `/work` 的子目录 —— 不能用 startswith 判包含。"""
+        from app.tools.sandbox import raise_if_outside
+
+        base = workspace_dir().resolve()
+        sibling = base.parent / (base.name + "-evil") / "x.txt"
+        with pytest.raises(ValueError, match="escapes"):
+            raise_if_outside(base, sibling.resolve(), str(sibling))
+
 
 class TestShellEscapeBlock:
     def test_absolute_path_detected(self):

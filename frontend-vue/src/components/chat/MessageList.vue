@@ -659,152 +659,184 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
 </script>
 
 <template>
-  <div
-    ref="scrollRef"
-    class="message-list scroll-fade-top"
-    @scroll.passive="onScroll"
-    @wheel.passive="onUserInput"
-    @touchstart.passive="onUserInput"
-    @mouseup="onSelectionUp"
-  >
-    <!-- P2-E: 首次加载骨架屏 -->
+  <!-- 外层定位容器：**锚点必须在这里，不能放进下面那个滚动容器**。
+       滚动容器里的元素（无论 sticky 还是 absolute）都会随内容一起滚走，
+       这正是"向上滚动时锚点飞走"的根因。 -->
+  <div class="message-list-wrap">
     <div
-      v-if="initialLoading"
-      class="skeleton-list"
+      ref="scrollRef"
+      class="message-list scroll-fade-top"
+      @scroll.passive="onScroll"
+      @wheel.passive="onUserInput"
+      @touchstart.passive="onUserInput"
+      @mouseup="onSelectionUp"
     >
+      <!-- P2-E: 首次加载骨架屏 -->
       <div
-        v-for="n in 4"
-        :key="n"
-        class="skeleton-msg"
-        :class="n % 2 === 0 ? 'user' : 'assistant'"
+        v-if="initialLoading"
+        class="skeleton-list"
       >
         <div
-          class="skeleton-avatar skeleton"
-          data-motion="wave"
-          :style="{ '--skel-i': 0 }"
-        />
-        <div class="skeleton-lines">
+          v-for="n in 4"
+          :key="n"
+          class="skeleton-msg"
+          :class="n % 2 === 0 ? 'user' : 'assistant'"
+        >
           <div
-            class="skeleton-line skeleton"
+            class="skeleton-avatar skeleton"
             data-motion="wave"
-            :style="{ width: 60 + (n * 7) % 30 + '%', '--skel-i': 1 }"
+            :style="{ '--skel-i': 0 }"
           />
-          <div
-            class="skeleton-line skeleton"
-            data-motion="wave"
-            :style="{ width: 80 + (n * 11) % 15 + '%', '--skel-i': 2 }"
-          />
+          <div class="skeleton-lines">
+            <div
+              class="skeleton-line skeleton"
+              data-motion="wave"
+              :style="{ width: 60 + (n * 7) % 30 + '%', '--skel-i': 1 }"
+            />
+            <div
+              class="skeleton-line skeleton"
+              data-motion="wave"
+              :style="{ width: 80 + (n * 11) % 15 + '%', '--skel-i': 2 }"
+            />
+          </div>
         </div>
       </div>
-    </div>
-    <div
-      v-else-if="items.length === 0"
-      class="list-empty-placeholder"
-    />
+      <div
+        v-else-if="items.length === 0"
+        class="list-empty-placeholder"
+      />
 
-    <!-- P 性能：触顶加载更早（infinite scroll）。
+      <!-- P 性能：触顶加载更早（infinite scroll）。
          失败与"没有更多"必须可区分：前者给一个可点的重试，后者整块消失。 -->
-    <div
-      v-if="props.hasMore || props.loadingEarlier"
-      class="earlier-loader"
-    >
-      <template v-if="props.loadingEarlier">
-        <span class="loading-dots"><span /><span /><span /></span>
-      </template>
-      <button
-        v-else-if="props.earlierLoadFailed"
-        type="button"
-        class="earlier-retry"
-        @click="emit('load-earlier')"
+      <div
+        v-if="props.hasMore || props.loadingEarlier"
+        class="earlier-loader"
       >
-        {{ $t('chat.load_earlier_failed_retry') }}
-      </button>
-      <span v-else>{{ $t('chat.load_earlier_messages') }}</span>
-    </div>
+        <template v-if="props.loadingEarlier">
+          <span class="loading-dots"><span /><span /><span /></span>
+        </template>
+        <button
+          v-else-if="props.earlierLoadFailed"
+          type="button"
+          class="earlier-retry"
+          @click="emit('load-earlier')"
+        >
+          {{ $t('chat.load_earlier_failed_retry') }}
+        </button>
+        <span v-else>{{ $t('chat.load_earlier_messages') }}</span>
+      </div>
 
-    <!-- 消息列表：窗口化渲染（只挂载窗口内的行，其余用 spacer 占位）。
+      <!-- 消息列表：窗口化渲染（只挂载窗口内的行，其余用 spacer 占位）。
          所有 item 类型统一交给 MessageItem 按 kind 分发（text / reasoning /
          tool_call / tool_result / turn_stats / date_divider），此处只额外处理
          kb_hits（统一任务模式的专属标签，不属于 ChatItem 联合类型） -->
-    <div class="message-container">
-      <template
-        v-for="node in renderNodes"
-        :key="node.key"
-      >
-        <!-- 段间与首尾占位：未挂载部分仍占真实高度，滚动条不跳 -->
-        <div
-          v-if="node.kind === 'spacer'"
-          class="window-spacer"
-          :style="{ height: (node as any).height + 'px' }"
-        />
-        <!-- data-item-key：锚点定位用的稳定身份（不能被内容补丁改写） -->
-        <div
-          v-else
-          class="chat-row"
-          :data-item-key="node.key"
+      <div class="message-container">
+        <template
+          v-for="node in renderNodes"
+          :key="node.key"
         >
-          <!-- 折叠头行（回合 / 工具组）：身份来自投影的 header.fold，点击切换折叠态 -->
-          <FoldHeader
-            v-if="(node as any).row.header"
-            :header="(node as any).row.header"
-            @toggle="toggleFold((node as any).row.header.fold)"
+          <!-- 段间与首尾占位：未挂载部分仍占真实高度，滚动条不跳 -->
+          <div
+            v-if="node.kind === 'spacer'"
+            class="window-spacer"
+            :style="{ height: (node as any).height + 'px' }"
           />
-          <MessageItem
-            v-else-if="(node as any).row.item.kind !== 'kb_hits'"
-            :item="(node as any).row.item"
-            :session-id="props.sessionKey"
-            :project-id="props.projectId"
-            :anchor-key="isUserAnchor((node as any).row.item) ? (node as any).row.index : undefined"
-            :highlighted="highlightIndex === (node as any).row.index"
-            :entering="enteringIds.has((node as any).row.item.id ?? '')"
-            @retry-from="(id: string, text: string) => emit('retry-from', id, text)"
-            @regenerate="(id: string) => emit('regenerate', id)"
-            @continue="(id: string) => emit('continue', id)"
-            @retry-failed="(id: string) => emit('retry-failed', id)"
-            @quote="(text: string) => emit('quote-text', text)"
-          />
+          <!-- data-item-key：锚点定位用的稳定身份（不能被内容补丁改写） -->
           <div
             v-else
-            class="kb-hits-tag"
+            class="chat-row"
+            :data-item-key="node.key"
           >
-            <span class="kb-hits-text">{{ $t('knowledge.referenced_knowledge_base_n', { n: (node as any).row.item.count || 1 }) }}</span>
-            <a
-              v-if="(node as any).row.item.kb_id"
-              class="kb-hits-link"
-              href="#"
-              :title="$t('knowledge.view_referenced_knowledge_base')"
-              @click.prevent
-            >{{ $t('knowledge.view_knowledge_base') }}</a>
+            <!-- 折叠头行（回合 / 工具组）：身份来自投影的 header.fold，点击切换折叠态 -->
+            <FoldHeader
+              v-if="(node as any).row.header"
+              :header="(node as any).row.header"
+              @toggle="toggleFold((node as any).row.header.fold)"
+            />
+            <MessageItem
+              v-else-if="(node as any).row.item.kind !== 'kb_hits'"
+              :item="(node as any).row.item"
+              :session-id="props.sessionKey"
+              :project-id="props.projectId"
+              :anchor-key="isUserAnchor((node as any).row.item) ? (node as any).row.index : undefined"
+              :highlighted="highlightIndex === (node as any).row.index"
+              :entering="enteringIds.has((node as any).row.item.id ?? '')"
+              @retry-from="(id: string, text: string) => emit('retry-from', id, text)"
+              @regenerate="(id: string) => emit('regenerate', id)"
+              @continue="(id: string) => emit('continue', id)"
+              @retry-failed="(id: string) => emit('retry-failed', id)"
+              @quote="(text: string) => emit('quote-text', text)"
+            />
+            <div
+              v-else
+              class="kb-hits-tag"
+            >
+              <span class="kb-hits-text">{{ $t('knowledge.referenced_knowledge_base_n', { n: (node as any).row.item.count || 1 }) }}</span>
+              <a
+                v-if="(node as any).row.item.kb_id"
+                class="kb-hits-link"
+                href="#"
+                :title="$t('knowledge.view_referenced_knowledge_base')"
+                @click.prevent
+              >{{ $t('knowledge.view_knowledge_base') }}</a>
+            </div>
           </div>
-        </div>
-      </template>
-    </div>
+        </template>
+      </div>
 
-    <div
-      v-if="loading"
-      class="loading-indicator"
-    >
-      <span class="loading-dots"><span /><span /><span /></span>
-    </div>
-
-    <!-- 回到底部按钮：离开底部时显示 + 新消息未读徽标（deepseek bottom-follow 语义补充） -->
-    <Transition name="back-fade">
-      <button
-        v-if="showBackToBottom"
-        class="back-to-bottom"
-        type="button"
-        :title="unseenCount ? $t('chat.back_to_bottom_n_new_messages', { n: unseenCount }) : $t('common.back_to_bottom')"
-        @click="scrollToBottom"
+      <div
+        v-if="loading"
+        class="loading-indicator"
       >
-        <ArrowDownOutlined />
-        <span
-          v-if="unseenCount"
-          class="back-badge"
-        >{{ badgeText }}</span>
-      </button>
-    </Transition>
+        <span class="loading-dots"><span /><span /><span /></span>
+      </div>
 
-    <!-- 提问导航条：零高度宿主 + sticky 居中；锚点数量多时由 JS 压缩尺寸装下，不出现内部滚动 -->
+      <!-- 回到底部按钮：离开底部时显示 + 新消息未读徽标（deepseek bottom-follow 语义补充） -->
+      <Transition name="back-fade">
+        <button
+          v-if="showBackToBottom"
+          class="back-to-bottom"
+          type="button"
+          :title="unseenCount ? $t('chat.back_to_bottom_n_new_messages', { n: unseenCount }) : $t('common.back_to_bottom')"
+          @click="scrollToBottom"
+        >
+          <ArrowDownOutlined />
+          <span
+            v-if="unseenCount"
+            class="back-badge"
+          >{{ badgeText }}</span>
+        </button>
+      </Transition>
+
+      <!-- 选中文本操作菜单：按内容坐标定位（.message-list 的 layout containment 是定位上下文） -->
+      <div
+        v-if="selectionAt"
+        class="selection-menu"
+        :class="{ below: selectionAt.below }"
+        :style="{ left: selectionAt.x + 'px', top: selectionAt.y + 'px' }"
+        role="menu"
+      >
+        <button
+          class="sel-btn"
+          type="button"
+          role="menuitem"
+          @click="copySelection"
+        >
+          {{ $t('common.copy') }}
+        </button>
+        <button
+          class="sel-btn"
+          type="button"
+          role="menuitem"
+          @click="quoteSelection"
+        >
+          {{ $t('common.quote_to_input_box') }}
+        </button>
+      </div>
+    </div><!-- /.message-list 滚动容器 -->
+
+    <!-- 提问导航条：在**滚动容器之外**，所以固定不动。
+         之前放在滚动容器内部，无论 sticky 还是 absolute 都会随内容滚走。 -->
     <div
       v-if="questions.length >= 2"
       class="question-rail-host"
@@ -831,37 +863,17 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
         />
       </nav>
     </div>
-
-    <!-- 选中文本操作菜单：按内容坐标定位（.message-list 的 layout containment 是定位上下文） -->
-    <div
-      v-if="selectionAt"
-      class="selection-menu"
-      :class="{ below: selectionAt.below }"
-      :style="{ left: selectionAt.x + 'px', top: selectionAt.y + 'px' }"
-      role="menu"
-    >
-      <button
-        class="sel-btn"
-        type="button"
-        role="menuitem"
-        @click="copySelection"
-      >
-        {{ $t('common.copy') }}
-      </button>
-      <button
-        class="sel-btn"
-        type="button"
-        role="menuitem"
-        @click="quoteSelection"
-      >
-        {{ $t('common.quote_to_input_box') }}
-      </button>
-    </div>
-  </div>
+  </div><!-- /.message-list-wrap -->
 </template>
 
 <style scoped>
-.message-list { flex: 1; overflow-y: auto; position: relative; contain: layout style; }
+/* 外层定位容器：承接原 `.message-list` 的 flex 占位，同时作为锚点的定位基准。
+ *
+ * 为什么需要这一层：锚点必须**在滚动容器之外**才能固定不动。
+ * 放在 `.message-list`（`overflow-y: auto`）内部时，无论 `sticky` 还是
+ * `absolute`，都会随内容一起滚走 —— 这正是"向上滚动时锚点飞走"的根因。 */
+.message-list-wrap { flex: 1; min-height: 0; position: relative; display: flex; }
+.message-list { flex: 1; min-width: 0; overflow-y: auto; position: relative; contain: layout style; }
 .list-empty-placeholder { height: 24px; }
 
 /* P2-E: 首屏骨架屏 */

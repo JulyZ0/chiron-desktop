@@ -58,6 +58,9 @@ CORE_TOOL_NAMES = frozenset(
         "subagent",  # 子 agent 委派（多 agent 协作核心）
         "use_capability",  # P7：外部能力（MCP / 插件）的单一代理入口
         "best_of_n",  # 差距D：多条路并排比较后选优（重构/修 bug/设计取舍）
+        # 模型自主整理上下文。注册了却不可见 = 这条能力等于不存在（`media_create` 踩过
+        # 同一个坑：见 vendor/规划.md §4）。它只在模型主动调用时才占上下文，平时零成本。
+        "compact_conversation",
     }
 )
 
@@ -88,6 +91,9 @@ CODE_TOOL_NAMES = frozenset(
         "run_code",  # 程序化批量操作（沙箱内执行）
         "git_status",  # 看工作区状态
         "git_diff",  # 看改动内容
+        # 编码任务最容易撑爆上下文（读一堆文件 → 改 → 跑测试）。允许模型在"定位结束、
+        # 准备动手"这个自然的阶段边界主动整理，比等阈值触发被动裁剪更可控。
+        "compact_conversation",
     }
 )
 

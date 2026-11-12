@@ -25,8 +25,14 @@ logger = logging.getLogger(__name__)
 
 #: 窗口配置的进程内缓存 TTL（秒）
 WINDOW_CACHE_TTL_SECONDS = 300
-#: 查不到窗口时的回落值（与 `runtime.MAX_CONTEXT_TOKENS` 同值，保持历史行为）
-DEFAULT_CONTEXT_WINDOW = 8192
+#: 查不到窗口时的回落值。
+#:
+#: **不能再用 8192**：Chiron 声明的 provider 里主流模型窗口都在 64K~1M，回落成 8K 会让
+#: "窗口表里没有这一行"直接退化成"每两轮压缩一次" —— 与 `MAX_MESSAGES` 那个 16 条上限
+#: 是同一类故障（拿历史常量当预算），而且更隐蔽：日志里只会看到压缩事件，看不出
+#: 是查库没查到。回落值取一个**保守但不荒谬**的现代下限；显式配置（`CompactionConfig.
+#: max_context_tokens`）仍然优先，溢出恢复（强制压缩 + 重试一次）继续兜底小窗口模型。
+DEFAULT_CONTEXT_WINDOW = 65536
 #: 查不到输出上限时的回落值（与 `settings.default_max_tokens` 同值，保持历史行为）
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
 #: 输出上限的下限。管理端填 1 会让模型一个字都说不完；低于此值按未知处理。

@@ -36,20 +36,47 @@ async def _clear(args: str, ctx: CommandContext | None) -> str:
 
 
 async def _compact(args: str, ctx: CommandContext | None) -> str:
-    """Compress / summarise conversation context."""
+    """Compress conversation context — **真的压**，不再伪造一条摘要。
+
+    旧实现只是把 `ctx.history` 清空、塞进一条
+    `[Compacted summary of N previous messages]` 占位：既没读原文、也没产出摘要，
+    等于**整段对话被删除**却报告"已压缩"。这里改成走真正的压缩链
+    （`app/agent/compaction.py`），并把压前/压后的 token 如实报出去。
+
+    手动入口的语义是"**现在**就整理"，所以阈值压到 0（必走 PRUNE）；
+    刻意不沿用溢出抢救时的降级砍半 —— 那是被动的、丢得更多。
+    """
     if ctx is None or not ctx.history:
         return "No conversation to compact."
-    count = len(ctx.history)
-    summary = f"Compacted {count} messages into context summary."
-    if ctx is not None:
-        ctx.history.clear()
-        ctx.history.append(
-            {
-                "role": "system",
-                "content": f"[Compacted summary of {count} previous messages]",
-            }
-        )
-    return summary
+
+    from dataclasses import replace
+
+    from app.agent.compaction import CompactionConfig, _compact_messages, _estimate_tokens
+
+    cfg = replace(
+        CompactionConfig(model=ctx.model or ""),
+        threshold_ratio=0.0,
+        snipe_ratio=0.0,
+        strategy="auto",
+        # 保留条数收紧到"最近一半"：`max_messages` 默认 200，一段几十条的对话在预算内
+        # 一条都不会被裁，用户敲完 `/compact` 只会收到"没有可压缩的内容"。
+        max_messages=max(4, len(ctx.history) // 2),
+    )
+    before_tokens = _estimate_tokens(ctx.history, cfg.model)
+    before_count = len(ctx.history)
+    compacted = _compact_messages(list(ctx.history), cfg)
+    after_tokens = _estimate_tokens(compacted, cfg.model)
+
+    # 压不动就如实说 —— 报"已压缩"却什么都没变，会让用户以为上下文被清空了。
+    if after_tokens >= before_tokens:
+        return "当前对话没有可压缩的内容（历史很短，或已在预算内）。"
+
+    ctx.history[:] = compacted
+    return (
+        f"Compacted {before_count} → {len(compacted)} messages, "
+        f"{before_tokens} → {after_tokens} tokens "
+        f"(saved {before_tokens - after_tokens})."
+    )
 
 
 # ── /model <name> ───────────────────────────────────────────────
