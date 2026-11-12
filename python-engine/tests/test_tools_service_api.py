@@ -9,7 +9,7 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.main import create_app, get_gateway
+from app.main import create_app
 
 # 网关注入的身份（AuthMiddleware 要求 query 身份 + X-Internal-Token 同时存在）
 IDENTITY = {"user_id": "test-user", "tenant_id": "1"}

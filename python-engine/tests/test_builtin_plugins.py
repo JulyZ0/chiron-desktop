@@ -24,7 +24,6 @@ from app.plugins.builtin import (
     builtin_plugins,
 )
 
-
 # ── 清单 ─────────────────────────────────────────────────────────────────
 
 

@@ -37,6 +37,19 @@ GOOD_DIGEST = (
 )
 
 
+def _big_source() -> list[dict[str, Any]]:
+    """一个**跨过折叠经济性门槛**的区间（`DIGEST_MIN_FOLD_TOKENS`）。
+
+    `_range()` 只够验证"序列化保留了角色"，却小到不值得发一次摘要调用 ——
+    而 `_upgrade_fold_digests` 现在会拒绝这种区间（Reasonix `foldEconomics` 同款）。
+    升级路径的测试必须用够大的区间，否则测的是门槛而不是升级。
+    """
+    return [
+        {**m, "content": (m.get("content") or "") + "补充说明。" * 120}
+        for m in _range()
+    ]
+
+
 def _range() -> list[dict[str, Any]]:
     """一个典型折叠区间：既有用户约束，也有改文件的工具调用。"""
     return [
@@ -186,7 +199,7 @@ def test_anchors_ignore_role_headers_but_keep_identifiers():
 @pytest.mark.asyncio
 async def test_upgrade_replaces_extractive_with_model_summary():
     gateway = _StubGateway(content=GOOD_DIGEST)
-    folds = [_fold(_range())]
+    folds = [_fold(_big_source())]
 
     await _runtime(gateway)._upgrade_fold_digests(folds, model="deepseek-chat")
 
@@ -202,7 +215,7 @@ async def test_upgrade_replaces_extractive_with_model_summary():
 async def test_upgrade_keeps_extractive_when_the_call_fails():
     """旁路失败绝不能拖垮本轮，也不能把摘要清空。"""
     gateway = _StubGateway(raises=RuntimeError("provider 503"))
-    folds = [_fold(_range())]
+    folds = [_fold(_big_source())]
 
     await _runtime(gateway)._upgrade_fold_digests(folds)
 
@@ -216,7 +229,7 @@ async def test_upgrade_keeps_extractive_when_the_summary_is_fabricated():
     gateway = _StubGateway(
         content="用户和助手围绕一个软件工程问题进行了多轮讨论，助手给出了一些方案，用户表示认可。"
     )
-    folds = [_fold(_range())]
+    folds = [_fold(_big_source())]
 
     await _runtime(gateway)._upgrade_fold_digests(folds)
 
@@ -225,7 +238,7 @@ async def test_upgrade_keeps_extractive_when_the_summary_is_fabricated():
 
 @pytest.mark.asyncio
 async def test_upgrade_skips_calling_the_model_without_a_gateway():
-    folds = [_fold(_range())]
+    folds = [_fold(_big_source())]
 
     await _runtime(None)._upgrade_fold_digests(folds)
 
@@ -237,7 +250,7 @@ async def test_upgrade_skips_calling_the_model_without_a_gateway():
 async def test_upgrade_only_summarises_the_newest_fold():
     """多条 fold 时不串行烧钱：旧区间保留提取式，但原文同样要清掉。"""
     gateway = _StubGateway(content=GOOD_DIGEST)
-    folds = [_fold(_range()), _fold(_range())]
+    folds = [_fold(_big_source()), _fold(_big_source())]
 
     await _runtime(gateway)._upgrade_fold_digests(folds)
 

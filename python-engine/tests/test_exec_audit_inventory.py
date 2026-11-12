@@ -66,6 +66,13 @@ AUDITED_BY_CALLER = {
 
 EXEMPT = {
     "agent/prompt_engine.py": "只跑**固定参数**的 git 只读命令（rev-parse/status/log），无外部输入",
+    "agent/git_checkpoint.py": (
+        "检查点机制**自身的底层实现**，不是 agent 执行的命令：唯一的起进程点是 "
+        "`_run_git` 的 `subprocess.run`，argv 全部由代码常量拼出（git 子命令 + 工作区根 + "
+        "git 自身输出里取到的路径），列表形式调用、不经 shell，子命令没有一处来自模型或用户输入。"
+        "检查点是否成功由 `GitError` 与 `checkpoint mark` 记录体现，混进 exec_audit 只会把"
+        "「agent 跑过什么命令」这条审计线索淹没在几十条内部 git 里"
+    ),
     "isolation/win.py": (
         "隔离机制**自身的前置配置**，不是 agent 执行的命令：4 处 subprocess.run 全是"
         "固定子命令的 icacls（/grant、/remove、/setintegritylevel、/grant:r），"

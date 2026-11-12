@@ -334,6 +334,10 @@ DIGEST_MAX_CHARS = 1200
 #: 送给模型做摘要的区间原文上限。区间可能很长，无上限会让这次旁路调用本身超窗；
 #: 旁路失败就回退提取式，等于白烧一次钱。超限时保留**靠后**的部分（与召回块同理）。
 DIGEST_SOURCE_MAX_CHARS = 24_000
+#: 摘要**链**的总长上限（多条 fold 的 digest 拼接后）。折叠十几次后光摘要就会
+#: 占掉大半预算，而摘要本身是压缩产物、理应急剧小于原文。超限时从旧到新截，
+#: 最新一条永远完整 —— 它覆盖的是刚刚发生的事，可信度最高。
+DIGEST_CHAIN_MAX_CHARS = 4000
 
 #: 摘要里**不该出现**的东西：占位串、降级标记、以及"我做不到"的套话。
 _DIGEST_REJECT_RE = re.compile(
@@ -828,6 +832,58 @@ def _prune_messages(
         if need == start:
             break
         start = need
+    # ── D3：本轮请求不能折进摘要 ──
+    #
+    # Reasonix `keepIndexes` 对 `activeTurnStart` 是硬性保留：
+    # "The request that began the running turn states the work the rest of the turn
+    # is executing. Its closed transactions may fold; it may not."
+    #
+    # 长回合（几十次工具调用）里，按条数/token 算出的切点很容易越过这条请求，
+    # 压缩完模型就"忘了自己在干什么"。
+    #
+    # 实现取"把切点前移到它之前"而不是"钉住它一条"：chiron 的 fold 是**连续**区间
+    # （`session_folds.covered_from/to`），跳着保留一条会让区间不再连续，连带
+    # `covered_ids`、recall block、`_apply_folds` 的相接校验全部失真。代价是本轮
+    # 请求起到尾部整段保留、这一轮少压一些 —— 这是有意的取舍：丢掉"正在做的事"
+    # 比少压几 KB 严重得多。窗口真的撑不住时，溢出路径的强制压缩会接手。
+    turn_start = -1
+    for idx in range(len(processed) - 1, -1, -1):
+        m = processed[idx]
+        if m.get("role") != "user":
+            continue
+        text = str(m.get("content") or "")
+        # 压缩自己写的提示（裁剪通知 / 续接简报）不是用户请求，不能当本轮起点。
+        if "were pruned to fit the context window" in text:
+            continue
+        if text.lstrip().startswith(("## 已完成工作", "[resume brief")):
+            continue
+        turn_start = idx
+        break
+    # 仅当本轮起点**之前还有历史**时才前移切点。`turn_start == 0` 表示整个区间
+    # 都是本轮（没有更早的上下文），此时前移到 0 等于完全禁止压缩 —— 窗口照样爆，
+    # 只是把问题推给溢出路径。"折进摘要会忘掉在干什么"的风险在那种情形下也不成立：
+    # 摘要里装的本来就是本轮内容。
+    if turn_start > 0:
+        start = min(start, turn_start)
+
+    # ── D4：折叠边界必须是"工具调用已闭合"的点 ──
+    #
+    # Reasonix `closedPrefixEnd` 的注释讲明了后果：停在别处等于交给 provider 一个
+    # assistant 回合、其中的调用**永远没有结果**，而被留下的尾部从半组开始 ——
+    # 模型看到的序列自相矛盾。既有循环保证的是"kept 内部配对完整"，不保证
+    # "折叠区间末端闭合"，所以这里把切点前移到整组之前。
+    if 0 < start < len(processed):
+        prev = processed[start - 1]
+        if prev.get("role") == "assistant" and prev.get("tool_calls"):
+            start -= 1
+            # 并行调用会连写多条 assistant(tool_calls)，整组一起让出
+            while (
+                start > 0
+                and processed[start - 1].get("role") == "assistant"
+                and processed[start - 1].get("tool_calls")
+            ):
+                start -= 1
+
     kept = processed[start:]
     dropped_count = len(processed) - len(kept)
     result = system_msgs + kept
@@ -1026,6 +1082,34 @@ def _fixed_tokens(message: dict[str, Any], chars_per_token: int = 4) -> int:
     return total
 
 
+def _relabel_by_ids(
+    rest: list[dict[str, Any]], folds: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    """`seq` 缺失时用 `covered_ids` 重建坐标（D8）。
+
+    `messages.seq` 是整表 identity 列，绝大多数行都有；但导入的旧会话、手工补录的
+    行可能没有。此时投影会因"坐标不完备"整段放弃 —— 回退全量、超预算只能走实时
+    裁剪，丢得比投影狠得多。折叠记录里的 `covered_ids` 留着每条被折消息的 id，
+    足以把边界重新算出来：用消息在序列中的**位置**当坐标即可。
+
+    返回 `(None, None)` 表示无法重建（有消息连 id 都没有，或某条 fold 的 id
+    全不在当前序列里）—— 那种情形确实没有可靠依据，宁可回退全量。
+    """
+    if any(not m.get("id") for m in rest):
+        return None, None
+    pos = {str(m["id"]): idx for idx, m in enumerate(rest)}
+    rebuilt = [{**m, "seq": idx} for idx, m in enumerate(rest)]
+    relabelled: list[dict[str, Any]] = []
+    for fold in folds:
+        idxs = [pos[str(i)] for i in (fold.get("covered_ids") or []) if str(i) in pos]
+        if not idxs:
+            return None, None
+        relabelled.append(
+            {**fold, "covered_from": min(idxs), "covered_to": max(idxs) + 1}
+        )
+    return rebuilt, relabelled
+
+
 def _apply_folds(
     messages: list[dict[str, Any]],
     folds: list[dict[str, Any]],
@@ -1054,9 +1138,12 @@ def _apply_folds(
     if not rest or not folds:
         return None
 
-    # 校验 1：坐标完备
+    # 校验 1：坐标完备。缺失时用 `covered_ids` 重建（D8），重建不了才放弃。
     if any(m.get("seq") is None for m in rest):
-        return None
+        rebuilt_rest, rebuilt_folds = _relabel_by_ids(rest, folds)
+        if rebuilt_rest is None:
+            return None
+        rest, folds = rebuilt_rest, rebuilt_folds
 
     ordered = sorted(rest, key=lambda m: int(m["seq"]))
     ordered_folds = sorted(folds, key=lambda f: int(f["covered_from"]))
@@ -1082,7 +1169,28 @@ def _apply_folds(
     if any(not _covered_by_fold(int(m["seq"])) for m in ordered if int(m["seq"]) < last_to):
         return None
 
-    digests = [f["digest"] for f in ordered_folds if f.get("digest")]
+    # D5：摘要**链**也要有上限。每条 fold 一条摘要，长会话折叠十几次后光摘要就
+    # 占掉大半预算 —— 而摘要本身是压缩产物，理论上应远小于原文，实际却会线性累积。
+    # Reasonix 把摘要全部放在可折叠区（`isCompactionSummary`），从不 pin。
+    #
+    # 这里取"从最新往回装，装不下就截断旧的"：最新一条永远完整（它覆盖的是刚刚
+    # 发生的事，可信度最高），更早的只保留开头（背景与约束通常在开头）。
+    # 一条都不装会丢掉全部历史，所以至少保住最新那一条。
+    chain: list[str] = []
+    remaining = DIGEST_CHAIN_MAX_CHARS
+    for fold in reversed(ordered_folds):
+        digest = fold.get("digest")
+        if not digest:
+            continue
+        text = str(digest)
+        if len(text) > remaining:
+            if not chain:
+                chain.append(text[:remaining])
+                break
+            break
+        chain.append(text)
+        remaining -= len(text)
+    digests = list(reversed(chain))
     if not digests:
         return None
 

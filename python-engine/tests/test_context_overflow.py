@@ -32,6 +32,20 @@ class _FakeWindowPool:
         return {"context_window": self.window}
 
 
+def _long_history(n: int = 40) -> list[dict[str, Any]]:
+    """一段**可折叠**的历史。
+
+    D1 之后，"压缩没腾出空间"会直接放弃重试（重发一次必然再溢出，纯烧钱）。
+    因此只有 system+user 两条消息的用例测到的是**放弃路径**；要测"重试一次"
+    必须真的给得出可压缩的上下文。
+    """
+    out: list[dict[str, Any]] = []
+    for i in range(n):
+        out.append({"role": "user", "content": f"第 {i} 个问题：" + "背景说明。" * 40})
+        out.append({"role": "assistant", "content": f"第 {i} 个回答：" + "细节解释。" * 40})
+    return out
+
+
 @pytest.fixture(autouse=True)
 def _clear_window_cache():
     model_window.clear_cache()
@@ -257,6 +271,10 @@ async def test_runtime_retries_once_on_context_overflow(monkeypatch: pytest.Monk
         system_prompt="sp",
         llm_config={"mode": "normal"},
         max_turns=2,
+        # 溢出重试的前提是"**有东西可压**"：D1 要求压缩必须真的让出空间，
+        # 否则重发一次只会再失败一次。只有 system+user 两条消息时压缩无从下手，
+        # 那时正确行为是直接放弃（另有测试覆盖）。这里给一段可折叠的历史。
+        history=_long_history(),
     )
     events = [event async for event in runtime.run(task)]
 
@@ -296,6 +314,8 @@ async def test_runtime_does_not_retry_twice(monkeypatch: pytest.MonkeyPatch):
         system_prompt="sp",
         llm_config={"mode": "normal"},
         max_turns=2,
+        # 同上：要有可折叠历史，第一次压缩才救得回来，才轮得到"第二次不重试"。
+        history=_long_history(),
     )
     events = [event async for event in runtime.run(task)]
 

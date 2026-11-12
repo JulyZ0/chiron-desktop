@@ -128,6 +128,11 @@ ASK_USER_TOOL = "ask_user"
 #: 真正的动作在 runtime 的工具循环里特判 —— 压缩要改的是 runtime 手里的 `messages`，
 #: 工具 handler 拿不到它。
 COMPACT_TOOL = "compact_conversation"
+
+#: 折叠经济性门槛（Reasonix `foldEconomics` 的 `minFoldTokens` 同款）。
+#: 区间小于这个规模时，一次摘要调用省下的 token 抵不过往返代价、延迟与计费 ——
+#: 宁可保留提取式摘要（质量差一点），也不为几十 token 的区间发一次 LLM 请求。
+DIGEST_MIN_FOLD_TOKENS = 100
 ASK_ANSWER_TTL_SECONDS = 300.0
 #: 跨副本审批/回答的兜底轮询间隔（秒）。唤醒频道只是**加速器**，不是仲裁者：
 #: 写入方 SET 决策/答案键后 PUBLISH 一条 per-tc 唤醒，等待副本收到即提前 GET+DEL；
@@ -849,6 +854,29 @@ class AgentRuntime:
             )
         )
         if force:
+            # D6：手动压缩的**准入门槛**。deepagents `_is_eligible_for_compaction`
+            # 要求对话已达自动触发线的 50%，否则直接回 "nothing to compact"。
+            #
+            # 为什么必须有：`compact_conversation` 是模型可自主调用的工具，而模型对
+            # "该整理了吗"的判断常常偏早（阶段边界、刚读完几个文件）。没有门槛时，
+            # 短对话里调一次就会**无谓丢掉一半历史**，还多烧一次摘要调用。自动路径
+            # 从不会这样 —— 它是阈值驱动的。手动路径必须自己守住这条线。
+            #
+            # 用 `budget × threshold_ratio` 反推自动触发线：`budget` 已含工具表与
+            # 输出预留，与自动判定同源；`threshold_ratio` 此时还是**配置值**（下面
+            # 才被压到 0），所以这里拿到的是"如果不管，什么时候会自己压"。
+            auto_trigger = int(budget * comp_cfg.threshold_ratio)
+            if auto_trigger > 0:
+                now_tokens = _estimate_tokens(messages, comp_cfg.model) + tools_tokens
+                if now_tokens < auto_trigger // 2:
+                    logger.info(
+                        "manual compaction declined: %d tokens is below half the "
+                        "auto trigger (%d)",
+                        now_tokens,
+                        auto_trigger,
+                    )
+                    return messages, None
+
             # 手动入口（`/compact` 与模型的 `compact_conversation`）语义是"**现在**就整理"，
             # 而不是"等占用到了再整理" —— 阈值压到 0 即必走 PRUNE。
             # 刻意**不**沿用 `_force_compact` 的降级砍半：那是溢出后的抢救手段，
@@ -939,10 +967,18 @@ class AgentRuntime:
         before_tokens = _estimate_tokens(messages, forced.model)
         after_tokens = _estimate_tokens(compacted, forced.model)
         if after_tokens >= before_tokens:
-            # 真没让出空间（消息数没超上限、或只剩 system）→ 直接砍消息数上限
+            # 真没让出空间（消息数没超上限、或只剩 system）→ 直接砍消息数上限。
+            #
+            # 第二刀必须相对**当前条数**减半，不能相对 `max_messages` 配置值：
+            # 配置默认 200，而溢出时的实际条数往往只有几十上百条，`200 // 2 = 100`
+            # 常常≥当前条数 ⇒ `_prune_messages` 无事可做，压缩"跑了但没效果"，
+            # 白白把一次救援机会用掉。（溢出路径上这条曾被真实触发。）
             compacted = _prune_messages(
                 messages,
-                replace(forced, max_messages=max(2, forced.max_messages // 2)),
+                replace(
+                    forced,
+                    max_messages=min(forced.max_messages, max(2, len(messages) // 2)),
+                ),
                 dropped=dropped,
                 folds=folds,
             )
@@ -1012,13 +1048,18 @@ class AgentRuntime:
 
     @staticmethod
     def _prefix_fingerprint(
-        messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
-    ) -> tuple[str, str]:
-        """稳定前缀的指纹：`(system 段, 工具表)` 两个哈希。
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str = "",
+    ) -> tuple[str, str, str]:
+        """稳定前缀的指纹：`(system 段, 工具表, 模型)` 三个哈希。
 
-        分开记是因为"提示词变了"与"工具表变了"是**两个不同原因**，要采取的行动也不同：
-        前者常是 persona / 技能目录 / 记忆注入，后者是 `tool_search` 激活了新工具。
-        在一起只能报"前缀变了"，等于没说。
+        分开记是因为它们是**三个不同原因**，要采取的行动也不同：前者常是
+        persona / 技能目录 / 记忆注入，第二个是 `tool_search` 激活了新工具，
+        第三个是切了模型。混在一起只能报"前缀变了"，等于没说。
+
+        模型必须进指纹（D9）：换模型会让 provider 侧的整段前缀缓存失效，代价与
+        改 system 段完全相同，而此前它完全不在视野里 —— 用户只觉得"这次怎么这么慢"。
         """
         import hashlib
 
@@ -1029,23 +1070,30 @@ class AgentRuntime:
         return (
             hashlib.sha256(sys_text.encode("utf-8", "replace")).hexdigest()[:12],
             hashlib.sha256(tools_text.encode("utf-8", "replace")).hexdigest()[:12],
+            hashlib.sha256((model or "").encode("utf-8", "replace")).hexdigest()[:12],
         )
 
     def _prefix_change(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str = "",
     ) -> dict[str, Any]:
         """对比上一轮的稳定前缀指纹，返回本轮的诊断（空列表 = 逐字未变）。"""
-        fp = self._prefix_fingerprint(messages, tools)
+        fp = self._prefix_fingerprint(messages, tools, model)
         prev = self._last_prefix_fp
         self._last_prefix_fp = fp
         if prev is None:
             # 本会话第一轮：没有可比对象，如实报"无基准"而不是谎报"没变"。
             return {"prefix_changed": [], "first_turn": True}
         changed: list[str] = []
+        # 逐位比较并带长度兜底：旧记录可能是两元素元组（升级前写入的实例状态）。
         if prev[0] != fp[0]:
             changed.append("system")
         if prev[1] != fp[1]:
             changed.append("tools")
+        if len(prev) > 2 and prev[2] != fp[2]:
+            changed.append("model")
         return {"prefix_changed": changed} if changed else {"prefix_changed": []}
 
     def _context_snapshot(
@@ -1299,6 +1347,17 @@ class AgentRuntime:
         source = fold.pop("_source", None)
         if not source or self._gateway is None:
             return
+        # 折叠经济性：区间太小时，省下的量抵不过一次摘要往返的代价与延迟
+        # （Reasonix `foldEconomics` 的 `minFoldTokens`）。这里用 `_fixed_tokens`
+        # 而不是校准估算 —— 判据只需要"够不够大"，不需要精确，且这条跑在用户
+        # 已经在等的路径上，逐条校准是 O(n) 次跨模块调用。
+        from app.agent.compaction import _fixed_tokens
+
+        if sum(_fixed_tokens(m) for m in source) < DIGEST_MIN_FOLD_TOKENS:
+            logger.info(
+                "compaction digest kept extractive: fold too small to justify a call"
+            )
+            return
 
         from app.agent.bounded_llm import call_bounded
         from app.agent.compaction import _digest_prompt, _validate_digest
@@ -1487,7 +1546,38 @@ class AgentRuntime:
                     raise
                 attempt += 1
                 before = len(messages)
+                # D1：压缩**必须真的让出空间**，否则重试必然再溢出一次 —— 那一趟往返
+                # 是纯亏（延迟 + 计费），而且还会把用户的等待拖长一倍。
+                # deepagents `_check_reduction` 的两条判据里第一条就是这个：绝不重发
+                # 一个与刚被拒请求**同样大**的请求。第二条（仍超预算也放弃）需要
+                # 窗口信息，`on_overflow` 已经把窗口用尽力气压过一轮了，这里以
+                # "没变小"为界即可，再细的判据留给 `_force_compact` 的降级砍半。
+                tokens_before_retry = _estimate_tokens(messages, model)
                 messages[:] = on_overflow()
+                tokens_after_retry = _estimate_tokens(messages, model)
+                freed_nothing = tokens_after_retry >= tokens_before_retry
+                # 事实先记录下来再决定是否重试：前端要能看见"压缩试过、但没救回来"，
+                # 否则用户只收到一个错误，无从知道我们尽力了。
+                overflow_flags.append(
+                    {
+                        "strategy": "forced",
+                        "reason": "context_overflow",
+                        "messages_before": before,
+                        "messages_after": len(messages),
+                        "tokens_before": tokens_before_retry,
+                        "tokens_after": tokens_after_retry,
+                        "retried": not freed_nothing,
+                    }
+                )
+                if freed_nothing:
+                    logger.error(
+                        "context overflow (model=%s): compaction freed nothing "
+                        "(%d -> %d tokens), not retrying a request that will fail again",
+                        model,
+                        tokens_before_retry,
+                        tokens_after_retry,
+                    )
+                    raise
                 overflow_flags.append(
                     {
                         "strategy": "forced",
@@ -3056,7 +3146,7 @@ class AgentRuntime:
                     messages=messages,
                     tools=tools,
                 ),
-                cache=self._prefix_change(messages, tools),
+                cache=self._prefix_change(messages, tools, model),
                 trace_id=trace_id,
             )
             logger.info(
