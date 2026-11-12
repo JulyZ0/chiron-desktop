@@ -253,11 +253,31 @@ class OutputGuard:
         return self._blocked
 
     def sanitize(self, text: str) -> str:
-        """对文本做脱敏替换；命中计数超过阈值后置 blocked。"""
+        """对文本做脱敏替换；命中计数超过阈值后置 blocked。
+
+        用于**下发给用户**的文本：宿主路径与 secret 都要抹掉。
+        """
         if not text:
             return text
         for pat in _HOST_PATH_RES:
             text = pat.sub(HOST_PATH_PLACEHOLDER, text)
+        return self._sanitize_secrets(text)
+
+    def sanitize_for_context(self, text: str) -> str:
+        """进入**模型上下文**的文本：只脱敏 secret，**保留真实宿主路径**。
+
+        为什么不能连路径一起抹：工具结果（`read_file` / `search_files` 等）的
+        返回值要回到模型手里继续用。把 `C:\\proj\\src\\a.py` 换成
+        `[host-path]\\src\\a.py` 之后，模型下一次拿这个路径去读就是
+        `file not found` —— 表现为"代码 agent 什么都读不到"，而日志里看不出任何异常。
+        路径泄露的对象是**用户自己**（本地桌面应用，这是他自己的机器），
+        而 secret 泄露给模型服务商是真风险，所以这一路仍然要抹。
+        """
+        if not text:
+            return text
+        return self._sanitize_secrets(text)
+
+    def _sanitize_secrets(self, text: str) -> str:
         for pat in _OUT_SECRET_RES:
             text = pat.sub(SECRET_PLACEHOLDER, text)
         # 计数阈值（近似：出现占位符即算一次命中）

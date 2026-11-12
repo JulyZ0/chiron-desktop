@@ -165,15 +165,21 @@ def _truncate_text(
 
 
 def _sanitize_tool_result(result: dict[Any, Any]) -> str:
-    """工具结果 → 清洗后的文本（脱敏宿主路径 / secret）。
+    """工具结果 → 清洗后的文本（**只脱敏 secret，保留真实路径**）。
 
-    压缩与截断都从这一步开始：**先进上下文的内容必须先过输出清洗**，
-    否则会把宿主文件结构泄露给模型/用户。
+    这一步的产物会进入**模型上下文**继续被使用，因此不能用
+    `OutputGuard.sanitize()`（它会把宿主绝对路径换成 `[host-path]`）：
+    模型随后拿着 `[host-path]\\src\\a.py` 去读文件必然 `file not found`，
+    表现为"代码 agent 读不到任何文件"，而日志里没有任何异常。
+
+    路径泄露的对象是用户自己（本地桌面应用、他自己的机器），secret 泄露给
+    模型服务商才是真风险 —— 所以只抹后者。展示给用户的那一路仍走
+    `sanitize()`（见 runtime.py 的流式下发）。
     """
     from app.agent.guards import OutputGuard
 
     text = json.dumps(result, ensure_ascii=False, default=str)
-    return OutputGuard(max_hits=1000).sanitize(text)
+    return OutputGuard(max_hits=1000).sanitize_for_context(text)
 
 
 def _truncate_tool_result(

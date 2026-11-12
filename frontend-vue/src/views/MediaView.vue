@@ -8,7 +8,7 @@ import {
   SearchOutlined, CloudUploadOutlined, FolderOutlined, FileOutlined,
   FolderAddOutlined, LeftOutlined, RightOutlined, TagOutlined, PictureOutlined,
 } from '@ant-design/icons-vue'
-import { api, resolveMediaUrl } from '../api'
+import { api, resolveMediaUrl, API_URL } from '../api'
 import { serverErrorMessage } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
 import { useMediaUpload } from '../composables/useMediaUpload'
@@ -48,7 +48,12 @@ import {
   shouldPreventDefault,
 } from './media/shortcuts'
 const { t: tr } = useI18n()
-const API_URL = import.meta.env.VITE_API_URL || ''
+// API_URL 必须取 `src/api/index.ts` 的那一份：它合并了**桌面壳注入的
+// `chironDesktop.apiUrl`** 与构建期 `VITE_API_URL`。这里原先自己算
+// `import.meta.env.VITE_API_URL || ''`，桌面构建时该变量为空 ⇒ API_URL=''，
+// 于是签名 URL `/media/s/xxx.pdf?...` 保持相对路径；而桌面端用
+// `loadFile(dist/index.html)` 加载，页面是 `file://`，PDF.js 按文档 baseURI
+// 解析它就变成了 `file:///C:/media/s/xxx.pdf` —— 预览必然失败。
 
 interface MediaItem {
   id: string

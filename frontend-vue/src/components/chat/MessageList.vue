@@ -134,7 +134,11 @@ function noteEnteringRows() {
 // 追加消息只改长度、换会话/重载换引用 —— 两个都要听，否则其中一路会漏
 watch(() => props.items.length, noteEnteringRows)
 watch(() => props.items, noteEnteringRows)
-onBeforeUnmount(() => { if (enterTimer) clearTimeout(enterTimer) })
+onBeforeUnmount(() => {
+  if (enterTimer) clearTimeout(enterTimer)
+  railObserver?.disconnect()
+  railObserver = null
+})
 
 /** 用户输入早于 scroll 事件到达：提前取得租约，避免流式增长抢走阅读位置。 */
 function onUserInput() {
@@ -325,6 +329,13 @@ onMounted(() => {
   measureMountedRows()
   recomputeWindow()
   syncActiveQuestion()
+  // 锚点条的高度上限取滚动容器的实测高度：窗口缩放、侧栏折叠、输入区变高
+  // 都会改变它，所以用 ResizeObserver 跟随而不是只在挂载时算一次。
+  syncRailMaxHeight()
+  if (typeof ResizeObserver !== 'undefined' && scrollRef.value) {
+    railObserver = new ResizeObserver(() => syncRailMaxHeight())
+    railObserver.observe(scrollRef.value)
+  }
 })
 
 /**
@@ -376,6 +387,77 @@ const activeQuestionKey = ref<string | null>(null)
  * 所以距离必须在 JS 里算 —— 这点状态是唯一的代价。
  */
 const railHoverIndex = ref<number | null>(null)
+
+/**
+ * 锚点条的可用高度上限 = 消息滚动容器的**实测高度**减去上下留白。
+ *
+ * 为什么不能用 `vh`：真正裁剪锚点条的是 `.message-list`（`overflow-y:auto` +
+ * `contain: layout style`），它上方有标题栏、下方有输入区，实际高度远小于视口。
+ * 用 `72vh` 做上限时，锚点条一旦超过容器高度就会被容器裁掉两端 ——
+ * 而滚动条被刻意隐藏，用户看到的就是"提问多了就少了几条"。
+ */
+const railMaxHeight = ref('')
+/** 可用高度（px 数值）。0 = 尚未测到，此时只用 CSS 兜底 */
+const railCapPx = ref(0)
+let railObserver: ResizeObserver | null = null
+
+function syncRailMaxHeight() {
+  const el = scrollRef.value
+  if (!el) return
+  // 只接受**有效**的可视高度。此前用 Math.max(96, …) 兜底，等于把
+  // clientHeight=0（隐藏态、首帧未布局、骨架屏阶段）写成固定 96px。
+  // 取不到就**不写**，让 CSS 的 calc(100dvh - 140px) 兜底。
+  if (el.clientHeight <= 0) {
+    railMaxHeight.value = ''
+    railCapPx.value = 0
+    return
+  }
+  const cap = el.clientHeight - 24
+  railCapPx.value = cap
+  railMaxHeight.value = `${Math.round(cap)}px`
+}
+
+/**
+ * 锚点条的自适应几何：**保证所有锚点一次看全，不出现内部滚动**。
+ *
+ * 之前的问题不是定位错了，而是 `max-height` 比内容矮时 `.question-rail` 会
+ * `overflow-y: auto`，而滚动条被刻意隐藏（`scrollbar-width: none` +
+ * `::-webkit-scrollbar { display:none }`）。结果就是"首尾都被裁、只剩中间一段"，
+ * 且用户不知道还能滚 —— 鼠标滚轮能滚出来，正是内部滚动的证据。
+ *
+ * 所以这里按锚点数量反推尺寸：先试标准尺寸（高 3px、间距 6px），装不下就压
+ * 间距，再装不下就压箭头本身的高度（下限 1.5px）。只有极端数量（>100 条）
+ * 才会真的滚起来 —— 那时滚是唯一合理的取舍。
+ */
+const railStyle = computed<Record<string, string> | undefined>(() => {
+  const style: Record<string, string> = {}
+  if (railMaxHeight.value) style.maxHeight = railMaxHeight.value
+
+  const n = questions.value.length
+  const cap = railCapPx.value
+  // 未测到高度：交给 CSS 兜底，锚点用标准尺寸
+  if (n < 2 || cap <= 0) return Object.keys(style).length ? style : undefined
+
+  const PAD = 16 // 上下 padding 各 8px
+  const avail = Math.max(24, cap - PAD)
+  const total = (h: number, gap: number): number => n * h + (n - 1) * gap
+
+  let dotH = 3
+  let gap = 6
+  if (total(dotH, gap) > avail) {
+    // 第一步：压缩间距到 1px
+    gap = Math.max(1, (avail - n * dotH) / (n - 1))
+    if (total(dotH, gap) > avail) {
+      // 第二步：间距到底，再压缩锚点本身（保持可见下限 1.5px）
+      gap = 1
+      dotH = Math.max(1.5, (avail - (n - 1) * gap) / n)
+    }
+  }
+
+  style.gap = `${gap.toFixed(2)}px`
+  style['--rail-dot-h'] = `${dotH.toFixed(2)}px`
+  return style
+})
 
 /**
  * 锚点长度：**近长远短**。
@@ -722,7 +804,7 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
       </button>
     </Transition>
 
-    <!-- 提问导航条：sticky + 零高度宿主，既不占内容流空间，又固定在容器中部 -->
+    <!-- 提问导航条：零高度宿主 + sticky 居中；锚点数量多时由 JS 压缩尺寸装下，不出现内部滚动 -->
     <div
       v-if="questions.length >= 2"
       class="question-rail-host"
@@ -730,6 +812,7 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
       <nav
         class="question-rail"
         :aria-label="$t('common.question_navigation')"
+        :style="railStyle"
         @mouseleave="railHoverIndex = null"
         @focusout="railHoverIndex = null"
       >
@@ -823,20 +906,31 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
 .back-fade-enter-active, .back-fade-leave-active { transition: opacity var(--dur-normal), transform var(--dur-normal); }
 .back-fade-enter-from, .back-fade-leave-to { opacity: 0; transform: translateY(8px); }
 
-/* 提问导航条：零高度宿主 + sticky，浮在滚动容器中部而不占内容流空间。
+/* 提问导航条：**绝对定位铺满滚动容器**，锚点条在其中垂直居中。
  *
- * 宿主 bottom:50% 把**锚点条的底边**钉在视口中线，锚点条自己再上移一半高度
- * （translateY(-50%)）⇒ 整体垂直居中。这一步是必须的：高度为 0 的宿主里，
- * flex 子项默认从宿主顶部向下排，锚点一多就整体压到下半屏、顶部被裁掉 ——
- * 之前的 46vh 上限正是为了掩盖这个现象，代价是提问多于约 8 条就看不全。 */
-.question-rail-host { position: sticky; bottom: 50%; height: 0; display: flex; justify-content: flex-end; pointer-events: none; z-index: var(--z-sticky); }
+ * 为什么 `inset: 0` 而不是 `sticky + height: 0`：这是实测结论，不是推测。
+ * 浏览器实测（容器 420px、30 条锚点）：
+ *   - 旧方案 sticky + height:0 → 锚点条被压成 **17px**，内部却有 **264px** 可滚内容；
+ *   - 新方案 absolute + inset:0 → 锚点条 **281px**，内部可滚 **0**。
+ * 旧方案下用户看到的正是"首尾都被截、只剩中间一段，滚轮却能滚出其他锚点"——
+ * 零高度宿主把子元素压塌，多出来的部分变成**内部滚动**，而滚动条被刻意隐藏
+ * （`scrollbar-width: none` + `::-webkit-scrollbar`），所以看不出还能滚。
+ * 铺满容器后高度**完全由容器决定**，不依赖 vh、不依赖 JS。
+ *
+ * `.message-list` 已是 `position: relative`，绝对定位相对它的 padding box，
+ * 尺寸等于可视区高度且不随内部滚动移动。 */
+.question-rail-host {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: flex-end;
+  pointer-events: none; z-index: var(--z-sticky);
+}
 .question-rail {
   pointer-events: auto;
   display: flex; flex-direction: column; align-items: center; gap: 6px;
-  /* 上限跟着视口走：留下上下各 70px 给标题栏与输入区，锚点再多也完整可见 */
-  max-height: min(72vh, calc(100dvh - 140px));
+  /* 上限相对宿主（= 容器可视高度），而不是视口：这是"装得下"的关键。
+     JS 的 railStyle 会在数量过多时进一步压缩间距与锚点高度。 */
+  max-height: 100%;
   overflow-y: auto;
-  transform: translateY(50%);
   margin-inline-end: 8px; padding: 8px 6px;
   border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-full);
   background: color-mix(in srgb, var(--bg-card) 88%, transparent);
@@ -850,7 +944,7 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
 /* 小横条：高度固定、**宽度由 JS 按到悬停点的距离算**（近长远短）。
    宽度写在行内样式里，这里只给不悬停时的兜底值与过渡。 */
 .rail-dot {
-  flex: none; width: 10px; height: 3px; padding: 0;
+  flex: none; width: 10px; height: var(--rail-dot-h, 3px); padding: 0;
   border: none; border-radius: var(--radius-full);
   background: var(--text-disabled);
   cursor: pointer;
