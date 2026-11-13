@@ -523,6 +523,55 @@ async def release_awaiting(
         return False
 
 
+async def abandon_stale_awaiting(*, limit: int = 50) -> int:
+    """把"票早已过期、却仍停在 `awaiting_input`"的 run 收口成 `abandoned`。
+
+    这是挂起路径上唯一可能**永久悬空**的状态，补上它才谈得上"无人值守也能收场"：
+
+    * `ACTIVE_STATUSES` 刻意不含 `awaiting_input` ⇒ `sweep_once` 的扫描条件
+      （`status IN ('running','checkpointed','resuming')`）在**定义上**就碰不到它；
+    * `expire_stale` 只把 `pending_interactions` 转 `expired`，不碰 `agent_runs`；
+    * `load()` / `mark()` / `claim()` 的谓词同样不含它。
+
+    三条路都不通的结果：用户关掉窗口、票在 TTL 后过期，那一行就**永远**是
+    `awaiting_input` —— 不续跑、不失败、也不会被任何巡检看见。用户回来时界面仍显示
+    "等你回答"，而那张票早已取不出来。判定"不会有人再答了"正是回收它的依据。
+
+    判据用**票**而不是快照窗口：票的 TTL 才是"答复还可能到达"的真正截止时间。快照冷窗口
+    24h 起步，拿它当标准会让一个 5 分钟就过期的审批白白挂满一天。
+
+    `answered` 未过期也算"有人会来"——票已答但尚未 `settle` 的那一瞬间，答复正在路上。
+    """
+    try:
+        pool = _pool()
+        if pool is None:
+            return 0
+        result = await pool.execute(
+            """
+            UPDATE agent_runs r
+               SET status = 'abandoned', updated_at = now()
+             WHERE r.status = 'awaiting_input'
+               AND r.session_id IN (
+                       SELECT r2.session_id FROM agent_runs r2
+                        WHERE r2.status = 'awaiting_input'
+                          AND NOT EXISTS (
+                                  SELECT 1 FROM pending_interactions p
+                                   WHERE p.session_id = r2.session_id
+                                     AND p.status IN ('pending', 'answered')
+                                     AND p.expires_at > now()
+                              )
+                        ORDER BY r2.updated_at ASC
+                        LIMIT $1
+                   )
+            """,
+            max(1, int(limit)),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stale awaiting-input sweep failed: %s", exc)
+        return 0
+    return _rowcount(result)
+
+
 async def pending_tool_calls(
     *, session_id: str, limit: int = 50
 ) -> list[dict[str, Any]]:

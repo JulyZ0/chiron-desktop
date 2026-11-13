@@ -502,6 +502,30 @@ class Settings(BaseSettings):
     pod_name: str = ""
     instance_id: str = ""
     # 引擎对外可达地址（批 E1 动态发现）：如 http://engine-0:8000;
+    # ── 人工介入（无人值守的收场保证）──
+    # 等一次人工答复（审批 / ask_user）的上限，秒。到点即**挂起**：把这一步留在
+    # `awaiting_input` 并以"等你答复"结束本轮，而不是继续空等（空等会把 reconciler 的
+    # 续跑节拍钉住一整个巡检周期）。
+    #
+    # 为什么必须可配置：无人值守场景（自动续跑、夜间批处理）里没人会来点，
+    # 300 秒的固定等待只是把"没人答"这件事往后拖 5 分钟；而交互场景里盯着屏幕的人
+    # 可能只想等 30 秒就希望它自己收手。两种场景共用一个硬编码值必然有一边不合适。
+    #
+    # **跨进程约束**：必须**小于** Go 网关的一轮超时（`AGENT_SUBMIT_TIMEOUT`，
+    # 兜底 `DefaultAgentTimeout = 300s`，见 internal/api/submit_handler.go 的
+    # `turnTimeout()`）。网关超时是 ASGI 取消（回合中止），不是可续暂停 —— 把这里
+    # 调到网关之上，等于让引擎永远等不到自己的上限就被外面掐断，挂起逻辑一次都执行不到。
+    agent_interaction_wait_seconds: float = 300.0
+
+    # 一条挂起票（`pending_interactions`）能活多久，秒。过期即由 reconciler 的
+    # `abandon_stale_awaiting` 把 run 收口成 `abandoned` —— 这是"明确放弃"的落点，
+    # 保证无人值守的任务最终**一定有结论**，不会永远挂在"等你确认"上。
+    #
+    # 不变量：必须 >= `agent_interaction_wait_seconds`。票比等待先过期，就等于
+    # "挂起即永久挂起"（等待超时去挂起时票已没了，再没人能看见它）。
+    # 这条不变量由 `_interaction_wait_seconds()` 兜底 clamp，配错也不会破。
+    agent_interaction_ttl_seconds: int = 24 * 3600
+
     # 为空则引擎不向 Redis 注册,网关回退静态 PYTHON_ENGINE_ADDRESS。
     engine_advertise_url: str = ""
 

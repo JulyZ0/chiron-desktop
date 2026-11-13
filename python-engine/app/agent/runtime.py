@@ -117,9 +117,49 @@ logger = logging.getLogger(__name__)
 
 # ── Token 节省参数与 CompactionConfig 已迁到 `app/agent/compaction.py`（顶部已再导出） ──
 
-#: 跨副本审批决策键的 TTL（秒）：与 _await_approval 的默认 timeout 对齐。
+#: 跨副本审批决策键的 TTL（秒）：与 _await_approval 的等待上限对齐。
 #: 超时后键自动过期，避免残留决策被后续同 id 的调用误取（单次消费由 GET+DEL 保证）。
+#: 取自 `settings.agent_interaction_ttl_seconds`（见 `_interaction_ttl_seconds()`）。
 APPROVAL_TTL_SECONDS = 300.0
+
+
+def _interaction_wait_seconds() -> float:
+    """等一次人工答复（审批 / ask_user）的上限，秒。到点即挂起，不空等。
+
+    可配置（`AGENT_INTERACTION_WAIT_SECONDS`）：无人值守里没人会来点，固定 5 分钟只是把
+    "没人答"往后拖；交互场景里用户可能只想等半分钟。下限 1 秒防止配成 0 变成"立刻放弃"，
+    下限 0.0/非法值一律回落到 300s，避免把回收器拖死。
+    """
+    try:
+        value = float(getattr(settings, "agent_interaction_wait_seconds", 300.0))
+    except (TypeError, ValueError):
+        return 300.0
+    return max(1.0, value)
+
+
+def _interaction_ttl_seconds() -> int:
+    """一条挂起票能活多久，秒。过期即由 `abandon_stale_awaiting` 收口成 `abandoned`。
+
+    **必须 >= 等待上限**（配置里那条不变量的运行时兜底）：票比等待先过期，就等于
+    "挂起即永久挂起" —— 等待超时去挂起时票已经没了，再没人能看见它、也没人能收口。
+    在这里 clamp 而不是只写在注释里，因为配错的人不会去读注释。
+    """
+    try:
+        ttl = int(getattr(settings, "agent_interaction_ttl_seconds", 24 * 3600))
+    except (TypeError, ValueError):
+        ttl = 24 * 3600
+    return max(int(_interaction_wait_seconds()), min(ttl, 30 * 24 * 3600))
+
+
+def _decision_key_ttl_seconds() -> int:
+    """跨副本决策键 / 审批票据的 Redis TTL，秒。
+
+    **必须覆盖整个等待窗口**（等待上限 + 余量）：这两类键是"响应在路上的那段时间里
+    唯一还能被另一副本取走的东西"。写死 300s 而上限被调大到 600s 时，用户在第 400 秒
+    点的批准会**先被 Redis 清掉再被读到** —— 表现是"我明明点了，它还是超时挂起了"。
+    余量 60s 用来吸收等待循环的轮询间隔与时钟抖动。
+    """
+    return max(int(_interaction_wait_seconds()) + 60, int(APPROVAL_TTL_SECONDS))
 
 #: ask_user 的答案回收与审批同构（同样的 TTL 与单次消费语义）。
 #: 工具名必须与 app/tools/ask_user.py 的 ASK_USER_TOOL 一致 —— runtime 靠它识别提问调用。
@@ -1281,6 +1321,46 @@ class AgentRuntime:
                 getattr(task, "session_id", ""), axis, exc,
             )
 
+    async def _persist_terminal_notice(
+        self, task: AgentTask, messages: list[dict[str, Any]], notice: str
+    ) -> None:
+        """把"这一轮为什么停"写进**会话历史**（终态路径专用）。
+
+        为什么必须有：终态只发一个 `error` 事件，而事件是**流**上的东西 —— 只有正在读
+        这条流的人看得见。可 `budget_exceeded` 恰好发生在最没有订阅者的两种场景里：
+        自动续跑（reconciler 的 `_auto_resume_runner` 明确 `pass` 掉所有事件）与用户
+        已关掉客户端。于是越界在界面上表现为"会话停在半句上"，没有任何解释 ——
+        用户回来分不清是额度用完了、还是程序崩了。
+
+        会话历史是他们一定读得到的通道（与有没有订阅者无关），所以结论落这里。
+
+        失败只降级：落地是增强项，不能让一个已经到达终态的 run 再抛一次。
+        """
+        text = str(notice or "").strip()
+        if not text or not getattr(task, "session_id", ""):
+            return
+        try:
+            msg = _normalize_msg(role="assistant", content=text)
+            messages.append(msg)
+            from app.agent import history_writer
+
+            await history_writer.persist_messages(
+                task.session_id,
+                task.tenant_id,
+                [msg],
+                turn_id=str(getattr(task, "turn_id", "") or ""),
+                roles={"assistant"},
+            )
+            # 与正常收尾同一口径：缓存仍写（PG 不可用时它是回落层）。
+            if self._session_store:
+                await self._session_store.append(task.session_id, [msg])
+        except Exception as exc:  # noqa: BLE001 — 落地失败只降级
+            logger.warning(
+                "terminal notice not persisted (session=%s): %s",
+                getattr(task, "session_id", ""),
+                str(exc)[:160],
+            )
+
     async def _persist_dropped(
         self, dropped: list[tuple[str, str]], task: AgentTask
     ) -> None:
@@ -2208,6 +2288,18 @@ class AgentRuntime:
                         error=f"budget_exceeded:{exceeded}",
                         trace_id=trace_id,
                     )
+                    # 事件只走流：无人值守（自动续跑 `pass` 掉所有事件）或用户已关客户端时
+                    # 没人看得见，会话就停在半句上。结论必须另走一条一定读得到的通道。
+                    # 措辞要对：per-run 预算是**单段**额度（每次 `run()` 新建），所以发一条
+                    # 新消息开新的一段就能继续；而**自动续跑会继承已用量**，它自己接上来
+                    # 只会立刻再越界 —— 这一点必须说清，否则用户以为"等一会儿它自己会继续"。
+                    await self._persist_terminal_notice(
+                        task,
+                        messages,
+                        f"这一轮因预算越界停在这里（{exceeded}）。已完成的部分都已保存；"
+                        "发下一条消息会开新的一段额度继续。"
+                        "（这一段不会被自动续跑接上：续跑会继承已用量，接上来也立刻越界。）",
+                    )
                     # A4：预算越界是**本 run 的终态**（不是崩溃）——标 failed 后它不再可被
                     # "用户重试续跑"误当现场；`ckpt.load` 只认活跃状态。
                     await self._mark_run_status(task, "failed")
@@ -2226,13 +2318,31 @@ class AgentRuntime:
                     # M26：主 run 的会话线越界 —— 除了硬拦，还要**挂一张提额票**：只报错的话
                     # 用户看到的只是"消息失败了"，既不知道这是额度问题、也不知道可以提额。
                     # 子 Agent 的委派线越界由 subagent_runner 自己挂票，这里不重复挂。
+                    _line_ticketed = False
                     if not str(getattr(task, "subagent_line", "") or ""):
                         await self._pause_session_line(task, line_axis)
+                        _line_ticketed = True
                     yield AgentEvent(
                         type="error",
                         error=f"budget_exceeded:{line_axis}",
                         trace_id=trace_id,
                     )
+                    # 与 per-run 越界同一个理由（见上面那段）：事件只走流，无人值守时没人看得见。
+                    # 但**措辞必须不同** —— 线级越界挂出了提额票，提额后这条线会重新放行；
+                    # 而 per-run 额度是单段的、重新发一条消息就能继续。把两者说成一样，
+                    # 用户会去等一个永远不会来的自动续跑，或者反过来重复发消息白花钱。
+                    if _line_ticketed:
+                        _line_notice = (
+                            f"这条会话的任务线额度用完了（{line_axis}），本轮停在这里。"
+                            "已替你挂了一张提额待办：提高上限后这条线会重新放行，"
+                            "接着补上的那一段不会重做已完成的部分。"
+                        )
+                    else:
+                        _line_notice = (
+                            f"委派线的额度用完了（{line_axis}），本轮停在这里。"
+                            "提额待办由派发那次子任务的执行体挂出。"
+                        )
+                    await self._persist_terminal_notice(task, messages, _line_notice)
                     await self._mark_run_status(task, "failed")
                     return
 
@@ -2783,6 +2893,21 @@ class AgentRuntime:
                                     error="budget_exceeded:steps",
                                     trace_id=trace_id,
                                 )
+                                # 这里原先**只** `yield` 然后 `return`：既没写终态，也没留结论。
+                                # 后果比 per-run 那两处更重 —— 正常收尾的 completed 写在循环之后，
+                                # 被这个 `return` 跳过；而 `finally` 只在异常/取消时补写终态，
+                                # 正常 return 的 `_exc` 是 None ⇒ 一条都不写。于是 `agent_runs`
+                                # 停在 `running`，被 reconciler 当僵尸收掉，用户什么解释也看不到。
+                                #
+                                # steps 轴与 tokens 轴同属**单段**额度（每个 `run()` 从 0 起算），
+                                # 所以续跑能接上 —— 但用户得先被告知"再发一条就能继续"。
+                                await self._persist_terminal_notice(
+                                    task,
+                                    messages,
+                                    "这一轮的步数额度用完了（steps），停在逐个工具调用之间。"
+                                    "已完成的部分都已保存；发下一条消息会开新的一段额度继续。",
+                                )
+                                await self._mark_run_status(task, "failed")
                                 return
 
                             # 副作用账本：记下这次动用了什么能力、能不能撤销
@@ -3175,12 +3300,26 @@ class AgentRuntime:
                 error=str(e),
             )
         finally:
-            # ── 兜底写终态（A4 补口）──
+            # ── 兜底写终态（A4 补口 + 断线可续）──
             # `asyncio.CancelledError` / `GeneratorExit` 是 **BaseException**，
-            # 上面那处 `except Exception` 接不住 —— 客户端断开、网关 300s 超时、
+            # 上面那处 `except Exception` 接不住 —— 客户端断开、网关单轮超时、
             # SSE 生成器被关闭都走这条路。不在这里收口，`agent_runs` 行会永远停在
             # `running`，而 `ux_agent_runs_session_active` 会让该会话再也提交不了新 run。
             # `mark()` 只迁活跃行 + 带 run_token 归属校验 ⇒ 与正常路径重复写也是幂等的。
+            #
+            # **被动中断必须保留现场（C1 可续）**：这里原本一律写 `cancelled`，而
+            # `cancelled` 是终态 —— 一出 `ACTIVE_STATUSES`，`checkpoint.load()` 与
+            # reconciler 的 `status IN (...)` 都再也看不到这条快照。于是"网关单轮超时"
+            # 这种**没人下过令**的中断，把该会话的续跑现场一起销毁了：用户重试只能从头
+            # 重来，已在跑的工具调用全部重放。
+            #
+            # 判据（与 `interrupt.py` 的设计同源）：**只有用户下过令才算取消**。
+            #   1. 显式停止 → `request_interrupt()` 落了 `engine:interrupt:{session_id}`
+            #      或本地标志 ⇒ 这是用户意图，写终态 `cancelled`（旧行为不变）。
+            #   2. **没有任何中断信号** ⇒ 断开/超时是外因，现场仍可信：先补一次快照，
+            #      再写 `checkpointed`（在活跃集合内）交给 reconciler 按热窗口续跑。
+            #   3. 查不到信号（Redis 不可用）⇒ 不猜：退回 `cancelled`，宁可让用户重试，
+            #      也不要让一个可能已被用户叫停的回合在后台自己复活。
             try:
                 import sys as _sys
 
@@ -3188,7 +3327,73 @@ class AgentRuntime:
 
                 _exc = _sys.exc_info()[1]
                 if isinstance(_exc, (asyncio.CancelledError, GeneratorExit)):
-                    await self._mark_run_status(task, _ckpt.STATUS_CANCELLED)
+                    _user_stopped: bool | None = None
+                    try:
+                        from app.agent.interrupt import (
+                            probe_interrupt as _probe_interrupt,
+                        )
+
+                        # 三态：True 有令 / False 确认没有 / None 读不到（Redis 不可用）。
+                        # 只有**确认没有**信号才保留现场 —— 见 probe_interrupt 的说明：
+                        # 把"读不到"折成 False 会让用户刚停掉、恰逢 Redis 故障的 run
+                        # 在 Redis 恢复后被 reconciler 自动复活并继续烧 token。
+                        _user_stopped = await _probe_interrupt(task.session_id)
+                    except Exception as e:  # noqa: BLE001 — 判不出来就别猜
+                        logger.warning(
+                            "finalize: interrupt signal unknown, keeping cancelled "
+                            "(session=%s): %s",
+                            task.session_id,
+                            e,
+                        )
+                        _user_stopped = None
+
+                    if _user_stopped is False and task.session_id:
+                        # 外因中断：尽量把尾巴落下来，否则"可续"只是名义上的。
+                        #
+                        # `_save_checkpoint` 要 5 个参数，而被动的取消点可能落在**任何一个
+                        # await** 上 —— 这时 `done_tool_ids` / `turn` / 累计 token 未必已绑定。
+                        # 直接引用会 NameError，而它会被外层 except 吞掉 ⇒ 快照不落、只写
+                        # status，结果是"标了可续却没有可续的东西"。所以用 `locals()` 取
+                        # 已绑定的值，缺的给安全默认：空 messages 由 build_snapshot 的
+                        # `min_tail_messages` 兜住（结果是空尾窗），不会抛。
+                        _lv = locals()
+                        try:
+                            await self._save_checkpoint(
+                                task,
+                                list(_lv.get("messages") or []),
+                                turn_index=int(_lv.get("turn", 0) or 0) + 1,
+                                done_tools=list(_lv.get("done_tool_ids") or []),
+                                usage={
+                                    "input_tokens": int(
+                                        _lv.get("resumed_input_tokens", 0) or 0
+                                    )
+                                    + int(_lv.get("total_input_tokens", 0) or 0),
+                                    "output_tokens": int(
+                                        _lv.get("resumed_output_tokens", 0) or 0
+                                    )
+                                    + int(_lv.get("total_output_tokens", 0) or 0),
+                                    "cached_tokens": int(
+                                        _lv.get("resumed_cached_tokens", 0) or 0
+                                    )
+                                    + int(_lv.get("total_cached_tokens", 0) or 0),
+                                    "tool_steps": int(getattr(self, "_tool_steps", 0) or 0),
+                                },
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning(
+                                "finalize: checkpoint on disconnect failed (session=%s): %s",
+                                task.session_id,
+                                e,
+                            )
+                        await self._mark_run_status(task, _ckpt.STATUS_CHECKPOINTED)
+                        logger.info(
+                            "run interrupted by transport (no user stop); "
+                            "kept resumable: session=%s status=%s",
+                            task.session_id,
+                            _ckpt.STATUS_CHECKPOINTED,
+                        )
+                    else:
+                        await self._mark_run_status(task, _ckpt.STATUS_CANCELLED)
                 elif _exc is not None:
                     await self._mark_run_status(task, _ckpt.STATUS_FAILED)
             except Exception as e:  # noqa: BLE001 — 终态兜底失败不该影响退出路径
@@ -3772,6 +3977,9 @@ class AgentRuntime:
             request=request,
             run_token=getattr(task, "run_token", "") or "",
             turn_id=str(getattr(task, "id", "") or ""),
+            # 票的寿命必须覆盖等待上限（配置里那条不变量的运行时兜底，见
+            # `_interaction_ttl_seconds`）：票比等待先过期就等于"挂起即永久挂起"。
+            ttl_seconds=_interaction_ttl_seconds(),
         )
         if interaction_id:
             self._interactions[tool_call_id] = {"id": interaction_id, "question": question}
@@ -3947,7 +4155,7 @@ class AgentRuntime:
         )
 
     async def _await_approval(
-        self, tool_call: dict[Any, Any], task: AgentTask, timeout: float = 300.0
+        self, tool_call: dict[Any, Any], task: AgentTask, timeout: float | None = None
     ) -> dict[Any, Any]:
         """等待用户对确认工具调用的决定（前端经 /v1/agent/approval → 本方法）。
 
@@ -3968,6 +4176,11 @@ class AgentRuntime:
         """
         tool_name = tool_call.get("name", "")
         tc_id = tool_call.get("id") or tool_name
+        # 等待上限可配置（`AGENT_INTERACTION_WAIT_SECONDS`，见 `_interaction_wait_seconds`）：
+        # 到点即挂起。写死 300s 的问题不是慢，而是**两种场景共用同一个值**：
+        # 无人值守里没人会来点，多等的每一秒都白等；交互场景里用户可能只想等半分钟。
+        if timeout is None:
+            timeout = _interaction_wait_seconds()
         # 模型**原始**请求的参数。C5 的 `edit` 需要它做两件事：① 核对票据（证明这张票正是
         # 这次调用的）② 与编辑后的参数比对动作级别。
         try:
@@ -4403,7 +4616,9 @@ class AgentRuntime:
             await redis.set(
                 self._approval_ticket_key(ticket.tool_call_id),
                 ticket.to_json(),
-                ex=int(APPROVAL_TTL_SECONDS),
+                # 覆盖整个等待窗口，而不是写死 300s：上限被调大后，票据先过期会让
+                # 用户在窗口内点的批准无从核对（见 `_decision_key_ttl_seconds`）。
+                ex=_decision_key_ttl_seconds(),
             )
         except Exception as e:  # noqa: BLE001 - 票据写失败不该阻断审批
             logger.warning("approval ticket store failed (id=%s): %s", ticket.tool_call_id, e)
@@ -4722,7 +4937,7 @@ class AgentRuntime:
         )
 
     async def _await_answer(
-        self, tool_call: dict[Any, Any], task: AgentTask, timeout: float = 300.0
+        self, tool_call: dict[Any, Any], task: AgentTask, timeout: float | None = None
     ) -> dict[Any, Any]:
         """等待用户回答（前端经 /v1/agent/answer → submit_answer）。
 
@@ -4735,6 +4950,9 @@ class AgentRuntime:
         from app.agent.interactions import KIND_QUESTION
 
         tc_id = tool_call.get("id") or ASK_USER_TOOL
+        # 与审批同一条上限（`AGENT_INTERACTION_WAIT_SECONDS`）：等不到就挂起，不空等。
+        if timeout is None:
+            timeout = _interaction_wait_seconds()
         future = self._pending_answers.get(tc_id)
         if future is None:
             return {"error": "ask_user state missing"}
@@ -5074,7 +5292,9 @@ async def _write_approval_decision(
         await redis.set(
             _approval_key(tool_call_id, user_id),
             stored.to_json(),
-            ex=int(APPROVAL_TTL_SECONDS),
+            # 同票据：必须活过整个等待窗口，否则窗口后半段的答复写进来就立刻过期，
+            # 另一副本永远取不到（见 `_decision_key_ttl_seconds`）。
+            ex=_decision_key_ttl_seconds(),
         )
         # 加速器：叫醒等待该 tc_id 的副本。丢了也非致命 —— 兜底轮询仍会取走（键已写）。
         try:

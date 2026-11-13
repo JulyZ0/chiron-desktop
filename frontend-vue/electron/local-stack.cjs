@@ -22,6 +22,7 @@ const crypto = require('node:crypto')
 const path = require('node:path')
 const components = require('./components.cjs')
 const runtimeState = require('./runtime-state.cjs')
+const { createSupervisor } = require('./supervisor.cjs')
 const DEFAULTS = components.DEFAULTS
 
 /**
@@ -184,6 +185,24 @@ const KNOWLEDGE_SERVICE_TIMEOUT_MS = 60_000
 const PORT_ATTEMPTS = DEFAULTS.CORE_PORT_ATTEMPTS
 
 let injected = null
+
+/**
+ * 诊断日志出口。由宿主通过 `_setDeps({ log })` 注入（main.cjs 传 `logMain`）。
+ *
+ * 不直接 `console.*`：Electron 主进程的 stdout 在打包态没有接收方，写进去等于丢掉；
+ * 而这几条日志（重启第几次、为什么放弃）正是事后唯一能定位"为什么它没自愈"的证据。
+ */
+let logSink = null
+
+function log(msg) {
+  if (typeof logSink === 'function') logSink(`[local-stack] ${msg}`)
+}
+
+/** 只设日志出口。与 `_setDeps` 分开，避免"注入日志"顺手把 spawn 替身清掉。 */
+function _setLog(fn) {
+  logSink = typeof fn === 'function' ? fn : null
+}
+
 const state = {
   /** 引导器进程记录（含它给出的连接信息） */
   launcher: null,
@@ -200,6 +219,14 @@ const state = {
    * 别的实例，停了会让对方崩掉。只有在接管方自己退出时才清状态文件。
    */
   attached: null,
+  /**
+   * 崩溃自愈监督器（见 supervisor.cjs）。
+   *
+   * 只在**本进程拉起**的栈上挂：接管来的栈不属于我们，重启别人的进程会让对方崩掉。
+   */
+  supervisor: null,
+  /** 重建进程所需的现场：重启必须在**同一端口**上重建，见 `restartProcess`。 */
+  restartCtx: null,
 }
 
 function runtime() {
@@ -216,6 +243,15 @@ function _resetDeps() {
 }
 
 function _resetState() {
+  // 先把旧监督器停掉再清引用。只置 null 的话，已经排在退避定时器里的重启会在
+  // 下一个 tick 照常拉起进程 —— 关停之后又被"自愈"复活，正是监督器要防的事。
+  if (state.supervisor && typeof state.supervisor.stop === 'function') {
+    try {
+      state.supervisor.stop()
+    } catch {
+      /* 停用失败不该阻断清理 */
+    }
+  }
   state.launcher = null
   state.engine = null
   state.engineFailure = null
@@ -223,6 +259,8 @@ function _resetState() {
   state.gateway = null
   state.attached = null
   state.ownedDataDir = ''
+  state.supervisor = null
+  state.restartCtx = null
 }
 
 /** 按行切分流式输出（与 components.cjs 同一套做法，那个未导出故自备一份） */
@@ -644,7 +682,9 @@ async function spawnGatewayOnce(info, options = {}) {
       // 本地模式的"可用"必须以 `/ready` 为准，否则会把"启动了但连不上库"报成成功。
       const ready = await probeReadyJson(record.baseUrl)
       if (ready.ok) {
-        return { child, baseUrl: record.baseUrl, port, ready, stderrTail: record.stderrTail }
+        // 带上 record：与 `startEngine` 同一理由 —— 调用方（崩溃自愈）要能在进程退出
+        // 那一刻拿到 `stopping` 标志与 stderr 尾部，而不是只有一个 child。
+        return { child, record, baseUrl: record.baseUrl, port, ready, stderrTail: record.stderrTail }
       }
     }
     await sleep(options.intervalMs || 500)
@@ -698,6 +738,8 @@ function sleep(ms) {
 async function stopGateway() {
   const record = state.gateway
   if (!record) return false
+  // 必须先于 kill 立标志：`watchGatewayExit` 靠它区分"我们让它退的"与"它自己崩的"。
+  record.stopping = true
   state.gateway = null
   if (!record.child || record.exited) return true
   const child = record.child
@@ -1195,6 +1237,127 @@ function watchEngineExit(engineRecord, onExit) {
   })
 }
 
+/**
+ * 在**原端口**上重建一个已崩溃的本地组件。
+ *
+ * 端口是硬的，不是偏好：网关起着的时候，引擎的 `GATEWAY_INTERNAL_URL` 已经按当时那个
+ * 网关端口写死在环境里；引擎起着的时候，网关的 `PYTHON_ENGINE_ADDRESS` 也同理。任何一方
+ * 换了端口，存活的那一方就会一直往失效地址上发请求 —— 表现为工具/媒体/设置静默失灵，
+ * 比一次明确的启动失败难查得多（`startLocalStack` 里对 gateway-port-drift 的判断同一理由）。
+ * 所以重启一律 `retryPortConflict: false`：宁可在原端口上失败并如实报告，也不偷换端口。
+ */
+async function restartProcess(role) {
+  const ctx = state.restartCtx
+  if (!ctx) return { ok: false, reason: 'no-context' }
+
+  if (role === 'engine') {
+    const result = await startEngine(ctx.info, {
+      ...ctx.options,
+      port: ctx.enginePort,
+      gatewayPort: ctx.gatewayPort,
+      knowledgeServicePort: ctx.knowledgeServicePort,
+      retryPortConflict: false,
+    })
+    if (!result.ok) {
+      return { ok: false, reason: result.reason || 'engine-failed', message: result.message }
+    }
+    // 重建之后必须**两个**监听都重挂：`once` 监听已随旧 child 一起消失，而重启后的
+    // 进程还会再崩 —— 只重启一次而不盯下一次，等于把"能自愈"降级成"能自愈一次"。
+    // 两条各司其职：watchEngineExit 通知用户，watchEngineRestart 负责再修一次。
+    if (ctx.onEngineExit) watchEngineExit(result.record, ctx.onEngineExit)
+    watchEngineRestart(result.record, state.supervisor)
+    return { ok: true, address: result.address, port: result.port }
+  }
+
+  if (role === 'gateway') {
+    try {
+      const result = await startGateway(ctx.info, {
+        ...ctx.options,
+        port: ctx.gatewayPort,
+        pythonEngineAddress: ctx.engineAddress,
+        retryPortConflict: false,
+      })
+      // 同上：网关重启后也要重新盯住下一次崩溃。
+      watchGatewayExit(result.record, state.supervisor)
+      return { ok: true, baseUrl: result.baseUrl, port: result.port }
+    } catch (err) {
+      return {
+        ok: false,
+        reason: err && err.reason ? err.reason : 'gateway-failed',
+        message: (err && err.message) || String(err),
+      }
+    }
+  }
+
+  return { ok: false, reason: 'not-supervised' }
+}
+
+/** 挂上"引擎运行中崩溃"的自愈监听。
+ *
+ *  与 `watchEngineExit`（用户通知）并存：两者职责不同 —— 一个告诉用户出了事，一个负责
+ *  把事修好。用一个 `once('exit')` 各挂一次，`EventEmitter` 允许多个监听器。
+ */
+function watchEngineRestart(engineRecord, supervisor) {
+  const child = engineRecord && engineRecord.child
+  if (!child || !supervisor) return
+  child.once('exit', (code, signal) => {
+    // `stopping` 由 `stopEngine` 在发信号**之前**立起：主动关停不是崩溃，
+    // 拿去重启会让用户退出应用后仍留下一个后台引擎。
+    if (engineRecord.stopping) return
+    supervisor.handleExit('engine', {
+      code: code === null || code === undefined ? null : code,
+      signal: signal || '',
+      stderrTail: engineRecord.stderrTail || '',
+      at: new Date().toISOString(),
+    })
+  })
+}
+
+/** 挂上"运行中崩溃"的监听：非预期退出才交给监督器，主动关停由各 stop 里的 stopping 挡住。 */
+function watchGatewayExit(gatewayRecord, supervisor) {
+  const child = gatewayRecord && gatewayRecord.child
+  if (!child) return
+  child.once('exit', (code, signal) => {
+    if (gatewayRecord.stopping) return
+    supervisor.handleExit('gateway', {
+      code: code === null || code === undefined ? null : code,
+      signal: signal || '',
+      at: new Date().toISOString(),
+    })
+  })
+}
+
+/**
+ * 装上崩溃自愈。
+ *
+ * 为什么必须有：网关与引擎都是长驻进程，而此前任何一方在运行中退出都**没有任何恢复**
+ * —— 引擎挂了只弹一次"引擎已停止"，网关挂了连提示都没有。用户开着窗口过夜、中途一次
+ * OOM 或一次未捕获异常，第二天回来看到的是一个只有外壳的界面，而且不会自己好。
+ *
+ * 反过来也不能无限重启：反复崩说明环境坏了，无限重建只会烧 CPU 并让用户永远等不到结论。
+ * 所以走 `supervisor.cjs` 的预算 + 退避 + 放弃通知（放弃才是可接受的终局）。
+ */
+function installSupervisor(options = {}) {
+  if (state.supervisor) return state.supervisor
+
+  const onGiveUp = options.onSupervisorGiveUp
+  // 退避/预算可注入：打包态用默认值，用例里把退避压到 0 才能在一次测试里跑完
+  // "崩溃 → 重启 → 再崩 → 放弃" 的整条链，而不是真的等 1+2+4 秒。
+  const overrides = options.supervisorOptions || {}
+  const sup = createSupervisor({
+    restart: role => restartProcess(role),
+    onGiveUp: (role, info) => {
+      // 放弃时必须让用户知道：这是"再也起不来了"，不是一次会自动好的抖动。
+      if (typeof onGiveUp === 'function') onGiveUp(role, info)
+      log(`supervisor gave up on ${role}`)
+    },
+    log: msg => log(msg),
+    ...overrides,
+  })
+  state.supervisor = sup
+  return sup
+}
+
 /** 停引擎。引擎是单进程（uvicorn 不分叉），SIGTERM 足够；超时再收树。 */
 async function stopEngine() {
   const record = state.engine
@@ -1297,15 +1460,37 @@ async function startLocalStack(options = {}) {
       throw err
     }
     state.engineFailure = null
+
+    // 崩溃自愈的现场：重启必须能在**原端口**上重建，所以把这次启动的全部入参留下来。
+    // 不留在闭包里是因为重启发生在很久之后（甚至另一轮 event loop），那时启动栈已经退出了。
+    state.restartCtx = {
+      info: launcherResult.info,
+      options,
+      enginePort,
+      gatewayPort,
+      knowledgeServicePort: knowledgeResult.ok ? knowledgeResult.port : 0,
+      engineAddress: engineResult.address,
+      onEngineExit: options.onEngineExit,
+    }
+    const supervisor = installSupervisor(options)
+
     // 就绪之后才挂这个监听：启动阶段的退出由上面的失败分支负责，两处都通知会把
     // 一次故障说成两次。
     watchEngineExit(engineResult.record, options.onEngineExit)
+    // 引擎起好了 ⇒ 稳定期开始。退避预算靠这个时间点判断"是启动即崩还是偶发崩溃"。
+    supervisor.markAlive('engine')
+    watchEngineRestart(engineResult.record, supervisor)
 
     const gatewayResult = await startGateway(launcherResult.info, {
       ...options,
       port: gatewayPort,
       pythonEngineAddress: engineResult.address,
     })
+
+    // 网关也挂自愈：它崩了比引擎崩了更彻底 —— 界面所有 API 一起失效，而此前
+    // 连一条提示都没有（引擎至少还有 onEngineExit）。
+    watchGatewayExit(gatewayResult.record, supervisor)
+    supervisor.markAlive('gateway')
 
     // 网关换了端口 ⇒ 引擎环境里那个 URL 就指向别处了，而引擎已经起来了、改不了。
     // 这里不"将就用"：半残状态表现为工具/媒体/系统设置静默失灵，比一次明确的启动失败难查得多。
@@ -1361,6 +1546,13 @@ async function stopLocalStack() {
     state.attached = null
     return { gatewayStopped: false, engineStopped: false, launcherStopped: false, detached: true }
   }
+
+  // **先拆自愈**：否则下面逐个 kill 子进程时会被监督器当成崩溃，一边关一边重启。
+  if (state.supervisor) {
+    state.supervisor.stop()
+    state.supervisor = null
+  }
+  state.restartCtx = null
 
   // 与启动相反：先网关，再引擎（它还在用知识库服务），最后数据栈
   const gatewayStopped = await stopGateway()
@@ -1430,6 +1622,7 @@ module.exports = {
   stopLocalStack,
   getStackState,
   _setDeps,
+  _setLog,
   _resetDeps,
   _resetState,
 }

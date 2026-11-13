@@ -394,6 +394,14 @@ func (h *Hub) ReplayAfter(ctx context.Context, sessionID, after string) ([]Event
 	if err != nil {
 		return nil, err
 	}
+	return decodeReplay(msgs, sessionID), nil
+}
+
+// decodeReplay 把 Stream 条目解成事件，并按**逻辑身份**去重。
+//
+// 去重的理由：同一条逻辑事件会被每个实例各追加一次（N 份），重放时只保留最早的一份。
+// 不去重的话，客户端断线重连后会看到 N 份重复事件（2026-10-08 双进程演练实测 [2,2,3,3]）。
+func decodeReplay(msgs []redis.XMessage, sessionID string) []Event {
 	events := make([]Event, 0, len(msgs))
 	seen := make(map[string]struct{}, len(msgs))
 	for _, m := range msgs {
@@ -407,8 +415,6 @@ func (h *Hub) ReplayAfter(ctx context.Context, sessionID, after string) ([]Event
 			continue
 		}
 		ev.ID = m.ID
-		// 多实例去重：同一条逻辑事件会被每个实例各追加一次（N 份），重放时只保留最早的一份。
-		// 不去重的话，客户端断线重连后会看到 N 份重复事件（2026-10-08 双进程演练实测 [2,2,3,3]）。
 		if key := logicalEventID(ev); key != "" {
 			if _, dup := seen[key]; dup {
 				continue
@@ -417,7 +423,86 @@ func (h *Hub) ReplayAfter(ctx context.Context, sessionID, after string) ([]Event
 		}
 		events = append(events, ev)
 	}
-	return events, nil
+	return events
+}
+
+// replayIsComplete 判定一次补发是否**真的补全**了缺口。
+//
+// 抽成纯函数是为了能直接测：这段判据是本功能对外的全部承诺，而它依赖的
+// Redis 边界（MaxLen 驱逐、TTL 过期）在单测里造不出来。判据写错的方向只有一个 ——
+// 把"补不齐"误判成"补齐了"，那正是让界面停在断线前那一刻的原因。
+//
+// 参数：
+//   - after：客户端送来的基线（已确认可解析）；
+//   - fetched：实际取回并准备发出的条数（未截断前）；
+//   - hasStream：会话流是否还存在；
+//   - oldestID：流里最老的一条的 ID（hasStream=false 时无意义）。
+func replayIsComplete(after string, fetched int, hasStream bool, oldestID string) bool {
+	if after == "" {
+		return true // 新连接没有基线，谈不上缺口
+	}
+	// 触顶说明后面很可能还有更多：宁可让客户端多拉一次历史，也不谎报"补齐了"
+	if fetched > sseEventsMaxLen {
+		return false
+	}
+	// 流不存在（TTL 已清）或已空：断线期间的事件无从追回
+	if !hasStream {
+		return false
+	}
+	// 判据是"基线不早于缓冲起点"：
+	//   * after > oldest  ⇒ 缓冲里还留着 after 之后的全部，补齐完整；
+	//   * after == oldest ⇒ 同理完整（oldest 就是 after 本身）；
+	//   * after < oldest  ⇒ after 到 oldest 之间那段已被 MaxLen 驱逐，无法知道少了什么。
+	// 所以完整 ⇔ NOT (oldest 严格晚于 after)。方向写反（`IsNewerStreamID(after, oldest)`）
+	// 会把"早被裁掉"判成"还在缓冲里"，缺口被静默吞掉 —— 那正是这个功能要防的唯一错法。
+	return !IsNewerStreamID(oldestID, after)
+}
+
+// ReplayAfterWithGap 与 ReplayAfter 相同，但额外**如实报告缺口是否补全**。
+//
+// 为什么必须有它：`ReplayAfter` 在两种真实场景下会返回"看起来正常、其实残缺"的结果 ——
+// 会话流被 MaxLen 裁到最近 200 条（断线久了，缺口比缓冲还大），或流已过 TTL 被整个删除。
+// 两种情况客户端都只看到"连上了、之后又有新事件了"，中间那段既没补、也没有任何提示，
+// 于是界面停在断线前那一刻：用户回来时以为任务还在跑，或者以为它从没跑过。
+//
+// 补全与否的判据见 `replayIsComplete`。
+//
+// complete=false **不代表**取回的事件不可用 —— 那部分仍然有效；它只表示客户端
+// 必须重拉消息列表（DB 才是事实源），而不能把这段缺口当成"什么都没发生"。
+func (h *Hub) ReplayAfterWithGap(ctx context.Context, sessionID, after string) ([]Event, bool, error) {
+	if sessionID == "" || after == "" {
+		return nil, true, nil
+	}
+	if h.localOnly {
+		// 没有 Redis 就没有任何补发能力 —— 不能假装"没有缺口"
+		return nil, false, nil
+	}
+	// 多取一条：用来判断是否还有被上限截掉的后续
+	msgs, err := h.rdb.XRange(
+		ctx, sessionEventsKey(sessionID), "("+after, "+", sseEventsMaxLen+1,
+	).Result()
+	if err != nil {
+		return nil, false, err
+	}
+	fetched := len(msgs)
+	if fetched > sseEventsMaxLen {
+		msgs = msgs[:sseEventsMaxLen]
+	}
+	events := decodeReplay(msgs, sessionID)
+	if fetched > sseEventsMaxLen {
+		// 已触顶，不必再查最老一条
+		return events, replayIsComplete(after, fetched, true, ""), nil
+	}
+	// 取流里最老的一条：`after` 若已早于它，说明缺口被 MaxLen 裁过
+	oldest, err := h.rdb.XRange(ctx, sessionEventsKey(sessionID), "-", "+", 1).Result()
+	if err != nil {
+		return events, false, err
+	}
+	oldestID := ""
+	if len(oldest) > 0 {
+		oldestID = oldest[0].ID
+	}
+	return events, replayIsComplete(after, fetched, len(oldest) > 0, oldestID), nil
 }
 
 func (h *Hub) redisListener() {

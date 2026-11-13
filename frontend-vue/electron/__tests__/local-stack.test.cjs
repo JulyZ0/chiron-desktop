@@ -806,4 +806,134 @@ test('主动关停引擎不通知（正常退出应用不该弹"引擎已停止"
 })
 
 
+// ------------------------------------------------------- 崩溃自愈（接线级）
+//
+// supervisor.test.cjs 用假时钟测的是**决策**；这里测的是**接线**：崩溃事件真的送到了
+// 监督器、重启真的落在原端口、主动关停真的不会被误判成崩溃。决策对而接线断过一次
+// （`watchGatewayExit(gatewayResult.record)` 里 record 根本不存在），所以这层必须单独钉住。
 
+/** 等到条件成立或超时：重启走 setTimeout + 多次 await，步数不固定 */
+async function waitFor(predicate, { timeoutMs = 3000, label = 'condition' } = {}) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  throw new Error('等待超时：' + label)
+}
+
+/**
+ * 起一套栈，并把监督器退避压到 0。
+ *
+ * 真实退避是 1/2/4 秒，用例没必要真的等；`stableMs` 放大到 1 分钟，免得跑得慢一点
+ * 就被判成"已稳定"把预算清零，让"连续崩溃"的用例变成偶发通过。
+ * `extraChildren` 是给"重启"那几次 spawn 预留的假子进程。
+ */
+async function startWithSupervisor(t, { portBase = 9460, extraChildren = [] } = {}) {
+  const launcherChild = fakeChild()
+  const engineChild = fakeChild()
+  const gatewayChild = fakeChild()
+  launcherChild.stdin.on('finish', () => {
+    launcherChild.exitCode = 0
+    launcherChild.emit('exit', 0)
+  })
+  const calls = withSpawnQueue(t, [launcherChild, engineChild, gatewayChild, ...extraChildren])
+  mockFetch(t, async url => gatewayFetch(url))
+
+  const giveUps = []
+  const promise = stack.startLocalStack({
+    launcher: { command: 'py', cwd: '/' },
+    exe: 'gateway.exe',
+    port: portBase,
+    appSecret: VALID_SECRET,
+    engine: { command: 'py-engine', args: ['-m', 'app.main'], cwd: '/' },
+    enginePort: portBase + 1,
+    intervalMs: 1,
+    onSupervisorGiveUp: (role, info) => giveUps.push({ role, info }),
+    supervisorOptions: { backoffMs: [0], stableMs: 60_000 },
+  })
+  launcherChild.stdout.write(
+    JSON.stringify({ event: 'launcher-ready', pg_dsn: 'postgresql://u@127.0.0.1:1/c', redis_addr: '127.0.0.1:2' }) + '\n',
+  )
+  await promise
+  return { calls, engineChild, gatewayChild, giveUps }
+}
+
+test('★ 引擎运行中崩溃 ⇒ 在原端口上自动重建', async t => {
+  const { calls, engineChild } = await startWithSupervisor(t, {
+    portBase: 9460,
+    extraChildren: [fakeChild()],
+  })
+  const before = calls.length
+
+  engineChild.emit('exit', 1)
+
+  await waitFor(() => calls.length > before, { label: '引擎被重建' })
+
+  const rebuilt = calls[calls.length - 1]
+  assert.equal(rebuilt.command, 'py-engine', '重建的必须是引擎')
+  assert.equal(
+    rebuilt.options.env.HTTP_PORT,
+    '9461',
+    '必须在原端口重建：网关的 PYTHON_ENGINE_ADDRESS 已按这个端口写死，换号等于让网关对着空气发请求',
+  )
+})
+
+test('★ 重建出来的进程再崩一次，也照样能自愈（监听要重挂）', async t => {
+  const second = fakeChild()
+  const { calls, engineChild } = await startWithSupervisor(t, {
+    portBase: 9470,
+    extraChildren: [second],
+  })
+  const before = calls.length
+
+  engineChild.emit('exit', 1)
+  await waitFor(() => calls.length > before, { label: '第一次重建' })
+
+  // `once('exit')` 已随旧 child 消失；不重挂的话这里就再也等不到第二次重建，
+  // "能自愈"退化成"能自愈一次"。
+  second.emit('exit', 1)
+  await waitFor(() => calls.length > before + 1, { label: '第二次重建' })
+
+  assert.equal(calls[calls.length - 1].command, 'py-engine')
+})
+
+test('★ 网关运行中崩溃 ⇒ 也自动重建（此前这一侧完全没人管）', async t => {
+  const { calls, gatewayChild } = await startWithSupervisor(t, {
+    portBase: 9490,
+    extraChildren: [fakeChild()],
+  })
+  const before = calls.length
+
+  gatewayChild.emit('exit', 1)
+
+  await waitFor(() => calls.length > before, { label: '网关被重建' })
+
+  const rebuilt = calls[calls.length - 1]
+  assert.equal(rebuilt.command, 'gateway.exe', '重建的必须是网关')
+  assert.equal(
+    rebuilt.options.env.PORT,
+    '9490',
+    '网关也必须原端口重建：引擎的 GATEWAY_INTERNAL_URL 已经写死了这个端口',
+  )
+})
+
+test('★ 主动关停引擎 ⇒ 不自愈（退出应用后不该留下后台引擎）', async t => {
+  const { calls } = await startWithSupervisor(t, { portBase: 9510 })
+  const before = calls.length
+
+  await stack.stopEngine()
+  await new Promise(resolve => setTimeout(resolve, 80))
+
+  assert.equal(calls.length, before, '主动关停不是崩溃，重建会让"退出应用"变成"后台还留着引擎"')
+})
+
+test('★ stopLocalStack 会拆掉自愈：关停过程中不会被一边杀一边重启', async t => {
+  const { calls } = await startWithSupervisor(t, { portBase: 9530 })
+  const before = calls.length
+
+  await stack.stopLocalStack()
+  await new Promise(resolve => setTimeout(resolve, 80))
+
+  assert.equal(calls.length, before, '关停流程里逐个子进程 kill 必须不被当成崩溃')
+})

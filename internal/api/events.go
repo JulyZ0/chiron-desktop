@@ -88,7 +88,7 @@ func handleSSE(w http.ResponseWriter, r *http.Request, hub *broadcast.Hub, subID
 		}
 	}
 	if sessionID != "" && lastSentID != "" {
-		replayed, err := hub.ReplayAfter(r.Context(), sessionID, lastSentID)
+		replayed, complete, err := hub.ReplayAfterWithGap(r.Context(), sessionID, lastSentID)
 		if err != nil {
 			// 缓冲不可读时降级为仅实时（不阻断连接；事件仍可由前端按 DB 状态自愈）
 			slog.Warn("sse replay failed, falling back to live-only", "session", sessionID, "error", err)
@@ -98,6 +98,23 @@ func handleSSE(w http.ResponseWriter, r *http.Request, hub *broadcast.Hub, subID
 				return
 			}
 			lastSentID = ev.ID
+		}
+		// 缺口如实报告：补发不完整时**必须**告诉客户端去重拉消息列表，而不是让它
+		// 以为"连上之后没新事件 = 什么都没发生"。会话流被 MaxLen 裁到最近 200 条、
+		// 或流已过 TTL 整条消失时，都会走到这里 —— 那是断线久了唯一会踩到的情况，
+		// 也正是"用户回来时看不见结论"的来源。
+		if !complete {
+			gap := broadcast.Event{
+				Type: "stream_gap",
+				Data: map[string]string{
+					"reason": "replay_incomplete",
+					"note":   "断线期间的推送无法完整补发；请以消息列表为准重拉该会话。",
+				},
+				SessionID: sessionID,
+			}
+			if !writeFrame(broadcast.FormatSSE(gap)) {
+				return
+			}
 		}
 	}
 

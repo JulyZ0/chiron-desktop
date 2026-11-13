@@ -41,6 +41,18 @@ func (h *SubmitHandler) agentDefaults() (int, int) {
 	return maxOutputTokens, defaultMaxTurns
 }
 
+// turnTimeout 是**一轮**提交的上限，来自 `AGENT_SUBMIT_TIMEOUT`。
+//
+// 它必须是可配置的真值：撞上它时引擎收到的是 ASGI 取消（回合中止），而不是一次可续的暂停。
+// 此前 `submitOnce` 自己写死 `DefaultAgentTimeout`，于是 `AGENT_SUBMIT_TIMEOUT` 只作用于
+// 外层后台 ctx，把它调大对单轮毫无效果 —— 现场被 300s 定时销毁，且用户在配置里改不动。
+func (h *SubmitHandler) turnTimeout() time.Duration {
+	if h.agentCfg != nil && h.agentCfg.AgentSubmitTimeout > 0 {
+		return h.agentCfg.AgentSubmitTimeout
+	}
+	return DefaultAgentTimeout
+}
+
 // applyMaxOutputDefault 只在请求**没带** `max_tokens` 时注入后台值。
 //
 // 显式值优先是契约的一部分：前端 / Agent 档案选了单次输出上限，后台的全局默认不能盖掉它；
@@ -403,8 +415,10 @@ func (h *SubmitHandler) saveGoal(ctx context.Context, g agentgoal.Goal) {
 // workbenchCtx 是前端组装的工作台上下文（kb_id / agent / skill_names / workflow_id），
 // 透传给引擎消费 —— 网关不再丢弃它。
 func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content, engineContent string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}) *agentgoal.Report {
-	// P1 修复：与 Python 引擎 5min 客户端超时对齐，避免长任务被 180s 硬超时截断
-	ctx, cancel := context.WithTimeout(ctx, DefaultAgentTimeout)
+	// 单轮上限来自 `AGENT_SUBMIT_TIMEOUT`（见 turnTimeout）。这里**不再**写死
+	// `DefaultAgentTimeout`：那个常量只是兜底，写死它会让配置项对外层 ctx 生效、
+	// 对真正的单轮无效，长回合依然在 300s 被销毁现场。
+	ctx, cancel := context.WithTimeout(ctx, h.turnTimeout())
 	defer cancel()
 	// session 亲和：同 session 的所有流式轮次固定路由到同一引擎实例
 	// （引擎 PersistentTerminal/后台任务/簿记为进程内状态，round-robin 跨实例会断链）

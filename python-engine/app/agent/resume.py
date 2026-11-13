@@ -397,6 +397,7 @@ async def sweep_once(
         "released": 0,
         "failed": 0,
         "pending_expired": 0,
+        "awaiting_abandoned": 0,
     }
 
     # M7：顺带回收过期的人工介入现场。放在**扫描之前**：run 表读不到不该连带把票也留着。
@@ -410,6 +411,15 @@ async def sweep_once(
         stats["pending_expired"] = await pending_interactions.expire_stale()
     except Exception as exc:  # noqa: BLE001 — 回收失败不影响 run 巡检
         logger.warning("reconciler: 介入现场过期回收失败: %s", exc)
+
+    # M7 收口：票已过期、run 却还停在 `awaiting_input` 的那些行。
+    # 必须紧接在 `expire_stale` 之后：它刚把票转成 `expired`，这里才能看出"不会再有人答了"。
+    # 不做这一步的话，挂起的 run 不在扫描条件里（见 `ACTIVE_STATUSES`），也就永远没有
+    # 任何巡检会碰它 —— 唯一的结局是"界面一直显示等你回答，而票早已取不出来"。
+    try:
+        stats["awaiting_abandoned"] = await ckpt.abandon_stale_awaiting()
+    except Exception as exc:  # noqa: BLE001 — 同上，不影响 run 巡检
+        logger.warning("reconciler: 挂起现场收口失败: %s", exc)
 
     pool = ckpt._pool()  # noqa: SLF001 — 与 checkpoint 同一池来源（同模块族）
     if pool is None:

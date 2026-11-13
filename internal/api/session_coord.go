@@ -254,6 +254,10 @@ func StartAgentCancelSubscriber(ctx context.Context) {
 					if !sessionCancels.CompareAndDelete(sessionID, v) {
 						continue
 					}
+					// 与 cancelSessionRun 同一顺序、同一理由：先落「用户下的令」。
+					// 少了这一步，跨实例停止在引擎侧与「网关超时/客户端断开」没有区别，
+					// 引擎会把这条 run 当外因中断保留现场并让 reconciler 自动复活它。
+					markUserStop(ctx, sessionID)
 					sc.cancel()
 					slog.Info("session cancelled via cross-instance broadcast",
 						"session_id", sessionID)

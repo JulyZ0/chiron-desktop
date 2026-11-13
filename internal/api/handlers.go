@@ -57,6 +57,39 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 // errNotSessionOwner 表示请求者不是该会话的主人（取消/接管都要拦）。
 var errNotSessionOwner = errors.New("session does not belong to the current user")
 
+// userStopSignalTTL 与引擎 `app/agent/interrupt.py` 的 `INTERRUPT_TTL_SECONDS` 逐字对齐。
+// 不够长会漏判：工具执行到一半的 run 要到下一个**轮次边界**才检查信号，超过 TTL 就
+// 读不到了，用户刚停掉的 run 会被当成"外因中断"复活。
+const userStopSignalTTL = 300 * time.Second
+
+// markUserStop 在**用户显式停止**时给引擎留一个可判定的意图信号。
+//
+// 为什么必须有：网关取消一轮的手段是 `cancel()` 本地 ctx ⇒ 引擎看到的是 ASGI 取消 /
+// SSE 中断，这与「网关单轮超时」「客户端断开」在引擎侧**完全同构**。引擎要决定
+// "这条是不是用户下的令"，只能靠这个信号（见 `python-engine/app/agent/runtime.py`
+// finally 段与 `app/agent/interrupt.py`）：有 ⇒ 写终态 `cancelled`；没有 ⇒ 保留现场
+// 待续跑。不写它，用户点停止的 run 会被自动复活并继续烧 token —— 那比"多跑一轮"严重。
+//
+// 键名必须与 `interrupt.interrupt_key()` 逐字一致（`rkey("engine:interrupt:") + sid`，
+// 两侧都由 `REDIS_KEY_PREFIX` 组装）。
+//
+// 失败只 warn：留不下信号时引擎退回保守方向（`cancelled`），不会误复活。
+func markUserStop(ctx context.Context, sessionID string) {
+	if db.Redis == nil || sessionID == "" {
+		return
+	}
+	// 独立短超时：调用点常挂在请求 ctx 上，而取消动作本身可能已让它失效
+	// （`sc.cancel()` 之后、或请求已经返回）。留信号失败只降级 —— 引擎会退回
+	// 保守方向（写 `cancelled`），不会误复活 —— 所以不必也不该阻塞取消。
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	key := db.RedisKey("engine:interrupt:") + sessionID
+	if err := db.Redis.Set(wctx, key, "1", userStopSignalTTL).Err(); err != nil {
+		slog.Warn("mark user stop failed; engine may treat this cancel as transport loss",
+			"session_id", sessionID, "error", err)
+	}
+}
+
 // cancelSessionRun 是"取消某会话正在跑的一轮"的唯一实现。
 //
 // /v1/agent/cancel 与 super-agent 打断共用它，避免两条路径的归属校验口径漂移 ——
@@ -77,6 +110,10 @@ func cancelSessionRun(ctx context.Context, sessionMgr *session.Manager, sessionI
 			slog.Warn("subagent session cancel broadcast failed",
 				"session_id", sessionID, "error", err)
 		}
+		// 顺序要紧：先落「这是用户下的令」，再 cancel()。反过来，引擎可能在
+		// cancel 生效的瞬间就跑到 finally 判据，读不到信号 ⇒ 把主动停止当成外因
+		// 中断并保留现场，下一轮 reconciler 会把它自动复活。
+		markUserStop(ctx, sessionID)
 		sc.cancel()
 		slog.Info("session cancelled", "session_id", sessionID)
 		return "cancelled", nil

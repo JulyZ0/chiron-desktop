@@ -2325,6 +2325,45 @@ function goalCompletionNotice(raw: string): string {
   }
 }
 
+/** 收到 `stream_gap` 后待补拉的会话（本轮还在流式输出时不能立刻覆盖，见下）。 */
+const gapPendingResync = new Set<string>()
+
+/** 重拉某会话的历史并替换该会话的条目。事实源是消息列表，不是事件流。 */
+async function resyncSessionHistory(sid: string) {
+  try {
+    const res = await api.get(`/v1/conversations/${sid}?limit=${HISTORY_PAGE_SIZE}`)
+    const data = res.data?.data || res.data
+    if (!data?.messages) return
+    const run = runOf(sid)
+    // 拉取期间该会话可能又开跑了新一轮：那时历史是旧的，覆盖会把新内容冲掉
+    if (run.loading) return
+    run.items = mergeHistory(data.messages, data.tool_calls || [])
+    if (sid === activeSessionId.value) {
+      await nextTick()
+      messageListRef.value?.scrollToBottom()
+    }
+  } catch {
+    // 拉不到就保持现状（不用半截数据覆盖）：缺口会随下一次正常加载补齐
+  }
+}
+
+/**
+ * 服务端说"断线期间的推送补不齐"（会话流被 MaxLen 裁到最近 200 条、或流已过 TTL 整条消失）。
+ *
+ * 这不是错误，不该弹窗 —— 此刻事实源是消息列表，重拉即恢复。**必须重拉**：不拉的话界面就
+ * 停在断线前那一刻，用户回来时以为任务还在跑，或者以为它根本没跑过。
+ */
+function scheduleGapResync(sid: string) {
+  if (!sid) return
+  if (runOf(sid).loading) {
+    // 本轮还在流式输出：立刻用历史覆盖会把这段累积冲掉（与 switchSession 同款判断）。
+    // 记下来，等本轮 `done` 收尾后再补 —— 那时实时与历史都已定稿。
+    gapPendingResync.add(sid)
+    return
+  }
+  void resyncSessionHistory(sid)
+}
+
 function onSSEMessage(raw: unknown, sid: string) {
   // SSE 载荷来自服务端 JSON（createSSEConnection 的 onMessage 契约即 unknown）：
   // 在边界一次性窄化成 Record，后续各事件分支只做字段级取值，不把 unknown 透出去。
@@ -2475,6 +2514,8 @@ function onSSEMessage(raw: unknown, sid: string) {
     // 轮次可能以 `awaiting_input` 收尾（SSE 已关，实时卡片不会再出现）：刷新收件箱把
     // 落在 pending_interactions 里的待办补上，否则用户只看到"回合结束"却不知还欠一次答复。
     void interactionInboxRef.value?.refresh()
+    // 断线期间补不齐的那一段：本轮已定稿，重拉历史补齐（见 scheduleGapResync）
+    if (gapPendingResync.delete(sid)) void resyncSessionHistory(sid)
   } else if (type === 'approval') {
     const callId = String(d.id ?? d.tool_call_id ?? Date.now())
     pendingApprovals.value.push({
@@ -2495,6 +2536,10 @@ function onSSEMessage(raw: unknown, sid: string) {
       expiresAt: Date.now() + ASK_TIMEOUT_MS,
     })
     ensureAskTimer()
+  } else if (type === 'stream_gap') {
+    // 服务端明确告知"断线期间的推送补不齐"（缓冲被 MaxLen 裁掉 / 流已过 TTL）。
+    // 不弹窗：这是可自愈的降级，不是错误。但**必须重拉**，否则界面就停在断线前那一刻。
+    scheduleGapResync(sid)
   } else if (type === 'guardrail_blocked') {
     flushStreamingFlags()
     loading.value = false

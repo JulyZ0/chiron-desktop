@@ -76,6 +76,21 @@ async def is_interrupted(session_id: str, *, redis: Any = None) -> bool:
 
     顺序有意如此：绝大多数取消来自同一副本（用户在同一个连接上点了取消），本地命中时不必付
     网络往返；跨副本是少数情况，那时才查 Redis。
+
+    **读不到等于没被取消**（`None` 折成 `False`）：run 循环不该因为 Redis 抽风就停下。
+    需要区分"确认没有信号"与"读不到"的调用方（收尾判据）用 :func:`probe_interrupt`。
+    """
+    return bool(await probe_interrupt(session_id, redis=redis))
+
+
+async def probe_interrupt(session_id: str, *, redis: Any = None) -> bool | None:
+    """三态查中断信号：`True` 被叫停 / `False` 确认没有信号 / `None` 读不到。
+
+    为什么要三态：run 收尾时要判断"这次中断是不是用户下的令" —— 有令写终态
+    `cancelled`，无令保留现场待续跑。把"读不到"混进 `False` 会让**用户刚停掉、
+    而 Redis 恰好不可用**的 run 被当成外因中断，等 Redis 恢复后被 reconciler
+    自动复活并继续烧 token。折进 `True` 又会把断线/超时错判成用户意图、销毁现场。
+    两种折法都错，所以这里把"不知道"如实暴露出来，让调用方自己选保守方向。
     """
     if not session_id:
         return False
@@ -83,12 +98,12 @@ async def is_interrupted(session_id: str, *, redis: Any = None) -> bool:
         return True
     client = await _resolve_redis(redis)
     if client is None:
-        return False
+        return None
     try:
         return bool(await client.get(interrupt_key(session_id)))
-    except Exception as exc:  # noqa: BLE001 — 查不到就当没被取消，不阻断 run
+    except Exception as exc:  # noqa: BLE001 — 读失败是"不知道"，不是"没有"
         logger.warning("interrupt: failed to read redis flag: %s", exc)
-        return False
+        return None
 
 
 async def clear_interrupt(session_id: str, *, redis: Any = None) -> None:

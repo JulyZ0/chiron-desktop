@@ -433,6 +433,12 @@ async function tryStartGoStack(options = {}) {
   const components = loadOptionalModule('./components.cjs')
   if (!stack || !components) return null
 
+  // 诊断出口：重启第几次、为什么放弃，这些只在 main.log 里查得到。
+  // 不注入就静默丢弃 —— 打包态 stdout 没有接收方。
+  if (typeof stack._setLog === 'function') {
+    stack._setLog(msg => logMain('info', msg))
+  }
+
   const gatewayExe = resolveGatewayExe()
   if (!gatewayExe) {
     logMain('info', '本地网关不可用（未找到 chiron.exe），退回 desktop-local core')
@@ -513,6 +519,8 @@ async function tryStartGoStack(options = {}) {
       engine: engineLaunch || undefined,
       knowledge: knowledgeLaunch || undefined,
       onEngineExit: notifyEngineExit,
+      // 自愈放弃才通知：这条是"放弃了"，与上一条"抖了一下"必须能区分开。
+      onSupervisorGiveUp: notifySupervisorGiveUp,
     })
 
     logMain(
@@ -1151,6 +1159,50 @@ function notifyEngineExit(info = {}) {
       if (response === 0) restartNow()
     })
     .catch(err => logMain('warn', `engine exit dialog failed: ${err?.message || err}`))
+}
+
+/**
+ * 崩溃自愈放弃后的收口。
+ *
+ * 为什么必须通知：自愈失败意味着本地后端**再也起不来了**，而界面还活着 —— 用户点任何
+ * 功能都只会得到一句"服务暂时不可用"。不告诉他"已经试过 N 次、不会再试了"，他唯一的
+ * 选择就是反复点重试，然后再也等不到结论。这与引擎崩溃那条提示不同：那条是"抖了一下"，
+ * 这条是"放弃"。
+ */
+let supervisorGaveUpNotified = false
+
+function notifySupervisorGiveUp(role, info = {}) {
+  const label = role === 'gateway' ? '本地网关' : role === 'engine' ? '本地 AI 引擎' : String(role)
+  const tail = String(info.stderrTail || '').trim().split('\n').slice(-8).join('\n')
+  logMain(
+    'error',
+    `本地组件 ${role} 连续崩溃已达上限，停止自愈（code=${info.code} signal=${info.signal || ''}）` +
+      (tail ? `\n${tail}` : ''),
+  )
+  if (supervisorGaveUpNotified) return
+  supervisorGaveUpNotified = true
+
+  const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+  if (!win) return
+  dialog
+    .showMessageBox(win, {
+      type: 'error',
+      title: `${label}反复崩溃，已停止自动重启`,
+      message: '本地后端无法自行恢复，功能会持续不可用',
+      detail:
+        `${label}在短时间内连续崩溃，已经自动重启到上限（3 次）仍不稳定，` +
+        '为避免反复重建拖垮机器，已停止自动重启。\n\n' +
+        (tail ? `最近的输出（尾部）：\n${tail}\n\n` : '') +
+        '重启应用会重新尝试一次完整的启动。若反复出现，请连同这条信息一起反馈。',
+      buttons: ['重启应用', '稍后手动重启'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    })
+    .then(({ response }) => {
+      if (response === 0) restartNow()
+    })
+    .catch(err => logMain('warn', `supervisor give-up dialog failed: ${err?.message || err}`))
 }
 
 /**
