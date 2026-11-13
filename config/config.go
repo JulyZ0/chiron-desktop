@@ -264,7 +264,9 @@ func loadConfig() *Config {
 		WechatAPIv3Key:        getEnv("WXPAY_API_V3_KEY", ""),
 		WechatMchCertSerialNo: getEnv("WXPAY_MCH_CERT_SERIAL_NO", ""),
 		WechatMchPrivateKey:   getEnv("WXPAY_MCH_PRIVATE_KEY", ""),
-		AgentDefaultMaxTurns:  getInt("AGENT_DEFAULT_MAX_TURNS", 5),
+		// 与 api.DefaultMaxTurns 同值（40）。网关每次提交都显式下发它，所以这里才是
+		// 实际生效的默认值；引擎侧 `settings.max_turns` 只是兜底。
+		AgentDefaultMaxTurns:  getInt("AGENT_DEFAULT_MAX_TURNS", 40),
 		AgentMaxOutputTokens:  getInt("AGENT_MAX_OUTPUT_TOKENS", 8192),
 		AgentMaxConcurrency:   getInt("AGENT_MAX_CONCURRENCY", 20),
 		// 默认 5 分钟，与 api.DefaultAgentTimeout 对齐（env AGENT_SUBMIT_TIMEOUT 可调大）

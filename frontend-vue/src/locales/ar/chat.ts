@@ -366,6 +366,7 @@ export default {
   workbench_path_outside_project: "«{path}» خارج مجلد المشروع الحالي ولا يمكن فتحه",
   workbench_file_not_found: "لم يُعثر على «{path}» في هذا المشروع",
   workbench_open_system: "فتح بتطبيق النظام",
+  workbench_preview_truncated: "لم يتم عرض {n} سطرًا إضافيًا للحفاظ على سلاسة الواجهة؛ افتحه بتطبيق النظام لرؤية الملف كاملًا.",
   workbench_open_needs_desktop: "فتح الملفات بتطبيق النظام يتطلب نسخة سطح المكتب؛ في المتصفح انسخ المسار وافتحه بنفسك",
   workbench_open_failed: "تعذّر الفتح: {message}",
   workbench_open_in_panel: "فتح {path} في لوحة ملفات المشروع",

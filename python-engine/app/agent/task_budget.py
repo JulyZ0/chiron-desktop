@@ -26,8 +26,10 @@ import os
 import time
 from dataclasses import dataclass, field
 
-#: 主 Agent 步数上限：一轮里 20 次工具调用是常态，60 足够跑完多轮工具链
-DEFAULT_MAX_STEPS = 60
+#: 主 Agent 步数上限：一次代码任务（读 → 改 → 跑测试 → 修）常态就接近 60 次工具调用，
+#: 再加上排查失败的那几轮，60 会先于 token 轴撞上。放到 150 后，真正失控仍由 tokens 轴拦住
+#: （400k 在那个调用量级下是更贴切的闸门），可用 `AGENT_MAX_STEPS` 覆盖。
+DEFAULT_MAX_STEPS = 150
 #: 主 Agent token 上限：只拦"明显失控"（正常长任务在数十万 token 量级）
 DEFAULT_MAX_TOKENS = 400_000
 #: wall 默认不限：该不该限时由调用方 / 网关的回合超时决定，引擎侧不重复限制

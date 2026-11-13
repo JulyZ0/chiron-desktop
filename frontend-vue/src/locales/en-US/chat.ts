@@ -363,6 +363,7 @@ export default {
   workbench_path_outside_project: "\"{path}\" is outside the current project and cannot be opened",
   workbench_file_not_found: "\"{path}\" was not found in this project",
   workbench_open_system: "Open with system app",
+  workbench_preview_truncated: "{n} more lines are not rendered to keep the view responsive; open it with a system app to see the whole file.",
   workbench_open_needs_desktop: "Opening files with a system app needs the desktop app; in the browser, copy the path and open it yourself",
   workbench_open_failed: "Could not open: {message}",
   workbench_open_in_panel: "Open {path} in the project files panel",

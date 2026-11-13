@@ -182,6 +182,12 @@ registry.register(
     description=(
         "Create or update your task list. Pass the FULL list every time — it replaces the "
         "previous one. Every item MUST have both `content` and `status`. "
+        # 「什么时候必须用」此前完全没写，只说怎么用（下面几行）—— 于是模型把"要不要建清单"
+        # 当成可选风格，长任务做到一半就跑偏。这里把触发条件写成可判定的形状。
+        "Call this FIRST, before any other tool, whenever the work needs more than about three "
+        "steps or touches more than one file: write the whole plan, then start executing. "
+        "Skipping it is the single most common cause of losing the goal halfway through a long "
+        "task — the list is what you re-read each turn to know what is still owed. "
         "Use it for multi-step work: mark an item `in_progress` when you START it and switch "
         "it to `completed` IMMEDIATELY when you finish it — do not batch several completions "
         "into one late update. When delegated to a subagent, you may send only your own items "

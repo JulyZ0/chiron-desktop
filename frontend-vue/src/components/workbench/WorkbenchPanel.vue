@@ -24,6 +24,10 @@ import {
   readProjectFile,
   type ProjectFileEntry,
 } from '../../api/projectFiles'
+// 复用消息区那套高亮（懒加载 highlight.js + 行号 + 跨行 span 闭合）。
+// 不另写一份：同一仓里两套高亮必然在语言映射与转义上漂移。
+import { highlightCodeBlocks } from '../chat/codeHighlighter'
+import { langOf, truncatePreview } from './previewCode'
 import { listProjectChanges, type ProjectChange, type ProjectChanges } from '../../api/projectChanges'
 import { pathKey, projectRelative } from './paths'
 import { describeApiError } from '../../utils/apiError'
@@ -436,6 +440,20 @@ function clearPreview() {
   previewText.value = ''
   previewBinary.value = false
   previewError.value = ''
+  previewLang.value = ''
+  previewTruncatedLines.value = 0
+}
+
+const previewLang = ref('')
+/** 被截断时告诉用户还剩多少行没显示 —— 不告知就等于假装文件只有这么长 */
+const previewTruncatedLines = ref(0)
+const previewHost = ref<HTMLElement | null>(null)
+
+/** 挂载后按需增强：高亮是纯增量，失败也只是少个配色，代码本身始终可读可复制。 */
+async function enhancePreview() {
+  await nextTick()
+  const host = previewHost.value
+  if (host) await highlightCodeBlocks(host)
 }
 
 async function selectFile(entry: ProjectFileEntry) {
@@ -454,12 +472,22 @@ async function selectFile(entry: ProjectFileEntry) {
     previewBinary.value = file.binary
     // 后端对超过 2MB 的文本直接返回 `file_too_large`（不返回一段被截断的内容），
     // 所以这里不需要"内容可能不完整"的判断 —— 能拿到内容就是完整的。
-    previewText.value = file.content ?? ''
+    previewLang.value = langOf(entry.path)
+    // 大文件在**渲染前**截断：塞进 DOM 之后再想办法隐藏没有意义，
+    // 卡住的是渲染本身，不是可见性（见 previewCode.ts 的 PREVIEW_LINE_LIMIT）。
+    const cut = truncatePreview(file.content ?? '')
+    previewText.value = cut.text
+    previewTruncatedLines.value = cut.dropped
   } catch (e) {
     previewError.value = describeApiError(e)
   } finally {
+    // **必须先关 loading 再增强**：预览正文挂在 `v-else` 分支上，而那条分支只在
+    // `previewLoading === false` 时才渲染。在 try 里调 enhancePreview 拿到的是
+    // 上一屏（甚至 null）的 host，高亮与行号于是被静默跳过 —— 界面照常显示纯文本，
+    // 看不出任何异常，只是"高亮没生效"。这是本功能最初的真实故障。
     previewLoading.value = false
   }
+  await enhancePreview()
 }
 
 /**
@@ -888,7 +916,25 @@ async function openWithSystem(entry: ProjectFileEntry) {
             >{{ tr('chat.workbench_open_system') }}</button>
           </div>
           <template v-else>
-            <pre class="wb-text">{{ previewText }}</pre>
+            <!-- 结构必须是 `pre > code[data-lang]`：codeHighlighter 按这个选择器增强，
+                 语言标记走 data-lang，未识别时由它退回 highlightAuto。 -->
+            <div
+              ref="previewHost"
+              class="wb-code"
+            >
+              <pre><code :data-lang="previewLang || undefined">{{ previewText }}</code></pre>
+            </div>
+            <div
+              v-if="previewTruncatedLines > 0"
+              class="wb-empty wb-empty-action"
+            >
+              <span>{{ tr('chat.workbench_preview_truncated', { n: previewTruncatedLines }) }}</span>
+              <button
+                type="button"
+                class="wb-btn"
+                @click="openWithSystem(selected)"
+              >{{ tr('chat.workbench_open_system') }}</button>
+            </div>
           </template>
         </div>
       </div>
@@ -959,6 +1005,16 @@ async function openWithSystem(entry: ProjectFileEntry) {
   margin: 0; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5;
   color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
 }
+/* 代码预览宿主：只负责滚动边界与等宽字体；配色由 .hljs 主题提供。
+   横向滚动而不是折行 —— 代码换行后缩进语义就断了，行号也会对不上。 */
+.wb-code {
+  overflow: auto; min-height: 0;
+}
+.wb-code pre {
+  margin: 0; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5;
+  color: var(--text-secondary); white-space: pre; tab-size: 4;
+}
+.wb-code code { font-family: inherit; }
 .wb-image { max-width: 100%; height: auto; }
 .wb-frame { width: 100%; height: 320px; border: none; background: var(--bg-card); }
 

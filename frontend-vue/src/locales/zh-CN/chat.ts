@@ -367,6 +367,7 @@ export default {
   workbench_path_outside_project: "「{path}」不在当前项目目录内，无法打开",
   workbench_file_not_found: "项目里找不到「{path}」",
   workbench_open_system: "用系统程序打开",
+  workbench_preview_truncated: "为保持界面流畅，还有 {n} 行未渲染；用系统程序打开可看全文。",
   workbench_open_needs_desktop: "只有桌面版能用系统程序打开文件；网页版请复制路径后自行打开",
   workbench_open_failed: "打开失败：{message}",
   workbench_open_in_panel: "在项目文件面板中打开 {path}",

@@ -16,7 +16,13 @@ import (
 // P0性能优化：集中管理超时常量，避免散落各处的魔法数字
 const (
 	DefaultAgentTimeout = 300 * time.Second
-	DefaultMaxTurns     = 5
+	// DefaultMaxTurns 一轮对话的默认 LLM 往返上限，随每次提交下发给引擎。
+	//
+	// **它是真正生效的那个值**：引擎自己也有 `settings.max_turns`，但网关每个请求都显式
+	// 带 `max_turns`（见 submit_handler.go 的 pythonReq），所以只改引擎那侧会被这里覆盖。
+	// 曾经是 5：一次代码任务（读文件 → 改 → 跑测试 → 修）轻易超过，表现就是"任务做到
+	// 一半忽然说轮数用完了"。真正的失控由引擎侧 steps / tokens 两轴拦住，不必靠轮数兜底。
+	DefaultMaxTurns = 40
 	// DefaultMaxOutputTokens 单次 LLM 调用的默认 max output tokens。
 	//
 	// M20：它不是 run 预算 —— run 全程的 token 上限在引擎侧（`AGENT_RUN_MAX_TOKENS`）。
