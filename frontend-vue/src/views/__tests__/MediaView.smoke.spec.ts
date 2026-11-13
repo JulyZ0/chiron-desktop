@@ -41,6 +41,12 @@ vi.mock('../../api', () => ({
     delete: apiMocks.delete,
   },
   resolveMediaUrl: apiMocks.resolveMediaUrl,
+  // `MediaView` 从 `../api` 拿 `API_URL`（它合并了桌面壳注入的 `chironDesktop.apiUrl`
+  // 与构建期 `VITE_API_URL`，见 `src/api/index.ts:20`），组件里的 `absUrl` 直接拼它。
+  // mock 是**整模块替换**，不补这一项就等于把该导出抹掉：渲染到第一张卡片时
+  // `API_URL` 是 undefined，`absUrl` 抛错 ⇒ 整列卡片都渲染不出来。
+  // 值给非空：顺带让"相对 URL 补前缀"这条真实行为也被覆盖到。
+  API_URL: 'http://api.test',
 }))
 
 vi.mock('../../utils/uploader', () => ({ createChunkUpload: vi.fn() }))
