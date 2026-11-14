@@ -36,7 +36,7 @@ ROLLBACK_AUTO = "auto"   # 有快照，可用 /undo 恢复
 ROLLBACK_NONE = "none"   # 做不到 —— 必须在**批准前**讲清楚
 
 #: 这些工具的副作用有快照兜底（见 app/agent/undo_stack.py 的挂钩点）
-_SNAPSHOT_TOOLS = frozenset({"write_file", "edit_file"})
+_SNAPSHOT_TOOLS = frozenset({"write_file", "edit_file", "replace_in_files"})
 
 #: target 摘要里优先取这几个参数（路径 / 地址 / 命令）
 _TARGET_KEYS = ("path", "url", "command", "cmd", "file", "target", "query")

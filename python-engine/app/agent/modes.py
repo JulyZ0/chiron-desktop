@@ -52,6 +52,7 @@ CORE_TOOL_NAMES = frozenset(
         "read_file",  # 读取文件
         "ls",  # 列目录（非递归）
         "write_file",  # 写入/保存文件
+        "replace_in_files",  # 跨文件查找替换（多处/多文件的同一处改动）
         "delete_file",  # 删除文件（delete 级：需人工确认 + 二次校验）
         "grep_files",  # 搜索文件
         "media_create",  # 产出可下载的资产（媒体库；含二进制——见 app/tools/media.py）
@@ -89,6 +90,7 @@ CODE_TOOL_NAMES = frozenset(
         "read_file",  # 读文件
         "write_file",  # 新建/整体覆盖
         "edit_file",  # 精确替换（改代码主力）
+        "replace_in_files",  # 跨文件批量替换（重命名符号/改签名——edit_file 的唯一性在这里是障碍）
         "ls",  # 列目录
         "grep_files",  # 按内容定位
         "glob_files",  # 按文件名定位

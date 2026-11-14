@@ -24,6 +24,7 @@ from app.backends.protocol import (
     EditResult,
     FileStat,
     GlobResult,
+    GrepMatch,
     GrepResult,
     LsResult,
     ReadBytesResult,
@@ -36,6 +37,7 @@ from app.tools.core import (
     READ_FILE_MAX_BYTES,
     READ_FILE_MAX_LINE_CHARS,
     grep_files,
+    outline_file,
     read_file,
 )
 
@@ -90,7 +92,30 @@ class _StubBackend:
     async def grep(
         self, pattern: str, *, path: str = ".", max_results: int = 100
     ) -> GrepResult:
-        return GrepResult()
+        """真的逐行匹配。
+
+        替身必须履行协议契约：`grep_files` 现在把匹配交给后端，替身返回空结果
+        等于"这个仓库里什么都搜不到"，测试就会在替身的偷懒上失败，而不是在
+        被测代码上失败。
+        """
+        import re as _re
+
+        try:
+            regex = _re.compile(pattern)
+        except _re.error as exc:
+            return GrepResult(error=f"invalid pattern: {exc}")
+        matches: list[GrepMatch] = []
+        for name in sorted(self.files):
+            if name != path and not name.startswith(path.rstrip("/") + "/"):
+                if path not in (".", ""):
+                    continue
+            for number, line in enumerate(self.files[name].splitlines(), start=1):
+                if not regex.search(line):
+                    continue
+                if len(matches) >= max_results:
+                    return GrepResult(matches=matches, truncated=True, reason="budget")
+                matches.append(GrepMatch(path=name, line_number=number, line=line))
+        return GrepResult(matches=matches)
 
     def supports_execution(self) -> bool:
         return False
@@ -214,4 +239,69 @@ async def test_invalid_pattern_still_reports_an_error():
     out = await grep_files("(unclosed")
 
     assert "invalid pattern" in out["error"]
+    assert out["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_outline_returns_definition_lines_without_body():
+    """骨架只给定义行与行号 —— 正文由 read_file 负责。
+
+    这是 outline 存在的全部理由：模型要知道"第几行有我要的函数"，而不是先读整份文件。
+    """
+    _install({
+        "mod.py": (
+            "import os\n"
+            "\n"
+            "class Foo:\n"
+            "    def bar(self):\n"
+            "        return 1\n"
+            "\n"
+            "async def baz():\n"
+            "    pass\n"
+        )
+    })
+
+    out = await outline_file("mod.py")
+
+    assert [e["line"] for e in out["entries"]] == [3, 4, 7]
+    assert out["fallback"] is False
+    # 正文没有混进骨架：命中行里不该出现函数体 `return 1`。
+    assert all("return 1" not in e["text"] for e in out["entries"])
+
+
+@pytest.mark.asyncio
+async def test_outline_reports_fallback_for_unknown_extension():
+    """不认识的扩展名必须自陈"骨架可能不全"。
+
+    否则 `fallback` 为空会被读成"这文件里没有定义"，比没有骨架更误导。
+    """
+    _install({"weird.zzz": "function alpha() {}\nnot a definition line\n"})
+
+    out = await outline_file("weird.zzz")
+
+    assert out["fallback"] is True
+    assert "incomplete" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_outline_stops_at_max_lines_and_says_so():
+    """命中数超上限要如实报告，否则"只有 N 条"会被误读成"文件只有 N 个定义"。"""
+    body = "\n".join(f"def f{i}(): pass" for i in range(10))
+    _install({"many.py": body})
+
+    out = await outline_file("many.py", max_lines=3)
+
+    assert out["count"] == 3
+    assert out.get("truncated") is True
+    assert "stopped at 3 entries" in out["note"]
+
+
+@pytest.mark.asyncio
+async def test_outline_missing_file_returns_error():
+    """读不到文件时不能返回空骨架 —— 空骨架会被当成"文件里没有定义"。"""
+    _install({"a.txt": "x"})
+
+    out = await outline_file("nope.py")
+
+    assert "file not found" in out["error"]
     assert out["count"] == 0

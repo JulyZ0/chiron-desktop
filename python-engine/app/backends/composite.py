@@ -24,6 +24,7 @@ CompositeBackend(
 from __future__ import annotations
 
 from app.backends.protocol import (
+    AppendingBackendProtocol,
     BackendProtocol,
     DeleteResult,
     EditResult,
@@ -88,6 +89,22 @@ class CompositeBackend:
     async def write(self, path: str, content: str) -> WriteResult:
         backend, inner = self._resolve(path)
         return await backend.write(inner, content)
+
+    async def append(self, path: str, content: str) -> WriteResult:
+        """转发追加；内部后端不支持时回退到"读全文→拼接→整写"。
+
+        为什么回退而不是直接报错：`append` 是可选加速能力，缺了它写入仍然**正确**，
+        只是分片写大文件会退化成 O(N²)。让复合后端永远"有"这个方法，调用方就
+        不必判断自己正透过哪一层 —— 但实现必须诚实地把能力差异处理掉，否则
+        就是假装加速、实际还是读拼写。
+        """
+        backend, inner = self._resolve(path)
+        if isinstance(backend, AppendingBackendProtocol):
+            return await backend.append(inner, content)
+        existing = await backend.read(inner, limit=0)
+        if existing.error:
+            return WriteResult(path=inner, error=existing.error)
+        return await backend.write(inner, existing.content + content)
 
     async def edit(self, path: str, old: str, new: str) -> EditResult:
         backend, inner = self._resolve(path)

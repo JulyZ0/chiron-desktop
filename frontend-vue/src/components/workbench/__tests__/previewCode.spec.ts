@@ -82,6 +82,26 @@ describe('大文件截断', () => {
     // 后端可能整段省略 content（二进制），调用方传 undefined 时不该抛
     expect(truncatePreview(undefined as unknown as string)).toEqual({ text: '', dropped: 0 })
   })
+
+  it('后端分屏时必须按 total_lines 报出剩余行数', () => {
+    // 关键回归：后端对大文件只返回一屏，此时本地行数恰好 ≤ 上限，
+    // 单看本地会算出 dropped=0 —— 界面于是显示"文件已完整"，用户据此
+    // 判断"这个函数不存在"。所以后端的 truncated 必须参与判定。
+    const raw = Array.from({ length: PREVIEW_LINE_LIMIT }, (_, i) => `line ${i}`).join('\n')
+    const { text, dropped } = truncatePreview(raw, { serverTruncated: true, totalLines: 9000 })
+
+    expect(text).toBe(raw)
+    expect(dropped).toBe(9000 - PREVIEW_LINE_LIMIT)
+  })
+
+  it('后端说还有内容但 total_lines 未知时，至少报 1 行', () => {
+    // "还有内容"与"0 行未显示"是自相矛盾的，宁可保守报 1
+    expect(truncatePreview('a\nb', { serverTruncated: true }).dropped).toBe(1)
+  })
+
+  it('后端未标记截断时，即使传了 totalLines 也不虚报', () => {
+    expect(truncatePreview('a\nb', { serverTruncated: false, totalLines: 99 }).dropped).toBe(0)
+  })
 })
 
 describe('无扩展名 / 约定文件名', () => {

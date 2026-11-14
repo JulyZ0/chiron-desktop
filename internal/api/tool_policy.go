@@ -76,7 +76,7 @@ var toolLevelTable = func() map[string]ToolLevel {
 		"tool",
 	)
 	add(ToolLevelWrite,
-		"write_file", "edit_file",
+		"write_file", "edit_file", "replace_in_files",
 		"git_commit", "git_branch",
 		"graph_create",
 		"remember", "media_create",

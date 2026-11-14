@@ -45,6 +45,7 @@ else:
     import app.tools.media  # noqa: F401
     import app.tools.memory  # noqa: F401
     import app.tools.pm  # noqa: F401
+    import app.tools.replace_tool  # noqa: F401 — replace_in_files（跨文件查找替换）
     import app.tools.run_code  # noqa: F401
     import app.tools.skill  # noqa: F401
     import app.tools.subagent  # noqa: F401

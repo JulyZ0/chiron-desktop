@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -376,16 +377,96 @@ func TestReadProjectTextRejectsDirectory(t *testing.T) {
 	}
 }
 
-func TestReadProjectTextTooLarge(t *testing.T) {
+func TestReadProjectTextLargeFileGivesAWindow(t *testing.T) {
 	root := t.TempDir()
-	// 造一个超过上限的文本文件。内容全是 'a'，不含 NUL，所以判定为文本 ——
-	// 测试要确认**大小**这一关先于读取生效，而不是靠内容判定挡住。
-	big := strings.Repeat("a", maxProjectFileBytes+1)
-	writeProject(t, root, "big.txt", big)
+	// 大文件**不再**整份拒绝：那让"打开一个 5MB 日志"变成死路，用户连第一行都看不到。
+	// 改成给一屏 + 如实标记还有更多。
+	var sb strings.Builder
+	for i := 0; i < maxProjectWindowLines+500; i++ {
+		sb.WriteString("line-content-")
+		sb.WriteString(strconv.Itoa(i))
+		sb.WriteByte('\n')
+	}
+	writeProject(t, root, "big.txt", sb.String())
 
-	_, err := readProjectText(root, "big.txt")
-	if !errors.Is(err, errFileTooLarge) {
-		t.Fatalf("期望 errFileTooLarge，得到 %v", err)
+	got, err := readProjectText(root, "big.txt")
+	if err != nil {
+		t.Fatalf("大文件应当能读出一屏，却被拒绝：%v", err)
+	}
+	if got.Binary {
+		t.Fatal("全 ASCII 文本不应被判为二进制")
+	}
+	if !got.Truncated {
+		t.Fatal("窗口之外还有内容时必须标记 truncated —— 否则用户会以为文件只有这么长")
+	}
+	if got.Offset != 0 {
+		t.Fatalf("首屏 offset 应为 0，得到 %d", got.Offset)
+	}
+	// 总行数要如实给出（界面用它显示"共 N 行"）
+	if got.TotalLines != maxProjectWindowLines+500 {
+		t.Fatalf("总行数应为 %d，得到 %d", maxProjectWindowLines+500, got.TotalLines)
+	}
+	if n := strings.Count(got.Content, "\n"); n != maxProjectWindowLines {
+		t.Fatalf("首屏应正好 %d 行，得到 %d", maxProjectWindowLines, n)
+	}
+	if !strings.HasPrefix(got.Content, "line-content-0\n") {
+		t.Fatalf("首屏必须从第 0 行开始，得到前 40 字节 %q", got.Content[:40])
+	}
+}
+
+func TestReadProjectTextWindowOffset(t *testing.T) {
+	root := t.TempDir()
+	writeProject(t, root, "a.txt", "l0\nl1\nl2\nl3\nl4\n")
+
+	got, err := readProjectTextWindow(root, "a.txt", 2, 2)
+	if err != nil {
+		t.Fatalf("读取失败：%v", err)
+	}
+	if got.Content != "l2\nl3\n" {
+		t.Fatalf("窗口内容不对：%q", got.Content)
+	}
+	// offset 必须回传：前端据此把行号接上，而不是让每段窗口都从 1 数起。
+	if got.Offset != 2 {
+		t.Fatalf("offset 应为 2，得到 %d", got.Offset)
+	}
+	if got.TotalLines != 5 {
+		t.Fatalf("总行数应为 5，得到 %d", got.TotalLines)
+	}
+	if !got.Truncated {
+		t.Fatal("窗口后面还有 l4，必须标记 truncated")
+	}
+}
+
+func TestReadProjectTextWindowAtTailNotTruncated(t *testing.T) {
+	root := t.TempDir()
+	writeProject(t, root, "a.txt", "l0\nl1\nl2\n")
+
+	got, err := readProjectTextWindow(root, "a.txt", 1, 100)
+	if err != nil {
+		t.Fatalf("读取失败：%v", err)
+	}
+	if got.Content != "l1\nl2\n" {
+		t.Fatalf("窗口内容不对：%q", got.Content)
+	}
+	// 读到文件尾就不能再声称被截断 —— 否则界面会一直显示"还有更多"。
+	if got.Truncated {
+		t.Fatal("已经读到文件尾，不应标记 truncated")
+	}
+}
+
+func TestReadProjectTextOffsetBeyondEOFIsEmptyNotAnError(t *testing.T) {
+	root := t.TempDir()
+	writeProject(t, root, "a.txt", "only\n")
+
+	got, err := readProjectTextWindow(root, "a.txt", 999, 10)
+	if err != nil {
+		t.Fatalf("offset 越界不应报错：%v", err)
+	}
+	if got.Content != "" {
+		t.Fatalf("越界窗口应为空，得到 %q", got.Content)
+	}
+	if got.Truncated {
+		t.Fatal("越界窗口之后没有内容，不应标记 truncated")
 	}
 }
 

@@ -1241,6 +1241,18 @@ watch(
   text-align: end; color: var(--text-tertiary); user-select: none;
 }
 .msg-text :deep(.code-line-body) { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-all; }
+/* 注释块折叠：与 WorkbenchPanel 同一套属性约定（见 codeHighlighter 的 addLineNumbers）。
+   `display: none` 会覆盖上面的 `display: flex` —— 属性选择器让特异性更高，无需 !important。 */
+.msg-text :deep(.code-fold-body[data-fold-state='collapsed']) { display: none; }
+.msg-text :deep(.code-fold-head) { cursor: pointer; }
+.msg-text :deep(.code-fold-head:hover .code-line-no) { color: var(--text-secondary); }
+.msg-text :deep(.code-fold-head .code-line-body)::after {
+  content: ' … (' attr(data-fold-hidden) ')';
+  color: var(--text-tertiary);
+  font-style: italic;
+  user-select: none;
+}
+.msg-text :deep(.code-fold-head[data-fold-open='1'] .code-line-body)::after { content: ''; }
 /* mermaid 图表：未渲染/渲染失败时按源码块展示（可读、可复制），成功后居中撑满内容列宽 */
 .msg-text :deep(.mermaid) {
   margin: 16px 0; padding: 12px;
@@ -1269,15 +1281,13 @@ watch(
 .msg-action.copied { color: var(--success); animation: cdsCheckDecay var(--dur-check-decay) linear; }
 .msg-action.copied :deep(svg) { animation: cdsCheckDraw var(--dur-normal) var(--ease-out); }
 
-/* P3-A: 用 CSS 变量覆盖 hljs token 颜色，暗色模式自动跟随 .dark class */
-.hljs { color: var(--hljs-fg); background: var(--hljs-bg); }
-.hljs-keyword, .hljs-selector-tag, .hljs-deletion { color: var(--hljs-keyword); }
-.hljs-string, .hljs-attr, .hljs-template-string, .hljs-addition { color: var(--hljs-string); }
-.hljs-number, .hljs-literal, .hljs-variable, .hljs-template-variable, .hljs-type { color: var(--hljs-number); }
-.hljs-comment, .hljs-quote { color: var(--hljs-comment); }
-.hljs-title, .hljs-section, .hljs-function .hljs-title { color: var(--hljs-title); }
-.hljs-built_in, .hljs-class .hljs-title, .hljs-name { color: var(--hljs-built-in); }
-.hljs-meta, .hljs-symbol, .hljs-bullet, .hljs-link { color: var(--hljs-meta); }
+/* P3-A: 用 CSS 变量覆盖 hljs token 颜色，暗色模式自动跟随 .dark class。
+   **这条规则的归属地是 src/style.css，不在这里** —— 代码高亮的 token 是
+   `innerHTML` 注入的（聊天正文走 v-html，工作台预览走 highlightCodeBlocks），
+   都不带 Vue 的 `data-v-*` 作用域属性。写在 scoped 样式里会被编译成
+   `.hljs[data-v-xxx]`，于是**一条都匹配不到**，两处代码块只能退回
+   `highlight.js/styles/github.css` 写死的浅色配色：暗色主题下白底黑字，和其它
+   主题完全脱节。见 style.css 的「代码高亮主题」段。 */
 
 /* P3-B: 长消息折叠 */
 /* 发丝环改用 inset 阴影而不是 border：不参与盒模型，所以"未选中 ↔ 选中"切换

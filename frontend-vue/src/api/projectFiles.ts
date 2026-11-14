@@ -42,6 +42,16 @@ export interface ProjectFileContent {
   size: number
   content?: string
   total_lines?: number
+  /** 本次内容窗口的起始行（0-based）。后端按行分屏时给出。 */
+  offset?: number
+  /**
+   * 窗口之外还有内容。
+   *
+   * **必须**与 `total_lines` 一起用：后端对大文件只返回一屏，此时 `content` 的行数
+   * 恰好等于 `PREVIEW_LINE_LIMIT`，前端的本地截断会算出 `dropped: 0` ——
+   * 只看本地截断就会得出"文件已经完整"的错误结论。
+   */
+  truncated?: boolean
 }
 
 function normalizeEntry(raw: unknown): ProjectFileEntry | null {
@@ -122,9 +132,17 @@ export async function searchProjectFiles(
 export async function readProjectFile(
   projectId: string,
   path: string,
+  /** 起始行（0-based）。超过一屏的文件靠它继续往下翻。 */
+  offset = 0,
+  /** 本屏最多多少行；0 交给后端默认（等于 PREVIEW_LINE_LIMIT）。 */
+  limit = 0,
 ): Promise<ProjectFileContent> {
+  const params = new URLSearchParams()
+  params.set('path', path)
+  if (offset > 0) params.set('offset', String(offset))
+  if (limit > 0) params.set('limit', String(limit))
   const { data } = await api.get(
-    `/v1/session-map/projects/${encodeURIComponent(projectId)}/file?path=${encodePath(path)}`,
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/file?${params.toString()}`,
   )
   const payload = data?.data ?? {}
   return {
@@ -133,6 +151,8 @@ export async function readProjectFile(
     size: typeof payload.size === 'number' ? payload.size : 0,
     content: typeof payload.content === 'string' ? payload.content : undefined,
     total_lines: typeof payload.total_lines === 'number' ? payload.total_lines : undefined,
+    offset: typeof payload.offset === 'number' ? payload.offset : undefined,
+    truncated: !!payload.truncated,
   }
 }
 

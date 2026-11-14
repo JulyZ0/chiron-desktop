@@ -68,7 +68,7 @@ _READ_TOOLS: frozenset[str] = frozenset(
 #: 本地写：产生副作用但**可回滚**（P1 的文件快照覆盖文件类；记忆/图/会话是本地状态）
 _WRITE_TOOLS: frozenset[str] = frozenset(
     {
-        "write_file", "edit_file",
+        "write_file", "edit_file", "replace_in_files",
         "git_commit", "git_branch",
         "remember", "media_create",
         "image_generate", "text_to_speech", "skill_generate",

@@ -21,7 +21,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import tempfile
+import threading
 from pathlib import Path
 
 from app.backends.protocol import (
@@ -39,26 +42,91 @@ from app.backends.protocol import (
 )
 from app.tools.sandbox import safe_join
 
+#: 搜索引擎要跳过的**内部**目录（相对 workspace）。
+#:
+#: `.chiron` 是引擎自己的产物（执行输出落盘在 `.chiron/exec`，见 sandbox 的
+#: `EXEC_OFFLOAD_DIR`）。它不是用户的源码，但位于 workspace 内 —— 不过滤的话，
+#: 一次 grep 会把几十份构建日志当成命中返回，把真正的代码挤到预算之外。
+#: 只跳过自己的目录：`.git` / `node_modules` 等属于既有语义，改它们会改变用户
+#: 能搜到的范围，不做顺手的扩大。
+_INTERNAL_DIR = ".chiron"
+
+
+def _is_internal(base: Path, candidate: Path) -> bool:
+    try:
+        parts = candidate.relative_to(base).parts
+    except ValueError:
+        return False
+    # `relative_to` 对 `candidate == base` 返回 `"."`（parts 为空）—— 直接取 [0]
+    # 会 IndexError。grep 允许直接指向单个文件，这条路径是真实会走到的。
+    return bool(parts) and parts[0] == _INTERNAL_DIR
+
+
+def _atomic_write_bytes(target: Path, data: bytes) -> None:
+    """同目录临时文件 + `os.replace`：观察者只可能看到完整旧内容或完整新内容。
+
+    临时文件必须与目标**同一目录** —— 跨文件系统的 `os.replace` 会退化成
+    copy+delete，原子性随之消失（Windows 上直接抛 OSError）。
+    任何一步失败都要清掉临时文件，否则长任务会在workspace 里堆一地 `.tmp`。
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            # fsync 之后再 replace：否则崩溃时可能"目录项已换、数据块未落盘"，
+            # 得到一个长度正确但内容是旧块的全零文件。
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, target)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _append_bytes(target: Path, data: bytes) -> None:
+    """`O_APPEND` 追加：不需要读回已有内容，代价与文件大小无关。"""
+    with open(target, "ab") as handle:
+        handle.write(data)
+
+
 
 def _grep_sync(base: Path, regex: re.Pattern[str], max_results: int) -> GrepResult:
-    """`grep` 的同步实现（在工作线程中运行）：目录遍历 + 逐文件读取。"""
+    """`grep` 的同步实现（在工作线程中运行）：目录遍历 + **逐行流式**匹配。
+
+    此前是 `read_text()` 读全文再 `splitlines()`：大仓库里一次 grep 会把每个候选
+    文件的完整内容读进内存，命中行的价值只是"定位到哪"，代价却按文件大小走。
+    改成流式读之后，驻留内存只有当前行 —— 匹配语义、扫描顺序、`max_results`
+    截断点都与原实现一致（`sorted` 保证确定性顺序，换来的内存是 O(1)）。
+    """
     candidates = sorted(base.rglob("*")) if base.is_dir() else [base]
     matches: list[GrepMatch] = []
     truncated = False
     for file in candidates:
-        if not file.is_file():
+        if not file.is_file() or _is_internal(base, file):
             continue
         try:
-            text = file.read_text(encoding="utf-8", errors="replace")
+            with open(file, encoding="utf-8", errors="replace") as handle:
+                for number, raw in enumerate(handle, start=1):
+                    # NUL 意味着这是二进制（图片/字体/压缩包）。全文读取时它会变成
+                    # 一长串替换字符，既浪费预算又不可能命中；当场放弃这个文件。
+                    if "\x00" in raw:
+                        break
+                    line = raw.rstrip("\n").rstrip("\r")
+                    if not regex.search(line):
+                        continue
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+                    matches.append(
+                        GrepMatch(path=str(file), line_number=number, line=line)
+                    )
         except OSError:  # 不可读文件跳过，不让整次搜索失败
             continue
-        for number, line in enumerate(text.splitlines(), start=1):
-            if not regex.search(line):
-                continue
-            if len(matches) >= max_results:
-                truncated = True
-                break
-            matches.append(GrepMatch(path=str(file), line_number=number, line=line))
         if truncated:
             break
     return GrepResult(
@@ -85,14 +153,62 @@ def _looks_binary(target: Path) -> bool:
     return b"\x00" in head
 
 
+#: 行数缓存：绝对路径 → (mtime_ns, size, total_lines)。
+#:
+#: 为什么值得缓存：`total_lines` 是给前端的既有承诺（显示「N 行」/「还有 N 行未渲染」），
+#: 但**每翻一屏都要重新数一遍整个文件**，于是翻 N 屏的代价是 O(N × 文件行数)。
+#: 文件没变时行数当然没变，重数纯粹是浪费。
+_TOTAL_CACHE: dict[str, tuple[int, int, int]] = {}
+_TOTAL_CACHE_LOCK = threading.Lock()
+#: 缓存条数上限。长任务会读几百个文件，不设上限就是慢性内存泄漏。
+#: 满了直接清空而不是做 LRU：缓存只影响快慢，清空一次只是下一次多扫一遍。
+_TOTAL_CACHE_MAX = 256
+
+
+def _stamp(target: Path) -> tuple[int, int] | None:
+    """取 (mtime_ns, size) 作为缓存键；读不到元信息返回 `None`（不缓存）。"""
+    try:
+        info = target.stat()
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size
+
+
+def _cached_total(target: Path, stamp: tuple[int, int] | None) -> int | None:
+    if stamp is None:
+        return None
+    with _TOTAL_CACHE_LOCK:
+        hit = _TOTAL_CACHE.get(str(target))
+    if hit is None:
+        return None
+    mtime_ns, size, total = hit
+    # 指纹不一致 = 文件被改过，旧行数作废（否则前端会把"还剩几行"算错）
+    if (mtime_ns, size) != stamp:
+        return None
+    return total
+
+
+def _remember_total(target: Path, stamp: tuple[int, int], total: int) -> None:
+    with _TOTAL_CACHE_LOCK:
+        if len(_TOTAL_CACHE) >= _TOTAL_CACHE_MAX:
+            _TOTAL_CACHE.clear()
+        _TOTAL_CACHE[str(target)] = (stamp[0], stamp[1], total)
+
+
 def _read_window(target: Path, offset: int, limit: int) -> tuple[list[str], int]:
     """流式取窗口，并把总行数数完 —— 只有窗口内容驻留内存。
 
     数完 `total_lines` 是为了它对前端的既有承诺（`ToolResultBlock.vue` 显示「N 行」）；
-    代价是仍要扫一遍文件，换来的收益是内存从 O(文件大小) 降到 O(窗口)。
+    代价是要扫一遍文件，换来的收益是内存从 O(文件大小) 降到 O(窗口)。
+
+    R2：行数按 `(mtime, size)` 缓存，且**已知总数时扫到窗口末尾就停**。
+    大文件上连续翻页因此从 O(N × 行长) 降到 O(窗口)；文件一被改，指纹变化即失效。
     """
     page: list[str] = []
     total = 0
+    before = _stamp(target)
+    known = _cached_total(target, before)
+    stop_at = offset + limit if known is not None else None
     with open(target, encoding="utf-8", errors="replace") as handle:
         for raw in handle:
             total += 1
@@ -100,7 +216,17 @@ def _read_window(target: Path, offset: int, limit: int) -> tuple[list[str], int]
                 continue
             if len(page) < limit:
                 page.append(raw.rstrip("\n").rstrip("\r"))
+            # 总数已知且窗口已填满：后面的行不影响返回值，不必再读。
+            if stop_at is not None and total >= stop_at:
+                break
+    if known is not None and stop_at is not None and total >= stop_at:
+        return page, known
+    # 只有"读前读后指纹一致"才缓存：读的过程中文件被改，`total` 是旧快照的数，
+    # 缓存它会让前端一直按错误的总行数计算剩余行数。
+    if before is not None and _stamp(target) == before:
+        _remember_total(target, before, total)
     return page, total
+
 
 
 class LocalWorkspaceBackend:
@@ -169,10 +295,38 @@ class LocalWorkspaceBackend:
         return FileStat(path=str(target), size=info.st_size, is_file=is_file)
 
     async def write(self, path: str, content: str) -> WriteResult:
+        """原子覆盖写：先写同目录临时文件，再 `os.replace` 换上去。
+
+        **为什么必须原子**：长任务里进程被 kill（超时、OOM、用户关窗口）是常态。
+        `write_text` 直接在目标文件上截断再写 —— 中途死掉就留下**半截文件**，
+        而且 undo 快照也随之失去意义（文件既不是旧的也不是新的）。`os.replace`
+        在同一文件系统内是原子的：观察者要么看到旧内容，要么看到新内容。
+
+        临时文件必须落在**同目录**：`os.replace` 跨文件系统会退化成 copy+delete，
+        原子性就没了。用 `tempfile.mkstemp` 的 `dir` 参数保证这一点。
+        """
         target = safe_join(path)
+        data = content.encode("utf-8")
         await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(target.write_text, content, encoding="utf-8")
-        return WriteResult(path=str(target), bytes_written=len(content.encode("utf-8")))
+        await asyncio.to_thread(_atomic_write_bytes, target, data)
+        return WriteResult(path=str(target), bytes_written=len(data))
+
+    async def append(self, path: str, content: str) -> WriteResult:
+        """真追加：只在文件末尾追加，不读回已有内容（O(1) 而非 O(文件大小)）。
+
+        这是 `AppendingBackendProtocol` 的实现。分片写大文件时，旧路径"读全文→拼→
+        整写"是 O(N²)，这里每片只把自己写进去。
+
+        追加模式本身是原子的（内核保证 `O_APPEND` 的写入不覆盖他人数据），但
+        **它会绕过 `_atomic_write_bytes`** —— 这是有意的：追加的语义就是"在末尾加"，
+        不存在"旧内容还是新内容"的二选一。中途失败只会留下**前缀**，而前缀正是
+        分片追加可以接着续写的状态。
+        """
+        target = safe_join(path)
+        data = content.encode("utf-8")
+        await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(_append_bytes, target, data)
+        return WriteResult(path=str(target), bytes_written=len(data))
 
     async def edit(self, path: str, old: str, new: str) -> EditResult:
         target = safe_join(path)
@@ -184,8 +338,11 @@ class LocalWorkspaceBackend:
         occurrences = text.count(old)
         if occurrences == 0:
             return EditResult(path=str(target), error="old text not found")
+        # 原地替换也必须走原子写：`edit` 是"读全文→改→写回"，中途被 kill
+        # 留下的半截文件与 `write` 的后果完全一样。这里原先直接 `write_text`，
+        # 成了原子写的唯一缺口。
         await asyncio.to_thread(
-            target.write_text, text.replace(old, new), encoding="utf-8"
+            _atomic_write_bytes, target, text.replace(old, new).encode("utf-8")
         )
         return EditResult(path=str(target), occurrences=occurrences)
 

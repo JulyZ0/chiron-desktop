@@ -47,6 +47,44 @@ GREP_MAX_LINE_CHARS = 240
 #: grep 单次返回的总字节预算。命中的是**线索**，不是正文。
 GREP_MAX_BYTES = 48 * 1024
 
+#: `outline` 按扩展名取"结构行"的正则。
+#:
+#: 为什么值得单独一个工具：读大文件最贵的不是"读多少行"，而是**读之前不知道哪里值得读**。
+#: 模型只能从第 1 行开始翻窗口，翻到第 8 屏才看见目标函数——那些窗口全进了上下文，
+#: 而且大多没用。先给一份"定义行 + 行号"的骨架，模型就能直接 `read_file(offset=N)`
+#: 跳到目标处，把读取轮数从"翻完整个文件"压到"一次定位 + 一次读窗口"。
+#:
+#: 刻意用正则而不是语法树：tree-sitter 要额外依赖与编译产物，而这里要的只是
+#: "函数/类/结构体定义大致在哪一行"。正则会漏（多行签名、宏生成的声明）也会多
+#: （字符串里的 `def `），但作为**索引**够用——它只负责指路，内容仍由 `read_file` 给。
+OUTLINE_PATTERNS: dict[str, str] = {
+    ".py": r"^(\s*)(?:async\s+)?(?:def|class)\s+\w+",
+    ".js": r"^(\s*)(?:export\s+)?(?:async\s+)?(?:function|class)\s+\w+|^(\s*)(?:export\s+)?const\s+\w+\s*=\s*(?:async\s*)?\(",
+    ".ts": r"^(\s*)(?:export\s+)?(?:async\s+)?(?:function|class|interface|type|enum)\s+\w+",
+    ".vue": r"^(\s*)(?:export\s+)?(?:async\s+)?(?:function|class)\s+\w+|^(\s*)(?:const|function)\s+\w+\s*[=(]",
+    ".go": r"^func\s|^type\s+\w+\s+(?:struct|interface)|^var\s+\w+\s*=",
+    ".rs": r"^(\s*)(?:pub\s+)?(?:async\s+)?(?:fn|struct|enum|trait|impl)\s+",
+    ".java": r"^(\s*)(?:public|private|protected)?\s*(?:static\s+)?(?:class|interface|enum)\s+\w+",
+    ".rb": r"^(\s*)(?:def|class|module)\s+",
+    ".sh": r"^(\s*)\w+\s*\(\)\s*\{",
+    ".sql": r"^\s*(?:CREATE|ALTER)\s+(?:TABLE|VIEW|INDEX|FUNCTION)",
+}
+
+#: outline 的缺省正则：够宽的通用形态，不认识的扩展名也还能给点线索。
+OUTLINE_FALLBACK = r"^(\s*)(?:def|class|function|func|fn|struct|interface|impl|type|enum|module)\s+\w+"
+
+#: outline 单次最多返回的结构行数。骨架的意义是"指路"，列全了反而又是正文。
+OUTLINE_MAX_LINES = 400
+
+
+def _outline_regex(suffix: str) -> tuple[str, bool]:
+    """取扩展名对应的结构行正则，返回 `(pattern, 是否走了兜底)`。"""
+    key = suffix.lower()
+    pattern = OUTLINE_PATTERNS.get(key)
+    if pattern:
+        return pattern, False
+    return OUTLINE_FALLBACK, True
+
 
 def _clip_line(line: str, limit: int) -> str:
     """把过长的行截断，并**在行内标注真实长度**。
@@ -176,13 +214,21 @@ async def read_image(path: str, max_bytes: int = 0) -> dict[str, Any]:
     }
 
 
-async def write_file(path: str, content: str) -> dict[str, Any]:
+async def write_file(
+    path: str, content: str, append: bool = False
+) -> dict[str, Any]:
     """写文件（会建父目录；写入前自动快照供 /undo 回滚）。
 
     路径 clamp 到工作区（`root` 参数已移除，理由与 `read_file` 相同）。
+
+    **`append=True` 是为"一次装不下"准备的**：模型输出受 `max_tokens` 限制，一份大内容
+    整份重发**必然再次被截断**（而且截断点还会移动），所以"重新发起调用"绝不是出路。
+    分段追加才是：第一片照常写，之后每片带 `append=True`。没有这个参数时，模型遇到大文件
+    只能反复重试同一个调用直到轮数耗尽 —— 表现出来就是"工具失败后不会自愈"。
     """
     from app.agent import undo_stack
     from app.backends.context import get_backend
+    from app.backends.protocol import AppendingBackendProtocol
     from app.tools.context import get_session_id
     from app.tools.fs_guard import check_before_write
     from app.tools.sandbox import safe_join
@@ -194,12 +240,43 @@ async def write_file(path: str, content: str) -> dict[str, Any]:
         return {"error": conflict}
     # 写入前快照：`/undo` 据此**真正恢复**文件（此前 /undo 只是回显一个字符串）。
     # 快照存不下（文件过大 / 存储不可用）时**当场告知"本次不可撤销"**，而不是事后才发现。
+    # 追加时快照拍的是**追加前**的内容 —— 撤销一次追加就该回到追加前，语义与覆盖写一致。
     undo_note = await undo_stack.snapshot_before_write(get_session_id(), target, "write_file")
     # 批 B：写入经**后端**（默认 = 本地工作区；建父目录也由后端负责）
-    written = await get_backend().write(path, content)
+    backend = get_backend()
+    if append:
+        # W1：优先走后端的**真追加**（O(1)，只写文件末尾）。
+        #
+        # 旧的"读全文→拼接→整写"是 O(N²)：分 N 片写一个文件要搬 1+2+…+N 份内容，
+        # 而且每片都会拍一次全文 undo 快照。但 `append` 是**可选**能力
+        # （`AppendingBackendProtocol`），FileStore / skill / 测试替身都没有实现它 ——
+        # 所以这里保留回退路径：能力缺失时行为与以前完全一致，只是不再更快。
+        if isinstance(backend, AppendingBackendProtocol):
+            written_append = await backend.append(path, content)
+            if written_append.error:
+                return {"error": written_append.error}
+            appended: dict[str, Any] = {
+                "path": written_append.path,
+                "bytes": written_append.bytes_written,
+                "appended": True,
+            }
+            if undo_note:
+                appended["undo_warning"] = undo_note
+            return appended
+        info = await backend.stat(path)
+        base = ""
+        if info is not None and info.is_file:
+            existing = await backend.read(path, limit=0)
+            if existing.error:
+                return {"error": existing.error}
+            base = existing.content
+        content = base + content
+    written = await backend.write(path, content)
     if written.error:
         return {"error": written.error}
     result: dict[str, Any] = {"path": written.path, "bytes": written.bytes_written}
+    if append:
+        result["appended"] = True
     if undo_note:
         result["undo_warning"] = undo_note
     return result
@@ -221,51 +298,78 @@ async def grep_files(
 ) -> dict[str, Any]:
     """按正则搜索文件内容（批 B：匹配与读取都经后端）。
 
-    行为与迁移前一致：候选文件由 `**/{glob}` 限定 → 逐个读全文 → 逐行匹配 → 命中达上限即返回。
-    因此保留"先拿文件列表、再逐文件读"的两步形态（而不是一次目录级 grep），
-    这样 `max_results` 的截断点与扫描顺序都不变。
+    R1：匹配下沉到**后端的流式 grep**，不再逐文件 `read(limit=0)` 读全文。
 
-    **命中行按预算裁剪**（`GREP_MAX_LINE_CHARS` / `GREP_MAX_BYTES`）。定位类工具的产出
-    是"线索"，不是"正文"：一次命中 200 行、每行都是压缩过的长行时，不裁剪的 grep
-    结果本身就够把上下文撑爆 —— 而模型真正要的只是"哪个文件第几行匹配到了"。
-    需要细节时用 `read_file` 带着 offset 去读那个位置。
+    此前这里是"glob 拿文件列表 → 对每个文件读完整内容 → 逐行匹配"，于是大仓库
+    一次搜索的内存开销按**仓库总字节**走，而产出只是一小把行号。后端本来就有
+    `grep`（逐行读，驻留内存只有当前行），却一直没被调用 —— 工具层自己抄了一份
+    全文读取的实现。
+
+    两条路径都保持原有语义（`max_results` 截断点、命中行裁剪、字节预算）：
+
+    - 无 `glob` 限定：一次 `backend.grep(root)`，后端只遍历一遍。
+    - 有 `glob` 限定：先按名筛出候选，再对每个候选走同一套流式匹配 ——
+      仍然是流式，只是分多次调用，不退回全文读取。
     """
     from app.backends.context import get_backend
 
     try:
-        pattern = re.compile(query)
+        # 只做一次语法校验：真正的匹配在后端内进行（逐行流式）。
+        # 无效正则若留到后端才暴露，会变成"每个候选文件各报一次错"。
+        re.compile(query)
     except re.error as exc:
         return {"error": f"invalid pattern: {exc}", "count": 0, "matches": []}
 
     backend = get_backend()
-    globbed = await backend.glob(f"**/{glob or '*'}", path=root or ".")
-    if globbed.error:
-        return {"error": globbed.error, "count": 0, "matches": []}
+    # 命中三元组 (path, line_number, line) —— 与 GrepMatch 字段一一对应，
+    # 两条路径产出同一种形状，后面的裁剪逻辑因此只需写一遍。
+    pool: list[tuple[str, int, str]] = []
+    backend_cut = False
 
+    if not glob:
+        found = await backend.grep(query, path=root or ".", max_results=max_results)
+        if found.error:
+            return {"error": found.error, "count": 0, "matches": []}
+        pool = [(m.path, m.line_number, m.line) for m in found.matches]
+        backend_cut = found.truncated
+    else:
+        globbed = await backend.glob(f"**/{glob}", path=root or ".")
+        if globbed.error:
+            return {"error": globbed.error, "count": 0, "matches": []}
+        for candidate in globbed.paths:
+            info = await backend.stat(candidate)
+            if info is None or not info.is_file:
+                continue
+            remaining = max_results - len(pool)
+            if remaining <= 0:
+                backend_cut = True
+                break
+            one = await backend.grep(query, path=candidate, max_results=remaining)
+            if one.error:
+                logger.debug("Cannot grep file %s, skipping", candidate)
+                continue
+            pool.extend((m.path, m.line_number, m.line) for m in one.matches)
+            if one.truncated:
+                backend_cut = True
+
+    # **命中行按预算裁剪**（`GREP_MAX_LINE_CHARS` / `GREP_MAX_BYTES`）。定位类工具的产出
+    # 是"线索"，不是"正文"：一次命中 200 行、每行都是压缩过的长行时，不裁剪的 grep
+    # 结果本身就够把上下文撑爆 —— 而模型真正要的只是"哪个文件第几行匹配到了"。
+    # 需要细节时用 `read_file` 带着 offset 去读那个位置。
     matches: list[dict[str, Any]] = []
     used = 0
     budget_hit = False
-    for candidate in globbed.paths:
-        info = await backend.stat(candidate)
-        if info is None or not info.is_file:
-            continue
-        read = await backend.read(candidate, limit=0)  # 全文：逐行匹配需要完整内容
-        if read.error:
-            logger.debug("Cannot read file %s, skipping", candidate)
-            continue
-        for idx, line in enumerate(read.content.splitlines(), start=1):
-            if pattern.search(line):
-                text = _clip_line(line, GREP_MAX_LINE_CHARS)
-                cost = len(text.encode("utf-8")) + 1
-                if matches and used + cost > GREP_MAX_BYTES:
-                    budget_hit = True
-                    break
-                matches.append({"path": candidate, "line": idx, "text": text})
-                used += cost
-                if len(matches) >= max_results:
-                    return {"count": len(matches), "matches": matches}
-        if budget_hit:
+    for path_, line_no, line in pool:
+        text = _clip_line(line, GREP_MAX_LINE_CHARS)
+        cost = len(text.encode("utf-8")) + 1
+        if matches and used + cost > GREP_MAX_BYTES:
+            budget_hit = True
             break
+        matches.append({"path": path_, "line": line_no, "text": text})
+        used += cost
+        if len(matches) >= max_results:
+            return {"count": len(matches), "matches": matches}
+
     if budget_hit:
         return {
             "count": len(matches),
@@ -273,6 +377,16 @@ async def grep_files(
             "truncated": True,
             "note": (
                 f"byte budget reached ({GREP_MAX_BYTES} bytes); "
+                "narrow the pattern or pass a smaller `root`/`glob` for the rest"
+            ),
+        }
+    if backend_cut:
+        return {
+            "count": len(matches),
+            "matches": matches,
+            "truncated": True,
+            "note": (
+                f"result limit reached ({max_results} hits); "
                 "narrow the pattern or pass a smaller `root`/`glob` for the rest"
             ),
         }
@@ -301,6 +415,81 @@ async def search_files(
         if len(files) >= max_results:
             break
     return {"count": len(files), "files": files}
+
+
+async def outline_file(
+    path: str, max_lines: int = OUTLINE_MAX_LINES
+) -> dict[str, Any]:
+    """给出源码文件的**结构骨架**（定义行 + 行号），不返回正文。
+
+    定位优先级：`outline_file` → `read_file(offset=...)`。先用骨架找出目标定义在哪一行，
+    再只读那一小段，比"从第 1 行开始一屏一屏翻到目标出现"省下的不只是 token ——
+    每翻一屏都是一次工具往返，翻八屏就是八轮，长任务里轮数比 token 更稀缺。
+
+    正则是有意为之的取舍（见 `OUTLINE_PATTERNS` 的说明）：它给的是**索引**，允许漏和
+    多报；真正的代码仍由 `read_file` 提供。因此结果里明确带上 `fallback` 标记，
+    让模型知道"这个扩展名没有专门规则，骨架可能不完整"，而不是把缺失当成"文件里没有定义"。
+    """
+    from app.backends.context import get_backend
+
+    backend = get_backend()
+    # `limit=0` = 读全文：这里**必须**看全文才能找全定义（与 read_file 的分页语义不同，
+    # 骨架的产出是行号列表，尺寸由 OUTLINE_MAX_LINES 与 _clip_line 控制）。
+    result = await backend.read(path, limit=0)
+    if result.error:
+        return {"error": result.error, "path": path, "count": 0, "entries": []}
+
+    pattern, fallback = _outline_regex(Path(path).suffix)
+    try:
+        matcher = re.compile(pattern)
+    except re.error as exc:  # pragma: no cover - 表内正则都经过测试覆盖
+        return {"error": f"invalid outline pattern: {exc}", "path": path, "count": 0, "entries": []}
+
+    entries: list[dict[str, Any]] = []
+    truncated = False
+    for number, raw in enumerate(result.content.splitlines(), start=1):
+        if not matcher.search(raw):
+            continue
+        if len(entries) >= max_lines:
+            # 命中数超上限：如实报告，否则"骨架只有 400 条"会被误读成"文件只有 400 个定义"。
+            truncated = True
+            break
+        indent = len(raw) - len(raw.lstrip())
+        entries.append(
+            {
+                "line": number,
+                "depth": indent // 2,
+                "text": _clip_line(raw.strip(), GREP_MAX_LINE_CHARS),
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "path": path,
+        "total_lines": result.total_lines,
+        "count": len(entries),
+        "entries": entries,
+        "fallback": fallback,
+    }
+    if truncated:
+        payload["truncated"] = True
+        payload["note"] = (
+            f"stopped at {max_lines} entries; narrow the file or read a window with "
+            "read_file(offset=N) for the rest"
+        )
+    if fallback:
+        payload["note"] = (
+            payload.get("note", "")
+            + ("; " if payload.get("note") else "")
+            + f"no rule for '{Path(path).suffix or '(no extension)'}' — the outline may be incomplete"
+        ).strip("; ")
+    if not entries:
+        # 空骨架有两种原因：文件里确实没有定义，或这个语言没有规则。区分不了就不能下结论。
+        payload["note"] = (
+            payload.get("note", "")
+            + ("; " if payload.get("note") else "")
+            + "no definition lines matched — the file may have none, or fall back to read_file"
+        ).strip("; ")
+    return payload
 
 
 async def execute_python(code: str, timeout: int = 30) -> dict[str, Any]:
@@ -366,13 +555,21 @@ registry.register(
     description=(
         "Write text to a file in the workspace (parent directories are created). "
         "This is for work-in-progress files; to hand the user a file they can open or "
-        "download, use media_create instead."
+        "download, use media_create instead. "
+        "**If the content is too large for one response** (your output is capped by "
+        "max_tokens), write the first chunk normally, then send the remaining chunks with "
+        "`append=true` — do NOT retry the whole call, it will be truncated again."
     ),
     parameters={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path relative to the workspace root"},
-            "content": {"type": "string", "description": "Full content to write"},
+            "content": {"type": "string", "description": "Content to write (one chunk when appending)"},
+            "append": {
+                "type": "boolean",
+                "default": False,
+                "description": "Append to the file instead of overwriting it (use for chunked writes)",
+            },
         },
         "required": ["path", "content"],
     },
@@ -432,6 +629,31 @@ registry.register(
         "required": ["pattern"],
     },
     handler=search_files,
+)
+
+registry.register(
+    name="outline_file",
+    description=(
+        "List the definition lines (functions / classes / types) of a source file with their "
+        "line numbers, **without** returning the body. Call this before `read_file` on any file "
+        "you have not read: one outline call usually replaces several paged reads, and each "
+        "avoided read is a saved round trip. Then `read_file(path, offset=line)` at the entry you "
+        "want. Treat it as an index — regex-based rules can miss or over-report (`fallback: true` "
+        "means this extension has no dedicated rule)."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path relative to the workspace"},
+            "max_lines": {
+                "type": "integer",
+                "default": OUTLINE_MAX_LINES,
+                "description": "Stop after this many definition lines",
+            },
+        },
+        "required": ["path"],
+    },
+    handler=outline_file,
 )
 
 registry.register(

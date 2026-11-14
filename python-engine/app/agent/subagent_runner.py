@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 RUN_ID_PREFIX = "rs_"
 # 只读运行时要剥离的"写/执行"类工具（未知工具默认保留，避免误伤读取能力）
 WRITE_TOOL_NAMES = frozenset({
-    "write_file", "edit_file", "run_code", "execute_python", "shell_exec", "persistent_shell",
+    "write_file", "edit_file", "replace_in_files", "run_code", "execute_python", "shell_exec", "persistent_shell",
     "git_commit", "git_branch", "skill_install", "skill_generate", "job_kill",
     "media_create", "image_generate", "browser", "kb_build",
 })

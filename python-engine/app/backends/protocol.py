@@ -180,3 +180,19 @@ class ExecutingBackendProtocol(BackendProtocol, Protocol):
     """带执行能力的后端（容器 / 远端沙箱 / 独立 sandbox 服务都实现它）。"""
 
     async def execute(self, command: str, *, timeout: float | None = None) -> ExecuteResult: ...
+
+
+@runtime_checkable
+class AppendingBackendProtocol(Protocol):
+    """**可选**能力：原子追加（不带这个能力时调用方回退到"读全文→拼接→整写"）。
+
+    为什么单独成协议而不是给 `write` 加参数：加参数会让**每个**实现都要改 ——
+    本地 / 远端 / FileStore / skill / 三个测试替身。而这是纯优化，缺了它系统仍然
+    正确，只是慢。用能力探测表达"可选的加速路径"，扩散面就只剩真正实现它的那一个。
+
+    为什么值得做：分片写入 `N` 片，旧的"读全文再拼"是 O(N²) 字节搬运 ——
+    写一个 10 片的大文件要搬 1+2+…+10 份内容，且每片都拍一次 undo 快照（也是全文复制）。
+    真追加是 O(N)：每片只把自己写到文件末尾。
+    """
+
+    async def append(self, path: str, content: str) -> WriteResult: ...

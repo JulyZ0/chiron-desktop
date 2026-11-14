@@ -61,14 +61,27 @@ export function langOf(path: string): string {
  *
  * 必须同时返回丢掉的行数：只截断不告知，等于让用户以为文件只有这么长 ——
  * 而他可能会据此判断"这个函数不存在"。
+ *
+ * `more` 用于**后端已经分屏**的情形：此时 `raw` 最多就是一屏，本地算出的
+ * dropped 恒为 0。只看本地会得出"文件已经完整"的结论，所以要用后端给出的
+ * `truncated` / `total_lines` 补上缺口。
  */
-export function truncatePreview(raw: string): { text: string; dropped: number } {
-  const lines = String(raw ?? '').split('\n')
-  if (lines.length <= PREVIEW_LINE_LIMIT) {
-    return { text: String(raw ?? ''), dropped: 0 }
+export function truncatePreview(
+  raw: string,
+  more?: { serverTruncated?: boolean; totalLines?: number },
+): { text: string; dropped: number } {
+  const source = String(raw ?? '')
+  const lines = source.split('\n')
+  if (lines.length > PREVIEW_LINE_LIMIT) {
+    return {
+      text: lines.slice(0, PREVIEW_LINE_LIMIT).join('\n'),
+      dropped: lines.length - PREVIEW_LINE_LIMIT,
+    }
   }
-  return {
-    text: lines.slice(0, PREVIEW_LINE_LIMIT).join('\n'),
-    dropped: lines.length - PREVIEW_LINE_LIMIT,
+  if (more?.serverTruncated) {
+    const total = typeof more.totalLines === 'number' ? more.totalLines : 0
+    // 至少报 1：后端说还有内容时，"0 行未显示"是自相矛盾的。
+    return { text: source, dropped: Math.max(total - lines.length, 1) }
   }
+  return { text: source, dropped: 0 }
 }

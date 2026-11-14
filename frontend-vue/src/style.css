@@ -2433,3 +2433,46 @@ html[data-density='comfortable'] :where(.ant-table-tbody > tr > td, .ant-table-t
 .form-label { font-size: 12px; color: var(--text-secondary); font-weight: var(--fw-medium); }
 .config-note { margin-top: 8px; color: var(--text-tertiary); font-size: 12px; line-height: 1.5; }
 .search-input { max-width: 320px; }
+
+/* ============================================================ */
+/* 代码高亮主题（hljs token 配色）
+   ------------------------------------------------------------------
+   为什么这条规则在**全局**而不是组件的 scoped 样式里：高亮的 token 是
+   `innerHTML` 注入的（聊天正文走 v-html，工作台预览走 highlightCodeBlocks），
+   它们**不带** Vue 的 `data-v-*` 作用域属性。写在 scoped 样式里会被编译成
+   `.hljs[data-v-xxx]`，一条都匹配不到 —— 代码块于是只能退回
+   `highlight.js/styles/github.css` 写死的浅色配色，暗色主题下白底黑字，
+   与整个界面脱节。这是"文件预览不适配主题"的真实成因。
+
+   为什么加 `html body` 前缀：github.css 是 side-effect import 进来的全局样式，
+   它出现的位置取决于模块加载顺序（组件懒加载时可能晚于本文件），不能指望
+   靠"写在后面"取胜。抬高一级特异性才能稳定压过它。
+   同理 `.hljs-function` 那类后代选择器也整体加前缀，避免只有它生效一半。
+
+   每个主题只需定义 `--hljs-*` 变量（见上方各 `[data-theme]` 块），
+   配色自动跟随，不必再引入第二套 hljs 主题包。 */
+html body .hljs { color: var(--hljs-fg); background: var(--hljs-bg); }
+html body .hljs-keyword,
+html body .hljs-selector-tag,
+html body .hljs-deletion { color: var(--hljs-keyword); }
+html body .hljs-string,
+html body .hljs-attr,
+html body .hljs-template-string,
+html body .hljs-addition { color: var(--hljs-string); }
+html body .hljs-number,
+html body .hljs-literal,
+html body .hljs-variable,
+html body .hljs-template-variable,
+html body .hljs-type { color: var(--hljs-number); }
+html body .hljs-comment,
+html body .hljs-quote { color: var(--hljs-comment); }
+html body .hljs-title,
+html body .hljs-section,
+html body .hljs-function .hljs-title { color: var(--hljs-title); }
+html body .hljs-built_in,
+html body .hljs-class .hljs-title,
+html body .hljs-name { color: var(--hljs-built-in); }
+html body .hljs-meta,
+html body .hljs-symbol,
+html body .hljs-bullet,
+html body .hljs-link { color: var(--hljs-meta); }

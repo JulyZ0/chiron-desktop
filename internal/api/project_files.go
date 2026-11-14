@@ -28,6 +28,7 @@ package api
 // handler 外壳。这样路径边界可以脱离数据库直接单测 —— 见 project_files_test.go。
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -59,12 +60,24 @@ const (
 	// 返回 2000 条要先分配几万个 DirEntry —— 这个端点点开工作台就会调。
 	// 256 是个折中：足够摊薄系统调用，又让峰值内存与目录大小脱钩。
 	dirBatchEntries = 256
-	// maxProjectFileBytes 是文本预览上限。超过就拒绝，而不是给一段被截断的 ——
-	// 截断的源码看起来和完整的一模一样，读它的人不会知道少了后半截。
+	// maxProjectFileBytes 曾是"文本预览一次装得下的上限"，超过就整个拒绝。
+	// 现在读取走按行窗口（见 readProjectTextWindow），这个常量只保留给
+	// `respondFileError` 的错误载荷（`limit` 字段）—— 前端据此说明"为什么被拒"。
 	maxProjectFileBytes = 2 << 20
 	// maxProjectRawBytes 是原始字节（图片 / PDF）上限。比文本宽：它们不参与模型
 	// 上下文，只是给人看的。
 	maxProjectRawBytes = 32 << 20
+	// maxProjectWindowLines / maxProjectWindowBytes 是**超大文本文件**的分屏预算。
+	//
+	// 为什么需要另开一条路径：`maxProjectFileBytes` 是"一次响应装得下"的上限，超了
+	// 就直接 413 —— 对"打开一个 5MB 的日志"这个动作是死路，用户连第一行都看不到。
+	// 而把上限抬高到几十 MB 也不是办法：那会把整份内容塞进一个 JSON 响应和 DOM。
+	// 折中是只给一屏（2000 行 ≈ 前端 PREVIEW_LINE_LIMIT），并明确告知"还有更多"。
+	//
+	// 字节上限与行数上限**必须同时有**：只限行数时，一行 minified 的 5MB JS 照样
+	// 会一次灌满；只限字节时，一行一个字符的空文件也要读几百万行才停。
+	maxProjectWindowLines = 2000
+	maxProjectWindowBytes = 1 << 20
 	// binarySniffBytes 是判定"是不是文本"时读的头部长度。
 	//
 	// 判据是 NUL 字节而不是扩展名：扩展名会骗人（`.log` 里可以是二进制），
@@ -156,6 +169,12 @@ type ProjectFile struct {
 	Content string `json:"content,omitempty"`
 	// TotalLines 只对文本有意义（末尾无换行时仍算一行）。
 	TotalLines int `json:"total_lines,omitempty"`
+	// Offset 是本次内容窗口的起始行（0-based）。只在按行窗口读取时出现，
+	// 前端据此把行号接上，而不是让每段窗口都从 1 开始数。
+	Offset int `json:"offset,omitempty"`
+	// Truncated 为真表示窗口之外还有内容。界面**必须**说出来并提供继续加载，
+	// 否则用户会以为文件只有这么长 —— 并据此判断"这个函数不存在"。
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // ── 纯函数：路径边界 ──
@@ -588,7 +607,24 @@ func openProjectFile(root, rel string, limit int64, tooLarge error) (*os.File, o
 // 二进制**不是错误**：报成失败会让前端只能显示红字，而这个文件本来好端端的 ——
 // 只是没法当文本读。
 func readProjectText(root, rel string) (*ProjectFile, error) {
-	f, info, err := openProjectFile(root, rel, maxProjectFileBytes, errFileTooLarge)
+	return readProjectTextWindow(root, rel, 0, 0)
+}
+
+// readProjectTextWindow 从第 offset 行（0-based）开始读一屏，最多 limit 行。
+//
+// 为什么另开窗口路径而不是把 `maxProjectFileBytes` 调大：调大只是把"一次拒绝"
+// 换成"一次卡死" —— 整份内容仍然要进一个 JSON 响应和一棵 DOM 树。窗口把动作
+// 变成可执行的：先看一屏，需要再按 offset 接着读。
+func readProjectTextWindow(root, rel string, offset, limit int) (*ProjectFile, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = maxProjectWindowLines
+	}
+	// 硬上限仍然是 maxProjectRawBytes：再大的文件连"翻页"都没意义，而且逐行
+	// 扫几十 MB 也只会拖住这个请求。
+	f, info, err := openProjectFile(root, rel, maxProjectRawBytes, errFileTooLargeRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -607,38 +643,62 @@ func readProjectText(root, rel string) (*ProjectFile, error) {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	// 读取本身也要封顶，不能只信 stat 的结果。
+
+	// 单遍顺序扫描：一边收集窗口，一边把总行数数完。
 	//
-	// `openProjectFile` 用 stat 得到的大小做限额，但那只是**一个时刻的快照**：
-	// stat 与 read 之间文件可能已经变大（最典型的是一个正在被追加的日志）。
-	// 裸 `io.ReadAll(f)` 会一直读到 EOF，于是一个 2KB 的检查通过之后，可以把
-	// 一个涨到几 GB 的文件整个读进内存 —— 服务端直接 OOM。
+	// 为什么不先数行数再 Seek 定位：那要扫两遍，而磁盘 IO 是这里最贵的一环。
+	// 也不按字节偏移 Seek —— 偏移会落在行中间，还得往回找换行，边界情况更多。
 	//
-	// 多读 1 字节用来区分"正好等于上限"和"还有更多"，这两种情况的界面表现
-	// 完全不同：前者可以正常显示，后者必须报超限。
-	data, err := io.ReadAll(io.LimitReader(f, maxProjectFileBytes+1))
-	if err != nil {
-		return nil, err
+	// 读取本身也要封顶，不能只信 stat：`openProjectFile` 的大小检查只是**一个
+	// 时刻的快照**，stat 与 read 之间文件可能被追加（最典型的是正在写的日志）。
+	reader := bufio.NewReaderSize(f, 64<<10)
+	var window strings.Builder
+	lineNo := 0    // 已扫过的行数，等于"下一行的 0-based 下标"
+	collected := 0 // 窗口内已收集的行数
+	windowBytes := 0
+	invalidUTF8 := false
+
+	for {
+		line, readErr := reader.ReadString('\n')
+		if line != "" {
+			if !utf8.ValidString(line) {
+				invalidUTF8 = true
+			}
+			// 两个上限都要守：只限行数时，一行 minified 的几 MB 照样一次灌满；
+			// 只限字节时，一行一个字符的文件要读几百万行才停。
+			// `collected == 0` 是刻意的兜底：单行就超预算时至少给出一行，
+			// 否则用户拿到的是"有内容但窗口是空的"。
+			if lineNo >= offset && collected < limit &&
+				(collected == 0 || windowBytes+len(line) <= maxProjectWindowBytes) {
+				window.WriteString(line)
+				windowBytes += len(line)
+				collected++
+			}
+			lineNo++
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return nil, readErr
+		}
 	}
-	if int64(len(data)) > maxProjectFileBytes {
-		return nil, errFileTooLarge
-	}
+
 	// 非法 UTF-8 也按二进制处理：硬转成文本只会得到一串替换字符，用户看不出原件
 	// 是什么编码。这时"用系统程序打开"才是对的动作。
-	if !utf8.Valid(data) {
+	if invalidUTF8 {
 		out.Binary = true
 		return out, nil
 	}
-	out.Content = string(data)
-	if out.Content != "" {
-		// 行数 = 换行符个数，末尾**没有**换行时再补一行。
-		// `line1\nline2\n` 是 2 行而不是 3 行：把末尾换行也数成一行，界面会显示
-		// 一个不存在的行号，而用户复制行号去定位时会差一行。
-		out.TotalLines = strings.Count(out.Content, "\n")
-		if !strings.HasSuffix(out.Content, "\n") {
-			out.TotalLines++
-		}
-	}
+
+	// 行数 = 换行符个数，末尾**没有**换行时再补一行。
+	// 逐行读取天然满足这条：`line1\nline2\n` 读到 2 行，而不是 3 行。
+	out.TotalLines = lineNo
+	out.Offset = offset
+	out.Content = window.String()
+	// 窗口之外还有行，就必须说出来 —— 只给一屏却不告知，等于让用户以为
+	// 文件只有这么长，并据此判断"这个函数不存在"。
+	out.Truncated = (lineNo - offset) > collected
 	return out, nil
 }
 
@@ -813,7 +873,11 @@ func (h *SessionMapHandler) SearchProjectFiles(w http.ResponseWriter, r *http.Re
 
 // ReadProjectFile 读取项目内的一个文本文件。
 //
-// query: path（必填，相对路径）
+// query: path（必填，相对路径）、offset（可选，起始行，0-based）、
+// limit（可选，本屏最多多少行）。
+//
+// 为什么带 offset/limit：大文件不能靠"把上限抬高"来打开 —— 那只是把一次拒绝换成
+// 一次卡死。窗口让用户先看到第一屏，再按 offset 接着读，代价与服务端内存都恒定。
 func (h *SessionMapHandler) ReadProjectFile(w http.ResponseWriter, r *http.Request) {
 	root, ok := h.requireProject(w, r)
 	if !ok {
@@ -824,7 +888,21 @@ func (h *SessionMapHandler) ReadProjectFile(w http.ResponseWriter, r *http.Reque
 		BadRequest(w, "path is required")
 		return
 	}
-	file, err := readProjectText(root, rel)
+	offset := 0
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		// 非法数字按 0 处理而不是报错：offset 只影响"从哪开始看"，
+		// 为一个笔误让整个预览失败没有道理。
+		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
+			offset = n
+		}
+	}
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
+			limit = n
+		}
+	}
+	file, err := readProjectTextWindow(root, rel, offset, limit)
 	if err != nil {
 		respondFileError(w, err, rel)
 		return

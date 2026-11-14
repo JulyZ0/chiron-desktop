@@ -419,7 +419,23 @@ watch(
 defineExpose({ reload })
 
 // ── 预览 ──
-const previewText = ref('')
+/**
+ * 预览正文按**块**存放：每翻一屏就是一个新块，旧块原样留在 DOM 里。
+ *
+ * 上一版是单个 `{{ previewText }}`，追加内容等于改写同一个文本节点 —— Vue 会把
+ * `code` 的子节点整体重置，增强器辛苦插进去的行号结构随之消失，于是"下半截没有
+ * 配色"和"行号重新从 1 开始"同时发生。为了绕开这点，原实现每次翻页都要把**整块**
+ * 重新高亮：翻到第十屏就是重算两万行，越翻越卡。
+ *
+ * 分块之后，翻页的高亮成本只与**新块**大小有关，已渲染的行完全不受影响。
+ */
+const previewChunks = ref<string[]>([])
+/** 每块首行的行号（1-based），让跨块的行号连续。 */
+const previewChunkStarts = ref<number[]>([])
+/** 每块的行数：给 `contain-intrinsic-size` 估算离屏块高度，避免滚动条跳动。 */
+const previewChunkLines = ref<number[]>([])
+/** 已渲染的总行数：续读起点与"还剩多少行"都按它算。 */
+const previewShownLines = ref(0)
 const previewBinary = ref(false)
 const previewLoading = ref(false)
 const previewError = ref('')
@@ -437,16 +453,27 @@ function revokePreviewURL() {
 
 function clearPreview() {
   revokePreviewURL()
-  previewText.value = ''
+  previewChunks.value = []
+  previewChunkStarts.value = []
+  previewChunkLines.value = []
+  previewShownLines.value = 0
   previewBinary.value = false
   previewError.value = ''
   previewLang.value = ''
   previewTruncatedLines.value = 0
+  previewOffset.value = 0
+  previewTotalLines.value = 0
 }
 
 const previewLang = ref('')
 /** 被截断时告诉用户还剩多少行没显示 —— 不告知就等于假装文件只有这么长 */
 const previewTruncatedLines = ref(0)
+/** 当前预览内容的起始行（0-based）。后端分屏时用它接续"继续加载"。 */
+const previewOffset = ref(0)
+/** 文件总行数（后端给出）；0 表示未知。 */
+const previewTotalLines = ref(0)
+/** 正在追加下一屏：按钮要能反映这件事，否则用户会连点。 */
+const previewLoadingMore = ref(false)
 const previewHost = ref<HTMLElement | null>(null)
 
 /** 挂载后按需增强：高亮是纯增量，失败也只是少个配色，代码本身始终可读可复制。 */
@@ -454,6 +481,60 @@ async function enhancePreview() {
   await nextTick()
   const host = previewHost.value
   if (host) await highlightCodeBlocks(host)
+}
+
+/**
+ * 继续加载下一屏。
+ *
+ * 只在后端分屏（`truncated`）时出现。追加而不是替换：用户翻页时通常正看着上面
+ * 那段，整块替换会把他刚读到的位置弹走。
+ *
+ * 每次翻页只**新增一个块**并只增强这个块 —— 旧块的 DOM 与高亮结构全部原样保留。
+ * 这正是分块渲染的目的：翻到第十屏的成本只与第十屏有关，不会重算前九屏。
+ */
+async function loadMorePreview() {
+  const entry = selected.value
+  if (!props.projectId || !entry || previewLoadingMore.value) return
+  previewLoadingMore.value = true
+  try {
+    const nextOffset = previewOffset.value + previewShownLines.value
+    const file = await readProjectFile(props.projectId, entry.path, nextOffset)
+    if (file.binary) return
+    const chunk = file.content ?? ''
+    if (!chunk) {
+      // 后端说还有、实际却读不到更多：以"到底了"收场，而不是留着按钮让用户
+      // 一点再点。空转的按钮比没有按钮更让人困惑。
+      previewTruncatedLines.value = 0
+      return
+    }
+    const start = previewShownLines.value + 1
+    previewOffset.value = file.offset ?? nextOffset
+    previewTotalLines.value = file.total_lines ?? previewTotalLines.value
+    const added = countLines(chunk)
+    previewChunkStarts.value = [...previewChunkStarts.value, start]
+    previewChunkLines.value = [...previewChunkLines.value, added]
+    previewChunks.value = [...previewChunks.value, chunk]
+    previewShownLines.value += added
+    const total = previewTotalLines.value
+    previewTruncatedLines.value = file.truncated
+      ? Math.max(total - previewShownLines.value, 1)
+      : 0
+
+    // **必须先等 Vue 把新块写进 DOM**，再增强 —— 新块此刻还不存在。
+    // 旧块不会被碰到：它们带 `data-highlighted`，天然被选择器跳过。
+    await enhancePreview()
+  } catch (e) {
+    notify.error(describeApiError(e))
+  } finally {
+    previewLoadingMore.value = false
+  }
+}
+
+/** 数一段文本的行数（末尾换行不算多出来的一行，与后端口径一致）。 */
+function countLines(text: string): number {
+  if (!text) return 0
+  const n = text.split('\n').length
+  return text.endsWith('\n') ? n - 1 : n
 }
 
 async function selectFile(entry: ProjectFileEntry) {
@@ -470,14 +551,25 @@ async function selectFile(entry: ProjectFileEntry) {
     }
     const file = await readProjectFile(props.projectId, entry.path)
     previewBinary.value = file.binary
-    // 后端对超过 2MB 的文本直接返回 `file_too_large`（不返回一段被截断的内容），
-    // 所以这里不需要"内容可能不完整"的判断 —— 能拿到内容就是完整的。
     previewLang.value = langOf(entry.path)
     // 大文件在**渲染前**截断：塞进 DOM 之后再想办法隐藏没有意义，
     // 卡住的是渲染本身，不是可见性（见 previewCode.ts 的 PREVIEW_LINE_LIMIT）。
-    const cut = truncatePreview(file.content ?? '')
-    previewText.value = cut.text
+    //
+    // 后端对超大文本只返回一屏（`truncated` 为真），此时本地按行截断必然算出
+    // dropped=0 —— 单看本地会得出"文件已经完整"的错误结论，所以把后端的
+    // 分屏标记一起传进去。
+    const cut = truncatePreview(file.content ?? '', {
+      serverTruncated: file.truncated,
+      totalLines: file.total_lines,
+    })
+    previewChunks.value = cut.text ? [cut.text] : []
+    previewChunkStarts.value = [1]
+    previewChunkLines.value = [countLines(cut.text)]
+    previewShownLines.value = countLines(cut.text)
     previewTruncatedLines.value = cut.dropped
+    // 记录首屏起点：后续"继续加载"要从这一屏的末尾接上，而不是从 0 重新读。
+    previewOffset.value = file.offset ?? 0
+    previewTotalLines.value = file.total_lines ?? 0
   } catch (e) {
     previewError.value = describeApiError(e)
   } finally {
@@ -926,14 +1018,36 @@ async function openWithSystem(entry: ProjectFileEntry) {
                    `pre code[data-lang]`，用 `|| undefined` 让 Vue 省略该属性时，
                    没有扩展名/未知扩展名的文件（`go.mod`、`Makefile`、`LICENSE`…）
                    会连行号都拿不到 —— 整块代码被当成不存在，静默跳过增强。
-                   空串让高亮器退回 highlightAuto，行号照加。 -->
-              <pre><code :data-lang="previewLang">{{ previewText }}</code></pre>
+                   空串让高亮器退回 highlightAuto，行号照加。
+
+                   按块渲染（`v-for`）而不是单个文本插值：每块是独立的 `pre > code`，
+                   翻页只新增一块，已渲染的块连同高亮与行号 DOM 全部保持不变。
+                   `:key` 用块序号 —— 块只追加、不重排，序号就是稳定身份。
+                   `data-start-line` 让行号跨块连续（每块起点在渲染时就已确定）。 -->
+              <pre
+                v-for="(chunk, i) in previewChunks"
+                :key="i"
+                class="wb-code-chunk"
+                :style="{ '--chunk-lines': previewChunkLines[i] || 1 }"
+              ><code
+                :data-lang="previewLang"
+                :data-start-line="previewChunkStarts[i]"
+              >{{ chunk }}</code></pre>
             </div>
             <div
               v-if="previewTruncatedLines > 0"
               class="wb-empty wb-empty-action"
             >
               <span>{{ tr('chat.workbench_preview_truncated', { n: previewTruncatedLines }) }}</span>
+              <!-- 有继续加载时优先给这条：翻页留在界面内，比"去系统程序里看"省一次
+                   应用切换。文字文件才有这个按钮，二进制本来就没有可追加的内容。 -->
+              <button
+                v-if="!previewBinary"
+                type="button"
+                class="wb-btn"
+                :disabled="previewLoadingMore"
+                @click="loadMorePreview"
+              >{{ previewLoadingMore ? tr('common.loading') : tr('chat.workbench_preview_load_more') }}</button>
               <button
                 type="button"
                 class="wb-btn"
@@ -1023,6 +1137,18 @@ async function openWithSystem(entry: ProjectFileEntry) {
   color: var(--text-secondary); white-space: pre; tab-size: 4;
 }
 .wb-code code { font-family: inherit; }
+/* 离屏块跳过布局与绘制（虚拟滚动的轻量实现）。
+   `content-visibility: auto` 让块不在视口附近时连同子树一起不参与渲染，但 DOM 与
+   已算好的高亮结构**原样保留** —— 这正是要的效果：翻到第十屏后的 DOM 体积依然是
+   十块，可绘制成本只与视口内那几块有关。
+   刻意**不用** JS 窗口化：预览靠外层 `.wb-preview-body` 统一横向滚动，按 scrollTop
+   卸载块会让横向滚动条宽度随视口跳变，而且行号列会跟着重排。
+   `contain-intrinsic-size` 必须给：没有它，离屏块的估算高度为 0，滚动条会随着
+   块进出视口反复跳动；行高 1.5 × 12px ≈ 18px，用它乘块行数做估算。 */
+.wb-code-chunk {
+  content-visibility: auto;
+  contain-intrinsic-size: auto calc(var(--chunk-lines, 1) * 18px);
+}
 /* 行号（codeHighlighter 会把每行包成 .code-line/.code-line-no/.code-line-body）。
    聊天区那份样式带 `white-space: pre-wrap; word-break: break-all` —— 那是为窄消息列
    设计的**折行**排版。工作台直接复用高亮器却拿不到那些 `:deep()` 样式，结果长代码行
@@ -1038,6 +1164,23 @@ async function openWithSystem(entry: ProjectFileEntry) {
   text-align: end; color: var(--text-tertiary); user-select: none;
 }
 .wb-code :deep(.code-line-body) { white-space: pre; }
+/* 注释块折叠。
+   折叠行用 `display: none` 而不是 `height: 0`：代码行是 `display: block` 的，
+   留出零高度仍会占据一个行盒，滚动区里会多出一串看不见的空隙。
+   头部的行号保留可见 —— 展开后紧接着的行号本来就不是连续的（中间藏着 N 行），
+   把头部行号一起藏掉反而让人以为折叠处丢了内容。 */
+.wb-code :deep(.code-fold-body[data-fold-state='collapsed']) { display: none; }
+.wb-code :deep(.code-fold-head) { cursor: pointer; }
+.wb-code :deep(.code-fold-head:hover .code-line-no) { color: var(--text-secondary); }
+/* 折叠提示用 `::after` 而不是插入元素：行内容由 innerHTML 生成，插入元素要在
+   addLineNumbers 里拼字符串，`,` 和转义都得自己管；伪元素只依赖属性，零成本。 */
+.wb-code :deep(.code-fold-head .code-line-body)::after {
+  content: ' … (' attr(data-fold-hidden) ')';
+  color: var(--text-tertiary);
+  font-style: italic;
+  user-select: none;
+}
+.wb-code :deep(.code-fold-head[data-fold-open='1'] .code-line-body)::after { content: ''; }
 .wb-image { max-width: 100%; height: auto; }
 .wb-frame { width: 100%; height: 320px; border: none; background: var(--bg-card); }
 

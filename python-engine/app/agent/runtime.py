@@ -624,6 +624,38 @@ def _record_recovery(
         state.record_success()
 
 
+def _truncation_recovery_hint(tool_name: str) -> str:
+    """截断之后给模型的**可执行**出路。
+
+    原来的文案是 "re-issue the tool call" —— 对截断**根本无效**：截断意味着内容超出了
+    输出预算，原样重发必然再截断。模型于是照做、再截断、再照做，直到耗尽轮数，
+    外表现就是"工具失败后不会自动修复、跑不下去"。提示必须指向**能真正收敛**的动作。
+    """
+    if tool_name == "write_file":
+        return (
+            "Do NOT resend the same content — it exceeds the output budget and will be "
+            "truncated again. Split the file: send the first chunk with "
+            "`write_file(path, content)` and each remaining chunk with "
+            "`write_file(path, content, append=true)`."
+        )
+    if tool_name == "edit_file":
+        return (
+            "Do NOT resend the same edit — it exceeds the output budget. Split it into "
+            "several smaller `edit_file` calls, each replacing a smaller unique snippet, "
+            "or write the file in chunks via `write_file(..., append=true)`."
+        )
+    if tool_name == "todo_write":
+        return (
+            "Do NOT resend the same list. Keep the checklist short (one line per item) "
+            "and send fewer items per call."
+        )
+    return (
+        "Do NOT resend the same call — it exceeds the output budget and will be truncated "
+        "again. Reduce the payload (smaller chunk, narrower scope), or split the work into "
+        "several smaller calls."
+    )
+
+
 def _loop_guard_result(
     verdict: Any, previous: dict[Any, Any] | None = None
 ) -> dict[str, Any]:
@@ -2688,7 +2720,7 @@ class AgentRuntime:
                         notice = (
                             f"error: output truncated by max_tokens before tool "
                             f"'{call['name']}' was complete; its arguments may be "
-                            f"incomplete. Re-issue the full tool call."
+                            f"incomplete. {_truncation_recovery_hint(call['name'])}"
                         )
                         yield AgentEvent(
                             type="tool_result",
@@ -3726,7 +3758,8 @@ class AgentRuntime:
             return {
                 "error": (
                     f"Tool '{tool_name}' arguments are not valid JSON (possibly "
-                    f"truncated by max_tokens); not executed — re-issue the tool call"
+                    f"truncated by max_tokens); not executed. "
+                    f"{_truncation_recovery_hint(tool_name)}"
                 )
             }, None
         verdict = self._tool_guard.evaluate(tool_name, targs or {}, self._current_mode)

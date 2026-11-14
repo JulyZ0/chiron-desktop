@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -614,6 +615,17 @@ MAX_EXECUTE_OUTPUT_BYTES = 512 * 1024
 EXECUTE_HEAD_BYTES = 8 * 1024
 EXECUTE_TAIL_BYTES = 2 * 1024
 
+#: 超限输出的落盘目录（相对 workspace）。
+#
+# 为什么必须落盘：只给 head+tail 时，被省掉的中段**没有任何通道能再取回** ——
+# 而编译/测试的第一条真实错误恰好常在中段。模型看到「省略 400KB」后只能重跑命令，
+# 于是同一道命令反复烧轮数，外表现就是"执行失败后不能自愈"。
+# 落盘 + 返回 `log_path` 之后，模型可以用 `read_file(offset)` 或 `grep_files` 取任意一段。
+EXEC_OFFLOAD_DIR = ".chiron/exec"
+
+#: 落盘日志的保留份数：长任务会跑几百条命令，不修剪会撑满磁盘
+EXEC_OFFLOAD_KEEP = 40
+
 
 def truncate_execute_output(text: str) -> tuple[str, bool]:
     """按字节上限截断执行输出，保留 head+tail 并标注省略量。
@@ -629,6 +641,98 @@ def truncate_execute_output(text: str) -> tuple[str, bool]:
     tail = encoded[-EXECUTE_TAIL_BYTES:].decode("utf-8", errors="replace")
     omitted = len(encoded) - EXECUTE_HEAD_BYTES - EXECUTE_TAIL_BYTES
     return f"{head}\n... [{omitted} bytes truncated] ...\n{tail}", True
+
+
+def _exec_offload_dir() -> Path:
+    folder = workspace_dir() / EXEC_OFFLOAD_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _prune_exec_logs(folder: Path) -> None:
+    """只留最近 `EXEC_OFFLOAD_KEEP` 份：长任务会跑掉几百条命令，不修剪会撑满磁盘。
+
+    修剪失败一律忽略：日志留多一份是无害的，把执行结果搞丢才是有害的。
+    """
+    try:
+        logs = sorted(
+            folder.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True
+        )
+    except OSError:
+        return
+    for stale in logs[EXEC_OFFLOAD_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def offload_execute_output(
+    text: str, kind: str
+) -> tuple[str, bool, str | None]:
+    """超限时把**完整**输出落盘，并把"去哪取中段"写进返回文本。
+
+    与 `truncate_execute_output` 的区别只有一个：省略掉的中段**还能取回来**。
+    路径是相对 workspace 的，所以模型能直接 `read_file` / `grep_files` 它 ——
+    给绝对路径反而会被 `safe_join` 拒绝，等于没给。
+
+    Returns:
+        `(呈现给模型的文本, 是否截断, 日志相对路径或 None)`。
+    """
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= MAX_EXECUTE_OUTPUT_BYTES:
+        return text, False, None
+
+    rel: str | None = None
+    try:
+        folder = _exec_offload_dir()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # 同一秒内可能连跑两条命令：加 pid 与序号避免覆盖
+        name = f"exec-{stamp}-{os.getpid()}-{kind}.log"
+        target = folder / name
+        counter = 1
+        while target.exists():
+            target = folder / f"exec-{stamp}-{os.getpid()}-{kind}-{counter}.log"
+            counter += 1
+        target.write_bytes(encoded)
+        _prune_exec_logs(folder)
+        rel = f"{EXEC_OFFLOAD_DIR}/{target.name}"
+    except Exception as exc:  # noqa: BLE001 — 落盘失败不能连累执行结果
+        logger.warning("exec offload failed (%s); falling back to head+tail only", exc)
+
+    head = encoded[:EXECUTE_HEAD_BYTES].decode("utf-8", errors="replace")
+    tail = encoded[-EXECUTE_TAIL_BYTES:].decode("utf-8", errors="replace")
+    omitted = len(encoded) - EXECUTE_HEAD_BYTES - EXECUTE_TAIL_BYTES
+    if rel is None:
+        return f"{head}\n... [{omitted} bytes truncated] ...\n{tail}", True, None
+    # 提示必须写成**可执行**的：模型要知道用哪个工具、传什么参数。只说"已保存"
+    # 等于让它猜，而猜错一次就是一轮预算。
+    notice = (
+        f"\n... [{omitted} bytes truncated of {len(encoded)} total; FULL output saved at "
+        f"{rel} — read the middle with read_file(path=\"{rel}\", offset=N) or narrow it "
+        f"with grep_files(query, root=\"{EXEC_OFFLOAD_DIR}\")] ...\n"
+    )
+    return f"{head}{notice}{tail}", True, rel
+
+
+def _attach_log_paths(
+    payload: dict[str, Any], stdout_log: str | None, stderr_log: str | None
+) -> None:
+    """把落盘路径挂到执行结果上（没落盘就不加字段）。
+
+    单独成字段而不是只写在文本里：前端与上层据此能直接给出"查看完整日志"的入口，
+    不必去正则解析刚才那段提示文字。
+    """
+    if stdout_log:
+        payload["stdout_log"] = stdout_log
+    if stderr_log:
+        payload["stderr_log"] = stderr_log
+    if stdout_log or stderr_log:
+        # 长任务里日志会越攒越多；让模型知道这里可以清理，而不是默认它永不爆。
+        payload["log_note"] = (
+            f"full output under {EXEC_OFFLOAD_DIR}/ (keeps the latest "
+            f"{EXEC_OFFLOAD_KEEP} files)"
+        )
 
 
 def apply_resource_limits() -> None:
@@ -812,14 +916,20 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
             return {
                 "error": f"sandbox unavailable: restricted exec failed — {result.spawn_error}",
             }
-        stdout_text, stdout_truncated = truncate_execute_output(result.stdout)
-        stderr_text, stderr_truncated = truncate_execute_output(result.stderr)
-        return {
+        stdout_text, stdout_truncated, stdout_log = offload_execute_output(
+            result.stdout, "stdout"
+        )
+        stderr_text, stderr_truncated, stderr_log = offload_execute_output(
+            result.stderr, "stderr"
+        )
+        payload: dict[str, Any] = {
             "exit_code": result.exit_code,
             "stdout": stdout_text,
             "stderr": stderr_text,
             "truncated": stdout_truncated or stderr_truncated,
         }
+        _attach_log_paths(payload, stdout_log, stderr_log)
+        return payload
 
     # **按档位改变执行路径**：`low_il` 及以上必须由**子进程自己**降级 —— 完整性级别
     # 改的是当前进程令牌，且 Windows 没有撤销 API，父进程一旦调用会连引擎一起降级。
@@ -869,16 +979,19 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
         if job is not None:
             job.close()
     # 批 B 片 5：执行输出按字节上限截断，并**显式标注**截断量（exit_code 不受影响 ——
-    # 不能因为输出太大就丢掉"命令到底成功没有"这个最关键的信息）
-    stdout_text, stdout_truncated = truncate_execute_output(
-        stdout.decode("utf-8", errors="replace")
+    # 不能因为输出太大就丢掉"命令到底成功没有"这个最关键的信息）。
+    # E1：超限不再"砍掉中段就完事"——完整输出落盘并给出可续取路径。
+    stdout_text, stdout_truncated, stdout_log = offload_execute_output(
+        stdout.decode("utf-8", errors="replace"), "stdout"
     )
-    stderr_text, stderr_truncated = truncate_execute_output(
-        stderr.decode("utf-8", errors="replace")
+    stderr_text, stderr_truncated, stderr_log = offload_execute_output(
+        stderr.decode("utf-8", errors="replace"), "stderr"
     )
-    return {
+    payload: dict[str, Any] = {
         "exit_code": proc.returncode,
         "stdout": stdout_text,
         "stderr": stderr_text,
         "truncated": stdout_truncated or stderr_truncated,
     }
+    _attach_log_paths(payload, stdout_log, stderr_log)
+    return payload

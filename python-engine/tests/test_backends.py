@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from app.backends.protocol import (
     EditResult,
     FileStat,
     GlobResult,
+    GrepMatch,
     GrepResult,
     LsResult,
     ReadBytesResult,
@@ -97,7 +99,24 @@ class _InMemoryBackend:
     async def grep(
         self, pattern: str, *, path: str = ".", max_results: int = 100
     ) -> GrepResult:
-        return GrepResult()
+        """真的逐行匹配（替身必须履行协议：`grep_files` 现在把匹配交给后端）。"""
+        try:
+            regex = re.compile(pattern)
+        except re.error as exc:
+            return GrepResult(error=f"invalid pattern: {exc}")
+        matches: list[GrepMatch] = []
+        for name in sorted(self.files):
+            if path not in (".", "") and not (
+                name == path or name.startswith(path.rstrip("/") + "/")
+            ):
+                continue
+            for number, line in enumerate(self.files[name].splitlines(), start=1):
+                if not regex.search(line):
+                    continue
+                if len(matches) >= max_results:
+                    return GrepResult(matches=matches, truncated=True, reason="budget")
+                matches.append(GrepMatch(path=name, line_number=number, line=line))
+        return GrepResult(matches=matches)
 
     def supports_execution(self) -> bool:
         return False
