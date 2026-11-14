@@ -1707,6 +1707,46 @@ def _setup_routes(app: FastAPI) -> None:
 # ── 模块级路由处理函数（FastAPI 需在模块作用域才能正确推断 body 类型） ──
 
 
+def _event_payload(event: Any) -> dict[str, Any]:
+    """把引擎的 `AgentEvent` 折成一条 SSE 帧的 payload（主对话事件的**唯一**出口）。
+
+    为什么抽成函数：这里原本是一行内联字典，字段全靠手抄 —— `revision` 就这么漏了。
+    而漏掉的表现不是报错，是"清单面板偶尔倒退一格然后永远差一格"，没人会想到去查
+    SSE 帧。帧形状集中在一处，才谈得上"引擎发出的字段不会在路上悄悄消失"。
+
+    字段必须与网关 `internal/engine.PythonEvent` **一一对齐**：那边没声明的字段会在
+    重新序列化时被丢掉（引擎 → PythonEvent → broadcast.Event → SSE 三段序列化，
+    任何一段漏字段都只在最后一段表现为"某个字段莫名其妙没了"）。加字段要两边一起加。
+
+    空值照原样发（不做 omitempty 裁剪）：网关侧用 `omitempty` 决定要不要出现在最终
+    帧里，这里提前裁会让"零值"与"没有这个字段"在链路上混为一谈。
+    """
+    return {
+        "type": event.type,
+        # content 兜 error：引擎把失败原因放在 `error` 上，而前端只认 content 一条通道。
+        # 这是既有约定，改掉会破坏所有错误提示的渲染。
+        "content": event.content or event.error,
+        "id": event.tool_call_id,
+        "name": event.tool_name,
+        "arguments": event.tool_arguments,
+        "options": event.options,
+        "input_tokens": event.input_tokens,
+        "output_tokens": event.output_tokens,
+        "cached_tokens": event.cached_tokens,
+        "model": event.model,
+        "budget": event.budget,
+        "context": event.context,
+        "cache": event.cache,
+        # 任务清单修订号（仅 todo_updated 非 0）：前端据此**丢弃**乱序到达的旧事件。
+        # 漏掉它，前端的 shouldApply 收到 undefined 就退化成"永远接受"，
+        # 重连补发 / 多副本接力时面板倒退一格。
+        "revision": event.revision,
+        # 本步耗时（trace_span 等）：前端的 turn_stats 汇总它显示本轮耗时；
+        # 漏掉时 `mergeTurnStats` 的 `durationMs > 0` 守卫直接跳过，耗时恒不显示。
+        "duration_ms": event.duration_ms,
+    }
+
+
 async def _inject_subagent_reports(task: Any) -> None:
     """把"自上次交互以来结束的后台子 Agent"挂到本轮 task 上（**永不抛**）。
 
@@ -2031,7 +2071,7 @@ async def agent_submit(
                     total_in += event.input_tokens
                 if event.output_tokens:
                     total_out += event.output_tokens
-                yield _frame({'type': event.type, 'content': event.content or event.error, 'id': event.tool_call_id, 'name': event.tool_name, 'arguments': event.tool_arguments, 'options': event.options, 'input_tokens': event.input_tokens, 'output_tokens': event.output_tokens, 'cached_tokens': event.cached_tokens, 'model': event.model, 'budget': event.budget, 'context': event.context, 'cache': event.cache})
+                yield _frame(_event_payload(event))
             # 收尾：把旁路中剩余的预览与唯一终态送出
             async for frame in _sink_frames():
                 yield frame

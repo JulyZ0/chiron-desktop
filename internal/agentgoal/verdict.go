@@ -57,10 +57,12 @@ const (
 type class string
 
 const (
-	classNoError    class = "no-error"          // 回合不得以错误结束
-	classAnswered   class = "answered"          // 回合应产出正文
-	classVerified   class = "verified-changes"  // 成功的改动应有验证跟随
-	classModelClaim class = "model-claim"       // 模型声明的判据（P3 起接入；判定仍只看证据）
+	classNoError    class = "no-error"         // 回合不得以错误结束
+	classAnswered   class = "answered"         // 回合应产出正文
+	classVerified   class = "verified-changes" // 成功的改动应有验证跟随
+	classProgress   class = "goal-progress"    // 任务清单里不能还有未完成项
+	classBudget     class = "budget"           // 段级预算中止后应有下一段把它接上
+	classModelClaim class = "model-claim"      // 模型声明的判据（P3 起接入；判定仍只看证据）
 )
 
 // Obligation 是一条需要被满足/证明的义务。
@@ -82,12 +84,22 @@ type Finding struct {
 }
 
 // Signals 是证据之外的、网关自身观测到的回合信号。
+//
+// 这里每一项都必须是**网关自己能看见**的事实。模型说的话一律不进来 —— 连
+// "清单已全部完成"这一步也是网关读 `todo_updated` 事件得到的，不是读模型正文。
 type Signals struct {
 	HasError     bool   // 引擎发过 error 事件
 	ErrorMessage string // 该错误的内容（用于报告）
 	HasAnswer    bool   // 回合产出了正文（非空文本）
 	Cancelled    bool   // 用户取消 / 会话取消
 	Truncated    bool   // 被 deadline 截断
+	// BudgetAxis 是**段级**预算中止的轴名（`steps`/`turns`/`tokens`/`wall`/`cost`），
+	// 空串 = 没撞墙。调用方只在错误正文确实是 `budget_exceeded:<轴>` 时才填它，
+	// 所以它与 HasError 不冲突：填了它就意味着那条 error **不是**硬失败。
+	BudgetAxis string
+	// Pending 是任务清单里**尚未完成**的条目内容（调用方已过滤，只放没做完的）。
+	// 空 = 没有未完成项，或这一轮压根没有清单 —— 两种情况都不派生 progress 义务。
+	Pending []string
 }
 
 // Report 是一次判定的输出。
@@ -96,6 +108,10 @@ type Report struct {
 	Findings []Finding `json:"findings"`
 	// Reasons 是给用户看的简短说明（Outcome 非 completed 时非空）。
 	Reasons []string `json:"reasons,omitempty"`
+	// BudgetAxis 原样带出撞墙的轴名，供续跑指令把"哪一档额度用完了"说清楚。
+	BudgetAxis string `json:"budget_axis,omitempty"`
+	// Pending 原样带出未完成的清单项，供续跑指令点名"还剩哪几件事"。
+	Pending []string `json:"pending,omitempty"`
 }
 
 // Complete 是给调用方的便捷判定：是否可以正常收尾（不被强制继续）。
@@ -125,6 +141,7 @@ func Evaluate(e *evidence.Collector, sig Signals) Report {
 			Reasons: []string{
 				"truncated: the turn hit the per-turn deadline; the workspace may hold unverified changes",
 			},
+			Pending: append([]string(nil), sig.Pending...),
 		}
 	}
 	obligations := derive(e, sig)
@@ -153,19 +170,42 @@ func Evaluate(e *evidence.Collector, sig Signals) Report {
 			}
 		}
 	}
-	return Report{Outcome: outcome, Findings: findings, Reasons: reasons}
+	return Report{
+		Outcome:  outcome,
+		Findings: findings,
+		Reasons:  reasons,
+		// 轴名与未完成项**只原样转述**（都来自调用方填的信号），判定逻辑本身不读它们
+		// 之外的任何东西。回灌层需要这两项才能把"为什么继续、还要做什么"说具体。
+		BudgetAxis: sig.BudgetAxis,
+		Pending:    append([]string(nil), sig.Pending...),
+	}
 }
 
 // derive 由 host **自己**派生出义务集 —— 这是"host 拥有型"的关键：
 // 模型不能通过少声明/多声明来改变判定的严格性（P3 的模型声明判据会被当作
 // classModelClaim 加入，但**只是被复核的对象**，不是判定依据）。
 func derive(e *evidence.Collector, sig Signals) []Obligation {
-	obs := []Obligation{{
-		ID:          "no-error",
-		Description: "The turn must not end on an engine error.",
-		Required:    true,
-		Class:       classNoError,
-	}}
+	var obs []Obligation
+
+	// 段级预算撞墙（`budget_exceeded:<轴>`）与"引擎报错"在现象上都是 error，但语义相反：
+	// 前者说明**这一段额度用完了**，现场已保存，下一段接着跑就能继续；后者是硬失败。
+	// 此前两者都判 Failed → GoalBlocked → 续跑链硬停，长任务就此断在半路。
+	// 所以撞墙时**不派生 no-error**，改派生 budget 义务（判 owed ⇒ Incomplete ⇒ 续跑）。
+	if sig.BudgetAxis == "" {
+		obs = append(obs, Obligation{
+			ID:          "no-error",
+			Description: "The turn must not end on an engine error.",
+			Required:    true,
+			Class:       classNoError,
+		})
+	} else {
+		obs = append(obs, Obligation{
+			ID:          "budget-continuation",
+			Description: "A budget-exhausted segment must be continued by a fresh segment.",
+			Required:    true,
+			Class:       classBudget,
+		})
+	}
 
 	// 只有出现过**成功的改动**时，才派生"改动需被验证"的义务 —— 否则纯问答回合
 	// 会被迫"验证"一件根本没发生的事（假警报会把这条机制变成噪声）。
@@ -175,6 +215,21 @@ func derive(e *evidence.Collector, sig Signals) []Obligation {
 			Description: "Every change to the workspace must be followed by a successful verification.",
 			Required:    true,
 			Class:       classVerified,
+		})
+	}
+
+	// 清单里还有没做完的事 ⇒ 这一轮不算做完。
+	//
+	// 清单是模型写的，所以它**只被用来收紧判定**：它能让回合从 Completed 降为
+	// Incomplete（继续跑），但任何清单状态都不足以把回合判成 Completed —— "全部
+	// completed"只是撤掉这条额外义务，仍然要由 no-error / answered / verified-changes
+	// 来支撑完成。这样模型既不能靠"清单写完成"骗过判定，也不能写完清单就收工。
+	if len(sig.Pending) > 0 {
+		obs = append(obs, Obligation{
+			ID:          "goal-progress",
+			Description: "Every item still open on the task list must be finished or dropped explicitly.",
+			Required:    true,
+			Class:       classProgress,
 		})
 	}
 
@@ -231,6 +286,17 @@ func judge(ob Obligation, e *evidence.Collector, sig Signals) Finding {
 				f.Evidence = append(f.Evidence, m.ToolCallID)
 			}
 		}
+	case classProgress:
+		// 清单里还有未完成项 ⇒ owed（还能继续做，不是失败）。
+		f.Verdict = Owed
+		f.Reason = fmt.Sprintf("%d item(s) on the task list are still open: %s",
+			len(sig.Pending), strings.Join(sig.Pending, "; "))
+	case classBudget:
+		// 段级额度用完：这不是失败，是"这一段停在这里、下一段接着跑"。
+		// 判 owed ⇒ Incomplete ⇒ Advance 继续，同时把轴名带进续跑指令。
+		f.Verdict = Owed
+		f.Reason = fmt.Sprintf("the segment stopped on the %s budget; a fresh segment must carry on",
+			nonEmpty(sig.BudgetAxis, "unknown"))
 	case classModelClaim:
 		// 模型声明的判据：**只按 host 证据复核**。无证据即 owed（claim 自身永不满足义务）。
 		f.Verdict = Owed

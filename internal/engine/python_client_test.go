@@ -149,3 +149,75 @@ func TestIsConnected_GETOnlyHealthz(t *testing.T) {
 		t.Fatalf("HealthCheck should report healthy, got: %+v", h)
 	}
 }
+
+// TestPythonEvent_ForwardsFieldsItDeclares 守住"网关不吞字段"。
+//
+// 这条链是四段序列化：引擎帧 → `PythonEvent` → `broadcast.Event` → 浏览器。
+// 网关转发时是 `Data: evt`（本结构体），**未声明的字段在重新序列化那一刻就消失**了
+// —— 只改引擎没有用，必须两边都声明。历史故障全是这一种形态：
+//
+//   - `revision` 缺 ⇒ 前端 `shouldApply` 收到 undefined，乱序防护退化成"永远接受"，
+//     重连补发时清单面板倒退一格然后永远差一格；
+//   - `options` 缺 ⇒ `ask_user` 的候选项永远是空列表，用户只能自己手打；
+//   - `budget`/`context`/`cache` 缺 ⇒ 预算面板、上下文占用、缓存诊断全空着；
+//   - `duration_ms` 缺 ⇒ `mergeTurnStats` 的 `> 0` 守卫直接跳过，本轮耗时恒不显示。
+//
+// 所以断言不是"解出来是对的"，而是"**再序列化一次**之后它还在" —— 那才是
+// 前端真正收到的形状。
+func TestPythonEvent_ForwardsFieldsItDeclares(t *testing.T) {
+	frame := `{"type":"todo_updated","content":"[]","revision":7,"duration_ms":1234,` +
+		`"options":["A","B"],"budget":{"tokens":{"used":10,"limit":100}},` +
+		`"context":{"used":5,"limit":50},"cache":{"prefix_changed":["system"]},` +
+		`"input_tokens":11,"output_tokens":22,"cached_tokens":33,"model":"m"}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		fmt.Fprintf(w, "data: %s\n\n", frame)
+	}))
+	defer srv.Close()
+
+	ch, err := NewPythonClient(srv.URL).RunSSE(t.Context(), "/v1/agent/submit", map[string]any{"content": "hi"})
+	if err != nil {
+		t.Fatalf("RunSSE: %v", err)
+	}
+	var events []PythonEvent
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	// 关键一步：按网关的真实做法重新序列化（`Data: evt`），再解码回来看字段在不在。
+	raw, err := json.Marshal(events[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var forwarded map[string]any
+	if err := json.Unmarshal(raw, &forwarded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, key := range []string{
+		"revision", "duration_ms", "options", "budget", "context", "cache",
+		"input_tokens", "output_tokens", "cached_tokens", "model",
+	} {
+		if _, ok := forwarded[key]; !ok {
+			t.Errorf("field %q disappeared at the gateway (engine sent it, frontend never sees it)", key)
+		}
+	}
+
+	if got := forwarded["revision"]; got != float64(7) {
+		t.Errorf("revision: got %v, want 7", got)
+	}
+	if got := forwarded["duration_ms"]; got != float64(1234) {
+		t.Errorf("duration_ms: got %v, want 1234", got)
+	}
+	if opts, ok := forwarded["options"].([]any); !ok || len(opts) != 2 {
+		t.Errorf("options: got %v, want 2 entries", forwarded["options"])
+	}
+}

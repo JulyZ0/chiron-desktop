@@ -56,7 +56,6 @@ func runAffinityFromCtx(ctx context.Context) bool {
 	return ok && v
 }
 
-
 // PythonClient calls the Python AI engine via HTTP SSE.
 // Supports multiple addresses with round-robin load balancing.
 // 地址表（批 E1）：由 mu 保护的动态列表——StartEngineDiscovery 每 15s 从 Redis
@@ -138,10 +137,6 @@ func NewPythonClient(addresses ...string) *PythonClient {
 	}
 	return c
 }
-
-
-
-
 
 // HealthCheck 对 Python 引擎执行健康检查（GET /healthz），
 // 返回状态和地址级信息。超时 5 秒，不触发重试逻辑。
@@ -229,8 +224,6 @@ const pythonDialTimeout = 3 * time.Second
 // 修复前该类故障只能等 http.Client 60s 总超时且在同一地址重试 4 次，
 // 前端"思考中"最长空等数分钟才收到 "Service temporarily unavailable"。
 const pythonResponseHeaderTimeout = 10 * time.Second
-
-
 
 // do 统一请求出口：记录成功/失败并更新熔断状态，支持重试
 // do 统一请求出口（同步 JSON/管理端点）：走 client（允许慢响应头）。
@@ -325,9 +318,6 @@ func (c *PythonClient) doWith(httpClient *http.Client, req *http.Request) (*http
 		defaultRetryConfig.MaxRetries+1, lastErr)
 }
 
-
-
-
 // PythonEvent is a single SSE event from the Python engine.
 type PythonEvent struct {
 	Type         string `json:"type"`
@@ -344,6 +334,29 @@ type PythonEvent struct {
 	Model        string `json:"model,omitempty"`
 	Message      string `json:"message,omitempty"`
 
+	// Options 是 `ask_user` 的建议答案（仅 `type="ask"`）。
+	//
+	// 曾经漏声明：引擎发了、网关在这里把它丢了，前端 AskCard 于是永远只拿到一个空
+	// 选项列表 —— 用户只能自己手打，而模型特意给出的候选项一个都没显示。
+	Options []string `json:"options,omitempty"`
+
+	// Budget / Context / Cache 是 `done` 事件上的三份快照：
+	// 预算五轴用量、上下文占用，以及前缀缓存诊断。
+	//
+	// 三者此前都**不在**网关声明里，于是同一类故障以三种面貌出现：预算面板永远空着
+	// （用户只到 `budget_exceeded` 才知道有上限）、上下文占用条不动、缓存命中率掉了
+	// 却查不出"是不是稳定前缀被打断"。用 `map[string]any` 转发而不是逐字段建模：
+	// 这些快照的字段集合由引擎决定并会演进，网关只负责**别弄丢**。
+	Budget  map[string]any `json:"budget,omitempty"`
+	Context map[string]any `json:"context,omitempty"`
+	Cache   map[string]any `json:"cache,omitempty"`
+
+	// DurationMS 是这一步的耗时（`trace_span` 等事件带）。
+	//
+	// 前端的 `turn_stats` 汇总它来显示本轮耗时；漏声明时该字段恒为 0，
+	// `mergeTurnStats` 的 `durationMs > 0` 守卫就直接跳过，耗时长年不显示。
+	DurationMS int `json:"duration_ms,omitempty"`
+
 	// Revision：任务清单的修订号（仅 `todo_updated` 事件带，见 runtime_types.AgentEvent）。
 	//
 	// **必须在网关侧声明**：submit_handler 转发时是 `Data: evt`（本结构体），
@@ -356,12 +369,12 @@ type PythonEvent struct {
 	// ── 子 Agent 进度事件（type 前缀 "subagent."，见 docs/subagent-design.md §4.2）──
 	// 这些字段让前端能按 run_id 建树、并按 depth/parent_run_id 还原层级；
 	// 主对话事件不带这些字段（omitempty 保证不污染既有帧）。
-	RunID       string         `json:"run_id,omitempty"`
-	ParentRunID string         `json:"parent_run_id,omitempty"`
-	Depth       int            `json:"depth,omitempty"`
-	Profile     string         `json:"profile,omitempty"`
-	Status      string         `json:"status,omitempty"`
-	Truncated   bool           `json:"truncated,omitempty"`
+	RunID       string `json:"run_id,omitempty"`
+	ParentRunID string `json:"parent_run_id,omitempty"`
+	Depth       int    `json:"depth,omitempty"`
+	Profile     string `json:"profile,omitempty"`
+	Status      string `json:"status,omitempty"`
+	Truncated   bool   `json:"truncated,omitempty"`
 	// Usage 是子 Agent 自己那一段的用量（`{input_tokens, output_tokens, steps}`），
 	// 只用于展示。**故意不喂给 usageTotals**：子 Agent 的 token 只记进引擎侧的
 	// 任务线账（subagent_runs + run_lineage_ledger，由线账闸门约束），不进租户额度池。

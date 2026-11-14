@@ -188,3 +188,101 @@ func TestSameInputSameResult(t *testing.T) {
 		t.Fatalf("Evaluate must be deterministic")
 	}
 }
+
+// TestBudgetExceededKeepsTheChainAlive 守住"段级额度用完不等于失败"。
+//
+// 曾经 `budget_exceeded:<轴>` 与引擎硬错误同形（都是 error 事件）⇒ 判 Failed ⇒
+// `Advance` 置 GoalBlocked 并停止续跑。于是一次典型的代码任务在 tokens 用尽时
+// **整条长线任务终结**，用户看到的是"做一半就停"，而且没有任何机制会把它接上。
+// 正确语义：这一段停在这里，下一段接着跑。
+func TestBudgetExceededKeepsTheChainAlive(t *testing.T) {
+	rep := Evaluate(nil, Signals{
+		HasError:     true,
+		ErrorMessage: "budget_exceeded:tokens",
+		BudgetAxis:   "tokens",
+		HasAnswer:    false,
+	})
+	if rep.Outcome != Incomplete {
+		t.Fatalf("a budget wall must be incomplete (continue), not %s", rep.Outcome)
+	}
+	if rep.BudgetAxis != "tokens" {
+		t.Fatalf("the hit axis must survive into the report, got %q", rep.BudgetAxis)
+	}
+	// 撞墙时不能同时派生 no-error：那会让同一件事被判两次，且其中一次是失败。
+	for _, f := range rep.Findings {
+		if f.Obligation.ID == "no-error" {
+			t.Fatalf("a budget wall must not derive the no-error obligation: %+v", f)
+		}
+	}
+}
+
+// TestBudgetExceededStillOwedAnswer：撞墙的那一轮通常没有正文，这条仍然欠着 ——
+// 于是 Incomplete 有两条独立理由，不依赖"只有 budget 一条"的偶然成立。
+func TestBudgetExceededStillOwedAnswer(t *testing.T) {
+	rep := Evaluate(nil, Signals{BudgetAxis: "steps"})
+	owed := map[string]bool{}
+	for _, f := range rep.Findings {
+		if f.Verdict == Owed {
+			owed[f.Obligation.ID] = true
+		}
+	}
+	if !owed["budget-continuation"] || !owed["answered"] {
+		t.Fatalf("want both budget-continuation and answered owed, got %+v", rep.Findings)
+	}
+}
+
+// TestOpenChecklistItemKeepsTheTurnIncomplete 是这次修复的核心那条：
+// "没有错误 + 有正文"不再等于完成。
+func TestOpenChecklistItemKeepsTheTurnIncomplete(t *testing.T) {
+	rep := Evaluate(nil, Signals{HasAnswer: true, Pending: []string{"跑测试", "写文档"}})
+	if rep.Outcome != Incomplete {
+		t.Fatalf("an open checklist must keep the turn incomplete, got %s", rep.Outcome)
+	}
+	if len(rep.Pending) != 2 {
+		t.Fatalf("the pending items must survive into the report, got %v", rep.Pending)
+	}
+	var found bool
+	for _, f := range rep.Findings {
+		if f.Obligation.ID == "goal-progress" {
+			found = true
+			if f.Verdict != Owed {
+				t.Fatalf("goal-progress must be owed while items remain, got %s", f.Verdict)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected a goal-progress obligation; findings=%+v", rep.Findings)
+	}
+}
+
+// TestFinishedChecklistDoesNotByItselfComplete：清单全 green 只是**撤掉**额外义务，
+// 不能把回合抬成完成 —— 判定仍由 no-error / answered / verified-changes 支撑。
+func TestFinishedChecklistDoesNotByItselfComplete(t *testing.T) {
+	// 有正文 + 无未完成项 ⇒ 完成（这是正常路径，清单不该变成噪声）。
+	if rep := Evaluate(nil, Signals{HasAnswer: true, Pending: nil}); rep.Outcome != Completed {
+		t.Fatalf("an empty pending set must not block completion, got %s", rep.Outcome)
+	}
+	// 没有正文时，清单全 green 也救不回来。
+	if rep := Evaluate(nil, Signals{HasAnswer: false, Pending: nil}); rep.Outcome != Incomplete {
+		t.Fatalf("a finished checklist must not substitute for the answer, got %s", rep.Outcome)
+	}
+	// 有未验证改动时同理：清单全 green 不能替代验证。
+	c := evidence.NewCollector()
+	c.ObserveToolCall("1", "edit_file", `{"path":"a.go"}`)
+	c.ObserveToolResult("1", "", `{"ok":true}`)
+	if rep := Evaluate(c, Signals{HasAnswer: true}); rep.Outcome != Incomplete {
+		t.Fatalf("a finished checklist must not substitute for verification, got %s", rep.Outcome)
+	}
+}
+
+// TestPendingSurvivesTruncation：被 deadline 掐断时未完成项也要带出去 ——
+// 否则续跑指令只能说"超时了"，说不出"还剩哪几件事"。
+func TestPendingSurvivesTruncation(t *testing.T) {
+	rep := Evaluate(nil, Signals{Truncated: true, Pending: []string{"跑测试"}})
+	if rep.Outcome != Incomplete {
+		t.Fatalf("want incomplete, got %s", rep.Outcome)
+	}
+	if len(rep.Pending) != 1 || rep.Pending[0] != "跑测试" {
+		t.Fatalf("pending items must survive truncation, got %v", rep.Pending)
+	}
+}

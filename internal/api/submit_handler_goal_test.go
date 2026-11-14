@@ -31,6 +31,57 @@ func TestGoalEnforcePromptHandlesNil(t *testing.T) {
 	}
 }
 
+// TestGoalEnforcePromptFeedsTheBudgetWallBack 是回灌层的核心断言。
+//
+// 撞墙这一轮如果只说"继续完成"，模型会把段级额度用完当成任务失败（道歉、重读、
+// 重做），下一段照样烧完就停。必须明确告诉它：这是额度用完、不是失败，已完成的
+// 都保存了，而新的一段额度同样有限 —— 于是它才会先收尾而不是先探索。
+func TestGoalEnforcePromptFeedsTheBudgetWallBack(t *testing.T) {
+	rep := &agentgoal.Report{
+		Outcome:    agentgoal.Incomplete,
+		BudgetAxis: "tokens",
+		Reasons:    []string{"the segment stopped on the tokens budget"},
+		Pending:    []string{"跑测试", "更新文档"},
+	}
+	g := agentgoal.NewGoal("g1", "s1", "long task", 0)
+	p := goalEnforcePromptFor(g, rep)
+
+	for _, want := range []string{
+		"tokens", // 点名撞的哪一档
+		"不是失败",   // 明确否定"任务失败了"
+		"跑测试",    // 把模型自己写的未完成项点出来
+		"更新文档",   // 全部列出，不许只提一条
+		"还剩",     // 剩下的轮次可见
+		"系统自动续跑", // 不伪装成用户新提问
+	} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("continuation prompt must carry %q; got:\n%s", want, p)
+		}
+	}
+}
+
+// TestGoalEnforcePromptOmitsEmptySections：没有撞墙、没有清单时不许出现空标题 ——
+// 空的"未满足项："会让模型以为那一节的内容丢了，反而开始自查整个任务。
+func TestGoalEnforcePromptOmitsEmptySections(t *testing.T) {
+	p := goalEnforcePromptFor(agentgoal.NewGoal("g1", "s1", "d", 0), &agentgoal.Report{Outcome: agentgoal.Incomplete})
+	for _, unwanted := range []string{"未满足项", "还没完成的是", "额度用完"} {
+		if strings.Contains(p, unwanted) {
+			t.Fatalf("prompt must omit the %q section when it has nothing to say; got:\n%s", unwanted, p)
+		}
+	}
+}
+
+// TestGoalEnforcePromptStopsCountingForTerminalGoals：目标已终结（blocked/completed）
+// 时不再报"还剩几轮"——那时不会再续跑，报数字只会误导排期。
+func TestGoalEnforcePromptStopsCountingForTerminalGoals(t *testing.T) {
+	g := agentgoal.NewGoal("g1", "s1", "d", 0)
+	g.Status = agentgoal.GoalBlocked
+	p := goalEnforcePromptFor(g, &agentgoal.Report{Outcome: agentgoal.Incomplete})
+	if strings.Contains(p, "还剩") {
+		t.Fatalf("a terminal goal must not advertise remaining rounds; got:\n%s", p)
+	}
+}
+
 func TestWithGoalEnforceDoesNotMutateInput(t *testing.T) {
 	in := map[string]interface{}{"kb_id": "kb1"}
 	out := withGoalEnforce(in)
@@ -158,5 +209,62 @@ func TestTodoEventDrivesTheSubGoalBoundary(t *testing.T) {
 	}
 	if g.TotalRounds != 19 {
 		t.Fatalf("the task-level total must survive a sub-goal change, got %d", g.TotalRounds)
+	}
+}
+
+// TestBudgetAxisOfSeparatesWallsFromHardFailures 守住"撞墙 ≠ 硬失败"的识别。
+//
+// 识别错了的代价不对称：把硬失败认成撞墙，续跑只会在同一堵墙上重复烧钱；
+// 把撞墙认成硬失败，整条长线任务就此终结 —— 而后者正是这次要修的那个 bug。
+func TestBudgetAxisOfSeparatesWallsFromHardFailures(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"budget_exceeded:tokens", "tokens"},
+		{"budget_exceeded:steps", "steps"},
+		{"budget_exceeded:cost", "cost"},
+		{"  budget_exceeded:wall  ", "wall"},
+		{"budget_exceeded:line_tokens", "line_tokens"},
+		// 尾部夹带说明：取轴名，不因多几个字就退化成硬失败。
+		{"budget_exceeded:tokens (segment 3)", "tokens"},
+		{"budget_exceeded:steps。请提额", "steps"},
+		// 不是预算撞墙：一律返回空串（照旧按硬失败处理）。
+		{"", ""},
+		{"boom", ""},
+		{"budget_exceeded", ""},
+		{"budget_exceeded:", ""},
+		{"error: budget_exceeded:tokens", ""}, // 必须在前缀位置，不做子串匹配
+	}
+	for _, c := range cases {
+		if got := budgetAxisOf(c.in); got != c.want {
+			t.Fatalf("budgetAxisOf(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestPrevTurnItemsKeepTheJudgementHonest 是这次修复的主线：
+//
+// 续跑轮通常不再重写清单（清单已经在往来历史里）。如果每轮只从**当轮**事件读，
+// 第二轮就没有清单 ⇒ 判定层看不见未完成项 ⇒ "没有错误 + 有正文"又等于完成 ⇒
+// 长任务在第一轮的续跑之后就静默收工。这里断言上一轮的清单能被沿用。
+func TestPrevTurnItemsKeepTheJudgementHonest(t *testing.T) {
+	prev, ok := parseTodoItems(`[{"content":"改配置","status":"completed"},{"content":"跑测试","status":"pending"}]`)
+	if !ok {
+		t.Fatalf("checklist must parse")
+	}
+	pending := agentgoal.PendingOf(prev)
+	if len(pending) != 1 || pending[0] != "跑测试" {
+		t.Fatalf("only the open item may count, got %v", pending)
+	}
+	// 只看清单仍不足以判定：还必须带上"这一轮有正文、没有错误、没有改动"。
+	rep := agentgoal.Evaluate(nil, agentgoal.Signals{HasAnswer: true, Pending: pending})
+	if rep.Outcome != agentgoal.Incomplete {
+		t.Fatalf("the carried-over checklist must keep the turn incomplete, got %s", rep.Outcome)
+	}
+	// 清单全部完成之后，同样的信号才是 Completed（完成由其余证据支撑）。
+	rep = agentgoal.Evaluate(nil, agentgoal.Signals{HasAnswer: true, Pending: nil})
+	if rep.Outcome != agentgoal.Completed {
+		t.Fatalf("a finished checklist must not block completion, got %s", rep.Outcome)
 	}
 }

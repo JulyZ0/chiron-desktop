@@ -77,6 +77,7 @@ from app.agent.compaction import (
 from app.agent.compaction import (
     _truncate_tool_result as _truncate_tool_result,
 )
+from app.agent.goal_context import render_goal_context
 from app.agent.harness_profile import apply_harness_suffix
 from app.agent.modes import CORE_TOOL_NAMES, AgentMode, ModeConfig, get_mode_config
 from app.agent.runtime_types import (  # noqa: F401 — 再导出：既有 import 路径不变
@@ -396,6 +397,14 @@ def _apply_system_prefix(
         prefix.append(
             _normalize_msg(role="system", content=base_prompt, cache_breakpoint=True)
         )
+    # 宿主续跑段的目标上下文（`workbench_context["goal_enforce"]`）。与记忆同款处置 ——
+    # **独立成 system 消息**、位置在稳定前缀之后：续跑摘要每段都不同，拼进 `system_prompt`
+    # 会让逐字稳定前缀的缓存整段失效。它排在记忆**之前**，因为"这一段是宿主接上的"
+    # 是解读后面所有上下文的框架（先知道自己在续跑，再读记忆与汇报）。
+    # 非续跑段渲染空串 ⇒ 零行为变化。
+    goal_context = render_goal_context((task.workbench_context or {}).get("goal_enforce"))
+    if goal_context:
+        prefix.append(_normalize_msg(role="system", content=goal_context))
     if task.memory_context:
         prefix.append(_normalize_msg(role="system", content=task.memory_context))
     # 批 G+ 批次 4：hook 的**上下文注入**。与记忆同样**独立成 system 消息**（不拼进
@@ -427,12 +436,19 @@ def _resume_task_meta(task: AgentTask) -> dict[str, Any]:
 
     **工具面不放**：它由 `mode` 决定（`task.tools` 为空时走 mode 的 core tools），把整份
     schema 塞进快照只会让快照膨胀，收益为零。
+
+    `workbench_context` 里的 `goal_enforce` **剔除**：它是"这一段是宿主接上的"这个
+    **一次性**事实（轮次 / 撞墙轴 / 未完成数都只对当时那一段成立），与 `report_context`
+    同款处置。冻进快照的话，续跑恢复出来的第一轮会带着**上一段**的轮次与欠项数继续
+    自称"续跑段"，把已被网关重新下发的新摘要盖掉。
     """
+    workbench_context = dict(task.workbench_context or {})
+    workbench_context.pop("goal_enforce", None)
     return {
         "user_id": task.user_id or "",
         "system_prompt": task.system_prompt or "",
         "llm_config": dict(task.llm_config or {}),
-        "workbench_context": dict(task.workbench_context or {}),
+        "workbench_context": workbench_context,
         "max_turns": int(task.max_turns or 0),
         "subagent_depth": int(task.subagent_depth or 0),
     }

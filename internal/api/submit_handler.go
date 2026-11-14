@@ -347,6 +347,23 @@ const GoalEnforceKey = "goal_enforce"
 // 前端据此渲染成系统卡片，模型也不会把它当真人输入。
 const GoalEnforceSource = "goal_enforce"
 
+// goalEnforceContext 是续跑轮随 `workbench_context` 下发的**结构化**上下文。
+//
+// 为什么不只传一个 `true`：引擎需要知道"这是同一件事的第几段、因为哪一档额度、
+// 还剩几件事"。有了它，引擎才能在 system 段（优先级高于 user 消息）用一句话定性
+// "本轮是宿主自动续跑"，而不是让模型自己去猜对话里那条指令是谁写的。
+//
+// 详细欠项仍然在 `content` 里（那是模型逐条执行的清单）；这里只放**摘要**，
+// 避免同一段文字在两个位置重复出现、白占上下文。
+type goalEnforceContext struct {
+	// Round 是本任务已跑过的段数（1 = 第一个续跑段）。
+	Round int `json:"round"`
+	// BudgetAxis 是上一段撞墙的额度轴（空 = 上一段是"没做完"而不是"额度用完"）。
+	BudgetAxis string `json:"budget_axis,omitempty"`
+	// Pending 是任务清单里尚未完成的条目数。
+	Pending int `json:"pending,omitempty"`
+}
+
 // goalKeyPrefix 是目标状态在 Redis 里的键前缀（会话级，跨轮持久）。
 const goalKeyPrefix = "goal:"
 
@@ -378,29 +395,39 @@ func (h *SubmitHandler) HandleSubmit(ctx context.Context, userID, sessionID, con
 	// 附件只随**用户那条消息**走（首轮）。续跑轮是系统指令（goalEnforcePrompt），
 	// 再带一次附件只会让模型以为用户又发了一遍同样的文件。
 	atts := attachments
-	// 首轮开始前先按**已有清单**绑定小目标（跨轮恢复时 goal 里已带 SubGoal，
-	// 这里不动它 —— 只有指纹真的变了才重置计数，见 agentgoal.BeginRound）。
 	for {
-		report, subGoal := h.submitOnce(ctx, userID, sessionID, msg, engineMsg, llmConfig, wb, atts)
+		// 把**已有清单**带进这一轮：续跑轮通常不再重写清单（清单已经在往来历史里），
+		// 若每轮只从当轮事件读，判定层从第二轮起就看不见未完成项。
+		res := h.submitOnce(ctx, userID, sessionID, msg, engineMsg, llmConfig, wb, atts, goal.Items)
 		atts = nil
 		engineMsg = ""
-		if report == nil {
+		if res == nil || res.Report == nil {
 			// 引擎不可达 / 去重命中：目标**不推进**（否则会把"没跑起来"误判成"没完成"，
 			// 白烧一轮续跑）。原样结束。
 			return
 		}
 		// 小目标边界：本轮清单推进到了新的一项，就把单小目标的轮数归零 ——
 		// 20 轮拦的是"这一件事卡住"，不是整条任务（见 agentgoal.DefaultGoalRounds）。
-		*goal = agentgoal.BeginRound(*goal, subGoal)
-		advanced, cont := agentgoal.Advance(*goal, *report, time.Now().Unix())
+		// SetItems 同时更新"清单"与"指纹"，两者不能分开：分开会出现"轮数按新清单算、
+		// 判定还看旧清单"的错位。本轮没发 `todo_updated` 时 items 为空 ⇒ 保留旧清单。
+		*goal = goal.SetItems(res.Items)
+		advanced, cont := agentgoal.Advance(*goal, *res.Report, time.Now().Unix())
 		*goal = advanced
 		h.saveGoal(ctx, *goal)
 		if !cont || ctx.Err() != nil {
 			return
 		}
 		// 续跑：把上一轮欠下的义务作为**系统指令**注入（带来源标记，不伪装成用户提问）。
-		msg = goalEnforcePrompt(report)
-		wb = withGoalEnforce(workbenchCtx)
+		// 带上 `*goal` 是为了让指令能说清"还剩多少轮额度"——预算对模型可见，它才会排优先级。
+		msg = goalEnforcePromptFor(*goal, res.Report)
+		// 同时下发**结构化摘要**：引擎据此在 system 段定性"这一段是宿主接上的"，
+		// 而不是让模型从对话里猜那条指令是谁写的（见 python-engine/app/agent/goal_context.py）。
+		// `Round` 用已跑完的段数：第一段结束后 TotalRounds=1，接着跑的就是第 1 个续跑段。
+		wb = withGoalEnforceContext(workbenchCtx, goalEnforceContext{
+			Round:      goal.TotalRounds,
+			BudgetAxis: res.Report.BudgetAxis,
+			Pending:    len(res.Report.Pending),
+		})
 	}
 }
 
@@ -441,12 +468,26 @@ func (h *SubmitHandler) saveGoal(ctx context.Context, g agentgoal.Goal) {
 	}
 }
 
+// turnResult 是**一轮**提交的产物：判定结论 + 这一轮看到的任务清单。
+//
+// 为什么要把清单一起返回：续跑链在两轮之间只经过 `HandleSubmit`，而 `Goal` 是它
+// 唯一的跨轮载体。清单必须跟着结论一起出去，才能被写进 `Goal.Items`，让下一轮
+// 的判定仍然看得见"还剩哪几件事"——否则从第二轮起就退回"没有错误 + 有正文 = 完成"。
+type turnResult struct {
+	Report *agentgoal.Report
+	// Items 是本轮 `todo_updated` 给出的清单（未解析/未发布时为空）。
+	Items []agentgoal.SubGoalItem
+}
+
 // submitOnce 是**一轮**提交：把请求代理到 Python 引擎并流式转发 SSE，
 // 结束时用 host 证据判定本轮的完成情况，并返回该判定。
 //
 // workbenchCtx 是前端组装的工作台上下文（kb_id / agent / skill_names / workflow_id），
 // 透传给引擎消费 —— 网关不再丢弃它。
-func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content, engineContent string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}) (*agentgoal.Report, string) {
+//
+// priorItems 是**上一轮留下的清单**。本轮引擎没发 `todo_updated` 时（续跑轮通常
+// 不再重写清单），判定仍要按它算未完成项 —— 详见 agentgoal.Goal.Items 的注释。
+func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content, engineContent string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}, priorItems []agentgoal.SubGoalItem) *turnResult {
 	// 单轮上限来自 `AGENT_SUBMIT_TIMEOUT`（见 turnTimeout）。这里**不再**写死
 	// `DefaultAgentTimeout`：那个常量只是兜底，写死它会让配置项对外层 ctx 生效、
 	// 对真正的单轮无效，长回合依然在 300s 被销毁现场。
@@ -500,7 +541,7 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 				slog.Info("submit deduplicated (already processing)",
 					"session", sessionID, "client_msg_id", clientMsgID)
 				// 这条消息已在处理中（同一次提交的重试）：直接结束，不再触发引擎。
-				return nil, ""
+				return nil
 			}
 			slog.Warn("submit dedup unavailable, proceeding", "error", err)
 		}
@@ -681,7 +722,7 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		}
 		h.eventHub.Publish(broadcast.Event{Type: "text", SessionID: sessionID, Data: map[string]string{"content": "Service temporarily unavailable. Please try again."}})
 		h.eventHub.Publish(broadcast.Event{Type: "turn_done", SessionID: sessionID, Data: map[string]string{"session_id": sessionID}})
-		return nil, ""
+		return nil
 	}
 
 	var finalContent string
@@ -693,10 +734,13 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	turnToolCallIDs := []string{} // S 修复：messages.tool_calls 列只存 tool_call id 集合（内容在 tool_calls 表）
 	// P1：host 证据采集器 —— 本轮所有工具事件都喂给它，收尾时据此判定完成情况。
 	ev := evidence.NewCollector()
-	// 本轮任务清单的"当前小目标"指纹（见 agentgoal.SubGoalOf）：续跑预算按**小目标**
-	// 计数，所以调用方需要知道这一轮结束时清单推进到了哪一项。空串表示本轮没有清单
-	// 事件（模型没建清单 / 引擎未发 todo_updated），此时不构成新的边界。
-	subGoal := ""
+	// 本轮任务清单（模型通过 `todo_write` 写的）。判定层靠它确认"还有几件事没做完"，
+	// 指纹靠它推出小目标边界。空 = 本轮引擎没发 `todo_updated`（续跑轮通常如此），
+	// 此时沿用 `priorItems` —— 否则清单只在第一轮可见，第二轮起判定就退回
+	// "没有错误 + 有正文 = 完成"。
+	var items []agentgoal.SubGoalItem
+	// 段级预算撞墙的轴名（`budget_exceeded:<轴>`）。空 = 这一轮没撞墙。
+	budgetAxis := ""
 
 	// P 性能：text 事件 50ms 合帧转发（公网多租户下 SSE 帧数减半，减少网关/前端处理开销）
 	const textFrameInterval = 50 * time.Millisecond
@@ -820,19 +864,26 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 				cancelStore()
 			}
 		case "todo_updated":
-			// 任务清单：续跑预算的**层级依据**。轮数上限按"单个小目标"计（见
-			// agentgoal.DefaultGoalRounds），所以网关必须自己从清单推出当前小目标，
-			// 而不是等到 20 轮之后才发现整条任务被拦住了。
+			// 任务清单：既是判定层的"还剩几件事"，也是续跑预算的**层级依据**。
+			// 轮数上限按"单个小目标"计（见 agentgoal.DefaultGoalRounds），所以网关必须
+			// 自己从清单推出当前小目标，而不是等到 20 轮之后才发现整条任务被拦住了。
 			//
 			// 载荷是引擎 `runtime.py` 直接 `json.dumps(tool_result["todos"])` 的数组；
-			// 解析失败只影响"预算能不能按小目标重置"（退化为整条任务算一个目标），
-			// 绝不能让它中断这一轮 —— 所以这里 fail-soft，不记 streamErr。
-			if items, ok := parseTodoItems(evt.Content); ok {
-				subGoal = agentgoal.SubGoalOf(items)
+			// 解析失败只影响"预算能不能按小目标重置"与"判定能不能看见未完成项"
+			// （都退化为"没有清单"），绝不能让它中断这一轮 —— 所以这里 fail-soft，
+			// 不记 streamErr。
+			if parsed, ok := parseTodoItems(evt.Content); ok {
+				items = parsed
 			}
 		case "error":
-			// 引擎侧异常：记录原因，回合终态判为 failed（000.md 第 14 条：失败不再静默）
+			// 引擎侧异常：记录原因，回合终态判为 failed（000.md 第 14 条：失败不再静默）。
+			//
+			// 但 `budget_exceeded:<轴>` 不是硬失败：它说明**这一段**额度用完了，现场已
+			// 保存，下一段接着跑就能继续。此前它与真正的引擎错误同形 ⇒ 判定 Failed ⇒
+			// GoalBlocked ⇒ 续跑链硬停，长任务就此断在半路。这里把它单独识别出来交给
+			// 判定层（见 agentgoal.Signals.BudgetAxis）。
 			streamErr = evt.Content
+			budgetAxis = budgetAxisOf(evt.Content)
 		}
 		usage = usage.withEvent(evt.Type, evt.InputTokens, evt.OutputTokens, evt.CachedTokens)
 		// 模型名只在 done 事件里带：取最后一个非空值（一次提交可能跨多轮 LLM 调用）
@@ -982,12 +1033,23 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	// `ctx` 在这一行仍是本轮的（submitOnce 内的 WithTimeout），所以这里读到的
 	// DeadlineExceeded 就是单轮预算耗尽，不是链级预算耗尽。
 	turnTruncated := ctx.Err() == context.DeadlineExceeded
+	// 本轮没发 `todo_updated`（续跑轮通常如此）⇒ 沿用上一轮留下的清单。清单必须
+	// 跨轮活下去：判定层靠它确认"还有几件事没做完"，一旦丢了，从第二轮起就又回到
+	// "没有错误 + 有正文 = 完成"。
+	if len(items) == 0 {
+		items = priorItems
+	}
 	goalReport := agentgoal.Evaluate(ev, agentgoal.Signals{
 		HasError:     streamErr != "",
 		ErrorMessage: streamErr,
 		HasAnswer:    strings.TrimSpace(stripThinkingBlocks(finalContent)) != "",
 		Cancelled:    ctx.Err() != nil && !turnTruncated,
 		Truncated:    turnTruncated,
+		// 撞墙的轴：判定层据此把"这一段用完额度"与"引擎硬失败"分开处理。
+		BudgetAxis: budgetAxis,
+		// 清单里还没做完的事：判定层据此把"清单没做完"从 Completed 降为 Incomplete。
+		// 只有这一条能让"没有错误 + 有正文"不再等于完成。
+		Pending: agentgoal.PendingOf(items),
 	})
 	if b, err := json.Marshal(goalReport); err == nil {
 		h.eventHub.Publish(broadcast.Event{
@@ -1008,7 +1070,28 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	}
 
 	h.eventHub.Publish(broadcast.Event{Type: "turn_done", SessionID: sessionID, Data: map[string]string{"session_id": sessionID}})
-	return &goalReport, subGoal
+	return &turnResult{Report: &goalReport, Items: items}
+}
+
+// budgetAxisOf 从引擎的 error 正文里取出撞墙的轴名（`budget_exceeded:<轴>`）；不是
+// 预算撞墙则返回空串。
+//
+// 调用方据此把"这一段额度用完"与"引擎硬失败"分开：前者现场已保存、下一段能接上，
+// 后者要继续就得人介入。识别必须是**前缀 + 非空轴名**：正文可能夹带其它信息（引擎
+// 会把 `budget_exceeded:<轴>` 原样作为 error 内容发出），用 `strings.Cut` 取第一段
+// 而不是整串判等，避免因为尾部多了标点就把它误判成硬失败。
+func budgetAxisOf(errContent string) string {
+	const marker = "budget_exceeded:"
+	text := strings.TrimSpace(errContent)
+	if !strings.HasPrefix(text, marker) {
+		return ""
+	}
+	axis := text[len(marker):]
+	// 只取到第一个空白/标点为止：轴名本身是 `steps`/`turns`/`tokens`/`wall`/`cost`。
+	if i := strings.IndexAny(axis, " \t\r\n,;。，；"); i >= 0 {
+		axis = axis[:i]
+	}
+	return strings.TrimSpace(axis)
 }
 
 // parseTodoItems 把 `todo_updated` 事件的载荷解析成小目标判定需要的两项。
@@ -1042,28 +1125,95 @@ func parseTodoItems(raw string) ([]agentgoal.SubGoalItem, bool) {
 }
 
 // goalEnforcePrompt 把上一轮欠下的义务转成一条**系统续跑指令**。
+//
+// 它是"回灌层"的唯一出口：判定层算出"欠什么"（Report），这里把它变成模型下一段
+// 真正看得到的指令。只回灌结论、不回灌理由的话，模型拿到的是"继续完成"，却不知道
+// 该继续什么 —— 表现就是续跑轮里它照样写一句总结然后收工。
 func goalEnforcePrompt(prev *agentgoal.Report) string {
+	return goalEnforcePromptFor(agentgoal.Goal{}, prev)
+}
+
+// goalEnforcePromptFor 是带目标状态的完整版本：除"欠什么"之外，还告诉模型
+// **这一段为什么停**（预算轴）与**还剩多少机会**（轮次）。
+//
+// 为什么不把这些塞进 Report：Report 是"这一轮的判定"，Goal 是"这条任务的账本"。
+// 混在一起会让判定层的纯函数依赖预算计数器，而判定必须只看证据（同一个输入永远
+// 得到同一个结论）。两者在这里汇合，正合适。
+func goalEnforcePromptFor(g agentgoal.Goal, prev *agentgoal.Report) string {
 	var b strings.Builder
 	b.WriteString("继续完成上一轮未满足的义务 —— 这是系统自动续跑，不是用户的新提问。\n")
+
+	// 预算撞墙：必须说清"这不是失败"。不说的话，模型会把段级额度用完当成任务失败，
+	// 于是下一段开头先道歉、重读上下文、或者干脆重做已完成的部分 —— 白烧一段额度。
+	if prev != nil && prev.BudgetAxis != "" {
+		b.WriteString("\n本段是因为 **")
+		b.WriteString(prev.BudgetAxis)
+		b.WriteString("** 这一档额度用完而中止的，不是失败，也不是被取消。\n")
+		b.WriteString("已完成的改动和工具结果都已保存；续跑会继承已用额度，所以这一段的额度同样有限。\n")
+		b.WriteString("请在有限额度内**优先收尾**：先做能直接补上欠项的那几步，不要重做已完成的部分，也不要重读整个仓库。\n")
+	}
+
 	if prev != nil && len(prev.Reasons) > 0 {
-		b.WriteString("未满足项：\n")
+		b.WriteString("\n未满足项：\n")
 		for _, r := range prev.Reasons {
 			b.WriteString("- ")
 			b.WriteString(r)
 			b.WriteString("\n")
 		}
 	}
-	b.WriteString("请补上缺失的证据（例如对已改动运行验证命令并让它通过），然后给出简明结论。")
+
+	// 清单里尚未完成的条目：这是模型自己写下的计划，点名比"继续完成任务"具体得多。
+	if prev != nil && len(prev.Pending) > 0 {
+		b.WriteString("\n你的任务清单里还没完成的是：\n")
+		for _, p := range prev.Pending {
+			b.WriteString("- ")
+			b.WriteString(p)
+			b.WriteString("\n")
+		}
+		b.WriteString("推进这些条目时，每完成一条就把它的 `status` 改成 `completed`；全部完成才算这一轮做完。\n")
+	}
+
+	// 剩余机会：把预算从"看不见的天花板"变成模型能据此排优先级的信息。
+	if g.Status == agentgoal.GoalActive {
+		left := g.EffectiveMaxRounds() - g.RoundsUsed
+		if left < 0 {
+			left = 0
+		}
+		leftTotal := g.EffectiveMaxTotalRounds() - g.TotalRounds
+		if leftTotal < 0 {
+			leftTotal = 0
+		}
+		fmt.Fprintf(&b, "\n续跑预算：当前小目标还剩 %d 轮，这条任务总共还剩 %d 轮。\n", left, leftTotal)
+	}
+
+	b.WriteString("\n请补上缺失的证据（例如对已改动运行验证命令并让它通过），然后给出简明结论。")
 	return b.String()
 }
 
 // withGoalEnforce 在 workbenchCtx 上打续跑标记（不改动调用方传入的原 map）。
+//
+// 只打 `true` 标记：调用方（前端渲染 / 消息来源判定）只需要知道"这是续跑段"。
+// 要给引擎补充结构化摘要请用 withGoalEnforceContext。
 func withGoalEnforce(workbenchCtx map[string]interface{}) map[string]interface{} {
 	out := make(map[string]interface{}, len(workbenchCtx)+1)
 	for k, v := range workbenchCtx {
 		out[k] = v
 	}
 	out[GoalEnforceKey] = true
+	return out
+}
+
+// withGoalEnforceContext 在续跑标记之上附带**结构化摘要**（轮次 / 撞墙轴 / 未完成数）。
+//
+// 键名不变、值从 `true` 变成对象：引擎侧 `goal_context.render_goal_context` 两种都认
+// （`true` 表示"旧版只说了这是续跑段"），所以滚动升级期间新旧任一侧单独上线都不会破。
+// 前端与 `msgSource` 判定只看键**在不在**，不受值形状影响。
+func withGoalEnforceContext(workbenchCtx map[string]interface{}, ctx goalEnforceContext) map[string]interface{} {
+	out := make(map[string]interface{}, len(workbenchCtx)+1)
+	for k, v := range workbenchCtx {
+		out[k] = v
+	}
+	out[GoalEnforceKey] = ctx
 	return out
 }
 
