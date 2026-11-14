@@ -1,6 +1,9 @@
 package api
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // 引擎事件的**用量通道**：`done` 给**整轮累计**，`usage` 给**按次增量**（C3）。
 //
@@ -81,11 +84,134 @@ func (t usageTotals) settled() usageTotals {
 	if t.input > 0 || t.output > 0 || t.cached > 0 {
 		return usageTotals{input: t.input, output: t.output, cached: t.cached}
 	}
-	// 走到这里说明 `done` 没给任何 token —— 无论它是"给了 0"还是"根本没到"，
+	// 走到这里说明 `done` 没给任何 token —— 无论是"给了 0"还是"根本没到"，
 	// 增量之和都是唯一能拿到的量。
 	return usageTotals{
 		input:  t.fallbackInput,
 		output: t.fallbackOutput,
 		cached: t.fallbackCached,
 	}
+}
+
+// modelUsage 是一条**按模型**的用量明细。
+type modelUsage struct {
+	Model string `json:"model"`
+	usageTotals
+}
+
+// modelLedger 按模型归集**每次 LLM 调用**的增量（`usage` 事件的 `model` 字段）。
+//
+// ## 为什么必须按模型拆
+//
+// 一次提交可以跨多个模型：主模型 + fallback + 子 Agent 外层调用 + 摘要。而
+// `done` 只给**整轮合计**，不给归属。此前的做法是拿"最后一个非空模型名"去乘
+// 全部 token —— 于是整轮的花费被算成"全都在那个模型上跑"，单价差几倍时成本
+// 直接错几倍。这不是精度问题，是归因错误。
+//
+// `usage` 事件恰好带 `model`，所以按模型拆的原始数据一直都在，只是没人用。
+//
+// ## 为什么不改 usageTotals
+//
+// 给 `usageTotals` 加 map 字段会让它不可比较（`==` 编译失败），而它被
+// `withEvent` 的单测当成值类型断言（`got != usageTotals{}`）。归因是**另一个
+// 维度**，不该塞进被计费守卫钉住的那个类型里。
+type modelLedger struct {
+	entries map[string]usageTotals
+}
+
+// add 记录一次调用的增量。model 为空时归入"未知"档（键为空串）。
+func (l *modelLedger) add(model string, input, output, cached int) {
+	if input == 0 && output == 0 && cached == 0 {
+		return
+	}
+	if l.entries == nil {
+		l.entries = make(map[string]usageTotals)
+	}
+	key := strings.TrimSpace(model)
+	cur := l.entries[key]
+	if input > 0 {
+		cur.input += input
+	}
+	if output > 0 {
+		cur.output += output
+	}
+	if cached > 0 {
+		cur.cached += cached
+	}
+	l.entries[key] = cur
+}
+
+// settle 把按模型归集的增量对齐到**整轮入账量** total。
+//
+// 返回的每一行都要写进 `usage_events`，各行之和**恒等于** total —— 归因只改变
+// 粒度，绝不改变总额。这条不变式是这里全部逻辑的理由：总额一旦被归因逻辑改动，
+// 就会出现"明细加起来对不上这一轮的扣费"。
+//
+// 三种情形：
+//
+//   - 没有增量（旧引擎 / 全零）：只能给一行，模型名用 fallbackModel。此时归因
+//     退化为旧行为，但总额仍取自 `settled()`，不会漏计。
+//   - 增量合计与 total 一致（正常路径）：逐模型返回，成本可按各自单价精确折算。
+//   - 不一致：`done` 里有增量没覆盖到的部分（例如某次调用没发 `usage`）。把差额
+//     并到 fallbackModel 那一行 —— 差额是真实发生过的用量，只能记在主模型名下。
+//     若差额为负（增量反而多于整轮合计，理论上不该出现），说明两份数据有一份
+//     不可信，整轮退回单行，只保证总额正确。
+func (l *modelLedger) settle(total usageTotals, fallbackModel string) []modelUsage {
+	sum := usageTotals{}
+	for _, e := range l.entries {
+		sum.input += e.input
+		sum.output += e.output
+		sum.cached += e.cached
+	}
+
+	keys := make([]string, 0, len(l.entries))
+	for k := range l.entries {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // 输出顺序稳定，便于对账与快照测试
+
+	fallback := strings.TrimSpace(fallbackModel)
+
+	if len(keys) == 0 {
+		if total.input == 0 && total.output == 0 && total.cached == 0 {
+			return nil // 这一轮确实没有任何用量，不写空行
+		}
+		return []modelUsage{{Model: fallback, usageTotals: total}}
+	}
+
+	gap := usageTotals{
+		input:  total.input - sum.input,
+		output: total.output - sum.output,
+		cached: total.cached - sum.cached,
+	}
+	if gap.input < 0 || gap.output < 0 || gap.cached < 0 {
+		// 增量多于整轮合计：两份数据打架，不信归因，只保总额。
+		return []modelUsage{{Model: fallback, usageTotals: total}}
+	}
+
+	out := make([]modelUsage, 0, len(keys)+1)
+	for _, k := range keys {
+		out = append(out, modelUsage{Model: k, usageTotals: l.entries[k]})
+	}
+	if gap.input > 0 || gap.output > 0 || gap.cached > 0 {
+		merged := false
+		for i := range out {
+			if out[i].Model == fallback {
+				out[i].input += gap.input
+				out[i].output += gap.output
+				out[i].cached += gap.cached
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			// 空模型名 + 差额：明确标出"这部分用量不知道是哪个模型"，
+			// 而不是假装它属于某个具体模型。
+			out = append(out, modelUsage{
+				Model:       fallback,
+				usageTotals: gap,
+			})
+		}
+	}
+	return out
 }

@@ -80,6 +80,23 @@ def get_project() -> str:
     return str(get_tool_context("project", ""))
 
 
+def get_plugin_names() -> list[str]:
+    """本次对话选中的插件名（MCP server 名）；未选时为**空列表**。
+
+    空列表的语义是"不限制"，不是"一个都不许" —— 用户没在对话里挑插件时，全部已连接
+    的插件都可用；只有明确挑过，才收窄到这几个。
+
+    为什么工具层需要它：MCP / 插件工具是**隐藏来源**，不进模型可见的工具清单，
+    只能经 `use_capability` 代理调用。于是 runtime 里那句
+    `_restrict_tools_to_plugins(...)` 对它们完全无效（它筛的是可见清单，而它们
+    压根不在里面），代理层若也不读这个选择，用户在对话里挑插件就等于没挑。
+    """
+    raw = get_tool_context("plugin_names", ())
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
 def get_gateway() -> Any:
     """当前运行的 GatewayRouter 引用（子 agent 委派需要）。"""
     return get_tool_context("gateway", None)

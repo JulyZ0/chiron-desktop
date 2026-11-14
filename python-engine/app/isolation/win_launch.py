@@ -24,6 +24,7 @@ import ctypes
 import ctypes.wintypes as wt
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -46,6 +47,13 @@ WAIT_OBJECT_0 = 0
 STILL_ACTIVE = 259
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
+#: `STARTUPINFOEXW` 的标志位。用 attribute list 就必须带它，否则 `lpAttributeList`
+#: 被内核忽略 —— 表现是"进程起来了，但完全不在 AppContainer 里跑"，比直接失败更糟。
+EXTENDED_STARTUPINFO_PRESENT = 0x0008_0000
+
+#: `UpdateProcThreadAttribute` 的 attribute id：包 SID 与能力集。
+PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES = 0x0002_0009
+
 #: 桌面完整访问权限
 DESKTOP_ALL_ACCESS = 0x000F_01FF
 READ_CONTROL = 0x0002_0000
@@ -61,6 +69,34 @@ class _SECURITY_ATTRIBUTES(ctypes.Structure):  # noqa: N801 — 沿用 Windows S
     ]
 
 
+class _STARTUPINFOEXW(ctypes.Structure):  # noqa: N801 — 沿用 Windows SDK 原名
+    """`STARTUPINFOW` + attribute list 指针。AppContainer 只能走这条结构体。
+
+    `subprocess` / `asyncio.create_subprocess_exec` 都无法表达 attribute list，
+    所以 `appcontainer` 档必须像 `restricted` 一样自建进程（见 `launch_appcontainer`）。
+    """
+
+    _fields_ = [
+        ("StartupInfo", win_token._STARTUPINFOW),  # noqa: SLF001 — 同一套 SDL 定义
+        ("lpAttributeList", ctypes.c_void_p),
+    ]
+
+
+class _SECURITY_CAPABILITIES(ctypes.Structure):  # noqa: N801 — 沿用 Windows SDK 原名
+    """`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 的值结构。
+
+    `CapabilityCount=0` 是刻意的：给 0 个能力意味着**没有任何**受控能力
+    （不含网络、不含大部分目录）。这正是 `appcontainer` 比 `low_il` 强的地方。
+    """
+
+    _fields_ = [
+        ("AppContainerSid", ctypes.c_void_p),
+        ("Capabilities", ctypes.c_void_p),
+        ("CapabilityCount", wt.DWORD),
+        ("Reserved", wt.DWORD),
+    ]
+
+
 @dataclass(frozen=True)
 class LaunchResult:
     """一次受限执行的结果。`spawn_error` 非空表示**进程都没起来**，与"起来了但失败"分开。"""
@@ -73,6 +109,20 @@ class LaunchResult:
     @property
     def started(self) -> bool:
         return self.spawn_error == ""
+
+
+@dataclass
+class _Spawned:
+    """AppContainer 进程的句柄集合（创建成功后的中间态）。
+
+    `stdin_write` 为 `None` 表示 stdin 接在空设备上（一次性执行不需要输入）。
+    """
+
+    pi: Any
+    out_r: Any
+    err_r: Any
+    stdin_write: Any
+    k32: Any
 
 
 def _k32() -> Any:
@@ -108,6 +158,50 @@ def _k32() -> Any:
     lib.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
     lib.LocalFree.restype = ctypes.c_void_p
     lib.LocalFree.argtypes = [ctypes.c_void_p]
+    # AppContainer 路径：attribute list 三个入口 + 带 attribute list 的 CreateProcessW。
+    #
+    # `argtypes` 不是可选的：64 位下不声明，ctypes 按 C `int` 传指针，
+    # 高 32 位被截断 ⇒ 稳定 `ERROR_INVALID_PARAMETER(87)`，而错误信息完全不提。
+    lib.InitializeProcThreadAttributeList.restype = wt.BOOL
+    lib.InitializeProcThreadAttributeList.argtypes = [
+        ctypes.c_void_p,
+        wt.DWORD,
+        wt.DWORD,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    lib.UpdateProcThreadAttribute.restype = wt.BOOL
+    lib.UpdateProcThreadAttribute.argtypes = [
+        ctypes.c_void_p,
+        wt.DWORD,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.DeleteProcThreadAttributeList.restype = None
+    lib.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+    # AppContainer **不走** CreateProcessAsUserW：它不需要另一个令牌，只需要 attribute
+    # list，因此普通（非提权）账户也能用 —— 这正是它比 `restricted` 更可达的原因。
+    lib.CreateProcessW.restype = wt.BOOL
+    lib.CreateProcessW.argtypes = [
+        wt.LPCWSTR,
+        wt.LPWSTR,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wt.BOOL,
+        wt.DWORD,
+        ctypes.c_void_p,
+        wt.LPCWSTR,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.GetExitCodeProcess.restype = wt.BOOL
+    lib.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+    lib.WaitForSingleObject.restype = wt.DWORD
+    lib.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+    lib.CloseHandle.restype = wt.BOOL
+    lib.CloseHandle.argtypes = [wt.HANDLE]
     return lib
 
 
@@ -142,6 +236,12 @@ def _advapi() -> Any:
         ctypes.POINTER(ctypes.c_void_p),
         ctypes.POINTER(wt.DWORD),
     ]
+    # AppContainer 的 `SECURITY_CAPABILITIES.AppContainerSid` 要的是 **PSID**，
+    # 而 `ensure_appcontainer` 只给**字符串** SID（便于 icacls 与日志）。
+    # 少了这一步就得让调用方各自转换，而转换要配对 `LocalFree`，漏掉就是每次
+    # 执行泄漏一块内核内存。
+    lib.ConvertStringSidToSidW.restype = wt.BOOL
+    lib.ConvertStringSidToSidW.argtypes = [wt.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
     return lib
 
 
@@ -349,6 +449,357 @@ def launch_restricted(
                     k32.CloseHandle(handle)
                 except Exception:  # noqa: BLE001
                     pass
+
+
+# ── AppContainer 执行层 ─────────────────────────────────────────
+
+#: AppContainer 子进程**必须**具备的环境变量名。
+#:
+#: 缺任何一个都会让 `CreateProcessW` 直接失败并返回 `ERROR_ENVVAR_NOT_FOUND(203)`,
+#: 而错误信息完全不指向环境块 —— 本机实测：只给 `SystemRoot/PATH/TEMP` 时稳定
+#: `err=203`，补齐下面这组后立刻 `exit=0` 且 stdout 正常。
+#:
+#: 原因在 AppContainer 的进程初始化会解析"已知文件夹"与几个系统标识，缺了就建不起来。
+#: 这些值本身不敏感（`C:\Windows`、计算机名、用户名），所以从宿主继承；
+#: 真正带路径语义的用户目录另见 `appcontainer_env`，一律重定向进工作区。
+_APPCONTAINER_SYSTEM_ENV = (
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "SYSTEMROOT",
+    "ALLUSERSPROFILE",
+    "PUBLIC",
+    "COMPUTERNAME",
+    "USERNAME",
+    "OS",
+    "NUMBER_OF_PROCESSORS",
+)
+
+#: 用户已知目录。AppContainer 的包 SID 默认对这些路径**没有**权限，
+#: 指向宿主只会换来 `PermissionError`，还把宿主路径泄给模型，所以一律指进工作区。
+_APPCONTAINER_USER_ENV = ("USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME")
+
+
+def appcontainer_env(env: dict[str, str], *, cwd: str) -> dict[str, str]:
+    """补全 AppContainer 子进程的环境（在 `sandboxed_env()` 的结果之上）。
+
+    两件事，缺一不可：
+
+    1. **补齐系统变量** —— 否则 `CreateProcessW` 返回 `err=203`，进程根本起不来；
+    2. **用户目录重定向进工作区** —— 包 SID 读不到宿主用户目录，指过去只会失败。
+    """
+    merged = dict(env)
+    for key in _APPCONTAINER_SYSTEM_ENV:
+        if not merged.get(key):
+            host_value = os.environ.get(key)
+            if host_value:
+                merged[key] = host_value
+    for key in _APPCONTAINER_USER_ENV:
+        merged[key] = cwd
+    # TEMP/TMP 必须在工作区内：包 SID 没有宿主临时目录的写权限
+    merged["TEMP"] = cwd
+    merged["TMP"] = cwd
+    return merged
+
+
+def _make_attribute_list(sid_string: str) -> tuple[Any, Any, str]:
+    """建带包 SID 的 attribute list。返回 `(alist, psid, 错误)`。
+
+    失败必须显式返回错误而不是抛异常：`resolve_level` 要据此**降级并说明原因**。
+    调用方负责 `DeleteProcThreadAttributeList` 与 `LocalFree(psid)`。
+    """
+    k32, adv = _k32(), _advapi()
+    psid = ctypes.c_void_p()
+    if not adv.ConvertStringSidToSidW(sid_string, ctypes.byref(psid)):
+        return None, None, f"ConvertStringSidToSidW 失败 err={ctypes.get_last_error()}"
+
+    caps = _SECURITY_CAPABILITIES(
+        # `CapabilityCount=0`：不授予任何受控能力（无网络、无多数目录）。
+        AppContainerSid=ctypes.cast(psid, ctypes.c_void_p),
+        Capabilities=None,
+        CapabilityCount=0,
+        Reserved=0,
+    )
+
+    size = ctypes.c_size_t(0)
+    # 第一次调用只为拿所需大小；返回值必为 FALSE（缓冲区还没给）
+    k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+    if size.value == 0:
+        k32.LocalFree(psid)
+        return None, None, "InitializeProcThreadAttributeList 未给出缓冲区大小"
+    # 缓冲区必须**由本栈帧持有**到进程创建完成：attribute list 里存的是
+    # `&caps` 指向的结构指针，`caps` 一离开作用域就是悬空指针。
+    buf = ctypes.create_string_buffer(size.value)
+    alist = ctypes.cast(buf, ctypes.c_void_p)
+    if not k32.InitializeProcThreadAttributeList(alist, 1, 0, ctypes.byref(size)):
+        k32.LocalFree(psid)
+        return None, None, f"InitializeProcThreadAttributeList 失败 err={ctypes.get_last_error()}"
+    if not k32.UpdateProcThreadAttribute(
+        alist,
+        0,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+        ctypes.byref(caps),
+        ctypes.sizeof(caps),
+        None,
+        None,
+    ):
+        err = ctypes.get_last_error()
+        k32.DeleteProcThreadAttributeList(alist)
+        k32.LocalFree(psid)
+        return None, None, f"UpdateProcThreadAttribute 失败 err={err}"
+    # 把 caps 与 psid 一起挂到 buffer 上，保证生命周期与 alist 一致
+    buf._caps = caps  # type: ignore[attr-defined]
+    buf._psid = psid  # type: ignore[attr-defined]
+    return alist, psid, ""
+
+
+def _spawn_appcontainer(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    with_stdin: bool,
+) -> tuple[_Spawned | None, str]:
+    """在 AppContainer 里创建进程。成功返回句柄集合，失败返回具体原因。
+
+    **为什么必须是 `CreateProcessW` 而不是 `CreateProcessAsUserW`**：
+    AppContainer 靠 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 指定包 SID，
+    不需要另一个用户令牌，因此普通（非提权）账户就能用 —— 这正是它比
+    `restricted` 更可达的原因（后者要 `SeIncreaseQuotaPrivilege`）。
+    """
+    if not win.IS_WINDOWS:
+        return None, "not windows"
+    if not argv:
+        return None, "empty argv"
+
+    ok, sid, err = win.ensure_appcontainer(win.appcontainer_name("default"))
+    if not ok:
+        return None, f"AppContainer profile 创建失败: {err}"
+    granted, gerr = win.grant_appcontainer_path(sid, cwd)
+    if not granted:
+        return None, f"工作区授权给包 SID 失败: {gerr}"
+
+    alist, psid, aerr = _make_attribute_list(sid)
+    if alist is None:
+        return None, aerr
+
+    k32 = _k32()
+    sa = _SECURITY_ATTRIBUTES(
+        nLength=ctypes.sizeof(_SECURITY_ATTRIBUTES),
+        lpSecurityDescriptor=None,
+        bInheritHandle=True,
+    )
+    out_r, out_w = wt.HANDLE(), wt.HANDLE()
+    err_r, err_w = wt.HANDLE(), wt.HANDLE()
+    in_r, in_w = wt.HANDLE(), wt.HANDLE()
+    pi = win_token._PROCESS_INFORMATION()  # noqa: SLF001
+    env_block = build_env_block(env)
+    env_buf = ctypes.create_string_buffer(env_block, len(env_block))
+    cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+
+    try:
+        for label, pair in (("stdout", (out_r, out_w)), ("stderr", (err_r, err_w))):
+            if not k32.CreatePipe(
+                ctypes.byref(pair[0]), ctypes.byref(pair[1]), ctypes.byref(sa), 0
+            ):
+                return None, f"CreatePipe({label}) 失败 err={ctypes.get_last_error()}"
+        if with_stdin and not k32.CreatePipe(
+            ctypes.byref(in_r), ctypes.byref(in_w), ctypes.byref(sa), 0
+        ):
+            return None, f"CreatePipe(stdin) 失败 err={ctypes.get_last_error()}"
+        # 父端不可继承：读端被继承会让父进程等不到 EOF，写端被继承会让 shell 等不到 EOF
+        for handle in (out_r, err_r, in_w):
+            if handle:
+                k32.SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0)
+
+        si = _STARTUPINFOEXW()
+        si.StartupInfo.cb = ctypes.sizeof(_STARTUPINFOEXW)
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+        # 一次性执行不接 stdin：给空句柄即"没有输入"，避免子进程读到引擎的 stdin
+        si.StartupInfo.hStdInput = in_r if with_stdin else wt.HANDLE()
+        si.StartupInfo.hStdOutput = out_w
+        si.StartupInfo.hStdError = err_w
+        si.lpAttributeList = alist
+
+        started = k32.CreateProcessW(
+            None,
+            ctypes.cast(cmdline, wt.LPWSTR),
+            ctypes.byref(sa),
+            None,
+            True,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+            ctypes.cast(env_buf, ctypes.c_void_p),
+            cwd,
+            ctypes.byref(si),
+            ctypes.byref(pi),
+        )
+        if not started:
+            return None, f"CreateProcessW(AppContainer) 失败 err={ctypes.get_last_error()}"
+    except Exception as exc:  # noqa: BLE001 — 任何异常都按"起不来"处理
+        logger.warning("_spawn_appcontainer 异常", exc_info=True)
+        return None, f"_spawn_appcontainer 异常: {exc}"
+    finally:
+        k32.DeleteProcThreadAttributeList(alist)
+        if psid:
+            k32.LocalFree(psid)
+        # 子进程已持有自己的副本，父进程立刻关掉这些，否则读不到 EOF
+        for handle in (out_w, err_w, in_r):
+            if handle:
+                try:
+                    k32.CloseHandle(handle)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return (
+        _Spawned(
+            pi=pi,
+            out_r=out_r,
+            err_r=err_r,
+            stdin_write=in_w if with_stdin else None,
+            k32=k32,
+        ),
+        "",
+    )
+
+
+def launch_appcontainer(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float = 60.0,
+    max_output: int = 1_000_000,
+) -> LaunchResult:
+    """在 AppContainer 里执行一条命令，等它结束并取回输出。
+
+    失败语义与 `launch_restricted` 一致：`spawn_error` 非空 ⇒ 进程没起来，
+    调用方应当**拒绝执行**，不得退回无隔离路径。
+    """
+    spawned, serr = _spawn_appcontainer(
+        argv, cwd=cwd, env=appcontainer_env(env, cwd=cwd), with_stdin=False
+    )
+    if spawned is None:
+        return LaunchResult(None, "", "", serr)
+
+    k32, pi = spawned.k32, spawned.pi
+    try:
+        stdout = _drain(spawned.out_r, max_output)
+        stderr = _drain(spawned.err_r, max_output)
+        wait_ms = INFINITE if timeout <= 0 else int(timeout * 1000)
+        if k32.WaitForSingleObject(pi.hProcess, wait_ms) != WAIT_OBJECT_0:
+            k32.TerminateProcess(pi.hProcess, 124)
+            k32.WaitForSingleObject(pi.hProcess, 5000)
+            return LaunchResult(124, stdout, stderr)
+        code = wt.DWORD()
+        k32.GetExitCodeProcess(pi.hProcess, ctypes.byref(code))
+        return LaunchResult(int(code.value), stdout, stderr)
+    finally:
+        for handle in (spawned.out_r, spawned.err_r, pi.hProcess, pi.hThread):
+            if handle:
+                try:
+                    k32.CloseHandle(handle)
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+def open_appcontainer_session(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+) -> tuple[RestrictedSession | None, str]:
+    """在 AppContainer 里起一个**常驻**进程（复用 `RestrictedSession` 的管道泵）。
+
+    常驻模式是持久 shell 能工作的前提：受限档下 `launch_restricted` 无法
+    "常驻 + 增量写 stdin"，`open_restricted_session` 补上了这个缺口；
+    AppContainer 档走同一套会话结构，只是建进程的方式不同。
+    """
+    spawned, serr = _spawn_appcontainer(
+        argv, cwd=cwd, env=appcontainer_env(env, cwd=cwd), with_stdin=True
+    )
+    if spawned is None:
+        return None, serr
+
+    session = RestrictedSession(
+        pid=int(spawned.pi.dwProcessId),
+        hprocess=spawned.pi.hProcess,
+        hthread=spawned.pi.hThread,
+        stdin_write=spawned.stdin_write,
+        k32=spawned.k32,
+    )
+    # 不排空的话 4KB 管道缓冲一满子进程就卡在 write 上（表现为"命令莫名挂住"）
+    for handle, sink in (
+        (spawned.out_r, session._out_chunks),  # noqa: SLF001
+        (spawned.err_r, session._err_chunks),  # noqa: SLF001
+    ):
+        threading.Thread(
+            target=session._pump,  # noqa: SLF001
+            args=(handle, sink),
+            daemon=True,
+            name=f"appcontainer-pump-{session.pid}",
+        ).start()
+    logger.info("AppContainer 常驻进程已启动: pid=%s", session.pid)
+    return session, ""
+
+
+def appcontainer_smoke_test() -> tuple[bool, str]:
+    """端到端验证 AppContainer 真能起进程并拿回输出（`exec_ready` 的判定依据）。
+
+    与 `smoke_test` 同样用 `cmd.exe` 的 `echo`：不依赖工作区可执行权限，
+    让"起不来"只可能是机制本身的问题。
+
+    **已验证的能力边界**（本机零提权实测，务必别当成"支持一切外挂程序"）：
+
+    * `cmd.exe` / 原生命令：可用，stdout/stderr/退出码都正常；
+    * `python.exe`：**不可用** —— `exit=3221225781`（`0xC0000135`，DLL 加载失败）。
+      包 SID 读不到 CPython 安装目录，而给该目录授权（`grant_appcontainer_path`）
+      会因安装目录的继承 ACL 而失败（`icacls` 返回 5 个失败文件）。所以
+      `run_code` 的 Python worker **不能**走这一档，它由
+      `child_applicable_level` 如实折算到 `low_il`（仍高于硬底线）。
+
+    因此冒烟只证明"执行层可用"，不证明"任意程序都能在包里跑"。
+    """
+    comspec = os.environ.get("COMSPEC") or shutil.which("cmd.exe") or r"C:\Windows\System32\cmd.exe"
+    workdir = os.path.join(
+        os.environ.get("TEMP", r"C:\Windows\Temp"), "chiron-appcontainer-probe"
+    )
+    try:
+        os.makedirs(workdir, exist_ok=True)
+    except OSError as exc:
+        return False, f"无法创建探测目录: {exc}"
+
+    result = launch_appcontainer(
+        [comspec, "/d", "/c", "echo ok&&echo bad 1>&2"],
+        cwd=workdir,
+        env={"SystemRoot": os.environ.get("SystemRoot", r"C:\Windows")},
+        timeout=20,
+    )
+    if not result.started:
+        return False, result.spawn_error
+    if result.exit_code != 0:
+        return False, f"exit={result.exit_code} stderr={result.stderr.strip()[:200]}"
+    if "ok" not in result.stdout:
+        return False, f"stdout 未收到预期输出: {result.stdout!r}"
+    return True, ""
+
+
+_appcontainer_ok: bool | None = None
+_appcontainer_error = ""
+
+
+def appcontainer_exec_ready() -> bool:
+    """AppContainer 执行层是否可用（带缓存）。失败原因见 `appcontainer_exec_error()`。"""
+    global _appcontainer_ok, _appcontainer_error
+    if _appcontainer_ok is None:
+        ok, err = appcontainer_smoke_test()
+        _appcontainer_ok = ok
+        _appcontainer_error = err
+        if not ok:
+            logger.warning("appcontainer 执行层冒烟测试失败: %s", err)
+    return bool(_appcontainer_ok)
+
+
+def appcontainer_exec_error() -> str:
+    return _appcontainer_error
 
 
 def _drain(handle: Any, max_output: int) -> str:
@@ -787,22 +1238,32 @@ def exec_error() -> str:
 def reset_probe() -> None:
     """清缓存，供测试与运行时切换档位后重新探测。"""
     global _smoke_ok, _smoke_error, _desktop_handle, _desktop_error
+    global _appcontainer_ok, _appcontainer_error
     _smoke_ok = None
     _smoke_error = ""
     _desktop_handle = None
     _desktop_error = ""
+    # AppContainer 的探测结果同样要清：重新探测的前提是"上次的结论不再可信"。
+    _appcontainer_ok = None
+    _appcontainer_error = ""
 
 
 __all__ = [
     "LaunchResult",
     "RestrictedSession",
+    "appcontainer_env",
+    "appcontainer_exec_error",
+    "appcontainer_exec_ready",
+    "appcontainer_smoke_test",
     "build_env_block",
     "desktop_ready",
     "ensure_desktop",
     "exec_error",
     "exec_ready",
     "is_admin",
+    "launch_appcontainer",
     "launch_restricted",
+    "open_appcontainer_session",
     "open_restricted_session",
     "reset_probe",
     "smoke_test",

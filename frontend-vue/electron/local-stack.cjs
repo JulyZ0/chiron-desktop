@@ -22,6 +22,7 @@ const crypto = require('node:crypto')
 const path = require('node:path')
 const components = require('./components.cjs')
 const runtimeState = require('./runtime-state.cjs')
+const engineEnvSettings = require('./engine-env.cjs')
 const { createSupervisor } = require('./supervisor.cjs')
 const DEFAULTS = components.DEFAULTS
 
@@ -792,7 +793,26 @@ function buildEngineEnv(info, options = {}) {
     throw new Error(`引擎端口非法：${options.port}`)
   }
 
-  const env = { ...process.env, ...(options.env || {}) }
+  // 用户配置的**功能开关**（`engine-env.json`）。必须压在 `process.env` 之上：
+  // 用户在界面上明确点过，比"从这里继承来的变量"更能代表意图。但仍低于
+  // `options.env` —— 单测与 ops 用它把值钉死，那些场景下"壳层说了算"是错的。
+  //
+  // 这里是**白名单**而不是"用户随便填 KEY=VALUE"：`APP_SECRET`、`SANDBOX_BACKEND`
+  // 这类键一旦可写，整个进程的安全边界就交出去了（详见 engine-env.cjs 的文档）。
+  //
+  // 不加这一句的后果是实打实的：打包态从开始菜单启动，没有 shell 可以设
+  // `SUPERAGENT_TAKEOVER_ENABLED`，引擎恒用默认 `false` ⇒ 巡检永不启动，
+  // 用户在界面上配的定时接管一条也不会被执行。
+  const engineToggles =
+    options.engineToggles !== undefined
+      ? options.engineToggles
+      : engineEnvSettings.readEngineEnvSettings(options.dataDir)
+
+  const env = {
+    ...process.env,
+    ...engineEnvSettings.togglesToEnv(engineToggles),
+    ...(options.env || {}),
+  }
   env.APP_SECRET = appSecret
   env.POSTGRES_DSN = pgDsn
   applyLocalModeSecrets(env, appSecret)

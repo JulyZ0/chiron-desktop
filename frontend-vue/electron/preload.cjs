@@ -168,6 +168,22 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   restartLocalBackend: () => ipcRenderer.invoke('desktop:restart-local-backend'),
 
   /**
+   * 引擎环境变量开关（白名单）。
+   *
+   * 为什么需要：`SUPERAGENT_TAKEOVER_ENABLED` 这类开关只认进程环境变量，
+   * 打包态从开始菜单启动没有 shell 可设，于是永远停在默认值（= 关）。
+   * 这里只暴露**白名单内**的功能开关；服务端安全相关的 env（`APP_SECRET`、
+   * `SANDBOX_*`）刻意不可改，主进程会丢弃白名单外的键。
+   *
+   * 保存后不会自动重启引擎 —— 重启会打断正在进行的会话，由用户显式触发
+   * `restartLocalBackend()`。
+   */
+  getEngineEnvSettings: () => ipcRenderer.invoke('desktop:get-engine-env-settings'),
+  saveEngineEnvSettings: toggles =>
+    ipcRenderer.invoke('desktop:save-engine-env-settings', toggles || {}),
+
+
+  /**
    * 订阅首次启动的运行时安装进度（install.html 用）。
    *
    * 只在安装进度页需要：正常启动时运行时已就绪，一条消息都不会来。

@@ -15,9 +15,11 @@ import (
 // 按模型的成本换算（`usage_events.cost_cents` 的**唯一**写入依据）。
 //
 // **为什么需要它**：`cost_cents` 这一列一直存在、一直被 `GetUsage` / `GetMetrics`
-// 读取，但**从来没有人写入过** —— `RecordUsageEvent` 的 `CostCents` 字段全仓只有
-// 一个声明点和一个读点，没有赋值点。结果是计费页的"花费"始终是 0，而"今日消耗"
-// 看起来像统计彻底坏了。
+// 读取，但长期**没有人写入** —— `RecordUsageEvent` 的 `CostCents` 字段曾只有声明点
+// 和读点、没有赋值点，于是计费页的"花费"始终是 0，看起来像统计彻底坏了。
+//
+// 现在写入点在 `submit_handler.go` 的结算段：按模型逐行定价（`modelLedger.settle`
+// 拆出各模型的 token），整轮金额再用 `aggregateCostCents` 精确累加后**只取整一次**。
 //
 // 价格来自 `model_prices`（由 `python-engine/app/pricing/sync.py` 多源交叉验证后
 // 写入，USD / 1k tokens）。**它是参考数据，不是计费权威** —— 但计费域
@@ -43,35 +45,84 @@ var (
 	priceCache   = map[string]priceEntry{}
 )
 
-// usageCostCents 按模型单价把一次调用的 token 用量换算成**分**。
+// usageCostUSD 按模型单价把一次调用的 token 用量换算成**美元**（未取整）。
 //
-// 换算：`tokens/1000 * usd_per_1k * 100`，即 `tokens * usd_per_1k / 10`。
+// 拆出这一层是为了**避免多次取整**：`usage_events` 按模型逐行落库，每行都要写成
+// 整数分，于是每行都会被「不足 1 分记 1 分」的规则抬一次。若整轮金额也由这些
+// 已取整的行相加得到，3 次各 0.3 分的调用会变成 3 分而不是 0.9 分 —— 贵了一倍多。
+// 整轮金额必须先按精确值累加，最后只取整一次。
 //
 // ⚠ **缓存命中的 token 按输入价计**：`model_prices` 没有 cached 档（多数厂商的
 // 缓存读价是输入价的 10%~50%），这里不打折是**保守**选择 —— 宁可成本算高一点，
 // 也不要凭空编一个折扣率出来。要精确就得让价格表带上 cached 列，那是另一件事。
-func usageCostCents(ctx context.Context, model string, input, output, cached int) *int {
+//
+// 第二个返回值表示**是否取到了单价**。取不到时不该是 0 分（"免费"），
+// 而应是不写（"不知道"）。
+func usageCostUSD(ctx context.Context, model string, input, output int) (float64, bool) {
 	model = strings.TrimSpace(model)
 	if model == "" || db.GlobalDBManager == nil {
-		return nil
+		return 0, false
 	}
 	entry := lookupPrice(ctx, model)
 	if !entry.found {
-		return nil
+		return 0, false
 	}
 	// cached 是 input 的子集（缓存命中那部分），所以输入侧总量仍是 input ——
 	// 不能把 cached 再加一遍，否则输入 token 被算两遍、成本虚高。
 	usd := float64(input)/1000*entry.inputPer1k + float64(output)/1000*entry.outputPer1k
 	if usd <= 0 {
+		// 价格为 0 或负（数据脏）：当成"不知道"，别写成免费。
+		return 0, false
+	}
+	return usd, true
+}
+
+// usageCostCents 按模型单价把一次调用的 token 用量换算成**分**。
+//
+// 换算：`tokens/1000 * usd_per_1k * 100`，即 `tokens * usd_per_1k / 10`。
+// 这是**逐行落库**用的口径：库里的 `cost_cents` 是 integer，只能存整数分。
+func usageCostCents(ctx context.Context, model string, input, output, cached int) *int {
+	usd, ok := usageCostUSD(ctx, model, input, output)
+	if !ok {
+		return nil
+	}
+	return roundCents(usd, input > 0 || output > 0)
+}
+
+// roundCents 把精确美元金额换算成整数分。
+//
+// hasUsage 表示"确实发生了 token 消耗"：此时金额不足 1 分也要记 1 分，
+// 否则"用了一次但没花钱"与"模型免费"就混为一谈了。
+func roundCents(usd float64, hasUsage bool) *int {
+	if usd <= 0 {
 		return nil
 	}
 	cents := int(math.Round(usd * 100))
-	// 有真实用量但换算后不足 1 分：记 1 分而不是 0。
-	// 记为 0 会让"用了一次但怎么没花钱"和"模型免费"混为一谈。
-	if cents == 0 && (input > 0 || output > 0) {
+	if cents == 0 && hasUsage {
 		cents = 1
 	}
 	return &cents
+}
+
+// aggregateCostCents 汇总**整轮**成本。
+//
+// ## 为什么不能把逐行的分相加
+//
+// 逐行落库必须写整数分（`cost_cents` 是 integer），于是每行都会被
+// `roundCents` 的「不足 1 分记 1 分」抬一次。三行各 0.3 分的调用相加得 3 分，
+// 而它们的真实合计是 0.9 分 —— 贵了两倍多，且模型越多偏得越狠。所以整轮金额
+// 必须由**未取整**的美元金额累加，最后只取整一次。
+//
+// ## unknown 为什么让结果是 nil 而不是部分和
+//
+// 只要有真实用量的那一行取不到单价，整轮金额就是**不可知**的。返回"已知行的和"
+// 会让界面显示一个具体但偏小的数 —— 那比 NULL（"不知道"）更糟：用户没有任何
+// 线索去怀疑它。
+func aggregateCostCents(usdTotal float64, unknown, hasUsage bool) *int {
+	if unknown || !hasUsage {
+		return nil
+	}
+	return roundCents(usdTotal, hasUsage)
 }
 
 // lookupPrice 取单价：精确名优先，回落到规范化名（去日期后缀/分隔符差异）。

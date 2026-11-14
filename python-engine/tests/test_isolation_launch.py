@@ -122,26 +122,86 @@ def test_launcher_puts_engine_root_on_sys_path():
 
 
 def test_appcontainer_never_claims_to_take_effect(monkeypatch):
-    """执行层没接入时，`appcontainer` 必须如实降级到 `low_il` 并给出原因。
+    """执行层**实测不可用**时，`appcontainer` 必须如实降级到 `low_il` 并给出原因。
 
-    原来这里 `return IsolationDecision(want, want, reasons)`，于是状态接口、前端
-    面板与审计日志一致声称 appcontainer 生效，而实际执行的仍是 low_il。
+    这条守的是"不许谎报"：`effective` 只能反映真的能拉起进程的档位。
+    曾经的缺陷是这里无条件 `return IsolationDecision(want, want, reasons)`，
+    于是状态接口、前端面板与审计日志一致声称 appcontainer 生效，
+    而实际执行的仍是 low_il。
     """
     monkeypatch.setattr(iso.win, "IS_WINDOWS", True)
     monkeypatch.setattr(iso, "_probe_job", lambda: True)
     monkeypatch.setattr(iso, "_probe_low_il", lambda: True)
     monkeypatch.setattr(iso, "_ensure_workspace_low_label", lambda _p: (True, ""))
-    # 让 AppContainer 机制本身"可用"，才能真正走到执行层这一步
+    # 机制本身"可用"（profile 建得出来），但**执行层**实测起不来 ——
+    # 后者才是能否声称生效的判据。
     monkeypatch.setattr(iso.win, "ensure_appcontainer", lambda _n: (True, "S-1-15-2-1", ""))
     monkeypatch.setattr(iso.win, "grant_appcontainer_path", lambda _sid, _p: (True, ""))
+    monkeypatch.setattr(iso, "_probe_appcontainer", lambda: False)
+    monkeypatch.setattr(
+        iso, "_appcontainer_probe_error", lambda: "CreateProcessW(AppContainer) 失败 err=4250"
+    )
 
     decision = resolve_level(Level.APPCONTAINER)
 
     assert decision.requested is Level.APPCONTAINER
     assert decision.effective is Level.LOW_IL
     assert decision.degraded is True
-    # 降级理由必须说清"执行层尚未接入"，而不是含糊的"不可用"
-    assert any("执行层尚未接入" in reason for reason in decision.reasons)
+    # 降级理由必须是**具体**的失败原因，不是含糊的"不可用"
+    assert any("err=4250" in reason for reason in decision.reasons)
     # 仍在硬底线之上，不是"退回无隔离"
     assert decision.effective.rank >= FLOOR_LEVEL.rank
     assert decision.below_floor is False
+
+
+def test_appcontainer_takes_effect_when_the_exec_layer_works(monkeypatch):
+    """执行层实测可用时，`appcontainer` 必须**如实生效**，不再降级。
+
+    与上一条互为反面：只堵"谎报生效"会诱出相反的错误 ——
+    明明能跑却永久降级，用户设的高档位形同虚设。
+    """
+    monkeypatch.setattr(iso.win, "IS_WINDOWS", True)
+    monkeypatch.setattr(iso, "_probe_job", lambda: True)
+    monkeypatch.setattr(iso, "_probe_low_il", lambda: True)
+    monkeypatch.setattr(iso, "_ensure_workspace_low_label", lambda _p: (True, ""))
+    monkeypatch.setattr(iso.win, "ensure_appcontainer", lambda _n: (True, "S-1-15-2-1", ""))
+    monkeypatch.setattr(iso.win, "grant_appcontainer_path", lambda _sid, _p: (True, ""))
+    monkeypatch.setattr(iso, "_probe_appcontainer", lambda: True)
+
+    decision = resolve_level(Level.APPCONTAINER)
+
+    assert decision.requested is Level.APPCONTAINER
+    assert decision.effective is Level.APPCONTAINER
+    assert decision.degraded is False
+    assert decision.reasons == []
+
+
+def test_appcontainer_child_cannot_reach_the_same_level():
+    """子进程自降级到不了 AppContainer：必须如实折算，不能原样透传。
+
+    包 SID 只能由**父进程**在 `CreateProcessW` 的属性列表里指定，
+    子进程无法给自己套包。`run_code` 的 worker 是普通 `Popen`，所以真实强度
+    只到 `low_il`；把它说成 appcontainer 就是配置/状态/日志三处谎报。
+    """
+    from app.isolation import child_applicable_level
+
+    assert child_applicable_level(Level.APPCONTAINER) is Level.LOW_IL
+    assert child_applicable_level(Level.RESTRICTED) is Level.LOW_IL
+    # 底线之内的档位原样返回
+    assert child_applicable_level(Level.LOW_IL) is Level.LOW_IL
+    assert child_applicable_level(Level.JOB) is Level.JOB
+
+
+def test_spawn_kwargs_never_leak_an_unconsumed_key():
+    """`spawn_kwargs` 必须恒为空。
+
+    历史上它给 appcontainer 塞过 `_appcontainer=True`，而那个键**没有任何消费者**：
+    真展开进 `create_subprocess_exec(...)` 会 `TypeError`，被 `**kwargs` 吞掉则
+    "档位显示在包里、进程其实不在"。两档现在都走自建路径，这里不该再返回值。
+    """
+    from app.isolation import IsolationDecision, spawn_kwargs
+
+    for level in (Level.NONE, Level.JOB, Level.LOW_IL, Level.RESTRICTED, Level.APPCONTAINER):
+        decision = IsolationDecision(level, level, [], False)
+        assert spawn_kwargs(decision) == {}, f"{level.value} 不该返回额外 kwargs"
+

@@ -337,6 +337,88 @@ test('buildEngineEnv 不把已带 scheme 的 Redis 地址拼成两遍', () => {
   assert.equal(env.REDIS_URL, 'redis://127.0.0.1:50404')
 })
 
+/**
+ * ★ 引擎功能开关必须真的进 spawn 的 env。
+ *
+ * 只把开关写进 `engine-env.json` 是不够的 —— 引擎读的是**进程环境变量**。
+ * 这一段先前缺失时的真机表现：用户在界面上打开了定时接管，重启后依旧什么都不发生，
+ * 因为 `buildEngineEnv` 从没把 `SUPERAGENT_TAKEOVER_ENABLED` 传下去，
+ * 引擎一直用默认 `false`，而链路上没有任何一处会报错。
+ */
+test('★ 引擎开关进入 spawn env（superagent 不能永远是关的）', () => {
+  const env = stack.buildEngineEnv(
+    { pgDsn: 'postgresql://x' },
+    {
+      appSecret: VALID_SECRET,
+      port: 9100,
+      env: {},
+      engineToggles: { SUPERAGENT_TAKEOVER_ENABLED: true },
+    },
+  )
+
+  assert.equal(env.SUPERAGENT_TAKEOVER_ENABLED, 'true')
+})
+
+test('显式关掉的开关下发 false，与"从没配过"可区分', () => {
+  const env = stack.buildEngineEnv(
+    { pgDsn: 'postgresql://x' },
+    {
+      appSecret: VALID_SECRET,
+      port: 9100,
+      env: {},
+      engineToggles: { SUPERAGENT_TAKEOVER_ENABLED: false },
+    },
+  )
+
+  assert.equal(env.SUPERAGENT_TAKEOVER_ENABLED, 'false')
+})
+
+test('没配开关就不往 env 里塞（留给引擎默认值）', () => {
+  const env = stack.buildEngineEnv(
+    { pgDsn: 'postgresql://x' },
+    { appSecret: VALID_SECRET, port: 9100, env: {}, engineToggles: {} },
+  )
+
+  assert.equal(env.SUPERAGENT_TAKEOVER_ENABLED, undefined)
+})
+
+/**
+ * 开关**不能**覆盖安全边界。
+ *
+ * `APP_SECRET` 是本地模式派生 JWT / INTERNAL_TOKEN 的种子，`SANDBOX_BACKEND` 决定
+ * 隔离是否成立。配置文件是用户可手改的，所以过滤必须发生在 `buildEngineEnv` 里，
+ * 而不是指望写入侧拦得住。
+ */
+test('★ 白名单外的键即使写进配置也不会进 env', () => {
+  const env = stack.buildEngineEnv(
+    { pgDsn: 'postgresql://x' },
+    {
+      appSecret: VALID_SECRET,
+      port: 9100,
+      env: {},
+      engineToggles: { APP_SECRET: 'hijacked', SANDBOX_BACKEND: 'none', PATH: 'C:\\evil' },
+    },
+  )
+
+  assert.equal(env.APP_SECRET, VALID_SECRET, 'APP_SECRET 必须仍是壳层生成的那个')
+  assert.equal(env.SANDBOX_BACKEND, 'local', '隔离后端不能被配置改成 none')
+})
+
+test('options.env 优先级最高（单测与 ops 要把值钉死）', () => {
+  const env = stack.buildEngineEnv(
+    { pgDsn: 'postgresql://x' },
+    {
+      appSecret: VALID_SECRET,
+      port: 9100,
+      env: { SUPERAGENT_TAKEOVER_ENABLED: 'pinned' },
+      engineToggles: { SUPERAGENT_TAKEOVER_ENABLED: true },
+    },
+  )
+
+  assert.equal(env.SUPERAGENT_TAKEOVER_ENABLED, 'pinned')
+})
+
+
 // ------------------------------------------------------------ 本地模式身份密钥
 
 /**

@@ -113,8 +113,11 @@ class PersistentTerminal:
             decision = resolve_level()
         except Exception as exc:  # noqa: BLE001 — 隔离模块异常时按既有路径走
             logger.warning("persistent_shell: resolve_level failed: %s", exc)
-        if decision is not None and decision.effective is Level.RESTRICTED:
-            return await self._open_restricted(key)
+        if decision is not None and decision.effective in (
+            Level.RESTRICTED,
+            Level.APPCONTAINER,
+        ):
+            return await self._open_self_built_session(key, decision.effective)
         # S 修复：ws 用局部变量，避免写成实例属性后被并发请求覆盖导致跨会话串 cwd/cd
         ws = str(workspace_dir())
         shell_exe = _shell_command()
@@ -179,40 +182,49 @@ class PersistentTerminal:
             self._jobs[key] = job
         return proc
 
-    async def _open_restricted(self, key: str) -> Any:
-        """`restricted` 档：起一个受限常驻 shell，再按普通路径的同一套 API 使用。
+    async def _open_self_built_session(self, key: str, level: Any) -> Any:
+        """`restricted` / `appcontainer` 档：起一个**自建**常驻 shell。
 
-        `open_restricted_session` 内部是同步 Win32 调用（`CreateProcessAsUserW`
-        等），必须丢线程，否则会卡住事件循环 —— 一次建进程就能拖住所有会话。
+        这两档都必须自建进程，因为 `asyncio.create_subprocess_exec` 表达不了它们的
+        建进程参数（受限令牌要 `CreateProcessAsUserW`，AppContainer 要进程属性列表）。
+        起好之后对外暴露的接口与普通 `Process` 一致，后续 `execute` 走同一套逻辑。
+
+        内部全是同步 Win32 调用，必须丢线程，否则会卡住事件循环 ——
+        一次建进程就能拖住所有会话。
         """
         from app.isolation import SHELL_LIMITS, Level, win_launch, wrap_async_process
 
         shell_exe = _shell_command()
         ws = str(workspace_dir())
+        if level is Level.APPCONTAINER:
+            opener = win_launch.open_appcontainer_session
+            hint = "请改用 shell_exec，或把隔离档位调到 low_il。"
+        else:
+            opener = win_launch.open_restricted_session
+            hint = "请改用 shell_exec，或把隔离档位调到 low_il。"
         session, err = await asyncio.to_thread(
-            win_launch.open_restricted_session,
+            opener,
             [shell_exe],
             cwd=ws,
             env=sandboxed_env(),
         )
         if session is None:
             # fail-closed：起不来就拒绝，**不**退回无隔离的普通 shell。
-            # 退回等于让 persistent_shell 成为绕过受限令牌的后门。
+            # 退回等于让 persistent_shell 成为绕过该档位的后门。
             raise RuntimeError(
-                f"persistent_shell 在 restricted 档下无法启动受限进程：{err}。"
-                "请改用 shell_exec，或把隔离档位调到 low_il。"
+                f"persistent_shell 在 {level.value} 档下无法启动受限进程：{err}。{hint}"
             )
 
-        # Job Object 同样要挂：受限令牌只约束令牌能力，不约束进程树规模。
+        # Job Object 同样要挂：令牌/包 SID 只约束权限，不约束进程树规模。
         job = None
         try:
             from app.isolation import resolve_level
 
             job = wrap_async_process(session, resolve_level(), SHELL_LIMITS)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("persistent_shell(restricted): job attach failed: %s", exc)
+            logger.warning("persistent_shell(%s): job attach failed: %s", level.value, exc)
 
-        # 首命令 cd：受限 shell 的起始目录已在 cwd 里给了，这里只是让后续
+        # 首命令 cd：shell 的起始目录已在 cwd 里给了，这里只是让后续
         # 命令与普通路径保持同样的工作目录语义（用户可能 cd 到子目录）。
         try:
             session.stdin.write(f'cd /d "{ws}"\n'.encode())
@@ -228,7 +240,9 @@ class PersistentTerminal:
             stale_job.close()
         self._procs[key] = session
         self._sessions[key] = session
-        self._levels[key] = Level.RESTRICTED
+        # 记录**实际**档位：`execute` 据此决定临时目录落在哪、以及是否需要
+        # 走 workspace 内的哨兵文件（low_il/appcontainer 写不了系统 %TEMP%）。
+        self._levels[key] = level
         if job is not None:
             self._jobs[key] = job
         return session

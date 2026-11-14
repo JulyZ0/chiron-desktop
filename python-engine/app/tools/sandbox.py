@@ -900,21 +900,36 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
         logger.warning("shell_exec: resolve_level failed: %s", exc)
         _decision = None
 
-    if _decision is not None and _decision.effective is Level.RESTRICTED:
+    if _decision is not None and _decision.effective in (
+        Level.RESTRICTED,
+        Level.APPCONTAINER,
+    ):
         from app.isolation import win_launch
 
+        # 这两档都必须**自建进程**，因为 `create_subprocess_exec` 表达不了它们的
+        # 建进程参数：`restricted` 要另一个令牌（`CreateProcessAsUserW`），
+        # `appcontainer` 要进程属性列表（`STARTUPINFOEXW` + `CreateProcessW`）。
+        # 建法不同，但"起不来就拒绝执行"的语义完全一致。
+        launcher = (
+            win_launch.launch_appcontainer
+            if _decision.effective is Level.APPCONTAINER
+            else win_launch.launch_restricted
+        )
         result = await asyncio.to_thread(
-            win_launch.launch_restricted,
+            launcher,
             [prog, *rest],
             cwd=str(workspace_dir()),
             env=sandboxed_env(),
             timeout=float(timeout),
         )
         if not result.started:
-            # 受限路径起不来就**拒绝执行**，不退回无隔离路径 ——
+            # 起不来就**拒绝执行**，不退回无隔离路径 ——
             # 悄悄降级正是"看起来有隔离"的老问题。
             return {
-                "error": f"sandbox unavailable: restricted exec failed — {result.spawn_error}",
+                "error": (
+                    f"sandbox unavailable: {_decision.effective.value} exec failed — "
+                    f"{result.spawn_error}"
+                ),
             }
         stdout_text, stdout_truncated, stdout_log = offload_execute_output(
             result.stdout, "stdout"

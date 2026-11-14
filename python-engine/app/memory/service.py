@@ -1707,6 +1707,27 @@ def _plan_near_duplicate_merge(items: list[Any]) -> tuple[list[Any], list[Any]]:
 
 _memory_service_instance: MemoryService | None = None
 
+#: 装配失败的原因（`None` = 装配成功或还没走到装配）。
+#:
+#: 为什么需要它：`_start_memory_service()` 整段包在 `try/except` 里，任何一步失败
+#: （缺连接池、缺表、嵌入链路不可用……）都只留一行 warning，于是
+#: `get_service()` 恒为 `None`，而 runtime 里五处 `self._memory is not None` 守卫
+#: 全部静默为假 —— 用户看到的是"记忆功能好像不存在"，日志里只有一句
+#: "Memory service not available"。把原因记下来，健康检查与记忆 API 才能
+#: 如实回答"为什么没有记忆"，而不是笼统的 503。
+_memory_init_error: str | None = None
+
+
+def set_memory_init_error(reason: str | None) -> None:
+    """记录（或清除）记忆服务装配失败的原因。"""
+    global _memory_init_error
+    _memory_init_error = reason
+
+
+def get_memory_init_error() -> str | None:
+    """返回记忆服务装配失败的原因；`None` 表示没有失败记录。"""
+    return _memory_init_error
+
 
 def set_memory_service(svc: MemoryService) -> None:
     """设置全局 MemoryService 实例（应用启动时调用）。"""

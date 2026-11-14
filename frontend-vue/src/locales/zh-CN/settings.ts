@@ -213,4 +213,30 @@ export default {
   isolation_running_unaffected: "已在运行的进程沿用原档位，新启动的进程使用新档位。",
   isolation_change_failed: "切换档位失败。",
   isolation_change_reason: "用户在设置页切换隔离档位",
+
+  // ── 引擎功能开关（桌面端可配的进程环境变量）──
+  // 措辞原则：说清"为什么必须在界面里配"（桌面端没有 shell），以及"改完要不要重启"。
+  engine_env_title: "引擎功能开关",
+  engine_env_intro:
+    "这些开关控制引擎进程级的能力。它们只认环境变量，而桌面端从开始菜单启动时没有 shell 可以设置 —— 所以必须在这里配置，否则相关功能会一直保持关闭。",
+  engine_env_restart_hint: "修改后需要重启本地后端才会生效，正在进行中的对话不会保留。",
+  engine_env_default_on: "引擎默认：开",
+  engine_env_default_off: "引擎默认：关",
+  engine_env_not_set: "未设置（使用引擎默认值）",
+  engine_env_explicitly_set: "已显式设置",
+  engine_env_save: "保存开关",
+  engine_env_saved: "已保存，重启本地后端后生效。",
+  engine_env_save_failed: "保存失败：{detail}",
+  engine_env_load_failed: "读取开关配置失败。",
+  engine_env_unsupported: "当前桌面外壳版本不支持开关配置，请升级客户端。",
+  engine_env_restart_now: "立即重启本地后端",
+  engine_env_restarting: "正在重启…",
+  engine_env_restarted: "本地后端已重启，开关已生效。",
+  engine_env_restart_failed: "重启失败：{detail}",
+  engine_env_superagent_takeover_enabled: "Super-agent 定时接管",
+  engine_env_superagent_takeover_enabled_desc:
+    "关闭时引擎不会巡检你设置的定时接管任务 —— 界面上配了也不会被执行。",
+  engine_env_memory_distill_enabled: "回合级记忆提炼",
+  engine_env_memory_distill_enabled_desc:
+    "开启后每回合会多一次模型调用，把当轮要点写进长期记忆（成本随对话量线性增长）。",
 }

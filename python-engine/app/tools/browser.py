@@ -68,11 +68,23 @@ class GatewayBrowserHub:
     使用共享 httpx.AsyncClient 连接池，避免每次调用新建连接（R6 修复）。
     """
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, *, trusted_internal: bool = False):
         import httpx
 
         from app.tools.ssrf import assert_safe_url
-        assert_safe_url(base_url)
+
+        # `trusted_internal`：地址来自**我们自己的配置**（`settings.gateway_internal_url`），
+        # 不是模型可控输入，所以跳过私网/回环拦截 —— 桌面端网关就监听在 127.0.0.1，
+        # 照常检查会让浏览器工具在单机部署下必然起不来。
+        # scheme 仍然校验：只允许 http/https，避免被配置成 `file://` 之类。
+        if trusted_internal:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(base_url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError(f"invalid internal gateway url: {base_url}")
+        else:
+            assert_safe_url(base_url)
         self._base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(60.0),
@@ -121,14 +133,40 @@ class GatewayBrowserHub:
 
 
 def _init_default_hub() -> None:
-    """依据配置绑定真实网关 Hub；无配置则保持 None（工具 fail-loud）。"""
+    """依据配置绑定真实网关 Hub；无配置则保持 None（工具 fail-loud）。
+
+    地址优先级：`RPA_GATEWAY_URL` > `settings.gateway_internal_url`。
+
+    为什么要回落到 `gateway_internal_url`：Go 网关**本来就**挂载了
+    `POST /v1/rpa/exec` 与 `/v1/rpa/clients`（`internal/api/routes_agent.go`），
+    而桌面端从不设置 `RPA_GATEWAY_URL`，于是浏览器工具恒报 "no hub bound" ——
+    一个已经具备的服务因为一个没人设的环境变量而整套不可用。这是配置默认值问题，
+    不是缺实现。
+
+    标记 `trusted_internal=True`：该地址来自我们自己的配置，不是模型输入，
+    因此跳过 SSRF 的私网拦截（桌面端网关就监听 127.0.0.1）。
+    """
     import os
 
     global _hub
     addr = os.getenv("RPA_GATEWAY_URL", "").strip()
+    trusted = True
+    if not addr:
+        try:
+            from app.config import settings
+
+            addr = (settings.gateway_internal_url or "").strip()
+        except Exception as exc:  # noqa: BLE001 — 配置不可读就不绑，保持 fail-loud
+            logger.warning("browser hub: settings unavailable: %s", exc)
+            return
     if addr:
-        _hub = GatewayBrowserHub(addr)
-        logger.info("Browser RPA hub bound to Go gateway: %s", addr)
+        try:
+            _hub = GatewayBrowserHub(addr, trusted_internal=trusted)
+            logger.info("Browser RPA hub bound to gateway: %s", addr)
+        except Exception as exc:  # noqa: BLE001
+            # 绑不上不是致命错误：浏览器工具会继续 fail-loud 并说清原因，
+            # 而引擎其余能力不受影响。
+            logger.warning("browser hub bind failed (%s): %s", addr, exc)
 
 
 _init_default_hub()

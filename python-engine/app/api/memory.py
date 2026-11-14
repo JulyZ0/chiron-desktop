@@ -20,7 +20,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.memory.layers import SLOT_LABELS, SLOTS
-from app.memory.service import get_service
+from app.memory.service import get_memory_init_error, get_service
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,25 @@ def _unavailable() -> JSONResponse:
 
 def _bad_request(msg: str) -> JSONResponse:
     return JSONResponse({"success": False, "error": msg}, status_code=400)
+
+
+@router.get("/v1/memory/status")
+async def memory_status() -> Any:
+    """记忆服务是否装配成功 —— 以及**没成功的话是为什么**。
+
+    为什么不能只靠 `_unavailable()` 的 503：那条消息永远是同一句
+    "PostgreSQL required"，而装配其实可能在任意一步失败（缺表、嵌入链路、
+    摘要装配……）。用户与排障者需要的是具体原因。
+
+    本端点**恒返回 200**：它报告的就是"不可用"这件事本身，
+    用 503 会让前端无法区分"没记忆"和"查不到状态"。
+    """
+    svc = get_service()
+    return {
+        "success": True,
+        "available": svc is not None,
+        "init_error": get_memory_init_error(),
+    }
 
 
 @router.get("/v1/memory/profile")

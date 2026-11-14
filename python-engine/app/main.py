@@ -492,6 +492,12 @@ async def _start_memory_service() -> None:
             "on" if _redis is not None else "OFF — Redis unavailable, L3 不会入队",
         )
     except Exception as e:
+        # 整段装配是**全有或全无**：任何一步失败，`get_service()` 就是 `None`，
+        # runtime 里所有记忆分支随之静默跳过。所以这里不能只留一行 warning ——
+        # 必须把原因存下来，让健康检查/记忆 API 能回答"为什么没有记忆"。
+        from app.memory.service import set_memory_init_error
+
+        set_memory_init_error(f"{type(e).__name__}: {e}")
         logger.warning("Memory service not available: %s", e)
 
 

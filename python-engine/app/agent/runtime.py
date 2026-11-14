@@ -358,6 +358,7 @@ def _apply_system_prefix(
     *,
     extra_suffix: str = "",
     controls_suffix: str = "",
+    planning_suffix: str = "",
 ) -> list[dict[str, Any]]:
     """把 messages 的 system 段**重新定形**为「稳定前缀 + 记忆」（C2/D2 的统一落点）。
 
@@ -394,6 +395,12 @@ def _apply_system_prefix(
         # 逐字稳定 ⇒ 前缀缓存仍命中）。位置与 harness suffix 一致：都在记忆之前。
         if controls_suffix:
             base_prompt = f"{base_prompt}\n\n{controls_suffix}"
+        # 差距E：**执行规范**（先规划 / 该委派就委派 / 清单不空不收工）。与上面两段同位置 ——
+        # 稳定前缀的**末尾**：同模式同工具集下逐字稳定 ⇒ 前缀缓存仍命中；而它盖在
+        # persona 之上，所以 "Reply briefly" 那类措辞压不住"该做的步骤别省"。
+        # 空串 = 该模式没有 todo_write / subagent ⇒ 逐字不变。
+        if planning_suffix:
+            base_prompt = f"{base_prompt}\n\n{planning_suffix}"
         prefix.append(
             _normalize_msg(role="system", content=base_prompt, cache_breakpoint=True)
         )
@@ -1736,11 +1743,20 @@ class AgentRuntime:
 
         # 回合起点检查点（fail-open）：钩子内部吞掉所有异常，未绑定项目时直接跳过。
         # 放在这里而不是工具执行前，是因为"这一轮开始前的状态"才是回滚目标。
+        #
+        # 建完**立刻上报**：`report_checkpoint` 自己吞异常且带超时，网关是本机回环
+        # （正常毫秒级），所以这一步不会拖住首字。
         from app.agent import checkpoint_hooks
 
-        checkpoint_hooks.turn_checkpoint(
+        _rec = checkpoint_hooks.turn_checkpoint_record(
             "pre_turn", state_dir=checkpoint_hooks.checkpoint_state_dir()
         )
+        if _rec is not None:
+            await checkpoint_hooks.report_checkpoint(
+                _rec,
+                session_id=task.session_id,
+                turn_id=str(getattr(task, "turn_id", "") or ""),
+            )
 
         start_time = time.time()
         total_input_tokens = 0
@@ -1884,6 +1900,11 @@ class AgentRuntime:
                 activated_tools=acts,
                 # C3：工作台选中的项目 → 工具侧（记住 / 召回 / 遗忘）按它隔离记忆
                 project=(task.workbench_context or {}).get("project") or "",
+                # 本次对话选中的插件（MCP server）。MCP 工具是**隐藏来源**，不进可见
+                # 工具清单，所以上面那句 `_restrict_tools_to_plugins` 筛不到它们 ——
+                # 真正生效的地方是 `use_capability` 代理（它从这里读）。不传的话，
+                # 用户在对话里挑插件就是个纯 UI 动作，后端一律不认。
+                plugin_names=_plugin_names_of(task.workbench_context),
                 # 差距C（执行图）：把**本 run 的 trace 语境**带进工具上下文 —— 委派
                 # （`subagent` 工具 → `SubAgentRunner`）必须知道"我是从哪一步派出去的"，
                 # 才能把子 Agent 那一支挂到父执行图上（见 subagent_runner 的
@@ -2103,13 +2124,9 @@ class AgentRuntime:
             from app.agent.output_controls import build_controls_suffix, resolve_controls
 
             _out_style, _out_lang, _out_think_lang = resolve_controls(task.llm_config)
-            messages = _apply_system_prefix(
-                messages,
-                task,
-                extra_suffix=_extra_suffix,
-                controls_suffix=build_controls_suffix(_out_style, _out_lang, _out_think_lang),
-            )
-
+            # 工具集必须在 system 段定形**之前**算出来：执行规范（`planning_guidance`）
+            # 要按"模型这次到底看得见哪些工具"决定提不提 `todo_write` / `subagent`。
+            # 按模式名判断是错的 —— `mode_overrides.json` 可以改工具集，改完两者就不一致了。
             tools = (
                 self._convert_tools(task.tools)
                 if task.tools
@@ -2118,6 +2135,32 @@ class AgentRuntime:
             # 插件限定：用户在对话里选了插件（MCP server）时，本次只放这些插件提供的
             # 工具 —— 内置工具保持可用（插件是"额外能力"，不该把读文件/跑代码一起砍掉）。
             tools = _restrict_tools_to_plugins(tools, task.workbench_context)
+
+            # 差距E：**执行规范**（先规划 / 该委派就委派 / 清单不空不收工）。
+            #
+            # 为什么非要单独一段：`todo_write` 与 `subagent` 早就在白名单与工具描述里，
+            # 但工具描述只在模型"已经决定看工具"时起作用；"什么时候该建清单、什么时候
+            # 该派人"是**动手之前**的判断，必须在 system 段。而实际 system prompt 只有
+            # `main.py` 那句 "You are Chiron. Reply briefly in Chinese." —— 其中
+            # "briefly" 反而在鼓励少做事。没有这段规范，模型就把清单当可选风格。
+            #
+            # 位置在稳定前缀**末尾**：同一模式、同一工具集下逐字稳定 ⇒ 前缀缓存仍命中。
+            from app.agent.planning_guidance import render_planning_guidance
+
+            _tool_names = {
+                str(((t or {}).get("function") or {}).get("name") or "") for t in tools
+            }
+            messages = _apply_system_prefix(
+                messages,
+                task,
+                extra_suffix=_extra_suffix,
+                controls_suffix=build_controls_suffix(_out_style, _out_lang, _out_think_lang),
+                planning_suffix=render_planning_guidance(
+                    has_todo="todo_write" in _tool_names,
+                    has_subagent="subagent" in _tool_names,
+                ),
+            )
+
 
             # 获取 LLM 配置
             llm_config = task.llm_config or {}
@@ -3247,8 +3290,14 @@ class AgentRuntime:
                     total_input_tokens += in_tokens
                     total_output_tokens += out_tokens
                     if candidates:
+                        # tenant 必须与**召回**侧同一口径（`or 0`）。这里原先是
+                        # `or "default"`：字符串进 int 列（`AgentTask.tenant_id: int`、
+                        # `user_memory_entries.tenant_id` 是整数），asyncpg 直接抛
+                        # DataError，而外面那层 `except` 只记一行 warning —— 表现就是
+                        # "记忆永远不落库，却一声不响"。`tenant_id=0` 与召回/记账一致，
+                        # 单租户部署下 `parseTenantID` 也回落到 0。
                         stats = await self._memory.ingest_candidates(
-                            task.tenant_id or "default",
+                            task.tenant_id or 0,
                             task.user_id,
                             candidates,
                             project=(task.workbench_context or {}).get("project") or "",
@@ -3531,9 +3580,15 @@ class AgentRuntime:
         # 可能失败的 git 操作，收益低于风险。
         from app.agent import checkpoint_hooks
 
-        checkpoint_hooks.turn_checkpoint(
+        _end_rec = checkpoint_hooks.turn_checkpoint_record(
             "post_turn", state_dir=checkpoint_hooks.checkpoint_state_dir()
         )
+        if _end_rec is not None:
+            await checkpoint_hooks.report_checkpoint(
+                _end_rec,
+                session_id=task.session_id,
+                turn_id=str(getattr(task, "turn_id", "") or ""),
+            )
 
     def _build_messages(self, task: AgentTask) -> list[dict[str, Any]]:
         """构建 LLM 消息列表（system + history + 当前用户消息）。

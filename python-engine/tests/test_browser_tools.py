@@ -184,3 +184,35 @@ async def test_no_hub_fails_loud(monkeypatch):
 def test_default_hub_is_none():
     """默认 _hub 必须为 None(生产不落 StubHub 假实现)。"""
     assert browser._hub is None or not isinstance(browser._hub, browser.StubHub)
+
+# ── 桌面端默认绑定：不再依赖用户手工设 RPA_GATEWAY_URL ──────────
+
+def test_init_default_hub_falls_back_to_gateway_internal_url(monkeypatch):
+    """没设 RPA_GATEWAY_URL 时，必须回落到 settings.gateway_internal_url。
+
+    Go 网关本来就挂载了 /v1/rpa/exec 与 /v1/rpa/clients，而桌面端从不设置
+    RPA_GATEWAY_URL —— 不回落的直接后果是浏览器工具在一台齐全的机器上恒报
+    "no hub bound"，11 个工具全部不可用。
+    """
+    from app.config import settings
+
+    monkeypatch.delenv("RPA_GATEWAY_URL", raising=False)
+    monkeypatch.setattr(settings, "gateway_internal_url", "http://127.0.0.1:8080", raising=False)
+    monkeypatch.setattr(browser, "_hub", None)
+
+    browser._init_default_hub()
+
+    assert isinstance(browser._hub, browser.GatewayBrowserHub)
+    # 回环地址必须能建起来：它来自我们自己的配置，不该被 SSRF 私网规则挡掉
+    assert "127.0.0.1" in browser._hub._base_url
+
+
+def test_init_default_hub_keeps_env_override(monkeypatch):
+    """显式设了 RPA_GATEWAY_URL 就听它的（运维覆盖优先于默认值）。"""
+    monkeypatch.setenv("RPA_GATEWAY_URL", "http://gateway:8080")
+    monkeypatch.setattr(browser, "_hub", None)
+
+    browser._init_default_hub()
+
+    assert isinstance(browser._hub, browser.GatewayBrowserHub)
+    assert browser._hub._base_url == "http://gateway:8080"

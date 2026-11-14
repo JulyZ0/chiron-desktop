@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.agents import router as agents_router
 from app.api.capabilities import router as capabilities_router
+from app.api.checkpoints import router as checkpoints_router
 from app.api.context import router as context_router
 from app.api.desktop_infer import router as desktop_infer_router
 from app.api.interactions import router as interactions_router
@@ -35,4 +36,5 @@ api_router.include_router(memory_router)
 api_router.include_router(output_controls_router)
 api_router.include_router(system_router)
 api_router.include_router(isolation_router)
+api_router.include_router(checkpoints_router)
 api_router.include_router(superagent_router)

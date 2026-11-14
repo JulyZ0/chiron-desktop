@@ -167,6 +167,29 @@ function shouldQuitOnAllWindowsClosed({ platform, startupComplete, holdingWindow
 }
 
 /**
+ * 应用页面**可以**申请的 Electron 权限白名单。
+ *
+ * 为什么列成常量 + 判定函数，而不是写死在 `main.cjs` 里：这些名字是 Chromium 的
+ * 内部字符串，写错一个不会报错，只会让对应能力在桌面端静默失效。踩过的坑是
+ * `clipboard-sanitized-write` —— 页面侧调 `navigator.clipboard.writeText()`，
+ * Chromium 对外暴露的权限名就是它（不是 `clipboard-write`）。白名单里只有
+ * `clipboard-read` 时，桌面端**所有复制按钮一起失效**：点了没反应、不抛错、
+ * 控制台只有一条 unhandled rejection（调用点普遍写成 `.then()` 且没接 catch）。
+ * 网页版走安全上下文，不经这条检查，所以只在桌面端复现 —— 排查时极易误判成前端 bug。
+ *
+ * 抽成纯函数放这里，同样是因为 main.cjs 一 require 就会起 Electron，单测没法覆盖它。
+ */
+const ALLOWED_PERMISSIONS = ['media', 'clipboard-read', 'clipboard-sanitized-write', 'fullscreen']
+
+/**
+ * 该权限是否在白名单内。只判白名单，**不含** `media` 的细化（摄像头拒绝等）——
+ * 那部分依赖 `details`，留在 main.cjs 的 handler 里。
+ */
+function isAllowedPermission(permission) {
+  return ALLOWED_PERMISSIONS.includes(permission)
+}
+
+/**
  * 把 `dialog.showOpenDialog` 的结果翻译成 `pickDocument` 的返回值（契约 §2）。
  *
  * 抽成纯函数放这里，同样是因为 main.cjs 一 require 就会起 Electron：
@@ -270,6 +293,8 @@ module.exports = {
   PIP_INDEX_MIRRORS,
   partitionFor,
   shouldQuitOnAllWindowsClosed,
+  ALLOWED_PERMISSIONS,
+  isAllowedPermission,
   pickDocumentResult,
   pickDirectoryResult,
   resolveStartupWindow,

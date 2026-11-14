@@ -48,6 +48,12 @@ class CheckpointRecord:
     file_count: int
     skipped_count: int
     untracked_count: int
+    #: 未跟踪文件的 ``(相对路径, sha256)`` 清单，按路径排序。
+    #:
+    #: 这个清单必须跟记录一起带走：网关的 `checkpoint_untracked` 表靠它落库，
+    #: 而回滚未跟踪文件时要从 CAS 按 sha256 取回内容。只带 `untracked_count`
+    #: （一个数字）看起来够用，实际会让"快照里有这些文件、回滚时一个也找不回"。
+    untracked: tuple[tuple[str, str], ...] = ()
 
 
 def _head_sha(root: Path, index_file: Path) -> str | None:
@@ -124,4 +130,7 @@ def create_checkpoint(
         # 注意这两个字段是**计数**（int），不是路径集合。
         skipped_count=snap.skipped_secrets + snap.skipped_oversized,
         untracked_count=len(snap.untracked),
+        # 按路径排序后带走：网关落表不关心顺序，但固定顺序让重复上报的清单
+        # 在测试与日志里可比对，也让"同一快照两次上报"的 diff 干净。
+        untracked=tuple(sorted(snap.untracked.items())),
     )

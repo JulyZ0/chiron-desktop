@@ -37,6 +37,7 @@ const {
   probe,
 } = require('./config.cjs')
 const shared = require('./shared.cjs')
+const engineEnvSettings = require('./engine-env.cjs')
 const dataDirAcl = require('./data-dir-acl.cjs')
 const windowsHello = require('./windows-hello.cjs')
 const accountVerify = require('./account-verify.cjs')
@@ -47,6 +48,7 @@ const {
   partitionFor,
   shouldQuitOnAllWindowsClosed,
   resolveStartupWindow,
+  isAllowedPermission,
   PIP_INDEX_MIRRORS,
   RUNTIME_CANCEL_CHANNEL,
   RUNTIME_MIRROR_CHANNEL,
@@ -467,9 +469,7 @@ async function tryStartGoStack(options = {}) {
     throw failure
   }
 
-  const dataDir = options.dataDir
-    ? String(options.dataDir)
-    : path.join(app.getPath('userData'), 'local')
+  const dataDir = resolveLocalDataDir(options.dataDir)
 
   // 引擎的依赖是**按需**装的（用到才装，见 components.ensureEngineRuntime），
   // 进度沿用同一条推送通道：首启弹了安装窗的话，这一段就显示在同一个窗里。
@@ -609,6 +609,22 @@ function ensureAppSecret(dataDir) {
     logMain('warn', `无法持久化 APP_SECRET：${err?.message || err}`)
   }
   return secret
+}
+
+/**
+ * 本地数据目录：`<userData>/local`，或被显式指定时用指定的那个。
+ *
+ * 抽成函数是因为它现在有**三个**读者，而它们必须指向同一处：
+ *   - `startLocalBackend` 把它交给 `startLocalStack`（引擎/网关的落盘路径全在它下面）；
+ *   - 引擎开关配置 `engine-env.json` 写在它里面（`engine-env.cjs`）；
+ *   - 清空数据 / 账户验证失败时要把这个路径告诉用户。
+ *
+ * 三处各写一遍 `path.join(app.getPath('userData'), 'local')` 的后果是：
+ * 以后改目录名会漏掉一处，于是"界面上设了开关但引擎没读到"——而那条链上
+ * 没有任何报错，只有行为不对。
+ */
+function resolveLocalDataDir(explicit) {
+  return explicit ? String(explicit) : path.join(app.getPath('userData'), 'local')
 }
 
 async function startLocalBackend(options = {}) {
@@ -942,11 +958,17 @@ function configureSession(partition) {
     callback({ responseHeaders })
   })
 
-  // 权限：只允许本地应用页面使用麦克风（语音输入）、剪贴板读取与全屏
-  const allowedPermissions = new Set(['media', 'clipboard-read', 'fullscreen'])
+  // 权限：只允许本地应用页面使用麦克风（语音输入）、剪贴板读写与全屏。
+  //
+  // 白名单本身在 `shared.cjs`（`ALLOWED_PERMISSIONS` / `isAllowedPermission`）：
+  // 这些是 Chromium 的内部字符串名，写错一个不会报错、只会让对应能力静默失效，
+  // 所以它必须被单测钉住 —— 而 main.cjs 一 require 就起 Electron，测不了。
+  // 踩过的坑是 `clipboard-sanitized-write`：页面侧调 `navigator.clipboard.writeText()`，
+  // Chromium 对外暴露的权限名就是它（不是 `clipboard-write`），漏了它桌面端
+  // **所有复制按钮一起失效**，且不抛错、只在控制台留一条 unhandled rejection。
   winSession.setPermissionRequestHandler((wc, permission, callback, details) => {
     const requestingUrl = details?.requestingUrl || wc.getURL()
-    if (!isTrustedUrl(requestingUrl) || !allowedPermissions.has(permission)) {
+    if (!isTrustedUrl(requestingUrl) || !isAllowedPermission(permission)) {
       logMain('warn', `denied permission ${permission} from ${requestingUrl}`)
       callback(false)
       return
@@ -960,7 +982,7 @@ function configureSession(partition) {
   })
   winSession.setPermissionCheckHandler((wc, permission, requestingOrigin, details) => {
     const requestingUrl = details?.requestingUrl || wc.getURL() || requestingOrigin
-    if (!isTrustedUrl(requestingUrl) || !allowedPermissions.has(permission)) return false
+    if (!isTrustedUrl(requestingUrl) || !isAllowedPermission(permission)) return false
     if (permission === 'media' && details?.mediaType === 'video') return false
     return true
   })
@@ -1869,6 +1891,47 @@ if (!gotLock) {
       assertTrustedSender(event)
       return readDeviceSettings()
     })
+
+    /**
+     * 引擎环境变量开关（白名单，见 engine-env.cjs）。
+     *
+     * 为什么这条 IPC 必须存在：`SUPERAGENT_TAKEOVER_ENABLED` 这类开关只认进程
+     * 环境变量，而打包态从开始菜单启动、没有 shell 可设。没有界面入口就等于
+     * "这个功能永远是关的"—— 用户只能改服务端环境变量，而桌面端根本没有服务端。
+     *
+     * 只返回**白名单内**的项与它们的说明，不接受任意键：`APP_SECRET` /
+     * `SANDBOX_BACKEND` 这类值不可由渲染进程改写（安全边界，理由见该模块文档）。
+     */
+    ipcMain.handle('desktop:get-engine-env-settings', event => {
+      assertTrustedSender(event)
+      const dataDir = resolveLocalDataDir()
+      return {
+        ok: true,
+        dataDir,
+        // 界面要能显示"这项是布尔、默认关"，所以把规格一起下发而不是让前端另写一份
+        toggles: engineEnvSettings.ENGINE_TOGGLES.map(spec => ({ ...spec })),
+        values: engineEnvSettings.readEngineEnvSettings(dataDir),
+      }
+    })
+
+    /**
+     * 保存开关。写入后**不会**自动重启引擎：重启会中断正在进行的会话，
+     * 这一步留给用户显式触发（界面上的「重启本地后端」）。
+     * 返回写入后的值，让界面显示真相而不是它自己以为的值。
+     */
+    ipcMain.handle('desktop:save-engine-env-settings', (event, toggles) => {
+      assertTrustedSender(event)
+      try {
+        const dataDir = resolveLocalDataDir()
+        const saved = engineEnvSettings.writeEngineEnvSettings(dataDir, toggles)
+        logMain('info', `engine env toggles saved: ${JSON.stringify(saved)}`)
+        return { ok: true, values: saved }
+      } catch (err) {
+        // 写盘失败要如实回传：界面不能显示"已保存"然后重启后一切照旧
+        return { ok: false, reason: 'write-failed', message: err?.message || String(err) }
+      }
+    })
+
     // 当前 OS 账户：本地模式下它**就是**应用用户（一个 OS 账户一套数据，
     // 见 data-dir-acl.cjs 与 userData 的隔离根）。账户页显示它，用户才知道
     // 自己看到的是哪一份数据。

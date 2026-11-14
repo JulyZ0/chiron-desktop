@@ -625,3 +625,55 @@ class TestErrorHandling:
             # User u2 in same tenant sees nothing
             r = await c.get("/v1/memory/profile?user_id=u2&tenant_id=1")
             assert r.json()["total"] == 0
+
+
+# ── 装配状态：把"记忆不可用"变成可诊断 ──────────────────────────────
+
+
+class TestMemoryStatus:
+    """`GET /v1/memory/status`。
+
+    回归的根因：`_start_memory_service()` 整段被 `try/except` 包住，任何一步失败
+    （缺连接池、缺表、嵌入链路不通……）只留一行 warning，于是 `get_service()` 恒为
+    `None`，runtime 里所有 `self._memory is not None` 守卫全部静默为假。用户看到的
+    只是"记忆功能好像不存在"，其余端点一律回同一句 "PostgreSQL required" —— 而真实
+    原因可能是完全不同的东西。这个端点存在的唯一理由就是把那个原因说出来。
+    """
+
+    async def test_reports_available_when_service_is_wired(self, app):
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.get("/v1/memory/status")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["available"] is True
+            assert body["init_error"] is None
+
+    async def test_reports_reason_instead_of_opaque_503(self, monkeypatch):
+        import app.api.memory as mem_api
+
+        monkeypatch.setattr(mem_api, "get_service", lambda: None)
+        monkeypatch.setattr(
+            mem_api,
+            "get_memory_init_error",
+            lambda: "RuntimeError: PostgreSQL pool not initialized",
+        )
+        app = _make_app(None)
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.get("/v1/memory/status")
+            # 状态端点本身**必须**可用：用 503 会让前端分不清"没记忆"和"查不到状态"。
+            assert r.status_code == 200
+            body = r.json()
+            assert body["available"] is False
+            assert "PostgreSQL" in body["init_error"]
+
+    async def test_other_endpoints_still_fail_loud(self, monkeypatch):
+        """状态端点说得详细，不代表其它端点可以假装成功。"""
+        import app.api.memory as mem_api
+
+        monkeypatch.setattr(mem_api, "get_service", lambda: None)
+        app = _make_app(None)
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.get("/v1/memory/profile?user_id=u1&tenant_id=1")
+            assert r.status_code == 503
+            assert r.json()["success"] is False
+

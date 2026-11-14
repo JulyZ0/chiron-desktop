@@ -294,22 +294,28 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
         # 于是 low_il 带着一条写不动的 ACL 静默上线（这正是实测到的缺陷）。
         _labeled_workspaces.discard(uri)
 
-        # **执行层尚未接入，所以这里必须降级，不能声称 appcontainer 生效。**
+        # 执行层是**实测**判定的，不是开关：`appcontainer_exec_ready()` 会真的在
+        # 包 SID 下起一个进程并读回输出（`win_launch.appcontainer_smoke_test`）。
         #
-        # 建 AppContainer 进程要 attribute-list（`PROC_THREAD_ATTRIBUTE_SECURITY_
-        # CAPABILITIES`），`subprocess` 与 `asyncio.create_subprocess_exec` 都表达
-        # 不了，必须 `UpdateProcThreadAttribute` + `CreateProcessW` 走独立路径
-        # （`spawn_kwargs` 里那个 `_appcontainer` 键至今没有任何调用方消费）。
+        # 此前这里无条件降级，理由是"建 AppContainer 进程需要进程属性列表，
+        # `subprocess` 表达不了" —— 那个缺口现由 `win_launch.launch_appcontainer`
+        # / `open_appcontainer_session` 补上（`STARTUPINFOEXW` + `CreateProcessW`）。
         #
-        # 原来这里直接 `return IsolationDecision(want, want, reasons)`，于是
-        # `/v1/system/isolation`、前端面板与审计日志一致声称 appcontainer 生效，
-        # 而实际执行的仍是 low_il —— 正是 `child_applicable_level` 文档点名的
-        # "配置、状态、日志三处谎报"。
-        reasons.append(
-            "AppContainer 执行层尚未接入（建进程需要进程属性列表，subprocess 表达不了）；"
-            "按 low_il 执行"
-        )
-        return IsolationDecision(want, Level.LOW_IL, reasons)
+        # 与 `restricted` 的关键差异：AppContainer **不需要另一个用户令牌**，
+        # 因此不要求 `SeIncreaseQuotaPrivilege` —— 普通（非提权）账户也能用。
+        # 本机实测：非提权下 `restricted` 恒 `err=5`（`CreateProcessAsUserW` 起不来），
+        # 而 AppContainer 冒烟测试通过。所以它才是这台机器上真正可达的高档位。
+        if not _probe_appcontainer():
+            reasons.append(
+                _appcontainer_probe_error() or "AppContainer 执行层不可用（原因未知）"
+            )
+            labeled, lerr = _ensure_workspace_low_label(uri)
+            if not labeled:
+                reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
+                return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
+            return IsolationDecision(want, Level.LOW_IL, reasons)
+
+        return IsolationDecision(want, want, reasons)
 
     return IsolationDecision(want, want, reasons)
 
@@ -317,6 +323,8 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
 _job_ok: bool | None = None
 _low_il_ok: bool | None = None
 _restricted_ok: bool | None = None
+#: `appcontainer` 执行层是否可用（端到端冒烟结果，不是配置项）。
+_appcontainer_ok: bool | None = None
 #: 已打过标签的 workspace 路径（避免每次 resolve 都跑一次 icacls）
 _labeled_workspaces: set[str] = set()
 
@@ -406,6 +414,43 @@ def _probe_restricted() -> bool:
     return _restricted_ok
 
 
+def _probe_appcontainer() -> bool:
+    """`appcontainer` 档能否**真正执行** —— 端到端实测，不是开关。
+
+    判据是 `win_launch.appcontainer_smoke_test()`：真的在包 SID 下起一个进程
+    并把 stdout/stderr 读回来。只验证"profile 建得出来"远远不够 ——
+    attribute list、环境块、管道继承、路径授权任一处错了，进程都起不来。
+
+    关键事实：这条路**不需要提权**。`CreateProcessW` + `STARTUPINFOEXW` 不涉及
+    `SeIncreaseQuotaPrivilege`，所以普通账户可用；而 `restricted` 走的
+    `CreateProcessAsUserW` 需要该特权，非提权下恒 `err=5`。本机实测：
+    appcontainer 冒烟通过、restricted 起不来 —— 因此 appcontainer 是本机
+    **真正可达**的高档位。
+
+    `win_launch` 反向 import 本模块，所以只能在这里延迟导入（顶层导入会成环）。
+    """
+    global _appcontainer_ok
+    if _appcontainer_ok is None:
+        try:
+            from app.isolation import win_launch
+
+            _appcontainer_ok = win_launch.appcontainer_exec_ready()
+        except Exception as exc:  # noqa: BLE001 — 探测本身失败按"不可用"
+            logger.warning("appcontainer probe failed: %s", exc)
+            _appcontainer_ok = False
+    return _appcontainer_ok
+
+
+def _appcontainer_probe_error() -> str:
+    """AppContainer 探测失败的具体原因（给 `reasons` 用，避免只说"不可用"）。"""
+    try:
+        from app.isolation import win_launch
+
+        return win_launch.appcontainer_exec_error()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def appcontainer_workspace() -> str:
     """AppContainer 需要授权的那个目录（工作区根）。
 
@@ -429,12 +474,16 @@ def child_applicable_level(level: Level) -> Level:
     `CreateProcessAsUserW` 建进程的那一刻（父进程侧）。子进程自己启动后再怎么改令牌
     也无法获得 restricting SID —— 所以子进程入口只能做到 Low IL。
 
-    这意味着 `run_code` 的 worker（普通 `Popen` + 子进程自降级）在 `restricted` 档下
-    真实强度是 `low_il`。把它说成 `restricted` 就是谎报：配置、`/v1/system/isolation`、
+    `appcontainer` 同理：包 SID 由**父进程**在 `CreateProcessW` 的
+    `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 里指定，子进程无法给自己套包。
+    `run_code` 的 worker 是普通 `Popen` + 子进程自降级，因此真实强度只到 `low_il`
+    （Low IL 仍在硬底线之上：写不了工作区之外，不是"无隔离"）。
+
+    把它说成 `restricted` / `appcontainer` 就是谎报：配置、`/v1/system/isolation`、
     日志三处都会声称比实际更强。所以把"子进程能到哪一档"收成单一事实源，供
     `apply_in_child()` 与调用方共同引用。
     """
-    if level is Level.RESTRICTED:
+    if level in (Level.RESTRICTED, Level.APPCONTAINER):
         return Level.LOW_IL
     return level
 
@@ -520,15 +569,23 @@ def child_launch_argv(
 def spawn_kwargs(decision: IsolationDecision) -> dict[str, Any]:
     """给 `asyncio.create_subprocess_exec` / `subprocess.Popen` 的额外参数。
 
-    * `low_il`：子进程启动后自己降级（见 `apply_in_child`），父侧**没有**额外参数 ——
-      Windows 没有 `preexec_fn` 的等价物，所以由子进程入口统一处理。
-    * `appcontainer`：需要 attribute-list，无法用 `subprocess` 表达，走独立路径
-      （暂未接入；`resolve_level` 会先降级到 `low_il` 并在 reasons 里说明）。
+    **恒为空字典**，这是刻意的：两档自建路径都无法用 `subprocess` 表达。
+
+    * `low_il` / `job`：子进程启动后自己降级（见 `apply_in_child`），父侧没有参数 ——
+      Windows 没有 `preexec_fn` 的等价物。
+    * `restricted`：要受限令牌，必须 `CreateProcessAsUserW`
+      （`win_launch.launch_restricted` / `open_restricted_session`）。
+    * `appcontainer`：要进程属性列表（`STARTUPINFOEXW` +
+      `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`），必须 `CreateProcessW`
+      （`win_launch.launch_appcontainer` / `open_appcontainer_session`）。
+
+    此前这里塞了一个 `_appcontainer=True` 键，**没有任何消费者** ——
+    一旦有人把它展开进 `create_subprocess_exec(...)`，会直接
+    `TypeError: unexpected keyword argument`；更糟的是如果被某个 `**kwargs` 吞掉，
+    档位显示 appcontainer 而进程根本不在包里。宁可不返回键，也不留这个陷阱。
     """
-    kwargs: dict[str, Any] = {}
-    if decision.effective is Level.APPCONTAINER:
-        kwargs["_appcontainer"] = True
-    return kwargs
+    _ = decision  # 签名保留：调用方按 decision 决策，语义仍要一致
+    return {}
 
 
 #: 面向「执行一条命令」的 Job 额度：收束进程树与内存，**不设 CPU 上限**。

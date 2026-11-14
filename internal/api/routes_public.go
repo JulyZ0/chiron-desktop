@@ -62,6 +62,11 @@ func registerPublicEndpoints(
 	// 送到这里统一落进同一条审计流，排障时不必逐台去捞。
 	mux.Handle("POST /v1/internal/audit/exec", rlMW(internalTokenMW(cfg, http.HandlerFunc(ExecAuditIngestHandler))))
 
+	// 检查点上报：引擎在回合起止处建好快照（git ref + 未跟踪文件 CAS）后送到这里落表。
+	// 少了这条写入口，`project_checkpoints` 恒空、时间线接口永远返回空数组 ——
+	// 前端也就没有任何回滚点可渲染。归属由网关按 session_id 反查，请求体不作数。
+	mux.Handle("POST /v1/internal/checkpoints", rlMW(internalTokenMW(cfg, http.HandlerFunc(IngestProjectCheckpoint))))
+
 	// Python 引擎数据库/Redis 统一访问端点（X-Internal-Token 保护）
 	mux.Handle("POST /v1/internal/db/query", rlMW(internalTokenMW(cfg, http.HandlerFunc(systemHandler.DBQuery))))
 	mux.Handle("POST /v1/internal/db/execute", rlMW(internalTokenMW(cfg, http.HandlerFunc(systemHandler.DBExecute))))

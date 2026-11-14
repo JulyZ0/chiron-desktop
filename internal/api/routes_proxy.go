@@ -234,4 +234,12 @@ func registerProxyRoutes(
 	mux.Handle("PUT /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation"))))))
 	mux.Handle("DELETE /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation"))))))
 	mux.Handle("POST /v1/system/isolation/revoke", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation/revoke"))))))
+
+	// 还原点回滚：把某个检查点重新应用到项目工作区。
+	//
+	// 这里**不走** `newProxy`：那条通道只把路径与身份透传给引擎，而引擎的回滚端点
+	// 拿起 `checkpoint_id` 就直接写磁盘 —— 它无法判断这个 id 是不是调用者自己的。
+	// 所以归属校验必须发生在网关（见 checkpoint_restore.go 文件头），handler 自己
+	// 查一次 `(id, tenant, user)` 再转发。
+	mux.Handle("POST /v1/checkpoints/{cid}/restore", authMW(rlMW(http.HandlerFunc(CheckpointRestoreHandler(pythonClient)))))
 }

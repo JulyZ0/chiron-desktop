@@ -70,6 +70,22 @@ export interface ChironDesktopHost {
    */
   openPath?: (payload: { path: string; reveal?: boolean }) => Promise<OpenPathResult>
   /**
+   * 引擎环境变量开关（白名单）。
+   *
+   * 存在的理由：`SUPERAGENT_TAKEOVER_ENABLED` 这类开关只认**进程环境变量**，
+   * 而打包态从开始菜单启动、没有 shell 可设 —— 没有这个入口，功能就永远是关的。
+   * 老外壳没有这两个成员，界面要能降级成"当前外壳不支持"。
+   */
+  getEngineEnvSettings?: () => Promise<EngineEnvSettingsResult>
+  saveEngineEnvSettings?: (toggles: Record<string, boolean>) => Promise<EngineEnvSaveResult>
+  /**
+   * 只重启本地后端（引擎 + 网关），不重启整个应用。
+   *
+   * 改引擎 env 后需要它生效：重启后端即可，关掉窗口是多余的打扰。
+   */
+  restartLocalBackend?: () => Promise<{ ok: boolean; reason?: string; message?: string }>
+
+  /**
    * 自绘标题栏的窗口控制（frameless 窗口里没有系统按钮，只能由页面提供）。
    *
    * 老外壳没有这个成员 —— 那时窗口仍然是系统框，页面不该画标题栏，
@@ -103,6 +119,41 @@ export interface WindowTitleBarApi {
 export interface OpenPathResult {
   ok: boolean
   /** `empty-path` / `not-absolute` / `missing` / `open-failed` */
+  reason?: string
+  message?: string
+}
+
+/**
+ * 一个可配置的引擎开关（主进程 `ENGINE_TOGGLES` 下发的**规格**）。
+ *
+ * 规格由主进程给而不是前端另写一份：它同时是白名单 —— 前端照着渲染即可，
+ * 不需要（也不能）自己决定哪些 env 可以改。安全边界只能在主进程。
+ */
+export interface EngineEnvToggleSpec {
+  /** 环境变量名，也是读写配置时的键 */
+  env: string
+  type: 'boolean'
+  /** 引擎侧默认值：界面要显示"默认关"，否则用户看不出自己有没有改过 */
+  default: boolean
+}
+
+/** `getEngineEnvSettings` 的结果 */
+export interface EngineEnvSettingsResult {
+  ok: boolean
+  /** 开关配置文件所在的数据目录（排查时用户要能找到它） */
+  dataDir?: string
+  /** 白名单与规格 */
+  toggles: EngineEnvToggleSpec[]
+  /** 用户显式设置过的值；缺省项表示"没配过，用引擎默认值" */
+  values: Record<string, boolean>
+  reason?: string
+  message?: string
+}
+
+/** `saveEngineEnvSettings` 的结果：返回写盘后的真相，界面不应自行推断 */
+export interface EngineEnvSaveResult {
+  ok: boolean
+  values?: Record<string, boolean>
   reason?: string
   message?: string
 }
@@ -457,6 +508,65 @@ export const useDeviceStore = defineStore('device', () => {
   }
 
   /**
+   * 读取引擎功能开关（白名单）。
+   *
+   * 外壳不支持时返回 `null` 而不是抛错：老 preload 没有这两个成员属于
+   * **能力缺失**，界面据此显示"当前外壳不支持"即可。
+   */
+  async function loadEngineEnvSettings(): Promise<EngineEnvSettingsResult | null> {
+    const host = desktopHost()
+    if (!host || typeof host.getEngineEnvSettings !== 'function') return null
+    try {
+      const result = await host.getEngineEnvSettings()
+      return result && typeof result === 'object' ? result : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * 保存开关。**不**在这里重启引擎 —— 重启会打断正在进行的会话，
+   * 由用户在界面上显式触发（`restartBackend`）。返回主进程写盘后的真相。
+   */
+  async function saveEngineEnvSettings(
+    toggles: Record<string, boolean>,
+  ): Promise<EngineEnvSaveResult> {
+    const host = desktopHost()
+    if (!host || typeof host.saveEngineEnvSettings !== 'function') {
+      return { ok: false, reason: 'unsupported', message: 'desktop shell does not expose saveEngineEnvSettings' }
+    }
+    try {
+      const result = await host.saveEngineEnvSettings(toggles)
+      return result && typeof result === 'object'
+        ? result
+        : { ok: false, reason: 'unexpected-response', message: 'unexpected response' }
+    } catch (err) {
+      return { ok: false, reason: 'save-failed', message: (err as Error)?.message || String(err) }
+    }
+  }
+
+
+  /**
+   * 重启本地后端（不改开关、只让已保存的配置生效）。
+   *
+   * 与 `restart()` 不同：那个重启整个应用。改引擎 env 只需要重启后端进程，
+   * 不必关掉窗口 —— 否则用户每改一个开关就要重开一次客户端。
+   */
+  async function restartLocalBackend(): Promise<{ ok: boolean; reason?: string; message?: string }> {
+    const host = desktopHost()
+    if (!host || typeof host.restartLocalBackend !== 'function') {
+      return { ok: false, reason: 'unsupported', message: 'desktop shell does not expose restartLocalBackend' }
+    }
+    try {
+      const result = await host.restartLocalBackend()
+      if (result && typeof result === 'object') return result as { ok: boolean }
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, reason: 'restart-failed', message: (err as Error)?.message || String(err) }
+    }
+  }
+
+  /**
    * 重启应用（契约：切换后必须重启，避免两个后端并存）。
    * 若主进程的 `setMode` 自己已经 `app.relaunch()`，这里多半来不及执行 —— 无副作用。
    */
@@ -513,5 +623,8 @@ export const useDeviceStore = defineStore('device', () => {
     wipeLocalData,
     checkHelloAvailability,
     openConnectionSetup,
+    restartLocalBackend,
+    loadEngineEnvSettings,
+    saveEngineEnvSettings,
   }
 })

@@ -17,6 +17,7 @@ import EmptyState from '../common/EmptyState.vue'
 import HarnessProfilePanel from './HarnessProfilePanel.vue'
 import RunModePanel from './RunModePanel.vue'
 import IsolationPanel from './IsolationPanel.vue'
+import EngineEnvPanel from './EngineEnvPanel.vue'
 import AboutPanel from './AboutPanel.vue'
 import ShortcutSettingsPanel from './ShortcutSettingsPanel.vue'
 import LanguageSwitcher from '../common/LanguageSwitcher.vue'
@@ -510,6 +511,15 @@ onUnmounted(() => {
       :tab="$t('settings.isolation_title')"
     >
       <IsolationPanel />
+    </a-tab-pane>
+
+    <!-- ── 引擎功能开关：只认进程环境变量，桌面端没有 shell，只能在这里配 ── -->
+    <a-tab-pane
+      v-if="deviceStore.isDesktop"
+      key="engine-env"
+      :tab="$t('settings.engine_env_title')"
+    >
+      <EngineEnvPanel />
     </a-tab-pane>
 
     <!-- ── 关于：产品定位与源码仓库。纯静态信息，桌面端与 Web 端都展示 ── -->

@@ -32,7 +32,6 @@ from app.tools.registry import HIDDEN_SOURCES, SOURCE_BUILTIN, registry
 logger = logging.getLogger(__name__)
 
 USE_CAPABILITY_NAME = "use_capability"
-
 #: ⚠️ **固定 schema** —— 这正是本工具的全部意义（对齐 Reasonix usecap 的
 #: "schema 字节不随 MCP 增删而变"）。**不要**动态改它，尤其不要往 properties 里
 #: 加入 MCP 的工具名 —— 那会让请求体重新随后端漂移，把这个问题原样带回来。
@@ -63,14 +62,44 @@ def _available() -> list[str]:
     return [c["name"] for c in registry.list_capabilities()]
 
 
+def _selected_plugins() -> list[str]:
+    """本次对话选中的插件（MCP server 名）；空列表 = 不限制。
+
+    这里**必须**读工具上下文而不是只看 registry：MCP / 插件工具是隐藏来源，不进
+    模型可见的工具清单，因此 runtime 的 `_restrict_tools_to_plugins` 对它们无效
+    （它筛的是可见清单）。代理层是唯一还能落实"用户挑了哪几个插件"的地方；
+    它不读，用户在对话里挑插件就是个纯 UI 动作。
+    """
+    try:
+        from app.tools.context import get_plugin_names
+
+        return get_plugin_names()
+    except ImportError:  # pragma: no cover — 上下文模块不可用时视为未选择
+        return []
+
+
+def _allowed(name: str, selected: list[str]) -> bool:
+    """能力是否在当前对话的插件选择范围内。
+
+    `selected` 为空 ⇒ 不限制（用户没挑 = 全都要）。非空时按 `{server}_{tool}`
+    的命名前缀归属判定 —— 与 `_restrict_tools_to_plugins` 同一口径，避免两处
+    对"这个工具属于哪个插件"给出不同答案。
+    """
+    if not selected:
+        return True
+    return any(name.startswith(f"{plugin}_") for plugin in selected)
+
+
 async def use_capability(
     capability: str = "", arguments: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """调用一个**隐藏来源**（MCP / 插件）的能力；无参时列出可用能力。"""
     name = (capability or "").strip()
+    selected = _selected_plugins()
     if not name:
-        caps = registry.list_capabilities()
-        return {
+        # 只列当前对话选中的那几个：列出用户明确排除的插件，模型会去调用并撞墙。
+        caps = [c for c in registry.list_capabilities() if _allowed(c["name"], selected)]
+        out: dict[str, Any] = {
             "capabilities": caps,
             "count": len(caps),
             "note": (
@@ -78,6 +107,12 @@ async def use_capability(
                 "These are external integrations; built-in tools are called directly."
             ),
         }
+        if selected:
+            out["scoped_to_plugins"] = selected
+            out["note"] += (
+                f" This conversation is scoped to plugins: {', '.join(selected)}."
+            )
+        return out
 
     tool = registry.get(name)
     if tool is None:
@@ -89,6 +124,17 @@ async def use_capability(
                 f"'{name}' is a built-in tool; call it directly instead of via "
                 f"{USE_CAPABILITY_NAME}"
             )
+        }
+    if not _allowed(name, selected):
+        # 明确拒绝而不是静默执行：用户没选这个插件，调用它属于越出本次对话的授权范围。
+        return {
+            "error": (
+                f"'{name}' belongs to a plugin that is not enabled for this conversation"
+            ),
+            "scoped_to_plugins": selected,
+            "available": [
+                c["name"] for c in registry.list_capabilities() if _allowed(c["name"], selected)
+            ],
         }
     return await registry.execute(name, dict(arguments or {}))
 

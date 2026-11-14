@@ -15,6 +15,44 @@ from app.providers.sdk_compat import drop_unsupported_params
 logger = logging.getLogger(__name__)
 
 
+def _anthropic_usage(usage: object) -> tuple[int, int]:
+    """把 Anthropic 的 usage 归一成 ``(总输入 token, 其中命中缓存的 token)``。
+
+    ## 为什么必须归一
+
+    Anthropic 的计数口径与 OpenAI **不同**：``input_tokens`` 只算"未命中缓存"的
+    那部分，命中缓存与写入缓存的 token 在 ``cache_read_input_tokens`` /
+    ``cache_creation_input_tokens`` 两个独立字段里。直接把 ``input_tokens`` 落库
+    会让总输入**少报** —— 长会话里缓存命中常占输入的大半，于是「输入 token」
+    与按 token 折算的成本同时系统性偏低，而会话统计里缓存命中率恒为 0
+    （``cached_tokens`` 从来没被填过)。
+
+    归一后与 OpenAI 口径一致：总量 + 其中命中的子集。下游（截断判定、成本换算、
+    缓存命中率）就只需要一套规则：``cached / input``。
+
+    取不到就回 0 —— 统计宁可少算，也不要因为某个字段缺失让整条流式响应失败
+    （与 ``cached_tokens_from_usage`` 的取舍一致）。
+    """
+    if usage is None:
+        return 0, 0
+
+    def _int(name: str) -> int:
+        value = getattr(usage, name, 0)
+        return int(value) if isinstance(value, int) and value > 0 else 0
+
+    plain = _int("input_tokens")
+    created = _int("cache_creation_input_tokens")
+    read = _int("cache_read_input_tokens")
+    # 兼容别的 SDK 版本把命中量放在嵌套 details 里
+    if read == 0:
+        details = getattr(usage, "prompt_tokens_details", None)
+        if details is not None:
+            nested = getattr(details, "cached_tokens", None)
+            if isinstance(nested, int) and nested > 0:
+                read = nested
+    return plain + created + read, read
+
+
 class AnthropicProvider(LLMProvider):
     name = "anthropic"
 
@@ -68,6 +106,7 @@ class AnthropicProvider(LLMProvider):
             kwargs["tools"] = self._convert_tools(tools)
 
         input_tokens = 0
+        cached_tokens = 0
         output_tokens = 0
         # M23 边界：流式这里**不做换 key 重试**。`client.messages.stream()` 是把"打开流"
         # 与"消费事件"包在一起的上下文管理器，而换 key 只允许发生在"还没 yield 过任何东西"
@@ -117,11 +156,16 @@ class AnthropicProvider(LLMProvider):
                 if final.stop_reason == "max_tokens":
                     finish = "length"
 
+                # 用量口径统一在 _anthropic_usage 里：Anthropic 的 `input_tokens`
+                # 只算**未命中缓存**的部分，命中/写入缓存是独立字段 —— 不合并回来，
+                # 长会话的输入量与按 token 折算的成本都会系统性偏低。
+                final_input, final_cached = _anthropic_usage(getattr(final, "usage", None))
                 yield ChatResponse(
                     tool_calls=tool_calls,
                     finish_reason=finish,
-                    input_tokens=input_tokens or getattr(final.usage, "input_tokens", 0),
+                    input_tokens=final_input or input_tokens,
                     output_tokens=output_tokens or getattr(final.usage, "output_tokens", 0),
+                    cached_tokens=final_cached,
                 )
         except Exception:
             await self._report_failure(key_item)
@@ -194,12 +238,15 @@ class AnthropicProvider(LLMProvider):
         if resp.stop_reason == "max_tokens":
             finish = "length"
 
+        # 与流式路径同一套口径（见 _anthropic_usage）：`input_tokens` 不含缓存部分。
+        resp_input, resp_cached = _anthropic_usage(resp.usage)
         return ChatResponse(
             content=content,
             tool_calls=tool_calls,
             finish_reason=finish,
-            input_tokens=resp.usage.input_tokens,
+            input_tokens=resp_input,
             output_tokens=resp.usage.output_tokens,
+            cached_tokens=resp_cached,
         )
 
     async def embed(self, text: str, model: str) -> EmbeddingResponse:

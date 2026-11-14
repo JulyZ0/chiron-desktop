@@ -730,6 +730,10 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	// 每轮累计用量：喂 FinishTurn（缓存命中率/每轮模型）与计费。**只收 `done` 的累计值** ——
 	// `usage` 是按次增量，并入会导致重复计费，守卫见 usageTotals.withEvent 与其单测。
 	var usage usageTotals
+	// 按模型归集的**增量**（`usage` 事件的 model 字段）。整轮成本必须按各自模型
+	// 单价折算 —— 一次提交可跨多个模型（fallback / 摘要 / 子 Agent 外层调用），
+	// 拿单个模型名乘全部 token 会让成本错几倍。
+	var ledger modelLedger
 	var turnModel string
 	turnToolCallIDs := []string{} // S 修复：messages.tool_calls 列只存 tool_call id 集合（内容在 tool_calls 表）
 	// P1：host 证据采集器 —— 本轮所有工具事件都喂给它，收尾时据此判定完成情况。
@@ -886,8 +890,18 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 			budgetAxis = budgetAxisOf(evt.Content)
 		}
 		usage = usage.withEvent(evt.Type, evt.InputTokens, evt.OutputTokens, evt.CachedTokens)
-		// 模型名只在 done 事件里带：取最后一个非空值（一次提交可能跨多轮 LLM 调用）
-		if evt.Model != "" {
+		// 按模型归因：只取**按次增量**（`usage` 事件），它的 `model` 是这一次调用的
+		// 真实模型。`done` 的整轮合计没有归属，故不进 ledger（那也正是它不能用来
+		// 算成本的原因）。`subagent.*` 与 `usage` 同口径排除在租户额度外，见 withEvent。
+		if evt.Type == usageEventType && !strings.HasPrefix(evt.Type, subagentEventPrefix) {
+			ledger.add(evt.Model, evt.InputTokens, evt.OutputTokens, evt.CachedTokens)
+		}
+		// 模型名：`done` 携带整轮的终态模型，取最后一个非空值。
+		//
+		// **排除 `usage`**：它是逐次调用的事件，覆盖 `turnModel` 会让"这一轮用的
+		// 哪个模型"变成本轮**最后一次**调用用的模型 —— 摘要、子 Agent 外层调用
+		// 都会把它带偏，于是会话遥测与 `turns.model` 记的都是偏的。
+		if evt.Model != "" && evt.Type != usageEventType {
 			turnModel = evt.Model
 		}
 		// 增量落库：工具事件是关键节点，立即写；其余事件走 3s 节流。
@@ -958,30 +972,61 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	// 会话遥测里的花费恒为 0。这里按 `model_prices` 的单价换算：取不到价格就写
 	// NULL（"不知道"），而不是 0（"免费"）—— 两者在汇总里都是 0，但在明细里
 	// 不该互相冒充。
-	var costCents *int
-	if usage.input > 0 || usage.output > 0 {
-		costCents = usageCostCents(storeCtx, turnModel, usage.input, usage.output, usage.cached)
-	}
-	// **每个回合都记一行**，不再只在有 token 时写。
 	//
-	// 为什么：此前 `usage_events` 只收 `input>0 || output>0` 的回合，于是引擎没回报
-	// 用量的回合在这张表里**根本不存在**。计费页的「调用次数」与「tokens」若同源于此表
-	// 就必然自相矛盾 —— 用户看到「9 次调用 / 0 tokens」这种无法解释的组合。
-	// 现在零 token 回合也落库：调用次数 = 真实回合数，tokens = 真实用量，
-	// 二者同源、可对账（tokens 为 0 只表示"这一轮没拿到用量"，不是"没发生调用"）。
-	// `costCents` 仍只在有 token 时按价换算，取不到价格写 NULL（"不知道"）而非 0（"免费"）。
-	RecordUsageEvent(storeCtx, UsageEvent{
-		TenantID:     tenantID,
-		UserID:       userID,
-		SessionID:    sessionID,
-		TurnID:       turnID,
-		Model:        turnModel,
-		Provider:     agentCfg.provider.Value,
-		InputTokens:  usage.input,
-		OutputTokens: usage.output,
-		CachedTokens: usage.cached,
-		CostCents:    costCents,
-	})
+	// **按模型逐行**：本表的设计是"一行一次 LLM 调用"（见 UsageEvent 的文档），
+	// 而一次提交可跨多个模型。此前整轮只写一行、模型名取"最后一个非空值"，
+	// 于是整轮 token 全被算成那个模型的单价 —— 主模型与 fallback 差几倍时，
+	// 成本直接错几倍。`ledger.settle` 保证各行之和恒等于整轮入账量，
+	// 归因只改粒度、不改总额。
+	rows := ledger.settle(usage, turnModel)
+	if len(rows) == 0 {
+		// 零用量回合也要留一行。
+		//
+		// 为什么：此前 `usage_events` 只收 `input>0 || output>0` 的回合，于是引擎没
+		// 回报用量的回合在这张表里**根本不存在**。计费页的「调用次数」与「tokens」
+		// 若同源于此表就必然自相矛盾 —— 用户看到「9 次调用 / 0 tokens」这种无法解释
+		// 的组合。零 token 也落库：调用次数 = 真实回合数，tokens = 真实用量，
+		// 二者同源、可对账（tokens 为 0 只表示"这一轮没拿到用量"，不是"没发生调用"）。
+		rows = []modelUsage{{Model: turnModel}}
+	}
+
+	// 整轮金额按**精确值**累加，最后只取整一次。
+	//
+	// 不能把逐行已取整的分相加：每行都有「不足 1 分记 1 分」的抬升，3 次各 0.3 分
+	// 的调用相加会变成 3 分而不是 0.9 分 —— 贵一倍多。逐行落库仍必须写整数分
+	// （列是 integer），所以两套口径分开算（见 aggregateCostCents）。
+	turnCostUSD := 0.0
+	costUnknown := false
+	hasBillableRows := false
+	for _, row := range rows {
+		billable := row.input > 0 || row.output > 0
+		var costCents *int
+		if billable {
+			costCents = usageCostCents(storeCtx, row.Model, row.input, row.output, row.cached)
+			hasBillableRows = true
+			if usd, ok := usageCostUSD(storeCtx, row.Model, row.input, row.output); ok {
+				turnCostUSD += usd
+			} else {
+				// 这一行有真实用量却取不到单价：整轮成本就**不可知**了。
+				// 不能把其余行的和当成整轮金额 —— 那是"少算了一部分"冒充"算完了"，
+				// 比 NULL（"不知道"）更难发现：界面会显示一个具体但偏小的数。
+				costUnknown = true
+			}
+		}
+		RecordUsageEvent(storeCtx, UsageEvent{
+			TenantID:     tenantID,
+			UserID:       userID,
+			SessionID:    sessionID,
+			TurnID:       turnID,
+			Model:        row.Model,
+			Provider:     agentCfg.provider.Value,
+			InputTokens:  row.input,
+			OutputTokens: row.output,
+			CachedTokens: row.cached,
+			CostCents:    costCents,
+		})
+	}
+	costCents := aggregateCostCents(turnCostUSD, costUnknown, hasBillableRows)
 
 	// 会话遥测实时层：读端（`GET /v1/sessions/{id}/metrics`）早就存在，
 	// 但**写入端从来没有** —— 热层永远为空，每次请求都落到 `turns` + `usage_events`

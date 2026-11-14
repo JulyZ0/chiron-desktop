@@ -383,13 +383,18 @@ class Settings(BaseSettings):
     #: 取值参考 `scripts/bench_sandbox.py` 实测出的"每实例安全并发数"。
     sandbox_service_max_concurrency: int = 0
 
-    #: Windows 原生执行隔离档位（`none` / `job` / `low_il` / `appcontainer`）。
+    #: Windows 原生执行隔离档位（`none` / `job` / `low_il` / `restricted` / `appcontainer`）。
     #:
     #: 本仓库是桌面端（Electron + 内嵌 PG/Redis），不该要求用户装 Docker，所以隔离
     #: 落在 Windows 自带机制上。实测（零提权）：`job` 能拦内存爆炸，`low_il` 还能
-    #: 挡住写用户目录，`appcontainer` 需先给目录授权否则子进程加载不了 DLL。
+    #: 挡住写用户目录；`restricted` 要 `SeIncreaseQuotaPrivilege`
+    #: （`CreateProcessAsUserW`），非提权账户恒 `err=5`；`appcontainer` 零提权可用，
+    #: 但包 SID 读不到 CPython 安装目录 ⇒ `python.exe` 起不来
+    #: （`0xC0000135`/`STATUS_DLL_NOT_FOUND`），因此**只适合跑原生命令**，
+    #: `run_code` 的 Python worker 会如实折算到 `low_il`（见 `child_applicable_level`）。
     #:
-    #: 空值 ⇒ 默认 `low_il`（Windows 上零提权且真能挡写）；非 Windows 上自然退化为
+    #: 空值 ⇒ 用 `app.isolation.DEFAULT_LEVEL`（Windows 上是 `restricted`，不可达时
+    #: 由 `resolve_level` 如实降级并在 `reasons` 里说明）；非 Windows 上自然退化为
     #: `none`，POSIX 继续走 `setrlimit`。**拼错会拒绝启动** —— 一个字母之差就等于
     #: 关掉隔离，不能猜。
     sandbox_isolation_level: str = ""

@@ -214,4 +214,30 @@ export default {
   isolation_running_unaffected: "Processes already running keep the previous tier; newly started processes use the new one.",
   isolation_change_failed: "Failed to switch the tier.",
   isolation_change_reason: "User switched the isolation tier in settings",
+
+  // ── Engine feature toggles (process env configurable from the desktop app) ──
+  engine_env_title: "Engine feature toggles",
+  engine_env_intro:
+    "These toggles control process-level engine capabilities. They only read environment variables, and the desktop app is launched from the Start menu with no shell to set them — so they must be configured here, otherwise the related features stay off forever.",
+  engine_env_restart_hint:
+    "Changes take effect only after the local backend restarts. Conversations in progress are not preserved.",
+  engine_env_default_on: "Engine default: on",
+  engine_env_default_off: "Engine default: off",
+  engine_env_not_set: "Not set (engine default applies)",
+  engine_env_explicitly_set: "Explicitly set",
+  engine_env_save: "Save toggles",
+  engine_env_saved: "Saved. Takes effect after the local backend restarts.",
+  engine_env_save_failed: "Failed to save: {detail}",
+  engine_env_load_failed: "Failed to read the toggle settings.",
+  engine_env_unsupported: "This desktop shell version does not support toggle settings. Please upgrade.",
+  engine_env_restart_now: "Restart local backend now",
+  engine_env_restarting: "Restarting…",
+  engine_env_restarted: "Local backend restarted. The toggles are now in effect.",
+  engine_env_restart_failed: "Restart failed: {detail}",
+  engine_env_superagent_takeover_enabled: "Scheduled Super-agent takeover",
+  engine_env_superagent_takeover_enabled_desc:
+    "When off, the engine never polls the scheduled takeovers you configured — they will not run even though the UI shows them.",
+  engine_env_memory_distill_enabled: "Per-turn memory distillation",
+  engine_env_memory_distill_enabled_desc:
+    "Adds one extra model call per turn to write the turn's key points into long-term memory (cost grows with conversation volume).",
 }
