@@ -73,6 +73,11 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	// 新增端点：性能监控
 	r.HandleFunc("GET /performance", h.GetPerformance)
 
+	// LLM 熔断读数与手动恢复。引擎 `/v1/gateway/reset-breaker` 早就存在，
+	// 但网关此前没有任何转发路由 —— 前端只认网关，于是这个能力实际上用不了。
+	r.HandleFunc("GET /gateway/breakers", h.GetGatewayBreakers)
+	r.HandleFunc("POST /gateway/reset-breaker", h.ResetGatewayBreaker)
+
 	// 新增端点：API Key 管理
 	r.HandleFunc("GET /api-keys", h.ListApiKeys)
 	// 运维类端点（租户/域名/数据库/Redis/模型/定时任务）—— /admin 全栈实装

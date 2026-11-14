@@ -50,10 +50,18 @@ LLM_KEY_RETRY = Counter(
     "LLM key rotation retries (outcome: retried/ok/skipped)",
     ["provider", "outcome"],
 )
+# M23：熔断状态。此前这个指标只有定义、**全仓零处 set** —— `/metrics` 抓到的永远是空
+# 序列，告警无从下手（"provider 熔断了"只能靠翻日志）。
+#
+# `kind` 维度是必须的：聊天与 embedding 用**两张独立**的熔断表（见 router.__init__），
+# 同名 provider 可能"chat 正常、embed 已熔断"。只用 provider 一个 label 会让两条序列
+# 互相覆盖，读数变成随机的那一条。
+# 取值 0=closed、1=half_open、2=open：半开单独给一个值，否则"正在试探"与"完全正常"
+# 在面板上分不出来，而那正是排查时要看的瞬间。
 LLM_CIRCUIT_STATE = Gauge(
     "llm_circuit_breaker_state",
-    "Circuit breaker state (0=closed, 1=open)",
-    ["provider"],
+    "Circuit breaker state (0=closed, 1=half_open, 2=open)",
+    ["provider", "kind"],
 )
 
 # ── 预算级 ──

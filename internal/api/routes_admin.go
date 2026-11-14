@@ -96,6 +96,13 @@ func registerAdminRoutes(
 	// Performance admin routes
 	mux.Handle("GET /v1/admin/performance", authMW(rlMW(platformReadMW(adminStrip))))
 
+	// LLM 熔断读数 / 手动恢复。
+	// 读用 platformReadMW（回的是全局运行状态，租户 admin 不该看见别家的 provider 熔断）；
+	// 重置用 platformWriteMW —— 它会把一个被判熔断的 provider **立刻重新放流量**，
+	// 是改变系统运行状态的写操作，与 queue/flush、redis/flush-all 同口径。
+	mux.Handle("GET /v1/admin/gateway/breakers", authMW(rlMW(platformReadMW(adminStrip))))
+	mux.Handle("POST /v1/admin/gateway/reset-breaker", authMW(rlMW(platformWriteMW(adminStrip))))
+
 	// API Key admin routes (direct handlers, avoid adminMux path mismatch)
 	mux.Handle("GET /v1/admin/api-keys", authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.ListLLMKeys)))))
 	mux.Handle("POST /v1/admin/api-keys", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.AddLLMKey)))))

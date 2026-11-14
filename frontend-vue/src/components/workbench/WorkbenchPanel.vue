@@ -29,6 +29,9 @@ import {
 import { highlightCodeBlocks } from '../chat/codeHighlighter'
 import { langOf, truncatePreview } from './previewCode'
 import { listProjectChanges, type ProjectChange, type ProjectChanges } from '../../api/projectChanges'
+// 还原点时间线独立成组件：回滚是写磁盘的操作，自带确认与结果展开，
+// 塞进这个已经千余行的面板只会让两边都难改。
+import CheckpointTimeline from './CheckpointTimeline.vue'
 import { pathKey, projectRelative } from './paths'
 import { describeApiError } from '../../utils/apiError'
 import { notify } from '../../utils/notify'
@@ -243,7 +246,7 @@ const selected = ref<ProjectFileEntry | null>(null)
 //
 // 这里**没有**暂存 / 丢弃 / 提交：它们都会写用户的仓库，其中"丢弃"真的会回退
 // 工作区。只读视图不提供需要撤销设计的按钮。
-const activeTab = ref<'files' | 'changes'>('files')
+const activeTab = ref<'files' | 'changes' | 'checkpoints'>('files')
 const changesLoading = ref(false)
 const changesError = ref('')
 const changesData = ref<ProjectChanges | null>(null)
@@ -405,9 +408,27 @@ function reload() {
 }
 
 /** 切页签：改动页签首次进入时才请求（用户不开这一页就不该有这次 git 调用） */
-function selectTab(tab: 'files' | 'changes') {
+function selectTab(tab: 'files' | 'changes' | 'checkpoints') {
   activeTab.value = tab
   if (tab === 'changes' && !changesData.value && !changesLoading.value) void loadChanges()
+}
+
+/**
+ * 回滚成功后的收尾。
+ *
+ * 这里**必须**让改动缓存与文件树双双失效：
+ *  - `changesData` 是回滚前的 git 视图，留着会让用户切过去看到已经不存在的改动；
+ *  - 文件树同理 —— 回滚会覆盖、新建、也可能删除文件，`childrenOf` 里那份目录
+ *    列表已经过时，而工作台是只读视图，用户没有别的地方能对照出"这里少了/多了"。
+ *
+ * 不立即重拉改动（用户通常还在看还原点页签），但**文件树必须立刻重拉**：
+ * 其他页签共用同一棵树，等用户切过去时它已经在显示旧内容了。
+ * 重拉走 `reload()`，它自增代次，会顺带丢弃所有在飞的旧目录请求。
+ */
+function onCheckpointRestored() {
+  changesData.value = null
+  changesError.value = ''
+  reload()
 }
 
 watch(
@@ -824,6 +845,14 @@ async function openWithSystem(entry: ProjectFileEntry) {
             class="wb-tab-count"
           >{{ changeCount }}</span>
         </button>
+        <button
+          type="button"
+          role="tab"
+          class="wb-tab"
+          :class="{ active: activeTab === 'checkpoints' }"
+          :aria-selected="activeTab === 'checkpoints'"
+          @click="selectTab('checkpoints')"
+        >{{ tr('chat.workbench_tab_checkpoints') }}</button>
       </div>
 
       <div
@@ -941,6 +970,18 @@ async function openWithSystem(entry: ProjectFileEntry) {
             class="wb-empty"
           >{{ tr('chat.workbench_changes_truncated') }}</div>
         </template>
+      </div>
+
+      <!-- 还原点页签：时间线与回滚。回滚会改写工作区，所以成功后要让"改动"
+           列表失效 —— 否则用户切过去看到的是回滚前的旧清单。 -->
+      <div
+        v-if="activeTab === 'checkpoints'"
+        class="wb-tree"
+      >
+        <CheckpointTimeline
+          :project-id="projectId"
+          @restored="onCheckpointRestored"
+        />
       </div>
 
       <div

@@ -338,6 +338,34 @@ export async function getDiagnostics(): Promise<DiagnosticsReport> {
   return data?.data ?? { generated_at: 0, status: 'skipped', counts: {}, checks: [] }
 }
 
+// ── LLM 熔断：读数与手动恢复 ─────────────────────────────────────────────
+
+/** 单个 provider 的熔断读数。空串表示引擎没报该表，与 'closed' 不同义。 */
+export interface GatewayBreaker {
+  provider: string
+  /** chat 熔断状态：closed / half_open / open */
+  chat: string
+  /** embedding 熔断状态，与 chat 是独立的两张表 */
+  embed: string
+  avg_latency_ms: number
+}
+
+/**
+ * 读取各 provider 的熔断状态。
+ *
+ * 引擎不可用时后端回 502（不是空列表）—— 空列表会被读成"没有 provider 熔断"，
+ * 而实际是"读不到"，两种情况的处置正好相反。
+ */
+export async function getGatewayBreakers(): Promise<GatewayBreaker[]> {
+  const { data } = await api.get('/v1/admin/gateway/breakers')
+  return data?.data?.breakers ?? []
+}
+
+/** 手动解除某 provider 的熔断（chat 与 embed 两张表一起清）。 */
+export async function resetGatewayBreaker(provider: string): Promise<void> {
+  await api.post('/v1/admin/gateway/reset-breaker', { provider })
+}
+
 // ── D3：用量目录（"花在哪"的构成，区别于配额用量的"还剩多少"）─────────────
 
 export interface UsageBucket {

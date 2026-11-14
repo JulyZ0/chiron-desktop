@@ -976,6 +976,70 @@ export async function listSkillResources(): Promise<WorkbenchResource[]> {
   return toWorkbenchResources(resp.data?.data?.skills)
 }
 
+/** 发现结果里的一条技能（`GET /v1/skills/discover` 的 local[] / remote[] 元素） */
+export interface DiscoveredSkill {
+  name: string
+  description: string
+  version: string
+  author: string
+  /**
+   * **安装地址**（单个技能定义的 JSON 地址）。
+   *
+   * 注意不是"这条来自哪份目录" —— 目录是数组，`POST /v1/skills/install {url}` 要求
+   * 目标是单个技能对象。目录条目没给出地址时这里是空串，前端据此禁用安装按钮，
+   * 避免"点了安装、后端回 must be a JSON object"这种假入口。
+   */
+  source: string
+  /** 条目所属目录地址（仅用于展示出处；本地已安装条目没有这个字段） */
+  catalogUrl: string
+  installed: boolean
+}
+
+export interface SkillDiscovery {
+  /** 已安装的技能 */
+  local: DiscoveredSkill[]
+  /** 远端目录里的技能（只有传了 catalogUrl 才非空） */
+  remote: DiscoveredSkill[]
+}
+
+function toDiscoveredSkills(raw: unknown): DiscoveredSkill[] {
+  if (!Array.isArray(raw)) return []
+  const out: DiscoveredSkill[] = []
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue
+    const rec = item as Record<string, unknown>
+    const name = typeof rec.name === 'string' ? rec.name : ''
+    if (!name) continue
+    out.push({
+      name,
+      description: typeof rec.description === 'string' ? rec.description : '',
+      version: typeof rec.version === 'string' ? rec.version : '',
+      author: typeof rec.author === 'string' ? rec.author : '',
+      source: typeof rec.source === 'string' ? rec.source : '',
+      catalogUrl: typeof rec.catalog_url === 'string' ? rec.catalog_url : '',
+      installed: rec.installed === true,
+    })
+  }
+  return out
+}
+
+/**
+ * 发现技能：不传 `catalogUrl` 只列已安装；传了则额外拉一份远端目录。
+ *
+ * 两份结果是**并列**的（不是"有远端就没本地"）：前端要靠 `installed` 判断
+ * "远端这个我装没装"，这需要同时看到本地列表。
+ */
+export async function discoverSkills(catalogUrl?: string): Promise<SkillDiscovery> {
+  const { data } = await api.get('/v1/skills/discover', {
+    params: catalogUrl ? { url: catalogUrl } : undefined,
+  })
+  const body = data?.data ?? {}
+  return {
+    local: toDiscoveredSkills(body.local),
+    remote: toDiscoveredSkills(body.remote),
+  }
+}
+
 /**
  * 插件（= MCP server）列表。用于"把插件带进对话"：选中后本次对话只放它提供的
  * 工具（见 python-engine/app/agent/runtime.py 的插件筛选）。

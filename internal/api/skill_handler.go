@@ -101,6 +101,26 @@ func identityParams(r *http.Request) url.Values {
 	return q
 }
 
+// forwardedQuery 合并客户端原始 query 与网关注入的身份参数。
+//
+// 历史缺陷：GET 分支此前只转发 identityParams(r).Encode()，把路径上客户端带的 query
+// **整个丢掉**。表现是 `GET /v1/skills/discover?url=...` 到引擎时已经没有 url，
+// 引擎于是走"列出本地技能"分支 —— 远端目录永远发现不到，而且**不报错**（静默降级，
+// 前端只会看到一份与本地列表一模一样的"发现结果"）。
+//
+// 身份参数后写覆盖：引擎无鉴权，网关是唯一可信边界，客户端不能靠 query 里的
+// user_id / tenant_id 冒充别人（见 identityParams 的说明）。
+func forwardedQuery(r *http.Request) url.Values {
+	q := r.URL.Query()
+	for k, vs := range identityParams(r) {
+		q.Del(k)
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
+	return q
+}
+
 // withQuery 把 query 追加到 path（path 可能已自带 query）。
 func withQuery(path, query string) string {
 	if query == "" {
@@ -126,7 +146,8 @@ func (h *SkillHandler) proxy(w http.ResponseWriter, r *http.Request) {
 		// 规范化转发路径：Python 端注册的是 /v1/skills（无尾斜杠）
 		basePath := strings.TrimSuffix(r.URL.Path, "/")
 		// 身份注入：GET 无 body，只能走 query（见 identityParams 的说明）。
-		path := withQuery(basePath, identityParams(r).Encode())
+		// 客户端原始 query 必须一并转发（如 discover 的 `url` / 删除的 `scope`）。
+		path := withQuery(basePath, forwardedQuery(r).Encode())
 		err = h.python.GetJSON(r.Context(), path, &result)
 	case "POST", "PUT":
 		var body map[string]interface{}

@@ -38,11 +38,15 @@ const apiMocks = vi.hoisted(() => ({
   post: vi.fn((): Promise<unknown> => Promise.resolve({ data: {} })),
   put: vi.fn((): Promise<unknown> => Promise.resolve({ data: {} })),
   delete: vi.fn((): Promise<unknown> => Promise.resolve({ data: {} })),
+  // 发现页签走独立封装（`api/index.ts:discoverSkills`），不是裸 api.get
+  discoverSkills: vi.fn((): Promise<unknown> =>
+    Promise.resolve({ local: [], remote: [] })),
 }))
 
 vi.mock('../../api', () => ({
   api: { get: apiMocks.get, post: apiMocks.post, put: apiMocks.put, delete: apiMocks.delete },
   listAgents: apiMocks.listAgents,
+  discoverSkills: apiMocks.discoverSkills,
 }))
 
 import SkillsView from '../SkillsView.vue'
@@ -77,6 +81,14 @@ describe('SkillsView（此前零测试）', () => {
     expect(apiMocks.get).toHaveBeenCalledWith('/v1/graphs')   // 反向引用要拉工作流图
     expect(apiMocks.listAgents).toHaveBeenCalled()
     expect(() => wrapper.unmount()).not.toThrow()
+  })
+
+  it('初始加载不主动发现（发现是显式动作，不能凭空多打一次远端）', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(apiMocks.discoverSkills).not.toHaveBeenCalled()
+    wrapper.unmount()
   })
 
   it('★ 来源一：Agent 的 skills 列 ⇒ 悬浮提示里出现该 Agent', async () => {

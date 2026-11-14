@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -271,6 +272,115 @@ func (h *AdminHandler) GetPerformance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	OK(w, stats)
+}
+
+// ── LLM 熔断状态与手动恢复 ──
+//
+// 引擎侧早就实现了熔断（`gateway/router.py`）与重置端点
+// `POST /v1/gateway/reset-breaker`，但**网关既没转发路由、前端也没入口** ——
+// 能力在，路径不通。前端只认网关（引擎不直接对外），所以运维实际上调不到它，
+// 只能等 `recovery_timeout` 自己半开。这两个端点把那条路接通。
+//
+// chat 与 embed 是**两张独立**的熔断表：embedding 打不通不该让聊天也不可用。
+// 因此读数与重置都必须覆盖两张，否则会留下"点了一次恢复、聊天好了、embedding 还在熔断"
+// 的错位状态，而运维看到的是同一个 provider 名字。
+
+// GatewayBreaker 是单个 provider 的熔断读数。
+type GatewayBreaker struct {
+	Provider string `json:"provider"`
+	// Chat / Embed 取 closed / half_open / open；引擎没报该表时为空串（不是 "closed"，
+	// 空串才表示"没有这一项"，否则会把"没采集到"显示成"健康"）。
+	Chat      string  `json:"chat"`
+	Embed     string  `json:"embed"`
+	AvgLatencyMs float64 `json:"avg_latency_ms"`
+}
+
+// GetGatewayBreakers 返回各 provider 的熔断状态（chat 与 embed 两张表并列）。
+//
+// 数据源是引擎 `/info` 的 `gateway.providers`，与 /admin/performance、monitor 面板同源。
+// 引擎不可用时回 502 而不是空列表：空列表会被读成"没有 provider 熔断"，而实际是
+// "读不到" —— 在排障页面上这两种结论的处置完全相反。
+func (h *AdminHandler) GetGatewayBreakers(w http.ResponseWriter, r *http.Request) {
+	if h.pythonClient == nil {
+		InternalError(w, "python engine not available")
+		return
+	}
+	info := h.fetchPyEngineInfo(r.Context())
+	if info == nil {
+		// 502 而不是空列表：空列表会被读成"没有 provider 熔断"，而实际是"读不到" ——
+		// 排障页上这两种结论的处置正好相反。
+		JSON(w, http.StatusBadGateway, APIResponse{Success: false, Error: "python engine unreachable"})
+		return
+	}
+
+	names := make([]string, 0, len(info.Gateway.Providers))
+	for name := range info.Gateway.Providers {
+		names = append(names, name)
+	}
+	// 排序：map 迭代顺序随机，不排序会让前端每次刷新都换一遍行序。
+	sort.Strings(names)
+
+	out := make([]GatewayBreaker, 0, len(names))
+	for _, name := range names {
+		p := info.Gateway.Providers[name]
+		out = append(out, GatewayBreaker{
+			Provider:     name,
+			Chat:         p.CircuitState,
+			Embed:        p.EmbedCircuitState,
+			AvgLatencyMs: round2(p.AvgLatencyMs),
+		})
+	}
+	OK(w, map[string]interface{}{"breakers": out})
+}
+
+// ResetGatewayBreaker 把手动恢复请求转发给引擎（body: {"provider": "openai"}）。
+//
+// 为什么不直接改网关本地状态：熔断表在**引擎进程**里，网关没有那份状态；
+// 在这里"记一笔已恢复"只会让读数与真实判定不一致。
+func (h *AdminHandler) ResetGatewayBreaker(w http.ResponseWriter, r *http.Request) {
+	if h.pythonClient == nil {
+		InternalError(w, "python engine not available")
+		return
+	}
+	var body struct {
+		Provider string `json:"provider"`
+	}
+	if err := DecodeJSON(w, r, &body); err != nil {
+		BadRequest(w, "invalid request body")
+		return
+	}
+	provider := strings.TrimSpace(body.Provider)
+	if provider == "" {
+		BadRequest(w, "provider is required")
+		return
+	}
+
+	var resp map[string]interface{}
+	err := h.pythonClient.PostJSON(r.Context(), "/v1/gateway/reset-breaker",
+		map[string]string{"provider": provider}, &resp)
+	if err != nil {
+		// 引擎对未知 provider 回 404。透传成 404 而不是 502：502 会被读成
+		// "引擎挂了"，而实际情况只是名字打错，处置完全不同（改名字 vs 修引擎）。
+		if strings.Contains(err.Error(), "returned 404") {
+			NotFound(w, "provider not found: "+provider)
+			return
+		}
+		logAndRespond(w, err, http.StatusBadGateway, "python engine error")
+		return
+	}
+
+	// 审计：这是**改变系统运行状态**的操作（解除熔断 = 立刻恢复向该 provider 发流量）。
+	// 出问题时必须能回答"谁在什么时候解除了哪个 provider 的熔断"。
+	userID := ""
+	var tenantID int16
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		userID = claims.UserID
+		tenantID = claims.TenantID
+	}
+	db.AuditLog(r.Context(), userID, tenantID, "gateway.reset_breaker",
+		"provider:"+provider, "manual circuit breaker reset", r.RemoteAddr, nil)
+
+	OK(w, resp)
 }
 
 // ── API Keys ──

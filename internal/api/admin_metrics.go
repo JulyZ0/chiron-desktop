@@ -314,8 +314,12 @@ type pyEngineInfo struct {
 	ActiveTasks   int     `json:"active_tasks"`
 	Gateway       struct {
 		Providers map[string]struct {
-			CircuitState string  `json:"circuit_state"`
-			AvgLatencyMs float64 `json:"avg_latency_ms"`
+			CircuitState string `json:"circuit_state"`
+			// EmbedCircuitState 是**独立的第二张**熔断表（见 python-engine
+			// gateway/router.py 的 _embed_breakers）：embedding 打不通不该让聊天也不可用。
+			// 不解析它就只看得见 chat 那一半，"embedding 已熔断、聊天正常"在面板上消失。
+			EmbedCircuitState string  `json:"embed_circuit_state"`
+			AvgLatencyMs      float64 `json:"avg_latency_ms"`
 		} `json:"providers"`
 		Cache *struct {
 			L1Hits  int64   `json:"l1_hits"`

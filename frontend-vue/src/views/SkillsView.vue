@@ -9,7 +9,7 @@ import {
   ThunderboltOutlined, DownloadOutlined, DeleteOutlined, PlayCircleOutlined,
   SearchOutlined, CodeOutlined, MessageOutlined, ShopOutlined, RobotOutlined,
 } from '@ant-design/icons-vue'
-import { api, listAgents } from '../api'
+import { api, listAgents, discoverSkills, type DiscoveredSkill, type SkillDiscovery } from '../api'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import AttachToAgentDialog from '../components/common/AttachToAgentDialog.vue'
@@ -291,6 +291,52 @@ async function handleGenerate() {
     genLoading.value = false
   }
 }
+
+// ── 发现（GET /v1/skills/discover）──
+//
+// 这是**唯一**能看到"远端有、本地没有"的入口：此前前端只有安装（要用户自己知道地址）
+// 与列表（只看已装），中间的"发现 → 挑选 → 安装"整段是断的。
+const catalogUrl = ref('')
+const discovery = ref<SkillDiscovery>({ local: [], remote: [] })
+const discoverLoading = ref(false)
+const discoverError = ref('')
+/** 是否已经拉过一次目录 —— 用来区分"还没拉"与"拉了但目录是空的" */
+const discoverDone = ref(false)
+
+async function handleDiscover() {
+  discoverLoading.value = true
+  discoverError.value = ''
+  try {
+    discovery.value = await discoverSkills(catalogUrl.value.trim() || undefined)
+    discoverDone.value = true
+  } catch (e) {
+    // 就地报错：拉取失败必须与"目录里确实没有技能"区分开，否则用户以为目录是空的。
+    discoverError.value = errorMessageText(e, tr('errors.operation_failed'))
+    discovery.value = { local: [], remote: [] }
+    discoverDone.value = false
+  } finally {
+    discoverLoading.value = false
+  }
+}
+
+/** 把发现结果里的条目装进本地（复用安装端点，装完刷新列表与发现结果） */
+async function installDiscovered(item: DiscoveredSkill) {
+  if (!item.source) {
+    message.warning(tr('agent.discover_no_install_url'))
+    return
+  }
+  installLoading.value = true
+  try {
+    await api.post('/v1/skills/install', { url: item.source })
+    message.success(tr('agent.skill_installed'))
+    await loadSkills()
+    await handleDiscover()
+  } catch (e) {
+    message.error(tr('errors.install_failed_error', { error: serverErrorDetail(e, '') }))
+  } finally {
+    installLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -561,6 +607,118 @@ async function handleGenerate() {
         </div>
       </TabPane>
 
+      <!-- ── 发现（远端目录）── -->
+      <TabPane
+        key="discover"
+        :tab="$t('agent.discover_skills')"
+      >
+        <div class="panel-card">
+          <h3 class="panel-title">
+            <ShopOutlined /> {{ $t('agent.skill_catalog_url') }}
+          </h3>
+          <Input
+            v-model:value="catalogUrl"
+            placeholder="https://example.com/skills.json"
+            :disabled="discoverLoading"
+            @press-enter="handleDiscover"
+          />
+          <p class="panel-hint">
+            {{ $t('agent.skill_catalog_hint') }}
+          </p>
+          <Button
+            type="primary"
+            :loading="discoverLoading"
+            class="install-btn"
+            @click="handleDiscover"
+          >
+            <template #icon>
+              <ShopOutlined />
+            </template>
+            {{ $t('agent.discover_pull') }}
+          </Button>
+        </div>
+
+        <!-- 拉取失败就地报错：不能让它显示成「目录里没有技能」 -->
+        <Alert
+          v-if="discoverError"
+          type="error"
+          show-icon
+          class="discover-alert"
+          :message="$t('errors.load_failed_please_retry_later')"
+          :description="discoverError"
+        />
+
+        <div
+          v-if="discovery.remote.length"
+          class="discover-list"
+        >
+          <div
+            v-for="item in discovery.remote"
+            :key="item.name"
+            class="discover-item"
+          >
+            <div class="discover-main">
+              <div class="card-name-line">
+                <span class="card-name">{{ item.name }}</span>
+                <Tag
+                  v-if="item.version"
+                  class="exec-tag"
+                >
+                  v{{ item.version }}
+                </Tag>
+                <Tag
+                  v-if="item.installed"
+                  color="green"
+                  class="exec-tag"
+                >
+                  {{ $t('agent.discover_installed_tag') }}
+                </Tag>
+              </div>
+              <span class="card-desc">{{ item.description }}</span>
+              <span
+                v-if="item.author"
+                class="discover-author"
+              >{{ item.author }}</span>
+            </div>
+            <Button
+              v-if="!item.installed"
+              type="primary"
+              ghost
+              :loading="installLoading"
+              :disabled="!item.source"
+              :title="item.source ? '' : $t('agent.discover_no_install_url')"
+              @click="installDiscovered(item)"
+            >
+              <template #icon>
+                <DownloadOutlined />
+              </template>
+              {{ $t('common.install') }}
+            </Button>
+          </div>
+        </div>
+        <EmptyState
+          v-else-if="!discoverLoading && !discoverError && discoverDone && catalogUrl.trim() && discovery.remote.length === 0"
+          size="page"
+          :icon="markRaw(ShopOutlined)"
+          :description="$t('agent.discover_remote_empty')"
+        />
+
+        <div
+          v-if="discovery.local.length"
+          class="discover-local"
+        >
+          <span class="detail-label">{{ $t('agent.skill_list') }}</span>
+          <div class="card-meta">
+            <Tag
+              v-for="s in discovery.local"
+              :key="s.name"
+            >
+              {{ s.name }}
+            </Tag>
+          </div>
+        </div>
+      </TabPane>
+
       <!-- ── AI 生成 ── -->
       <TabPane
         key="generate"
@@ -749,6 +907,24 @@ async function handleGenerate() {
 .or-divider { text-align: center; color: var(--text-tertiary); margin: 14px 0; }
 .mono-input :deep(textarea) { font-family: var(--font-mono); font-size: 12px; }
 .install-btn { margin-top: 14px; }
+.panel-hint { margin: 8px 0 0; font-size: var(--fs-xs); color: var(--text-tertiary); line-height: 1.5; }
+
+/* 发现页签：左侧条目信息、右侧安装按钮，窄屏时上下堆叠 */
+.discover-alert { margin-top: 14px; }
+.discover-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+.discover-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border: var(--hairline-width) solid var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+}
+.discover-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.discover-author { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.discover-local { display: flex; flex-direction: column; gap: 6px; margin-top: 20px; }
 .gen-alert { margin-top: 14px; }
 .gen-pre { margin: 12px 0 0; padding: 10px; background: var(--bg-secondary); border-radius: var(--radius-lg); font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-secondary); white-space: pre-wrap; max-height: 260px; overflow-y: auto; }
 

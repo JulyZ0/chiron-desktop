@@ -1594,7 +1594,16 @@ def _setup_routes(app: FastAPI) -> None:
 
     @app.get("/readyz")
     async def readyz() -> Any:
-        """K8s readiness: Redis + 至少一个 Provider 可用"""
+        """就绪探测：**只看 Redis**。
+
+        原 docstring 写的是 "Redis + 至少一个 Provider 可用"，但实现从来没检查过
+        Provider —— 运维据此以为"provider 全挂会 503"，实际仍然回 ready。
+
+        这里把说明对齐实现，而不是反过来加 Provider 检查：**没配 key 是合法的待配置
+        状态**（打包桌面态首次启动必然如此）。若因缺 provider 就回 503，壳层那段
+        "等业务就绪"会一直等到超时，用户连配置密钥的界面都进不去。Provider 的真实
+        可用性由 `/healthz/providers`（逐个探活）与 `llm_circuit_breaker_state` 指标回答。
+        """
         if _redis is None:
             return JSONResponse(
                 {"status": "not_ready", "reason": "redis not available"},

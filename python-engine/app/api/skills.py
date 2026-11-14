@@ -323,47 +323,74 @@ async def run_skill(
 async def discover_skills(
     url: str = "", user_id: str = "", tenant_id: int = 0
 ) -> dict[str, Any]:
+    """发现技能：`local` = 已安装，`remote` = 远端目录（给了 `url` 才有）。
+
+    为什么两份都要返回：安装决策是**对比**出来的 —— 前端要知道"远端这个我装没装"
+    （`installed`）以及"本地已经有的是哪些"。此前 url 分支把远端条目**塞进 `local`**、
+    `remote` 恒为空，等于键名在说谎；只传 url 时本地列表还会整个消失。
+
+    取回走 `app/tools/skill.py:_fetch_skill_json`（与 `skill_discover` / `skill_install`
+    同一入口）：SSRF 解析级校验 + **流式**体积上限都在那里。此前本端点自己调
+    `fetch_url_safe`，没有体积上限，同一个 `url` 在两个入口上策略不一致。
+    """
     store = _store_for(user_id, tenant_id)
-    results: list[dict[str, Any]] = []
 
-    if url:
-        try:
-            from app.config import settings
-            from app.http_client import shared_client
+    local: list[dict[str, Any]] = [
+        {
+            "name": s.name,
+            "description": s.description,
+            "version": s.version,
+            "author": s.author,
+            "source": s.source,
+            "installed": True,
+        }
+        for s in store.list()
+    ]
 
-            async with shared_client(timeout=settings.http_timeout_default) as client:
-                # SSRF 防护：同 install_skill —— url 由调用方控制，须走解析级校验。
-                from app.tools.ssrf import fetch_url_safe
+    if not url:
+        return {"local": local, "remote": []}
 
-                resp = await fetch_url_safe(client, url)
-                resp.raise_for_status()
-                items = resp.json()
-                installed_names = {s.name for s in store.list()}
-                for item in items:
-                    name = item.get("name", "")
-                    results.append(
-                        {
-                            "name": name,
-                            "description": item.get("description", ""),
-                            "version": item.get("version", ""),
-                            "author": item.get("author", ""),
-                            "source": item.get("source", url),
-                            "installed": name in installed_names,
-                        }
-                    )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"discover remote failed: {e}") from e
-    else:
-        for s in store.list():
-            results.append(
-                {
-                    "name": s.name,
-                    "description": s.description,
-                    "version": s.version,
-                    "author": s.author,
-                    "source": s.source,
-                    "installed": True,
-                }
-            )
+    from app.tools.skill import _fetch_skill_json
 
-    return {"local": results, "remote": []}
+    try:
+        payload = await _fetch_skill_json(url)
+    except ValueError as e:
+        # SSRF 校验不通过：这是**调用方**给错了 url，不是引擎故障。
+        raise HTTPException(status_code=400, detail=f"discover remote rejected: {e}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"discover remote failed: {e}") from e
+
+    if not isinstance(payload, list):
+        raise HTTPException(
+            status_code=400, detail="remote skill catalog must be a JSON array"
+        )
+
+    installed_names = {s.name for s in store.list()}
+    remote: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            # 目录里混进非对象条目时跳过该条，不让一个坏条目毁掉整份目录。
+            continue
+        name = item.get("name", "")
+        if not isinstance(name, str) or not name:
+            continue
+        # `source` 是**安装地址**，不是"这个条目从哪份目录来的"。
+        #
+        # 目录（数组）本身不能当安装地址 —— `POST /v1/skills/install {url}` 要求目标是
+        # 单个技能定义（JSON 对象），拿目录 url 去装只会报 "must be a JSON object"。
+        # 所以缺省留空（前端据此禁用安装按钮并说明原因），**不回填** `url`；
+        # 目录出处另放 `catalog_url`，两个概念各归各的键。
+        skill_url = item.get("source", "")
+        remote.append(
+            {
+                "name": name,
+                "description": item.get("description", ""),
+                "version": item.get("version", ""),
+                "author": item.get("author", ""),
+                "source": skill_url if isinstance(skill_url, str) else "",
+                "catalog_url": url,
+                "installed": name in installed_names,
+            }
+        )
+
+    return {"local": local, "remote": remote}

@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
 
 import WorkbenchPanel from '../WorkbenchPanel.vue'
+import CheckpointTimeline from '../CheckpointTimeline.vue'
 
 /**
  * 把目录请求拦在"还没回来"的状态，用来构造切项目时的竞态。
@@ -38,6 +39,15 @@ vi.mock('../../../api/projectFiles', () => ({
   projectFileObjectURL: () => Promise.reject(new Error('unused')),
   isImagePath: () => false,
   isPdfPath: () => false,
+}))
+
+/**
+ * 还原点页签会真的被渲染，所以它的数据面也要拦掉 —— 否则这里会去打真实网络。
+ * 返回空列表即可：本文件要验证的是**回滚事件如何驱动文件树**，不是时间线本身。
+ */
+vi.mock('../../../api/checkpoints', () => ({
+  listProjectCheckpoints: () => Promise.resolve([]),
+  restoreCheckpoint: () => Promise.reject(new Error('unused')),
 }))
 
 /** 让 resolve 之后串起来的微任务与 Vue 的下一次渲染跑完 */
@@ -186,5 +196,53 @@ describe('二进制文件的打开入口', () => {
 
     // 必须拼成绝对路径：openPath 只接受绝对路径，相对路径会被主进程拒掉
     expect(openPath).toHaveBeenCalledWith({ path: 'C:\\proj\\简历.docx' })
+  })
+})
+
+/**
+ * 回滚会改写工作区，但工作台的文件树是**独立于时间线**的另一份缓存。
+ *
+ * 不重拉的后果不是报错，而是"切过去还看见已经不存在的文件"——用户会据此以为
+ * 回滚没生效，或者更糟：点开一个刚被删掉的文件去预览。这条必须靠事件联动守住。
+ */
+describe('回滚后文件树失效', () => {
+  beforeEach(() => {
+    net.calls.length = 0
+  })
+
+  it('时间线发出 restored 后重新拉根目录', async () => {
+    const wrapper = mountPanel({ projectId: 'p1' })
+    await flush()
+    expect(net.calls).toHaveLength(1)
+    net.calls[0].resolve(listing('C:/p1', 'OLD.ts'))
+    await flush()
+    expect(wrapper.text()).toContain('OLD.ts')
+
+    // 切到还原点页签，让 CheckpointTimeline 真正挂载
+    const tabs = wrapper.findAll('.wb-tab')
+    await tabs[tabs.length - 1].trigger('click')
+    await flush()
+
+    const timeline = wrapper.findComponent(CheckpointTimeline)
+    expect(timeline.exists(), '还原点页签没有渲染出时间线组件').toBe(true)
+    timeline.vm.$emit('restored', {
+      ok: true,
+      written: [], added: [], deleted: [], pruned_dirs: [],
+      failed: [], skipped_removed: [], protected_removed: [], unsupported: [],
+    })
+    await flush()
+
+    // 必须真的发出新的根目录请求：只清缓存不重拉的话，树会停在空树上
+    const reissue = net.calls.filter(c => c.path === '' && c.projectId === 'p1')
+    expect(reissue.length, '回滚后没有重拉项目根目录').toBe(2)
+
+    reissue[1].resolve(listing('C:/p1', 'NEW.ts'))
+    await flush()
+
+    // 文件树只在 files 页签渲染；切回去看它是否已经换成了回滚后的内容
+    await wrapper.findAll('.wb-tab')[0].trigger('click')
+    await flush()
+    expect(wrapper.text()).toContain('NEW.ts')
+    expect(wrapper.text()).not.toContain('OLD.ts')
   })
 })

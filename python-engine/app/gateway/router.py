@@ -117,12 +117,16 @@ class GatewayRouter:
             for item in (provider_catalog or [])
             if isinstance(item, dict) and item.get("id")
         }
-        self._breakers = {name: CircuitBreaker() for name in providers}
+        self._breakers = {
+            name: CircuitBreaker(provider=name, kind="chat") for name in providers
+        }
         # embed 用**独立**的熔断表：embeddings 打不通不该让聊天也不可用。
         # 真实故障：opencode-go 的 base_url 下没有 /embeddings（返回 HTML 404），
         # 该失败连续累积把**共用**的熔断器打到 15 次，于是连 chat_stream 都进不去 ——
         # 用户看到的却是 "no LLM provider available for model=…"，把方向引到了模型上。
-        self._embed_breakers = {name: CircuitBreaker() for name in providers}
+        self._embed_breakers = {
+            name: CircuitBreaker(provider=name, kind="embed") for name in providers
+        }
         self._latencies: dict[str, float] = {
             name: 500.0 for name in providers
         }  # moving avg ms
@@ -159,8 +163,12 @@ class GatewayRouter:
         所以 preset 要显式带上，否则按 `provider/model` 前缀路由的自定义 provider 匹配不到。
         """
         self._providers[name] = provider
-        self._breakers.setdefault(name, CircuitBreaker())
-        self._embed_breakers.setdefault(name, CircuitBreaker())
+        # 先判存在再构造：`setdefault(name, CircuitBreaker(...))` 的第二参数是**先求值**的，
+        # 而熔断器构造即上报 closed —— 重复注册会把一个已熔断 provider 的指标刷回 0。
+        if name not in self._breakers:
+            self._breakers[name] = CircuitBreaker(provider=name, kind="chat")
+        if name not in self._embed_breakers:
+            self._embed_breakers[name] = CircuitBreaker(provider=name, kind="embed")
         self._latencies.setdefault(name, 500.0)
         if preset is not None:
             self._catalog.setdefault(name, preset)
@@ -487,15 +495,24 @@ class GatewayRouter:
         return self.PROBE_MODELS.get(name, "")
 
     async def health_check(self) -> dict[str, Any]:
-        """返回各 Provider 健康状态"""
+        """返回各 Provider 健康状态。
+
+        `circuit` 取的是**探活之后**的值。此前先取快照再探活：探活失败把熔断器打到
+        OPEN，返回的却仍是 "closed" —— 管理端据此判定"健康"，而实际上下一次真实调用
+        就会被拒。读数必须反映这次探活的结果，而不是探活前的样子。
+        """
         result = {}
         for name, provider in self._providers.items():
-            state = self._breakers[name].state.value
+            breaker = self._breakers[name]
             probe_model = self._probe_model(name)
             if not probe_model:
                 # 目录未给探活模型（自定义端点等）：不探活，避免用错模型名
                 # 触发 404 → 误开熔断；状态交由真实调用反馈。
-                result[name] = {"status": "ok", "circuit": state, "probe": "skipped"}
+                result[name] = {
+                    "status": "ok",
+                    "circuit": breaker.state.value,
+                    "probe": "skipped",
+                }
                 continue
             try:
                 # 尝试廉价模型调用 probe
@@ -506,13 +523,21 @@ class GatewayRouter:
                     temperature=0,
                 )
                 if resp.finish_reason != "error":
-                    self._breakers[name].record_success()
-                    result[name] = {"status": "ok", "circuit": state}
+                    breaker.record_success()
+                    result[name] = {"status": "ok", "circuit": breaker.state.value}
                 else:
-                    result[name] = {"status": "error", "circuit": state, "message": "probe failed"}
+                    result[name] = {
+                        "status": "error",
+                        "circuit": breaker.state.value,
+                        "message": "probe failed",
+                    }
             except Exception as e:
-                self._breakers[name].record_failure()
-                result[name] = {"status": "error", "circuit": state, "message": str(e)}
+                breaker.record_failure()
+                result[name] = {
+                    "status": "error",
+                    "circuit": breaker.state.value,
+                    "message": str(e),
+                }
         return result
 
     async def reset_breaker(self, provider_name: str) -> bool:
@@ -520,10 +545,19 @@ class GatewayRouter:
 
         返回 True 表示成功，False 表示 provider 不存在。
         用于管理端手动恢复熔断的 provider。
+
+        **两张表一起清**：chat 与 embed 是各自独立的熔断表（见 __init__）。只清 chat
+        会留下一个"管理端点了恢复、聊天好了、但 embedding 仍被判熔断"的错位状态 ——
+        而运维看到的是同一个 provider 名字，无从判断为什么一半可用。
+
+        用 ``reset()`` 而不是新建实例：新建会丢掉 ``provider``/``kind`` 身份，之后的
+        状态再也不会写进 ``llm_circuit_breaker_state``（指标停在上一次的 open 值上）。
         """
         if provider_name not in self._breakers:
             return False
-        self._breakers[provider_name] = CircuitBreaker()
+        self._breakers[provider_name].reset()
+        if provider_name in self._embed_breakers:
+            self._embed_breakers[provider_name].reset()
         logger.info("Circuit breaker reset for provider=%s", provider_name)
         return True
 
@@ -532,11 +566,25 @@ class GatewayRouter:
             await p.close()
 
     def stats(self) -> dict[str, Any]:
-        """返回路由器统计"""
+        """返回路由器统计。
+
+        `embed_circuit_state` 与 `circuit_state` 并列给出：chat 与 embed 是两张独立
+        熔断表（见 `__init__`），而 `reset_breaker()` 会把两张一起清。只报 chat 的话，
+        "embedding 被熔断了但聊天正常"这种真实形态在读数上完全看不出来 —— 而这正是
+        当初把两张表拆开要解决的问题（opencode-go 缺 /embeddings 把整站聊天带崩）。
+
+        新增字段而非改结构：Go 侧（`internal/api/admin_metrics.go` 的 `pyEngineInfo`）
+        按字段名解析 JSON，多出来的字段会被忽略，现有读数不会因为这次加字段而失败。
+        """
         return {
             "providers": {
                 name: {
                     "circuit_state": self._breakers[name].state.value,
+                    "embed_circuit_state": (
+                        self._embed_breakers[name].state.value
+                        if name in self._embed_breakers
+                        else ""
+                    ),
                     "avg_latency_ms": round(self._latencies[name], 1),
                 }
                 for name in self._providers
