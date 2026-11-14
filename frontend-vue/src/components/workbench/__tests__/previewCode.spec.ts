@@ -32,10 +32,12 @@ describe('预览语言识别', () => {
   })
 
   it('无扩展名 / 未知扩展名返回空串', () => {
-    // 空串让高亮器走 highlightAuto，而不是解析失败或抛错
-    expect(langOf('Dockerfile')).toBe('')
+    // 空串让高亮器走 highlightAuto，而不是解析失败或抛错。
+    // 注意 `Dockerfile` 不在此列 —— 它由整名映射识别为 dockerfile，
+    // 见下面「无扩展名 / 约定文件名」那组。
     expect(langOf('weird.zzz')).toBe('')
     expect(langOf('')).toBe('')
+    expect(langOf('LICENSE')).toBe('')
   })
 
   it('路径中间的点不干扰扩展名判定', () => {
@@ -79,5 +81,24 @@ describe('大文件截断', () => {
     expect(truncatePreview('')).toEqual({ text: '', dropped: 0 })
     // 后端可能整段省略 content（二进制），调用方传 undefined 时不该抛
     expect(truncatePreview(undefined as unknown as string)).toEqual({ text: '', dropped: 0 })
+  })
+})
+
+describe('无扩展名 / 约定文件名', () => {
+  it('go.mod / Makefile 这类按整名识别', () => {
+    // 它们的"扩展名"要么是 mod（查不到），要么根本没有 —— 只按扩展名会全部落空
+    expect(langOf('go.mod')).toBe('go')
+    expect(langOf('Makefile')).toBe('makefile')
+    expect(langOf('Dockerfile')).toBe('dockerfile')
+  })
+
+  it('整名优先于扩展名', () => {
+    // go.mod 的扩展名是 mod，若先按扩展名查就会落空
+    expect(langOf('sub/dir/go.mod')).toBe('go')
+  })
+
+  it('大小写不敏感', () => {
+    expect(langOf('GO.MOD')).toBe('go')
+    expect(langOf('makefile')).toBe('makefile')
   })
 })

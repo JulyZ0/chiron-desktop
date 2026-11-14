@@ -31,6 +31,33 @@ def _safe_path(path: str, root: str) -> Path:
 #: 分页的意义是"给一个能继续的窗口"，不是"一次读完"。
 READ_FILE_DEFAULT_LIMIT = 2000
 
+#: 单行最大字符数。**只有行数上限是不够的**：一行 minified 的 JS/JSON/CSS 可以是几 MB，
+#: `limit=2000` 行听起来很节制，实际一次就灌满整个上下文窗口，而模型看到的还只是
+#: "第 1 行"——它连"这文件很大"都判断不出来。超出的部分在行内截断并标注真实长度。
+READ_FILE_MAX_LINE_CHARS = 500
+
+#: 单次读返回的总字节预算。行数上限 × 单行上限仍可能过大（2000 × 500 = 1MB），
+#: 所以在行数之外再压一层字节闸门：到量即停，并把"从哪继续"如实告诉模型。
+READ_FILE_MAX_BYTES = 64 * 1024
+
+#: grep 命中的单行上限。比 `read_file` 更短：一次可能命中几十上百行，
+#: 命中行的价值在"定位到哪"，不在"整行原文"——细节让模型再用 read_file 取窗口。
+GREP_MAX_LINE_CHARS = 240
+
+#: grep 单次返回的总字节预算。命中的是**线索**，不是正文。
+GREP_MAX_BYTES = 48 * 1024
+
+
+def _clip_line(line: str, limit: int) -> str:
+    """把过长的行截断，并**在行内标注真实长度**。
+
+    标注不是装饰：模型需要知道"这里被截了"，否则它会把半行代码当成完整语句去改，
+    或者据此判断"这个文件就长这样"。省略号单独给出，尾巴里带原长度。
+    """
+    if len(line) <= limit:
+        return line
+    return f"{line[:limit]}… [line truncated: {len(line)} chars total]"
+
 
 async def read_file(path: str, offset: int = 0, limit: int = READ_FILE_DEFAULT_LIMIT) -> dict[str, Any]:
     """读文件（分页）。
@@ -41,6 +68,16 @@ async def read_file(path: str, offset: int = 0, limit: int = READ_FILE_DEFAULT_L
     **续读**：`offset` 是 0-based 行偏移，`limit` 是本次最多返回的行数。被截断时返回值
     带 `truncated`，且正文末尾附一行 `[more lines below; pass offset=N to continue]` ——
     模型据此继续读，不必靠比较 `offset + limit` 与 `total_lines` 去猜还有没有下文。
+
+    **三层预算，缺一层都会被绕过**：
+
+    1. 行数（`limit`）：防"文件有一万行"；
+    2. 单行长度（`READ_FILE_MAX_LINE_CHARS`）：防"文件只有三行，但第一行是 2MB 的
+       minified bundle"。只有行数上限时，这条路一次就能把上下文灌满；
+    3. 总字节（`READ_FILE_MAX_BYTES`）：行数 × 单行仍是 1MB 量级，需要最后一道闸。
+
+    三层都在**工具层**做，不动后端契约：`limit=0` 读全文是 `edit_file` 的依赖
+    （精确替换需要原始字节），截断必须发生在"给模型看"这一层。
     """
     from app.backends.context import get_backend
     from app.tools.fs_guard import observe
@@ -52,16 +89,40 @@ async def read_file(path: str, offset: int = 0, limit: int = READ_FILE_DEFAULT_L
         return {"error": result.error}
     # 横切逻辑留在工具层：read-before-write 观测（写入校验依赖它）
     observe(safe_join(path))  # 记录版本，供 write/edit 的 read-before-write 校验
-    content = result.content
-    if result.truncated:
-        # 截断提示由**产生截断的这一层**给出（后端已算好 truncated），不在这里重算。
-        content = f"{content}\n[more lines below; pass offset={result.offset + result.limit} to continue]"
+
+    lines = result.content.splitlines()
+    kept: list[str] = []
+    used = 0
+    byte_capped = False
+    for line in lines:
+        clipped = _clip_line(line, READ_FILE_MAX_LINE_CHARS)
+        # +1 是换行符的估算：判"装不装得下"要按落盘后的真实体量算
+        cost = len(clipped.encode("utf-8")) + 1
+        if kept and used + cost > READ_FILE_MAX_BYTES:
+            byte_capped = True
+            break
+        kept.append(clipped)
+        used += cost
+
+    content = "\n".join(kept)
+    # 行级截断（后端算好的）与字节级截断（这里算的）任一发生，都要告诉模型怎么续读。
+    truncated = result.truncated or byte_capped
+    if truncated:
+        next_offset = result.offset + len(kept)
+        if byte_capped:
+            content = (
+                f"{content}\n[byte budget reached: this window stopped at "
+                f"{READ_FILE_MAX_BYTES} bytes; pass offset={next_offset} to continue]"
+            )
+        else:
+            # 截断提示由**产生截断的这一层**给出（后端已算好 truncated），不在这里重算。
+            content = f"{content}\n[more lines below; pass offset={next_offset} to continue]"
     return {
         "path": result.path,
         "total_lines": result.total_lines,
         "offset": result.offset,
         "limit": result.limit,
-        "truncated": result.truncated,
+        "truncated": truncated,
         "content": content,
     }
 
@@ -163,6 +224,11 @@ async def grep_files(
     行为与迁移前一致：候选文件由 `**/{glob}` 限定 → 逐个读全文 → 逐行匹配 → 命中达上限即返回。
     因此保留"先拿文件列表、再逐文件读"的两步形态（而不是一次目录级 grep），
     这样 `max_results` 的截断点与扫描顺序都不变。
+
+    **命中行按预算裁剪**（`GREP_MAX_LINE_CHARS` / `GREP_MAX_BYTES`）。定位类工具的产出
+    是"线索"，不是"正文"：一次命中 200 行、每行都是压缩过的长行时，不裁剪的 grep
+    结果本身就够把上下文撑爆 —— 而模型真正要的只是"哪个文件第几行匹配到了"。
+    需要细节时用 `read_file` 带着 offset 去读那个位置。
     """
     from app.backends.context import get_backend
 
@@ -177,6 +243,8 @@ async def grep_files(
         return {"error": globbed.error, "count": 0, "matches": []}
 
     matches: list[dict[str, Any]] = []
+    used = 0
+    budget_hit = False
     for candidate in globbed.paths:
         info = await backend.stat(candidate)
         if info is None or not info.is_file:
@@ -187,9 +255,27 @@ async def grep_files(
             continue
         for idx, line in enumerate(read.content.splitlines(), start=1):
             if pattern.search(line):
-                matches.append({"path": candidate, "line": idx, "text": line})
+                text = _clip_line(line, GREP_MAX_LINE_CHARS)
+                cost = len(text.encode("utf-8")) + 1
+                if matches and used + cost > GREP_MAX_BYTES:
+                    budget_hit = True
+                    break
+                matches.append({"path": candidate, "line": idx, "text": text})
+                used += cost
                 if len(matches) >= max_results:
                     return {"count": len(matches), "matches": matches}
+        if budget_hit:
+            break
+    if budget_hit:
+        return {
+            "count": len(matches),
+            "matches": matches,
+            "truncated": True,
+            "note": (
+                f"byte budget reached ({GREP_MAX_BYTES} bytes); "
+                "narrow the pattern or pass a smaller `root`/`glob` for the rest"
+            ),
+        }
     return {"count": len(matches), "matches": matches}
 
 
@@ -254,7 +340,10 @@ registry.register(
     description=(
         "Read a text file from the workspace with pagination. Use `offset`/`limit` to page "
         "through large files; a truncated result says so in a trailer and names the offset to "
-        "continue from."
+        "continue from. **Prefer `grep_files`/`glob_files` to locate the interesting region "
+        "first**: a read returns at most ~64KB with over-long lines clipped, so pulling a whole "
+        "large file page by page to find one function wastes the context you need for the work "
+        "itself. Read the window around what you actually need."
     ),
     parameters={
         "type": "object",
@@ -309,7 +398,14 @@ registry.register(
 
 registry.register(
     name="grep_files",
-    description="Regex-search the contents of files under a workspace directory.",
+    description=(
+        "Regex-search file contents under a workspace directory. **Start here when you do not "
+        "already know where something lives** — locating first and then reading a window costs "
+        "a fraction of the tokens of opening files to find out. Returns `path`/`line`/`text` per "
+        "match with match lines clipped to a byte budget; treat it as an index, then call "
+        "`read_file` with `offset` to read the surrounding code. Narrow with `glob`/`root` "
+        "instead of raising `max_results` when the hit list is too long."
+    ),
     parameters={
         "type": "object",
         "properties": {

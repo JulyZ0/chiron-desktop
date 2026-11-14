@@ -922,7 +922,12 @@ async function openWithSystem(entry: ProjectFileEntry) {
               ref="previewHost"
               class="wb-code"
             >
-              <pre><code :data-lang="previewLang || undefined">{{ previewText }}</code></pre>
+              <!-- `data-lang` 必须**总是渲染**（空串也行）：codeHighlighter 的选择器是
+                   `pre code[data-lang]`，用 `|| undefined` 让 Vue 省略该属性时，
+                   没有扩展名/未知扩展名的文件（`go.mod`、`Makefile`、`LICENSE`…）
+                   会连行号都拿不到 —— 整块代码被当成不存在，静默跳过增强。
+                   空串让高亮器退回 highlightAuto，行号照加。 -->
+              <pre><code :data-lang="previewLang">{{ previewText }}</code></pre>
             </div>
             <div
               v-if="previewTruncatedLines > 0"
@@ -1005,16 +1010,34 @@ async function openWithSystem(entry: ProjectFileEntry) {
   margin: 0; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5;
   color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
 }
-/* 代码预览宿主：只负责滚动边界与等宽字体；配色由 .hljs 主题提供。
-   横向滚动而不是折行 —— 代码换行后缩进语义就断了，行号也会对不上。 */
+/* 代码预览：滚动交给**外层** `.wb-preview-body` 负责。
+   这里刻意**不再设 `overflow`** —— 上一版给 `.wb-code` 也加了 `overflow: auto`，
+   于是出现两个嵌套滚动容器：内层没有确定宽度就撑不出自己的滚动边界，
+   配合 `white-space: pre` 的结果是整段代码被压成一行、横向无处滚动。
+   `min-width: max-content` 让内容能自然撑宽，由外层统一滚动。 */
 .wb-code {
-  overflow: auto; min-height: 0;
+  min-width: max-content;
 }
 .wb-code pre {
   margin: 0; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5;
   color: var(--text-secondary); white-space: pre; tab-size: 4;
 }
 .wb-code code { font-family: inherit; }
+/* 行号（codeHighlighter 会把每行包成 .code-line/.code-line-no/.code-line-body）。
+   聊天区那份样式带 `white-space: pre-wrap; word-break: break-all` —— 那是为窄消息列
+   设计的**折行**排版。工作台直接复用高亮器却拿不到那些 `:deep()` 样式，结果长代码行
+   既没行号列也没换行，全挤在一起。这里补一份**横向滚动**版本：行号定宽不换行，
+   代码保持原样，由外层 .wb-preview-body 统一滚动。
+
+   必须用 `:deep()`：这些 span 是 codeHighlighter 通过 `innerHTML` 动态插入的，
+   不带 Vue 的 `data-v-*` 作用域属性，普通选择器**匹配不到** —— 写上去看起来生效了，
+   实际 line 仍是 inline，所有行叠在同一个 top 上（正是"挤成一行"的成因）。 */
+.wb-code :deep(.code-line) { display: block; }
+.wb-code :deep(.code-line-no) {
+  display: inline-block; width: 3em; padding-inline-end: 12px;
+  text-align: end; color: var(--text-tertiary); user-select: none;
+}
+.wb-code :deep(.code-line-body) { white-space: pre; }
 .wb-image { max-width: 100%; height: auto; }
 .wb-frame { width: 100%; height: 320px; border: none; background: var(--bg-card); }
 

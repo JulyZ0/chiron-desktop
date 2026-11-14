@@ -139,3 +139,37 @@ class TestCodeMode:
         assert code.include_tools != normal.include_tools
         assert code.include_tools != minimal.include_tools
         assert code.persona != minimal.persona
+
+
+class TestPlanningToolsAreVisible:
+    """规划类工具必须**真的出现在工具面里**。
+
+    这是"不能规划长线任务"的真实根因：`todo_write` 早已在 `app/tools/todo.py` 注册，
+    却不在任何模式的 `include_tools` 里，于是 `_get_core_tools` 按白名单把它过滤掉 ——
+    模型根本看不到这个工具。所有"任务复杂时先写计划"的提示词因此全是空话。
+
+    **注册 ≠ 可见**：这条测试守的就是这个区别。之前也踩过同一个坑（`media_create`、
+    `web_fetch` 都出现过"注册了但白名单里没有，等于不存在"）。
+    """
+
+    def test_todo_write_is_visible_in_normal_mode(self):
+        cfg = get_mode_config("normal")
+        assert "todo_write" in cfg.include_tools, (
+            "normal 模式看不到 todo_write —— 模型无法规划多步任务"
+        )
+
+    def test_todo_write_is_visible_in_code_mode(self):
+        cfg = get_mode_config("code")
+        assert "todo_write" in cfg.include_tools, (
+            "code 模式看不到 todo_write —— 编码任务最容易在多轮后忘记最初的目标"
+        )
+
+    def test_todo_write_is_actually_registered(self):
+        """白名单里写了、但没注册，同样等于不存在（反向的同一个坑）。"""
+        from app.tools import registry
+
+        names = {
+            t.get("function", {}).get("name")
+            for t in registry.to_openai_tools()
+        }
+        assert "todo_write" in names

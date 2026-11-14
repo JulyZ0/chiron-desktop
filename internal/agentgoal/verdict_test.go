@@ -86,10 +86,34 @@ func TestNoAnswerIsOwed(t *testing.T) {
 }
 
 func TestCancelledDoesNotOweAnswer(t *testing.T) {
-	// 取消的回合不该因为"没有回答"被算作欠 —— 那是 Blocked 语义，answered 义务不派生。
+	// 取消的回合不该因为"没有回答"被算作欠 —— 更不该被算作"完成"。
+	//
+	// 曾经这里断言 Completed：取消不派生 answered 义务，而 no-error 自动满足，
+	// 于是 summarize 返回 Completed，Advance 把 Goal 置为 GoalCompleted 并停止续跑。
+	// 那意味着"用户点停止"与"任务真的做完了"在状态机里不可区分。现在取消走 Blocked。
 	rep := Evaluate(nil, Signals{Cancelled: true})
-	if rep.Outcome != Completed {
-		t.Fatalf("cancelled turn with no other obligations should not be incomplete; got %s", rep.Outcome)
+	if rep.Outcome != Blocked {
+		t.Fatalf("cancelled turn must be blocked, not %s", rep.Outcome)
+	}
+	if rep.Complete() {
+		t.Fatalf("a cancelled turn must never count as complete")
+	}
+}
+
+func TestTruncatedTurnIsIncompleteSoTheChainContinues(t *testing.T) {
+	// 单轮 deadline 截断：现场已 checkpoint，义务未了结。
+	//
+	// 判定必须是 Incomplete（而非 Completed / Blocked）——这是长线任务能续跑的关键：
+	// Completed 会让 Advance 停止续跑并谎称"做完了"；Blocked 会让 Goal 变 Abandoned。
+	rep := Evaluate(nil, Signals{Truncated: true})
+	if rep.Outcome != Incomplete {
+		t.Fatalf("truncated turn must be incomplete so the chain continues, got %s", rep.Outcome)
+	}
+	if rep.Complete() {
+		t.Fatalf("a truncated turn must never count as complete")
+	}
+	if len(rep.Reasons) == 0 {
+		t.Fatalf("a truncated report must say why it is incomplete")
 	}
 }
 
@@ -104,12 +128,24 @@ func TestReadOnlyTurnIsCompleted(t *testing.T) {
 	}
 }
 
-func TestNoObligationsIsNone(t *testing.T) {
-	// 取消 + 无其他义务 + 无变更 ⇒ 无义务（None），Complete() 为真（不强制继续）。
-	rep := Evaluate(nil, Signals{Cancelled: true})
-	if len(rep.Findings) == 0 {
-		if rep.Outcome != None {
-			t.Fatalf("want none, got %s", rep.Outcome)
+func TestEveryNaturalTurnDerivesRequiredObligations(t *testing.T) {
+	// 曾经这里断言"取消 + 无义务 ⇒ None"。取消现在在 Evaluate 入口返回 Blocked
+	// （否则会被判成 Completed），而 derive 恒派生 no-error 与 answered 两条必需义务，
+	// 所以 None 从评估路径不可达。这里改为守住真正的不变式：
+	// 任何自然结束（非取消/非截断）的回合都必须至少判到这两条义务。
+	rep := Evaluate(nil, Signals{HasAnswer: true})
+	if rep.Outcome == None {
+		t.Fatalf("a natural turn must always carry obligations")
+	}
+	if len(rep.Findings) < 2 {
+		t.Fatalf("want at least no-error and answered findings, got %d", len(rep.Findings))
+	}
+	for _, f := range rep.Findings {
+		if !f.Obligation.Required {
+			continue
+		}
+		if f.Obligation.ID != "no-error" && f.Obligation.ID != "answered" {
+			t.Fatalf("unexpected required obligation %q", f.Obligation.ID)
 		}
 	}
 }

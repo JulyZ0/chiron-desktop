@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.agent import runtime as runtime_module
@@ -25,7 +27,7 @@ from app.agent.runtime import (
     _interaction_ttl_seconds,
     _interaction_wait_seconds,
 )
-from app.agent.runtime_types import AgentTask
+from app.agent.runtime_types import AgentTask, ApprovalDecision, DECISION_APPROVE
 from app.config import settings
 
 
@@ -223,4 +225,73 @@ class TestWaitFunctionsHonorTheConfig:
 
         assert captured and captured[0]["ttl_seconds"] == 7200
         assert captured[0]["ttl_seconds"] >= int(_interaction_wait_seconds())
+
+
+class TestUnavailableChannelDoesNotAnswerForTheUser:
+    """远端通道不可用 ≠ 用户没回答。
+
+    要防的失败模式：Redis 不可用时（桌面单机部署的常态），远端 poll 会**立即**
+    返回空值。旧实现用一次 `FIRST_COMPLETED` 收工，于是"这条通道用不了"被当成
+    "没人答"，仍在本机等着的用户直接判超时/挂起 —— 用户点了「批准」什么也不会
+    发生。等待的对象是人，不是通道。
+    """
+
+    async def test_local_approval_wins_when_remote_is_down(self, cfg):
+        cfg(wait=5.0)
+        rt = _rt()
+
+        async def _remote_down(tc_id, timeout, user_id="", interval=1.5):
+            return None  # Redis 不可用：立即返回，不是等满
+
+        rt._poll_remote_decision = _remote_down  # noqa: SLF001
+
+        future = asyncio.get_running_loop().create_future()
+
+        async def _approve_shortly():
+            await asyncio.sleep(0.05)
+            if not future.done():
+                future.set_result(ApprovalDecision(decision=DECISION_APPROVE))
+
+        helper = asyncio.create_task(_approve_shortly())
+        decision = await rt._wait_approval_decision("tc-1", future, timeout=5.0)  # noqa: SLF001
+        await helper
+
+        assert decision is not None, "本机用户的批准不能被「远端不可用」吞掉"
+        assert decision.decision == DECISION_APPROVE
+
+    async def test_local_answer_wins_when_remote_is_down(self, cfg):
+        cfg(wait=5.0)
+        rt = _rt()
+
+        async def _remote_down(tc_id, timeout, interval=1.5):
+            return None
+
+        rt._poll_remote_answer = _remote_down  # noqa: SLF001
+
+        future = asyncio.get_running_loop().create_future()
+
+        async def _answer_shortly():
+            await asyncio.sleep(0.05)
+            if not future.done():
+                future.set_result("用方案 A")
+
+        helper = asyncio.create_task(_answer_shortly())
+        answer = await rt._wait_answer_decision("tc-ask", future, timeout=5.0)  # noqa: SLF001
+        await helper
+
+        assert answer == "用方案 A", "本机用户的回答不能被「远端不可用」吞掉"
+
+    async def test_both_channels_dead_still_returns_at_the_deadline(self, cfg):
+        """两条通道都用不了时必须到点收场 —— 修复不能变成永不返回。"""
+        cfg(wait=0.2)
+        rt = _rt()
+
+        async def _remote_down(*args, **kwargs):
+            return None
+
+        rt._poll_remote_decision = _remote_down  # noqa: SLF001
+        never = asyncio.get_running_loop().create_future()
+
+        got = await rt._wait_approval_decision("tc-1", never, timeout=0.2)  # noqa: SLF001
+        assert got is None
 

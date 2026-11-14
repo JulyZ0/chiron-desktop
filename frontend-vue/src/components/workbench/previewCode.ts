@@ -28,6 +28,19 @@ const EXT_TO_LANG: Record<string, string> = {
   sql: 'sql', md: 'markdown', dockerfile: 'dockerfile',
 }
 
+/** 无扩展名但约定俗成的文件名 → 语言名（按整名匹配，优先级高于扩展名）。 */
+const NAME_TO_LANG: Record<string, string> = {
+  dockerfile: 'dockerfile',
+  makefile: 'makefile',
+  'go.mod': 'go',
+  'go.sum': 'go',
+  gemfile: 'ruby',
+  rakefile: 'ruby',
+  '.gitignore': 'bash',
+  '.dockerignore': 'bash',
+  '.env': 'bash',
+}
+
 /**
  * 从路径推出 highlight.js 的语言名；认不出返回空串。
  *
@@ -36,6 +49,9 @@ const EXT_TO_LANG: Record<string, string> = {
  */
 export function langOf(path: string): string {
   const name = String(path || '').split('/').pop() || ''
+  // 整名优先：`go.mod` 的"扩展名"是 `mod`，按扩展名查不到；`Makefile` 则根本没扩展名。
+  const byName = NAME_TO_LANG[name.toLowerCase()]
+  if (byName) return byName
   const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : ''
   return EXT_TO_LANG[ext] || ''
 }

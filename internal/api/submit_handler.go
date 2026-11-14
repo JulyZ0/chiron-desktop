@@ -53,6 +53,33 @@ func (h *SubmitHandler) turnTimeout() time.Duration {
 	return DefaultAgentTimeout
 }
 
+// goalTimeout 是**整条续跑链**（Goal FSM 所有轮次）的上限，来自 `AGENT_GOAL_TIMEOUT`。
+//
+// 它必须与 turnTimeout 分开：单轮预算管"一轮能跑多久"，续跑链预算管"这条链总共能跑多久"。
+// 两者共用同一个 ctx 时，单轮耗尽即外层 DeadlineExceeded，续跑循环的 `ctx.Err() != nil`
+// 分支直接返回 —— agentgoal.MaxRounds 形同虚设，长线任务必然"做一半就停"。
+func (h *SubmitHandler) goalTimeout() time.Duration {
+	if h.agentCfg != nil && h.agentCfg.AgentGoalTimeout > 0 {
+		return h.agentCfg.AgentGoalTimeout
+	}
+	return DefaultAgentTimeout
+}
+
+// submitChainTimeout 计算**整条 submit 链**（Goal FSM 的 N 轮续跑串行）的预算。
+//
+// 不变式：链级预算必须不短于单轮预算。两者相等时，第一轮跑完就不再有余量，
+// 续跑循环靠 `ctx.Err() != nil` 退出，agentgoal 的轮数上限永远执行不到 ——
+// 长线任务的表现就是"做一半就停"。判据放在这里而不是内联，是为了能直接测到。
+func submitChainTimeout(turnLimit, goalLimit time.Duration) time.Duration {
+	if turnLimit < DefaultAgentTimeout {
+		turnLimit = DefaultAgentTimeout
+	}
+	if goalLimit < turnLimit {
+		return turnLimit
+	}
+	return goalLimit
+}
+
 // applyMaxOutputDefault 只在请求**没带** `max_tokens` 时注入后台值。
 //
 // 显式值优先是契约的一部分：前端 / Agent 档案选了单次输出上限，后台的全局默认不能盖掉它；
@@ -351,8 +378,10 @@ func (h *SubmitHandler) HandleSubmit(ctx context.Context, userID, sessionID, con
 	// 附件只随**用户那条消息**走（首轮）。续跑轮是系统指令（goalEnforcePrompt），
 	// 再带一次附件只会让模型以为用户又发了一遍同样的文件。
 	atts := attachments
+	// 首轮开始前先按**已有清单**绑定小目标（跨轮恢复时 goal 里已带 SubGoal，
+	// 这里不动它 —— 只有指纹真的变了才重置计数，见 agentgoal.BeginRound）。
 	for {
-		report := h.submitOnce(ctx, userID, sessionID, msg, engineMsg, llmConfig, wb, atts)
+		report, subGoal := h.submitOnce(ctx, userID, sessionID, msg, engineMsg, llmConfig, wb, atts)
 		atts = nil
 		engineMsg = ""
 		if report == nil {
@@ -360,6 +389,9 @@ func (h *SubmitHandler) HandleSubmit(ctx context.Context, userID, sessionID, con
 			// 白烧一轮续跑）。原样结束。
 			return
 		}
+		// 小目标边界：本轮清单推进到了新的一项，就把单小目标的轮数归零 ——
+		// 20 轮拦的是"这一件事卡住"，不是整条任务（见 agentgoal.DefaultGoalRounds）。
+		*goal = agentgoal.BeginRound(*goal, subGoal)
 		advanced, cont := agentgoal.Advance(*goal, *report, time.Now().Unix())
 		*goal = advanced
 		h.saveGoal(ctx, *goal)
@@ -414,7 +446,7 @@ func (h *SubmitHandler) saveGoal(ctx context.Context, g agentgoal.Goal) {
 //
 // workbenchCtx 是前端组装的工作台上下文（kb_id / agent / skill_names / workflow_id），
 // 透传给引擎消费 —— 网关不再丢弃它。
-func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content, engineContent string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}) *agentgoal.Report {
+func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content, engineContent string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}) (*agentgoal.Report, string) {
 	// 单轮上限来自 `AGENT_SUBMIT_TIMEOUT`（见 turnTimeout）。这里**不再**写死
 	// `DefaultAgentTimeout`：那个常量只是兜底，写死它会让配置项对外层 ctx 生效、
 	// 对真正的单轮无效，长回合依然在 300s 被销毁现场。
@@ -423,10 +455,12 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	// session 亲和：同 session 的所有流式轮次固定路由到同一引擎实例
 	// （引擎 PersistentTerminal/后台任务/簿记为进程内状态，round-robin 跨实例会断链）
 	ctx = engine.WithSession(ctx, sessionID)
-	if sessionID != "" {
-		sessionCancels.Store(sessionID, &sessionCancel{userID: userID, cancel: cancel})
-		defer sessionCancels.Delete(sessionID)
-	}
+	// 不在这里登记 sessionCancels：取消条目归**整条续跑链**所有
+	// （routes_agent.go 在启动 goroutine 前登记外层 cancel 并 defer 删除）。
+	// 此前每轮 Store 单轮 cancel 并 defer Delete，造成两个后果：
+	//   1. 用户点「停止」只取消了当前轮，外层 ctx 未取消 ⇒ 续跑循环照常开下一轮；
+	//   2. 本轮结束即删除登记 ⇒ 轮次间隙点「停止」得到 no_active_task。
+	// 链级 cancel 是外层 ctx 的 cancel，取消它会级联传到本轮的 ctx，语义更强且不漏。
 
 	// 落库专用 ctx 工厂（S 修复）：不继承主 ctx 的取消/期限 —— 流可能被超时、前端断开、
 	// 会话取消等截断，但已产生的消息（user/assistant/tool_call）必须写入，否则刷新后丢失。
@@ -466,7 +500,7 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 				slog.Info("submit deduplicated (already processing)",
 					"session", sessionID, "client_msg_id", clientMsgID)
 				// 这条消息已在处理中（同一次提交的重试）：直接结束，不再触发引擎。
-				return nil
+				return nil, ""
 			}
 			slog.Warn("submit dedup unavailable, proceeding", "error", err)
 		}
@@ -647,7 +681,7 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		}
 		h.eventHub.Publish(broadcast.Event{Type: "text", SessionID: sessionID, Data: map[string]string{"content": "Service temporarily unavailable. Please try again."}})
 		h.eventHub.Publish(broadcast.Event{Type: "turn_done", SessionID: sessionID, Data: map[string]string{"session_id": sessionID}})
-		return nil
+		return nil, ""
 	}
 
 	var finalContent string
@@ -659,6 +693,10 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	turnToolCallIDs := []string{} // S 修复：messages.tool_calls 列只存 tool_call id 集合（内容在 tool_calls 表）
 	// P1：host 证据采集器 —— 本轮所有工具事件都喂给它，收尾时据此判定完成情况。
 	ev := evidence.NewCollector()
+	// 本轮任务清单的"当前小目标"指纹（见 agentgoal.SubGoalOf）：续跑预算按**小目标**
+	// 计数，所以调用方需要知道这一轮结束时清单推进到了哪一项。空串表示本轮没有清单
+	// 事件（模型没建清单 / 引擎未发 todo_updated），此时不构成新的边界。
+	subGoal := ""
 
 	// P 性能：text 事件 50ms 合帧转发（公网多租户下 SSE 帧数减半，减少网关/前端处理开销）
 	const textFrameInterval = 50 * time.Millisecond
@@ -780,6 +818,17 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 				h.sessionMgr.SaveToolCall(sctx, sessionID,
 					spillRecordID("compaction"), "compaction", evt.Content, turnID)
 				cancelStore()
+			}
+		case "todo_updated":
+			// 任务清单：续跑预算的**层级依据**。轮数上限按"单个小目标"计（见
+			// agentgoal.DefaultGoalRounds），所以网关必须自己从清单推出当前小目标，
+			// 而不是等到 20 轮之后才发现整条任务被拦住了。
+			//
+			// 载荷是引擎 `runtime.py` 直接 `json.dumps(tool_result["todos"])` 的数组；
+			// 解析失败只影响"预算能不能按小目标重置"（退化为整条任务算一个目标），
+			// 绝不能让它中断这一轮 —— 所以这里 fail-soft，不记 streamErr。
+			if items, ok := parseTodoItems(evt.Content); ok {
+				subGoal = agentgoal.SubGoalOf(items)
 			}
 		case "error":
 			// 引擎侧异常：记录原因，回合终态判为 failed（000.md 第 14 条：失败不再静默）
@@ -928,11 +977,17 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	//
 	// 这一步把"这一轮做完没有"变成一个 **host 可复核的断言**：义务由 host 自己派生，
 	// 判定只看采集到的工具证据与本轮信号，不读模型写下的任何状态。
+	// 单轮 deadline 与「用户/会话取消」必须分开：前者现场已 checkpoint、义务未了结，
+	// 应判 Incomplete 让续跑链接上；后者是用户叫停，判 Blocked 不续跑。
+	// `ctx` 在这一行仍是本轮的（submitOnce 内的 WithTimeout），所以这里读到的
+	// DeadlineExceeded 就是单轮预算耗尽，不是链级预算耗尽。
+	turnTruncated := ctx.Err() == context.DeadlineExceeded
 	goalReport := agentgoal.Evaluate(ev, agentgoal.Signals{
 		HasError:     streamErr != "",
 		ErrorMessage: streamErr,
 		HasAnswer:    strings.TrimSpace(stripThinkingBlocks(finalContent)) != "",
-		Cancelled:    ctx.Err() != nil,
+		Cancelled:    ctx.Err() != nil && !turnTruncated,
+		Truncated:    turnTruncated,
 	})
 	if b, err := json.Marshal(goalReport); err == nil {
 		h.eventHub.Publish(broadcast.Event{
@@ -953,7 +1008,37 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	}
 
 	h.eventHub.Publish(broadcast.Event{Type: "turn_done", SessionID: sessionID, Data: map[string]string{"session_id": sessionID}})
-	return &goalReport
+	return &goalReport, subGoal
+}
+
+// parseTodoItems 把 `todo_updated` 事件的载荷解析成小目标判定需要的两项。
+//
+// 只取 `content` 与 `status`：判定"当前推进到哪一件事"只需要这两项，其余字段
+// （owner/files/verified/depends_on）与预算无关，多解析一份只是多一处会跟着引擎
+// 字段变更一起坏掉的地方。返回 ok=false 表示"这不是一份可用的清单"，调用方据此
+// 退化为"没有小目标边界"，而不是把这一轮判成失败。
+func parseTodoItems(raw string) ([]agentgoal.SubGoalItem, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, false
+	}
+	var entries []struct {
+		Content string `json:"content"`
+		Status  string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, false
+	}
+	// 空清单（`null` / `[]`）不算边界：没有条目就没有"当前推进到哪一件事"，
+	// 调用方应退化为"整条任务算一个目标"。`null` 会 unmarshal 成 nil slice 且
+	// 不报错，所以必须在这里显式挡掉，否则它会被当成一份"合法的空清单"。
+	if len(entries) == 0 {
+		return nil, false
+	}
+	items := make([]agentgoal.SubGoalItem, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, agentgoal.SubGoalItem{Content: e.Content, Status: e.Status})
+	}
+	return items, true
 }
 
 // goalEnforcePrompt 把上一轮欠下的义务转成一条**系统续跑指令**。

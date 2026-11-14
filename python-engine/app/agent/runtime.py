@@ -4700,29 +4700,61 @@ class AgentRuntime:
         self, tc_id: str, future: asyncio.Future[Any], timeout: float, user_id: str = ""
     ) -> ApprovalDecision | None:
         """本地 Future 与 Redis 决策键竞争，返回决策；超时返回 None。"""
-        poll = asyncio.create_task(self._poll_remote_decision(tc_id, timeout, user_id))
-        waiters: list[asyncio.Future[Any]] = [poll, asyncio.ensure_future(future)]
-        try:
-            done, _pending = await asyncio.wait(
-                waiters, return_when=asyncio.FIRST_COMPLETED
+        res = await self._first_ready(
+            [self._poll_remote_decision(tc_id, timeout, user_id), future], timeout
+        )
+        if isinstance(res, ApprovalDecision):
+            return res
+        # 容错：某条路径仍以裸 bool 提交（如旧测试替身）→ 按等价决策收下
+        if isinstance(res, bool):
+            return ApprovalDecision(
+                decision=DECISION_APPROVE if res else DECISION_REJECT
             )
+        return None
+
+    async def _first_ready(
+        self, waiters: list[Any], timeout: float
+    ) -> Any | None:
+        """在 `timeout` 内返回第一个**非空**结果；全部为空或超时返回 None。
+
+        为什么不是一次 `FIRST_COMPLETED`：远端通道（Redis 键）在 Redis 不可用时
+        会**立即**返回 None —— 那不代表"没人答"，只代表"这条通道用不了"。用一次
+        `FIRST_COMPLETED` 收工，就把仍在本机等着的用户直接判成"没人答"：
+        桌面版常常没有 Redis，用户点了「批准」却什么都不发生，这一轮随即被挂起或
+        判超时。等待的是**人**，不是通道 —— 只要还有一个通道可能在规定时间内给出
+        答复，就得等满。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        pending: list[asyncio.Future[Any]] = [
+            asyncio.ensure_future(w) for w in waiters
+        ]
+        try:
+            while pending:
+                remain = deadline - loop.time()
+                if remain <= 0:
+                    return None
+                done, _ = await asyncio.wait(
+                    pending, timeout=remain, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    # 到点：所有还活着的通道都没给出答复
+                    return None
+                for w in done:
+                    pending.remove(w)
+                    try:
+                        res = w.result()
+                    except Exception:  # noqa: BLE001 - 单通道异常不中断等待
+                        continue
+                    if res is not None:
+                        return res
+                # 有通道返回了空值（典型：Redis 不可用）⇒ 把它从集合里摘掉，
+                # 继续等其余通道，而不是就此收工。
+            return None
         finally:
-            for w in waiters:
+            for w in pending:
                 if not w.done():
                     w.cancel()
-        for w in done:
-            try:
-                res = w.result()
-            except Exception:  # noqa: BLE001 - 单通道异常不应中断审批
-                continue
-            if isinstance(res, ApprovalDecision):
-                return res
-            # 容错：某条路径仍以裸 bool 提交（如旧测试替身）→ 按等价决策收下
-            if isinstance(res, bool):
-                return ApprovalDecision(
-                    decision=DECISION_APPROVE if res else DECISION_REJECT
-                )
-        return None
 
     async def _take_key_with_wake(
         self, key: str, channel: str, timeout: float, interval: float
@@ -5004,24 +5036,13 @@ class AgentRuntime:
         self, tc_id: str, future: asyncio.Future[Any], timeout: float
     ) -> str | None:
         """本地 Future 与 Redis 答案键竞争，返回答案；超时返回 None。"""
-        poll = asyncio.create_task(self._poll_remote_answer(tc_id, timeout))
-        waiters: list[asyncio.Future[Any]] = [poll, asyncio.ensure_future(future)]
-        try:
-            done, _pending = await asyncio.wait(
-                waiters, return_when=asyncio.FIRST_COMPLETED
-            )
-        finally:
-            for w in waiters:
-                if not w.done():
-                    w.cancel()
-        for w in done:
-            try:
-                res = w.result()
-            except Exception:  # noqa: BLE001 - 单通道异常不应中断等待
-                continue
-            if isinstance(res, str):
-                return res
-        return None
+        # 与审批同一条判据（见 `_first_ready`）：Redis 不可用时远端通道会立即返回
+        # 空值，那只是"这条通道用不了"，不是"用户没回答"。一次 `FIRST_COMPLETED`
+        # 就收工会把仍在本机作答的用户判成"没答"，所以必须等到真有答复或到点。
+        res = await self._first_ready(
+            [self._poll_remote_answer(tc_id, timeout), future], timeout
+        )
+        return res if isinstance(res, str) else None
 
     async def _poll_remote_answer(
         self, tc_id: str, timeout: float, interval: float = REMOTE_WAIT_POLL_INTERVAL_SECONDS

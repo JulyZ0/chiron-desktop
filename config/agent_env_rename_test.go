@@ -96,7 +96,16 @@ func TestAgentEnvDefaultsUseTheNewNamesOnly(t *testing.T) {
 	if cfg.AgentMaxOutputTokens != 8192 {
 		t.Fatalf("AGENT_MAX_OUTPUT_TOKENS 默认应为 8192, got %d", cfg.AgentMaxOutputTokens)
 	}
-	if cfg.AgentDefaultMaxTurns != 5 {
-		t.Fatalf("AGENT_DEFAULT_MAX_TURNS 默认应为 5, got %d", cfg.AgentDefaultMaxTurns)
+	if cfg.AgentDefaultMaxTurns != 40 {
+		t.Fatalf("AGENT_DEFAULT_MAX_TURNS 默认应为 40（与 api.DefaultMaxTurns 同值）, got %d", cfg.AgentDefaultMaxTurns)
+	}
+	// 续跑链预算与单轮预算必须是**两个**独立的非零默认值：共用一个时，
+	// 单轮耗尽即掐断整条链，长线任务永远"做一半就停"。
+	if cfg.AgentSubmitTimeout <= 0 {
+		t.Fatalf("AGENT_SUBMIT_TIMEOUT 必须有正的默认值, got %s", cfg.AgentSubmitTimeout)
+	}
+	if cfg.AgentGoalTimeout <= cfg.AgentSubmitTimeout {
+		t.Fatalf("AGENT_GOAL_TIMEOUT (%s) 必须严格大于单轮上限 (%s)，否则续跑链无法推进",
+			cfg.AgentGoalTimeout, cfg.AgentSubmitTimeout)
 	}
 }

@@ -162,10 +162,16 @@ func registerAgentRoutes(
 		// 修复：此前硬编码 180s，比 api.DefaultAgentTimeout(300s) 更短，长回合
 		// （多轮 LLM + 工具调用）必然被提前取消，表现为"思考/工具调用做一半就断"。
 		// 现取配置项 AGENT_SUBMIT_TIMEOUT（默认 5 分钟），并兜底不低于 DefaultAgentTimeout。
-		limit := submitTimeout
-		if limit < DefaultAgentTimeout {
-			limit = DefaultAgentTimeout
+		turnLimit := submitTimeout
+		// 这里限的是**整条 submit 链**（Goal FSM 的 N 轮续跑串行），不是单轮；
+		// 单轮上限在 submitOnce 内由 turnTimeout() 另设。两者共用一个预算时，
+		// 第一轮用完时间后 HandleSubmit 的续跑循环就 `ctx.Err() != nil` 退出，
+		// 轮数上限（agentgoal.MaxRounds）永远执行不到 —— 表现为"长任务做一半就停"。
+		goalLimit := time.Duration(0)
+		if submitHandler != nil {
+			goalLimit = submitHandler.goalTimeout()
 		}
+		limit := submitChainTimeout(turnLimit, goalLimit)
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), limit)
 		// 批 E2：每次 run 唯一 token（锁归属校验：续期/释放均需匹配，防旧 run 误删新锁）
 		var rnd [12]byte

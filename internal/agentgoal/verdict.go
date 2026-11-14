@@ -107,6 +107,26 @@ func (r Report) Complete() bool {
 //
 // 注意 `e` 可以为 nil（采集器未接入 / 空回合），此时按"无证据"处理。
 func Evaluate(e *evidence.Collector, sig Signals) Report {
+	// 显式取消（用户点停止 / 会话被取消）：结论不适用。必须在 derive 之前返回 ——
+	// 否则"取消导致不派生 answered 义务 + 无 error 即 no-error 满足"会让本回合
+	// 被判成 Completed，把"用户叫停"记成"目标已完成"。
+	if sig.Cancelled {
+		return BlockedReport("turn ended with an explicit cancellation")
+	}
+	// deadline 截断：这一轮被宿主掐断，现场已 checkpoint，义务仍未了结。
+	//
+	// 必须判 Incomplete 让续跑链接上。此前不区分取消与截断，两者都走上面那条
+	// "不派生 answered"的路径 → 被判 Completed → Advance 置 GoalCompleted 并停止续跑。
+	// 于是任何一次单轮超时都会静默终结整条长线任务，用户看到的就是"做一半就停"。
+	// 判 Incomplete 仍是有界的：撞墙会消耗 RoundsUsed，最终由 MaxRounds 收敛。
+	if sig.Truncated {
+		return Report{
+			Outcome: Incomplete,
+			Reasons: []string{
+				"truncated: the turn hit the per-turn deadline; the workspace may hold unverified changes",
+			},
+		}
+	}
 	obligations := derive(e, sig)
 	if len(obligations) == 0 {
 		return Report{Outcome: None}
@@ -158,15 +178,14 @@ func derive(e *evidence.Collector, sig Signals) []Obligation {
 		})
 	}
 
-	// 回合应产出正文（除非被取消/截断 —— 那属于 Blocked，不算欠）。
-	if !sig.Cancelled && !sig.Truncated {
-		obs = append(obs, Obligation{
-			ID:          "answered",
-			Description: "The turn must produce a non-empty answer.",
-			Required:    true,
-			Class:       classAnswered,
-		})
-	}
+	// 回合应产出正文。取消与截断已在 Evaluate 入口提前返回，不会走到这里，
+	// 因此本义务恒定派生。
+	obs = append(obs, Obligation{
+		ID:          "answered",
+		Description: "The turn must produce a non-empty answer.",
+		Required:    true,
+		Class:       classAnswered,
+	})
 	return obs
 }
 

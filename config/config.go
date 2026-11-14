@@ -148,6 +148,13 @@ type Config struct {
 	// 必须 >= api.DefaultAgentTimeout（300s）：曾经硬编码 180s，比它短，
 	// 长回合（多轮工具调用）必然被提前取消，表现为"思考/工具调用做一半就断"。
 	AgentSubmitTimeout time.Duration
+	// AgentGoalTimeout 是**整条续跑链**（Goal FSM 的所有轮次）在网关侧的总上限。
+	//
+	// 必须与 AgentSubmitTimeout 分成两个预算：后者只管**单轮**，而续跑链是
+	// N 轮串行。此前两者共用同一个 ctx 预算（5 分钟管住整条链），于是第一轮
+	// 用完时间后外层就 DeadlineExceeded，循环里的 `ctx.Err() != nil` 立刻退出 ——
+	// 轮数上限（agentgoal.MaxRounds）根本没有机会被执行，表现就是"做一半就停"。
+	AgentGoalTimeout time.Duration
 
 	// Python AI 引擎
 	PythonEngineAddress string // HTTP 地址，如 "localhost:8000"
@@ -266,11 +273,20 @@ func loadConfig() *Config {
 		WechatMchPrivateKey:   getEnv("WXPAY_MCH_PRIVATE_KEY", ""),
 		// 与 api.DefaultMaxTurns 同值（40）。网关每次提交都显式下发它，所以这里才是
 		// 实际生效的默认值；引擎侧 `settings.max_turns` 只是兜底。
-		AgentDefaultMaxTurns:  getInt("AGENT_DEFAULT_MAX_TURNS", 40),
-		AgentMaxOutputTokens:  getInt("AGENT_MAX_OUTPUT_TOKENS", 8192),
-		AgentMaxConcurrency:   getInt("AGENT_MAX_CONCURRENCY", 20),
-		// 默认 5 分钟，与 api.DefaultAgentTimeout 对齐（env AGENT_SUBMIT_TIMEOUT 可调大）
+		AgentDefaultMaxTurns: getInt("AGENT_DEFAULT_MAX_TURNS", 40),
+		AgentMaxOutputTokens: getInt("AGENT_MAX_OUTPUT_TOKENS", 8192),
+		AgentMaxConcurrency:  getInt("AGENT_MAX_CONCURRENCY", 20),
+		// 默认 5 分钟：这是**单轮**上限（一次"读文件 → 改 → 跑测试"的预算），
+		// 不是整条长任务的预算。轮次上限按**单个小目标**计 20 轮（见
+		// agentgoal.DefaultGoalRounds），整条长任务由链级预算
+		// AGENT_GOAL_TIMEOUT 兜底 —— 三层各管一层，互不吃掉。
 		AgentSubmitTimeout: getDuration("AGENT_SUBMIT_TIMEOUT", 5*time.Minute),
+		// 链级预算是**整条长任务**的墙钟兜底（不是轮数闸门）：单个小目标 20 轮
+		// （agentgoal.DefaultGoalRounds）× 单轮 5 分钟 = 100 分钟，而整条任务允许
+		// 200 轮（agentgoal.DefaultMaxTotalRounds）× 5 分钟 = 1000 分钟 ≈ 16.7 小时。
+		// 默认 24 小时必须装得下这个理论上限，否则撞的会是墙钟而不是轮数闸门，
+		// 用户看到的是"轮数还没用完就停了"。三层各管一层，见 internal/agentgoal。
+		AgentGoalTimeout: getDuration("AGENT_GOAL_TIMEOUT", 24*time.Hour),
 
 		PythonEngineAddress: getEnv("PYTHON_ENGINE_ADDRESS", "localhost:8000"),
 		PythonEngineTimeout: getDuration("PYTHON_ENGINE_TIMEOUT", 5*time.Minute),
