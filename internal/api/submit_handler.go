@@ -1,0 +1,1306 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/athenavi/chiron/config"
+	"github.com/athenavi/chiron/internal/agentgoal"
+	"github.com/athenavi/chiron/internal/auth"
+	"github.com/athenavi/chiron/internal/broadcast"
+	"github.com/athenavi/chiron/internal/db"
+	"github.com/athenavi/chiron/internal/engine"
+	"github.com/athenavi/chiron/internal/evidence"
+	"github.com/athenavi/chiron/internal/id"
+	"github.com/athenavi/chiron/internal/session"
+	"github.com/redis/go-redis/v9"
+)
+
+// SubmitHandler proxies /submit requests to the Python AI engine.
+// agentDefaults 返回（单次输出上限, 默认回合数）。
+//
+// M20：这两个数来自后台「系统设置」；此前它们被写进 `config.Config` 却**没有任何读取点**。
+// nil cfg（测试）与非法值（<=0）都回落到包内默认 —— 不做"0 = 关掉预算"的隐式语义。
+func (h *SubmitHandler) agentDefaults() (int, int) {
+	maxOutputTokens, defaultMaxTurns := DefaultMaxOutputTokens, DefaultMaxTurns
+	if h.agentCfg != nil {
+		if h.agentCfg.AgentMaxOutputTokens > 0 {
+			maxOutputTokens = h.agentCfg.AgentMaxOutputTokens
+		}
+		if h.agentCfg.AgentDefaultMaxTurns > 0 {
+			defaultMaxTurns = h.agentCfg.AgentDefaultMaxTurns
+		}
+	}
+	return maxOutputTokens, defaultMaxTurns
+}
+
+// turnTimeout 是**一轮**提交的上限，来自 `AGENT_SUBMIT_TIMEOUT`。
+//
+// 它必须是可配置的真值：撞上它时引擎收到的是 ASGI 取消（回合中止），而不是一次可续的暂停。
+// 此前 `submitOnce` 自己写死 `DefaultAgentTimeout`，于是 `AGENT_SUBMIT_TIMEOUT` 只作用于
+// 外层后台 ctx，把它调大对单轮毫无效果 —— 现场被 300s 定时销毁，且用户在配置里改不动。
+func (h *SubmitHandler) turnTimeout() time.Duration {
+	if h.agentCfg != nil && h.agentCfg.AgentSubmitTimeout > 0 {
+		return h.agentCfg.AgentSubmitTimeout
+	}
+	return DefaultAgentTimeout
+}
+
+// goalTimeout 是**整条续跑链**（Goal FSM 所有轮次）的上限，来自 `AGENT_GOAL_TIMEOUT`。
+//
+// 它必须与 turnTimeout 分开：单轮预算管"一轮能跑多久"，续跑链预算管"这条链总共能跑多久"。
+// 两者共用同一个 ctx 时，单轮耗尽即外层 DeadlineExceeded，续跑循环的 `ctx.Err() != nil`
+// 分支直接返回 —— agentgoal.MaxRounds 形同虚设，长线任务必然"做一半就停"。
+func (h *SubmitHandler) goalTimeout() time.Duration {
+	if h.agentCfg != nil && h.agentCfg.AgentGoalTimeout > 0 {
+		return h.agentCfg.AgentGoalTimeout
+	}
+	return DefaultAgentTimeout
+}
+
+// submitChainTimeout 计算**整条 submit 链**（Goal FSM 的 N 轮续跑串行）的预算。
+//
+// 不变式：链级预算必须不短于单轮预算。两者相等时，第一轮跑完就不再有余量，
+// 续跑循环靠 `ctx.Err() != nil` 退出，agentgoal 的轮数上限永远执行不到 ——
+// 长线任务的表现就是"做一半就停"。判据放在这里而不是内联，是为了能直接测到。
+func submitChainTimeout(turnLimit, goalLimit time.Duration) time.Duration {
+	if turnLimit < DefaultAgentTimeout {
+		turnLimit = DefaultAgentTimeout
+	}
+	if goalLimit < turnLimit {
+		return turnLimit
+	}
+	return goalLimit
+}
+
+// applyMaxOutputDefault 只在请求**没带** `max_tokens` 时注入后台值。
+//
+// 显式值优先是契约的一部分：前端 / Agent 档案选了单次输出上限，后台的全局默认不能盖掉它；
+// 反过来，后台设了值也必须真的出现在发给引擎的 `llm_config` 里（这正是 M20 要修的缺口）。
+func applyMaxOutputDefault(llmConfig map[string]interface{}, maxOutputTokens int) {
+	if llmConfig == nil {
+		return
+	}
+	if _, ok := llmConfig["max_tokens"]; ok {
+		return
+	}
+	llmConfig["max_tokens"] = maxOutputTokens
+}
+
+type SubmitHandler struct {
+	python     *engine.PythonClient
+	sessionMgr *session.Manager
+	eventHub   *broadcast.Hub
+	// agentCfg 只用来读后台「系统设置」里的两个 Agent 默认值（M20 把它们接到真实读取点）：
+	// `AgentDefaultMaxTurns`（默认提交回合数）与 `AgentMaxOutputTokens`（单次调用上限）。
+	// 允许为 nil（测试里就是这样）：此时回落到包内的 DefaultMaxTurns / DefaultMaxOutputTokens。
+	agentCfg *config.Config
+}
+
+func NewSubmitHandler(python *engine.PythonClient, sessionMgr *session.Manager, eventHub *broadcast.Hub, agentCfg *config.Config) *SubmitHandler {
+	return &SubmitHandler{
+		python:     python,
+		sessionMgr: sessionMgr,
+		eventHub:   eventHub,
+		agentCfg:   agentCfg,
+	}
+}
+
+// SubmitApproval proxies the user's tool-approval decision to the Python engine
+// (S 安全修复：工具三态栅栏的“确认”态 — 前端确认卡片回调这里).
+func (h *SubmitHandler) SubmitApproval(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID  string `json:"session_id"`
+		ToolCallID string `json:"tool_call_id"`
+		Approved   bool   `json:"approved"`
+		// Decision（C5）是审批三态：`approve` / `reject` / **`edit`**。
+		// 留空 = 由 `Approved` 推导 ⇒ 旧前端（只发 approved）行为不变。
+		Decision string `json:"decision,omitempty"`
+		// Arguments（C5）仅在 Decision=edit 时出现：**编辑后的完整参数对象**（JSON 字符串）。
+		// 引擎会用它重跑 tool_policy 分级（级别升高则**不执行**）并落审计，
+		// 见 python-engine/app/agent/runtime.py 的 `_await_approval`。
+		Arguments string `json:"arguments,omitempty"`
+		Reason    string `json:"reason"`
+		UserID    string `json:"user_id,omitempty"`
+		// RunToken 由网关从 Redis 归属映射（engine:run:{session}）读出后注入，
+		// 供引擎拒绝「陈旧 run」的审批（批次 4）。
+		RunToken string `json:"run_token,omitempty"`
+	}
+	if err := DecodeJSON(w, r, &req); err != nil {
+		BadRequest(w, "invalid request")
+		return
+	}
+	if req.SessionID == "" || req.ToolCallID == "" {
+		BadRequest(w, "session_id and tool_call_id are required")
+		return
+	}
+	// C5 的**字段级**校验在网关侧先做一遍（与引擎同一契约）：决策值非法、编辑态缺参数
+	// 都能立刻拿到 400，而不是绕一圈才失败。语义校验（重跑分级、级别升高拦截、
+	// 审计双参数）仍归引擎 —— 那需要工具分级表，网关不该有第二份（避免双实现漂移）。
+	switch req.Decision {
+	case "", "approve", "reject":
+	case "edit":
+		if strings.TrimSpace(req.Arguments) == "" {
+			BadRequest(w, "decision=edit requires 'arguments'")
+			return
+		}
+	default:
+		BadRequest(w, "unknown decision: "+req.Decision)
+		return
+	}
+	var out map[string]any
+	// S 修复：把已验证 JWT claims 的 user_id 一并透传，供 Python 端校验
+	// 来电者是否为会话 owner，防止他人代批/拒批危险工具。
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		req.UserID = claims.UserID
+	}
+	// approval 必须路由到承载该 session 运行的引擎实例：路由优先按 Redis 归属映射
+	// （engine:run:{session}，见 engine.RunOwnerURL），一致性哈希仅作回退；否则
+	// round-robin/哈希漂移会打到没有该 run 的实例并返回 "no active agent"。
+	routeCtx := engine.WithRunAffinity(r.Context(), req.SessionID)
+	// 顺带取出当前 run 的 token：引擎据此拒绝陈旧 run 的审批（映射不可用时留空，
+	// 引擎只在「带上了且不匹配」时拒绝，兼容未启用归属映射的部署）。
+	if rec, ok := engine.RunOwner(routeCtx, req.SessionID); ok {
+		req.RunToken = rec.RunToken
+	}
+	if err := h.python.PostJSON(routeCtx, "/v1/agent/approval", req, &out); err != nil {
+		slog.Error("approval: python proxy failed", "session", req.SessionID, "error", err)
+		InternalError(w, "approval proxy failed")
+		return
+	}
+	JSON(w, http.StatusOK, APIResponse{Success: true, Data: out})
+}
+
+// SubmitAnswer proxies the user's structured answer to a pending `ask_user` call.
+//
+// 为什么需要它：引擎侧 ask_user 会阻塞在 runtime.submit_answer 上等待用户输入，
+// 前端也早已调用 POST /v1/agent/answer —— 但网关一直没注册这条路由，于是请求 404、
+// 引擎只能等到超时（表现是"Agent 问了问题，用户答了却没反应"）。
+//
+// 校验与转发必须与 SubmitApproval **完全一致**（引擎的注释也这么要求）：二者都是
+// "把外部输入注入正在运行的 agent 循环"的通道，会话归属、调用者身份、run token
+// 缺一不可，否则就成了绕过审批栅栏的后门。
+func (h *SubmitHandler) SubmitAnswer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID  string `json:"session_id"`
+		ToolCallID string `json:"tool_call_id"`
+		Answer     string `json:"answer"`
+		UserID     string `json:"user_id,omitempty"`
+		// RunToken 同审批端点：由网关从 Redis 归属映射读出后注入，供引擎拒绝陈旧 run。
+		RunToken string `json:"run_token,omitempty"`
+	}
+	if err := DecodeJSON(w, r, &req); err != nil {
+		BadRequest(w, "invalid request")
+		return
+	}
+	if req.SessionID == "" {
+		BadRequest(w, "session_id is required")
+		return
+	}
+	if req.ToolCallID == "" {
+		BadRequest(w, "tool_call_id is required")
+		return
+	}
+	if strings.TrimSpace(req.Answer) == "" {
+		BadRequest(w, "answer is required")
+		return
+	}
+	var out map[string]any
+	// 透传已验证 JWT 的 user_id：Python 端据此校验来电者是否为会话 owner
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		req.UserID = claims.UserID
+	}
+	// 必须路由到承载该 session 运行的引擎实例，否则会打到没有该 run 的副本并报 no active agent
+	routeCtx := engine.WithRunAffinity(r.Context(), req.SessionID)
+	if rec, ok := engine.RunOwner(routeCtx, req.SessionID); ok {
+		req.RunToken = rec.RunToken
+	}
+	if err := h.python.PostJSON(routeCtx, "/v1/agent/answer", req, &out); err != nil {
+		slog.Error("answer: python proxy failed", "session", req.SessionID, "error", err)
+		InternalError(w, "answer proxy failed")
+		return
+	}
+	JSON(w, http.StatusOK, APIResponse{Success: true, Data: out})
+}
+
+// SubmitInterrupt proxies an explicit "cancel this run" request to the engine.
+//
+// 与 SubmitApproval / SubmitAnswer 同一套校验（会话归属 + 调用者身份 + run token）——
+// 它同样是"从外部作用于正在运行的 agent 循环"的通道。少任何一条，别人就能反复打断你的 run：
+// 既是骚扰，也是成本攻击（一直取消让你永远跑不完）。
+//
+// 与它们的一处差别：中断**不依赖"本副本是否有该 run"** —— 引擎在本地没有该 run 时会走 Redis
+// 信号那条路（run 可能在别的副本）。所以归属映射不可用时这里照发，由引擎侧各自判断。
+func (h *SubmitHandler) SubmitInterrupt(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		UserID    string `json:"user_id,omitempty"`
+		// RunToken 同审批端点：由网关从 Redis 归属映射读出后注入，供引擎拒绝陈旧 run。
+		RunToken string `json:"run_token,omitempty"`
+	}
+	if err := DecodeJSON(w, r, &req); err != nil {
+		BadRequest(w, "invalid request")
+		return
+	}
+	if req.SessionID == "" {
+		BadRequest(w, "session_id is required")
+		return
+	}
+	// 透传已验证 JWT 的 user_id：Python 端据此校验来电者是否为会话 owner
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		req.UserID = claims.UserID
+	}
+	// 按 run 归属路由（优先打到承载该 run 的实例）；映射不可用时仍照发 —— 见上面的说明。
+	routeCtx := engine.WithRunAffinity(r.Context(), req.SessionID)
+	if rec, ok := engine.RunOwner(routeCtx, req.SessionID); ok {
+		req.RunToken = rec.RunToken
+	}
+	var out map[string]any
+	if err := h.python.PostJSON(routeCtx, "/v1/agent/interrupt", req, &out); err != nil {
+		slog.Error("interrupt: python proxy failed", "session", req.SessionID, "error", err)
+		InternalError(w, "interrupt proxy failed")
+		return
+	}
+	JSON(w, http.StatusOK, APIResponse{Success: true, Data: out})
+}
+
+// SubmitSteer 把用户的追加指令注入正在跑的 run（**不终止**）。
+//
+// 准入与 SubmitInterrupt 同源：会话归属 + 调用者身份 + run token。少任何一条，别人就能
+// 往你的 run 里塞指令 —— 那是**内容注入**，比打断更危险。差别只在引擎侧不停 run，
+// 而是把文本排队，由下一轮边界消费。
+//
+// 与 SubmitInterrupt 的一处刻意不同：引擎用 `200 + {"ok": false, "error": ...}` 表达拒绝
+// （它同时要给直连引擎的 ACP 客户端用），这里把 `ok:false` 翻成对应的 HTTP 状态码。
+// 照抄 200 会让"没送到"看起来像"送到了" —— steer 的全部价值就是让用户相信话带到了。
+func (h *SubmitHandler) SubmitSteer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string `json:"session_id"`
+		UserID    string `json:"user_id,omitempty"`
+		RunToken  string `json:"run_token,omitempty"`
+		Text      string `json:"text"`
+	}
+	if err := DecodeJSON(w, r, &req); err != nil {
+		BadRequest(w, "invalid request")
+		return
+	}
+	if req.SessionID == "" {
+		BadRequest(w, "session_id is required")
+		return
+	}
+	if strings.TrimSpace(req.Text) == "" {
+		BadRequest(w, "text is required")
+		return
+	}
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		req.UserID = claims.UserID
+	}
+	routeCtx := engine.WithRunAffinity(r.Context(), req.SessionID)
+	if rec, ok := engine.RunOwner(routeCtx, req.SessionID); ok {
+		req.RunToken = rec.RunToken
+	}
+	var out map[string]any
+	if err := h.python.PostJSON(routeCtx, "/v1/agent/steer", req, &out); err != nil {
+		slog.Error("steer: python proxy failed", "session", req.SessionID, "error", err)
+		InternalError(w, "steer proxy failed")
+		return
+	}
+	if ok, _ := out["ok"].(bool); !ok {
+		reason, _ := out["error"].(string)
+		JSON(w, steerStatus(reason), APIResponse{Success: false, Error: reason})
+		return
+	}
+	JSON(w, http.StatusOK, APIResponse{Success: true, Data: out})
+}
+
+// steerStatus 把引擎的拒绝原因映射成状态码，让调用方能区分"重试有用"与"没用"。
+//
+// 按 `docs/error-codes.md` 的口径：4xx 是调用方的问题（不该重试），429 是限流（可退避），
+// 409 是状态冲突（run 已结束/换了 run，重试通常无用但换 token 可能有用）。
+func steerStatus(reason string) int {
+	switch {
+	case strings.Contains(reason, "not session owner"):
+		return http.StatusForbidden
+	case strings.Contains(reason, "rate limited"):
+		return http.StatusTooManyRequests
+	case strings.Contains(reason, "no active agent"), strings.Contains(reason, "stale run token"):
+		return http.StatusConflict
+	case strings.Contains(reason, "too long"), strings.Contains(reason, "is required"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusConflict
+	}
+}
+
+const GoalEnforceKey = "goal_enforce"
+
+// GoalEnforceSource 是续跑轮注入消息的来源标记。
+//
+// 续跑指令由**系统**产生，不能伪装成用户提问 ——
+// 前端据此渲染成系统卡片，模型也不会把它当真人输入。
+const GoalEnforceSource = "goal_enforce"
+
+// goalEnforceContext 是续跑轮随 `workbench_context` 下发的**结构化**上下文。
+//
+// 为什么不只传一个 `true`：引擎需要知道"这是同一件事的第几段、因为哪一档额度、
+// 还剩几件事"。有了它，引擎才能在 system 段（优先级高于 user 消息）用一句话定性
+// "本轮是宿主自动续跑"，而不是让模型自己去猜对话里那条指令是谁写的。
+//
+// 详细欠项仍然在 `content` 里（那是模型逐条执行的清单）；这里只放**摘要**，
+// 避免同一段文字在两个位置重复出现、白占上下文。
+type goalEnforceContext struct {
+	// Round 是本任务已跑过的段数（1 = 第一个续跑段）。
+	Round int `json:"round"`
+	// BudgetAxis 是上一段撞墙的额度轴（空 = 上一段是"没做完"而不是"额度用完"）。
+	BudgetAxis string `json:"budget_axis,omitempty"`
+	// Pending 是任务清单里尚未完成的条目数。
+	Pending int `json:"pending,omitempty"`
+}
+
+// goalKeyPrefix 是目标状态在 Redis 里的键前缀（会话级，跨轮持久）。
+const goalKeyPrefix = "goal:"
+
+// goalTTL 是目标状态的存活时间：会话闲置后自然过期，不留永久的"半完成目标"。
+const goalTTL = 24 * time.Hour
+
+// HandleSubmit 执行一次聊天提交，并由 **Goal FSM（P6）** 驱动跨轮的自动续跑。
+//
+// 与 P1c 的区别：目标状态**跨用户请求持久化** —— 上一次没做完不会因为用户没再说话而消失。
+// 推进规则见 internal/agentgoal/goal.go 的 Advance（纯函数）：
+// 完成即终止；未完成则续跑到回合上限后判 **blocked（不是 completed）**；硬失败直接 blocked。
+func (h *SubmitHandler) HandleSubmit(ctx context.Context, userID, sessionID, content string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}) {
+	// 链级收尾信号：`turn_done` 表示**整条续跑链**结束（Goal FSM 所有轮次都跑完，
+	// 或引擎不可达 / 用户停止）。它必须在这里 defer 发一次，而不是在 `submitOnce`
+	// 里每段发一次 —— 后者会让前端在第一段结束时就把 SSE 关掉，续跑段的
+	// text/tool_call 全部送进无人订阅的流里：表现就是"长任务跑到一半就停"，
+	// 而刷新后结果又都在（因为都已落库）。`done` 是**段**级终态，链级收尾只看这条。
+	defer h.eventHub.Publish(broadcast.Event{
+		Type:      "turn_done",
+		SessionID: sessionID,
+		Data:      map[string]string{"session_id": sessionID},
+	})
+
+	goal := h.loadGoal(ctx, sessionID)
+	if goal == nil || goal.Terminal() {
+		goalID, _ := id.UUID()
+		g := agentgoal.NewGoal(goalID, sessionID, content, time.Now().Unix())
+		goal = &g
+	}
+
+	msg := content
+	// `@路径` 引用：把正文里的路径展开成文件内容块 —— **只发给引擎**，落库的
+	// `content` 仍是用户打的那一行。否则刷新会话会看到满屏文件内容，而用户
+	// 从没打过它们。
+	//
+	// 只展开首轮：续跑轮的正文是系统指令（goalEnforcePrompt），不含引用；
+	// 每轮重读一次文件既慢，又会让模型以为用户又发了一遍。
+	engineMsg := expandFileRefs(ctx, sessionID, content)
+	wb := workbenchCtx
+	// 附件只随**用户那条消息**走（首轮）。续跑轮是系统指令（goalEnforcePrompt），
+	// 再带一次附件只会让模型以为用户又发了一遍同样的文件。
+	atts := attachments
+	for {
+		// 把**已有清单**带进这一轮：续跑轮通常不再重写清单（清单已经在往来历史里），
+		// 若每轮只从当轮事件读，判定层从第二轮起就看不见未完成项。
+		res := h.submitOnce(ctx, userID, sessionID, msg, engineMsg, llmConfig, wb, atts, goal.Items)
+		atts = nil
+		engineMsg = ""
+		if res == nil || res.Report == nil {
+			// 引擎不可达 / 去重命中：目标**不推进**（否则会把"没跑起来"误判成"没完成"，
+			// 白烧一轮续跑）。原样结束。
+			return
+		}
+		// 小目标边界：本轮清单推进到了新的一项，就把单小目标的轮数归零 ——
+		// 20 轮拦的是"这一件事卡住"，不是整条任务（见 agentgoal.DefaultGoalRounds）。
+		// SetItems 同时更新"清单"与"指纹"，两者不能分开：分开会出现"轮数按新清单算、
+		// 判定还看旧清单"的错位。本轮没发 `todo_updated` 时 items 为空 ⇒ 保留旧清单。
+		*goal = goal.SetItems(res.Items)
+		advanced, cont := agentgoal.Advance(*goal, *res.Report, time.Now().Unix())
+		*goal = advanced
+		h.saveGoal(ctx, *goal)
+		if !cont || ctx.Err() != nil {
+			return
+		}
+		// 续跑：把上一轮欠下的义务作为**系统指令**注入（带来源标记，不伪装成用户提问）。
+		// 带上 `*goal` 是为了让指令能说清"还剩多少轮额度"——预算对模型可见，它才会排优先级。
+		msg = goalEnforcePromptFor(*goal, res.Report)
+		// 同时下发**结构化摘要**：引擎据此在 system 段定性"这一段是宿主接上的"，
+		// 而不是让模型从对话里猜那条指令是谁写的（见 python-engine/app/agent/goal_context.py）。
+		// `Round` 用已跑完的段数：第一段结束后 TotalRounds=1，接着跑的就是第 1 个续跑段。
+		wb = withGoalEnforceContext(workbenchCtx, goalEnforceContext{
+			Round:      goal.TotalRounds,
+			BudgetAxis: res.Report.BudgetAxis,
+			Pending:    len(res.Report.Pending),
+		})
+	}
+}
+
+// loadGoal 从 Redis 读回会话目标（fail-soft：读不到就当作没有目标）。
+func (h *SubmitHandler) loadGoal(ctx context.Context, sessionID string) *agentgoal.Goal {
+	if db.Redis == nil || sessionID == "" {
+		return nil
+	}
+	res := db.Redis.Do(ctx, "GET", db.RedisKey(goalKeyPrefix+sessionID))
+	if res.Err() != nil {
+		return nil
+	}
+	raw, err := res.Text()
+	if err != nil || raw == "" {
+		return nil
+	}
+	var g agentgoal.Goal
+	if json.Unmarshal([]byte(raw), &g) != nil {
+		return nil
+	}
+	return &g
+}
+
+// saveGoal 把目标状态写回 Redis（fail-soft：写失败只影响"跨轮记忆"，不影响本轮结论）。
+func (h *SubmitHandler) saveGoal(ctx context.Context, g agentgoal.Goal) {
+	if db.Redis == nil || g.SessionID == "" {
+		return
+	}
+	b, err := json.Marshal(g)
+	if err != nil {
+		return
+	}
+	if err := db.Redis.Do(
+		ctx, "SET", db.RedisKey(goalKeyPrefix+g.SessionID), string(b),
+		"EX", fmt.Sprintf("%d", int(goalTTL.Seconds())),
+	).Err(); err != nil {
+		slog.Warn("save goal state failed", "session", g.SessionID, "error", err)
+	}
+}
+
+// turnResult 是**一轮**提交的产物：判定结论 + 这一轮看到的任务清单。
+//
+// 为什么要把清单一起返回：续跑链在两轮之间只经过 `HandleSubmit`，而 `Goal` 是它
+// 唯一的跨轮载体。清单必须跟着结论一起出去，才能被写进 `Goal.Items`，让下一轮
+// 的判定仍然看得见"还剩哪几件事"——否则从第二轮起就退回"没有错误 + 有正文 = 完成"。
+type turnResult struct {
+	Report *agentgoal.Report
+	// Items 是本轮 `todo_updated` 给出的清单（未解析/未发布时为空）。
+	Items []agentgoal.SubGoalItem
+}
+
+// submitOnce 是**一轮**提交：把请求代理到 Python 引擎并流式转发 SSE，
+// 结束时用 host 证据判定本轮的完成情况，并返回该判定。
+//
+// workbenchCtx 是前端组装的工作台上下文（kb_id / agent / skill_names / workflow_id），
+// 透传给引擎消费 —— 网关不再丢弃它。
+//
+// priorItems 是**上一轮留下的清单**。本轮引擎没发 `todo_updated` 时（续跑轮通常
+// 不再重写清单），判定仍要按它算未完成项 —— 详见 agentgoal.Goal.Items 的注释。
+func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, content, engineContent string, llmConfig, workbenchCtx map[string]interface{}, attachments []map[string]interface{}, priorItems []agentgoal.SubGoalItem) *turnResult {
+	// 单轮上限来自 `AGENT_SUBMIT_TIMEOUT`（见 turnTimeout）。这里**不再**写死
+	// `DefaultAgentTimeout`：那个常量只是兜底，写死它会让配置项对外层 ctx 生效、
+	// 对真正的单轮无效，长回合依然在 300s 被销毁现场。
+	ctx, cancel := context.WithTimeout(ctx, h.turnTimeout())
+	defer cancel()
+	// session 亲和：同 session 的所有流式轮次固定路由到同一引擎实例
+	// （引擎 PersistentTerminal/后台任务/簿记为进程内状态，round-robin 跨实例会断链）
+	ctx = engine.WithSession(ctx, sessionID)
+	// 不在这里登记 sessionCancels：取消条目归**整条续跑链**所有
+	// （routes_agent.go 在启动 goroutine 前登记外层 cancel 并 defer 删除）。
+	// 此前每轮 Store 单轮 cancel 并 defer Delete，造成两个后果：
+	//   1. 用户点「停止」只取消了当前轮，外层 ctx 未取消 ⇒ 续跑循环照常开下一轮；
+	//   2. 本轮结束即删除登记 ⇒ 轮次间隙点「停止」得到 no_active_task。
+	// 链级 cancel 是外层 ctx 的 cancel，取消它会级联传到本轮的 ctx，语义更强且不漏。
+
+	// 落库专用 ctx 工厂（S 修复）：不继承主 ctx 的取消/期限 —— 流可能被超时、前端断开、
+	// 会话取消等截断，但已产生的消息（user/assistant/tool_call）必须写入，否则刷新后丢失。
+	//
+	// 关键：超时窗口必须从「每次落库那一刻」开始计时。此前只在回合开始时创建一个 10s
+	// 窗口，任何长于 10s 的回合（多轮 LLM + 工具调用是常态）都会让之后的落库全部
+	// `context deadline exceeded` —— 表现为思考过程、工具调用与助手回复刷新/重启后全丢。
+	const storeWriteTimeout = 10 * time.Second
+	storeCtxFor := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), storeWriteTimeout)
+	}
+
+	// ── 发送侧幂等（#4）──
+	//
+	// 读取侧已有 per-session 缓冲补发（events.go），解决"**断了怎么续**"；
+	// 这里解决另一件事："**重复了怎么不重跑**"。
+	//
+	// 没有它时：网络抖动导致的重试、或用户以为没发出去而重发，都会让引擎把同一条消息
+	// 执行两次 —— 表现是重复写文件、重复计费。有 `client_msg_id` 时用 Redis SETNX 做
+	// 5 分钟窗口去重，命中即**不再触发引擎**；没有该字段（老客户端 / 外部调用）时行为完全不变。
+	//
+	// ID 由前端放进 `llm_config` 一并传（避免为它改 HandleSubmit 的签名），
+	// 取出后立即删除，不让传输层字段污染引擎的任务配置。
+	clientMsgID := ""
+	if v, ok := llmConfig["client_msg_id"].(string); ok {
+		clientMsgID = strings.TrimSpace(v)
+		delete(llmConfig, "client_msg_id")
+	}
+	if clientMsgID != "" && db.Redis != nil && sessionID != "" {
+		dedupKey := db.RedisKey("submit:dedup:" + sessionID + ":" + clientMsgID)
+		// 用 `SET … NX EX`（RedisClient 接口没有类型化的 SetNX，`Do` 是本项目的既有用法）。
+		// 语义要点：**只有"键已存在"才判定重复**；Redis 故障等其它错误一律放行 ——
+		// 去重是优化，不该因为它自己不可用就把用户的正常提交卡住。
+		res := db.Redis.Do(ctx, "SET", dedupKey, "1", "NX", "EX", "300")
+		if err := res.Err(); err != nil {
+			if err == redis.Nil {
+				slog.Info("submit deduplicated (already processing)",
+					"session", sessionID, "client_msg_id", clientMsgID)
+				// 这条消息已在处理中（同一次提交的重试）：直接结束，不再触发引擎。
+				return nil
+			}
+			slog.Warn("submit dedup unavailable, proceeding", "error", err)
+		}
+	}
+
+	// turn 一致性（000.md 第 14 条）：本轮回合 ID，贯穿消息/工具调用/计费落库，
+	// 收尾时收敛 turns 状态（completed/failed/cancelled），不再"只记日志"。
+	turnID, turnIDErr := id.UUID()
+	if turnIDErr != nil {
+		slog.Warn("turn: generate id failed, turn tracking disabled", "error", turnIDErr)
+		turnID = ""
+	}
+	// 回合计时锚点：遥测里的 `duration_ms` 用「引擎流开始 → 收尾」的墙钟差。
+	// 放在这里而不是函数入口：之前的时间花在鉴权/配置解析/历史加载上，
+	// 那些不属于这一轮 LLM 对话的耗时。
+	turnStarted := time.Now()
+	// 消息来源：证据判定驱动的续跑轮必须带来源标记 —— 前端据此渲染成系统卡片，
+	// 而不是伪装成一条用户提问。
+	msgSource := ""
+	if _, ok := workbenchCtx[GoalEnforceKey]; ok {
+		msgSource = GoalEnforceSource
+	}
+	// S 修复：上下文丢失 — 提交时立即持久化用户消息（SSE 中断/停止也不丢历史）
+	{
+		sctx, cancelStore := storeCtxFor()
+		h.sessionMgr.SaveUserMessage(sctx, sessionID, userID, content, turnID, msgSource)
+		if turnID != "" {
+			// origin 与 msgSource 同源：接管巡检轮的整个回合（含助手回复）都要能被
+			// 认出来，不能只在注入的那条 user 消息上打标记。
+			h.sessionMgr.CreateTurn(sctx, turnID, sessionID, userID, msgSource)
+		}
+		cancelStore()
+	}
+
+	histMsgs := make([]map[string]string, 0)
+	if hist, err := h.sessionMgr.GetMessages(ctx, sessionID, 50); err == nil && len(hist) > 0 {
+		// 只保留最近 8 条消息（Python SessionStore 有完整缓存）
+		const maxHistory = 8
+		start := 0
+		if len(hist) > maxHistory {
+			start = len(hist) - maxHistory
+		}
+		for _, m := range hist[start:] {
+			if (m.Role == "user" || m.Role == "assistant" || m.Role == "tool") && m.Content != "" {
+				content := m.Content
+				if m.Role == "assistant" {
+					// 落库的 assistant 内容保留 [thinking]…[/thinking] 思考块（前端刷新后还原思考），
+					// 但回传引擎作为 LLM 上下文时应剥离：思考只在当轮有意义，历史思考白占 token。
+					content = stripThinkingBlocks(content)
+					if content == "" {
+						continue // 纯思考轮：剥离后无正文，跳过（避免空 assistant 消息）
+					}
+				}
+				histMsgs = append(histMsgs, map[string]string{"role": m.Role, "content": content})
+			}
+		}
+	}
+
+	// 默认 max_turns，若 llm_config 中有则使用前端指定的值
+	//
+	// M20：这里的"默认"改由后台「系统设置」的 agent.max_turns 决定（此前是一个死字段）。
+	// 优先级：请求显式（前端 / Agent 档案）> 后台全局默认 > 包内常量。
+	maxOutputTokens, defaultMaxTurns := h.agentDefaults()
+	if llmConfig != nil {
+		if mt, ok := llmConfig["max_turns"].(float64); ok && mt > 0 {
+			defaultMaxTurns = int(mt)
+		}
+	}
+	// 发给引擎的正文：首轮是展开过 `@路径` 的那份，续跑轮退回原文
+	// （`engineContent` 为空表示"这一轮不重新展开"）。
+	engineText := engineContent
+	if engineText == "" {
+		engineText = content
+	}
+	pythonReq := map[string]interface{}{
+		"session_id": sessionID,
+		"user_id":    userID,
+		"content":    engineText,
+		"history":    histMsgs,
+		"max_turns":  defaultMaxTurns,
+		// M19：run 与 `turns` 的**唯一**对应关系。引擎自己生成的 task id 是内部标识，
+		// 与计费回合无关；没有这个字段，崩溃/接管段的用量就无法与已计费回合对账。
+		"turn_id": turnID,
+	}
+	// 附件原样透传给引擎：由引擎决定怎么变成模型可见内容（图片 / 文档 / 其他）。
+	// 只带附件不带文字时 content 为空串，引擎侧据此单独组一条 user 消息。
+	if len(attachments) > 0 {
+		pythonReq["attachments"] = attachments
+	}
+	// P1-c：用**会话运行时状态**解析最终生效的模式/模型/provider（唯一解析链，spec §3）。
+	// 前端 llm_config 视为"本次请求的显式意图"，优先级高于会话 runtime 与默认值；
+	// 若前端未传（P1-e 后的目标形态），则由 runtime / 用户默认 / 全局默认依次生效。
+	explicit := map[string]string{}
+	if llmConfig != nil {
+		if v, ok := llmConfig["mode"].(string); ok && v != "" {
+			explicit["mode"] = v
+		}
+		// 工具授权模式：**唯一来源就是这里** —— 前端实时状态经 llm_config.tools_mode 携带。
+		// 非法值当场归一化，不把不可信输入透传给引擎。
+		if v, ok := llmConfig["tools_mode"].(string); ok && v != "" {
+			explicit["tools_mode"] = normalizeToolsMode(v)
+		}
+		if v, ok := llmConfig["model"].(string); ok && v != "" {
+			explicit["model"] = v
+		}
+	}
+	var tenantID int16
+	if claims := auth.GetClaims(ctx); claims != nil {
+		tenantID = claims.TenantID
+		if tenantID == 0 {
+			tenantID = parseTenantID(claims.UserID)
+		}
+	}
+	// tenant_id 仍要透传：引擎侧按它隔离记忆/知识库/审计。
+	pythonReq["tenant_id"] = tenantID
+	agentCfg := ResolveSessionAgentConfig(ctx, db.Redis, tenantStr(tenantID), userID, sessionID, explicit)
+	if llmConfig == nil {
+		llmConfig = map[string]interface{}{}
+	}
+	// M20：后台「系统设置」的单次 max output 上限（agent.max_tokens）接到这里 ——
+	// 它此前写进 config.Config.AgentMaxTokens，而那个字段**全库零读取点**，
+	// 于是"用户在后台改了数字，什么都没发生"。
+	// **只在请求没带时注入**：前端 / Agent 档案的显式值优先（与 max_turns 同一优先级）；
+	// 引擎 `app/main.py` 的兜底 8192 因此只在"绕过网关直连引擎"时才生效。
+	applyMaxOutputDefault(llmConfig, maxOutputTokens)
+	llmConfig["mode"] = agentCfg.mode.Value
+	// 工具授权模式随请求下发（**不再经 Redis 往返**）：引擎在任务开始时读取一次并用于
+	// 每次工具裁决（python-engine/app/agent/runtime.py）。此前它存在 Redis 里由引擎反查，
+	// 与前端选择、runtime 状态三处并存，任一处不一致就表现为"设置存了却不生效"。
+	llmConfig["tools_mode"] = agentCfg.toolsMode.Value
+	llmConfig["model"] = agentCfg.model.Value
+	if agentCfg.provider.Value != "" {
+		// 显式 provider：引擎从 llm_config.provider 读（main.py:1007 → AgentRuntime 的
+		// provider_hint → gateway._select 优先命中），解决多网关同名模型抢路由
+		// （如 OpenCode 与 DeepSeek 直连都提供 deepseek-*）。
+		llmConfig["provider"] = agentCfg.provider.Value
+	}
+	pythonReq["llm_config"] = llmConfig
+	// 项目根注入：agent 的文件/git 工具必须作用在**用户选中的项目目录**上，
+	// 而不是沙箱副本。引擎侧读 `context.root_path` 设置工具工作根。
+	//
+	// 查库复用 `file_refs.go` 的 `projectRootForSession` —— 与 `@路径` 展开用的是
+	// 同一条关联链（会话 → 项目 → root_path），两处各写一遍迟早会不一致。
+	//
+	// 必须**复制**再改：`workbenchCtx` 是调用方传入的 map，`HandleSubmit` 在续跑轮
+	// 会复用它 —— 就地写入会把上一轮的项目根带到下一轮。
+	//
+	// fail-soft：查不到（画布会话、DB 不可用、无 claims）就不注入，引擎回退到沙箱。
+	// 提交本身绝不能因为"找不到项目根"而失败。
+	// 注：目录是否存在不在这里判断 —— `file_refs.go` 的 `projectRootForSession` 只判空串。
+	// 路径可用性由引擎侧 `sandbox.project_root()` 复核（绝对路径 + 确实是目录），
+	// 因为那才是真正使用路径的地方。
+	if root, ok := projectRootForSession(ctx, sessionID); ok && root != "" {
+		wb := make(map[string]interface{}, len(workbenchCtx)+1)
+		for k, v := range workbenchCtx {
+			wb[k] = v
+		}
+		wb["root_path"] = root
+		workbenchCtx = wb
+	}
+	// 工作台上下文原样透传：引擎侧决定如何消费（RAG 注入、技能装配、Agent 覆盖）
+	if len(workbenchCtx) > 0 {
+		pythonReq["context"] = workbenchCtx
+	}
+
+	events, err := h.python.RunSSE(ctx, "/v1/agent/submit", pythonReq,
+		map[string]string{"X-User-ID": userID})
+	if err != nil {
+		slog.Error("submit: python proxy failed", "error", err)
+		// 回合终态必须**在这里**收敛：此前这个分支直接 return，而 FinishTurn 只在
+		// "流正常结束"之后才调用 —— 于是"引擎不可达"的每一轮都会在 DB 里留下一条
+		// 永远 running 的记录（会话地图/侧边栏永久"运行中"，与 FinishTurn 写库失败
+		// 是同一个观感）。实测：网关 401 期间的两轮提交都留成了僵尸 turn。
+		if turnID != "" {
+			sctx, cancelStore := storeCtxFor()
+			h.sessionMgr.FinishTurn(sctx, turnID, "failed", "engine unavailable: "+err.Error(), "", 0, 0, 0)
+			cancelStore()
+		}
+		h.eventHub.Publish(broadcast.Event{Type: "text", SessionID: sessionID, Data: map[string]string{"content": "Service temporarily unavailable. Please try again."}})
+		// `turn_done` 不在这里发：HandleSubmit 的 defer 统一发链级收尾信号。
+		return nil
+	}
+
+	var finalContent string
+	var streamErr string // 引擎回传的 error 事件内容（用于 turns.status=failed）
+	// 每轮累计用量：喂 FinishTurn（缓存命中率/每轮模型）与计费。**只收 `done` 的累计值** ——
+	// `usage` 是按次增量，并入会导致重复计费，守卫见 usageTotals.withEvent 与其单测。
+	var usage usageTotals
+	// 按模型归集的**增量**（`usage` 事件的 model 字段）。整轮成本必须按各自模型
+	// 单价折算 —— 一次提交可跨多个模型（fallback / 摘要 / 子 Agent 外层调用），
+	// 拿单个模型名乘全部 token 会让成本错几倍。
+	var ledger modelLedger
+	var turnModel string
+	turnToolCallIDs := []string{} // S 修复：messages.tool_calls 列只存 tool_call id 集合（内容在 tool_calls 表）
+	// P1：host 证据采集器 —— 本轮所有工具事件都喂给它，收尾时据此判定完成情况。
+	ev := evidence.NewCollector()
+	// 本轮任务清单（模型通过 `todo_write` 写的）。判定层靠它确认"还有几件事没做完"，
+	// 指纹靠它推出小目标边界。空 = 本轮引擎没发 `todo_updated`（续跑轮通常如此），
+	// 此时沿用 `priorItems` —— 否则清单只在第一轮可见，第二轮起判定就退回
+	// "没有错误 + 有正文 = 完成"。
+	var items []agentgoal.SubGoalItem
+	// 段级预算撞墙的轴名（`budget_exceeded:<轴>`）。空 = 这一轮没撞墙。
+	budgetAxis := ""
+
+	// P 性能：text 事件 50ms 合帧转发（公网多租户下 SSE 帧数减半，减少网关/前端处理开销）
+	const textFrameInterval = 50 * time.Millisecond
+	var textBuf strings.Builder
+	lastTextFlush := time.Now()
+	flushText := func() {
+		if textBuf.Len() == 0 {
+			return
+		}
+		payload := textBuf.String()
+		textBuf.Reset()
+		finalContent += payload
+		h.eventHub.Publish(broadcast.Event{
+			Type: "text", SessionID: sessionID,
+			Data: engine.PythonEvent{Type: "text", Content: payload},
+		})
+		lastTextFlush = time.Now()
+	}
+
+	// ── 增量落库 ──
+	// 回合进行中把已产生的思考块/正文/工具调用按节流写进同一条 assistant 消息，
+	// 使刷新、断线、网关重启后都能看到已完成的部分；回合结束时用同一 id 定型，不产生重复行。
+	// 此前只在回合结束才落库：长回合（多轮工具调用，常达数分钟）进行中刷新会看到"什么都没有"。
+	assistantMsgID, msgIDErr := id.UUID()
+	if msgIDErr != nil {
+		slog.Warn("submit: generate assistant message id failed", "error", msgIDErr)
+		assistantMsgID = ""
+	}
+	const draftInterval = 3 * time.Second
+	lastDraftAt := time.Now()
+	saveDraft := func(force bool) {
+		if assistantMsgID == "" {
+			return
+		}
+		if !force && time.Since(lastDraftAt) < draftInterval {
+			return
+		}
+		lastDraftAt = time.Now()
+		tcJSON, _ := json.Marshal(turnToolCallIDs)
+		sctx, cancelStore := storeCtxFor()
+		h.sessionMgr.UpsertAssistantMessage(sctx, sessionID, assistantMsgID, finalContent, string(tcJSON), turnID)
+		cancelStore()
+	}
+
+	for evt := range events {
+		// 思考事件（[thinking] 前缀）不参与合帧：过程性内容需即时逐段推送，
+		// 否则毫秒级到达的 thinking 片段会被 50ms 合帧合并成整段（思考不流式）。
+		isThinking := strings.HasPrefix(evt.Content, "[thinking]")
+		if evt.Type == "text" && evt.Content != "" && !isThinking {
+			textBuf.WriteString(evt.Content)
+			if time.Since(lastTextFlush) >= textFrameInterval {
+				flushText()
+			}
+		} else {
+			flushText() // 非 text 事件先冲刷缓冲，保持顺序
+			// 思考内容虽然不参与合帧，但必须计入落库文本（finalContent）：
+			// 引擎按 80 字符分段下发 "[thinking]片段[/thinking]"（见 runtime.py reasoning 转发），
+			// 前端历史回放依赖 splitThinking(loose) 从 content 还原思考块。
+			// 此前未累加 → assistant content 只剩正文，刷新后思考永久丢失。
+			if evt.Type == "text" && isThinking {
+				finalContent += evt.Content
+			}
+			// A1 的**独立 `thinking` 事件**同样必须落库 —— 否则刷新后思考丢失，
+			// 与上面那条 `[thinking]` 文本路径是同一个坑的第二种形态（2026-10-09 补）。
+			// 引擎自 A1 起不再把 native reasoning 包进 text，改为发独立 `thinking` 事件；
+			// 这里按**既有历史格式**包回 `[thinking]…[/thinking]` 再累加，前端
+			// `splitThinking(loose)` 才能从 content 还原思考块（回放格式不变）。
+			if evt.Type == "thinking" && evt.Content != "" {
+				finalContent += "[thinking]" + evt.Content + "[/thinking]"
+			}
+			h.eventHub.Publish(broadcast.Event{Type: evt.Type, SessionID: sessionID, Data: evt})
+		}
+		// S 修复：工具调用过程落库（tool_call 记录 + tool_result 回填），刷新后显示一致。
+		// 每次写入都用独立的短超时（storeCtxFor），避免回合跑久后写入被 deadline 掐掉。
+		switch evt.Type {
+		case "tool_call":
+			{
+				sctx, cancelStore := storeCtxFor()
+				h.sessionMgr.SaveToolCall(sctx, sessionID, evt.ID, evt.Name, evt.Arguments, turnID)
+				cancelStore()
+			}
+			if evt.ID != "" {
+				turnToolCallIDs = append(turnToolCallIDs, evt.ID)
+			}
+			// P1：host 证据（工具名 + 参数）。
+			ev.ObserveToolCall(evt.ID, evt.Name, evt.Arguments)
+		case "tool_result":
+			{
+				sctx, cancelStore := storeCtxFor()
+				h.sessionMgr.UpdateToolCall(sctx, evt.ID, evt.Content, strings.Contains(evt.Content, `"error"`), turnID)
+				cancelStore()
+			}
+			// P1：host 证据（工具结果 —— 成败与退出信息由它判定）。
+			ev.ObserveToolResult(evt.ID, "", evt.Content)
+		case "guardrail_blocked":
+			// SaaS 合规：栅栏拒绝留痕（输入注入/输出泄露/工具 block 审计）。
+			//
+			// ⚠ **2026-10-09 修一处有损留痕**：早先这里写 `"guard_"+evt.ID`，但引擎的
+			// `AgentEvent` **根本没有 `id` 字段**（只有 `tool_call_id`，见
+			// `python-engine/app/agent/runtime_types.py`），而 `guardrail_blocked` 也不带
+			// `tool_call_id` ⇒ **`evt.ID` 恒为空**，于是 id 变成**常量** `"guard_"`；
+			// `SaveToolCall` 走 `ON CONFLICT (id) DO UPDATE` ⇒ **同会话里后一次拦截会覆盖前一次**，
+			// 留痕只剩最后一条（`SaveToolCall` 对**空** id 则直接 return，连一条都不留）。
+			// 改用 `spillRecordID` 生成唯一 id。
+			{
+				sctx, cancelStore := storeCtxFor()
+				h.sessionMgr.SaveToolCall(sctx, sessionID,
+					spillRecordID("guard"), "guardrail",
+					fmt.Sprintf(`{"reason":%q}`, evt.Content), turnID)
+				cancelStore()
+			}
+		case "compaction":
+			// 上下文压缩留痕：引擎**只在真的压缩了**时才发它（`runtime.py:884-919`，返回 None 表示没压），
+			// 载荷是 `{before_tokens, after_tokens, saved_tokens, messages_before/after, strategy}` 的 JSON。
+			// 落成 `tool_name='compaction'` 的记录 ⇒ 前端投影把它渲染成 **notice 行**（刷新后仍可见），
+			// 与状态栏那行「压缩前→后」互补：状态栏是即时读数，notice 是**可追溯的留痕**。
+			{
+				sctx, cancelStore := storeCtxFor()
+				h.sessionMgr.SaveToolCall(sctx, sessionID,
+					spillRecordID("compaction"), "compaction", evt.Content, turnID)
+				cancelStore()
+			}
+		case "todo_updated":
+			// 任务清单：既是判定层的"还剩几件事"，也是续跑预算的**层级依据**。
+			// 轮数上限按"单个小目标"计（见 agentgoal.DefaultGoalRounds），所以网关必须
+			// 自己从清单推出当前小目标，而不是等到 20 轮之后才发现整条任务被拦住了。
+			//
+			// 载荷是引擎 `runtime.py` 直接 `json.dumps(tool_result["todos"])` 的数组；
+			// 解析失败只影响"预算能不能按小目标重置"与"判定能不能看见未完成项"
+			// （都退化为"没有清单"），绝不能让它中断这一轮 —— 所以这里 fail-soft，
+			// 不记 streamErr。
+			if parsed, ok := parseTodoItems(evt.Content); ok {
+				items = parsed
+			}
+		case "error":
+			// 引擎侧异常：记录原因，回合终态判为 failed（000.md 第 14 条：失败不再静默）。
+			//
+			// 但 `budget_exceeded:<轴>` 不是硬失败：它说明**这一段**额度用完了，现场已
+			// 保存，下一段接着跑就能继续。此前它与真正的引擎错误同形 ⇒ 判定 Failed ⇒
+			// GoalBlocked ⇒ 续跑链硬停，长任务就此断在半路。这里把它单独识别出来交给
+			// 判定层（见 agentgoal.Signals.BudgetAxis）。
+			streamErr = evt.Content
+			budgetAxis = budgetAxisOf(evt.Content)
+		}
+		usage = usage.withEvent(evt.Type, evt.InputTokens, evt.OutputTokens, evt.CachedTokens)
+		// 按模型归因：只取**按次增量**（`usage` 事件），它的 `model` 是这一次调用的
+		// 真实模型。`done` 的整轮合计没有归属，故不进 ledger（那也正是它不能用来
+		// 算成本的原因）。`subagent.*` 与 `usage` 同口径排除在租户额度外，见 withEvent。
+		if evt.Type == usageEventType && !strings.HasPrefix(evt.Type, subagentEventPrefix) {
+			ledger.add(evt.Model, evt.InputTokens, evt.OutputTokens, evt.CachedTokens)
+		}
+		// 模型名：`done` 携带整轮的终态模型，取最后一个非空值。
+		//
+		// **排除 `usage`**：它是逐次调用的事件，覆盖 `turnModel` 会让"这一轮用的
+		// 哪个模型"变成本轮**最后一次**调用用的模型 —— 摘要、子 Agent 外层调用
+		// 都会把它带偏，于是会话遥测与 `turns.model` 记的都是偏的。
+		if evt.Model != "" && evt.Type != usageEventType {
+			turnModel = evt.Model
+		}
+		// 增量落库：工具事件是关键节点，立即写；其余事件走 3s 节流。
+		// `compaction` 也立即写：它一回合最多一次、且是"上下文被压过"的唯一留痕，丢了就查不出来。
+		saveDraft(evt.Type == "tool_call" || evt.Type == "tool_result" || evt.Type == "guardrail_blocked" || evt.Type == "compaction")
+	}
+	flushText()     // 流结束兜底冲刷
+	saveDraft(true) // 定型：覆盖正常结束、被取消、断线等所有路径
+
+	// 可观测性：区分"正常结束"与三种中断（前端断开 / 会话取消 / DefaultAgentTimeout 超时）。
+	//
+	// 关键是**超时必须被当成异常**：在此之前它只记一条 slog.Info，于是 300s 的静默截断
+	// 在日志里和"正常结束"长得一模一样，前端也只看到流关闭、拿不到任何原因 ——
+	// 用户侧的表现就是"这轮莫名结束了"。而它还会**连带取消该会话的后台子 Agent**
+	// （引擎收到 CancelledError → cancel_session），那些子 Agent 的结论因此永远回不到主对话。
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			slog.Warn(
+				"submit turn truncated by deadline; this session's sub-agents were cancelled, "+
+					"so their conclusions will NOT reach the conversation",
+				"session_id", sessionID,
+			)
+		} else {
+			slog.Info("submit stream ended with cancellation",
+				"session_id", sessionID, "error", err)
+		}
+	}
+
+	// 收尾落库/计费：用「从现在起算」的独立短超时上下文。
+	// 不能用回合开始时创建的窗口 —— 回合通常远超 10s，那会让这里的写入全部超时。
+	storeCtx, storeCancel := storeCtxFor()
+	defer storeCancel()
+
+	if finalContent != "" || len(turnToolCallIDs) > 0 {
+		// 纯工具调用轮（无文本）也保存 assistant 消息；
+		// messages.tool_calls 列只存 id 集合（内容在 tool_calls 表，避免重复存储）。
+		// 复用增量落库的 message id：收尾只更新同一行，不新增重复消息。
+		toolCallsJSON, _ := json.Marshal(turnToolCallIDs)
+		if assistantMsgID != "" {
+			h.sessionMgr.UpsertAssistantMessage(storeCtx, sessionID, assistantMsgID, finalContent, string(toolCallsJSON), turnID)
+		} else {
+			h.sessionMgr.SaveAssistantMessage(storeCtx, sessionID, finalContent, string(toolCallsJSON), turnID)
+		}
+	} else {
+		// 无文本无工具：仅用户消息已由 SaveUserMessage 持久化
+	}
+
+	// 回合终态收敛：取消(断开/超时) -> cancelled；引擎报错 -> failed；否则 completed。
+	// 提到用量记录之前：成本与遥测都要带上终态。
+	turnStatus := "completed"
+	switch {
+	case ctx.Err() != nil:
+		turnStatus = "cancelled"
+	case streamErr != "":
+		turnStatus = "failed"
+	}
+
+	// 结算本轮用量：`done` 的整轮累计优先；它没带 token 时（取消/断线/旧引擎）
+	// 回落到逐次 `usage` 增量之和 —— 否则整轮会被记成 0，用户看到"输入 0 / 输出 0"，
+	// 计费也会漏掉这一轮。两者互斥，不会重复计。
+	usage = usage.settled()
+
+	// 用量明细（usage_events）：**只记录、不参与扣费**，供"钱花在哪个模型上"的统计。
+	//
+	// 写入失败只告警（见 RecordUsageEvent），不影响已完成的回合。
+	//
+	// `CostCents` 此前**从未被赋值**（字段只有声明点和读点），于是计费页与
+	// 会话遥测里的花费恒为 0。这里按 `model_prices` 的单价换算：取不到价格就写
+	// NULL（"不知道"），而不是 0（"免费"）—— 两者在汇总里都是 0，但在明细里
+	// 不该互相冒充。
+	//
+	// **按模型逐行**：本表的设计是"一行一次 LLM 调用"（见 UsageEvent 的文档），
+	// 而一次提交可跨多个模型。此前整轮只写一行、模型名取"最后一个非空值"，
+	// 于是整轮 token 全被算成那个模型的单价 —— 主模型与 fallback 差几倍时，
+	// 成本直接错几倍。`ledger.settle` 保证各行之和恒等于整轮入账量，
+	// 归因只改粒度、不改总额。
+	rows := ledger.settle(usage, turnModel)
+	if len(rows) == 0 {
+		// 零用量回合也要留一行。
+		//
+		// 为什么：此前 `usage_events` 只收 `input>0 || output>0` 的回合，于是引擎没
+		// 回报用量的回合在这张表里**根本不存在**。计费页的「调用次数」与「tokens」
+		// 若同源于此表就必然自相矛盾 —— 用户看到「9 次调用 / 0 tokens」这种无法解释
+		// 的组合。零 token 也落库：调用次数 = 真实回合数，tokens = 真实用量，
+		// 二者同源、可对账（tokens 为 0 只表示"这一轮没拿到用量"，不是"没发生调用"）。
+		rows = []modelUsage{{Model: turnModel}}
+	}
+
+	// 整轮金额按**精确值**累加，最后只取整一次。
+	//
+	// 不能把逐行已取整的分相加：每行都有「不足 1 分记 1 分」的抬升，3 次各 0.3 分
+	// 的调用相加会变成 3 分而不是 0.9 分 —— 贵一倍多。逐行落库仍必须写整数分
+	// （列是 integer），所以两套口径分开算（见 aggregateCostCents）。
+	turnCostUSD := 0.0
+	costUnknown := false
+	hasBillableRows := false
+	for _, row := range rows {
+		billable := row.input > 0 || row.output > 0
+		var costCents *int
+		if billable {
+			costCents = usageCostCents(storeCtx, row.Model, row.input, row.output, row.cached)
+			hasBillableRows = true
+			if usd, ok := usageCostUSD(storeCtx, row.Model, row.input, row.output); ok {
+				turnCostUSD += usd
+			} else {
+				// 这一行有真实用量却取不到单价：整轮成本就**不可知**了。
+				// 不能把其余行的和当成整轮金额 —— 那是"少算了一部分"冒充"算完了"，
+				// 比 NULL（"不知道"）更难发现：界面会显示一个具体但偏小的数。
+				costUnknown = true
+			}
+		}
+		RecordUsageEvent(storeCtx, UsageEvent{
+			TenantID:     tenantID,
+			UserID:       userID,
+			SessionID:    sessionID,
+			TurnID:       turnID,
+			Model:        row.Model,
+			Provider:     agentCfg.provider.Value,
+			InputTokens:  row.input,
+			OutputTokens: row.output,
+			CachedTokens: row.cached,
+			CostCents:    costCents,
+		})
+	}
+	costCents := aggregateCostCents(turnCostUSD, costUnknown, hasBillableRows)
+
+	// 会话遥测实时层：读端（`GET /v1/sessions/{id}/metrics`）早就存在，
+	// 但**写入端从来没有** —— 热层永远为空，每次请求都落到 `turns` + `usage_events`
+	// 两张表的聚合回落上。这里补上写入，让热层真正生效。
+	if turnID != "" {
+		cost := 0
+		if costCents != nil {
+			cost = *costCents
+		}
+		RecordSessionMetrics(storeCtx, tenantID, sessionID, SessionTurnMetrics{
+			TurnID:       turnID,
+			Model:        turnModel,
+			Status:       turnStatus,
+			InputTokens:  usage.input,
+			OutputTokens: usage.output,
+			CachedTokens: usage.cached,
+			// `aggregateMetrics` 用 `== true` 比较，这里必须写 bool，不能写 1 / "true"
+			CacheHit:   usage.cached > 0,
+			CostCents:  cost,
+			DurationMs: time.Since(turnStarted).Milliseconds(),
+		})
+	}
+
+	if turnID != "" {
+		h.sessionMgr.FinishTurn(storeCtx, turnID, turnStatus, streamErr, turnModel, usage.input, usage.output, usage.cached)
+	}
+	// 中断留痕（2026-10-09）：`cancelled` 此前**只落在 `turns.status` 里**，界面无从呈现 ——
+	// 用户**主动停止**时前端自己有 `stopped` 标记（`ChatView.vue` 的停止分支），但
+	// **断线 / 会话取消 / 超时**这三种中断，用户侧**看不到任何痕迹**，刷新后更没有
+	// （`stopped` 是纯前端字段、不入库）。落一条 `tool_name='interrupted'` 的记录 ⇒
+	// 前端投影渲染成 notice 行（刷新后仍可追溯）。
+	// 区分超时与其它取消：`ctx.Err()` 只会有 `Canceled` / `DeadlineExceeded` 两种取值。
+	if turnStatus == "cancelled" {
+		reason := "cancelled"
+		if ctx.Err() == context.DeadlineExceeded {
+			reason = "timeout"
+		}
+		h.sessionMgr.SaveToolCall(storeCtx, sessionID,
+			spillRecordID("interrupted"), "interrupted",
+			fmt.Sprintf(`{"reason":%q}`, reason), turnID)
+	}
+
+	// ── P1：host 证据判定（"完成"不再等于"模型不再调工具"）──
+	//
+	// 这一步把"这一轮做完没有"变成一个 **host 可复核的断言**：义务由 host 自己派生，
+	// 判定只看采集到的工具证据与本轮信号，不读模型写下的任何状态。
+	// 单轮 deadline 与「用户/会话取消」必须分开：前者现场已 checkpoint、义务未了结，
+	// 应判 Incomplete 让续跑链接上；后者是用户叫停，判 Blocked 不续跑。
+	// `ctx` 在这一行仍是本轮的（submitOnce 内的 WithTimeout），所以这里读到的
+	// DeadlineExceeded 就是单轮预算耗尽，不是链级预算耗尽。
+	turnTruncated := ctx.Err() == context.DeadlineExceeded
+	// 本轮没发 `todo_updated`（续跑轮通常如此）⇒ 沿用上一轮留下的清单。清单必须
+	// 跨轮活下去：判定层靠它确认"还有几件事没做完"，一旦丢了，从第二轮起就又回到
+	// "没有错误 + 有正文 = 完成"。
+	if len(items) == 0 {
+		items = priorItems
+	}
+	goalReport := agentgoal.Evaluate(ev, agentgoal.Signals{
+		HasError:     streamErr != "",
+		ErrorMessage: streamErr,
+		HasAnswer:    strings.TrimSpace(stripThinkingBlocks(finalContent)) != "",
+		Cancelled:    ctx.Err() != nil && !turnTruncated,
+		Truncated:    turnTruncated,
+		// 撞墙的轴：判定层据此把"这一段用完额度"与"引擎硬失败"分开处理。
+		BudgetAxis: budgetAxis,
+		// 清单里还没做完的事：判定层据此把"清单没做完"从 Completed 降为 Incomplete。
+		// 只有这一条能让"没有错误 + 有正文"不再等于完成。
+		Pending: agentgoal.PendingOf(items),
+	})
+	if b, err := json.Marshal(goalReport); err == nil {
+		h.eventHub.Publish(broadcast.Event{
+			Type:      "completion",
+			SessionID: sessionID,
+			Data:      engine.PythonEvent{Type: "completion", Content: string(b)},
+		})
+	}
+	if !goalReport.Complete() && goalReport.Outcome != agentgoal.None {
+		// 未完成留痕：走与 interrupted / compaction 相同的投影通道（前端渲染成 notice 行），
+		// 使"这轮没做完"在刷新后仍可追溯 —— 而不是只活在这一条 SSE 流里。
+		reasonsJSON, _ := json.Marshal(goalReport.Reasons)
+		h.sessionMgr.SaveToolCall(storeCtx, sessionID,
+			spillRecordID("goal"), "goal_incomplete",
+			fmt.Sprintf(`{"outcome":%q,"reasons":%s}`, goalReport.Outcome, reasonsJSON), turnID)
+		slog.Info("turn judged incomplete by host evidence",
+			"session", sessionID, "outcome", goalReport.Outcome, "reasons", goalReport.Reasons)
+	}
+
+	// `turn_done` **不在这里发**：这里是"一段"的末尾，而 Goal FSM 判 Incomplete 后
+	// 还会自动续跑下一段。段级就宣布收尾会让前端提前关流，续跑段的输出全丢
+	// （见 HandleSubmit 顶部的 defer）。
+	return &turnResult{Report: &goalReport, Items: items}
+}
+
+// budgetAxisOf 从引擎的 error 正文里取出撞墙的轴名（`budget_exceeded:<轴>`）；不是
+// 预算撞墙则返回空串。
+//
+// 调用方据此把"这一段额度用完"与"引擎硬失败"分开：前者现场已保存、下一段能接上，
+// 后者要继续就得人介入。识别必须是**前缀 + 非空轴名**：正文可能夹带其它信息（引擎
+// 会把 `budget_exceeded:<轴>` 原样作为 error 内容发出），用 `strings.Cut` 取第一段
+// 而不是整串判等，避免因为尾部多了标点就把它误判成硬失败。
+func budgetAxisOf(errContent string) string {
+	const marker = "budget_exceeded:"
+	text := strings.TrimSpace(errContent)
+	if !strings.HasPrefix(text, marker) {
+		return ""
+	}
+	axis := text[len(marker):]
+	// 只取到第一个空白/标点为止：轴名本身是 `steps`/`turns`/`tokens`/`wall`/`cost`。
+	if i := strings.IndexAny(axis, " \t\r\n,;。，；"); i >= 0 {
+		axis = axis[:i]
+	}
+	return strings.TrimSpace(axis)
+}
+
+// parseTodoItems 把 `todo_updated` 事件的载荷解析成小目标判定需要的两项。
+//
+// 只取 `content` 与 `status`：判定"当前推进到哪一件事"只需要这两项，其余字段
+// （owner/files/verified/depends_on）与预算无关，多解析一份只是多一处会跟着引擎
+// 字段变更一起坏掉的地方。返回 ok=false 表示"这不是一份可用的清单"，调用方据此
+// 退化为"没有小目标边界"，而不是把这一轮判成失败。
+func parseTodoItems(raw string) ([]agentgoal.SubGoalItem, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, false
+	}
+	var entries []struct {
+		Content string `json:"content"`
+		Status  string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, false
+	}
+	// 空清单（`null` / `[]`）不算边界：没有条目就没有"当前推进到哪一件事"，
+	// 调用方应退化为"整条任务算一个目标"。`null` 会 unmarshal 成 nil slice 且
+	// 不报错，所以必须在这里显式挡掉，否则它会被当成一份"合法的空清单"。
+	if len(entries) == 0 {
+		return nil, false
+	}
+	items := make([]agentgoal.SubGoalItem, 0, len(entries))
+	for _, e := range entries {
+		items = append(items, agentgoal.SubGoalItem{Content: e.Content, Status: e.Status})
+	}
+	return items, true
+}
+
+// goalEnforcePrompt 把上一轮欠下的义务转成一条**系统续跑指令**。
+//
+// 它是"回灌层"的唯一出口：判定层算出"欠什么"（Report），这里把它变成模型下一段
+// 真正看得到的指令。只回灌结论、不回灌理由的话，模型拿到的是"继续完成"，却不知道
+// 该继续什么 —— 表现就是续跑轮里它照样写一句总结然后收工。
+func goalEnforcePrompt(prev *agentgoal.Report) string {
+	return goalEnforcePromptFor(agentgoal.Goal{}, prev)
+}
+
+// goalEnforcePromptFor 是带目标状态的完整版本：除"欠什么"之外，还告诉模型
+// **这一段为什么停**（预算轴）与**还剩多少机会**（轮次）。
+//
+// 为什么不把这些塞进 Report：Report 是"这一轮的判定"，Goal 是"这条任务的账本"。
+// 混在一起会让判定层的纯函数依赖预算计数器，而判定必须只看证据（同一个输入永远
+// 得到同一个结论）。两者在这里汇合，正合适。
+func goalEnforcePromptFor(g agentgoal.Goal, prev *agentgoal.Report) string {
+	var b strings.Builder
+	b.WriteString("继续完成上一轮未满足的义务 —— 这是系统自动续跑，不是用户的新提问。\n")
+
+	// 预算撞墙：必须说清"这不是失败"。不说的话，模型会把段级额度用完当成任务失败，
+	// 于是下一段开头先道歉、重读上下文、或者干脆重做已完成的部分 —— 白烧一段额度。
+	if prev != nil && prev.BudgetAxis != "" {
+		b.WriteString("\n本段是因为 **")
+		b.WriteString(prev.BudgetAxis)
+		b.WriteString("** 这一档额度用完而中止的，不是失败，也不是被取消。\n")
+		b.WriteString("已完成的改动和工具结果都已保存；续跑会继承已用额度，所以这一段的额度同样有限。\n")
+		b.WriteString("请在有限额度内**优先收尾**：先做能直接补上欠项的那几步，不要重做已完成的部分，也不要重读整个仓库。\n")
+	}
+
+	if prev != nil && len(prev.Reasons) > 0 {
+		b.WriteString("\n未满足项：\n")
+		for _, r := range prev.Reasons {
+			b.WriteString("- ")
+			b.WriteString(r)
+			b.WriteString("\n")
+		}
+	}
+
+	// 清单里尚未完成的条目：这是模型自己写下的计划，点名比"继续完成任务"具体得多。
+	if prev != nil && len(prev.Pending) > 0 {
+		b.WriteString("\n你的任务清单里还没完成的是：\n")
+		for _, p := range prev.Pending {
+			b.WriteString("- ")
+			b.WriteString(p)
+			b.WriteString("\n")
+		}
+		b.WriteString("推进这些条目时，每完成一条就把它的 `status` 改成 `completed`；全部完成才算这一轮做完。\n")
+	}
+
+	// 剩余机会：把预算从"看不见的天花板"变成模型能据此排优先级的信息。
+	if g.Status == agentgoal.GoalActive {
+		left := g.EffectiveMaxRounds() - g.RoundsUsed
+		if left < 0 {
+			left = 0
+		}
+		leftTotal := g.EffectiveMaxTotalRounds() - g.TotalRounds
+		if leftTotal < 0 {
+			leftTotal = 0
+		}
+		fmt.Fprintf(&b, "\n续跑预算：当前小目标还剩 %d 轮，这条任务总共还剩 %d 轮。\n", left, leftTotal)
+	}
+
+	b.WriteString("\n请补上缺失的证据（例如对已改动运行验证命令并让它通过），然后给出简明结论。")
+	return b.String()
+}
+
+// withGoalEnforce 在 workbenchCtx 上打续跑标记（不改动调用方传入的原 map）。
+//
+// 只打 `true` 标记：调用方（前端渲染 / 消息来源判定）只需要知道"这是续跑段"。
+// 要给引擎补充结构化摘要请用 withGoalEnforceContext。
+func withGoalEnforce(workbenchCtx map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(workbenchCtx)+1)
+	for k, v := range workbenchCtx {
+		out[k] = v
+	}
+	out[GoalEnforceKey] = true
+	return out
+}
+
+// withGoalEnforceContext 在续跑标记之上附带**结构化摘要**（轮次 / 撞墙轴 / 未完成数）。
+//
+// 键名不变、值从 `true` 变成对象：引擎侧 `goal_context.render_goal_context` 两种都认
+// （`true` 表示"旧版只说了这是续跑段"），所以滚动升级期间新旧任一侧单独上线都不会破。
+// 前端与 `msgSource` 判定只看键**在不在**，不受值形状影响。
+func withGoalEnforceContext(workbenchCtx map[string]interface{}, ctx goalEnforceContext) map[string]interface{} {
+	out := make(map[string]interface{}, len(workbenchCtx)+1)
+	for k, v := range workbenchCtx {
+		out[k] = v
+	}
+	out[GoalEnforceKey] = ctx
+	return out
+}
+
+// thinkingBlockRe 匹配引擎转发的思考块：runtime.py 在正文开始前按 ~80 字符分段
+// yield "[thinking]片段[/thinking]"（DeepSeek thinking mode）。
+var thinkingBlockRe = regexp.MustCompile(`(?s)\[thinking\].*?\[/thinking\]`)
+
+// stripThinkingBlocks 剥离内容中的思考块与流式切割残留的孤立标签。
+// 仅用于回传 LLM 的历史上下文：落库与前端渲染仍保留原始标签（splitThinking 还原思考块）。
+func stripThinkingBlocks(s string) string {
+	if !strings.Contains(s, "thinking]") {
+		return s
+	}
+	s = thinkingBlockRe.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "[thinking]", "")
+	s = strings.ReplaceAll(s, "[/thinking]", "")
+	return strings.TrimSpace(s)
+}
+
+// spillRecordID 给「不是工具调用」的留痕（护栏拦截 / 上下文压缩）生成**唯一** id。
+//
+// 为什么不能直接用 `evt.ID`：引擎的 `AgentEvent` **没有 `id` 字段**（只有 `tool_call_id`），
+// 而这两类事件都不带 `tool_call_id` ⇒ 帧里根本没有 `id`，`evt.ID` 恒为空。而 `SaveToolCall`
+// 对**空 id 直接 return**（一条都不留）、对**重复 id 走 `ON CONFLICT (id) DO UPDATE`**（后一条
+// 覆盖前一条）—— 所以"`前缀 + evt.ID`"这种写法要么全丢、要么**有损**（2026-10-09 实测发现：
+// 同会话多次拦截只剩最后一条）。
+//
+// 用纳秒时间戳：这些留痕**不是业务主键**，只需在单进程内互不相同（同一纳秒两次不可能发生：
+// 事件是串行消费的）。`prefix` 保留可读性，排障时一眼能看出是哪类留痕。
+func spillRecordID(prefix string) string {
+	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+}

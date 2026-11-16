@@ -1,0 +1,770 @@
+"""run_code 工具 — 程序化工具调用（对应 deepseek-harness Code Mode SDK）
+
+模型编写一段 Python 异步程序，通过注入的 ``tools`` 命名空间组合调用多个
+工具（``await tools.read_file(...)``、``await tools.shell_exec(...)`` 等），
+一次执行多步操作（deepseek: "five round trips become one"）。
+
+- 程序体为 ``async def _main():`` 的函数体
+- ``tools`` 是注入的命名空间：每个已注册工具的异步方法，调用
+  ``registry.execute(name, args)``，返回规范 JSON；工具失败抛
+  ``ToolCallError(name, message)``
+- stdout 捕获 → logs；``return`` 值 → result
+- 超时/异常 → 结构化 ``{isError, message, logs}`` 返回模型自纠
+
+S5 沙箱隔离（subprocess + IPC 代理）：
+- 模型代码在独立子进程内执行，通过 stdin/stdout JSON-line 协议
+  代理 tools 调用回主进程；子进程无直接访问宿主文件/socket/DB 的能力
+- 子进程应用 RLIMIT_AS/CPU/FSIZE（POSIX）+ 主进程 wall-clock SIGKILL
+- 静态守卫（code_guard.check_static）在子进程内再次执行（纵深防御） +
+  封禁 __class__/__subclasses__ 等对象内省逃逸链
+- S 修复：子进程不可用时 fail-closed 报错，绝不在宿主进程直接 exec 用户代码
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import json
+import logging
+import subprocess
+import sys
+import threading
+import time
+import types
+from typing import Any, cast
+
+from app.tools.code_guard import (
+    check_static as _check_static,
+)
+from app.tools.code_guard import (
+    safe_builtins as _safe_builtins,
+)
+from app.tools.registry import registry
+
+# 这两个符号以 ``_`` 前缀从 code_guard 转出，供 app/skill/manager.py 与本模块共用
+# （见 manager.py 的 `from app.tools.run_code import _check_static, _safe_builtins`）。
+# 显式登记一次，避免 Ruff F401 把「转给他人用」误判成「未使用」而删除。
+__all__ = [
+    "run_code",
+    "sdk_usage_text",
+    "_check_static",
+    "_render_result",
+    "_safe_builtins",
+]
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TIMEOUT_SECONDS = 60
+MAX_LOG_CHARS = 20_000
+
+
+class ToolCallError(Exception):
+    """模型程序内调用工具失败时抛出的错误（仅携带 toolName + message）。"""
+
+    def __init__(self, tool_name: str, message: str):
+        self.tool_name = tool_name
+        self.message = message
+        super().__init__(f"ToolCallError({tool_name}): {message}")
+
+
+async def _dispatch(name: str, args: dict[str, Any]) -> Any:
+    """调用一个已注册工具，失败抛 ToolCallError。"""
+    result = await registry.execute(name, args)
+    if isinstance(result, dict) and result.get("error"):
+        raise ToolCallError(name, str(result["error"]))
+    return result
+
+
+def _build_sdk() -> types.SimpleNamespace:
+    """构造 tools 命名空间：每个注册工具一个 async 方法（同进程降级模式用）。"""
+    ns = types.SimpleNamespace()
+
+    async def _make_tool(name: str, *args: Any, **kwargs: Any) -> Any:
+        # 兼容 tools.name(args_dict) 与 tools.name(k=v) 两种调用
+        if len(args) == 1 and isinstance(args[0], dict) and not kwargs:
+            params: dict[str, Any] = args[0]
+        else:
+            params = kwargs
+        return await _dispatch(name, params)
+
+    for tool_name in registry.list_names():
+        setattr(ns, tool_name, _make_tool.__get__(tool_name, None))
+    return ns
+
+
+def sdk_usage_text() -> str:
+    """生成注入 prompt 的 SDK 用法说明（确定性、按当前注册表）。"""
+    names = ", ".join(sorted(registry.list_names()))
+    return (
+        "In the run_code program, a `tools` namespace is available: "
+        "each registered tool is an async callable, e.g. "
+        "`result = await tools.read_file(path='src/main.py')` or "
+        "`result = await tools.grep_files(pattern='import', path='src')`. "
+        "Tool failures raise ToolCallError(name, message). "
+        "Return a JSON-serializable value from the program; captured stdout "
+        "appears in logs. Available tools: " + names
+    )
+
+
+def _render_result(value: Any) -> Any:
+    """规范化返回值（json-serializable），限制递归深度防栈溢出。"""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        return json.loads(
+            json.dumps(
+                value, ensure_ascii=False, default=str, check_circular=True, indent=None
+            )
+        )
+    except (ValueError, RecursionError, OverflowError):
+        return str(value)
+
+
+# ── subprocess 隔离模式 ──────────────────────────────────────────────
+
+
+def _resolve_worker_cmd() -> list[str] | None:
+    """构造启动 _sandbox_worker 子进程的命令。失败时返回 None（触发降级）。"""
+    # 优先以模块方式启动：python -m app.tools._sandbox_worker
+    # 要求主进程在 python-engine/ 目录下启动（与现有部署一致）
+    cmd = [sys.executable, "-m", "app.tools._sandbox_worker"]
+    # 把本次**子进程实际能达到**的隔离档位传给子进程入口（它会在执行模型代码之前自我降级）。
+    # 取 resolve_level 的 effective 而不是 configured：本机做不到的档位不该被谎报。
+    #
+    # 再套一层 `child_applicable_level`：`restricted` 依赖父进程建令牌，而 worker 是
+    # 普通 `Popen` + 自降级，真实强度只到 `low_il`。若不折算，worker 会收到
+    # `--isolation-level=restricted` 却只做到 low_il —— 日志与子进程报出的档位都比
+    # 实际更强，正是"看起来有隔离"的老问题。
+    #
+    # `restricted` 档下 worker 照样传它能达到的档位（`low_il`）：受限令牌 + 合成 SID
+    # 由父进程在建进程那刻施加，worker 再把自己降到 Low IL 是叠加的纵深防御 ——
+    # `apply_in_child` 改的是**自身进程令牌**的完整性级别，不碰目录 ACE 标签，
+    # 与 `restricted` 的授权机制互不干扰。子进程 stderr 会写明实际档位。
+    try:
+        from app.isolation import child_applicable_level, resolve_level
+
+        level = child_applicable_level(resolve_level().effective)
+        cmd.append(f"--isolation-level={level.value}")
+    except Exception as e:  # noqa: BLE001 — 解析失败不阻塞执行，但要留痕
+        logger.warning("resolve isolation level failed, worker runs unhardened: %s", e)
+    return cmd
+
+
+class _RestrictedStdout:
+    """把受限会话的 stdout 排空缓冲适配成 `Popen.stdout.readline()`。"""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._buf = ""
+
+    def readline(self) -> str:
+        while True:
+            nl = self._buf.find("\n")
+            if nl >= 0:
+                line, self._buf = self._buf[: nl + 1], self._buf[nl + 1 :]
+                return line
+            chunk = self._session.take_stream("out")
+            if chunk:
+                self._buf += chunk
+                continue
+            if self._session.returncode is not None:
+                # 进程已退出不等于排空线程已读完：给它一点时间收尾，
+                # 否则最后一条 done/result 消息会被判成 EOF 丢掉。
+                time.sleep(0.05)
+                tail = self._session.take_stream("out")
+                if tail:
+                    self._buf += tail
+                    continue
+                if self._buf:
+                    line, self._buf = self._buf, ""
+                    return line
+                return ""
+            time.sleep(0.01)
+
+
+class _RestrictedStderr:
+    """把受限会话的 stderr 排空缓冲适配成可迭代对象（供 `for line in proc.stderr`）。"""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._buf = ""
+
+    def __iter__(self) -> Any:
+        while True:
+            nl = self._buf.find("\n")
+            if nl >= 0:
+                line, self._buf = self._buf[: nl + 1], self._buf[nl + 1 :]
+                yield line
+                continue
+            chunk = self._session.take_stream("err")
+            if chunk:
+                self._buf += chunk
+                continue
+            if self._session.returncode is not None:
+                time.sleep(0.05)
+                tail = self._session.take_stream("err")
+                if tail:
+                    self._buf += tail
+                    continue
+                if self._buf:
+                    yield self._buf
+                    self._buf = ""
+                return
+            time.sleep(0.01)
+
+
+class _RestrictedWorkerIO:
+    """把 `RestrictedSession` 适配成 `subprocess.Popen` 的最小子集。
+
+    为什么不在 `run_code` 里写两条主循环：执行器围绕 `Popen` 写了一整套
+    「写 init → 逐行读 → 处理 tool_call → kill/wait」。为受限档复制一份，
+    日后修 IPC 就会只修到其中一条 —— 差异收敛在这一层比复制主循环安全。
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self.pid = session.pid
+        self.stdin = session.stdin
+        self.stdout = _RestrictedStdout(session)
+        self.stderr = _RestrictedStderr(session)
+
+    @property
+    def returncode(self) -> int | None:
+        return self._session.returncode
+
+    def kill(self) -> None:
+        self._session.kill()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._session.wait_sync(timeout)
+
+
+def _start_restricted_worker(cmd: list[str]) -> Any | None:
+    """用受限令牌启动 worker。失败返回 None（调用方据此 fail-closed）。"""
+    from app.isolation import win_launch
+    from app.tools.sandbox import sandboxed_env, workspace_dir
+
+    try:
+        session, err = win_launch.open_restricted_session(
+            cmd, cwd=str(workspace_dir()), env=sandboxed_env()
+        )
+    except Exception as e:  # noqa: BLE001 — 任何异常都按"起不来"处理
+        logger.error("restricted worker start raised: %s", e)
+        return None
+    if session is None:
+        # 不退回普通 Popen：那会让"配置声称 restricted、实际 worker 无令牌"静默成立。
+        logger.error("restricted worker 启动失败，拒绝执行模型代码: %s", err)
+        return None
+    logger.info("run_code worker 以受限令牌启动: pid=%s", session.pid)
+    return _RestrictedWorkerIO(session)
+
+
+def _run_subprocess_sync(
+    code: str,
+    tool_names: list[str],
+    timeout: int,
+    loop: asyncio.AbstractEventLoop,
+    context_snapshot: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """同步子进程执行器（在 executor 线程中运行）。
+
+    用 subprocess.Popen + 阻塞 readline 主循环；工具调用通过
+    ``asyncio.run_coroutine_threadsafe`` 调度回主 asyncio loop 执行
+    registry.execute，避免 Windows ProactorEventLoop 下 asyncio.subprocess
+    的 buffering 问题（同步 subprocess 的 stdout 行缓冲更可靠）。
+    """
+    # `restricted` 档必须由**父进程在建进程那刻**施加隔离（受限令牌 + 合成 SID +
+    # 独立桌面）；普通 `Popen` + 子进程自降级最多只到 `low_il`。所以这里分两条路径，
+    # 而受限路径起不来就返回 None —— `run_code` 会把 None 当"沙箱不可用"拒绝执行，
+    # 不会退回无令牌的 Popen。
+    restricted = False
+    try:
+        from app.isolation import Level, resolve_level
+
+        restricted = resolve_level().effective is Level.RESTRICTED
+    except Exception as e:  # noqa: BLE001 — 判定失败按普通路径走（它也会自降级）
+        logger.warning("resolve isolation level failed: %s", e)
+
+    cmd = _resolve_worker_cmd()
+    if cmd is None:
+        return None
+
+    if restricted:
+        proc = _start_restricted_worker(cmd)
+        if proc is None:
+            return None
+    else:
+        try:
+            from app.tools.sandbox import sandboxed_env
+
+            # S 安全修复:子进程清理宿主 env(API key/JWT_SECRET 等),仅保留基础变量,
+            # 防止沙箱内模型代码 `os.environ` 外带密钥。
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,  # 行缓冲
+                env=sandboxed_env(),
+            )
+            # stdin/stdout 都显式用了 PIPE，这里只是把类型收窄（Popen 的返回类型是
+            # IO[str] | None）。真为 None 时下面的写入本来就会 AttributeError，
+            # 所以断言不改变任何可达路径的行为。
+            assert proc.stdin is not None and proc.stdout is not None
+        except (OSError, FileNotFoundError) as e:
+            logger.warning("subprocess start failed, will fallback to in-process: %s", e)
+            return None
+        except Exception as e:  # noqa: BLE001 — 任何启动异常都降级
+            logger.warning("subprocess start unexpected error, will fallback: %s", e)
+            return None
+
+    # Windows：把子进程挂进 Job Object —— 内存/CPU 上限 + 退出即杀光子孙进程。
+    # 必须持有 job 引用到进程结束（handle 一关 KILL_ON_JOB_CLOSE 立刻生效）。
+    _job = None
+    try:
+        from app.isolation import resolve_level, wrap_async_process
+
+        _job = wrap_async_process(proc, resolve_level())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("job object attach failed (resource limits disabled): %s", e)
+
+    deadline = time.time() + timeout
+
+    # P0 安全修复：启动后台 stderr 消费线程
+    # 如果 stderr 管道被填满，子进程会永久阻塞。后台线程持续消费 stderr 防止此问题。
+    stderr_buffer: list[str] = []
+    stderr_lock = threading.Lock()
+
+    def _drain_stderr() -> None:
+        try:
+            if proc.stderr:
+                for line in proc.stderr:
+                    with stderr_lock:
+                        stderr_buffer.append(line)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True, name="stderr_drain")
+    stderr_thread.start()
+
+    try:
+        # 1) 写 init 消息
+        init_msg = (
+            json.dumps(
+                {
+                    "type": "init",
+                    "code": code,
+                    "tools": tool_names,
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        try:
+            proc.stdin.write(init_msg)
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError) as e:
+            _kill_proc_sync(proc)
+            stderr_thread.join(timeout=1.0)
+            with stderr_lock:
+                stderr = "".join(stderr_buffer)[:500]
+            return {
+                "isError": True,
+                "message": f"subprocess stdin write failed: {e}; stderr: {stderr}",
+                "logs": "",
+            }
+
+        # 2) 主循环：阻塞读 stdout，处理 tool_call，写 tool_result
+        while True:
+            line = _readline_with_deadline(proc, deadline)
+            if line is None:
+                # 超时
+                _kill_proc_sync(proc)
+                stderr_thread.join(timeout=1.0)
+                return {
+                    "isError": True,
+                    "message": f"subprocess timed out after {timeout}s",
+                    "logs": "",
+                }
+            if line == "":
+                # EOF：子进程退出但无 done/error
+                stderr_thread.join(timeout=1.0)
+                with stderr_lock:
+                    stderr = "".join(stderr_buffer)[:500]
+                return {
+                    "isError": True,
+                    "message": f"subprocess exited unexpectedly: {stderr}",
+                    "logs": "",
+                }
+
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "invalid IPC line from subprocess: %s (line=%r)", e, line[:200]
+                )
+                continue
+
+            mtype = msg.get("type")
+            if mtype == "tool_call":
+                call_id = msg.get("call_id")
+                name = msg.get("name", "")
+                args = msg.get("args", {}) or {}
+
+                # 调度 async registry.execute 到主 asyncio loop（带 contextvar 快照）
+                future = asyncio.run_coroutine_threadsafe(
+                    _safe_tool_call(name, args, context_snapshot, str(call_id or "")),
+                    loop,
+                )
+                try:
+                    result_obj = future.result(timeout=max(1, deadline - time.time()))
+                except Exception as e:  # noqa: BLE001 — 工具调用失败
+                    if time.time() >= deadline:
+                        _kill_proc_sync(proc)
+                        return {
+                            "isError": True,
+                            "message": f"tool call timed out (exceeded overall {timeout}s deadline)",
+                            "logs": "",
+                        }
+                    resp: dict[str, Any] = {
+                        "type": "tool_error",
+                        "call_id": call_id,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                else:
+                    if isinstance(result_obj, dict) and result_obj.get("error"):
+                        resp = {
+                            "type": "tool_error",
+                            "call_id": call_id,
+                            "error": str(result_obj["error"]),
+                        }
+                    else:
+                        resp = {
+                            "type": "tool_result",
+                            "call_id": call_id,
+                            "result": _render_result(result_obj),
+                        }
+
+                try:
+                    proc.stdin.write(
+                        json.dumps(resp, ensure_ascii=False, default=str) + "\n"
+                    )
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    return {
+                        "isError": True,
+                        "message": "subprocess died during tool call",
+                        "logs": "",
+                    }
+            elif mtype == "done":
+                _wait_proc_sync(proc)
+                return {
+                    "logs": str(msg.get("logs", ""))[-MAX_LOG_CHARS:],
+                    "result": _render_result(msg.get("result")),
+                }
+            elif mtype == "error":
+                _wait_proc_sync(proc)
+                return {
+                    "isError": True,
+                    "message": str(msg.get("message", "unknown subprocess error")),
+                    "logs": str(msg.get("logs", ""))[-MAX_LOG_CHARS:],
+                }
+            else:
+                logger.warning("unknown IPC message type: %s", mtype)
+    except Exception as e:  # noqa: BLE001 — 主循环意外异常
+        _kill_proc_sync(proc)
+        stderr_thread.join(timeout=1.0)
+        return {
+            "isError": True,
+            "message": f"orchestrator error: {type(e).__name__}: {e}",
+            "logs": "",
+        }
+
+
+async def _record_nested_span(
+    name: str,
+    call_id: str,
+    parent_call_id: str,
+    span_id: str,
+    parent_span_id: str,
+    started: float,
+    *,
+    success: bool,
+) -> None:
+    """为 `run_code` 里的一次嵌套调用记一条 span（失败绝不影响执行）。
+
+    G-T4：此前这些子调用**只发生在子进程里** —— 主循环既不为它记 span，也不把它
+    挂到任何节点下，于是执行图上"一次 run_code 里跑了 20 个工具"看起来像什么都没做，
+    审计时也拼不出"这个文件是谁在什么上下文里改的"。挂上父指针之后，从父节点点进去
+    就能看到全部子调用，反过来也能从子调用回到发起它的那次 `run_code`。
+    """
+    from app.tools.context import get_tenant_id_int, get_tool_context
+
+    trace_id = str(get_tool_context("trace_id", "") or "")
+    if not trace_id or not span_id:
+        return
+    try:
+        from app.trace import record_span
+
+        await record_span(
+            trace_id=trace_id,
+            span_name=f"tool:{name}",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            metadata={
+                "tool_name": name,
+                "success": success,
+                "tool_call_id": call_id,
+                # 这一格是 G-T4 的要点：子调用自己就能回答"我是谁发起的"，
+                # 不必再去反查父 span 的 metadata。
+                "parent_tool_call_id": parent_call_id,
+                "nested": True,
+                "via": "run_code",
+            },
+            tenant_id=get_tenant_id_int(),
+            span_id=span_id,
+            parent_span_id=parent_span_id,
+            kind="tool",
+        )
+    except Exception as e:  # noqa: BLE001 — 记账失败不影响工具结果
+        logger.warning("nested tool span skipped (%s/%s): %s", name, call_id, e)
+
+
+async def _safe_tool_call(
+    name: str,
+    args: dict[str, Any],
+    context_snapshot: dict[str, Any] | None,
+    call_id: str = "",
+) -> Any:
+    """异步包装 registry.execute，供 run_coroutine_threadsafe 调度。
+
+    contextvars 不跨线程传播：本函数在调度时显式 restore 主进程捕获的
+    tool_context 快照（user_id/tenant_id/session_id），否则子进程代理调用的
+    工具会看到空上下文（workspace_dir 解析到 default/anonymous）。
+
+    G-T4：快照里还带着**父调用**的身份（`tool_call_id` / `tool_span_id`，由
+    `_dispatch_tool` 压入、`_run_in_subprocess` 捕获），所以这里能算出子节点该挂在
+    谁下面。子调用会在自己的作用域里执行 —— 它再调 `run_code` 时，父指针就指向它
+    而不是更外层的那次调用，多层嵌套不会串味。
+    """
+    if context_snapshot is not None:
+        from app.tools.context import restore_context
+
+        restore_context(context_snapshot)
+
+    from app.tools.context import get_tool_call_id, get_tool_span_id, tool_call_scope
+
+    parent_call_id = get_tool_call_id()
+    parent_span_id = get_tool_span_id()
+    # 节点 id 沿用主循环的拼接口径（`{父}:tool:{id}` 的那一族），只是多一层 `call:`
+    # —— 子进程给出的 `call_id` 只在这一次 `run_code` 内唯一。
+    span_id = f"{parent_span_id}:call:{call_id}" if parent_span_id and call_id else ""
+
+    started = time.monotonic()
+    try:
+        with tool_call_scope(call_id, span_id=span_id):
+            result = await registry.execute(name, args)
+    except BaseException:
+        # 工具异常照旧上抛（子进程那边会转成 tool_error），但执行图上要留下痕迹：
+        # 否则"失败了"与"没调用过"看起来一样。
+        await _record_nested_span(
+            name, call_id, parent_call_id, span_id, parent_span_id, started, success=False
+        )
+        raise
+    await _record_nested_span(
+        name,
+        call_id,
+        parent_call_id,
+        span_id,
+        parent_span_id,
+        started,
+        success=not (isinstance(result, dict) and result.get("error")),
+    )
+    return result
+
+
+async def _run_in_subprocess(
+    code: str, tool_names: list[str], timeout: int
+) -> dict[str, Any] | None:
+    """在 executor 线程中运行同步子进程执行器，避免阻塞主 asyncio loop。
+
+    工具调用通过 ``asyncio.run_coroutine_threadsafe`` 回调主 loop 执行。
+    主 loop 的 contextvar 快照在调度前捕获，传入 _safe_tool_call restore。
+    """
+    from app.tools.context import get_all
+
+    loop = asyncio.get_event_loop()
+    # 在主 loop 当前 task 的 contextvar 中捕获快照（测试或 agent runtime 设置的 user_id 等）
+    context_snapshot = get_all()
+    return await loop.run_in_executor(
+        None,
+        _run_subprocess_sync,
+        code,
+        tool_names,
+        timeout,
+        loop,
+        context_snapshot,
+    )
+
+
+def _kill_proc_sync(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL 子进程。"""
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+# 复用线程池，避免每次 _readline_with_deadline 创建新线程
+_READER_POOL: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _get_reader_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _READER_POOL
+    if _READER_POOL is None:
+        _READER_POOL = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4,  # P0 性能修复：提升到 4 以避免高并发序列化瓶颈
+            thread_name_prefix="subproc_reader",
+        )
+    return _READER_POOL
+
+
+def _readline_with_deadline(
+    proc: subprocess.Popen[str], deadline: float
+) -> str | None:
+    """读一行 stdout，带 deadline 超时。
+
+    返回 None 表示超时；返回空串表示 EOF；否则返回一行（含末尾 \\n）。
+    使用线程池线程读，避免 readline 在子进程无输出时永久阻塞。
+    """
+    pool = _get_reader_pool()
+    # 调用方都用 Popen(stdout=PIPE)，这里收窄类型（也顺带把"没有 stdout"当作无输出，
+    # 与"超时"同样返回 None）。收窄后线程池的提交才有明确签名。
+    stdout = proc.stdout
+    if stdout is None:  # pragma: no cover - 调用方都传 PIPE
+        return None
+    fut = pool.submit(stdout.readline)
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        return None
+    try:
+        return cast("str | None", fut.result(timeout=max(0.001, remaining)))
+    except concurrent.futures.TimeoutError:
+        # 超时：杀掉子进程让 reader 收尾，然后**必须返回 None（超时）**。
+        # 若把 reader 因 EOF 得到的 ""透传出去，主循环会走「subprocess exited
+        # unexpectedly」分支，把「超时」误报成「异常退出」。
+        _kill_proc_sync(proc)
+        try:
+            fut.result(timeout=2.0)
+        except (concurrent.futures.TimeoutError, Exception):
+            pass
+        return None
+    except Exception:
+        return ""
+
+
+def _wait_proc_sync(proc: subprocess.Popen[str], timeout: float = 2.0) -> None:
+    """best-effort 等待子进程退出。"""
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_proc_sync(proc)
+
+
+# ── 主入口（仅 subprocess 隔离执行，子进程不可用即 fail-closed） ──────
+
+
+async def run_code(
+    code: str, description: str = "", timeout: int = DEFAULT_TIMEOUT_SECONDS
+) -> dict[str, Any]:
+    """Execute a Python async program against the tool SDK.
+
+    在独立子进程中执行（OS 级隔离 + IPC 代理 tools 调用）；子进程不可用时
+    fail-closed 返回错误，绝不在宿主进程直接 exec 用户代码（S 安全修复）。
+
+    Parameters
+    ----------
+    code:
+        Body of ``async def _main():``. May use the injected ``tools``
+        namespace and ``return`` a JSON-serializable value.
+    description:
+        Short summary of what the program does (for the model's own bookkeeping).
+    """
+    if not code.strip():
+        return {"error": "code is required"}
+    timeout = max(1, min(timeout, 300))
+
+    tool_names = registry.list_names()
+
+    # S 安全修复：必须走 subprocess 隔离执行,不再降级到主进程 exec 用户代码。
+    # 同进程模式无 OS 级隔离,`__class__.__subclasses__()` 等逃逸可达主进程
+    # 全部特权 → RCE。子进程不可用即 fail-closed,返回结构化错误而非提升特权执行。
+    import time
+
+    from app.tools.exec_audit import OUTCOME_ERROR, OUTCOME_OK, record_execution
+
+    started = time.monotonic()
+    result = await _run_in_subprocess(code, tool_names, timeout)
+
+    # S5-3：审计。含 fail-closed 路径 —— "沙箱子进程不可用"同样是必须留痕的事件
+    # （否则"明明没执行"与"执行了但没记录"无法区分）。
+    if result is None:
+        outcome = OUTCOME_ERROR
+        reason: str | None = "sandbox subprocess unavailable"
+    elif result.get("isError"):
+        outcome = OUTCOME_ERROR
+        reason = str(result.get("message", ""))[:200] or None
+    else:
+        outcome = OUTCOME_OK
+        reason = None
+    record_execution(
+        tool="run_code",
+        command=code,
+        outcome=outcome,
+        reason=reason,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+
+    if result is not None:
+        return result
+    return {
+        "isError": True,
+        "message": "run_code sandbox subprocess unavailable; refusing to run in host process",
+        "logs": "",
+    }
+
+
+# ── Register ─────────────────────────────────────────────────────
+registry.register(
+    name="run_code",
+    description=(
+        "Write a Python async program that composes multiple tool calls into one step. "
+        "The program body runs as `async def _main()`, with an injected `tools` namespace: "
+        "`await tools.<name>(**args)` calls any registered tool and returns its JSON result; "
+        "tool failures raise ToolCallError. Capture stdout goes to logs; `return` a "
+        "JSON-serializable value as the result. Use this to batch several file/shell/search "
+        "operations into a single round trip.\n\n" + sdk_usage_text()
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Body of `async def _main():` — Python code using the tools namespace",
+            },
+            "description": {
+                "type": "string",
+                "description": "Short summary of what the program does",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "Timeout in seconds (default 60, max 300)",
+                "default": 60,
+            },
+        },
+        "required": ["code"],
+    },
+    handler=run_code,
+)

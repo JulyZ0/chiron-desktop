@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      首次启动安装页：和 error.html 一样不依赖前端 dist 与网络，
+      因为它在应用「还没准备好」的时候就要能显示。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'"
+    />
+    <title>Chiron — 正在准备本地环境</title>
+    <style>
+      :root {
+        --bg-page: #f9f9f7;
+        --bg-card: #ffffff;
+        --text-primary: #1f1f1c;
+        --text-secondary: #5c5c56;
+        --text-tertiary: #8a8a82;
+        --border: #e6e6e1;
+        --primary: #d97757;
+        --radius: 10px;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg-page: #1a1a19;
+          --bg-card: #20201f;
+          --text-primary: #f0efe9;
+          --text-secondary: #a8a8a0;
+          --text-tertiary: #75756e;
+          --border: #333330;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--bg-page);
+        color: var(--text-primary);
+        font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      main {
+        width: min(460px, calc(100vw - 48px));
+        padding: 28px;
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+      }
+      h1 { margin: 0 0 8px; font-size: 20px; font-weight: 600; }
+      p { margin: 0 0 16px; color: var(--text-secondary); }
+      /* 阶段列表：已完成打勾、进行中高亮，用户能看出走到哪一步而不是干等 */
+      ol { margin: 0 0 16px; padding: 0; list-style: none; }
+      li {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 5px 0;
+        color: var(--text-tertiary);
+        font-size: 13px;
+      }
+      li .mark { width: 14px; flex: none; text-align: center; }
+      li.active { color: var(--text-primary); font-weight: 600; }
+      li.done { color: var(--text-secondary); }
+      li.done .mark { color: var(--primary); }
+      .hint {
+        margin: 0;
+        padding-top: 12px;
+        border-top: 1px solid var(--border);
+        font-size: 12px;
+        color: var(--text-tertiary);
+      }
+      /* 当前正在装哪一套环境：脚本按 stage 事件里的 target 换这一行的文字 */
+      .target {
+        margin: 0 0 10px;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary);
+      }
+      .bar {
+        height: 3px;
+        margin: 0 0 18px;
+        border-radius: 2px;
+        background: var(--border);
+        overflow: hidden;
+      }
+      .bar > i {
+        display: block;
+        height: 100%;
+        width: 8%;
+        border-radius: 2px;
+        background: var(--primary);
+        transition: width 0.4s ease;
+      }
+      code {
+        display: block;
+        margin: 10px 0 0;
+        font: 12px/1.5 ui-monospace, "Cascadia Code", Consolas, monospace;
+        color: var(--text-tertiary);
+        word-break: break-all;
+      }
+      /* 动作区：默认隐藏，静默 15s 后才露出"取消"，失败后额外露出"换源"。
+         为什么不一开就显示：一启动就摆个取消按钮，用户会条件反射地点掉，
+         白白丢掉已经下好的那部分；而等太久不给出口，他又只能去杀进程。 */
+      .actions {
+        display: none;
+        gap: 8px;
+        margin-top: 16px;
+      }
+      .actions.show {
+        display: flex;
+      }
+      .actions button {
+        flex: 1;
+        padding: 8px 12px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--text-primary);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .actions button.primary {
+        border-color: var(--primary);
+        background: var(--primary);
+        color: #fff;
+      }
+      .actions button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      /* 卡住计数：进度页最怕"什么都没发生"，这里每 10s 显式走秒，证明应用还活着 */
+      .stall {
+        display: none;
+        margin-top: 12px;
+        font-size: 12px;
+        color: var(--text-tertiary);
+      }
+      .stall.show {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>正在准备本地环境</h1>
+      <p>首次启动会创建 Python 环境并安装依赖，可能需要几分钟。之后启动会直接进入界面。</p>
+      <!--
+        本地模式要装**两套**环境（本地核心 / AI 引擎），彼此独立。没有这一行，
+        第二段进度看起来像是同一步"又失败了一次"。文案由脚本按 stage 事件的 target 填。
+      -->
+      <p class="target" id="target">正在准备：本地核心</p>
+      <div class="bar"><i id="progress"></i></div>
+      <ol id="stages">
+        <li data-stage="probing"><span class="mark">·</span><span>检查本地运行时</span></li>
+        <li data-stage="creating-venv"><span class="mark">·</span><span>创建 Python 环境</span></li>
+        <li data-stage="installing-deps"><span class="mark">·</span><span>安装依赖</span></li>
+        <li data-stage="syncing-deps"><span class="mark">·</span><span>同步依赖</span></li>
+        <li data-stage="verifying"><span class="mark">·</span><span>验证运行时</span></li>
+      </ol>
+      <p class="hint">请保持网络连接。关闭窗口会中止本次安装，下次启动会重新尝试。</p>
+      <code id="detail"></code>
+      <p class="stall" id="stall"></p>
+      <div class="actions" id="actions">
+        <button id="mirror" class="primary">改用国内镜像重试</button>
+        <button id="cancel">取消</button>
+      </div>
+    </main>
+    <script>
+      const ORDER = ['probing', 'creating-venv', 'installing-deps', 'syncing-deps', 'verifying']
+      const stages = document.getElementById('stages')
+      const progress = document.getElementById('progress')
+      const detail = document.getElementById('detail')
+      const targetLine = document.getElementById('target')
+
+      let current = 'probing'
+      let currentTarget = 'core'
+
+      /**
+       * 切到另一套环境（本地核心 → AI 引擎）：只换标题。
+       *
+       * 阶段列表与进度条**不需要**在这里复位 —— `render()` 每次都按当前 stage 的下标
+       * 重算全部 `li` 和宽度，所以换 target 后第一条带 stage 的事件自然从第一步开始。
+       * 早先这里还写着一段"清空勾 + 回落到 8%"，实测是死代码：紧随其后的 render
+       * 会整表重写，删掉它用例仍然全绿。留着只会让人以为切换靠这段生效。
+       */
+      function applyTarget(info) {
+        const id = info.target || 'core'
+        if (id === currentTarget && targetLine.textContent) return
+        currentTarget = id
+        targetLine.textContent = `正在准备：${info.targetLabel || id}`
+      }
+
+      /** 把某阶段标记为进行中，之前的全部记为已完成 */
+      function render(stageId, message) {
+        if (stageId === 'ready') {
+          // 装完就该切主界面了；这里先把进度条填满，避免闪一下 90%
+          progress.style.width = '100%'
+          stopStallClock()
+          for (const li of stages.children) {
+            li.className = 'done'
+            li.querySelector('.mark').textContent = '✓'
+          }
+          return
+        }
+        // failed / cancelled 是"终止态"，不在进度序列里：它们不该改阶段勾选，
+        // 但**必须**把原因写到 detail 上 —— 之前这里是无条件 return，
+        // 于是失败事件只露出了按钮、原因一个字都没显示。
+        if (!ORDER.includes(stageId)) {
+          detail.textContent = message || ''
+          return
+        }
+        current = stageId
+        const currentIndex = ORDER.indexOf(stageId)
+        for (const li of stages.children) {
+          const index = ORDER.indexOf(li.dataset.stage)
+          const mark = li.querySelector('.mark')
+          if (index < currentIndex) {
+            li.className = 'done'
+            mark.textContent = '✓'
+          } else if (index === currentIndex) {
+            li.className = 'active'
+            mark.textContent = '›'
+          } else {
+            li.className = ''
+            mark.textContent = '·'
+          }
+        }
+        progress.style.width = `${Math.max(8, (currentIndex / ORDER.length) * 100)}%`
+        detail.textContent = message || ''
+      }
+
+      render('probing', '正在检查…')
+
+      const stallLine = document.getElementById('stall')
+      const actions = document.getElementById('actions')
+      const mirrorBtn = document.getElementById('mirror')
+      const cancelBtn = document.getElementById('cancel')
+
+      /**
+       * 无进展走秒。
+       *
+       * 真机现场的"卡住"不是没有进展，而是**进展没有任何输出**：安装页从
+       * installing-deps 起就只剩静态文字，用户分不清是网络慢还是应用死了，
+       * 于是关掉进程 —— 而关掉会把已经下了一半的东西全丢掉。
+       * 这里每 5s 更新一次"已等待 N 秒"，至少证明主进程还活着。
+       */
+      let lastEventAt = Date.now()
+      let stallTimer = null
+
+      function resetStallClock() {
+        lastEventAt = Date.now()
+        if (stallLine) stallLine.className = 'stall'
+        // 收到新的进度事件 = 新一轮尝试已经开始，按钮要恢复可点。
+        // 不清这个状态，用户点了"换源重试"之后按钮会一直是灰的，看起来像没生效。
+        if (cancelBtn) cancelBtn.disabled = false
+        if (mirrorBtn) {
+          mirrorBtn.disabled = false
+          mirrorBtn.style.display = 'none'
+        }
+      }
+
+      function tickStall() {
+        const seconds = Math.round((Date.now() - lastEventAt) / 1000)
+        if (seconds < 15 || !stallLine) return
+        stallLine.className = 'stall show'
+        stallLine.textContent =
+          `已等待 ${seconds} 秒且没有新的下载进度。网络较慢时会这样，` +
+          '可以先改用国内镜像；不想等可以取消，下次启动会接着装。'
+        // 等了 15s 还没动静才露出"取消"：一开就摆个取消按钮，用户会条件反射地点掉，
+        // 白白丢掉刚刚下好的那部分。失败事件走 showActions(true)，额外露出换源。
+        if (actions && !actions.classList.contains('show')) showActions(false)
+      }
+
+      if (typeof setInterval === 'function') {
+        stallTimer = setInterval(tickStall, 5000)
+        // 不让这个定时器成为进程存活的理由：浏览器里没有 unref（可选调用即可），
+        // 而在 node 下跑这段页面脚本时，留着它会挂住测试进程直到超时。
+        if (stallTimer && typeof stallTimer.unref === 'function') stallTimer.unref()
+      }
+
+      function stopStallClock() {
+        if (stallTimer) {
+          clearInterval(stallTimer)
+          stallTimer = null
+        }
+      }
+
+      function showActions(showMirror) {
+        if (!actions) return
+        actions.className = 'actions show'
+        if (mirrorBtn) mirrorBtn.style.display = showMirror ? '' : 'none'
+      }
+
+      if (cancelBtn) {
+        cancelBtn.addEventListener('click', () => {
+          cancelBtn.disabled = true
+          if (mirrorBtn) mirrorBtn.disabled = true
+          detail.textContent = '正在取消…'
+          if (stallTimer) clearInterval(stallTimer)
+          if (window.chironDesktop && window.chironDesktop.cancelRuntimeInstall) {
+            window.chironDesktop.cancelRuntimeInstall()
+          }
+        })
+      }
+
+      if (mirrorBtn) {
+        mirrorBtn.addEventListener('click', () => {
+          mirrorBtn.disabled = true
+          if (cancelBtn) cancelBtn.disabled = true
+          detail.textContent = '正在切换到镜像源并重试…'
+          if (window.chironDesktop && window.chironDesktop.retryRuntimeInstallWithMirror) {
+            window.chironDesktop.retryRuntimeInstallWithMirror()
+          }
+        })
+      }
+
+      // 通过 preload 订阅：不直接碰 ipcRenderer（contextIsolation 下页面拿不到）
+      if (window.chironDesktop && window.chironDesktop.onRuntimeInstallStage) {
+        window.chironDesktop.onRuntimeInstallStage(info => {
+          if (!info) return
+          resetStallClock()
+          applyTarget(info)
+          render(info.stage, info.message)
+          // 失败事件带 failed 标记：这时才露出"换源重试"，平时只保留"取消"。
+          if (info.failed) showActions(info.retryableWithMirror !== false)
+        })
+      } else {
+        detail.textContent = '无法订阅安装进度（preload 未就绪），安装仍在后台进行。'
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,297 @@
+"""Git 工具集 — 通过 subprocess 执行常用 git 命令。"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any
+
+from app.tools.registry import registry
+
+logger = logging.getLogger(__name__)
+
+
+async def _run_git(*args: str, timeout: int = 30) -> dict[str, Any]:
+    """Run a git command in the sandbox workspace and return stdout/stderr/exit_code.
+
+    使用 sandboxed_env 清理环境变量，防止宿主密钥泄露给 git 子进程。
+    超时控制防止 git 命令卡住。
+
+    **cwd 刻意不可传**：git 命令一律在工作区内执行（此前有个 `cwd` 参数被传进来又被忽略，
+    是"参数说谎"的一种）。逃逸检查见 :func:`_run_git_guarded`。
+
+    **审计**：这是模型可触达的执行路径之一（参数由模型给出），与
+    `shell_exec` / `run_code` / `persistent_shell` / `tool_job` 同记一本账 —— 此前唯独它没有痕迹。
+    """
+    from app.tools.exec_audit import (
+        OUTCOME_ERROR,
+        OUTCOME_OK,
+        OUTCOME_TIMEOUT,
+        record_execution,
+    )
+    from app.tools.sandbox import isolation_exec_argv, sandboxed_env, workspace_dir
+
+    started = time.monotonic()
+    cmd = ["git", *args]
+    # 按隔离档位包装：git 能改工作区外的一切（`-C`、hooks、`core.pager`），
+    # 不包装就等于给了一条绕过档位的执行入口。
+    try:
+        exec_argv = isolation_exec_argv(cmd)
+    except Exception as exc:  # noqa: BLE001 — fail-closed，不退回无隔离执行
+        record_execution(
+            tool="git",
+            command=" ".join(cmd),
+            outcome=OUTCOME_ERROR,
+            reason=f"isolation unavailable: {exc}",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"isolation unavailable: {exc}"}
+    proc = await asyncio.create_subprocess_exec(
+        *exec_argv,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(workspace_dir()),
+        env=sandboxed_env(),
+    )
+    # Windows：挂进 Job Object。git 会起 `git-remote-https`、编辑器、hook 等子树，
+    # 墙钟 timeout 只能 kill 直接子进程 —— Chiron 退出时那些孙进程会成为孤儿。
+    from app.isolation import COMMAND_LIMITS, attach_job
+
+    _job = attach_job(proc, COMMAND_LIMITS, label="git")
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        proc.kill()
+        record_execution(
+            tool="git",
+            command=" ".join(cmd),
+            outcome=OUTCOME_TIMEOUT,
+            reason=f"timeout after {timeout}s",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": "timeout", "timeout": timeout}
+    exit_code = proc.returncode
+    record_execution(
+        tool="git",
+        command=" ".join(cmd),
+        outcome=OUTCOME_OK if exit_code == 0 else OUTCOME_ERROR,
+        exit_code=exit_code,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+    return {
+        "exit_code": proc.returncode,
+        "stdout": stdout.decode("utf-8", errors="replace"),
+        "stderr": stderr.decode("utf-8", errors="replace"),
+    }
+
+
+async def _ensure_sandbox_repo() -> dict[str, Any] | None:
+    """校验 git 仓库根没有**向上穿透**到工作根之外。
+
+    两种工作根，同一条断言：
+
+    - 未绑定项目时，工作根是沙箱 workspace。沙箱若位于宿主 git 仓库内，git 命令
+      会向上穿透到宿主 `.git` —— 这里用 `rev-parse --show-toplevel` 挡住。
+    - 绑定了项目时，工作根就是**用户的项目目录**。此时要求仓库根**恰好等于**工作根：
+      若项目根是 monorepo 的子目录，`top` 会落在父层，git 操作会作用到整个仓库 ——
+      这正是 D6「当前仅适配单仓库目录」要拒绝的形态。
+
+    返回 None 表示通过；否则返回错误 dict。
+    """
+    import os
+
+    from app.tools.sandbox import project_root, workspace_dir
+
+    ws = os.path.normpath(str(workspace_dir()))
+    check = await _run_git("rev-parse", "--show-toplevel")
+    if "error" in check:
+        # 非 git 仓库（或命令失败）→ 无穿透风险
+        return None
+    top = os.path.normpath(check["stdout"].strip())
+    if not top:
+        return None
+    if top != ws:
+        # 绑定项目时要求仓库根**恰为**项目根：项目根若落在 monorepo 子目录，top 会
+        # 升到父层，git 操作将作用到整个仓库 —— 这是 D6「仅适配单仓库目录」要拒的。
+        # 沙箱模式保留旧行为：agent 在 workspace 的子目录里自建仓库是合法的，
+        # 需要拦的只是"向上穿透到 workspace 之外"。
+        if project_root() is not None or not top.startswith(ws + os.sep):
+            return {
+                "error": f"git repository root does not match workspace: {top} != {ws}"
+            }
+    return None
+
+
+async def _run_git_guarded(*args: str, timeout: int = 30) -> dict[str, Any]:
+    """**所有** git 工具的统一入口：先过逃逸检查，再执行。
+
+    为什么必须统一：此前只有 `git_status` 调了 `_ensure_sandbox_repo`，而
+    `git_diff` / `git_log` / `git_commit` / `git_branch` 直接执行 —— 工作区位于宿主
+    仓库内时，它们会**向上穿透**：`git_diff` 泄露宿主改动、`git_commit` 直接在宿主仓库
+    提交。检查放在入口而不是逐个工具里，是为了"新增 git 工具时不会再漏"。
+    """
+    guard = await _ensure_sandbox_repo()
+    if guard:
+        return guard
+    return await _run_git(*args, timeout=timeout)
+
+
+async def git_status() -> dict[str, Any]:
+    """Return git status (modified, added, deleted files)."""
+    result = await _run_git_guarded("status", "--porcelain")
+    if "error" in result:
+        return result
+    # NOTE: do NOT .strip() the whole stdout — that eats the leading space of the
+    # first porcelain line (e.g. " M file" becomes "M file", breaking the offset).
+    lines = [ln.rstrip("\r") for ln in result["stdout"].splitlines() if ln.strip()]
+    files: list[dict[str, str]] = []
+    for line in lines:
+        # Porcelain format: XY PATH  (XY = 2-char status, separated by a space from the path)
+        if len(line) < 4:
+            continue
+        status = line[:2].strip()
+        path = line[3:]
+        files.append({"status": status, "path": path})
+    return {
+        "exit_code": result["exit_code"],
+        "count": len(files),
+        "files": files,
+        "raw": result["stdout"].strip(),
+    }
+
+
+async def git_diff(staged: bool = False) -> dict[str, Any]:
+    """Return diff of changes. If staged=True, shows staged changes."""
+    args = ["diff"]
+    if staged:
+        args.append("--cached")
+    result = await _run_git_guarded(*args)
+    if "error" in result:
+        return result
+    return {
+        "exit_code": result["exit_code"],
+        "diff": result["stdout"],
+        "staged": staged,
+    }
+
+
+async def git_log(limit: int = 10) -> dict[str, Any]:
+    """Return recent commits."""
+    result = await _run_git_guarded("log", "--oneline", f"-{limit}")
+    if "error" in result:
+        return result
+    lines = [ln for ln in result["stdout"].strip().splitlines() if ln]
+    commits: list[dict[str, str]] = []
+    for line in lines:
+        parts = line.split(" ", 1)
+        commits.append(
+            {"hash": parts[0], "message": parts[1] if len(parts) > 1 else ""}
+        )
+    return {"exit_code": result["exit_code"], "count": len(commits), "commits": commits}
+
+
+async def git_commit(message: str) -> dict[str, Any]:
+    """Stage all changes and commit with the given message."""
+    # Stage all
+    stage = await _run_git_guarded("add", "-A")
+    if "error" in stage:
+        return stage
+    if stage["exit_code"] != 0:
+        return {"error": stage["stderr"].strip(), "exit_code": stage["exit_code"]}
+
+    # Commit
+    result = await _run_git_guarded("commit", "-m", message)
+    if "error" in result:
+        return result
+    return {
+        "exit_code": result["exit_code"],
+        "message": message,
+        "output": (result["stdout"] + result["stderr"]).strip(),
+    }
+
+
+async def git_branch() -> dict[str, Any]:
+    """List branches and show current branch."""
+    result = await _run_git_guarded("branch")
+    if "error" in result:
+        return result
+    lines = [ln for ln in result["stdout"].strip().splitlines() if ln]
+    current = ""
+    branches: list[str] = []
+    for line in lines:
+        name = line.strip()
+        if name.startswith("* "):
+            name = name[2:]
+            current = name
+        branches.append(name)
+    return {"exit_code": result["exit_code"], "current": current, "branches": branches}
+
+
+# ---------------------------------------------------------------------------
+# 注册
+# ---------------------------------------------------------------------------
+registry.register(
+    name="git_status",
+    description="Show working-tree status inside the sandbox workspace (modified/added/deleted files).",
+    parameters={"type": "object", "properties": {}, "required": []},
+    handler=git_status,
+)
+
+registry.register(
+    name="git_diff",
+    description="Show the diff of uncommitted changes in the sandbox workspace.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "staged": {
+                "type": "boolean",
+                "description": "Show staged (--cached) changes instead of the working tree",
+                "default": False,
+            },
+        },
+        "required": [],
+    },
+    handler=git_diff,
+)
+
+registry.register(
+    name="git_log",
+    description="List recent commits in the sandbox workspace.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Max commits to return (default 10)",
+                "default": 10,
+            },
+        },
+        "required": [],
+    },
+    handler=git_log,
+)
+
+registry.register(
+    name="git_commit",
+    description=(
+        "Stage all changes in the sandbox workspace and commit them. "
+        "Only the sandbox repository is touched — a workspace nested inside a host repo "
+        "is refused rather than committing to the host."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "message": {"type": "string", "description": "Commit message"},
+        },
+        "required": ["message"],
+    },
+    handler=git_commit,
+)
+
+registry.register(
+    name="git_branch",
+    description="List branches and show the current branch in the sandbox workspace.",
+    parameters={"type": "object", "properties": {}, "required": []},
+    handler=git_branch,
+)

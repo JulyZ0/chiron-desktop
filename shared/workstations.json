@@ -1,0 +1,10 @@
+{
+  "_comment": "工作台标识的唯一事实源。运行时三端都不读这个文件——它是比对基准，不是配置源。Go/Python 侧走类型常量，TS 侧走 WORKSTATIONS；python-engine/tests/test_workstation_contract.py 比对四处是否漂移。label 是 i18n 文案键（源语言 zh-CN），不是中文原文。",
+  "workstations": [
+    { "id": "dialogue", "label": "chat.chat" },
+    { "id": "agent", "label": "Agent" },
+    { "id": "skill", "label": "agent.skill" },
+    { "id": "knowledge", "label": "knowledge.knowledge" },
+    { "id": "plugin", "label": "common.plugin" }
+  ]
+}

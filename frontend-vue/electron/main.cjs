@@ -1,0 +1,2699 @@
+/**
+ * Chiron Desktop — Electron 主进程
+ *
+ * 形态：双模式桌面壳。渲染层始终是已构建的前端（dist/），后端按模式分流：
+ *   local —— 本机后端（embedded-postgres + 本地 API，由 components.cjs 负责拉起）
+ *   cloud —— 已废除（当前版本与云端服务端不兼容），不再说明
+ * 契约见 docs/desktop-local/contracts.md：config.json 是模式真相，两个模式各用一个
+ * Electron session partition，切换模式时清掉离开模式的会话数据并重启。
+ *
+ * 为什么选 Electron 而不是 Tauri/Wails：本仓样式对现代 CSS 是硬依赖
+ * （`color-mix` 86 处、`@container` 4 处、`backdrop-filter` 25 处），而
+ * Tauri/Wails 在 Linux 上借用系统 WebKitGTK —— Ubuntu 22.04 的 2.36 不支持
+ * color-mix，主题阴影会静默失效。Electron 自带 Chromium，开发环境所见即用户所见。
+ *
+ * 启动分流：
+ *   local 且本地后端拉起成功 → 主界面
+ *   local 且本地后端未安装/启动失败 → 给重试 / 切回云端 / 退出三个选择，仍打不开则落到 error.html
+ *   老配置（有 apiUrl 但没有 mode） → 先弹一次迁移提示，默认本地，apiUrl 保留
+ *
+ * 安全基线：contextIsolation 开、nodeIntegration 关、preload 只暴露明确的几个动作，
+ * 外部链接一律交给系统浏览器。
+ */
+const {
+  app,
+  BrowserWindow,
+  shell,
+  Menu,
+  ipcMain,
+  session,
+  dialog,
+  Tray,
+  nativeImage,
+  clipboard,
+} = require('electron')
+const fs = require('node:fs')
+const crypto = require('node:crypto')
+const path = require('node:path')
+const { fileURLToPath } = require('node:url')
+const {
+  resolveApiUrl,
+  resolveMode,
+  readDeviceSettings,
+  readRuntimeDeviceSettings,
+  readConfig,
+  writeConfig,
+  saveApiUrl,
+  saveDeviceSettings,
+  saveMode,
+  markApiUrlPending,
+  consumeApiUrlPending,
+  probe,
+} = require('./config.cjs')
+const shared = require('./shared.cjs')
+const engineEnvSettings = require('./engine-env.cjs')
+const dataDirAcl = require('./data-dir-acl.cjs')
+const windowsHello = require('./windows-hello.cjs')
+const accountVerify = require('./account-verify.cjs')
+const twoFactor = require('./two-factor.cjs')
+const {
+  API_URL_ARG_PREFIX,
+  MODE_ARG_PREFIX,
+  DEFAULT_DEV_URL,
+  partitionFor,
+  shouldQuitOnAllWindowsClosed,
+  resolveStartupWindow,
+  isAllowedPermission,
+  PIP_INDEX_MIRRORS,
+  RUNTIME_CANCEL_CHANNEL,
+  RUNTIME_MIRROR_CHANNEL,
+  TITLEBAR_ARG_PREFIX,
+  WINDOW_CHANNELS,
+} = shared
+/**
+ * 本地设备 token 的注入前缀（`--chiron-device-token=<token>`）。
+ *
+ * 首选 shared.cjs 里的同名常量（契约 §3.1 要求共享常量集中在那里），本 worktree 没有
+ * 改 shared.cjs 的授权，所以缺失时用这里的兜底字面量 —— preload.cjs 用同一套写法，
+ * 两边只要有一处把常量搬到 shared.cjs 就会同时生效。
+ */
+const DEVICE_TOKEN_ARG_PREFIX = shared.DEVICE_TOKEN_ARG_PREFIX || '--chiron-device-token='
+const { readToken, writeToken, clearToken } = require('./token-store.cjs')
+const { switchMode } = require('./mode-switch.cjs')
+const { wipeLocalData, relaunchAfterWipe } = require('./wipe-data.cjs')
+
+/** 开发模式：`electron . --dev` 时连 Vite dev server，否则加载 dist/ */
+const isDev = process.argv.includes('--dev')
+const DEV_URL = process.env.CHIRON_DEV_URL || DEFAULT_DEV_URL
+
+/** 窗口底色取 --bg-page 的浅色值：主进程拿不到 CSS 变量，只能写字面值。 */
+const WINDOW_BACKGROUND = '#f9f9f7'
+
+/**
+ * 是否用自绘标题栏（`frame: false`）。
+ *
+ * Windows 的默认窗口框是一条 1px 的系统描边 + 系统标题栏，放在这套纸色界面里
+ * 显得像另一个程序；而 macOS 的系统红绿灯反而是用户预期的一部分。所以：
+ *   - Windows / Linux：`frame: false`，标题栏、拖拽区、最小化/最大化/关闭全部自绘
+ *     （见 src/components/shell/TitleBar.vue 与 preload 的 windowControls）；
+ *   - macOS：`titleBarStyle: 'hiddenInset'`，保留原生红绿灯，只把内容上移到
+ *     标题栏区域，双击缩放等系统行为不变。
+ *
+ * 抽成常量而不是内联三元：建窗有两处（主窗口 / 安装窗口），漏掉一处就会
+ * 出现"一个窗口有边框、另一个没有"的割裂感。
+ */
+const USE_CUSTOM_TITLEBAR = process.platform !== 'darwin'
+
+let mainWindow = null
+
+/** 当前窗口使用的 API 地址；CORS 响应头只补给它，不碰其它站点 */
+let currentApiUrl = ''
+
+/** 「连接设置…」菜单强制进配置页（即使已有地址），见 relaunchIntoSetup */
+let forceSetup = false
+
+/** 本次运行的运行模式（whenReady 时定一次；切换模式一律走重启） */
+let currentMode = 'local'
+
+/**
+ * 本地后端状态：`{ ok, baseUrl, token, dataDir, via, reason, message }`，由 startLocalBackend 填充。
+ * 本地模式下设备 token 由 Go 网关注入，这里留空（见 tryStartGoStack 的返回值）。
+ *
+ * `via` 是**进程归属**：本地模式恒为 `'go-stack'` —— 网关/引擎/引导器（PG、Redis）
+ * 都归 local-stack.cjs。停止时必须按它找 owner，停错那套等于一个进程都没回收
+ * （见 stopLocalBackend）。
+ */
+let localBackend = blankLocalBackend()
+
+/** 空态：停过之后不能把死 baseUrl 和废 token 留给后面重建的窗口 */
+function blankLocalBackend() {
+  return { ok: false, baseUrl: '', token: '', dataDir: '', via: '', reason: 'not-started', message: '' }
+}
+
+/** 已经注册过 webRequest / 权限 / 下载监听的 session（重建窗口时不能重复注册） */
+const configuredSessions = new WeakSet()
+
+/** 本地后端只停一次：before-quit 与模式切换都会触发停止 */
+let localBackendStopped = false
+
+/**
+ * 是否处于**真正的退出**流程（托盘菜单「退出 Chiron」、系统关机、菜单栏退出）。
+ *
+ * 关窗默认只是收进托盘 —— 核心 Agent 在后台跑，用户关掉窗口不等于要中断它。
+ * 没有这个标志就无法区分「关窗」和「退出」：两者都会走到 window-all-closed。
+ */
+let isQuitting = false
+
+/** 首次收进托盘时提示过一次的标记键（存 config.json，跟着用户数据走） */
+const TRAY_HINT_KEY = 'trayHintShown'
+
+/**
+ * 启动流程（whenReady 里那串 await）是否已经走到建主窗口这一步。
+ *
+ * 存在的唯一原因：首次启动时安装进度窗是**当时唯一的窗口**，而 `destroy()`
+ * 会**同步**派发 window-all-closed（electron 45 实测确认，不是"下个 tick 才发"）。
+ * 不在启动期间拦一下，closeInstallWindow() 会立刻把 app.quit() 排进队列，
+ * 紧接着建好的主窗口还没显示，进程就退了 —— 用户看到的就是
+ * "检查本地运行时就闪退"。
+ */
+let startupComplete = false
+
+/**
+ * 正在做的"先销毁旧窗口、再建新窗口"的同步重建次数。
+ *
+ * relaunchIntoApp / relaunchIntoSetup 都是 `destroy()` 紧接着 `createWindow()`，
+ * 和启动期同一个坑：destroy 同步触发 window-all-closed。计数 >0 期间不允许因此退出。
+ */
+let holdingWindows = 0
+
+/** 把"销毁 + 重建"包成原子操作：中间那一下空窗口不触发退出 */
+function holdingWindowQuota(fn) {
+  holdingWindows += 1
+  try {
+    return fn()
+  } finally {
+    holdingWindows -= 1
+  }
+}
+
+/**
+ * 系统托盘：最小化时把窗口收进托盘，而不是留在任务栏。
+ *
+ * 为什么需要：这个应用是常驻型工作台（本地后端与引擎都跑在后台），用户点最小化
+ * 多半是"先收起来，等会儿还要用"。留在任务栏占一格，直接关掉又要重等后端启动 ——
+ * 托盘是这两者之间唯一合理的落点。
+ *
+ * 只在主界面启用：setup / error 是单栏对话框，收进托盘后没有任何能恢复它的入口
+ * （用户不会想到去托盘里找一个配置窗口）。
+ */
+let tray = null
+
+/**
+ * 创建托盘图标（只创建一次；createWindow 会被 relaunch* 多次调用）。
+ *
+ * 图标缺失时**不建托盘也不报错退出**：托盘是增强功能，缺它只是退化成
+ * "最小化仍留在任务栏"，不该让整个应用起不来。
+ */
+function createTray() {
+  if (tray || process.platform !== 'win32') return
+  const iconPath = path.join(__dirname, 'resources', 'icon-32.png')
+  const image = nativeImage.createFromPath(iconPath)
+  if (image.isEmpty()) {
+    logMain('warn', `tray icon missing or unreadable: ${iconPath}`)
+    return
+  }
+  tray = new Tray(image)
+  tray.setToolTip('Chiron')
+  tray.on('click', () => showMainWindow())
+  tray.on('double-click', () => showMainWindow())
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: '显示主窗口', click: () => showMainWindow() },
+      { type: 'separator' },
+      {
+        label: '退出 Chiron',
+        click: () => {
+          // 只有这里（以及系统关机）算"真的要退出"。关窗只是收进托盘，
+          // 不设这个标志，close 拦截会把退出流程也拦下来。
+          isQuitting = true
+          app.quit()
+        },
+      },
+    ]),
+  )
+}
+
+/**
+ * 首次"关窗收进托盘"时提示一次。
+ *
+ * 不提示的后果很具体：用户点了 ×，以为程序已经退出，而后台 Agent 还在跑。
+ * 预期与实际对不上，下一步往往是去任务管理器强杀进程 —— 那会连带掐掉正在跑的回合。
+ * 只提示一次：用过一次之后这个行为就不需要再解释了。
+ */
+function showTrayHintOnce() {
+  if (!tray || process.platform !== 'win32') return
+  try {
+    const cfg = readConfig() || {}
+    if (cfg[TRAY_HINT_KEY]) return
+    tray.displayBalloon({
+      title: 'Chiron 仍在后台运行',
+      content: '窗口已收进托盘，Agent 会继续运行。要彻底退出，请右键托盘图标选择「退出 Chiron」。',
+    })
+    writeConfig({ ...cfg, [TRAY_HINT_KEY]: true })
+  } catch (err) {
+    // 提示失败不影响收进托盘本身的语义
+    logMain('warn', `tray hint failed: ${err && err.message}`)
+  }
+}
+
+/**
+ * 从托盘恢复主窗口。
+ *
+ * 窗口并没有被 hide()，只是最小化 + 摘掉了任务栏按钮，所以标准 restore() 就是
+ * 正确的恢复路径 —— 不要换成 show()：对最小化窗口，show() 不会清除最小化状态。
+ */
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow()
+    return
+  }
+  // 无条件 restore()：窗口的最小化状态是系统在管的，restore() 对正常窗口是 no-op。
+  // 反过来用 `if (isMinimized())` 做守卫会踩坑 —— 守卫一旦判断失误就跳过 restore()，
+  // 窗口带着最小化的内部状态被 show() 出来，表现为"框在、内容冻住点不动"。
+  mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+/**
+ * 首次启动安装进度窗口。安装发生在 createWindow 之前，没有窗口就没有任何东西
+ * 能显示进度 —— 用户只会看到"点了图标没反应"。装完立刻关掉，主界面照旧走 createWindow。
+ */
+let installWindow = null
+
+/** 安装进度推送通道名，必须与 preload.cjs 的订阅名一致 */
+const RUNTIME_STAGE_CHANNEL = 'desktop:runtime-stage'
+
+const APP_ID = 'com.chiron.agent'
+const APP_ROOT = path.resolve(__dirname, '..')
+const DEV_ORIGIN = (() => {
+  try {
+    return new URL(DEV_URL).origin
+  } catch {
+    return ''
+  }
+})()
+
+/** 本地诊断日志：不依赖网络，崩溃/加载失败时至少能给用户一个文件 */
+function logMain(level, message) {
+  const line = `${new Date().toISOString()} [${level}] ${message}\n`
+  try {
+    const file = path.join(app.getPath('userData'), 'logs', 'main.log')
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.appendFileSync(file, line)
+  } catch {
+    /* 日志失败不能影响主流程 */
+  }
+  if (level === 'error') console.error(message)
+}
+
+/**
+ * 允许的页面地址：本地 app 根目录下的 file://，或开发模式的 Vite origin。
+ * 导航限制与 IPC sender 校验共用这一份判断，避免两处规则漂移。
+ */
+function isTrustedUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl)
+    if (url.protocol === 'file:') {
+      const filePath = path.resolve(fileURLToPath(url))
+      return filePath === APP_ROOT || filePath.startsWith(APP_ROOT + path.sep)
+    }
+    return isDev && url.origin === DEV_ORIGIN
+  } catch {
+    return false
+  }
+}
+
+/**
+ * file:// 页面没有 CSP 时 Electron 会直接报安全警告；XSS 也能任意外连。
+ * 只放行本地资源与用户自己配置的 API/WS origin，其余 connect 一律拒绝。
+ */
+function buildCsp() {
+  const local = "'self' file:"
+  const connect = ["'self'", 'file:']
+  if (currentApiUrl) {
+    try {
+      const api = new URL(currentApiUrl)
+      connect.push(api.origin)
+      connect.push(`${api.protocol === 'https:' ? 'wss' : 'ws'}://${api.host}`)
+    } catch {
+      /* 地址已在 config.cjs 校验；这里失败就不额外放行 */
+    }
+  }
+  return [
+    `default-src ${local}`,
+    `script-src ${local} 'wasm-unsafe-eval'`,
+    `style-src ${local} 'unsafe-inline'`,
+    `img-src ${local} data: blob:`,
+    `media-src ${local} data: blob:`,
+    `font-src ${local} data:`,
+    `connect-src ${connect.join(' ')}`,
+    `worker-src ${local} blob:`,
+    `child-src ${local} blob:`,
+    // frame-src 必须与 child-src 同样放行 blob:。
+    //
+    // PDF 预览走的是 `<iframe src="blob:…">`（raw 端点要 Bearer 鉴权，而 iframe
+    // 带不了请求头，只能先取字节再转 objectURL —— 见 projectFiles.ts）。frame-src
+    // 一旦存在就会**覆盖** child-src 对 frame 的授权，只写 child-src 等于没写：
+    // 图片能看、PDF 一片空白，且控制台只报一句 CSP 违规，很容易被当成后端坏了。
+    `frame-src ${local} blob:`,
+    "object-src 'none'",
+    "base-uri 'none'",
+    `form-action ${local}`,
+  ].join('; ')
+}
+
+/** 主文档加载失败时切到本地错误页，而不是留一个空白窗口 */
+function showLoadError(code, description, failedUrl) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (code === -3) return // ERR_ABORTED：用户主动取消导航
+  if (failedUrl.includes('/error.html')) return
+  logMain('error', `load failed (${code}) ${description} ${failedUrl}`)
+  mainWindow
+    .loadFile(path.join(__dirname, 'error.html'), {
+      query: {
+        code: String(code),
+        desc: description || '',
+        url: failedUrl || '',
+        retry: failedUrl || '',
+      },
+    })
+    .catch(err => logMain('error', `error page load failed: ${err.message}`))
+}
+
+process.on('uncaughtException', err => logMain('error', `uncaughtException: ${err?.stack || err}`))
+process.on('unhandledRejection', reason => logMain('error', `unhandledRejection: ${reason}`))
+
+/** IPC 只接受来自应用自身页面（或开发服务器）的调用 */
+function assertTrustedSender(event) {
+  const frameUrl = event.senderFrame?.url || event.sender.getURL()
+  if (!isTrustedUrl(frameUrl)) {
+    logMain('warn', `blocked IPC from ${frameUrl}`)
+    throw new Error('forbidden')
+  }
+}
+
+/**
+ * 窗口当前的"可视状态"。
+ *
+ * 渲染进程要靠它画最大化/还原图标（自绘标题栏的图标不能靠页面自己猜：
+ * 用户也可能用 Win+↑、Aero Snap 或系统菜单改变窗口状态，页面完全收不到点击事件）。
+ */
+function windowStateOf(win) {
+  return {
+    maximized: win.isMaximized(),
+    fullScreen: win.isFullScreen(),
+    focused: win.isFocused(),
+  }
+}
+
+/**
+ * 把窗口状态变化推给自绘标题栏。
+ *
+ * 监听 resize 是必须的：Windows 的 Aero Snap（拖到屏幕边缘 / Win+方向键）只会
+ * 触发 resize，不一定先派发 maximize。只听 maximize 的话，贴边半屏之后图标
+ * 还停在"最大化"，用户点一下反而把窗口缩小了。
+ */
+function attachWindowStateBroadcast(win) {
+  const push = () => {
+    if (!win || win.isDestroyed() || win.webContents.isDestroyed()) return
+    win.webContents.send(WINDOW_CHANNELS.state, windowStateOf(win))
+  }
+  for (const evt of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen', 'focus', 'blur', 'resize']) {
+    win.on(evt, push)
+  }
+}
+
+/**
+ * 自绘标题栏的四个 IPC。
+ *
+ * 目标是 `BrowserWindow.fromWebContents(event.sender)` 而不是模块级的 `mainWindow`：
+ * 安装进度窗（openInstallWindow）在 createWindow 之前就存在，主界面重建时旧窗口
+ * 也还在关闭途中；用 mainWindow 可能作用到另一个窗口，甚至作用在已销毁的窗口上
+ * 直接抛错 —— 而这条链路上用户已经没有系统标题栏可以兜底了。
+ */
+function registerWindowControlIpc() {
+  const windowFor = event => {
+    assertTrustedSender(event)
+    const win = BrowserWindow.fromWebContents(event.sender)
+    if (!win || win.isDestroyed()) throw new Error('no-window')
+    return win
+  }
+
+  ipcMain.handle(WINDOW_CHANNELS.minimize, event => {
+    windowFor(event).minimize()
+    return true
+  })
+
+  ipcMain.handle(WINDOW_CHANNELS.toggleMaximize, event => {
+    const win = windowFor(event)
+    // 对话框（配置页/错误页）不可最大化：直接回当前状态，让按钮维持原样，
+    // 而不是 throw —— 页面没必要为"这个窗口不能最大化"弹一个错误。
+    if (!win.isMaximizable()) return windowStateOf(win)
+    if (win.isMaximized()) win.unmaximize()
+    else win.maximize()
+    return windowStateOf(win)
+  })
+
+  ipcMain.handle(WINDOW_CHANNELS.close, event => {
+    windowFor(event).close()
+    return true
+  })
+
+  ipcMain.handle(WINDOW_CHANNELS.getState, event => windowStateOf(windowFor(event)))
+}
+
+/**
+ * 可选模块接线：components.cjs / secrets.cjs / inference-proxy.cjs 由另一个
+ * worktree 实现并按需发布。本文件只 require + try/catch 接线，绝不在这里写它们的实现，
+ * 模块不存在时安静降级（未安装本地组件是用户的正常状态）。
+ */
+const optionalModules = new Map()
+function loadOptionalModule(name) {
+  if (optionalModules.has(name)) return optionalModules.get(name)
+  let mod = null
+  try {
+    mod = require(name)
+  } catch (err) {
+    logMain('info', `optional module ${name} unavailable: ${err?.message || err}`)
+  }
+  optionalModules.set(name, mod)
+  return mod
+}
+
+/**
+ * 启动本地后端（mode=local）。
+ *
+ * 启动回调由 W4 的 components.cjs 提供；这里全部走可选探测 —— 模块缺失、接口缺失、
+ * 启动抛错都要变成一条可读状态再显示本地错误页，而不是让主进程崩掉。
+ *
+ * **返回值的两条语义必须分清**（本轮改的就是这条）：
+ *   - `null`  = 这条链路**不适用**（壳里没有 local-stack / components，或这台机器
+ *     根本没有网关二进制，或引导器运行时还没装）→ 调用方才允许走 desktop-local core；
+ *   - **抛错** = 真的试过并且失败了 → 绝不回退。回退会拉起第二套 PG/Redis，
+ *     还会把"引擎没起来"这种必须让用户知道的细节全部丢掉。
+ * 过去这里把抛错也吞成 null，于是打包态每次引擎失败都变成"界面能开但半数是坏的"。
+ */
+async function tryStartGoStack(options = {}) {
+  const stack = loadOptionalModule('./local-stack.cjs')
+  const components = loadOptionalModule('./components.cjs')
+  if (!stack || !components) return null
+
+  // 诊断出口：重启第几次、为什么放弃，这些只在 main.log 里查得到。
+  // 不注入就静默丢弃 —— 打包态 stdout 没有接收方。
+  if (typeof stack._setLog === 'function') {
+    stack._setLog(msg => logMain('info', msg))
+  }
+
+  const gatewayExe = resolveGatewayExe()
+  if (!gatewayExe) {
+    logMain('info', '本地网关不可用（未找到 chiron.exe），退回 desktop-local core')
+    return null
+  }
+
+  let launch
+  try {
+    // 用 prepareCoreLaunch 而不是裸 resolveCoreLaunch：全新安装时 venv 还不存在，
+    // 后者必然抛错，那时若直接回退到老路径，用户第一次启动拿到的是只有 desktop-local
+    // 的**半套**界面（网关那侧的 skills/graphs/kb/workflows 全缺），而且引擎依赖
+    // 也永远轮不到装。这里先按需装好 core，装完仍然拿不到启动信息才算这条链路不适用。
+    launch = await components.prepareCoreLaunch(options)
+  } catch (err) {
+    // **必须把真因抛出去，不能 return null**：回退到 desktop-local core 的那条老路径
+    // 已经随业务层删除（见 startLocalBackend 的注释：这里刻意没有回退分支）。返回 null
+    // 只会让调用方落到「本地网关不可用：未找到 chiron 二进制或本地运行时尚未就绪」这句
+    // 笼统文案上。真机现场就是这么被误导的：实际失败是"装依赖时 PyPI 超时"，界面却说
+    // 二进制的不是，用户照着提示去查安装包完整性，永远查不到问题。
+    logMain('info', `引导器运行时不可用：${err?.message || err}`)
+    const failure = new Error(err?.message || String(err))
+    // reason 透传：安装失败（runtime-unavailable）与二进制缺失（gateway-unavailable）
+    // 在恢复对话框里是两件完全不同的事，不能被合并成同一句提示。
+    failure.reason = err?.reason || 'runtime-unavailable'
+    failure.runtimeFailure = err
+    throw failure
+  }
+
+  const dataDir = resolveLocalDataDir(options.dataDir)
+
+  // 引擎的依赖是**按需**装的（用到才装，见 components.ensureEngineRuntime），
+  // 进度沿用同一条推送通道：首启弹了安装窗的话，这一段就显示在同一个窗里。
+  // 装失败会抛 —— 由 startLocalBackend 转成可读状态，这里不吞。
+  const engineLaunch = await prepareEngine(components, options)
+
+  // 知识库检索服务（pageindex-service）**也要按需装**，理由同引擎：它有自己的 venv
+  // （pageindex → litellm 要求 openai<3，与引擎的 openai 3.x 无法共存）。
+  //
+  // 这里原来是直接 `resolveKnowledgeServiceLaunch()` —— 那个函数**只查不装**，于是
+  // 首启必然返回 null，检索服务从没起来过，引擎侧 `KNOWLEDGE_SERVICE_URL` 为空，
+  // 用户在"自托管"下看到的是一句内部变量名。现在先装再用。
+  //
+  // 它不是强依赖：装不上也继续，只是知识库的建索引/检索不可用（建库与上传照常）。
+  let knowledgeLaunch = null
+  try {
+    const knowledgeRuntime = await components.ensureKnowledgeServiceRuntime({
+      userDataPath: app.getPath('userData'),
+      onRuntimeStage: options.onRuntimeStage,
+      onRuntimeLine: options.onRuntimeLine,
+      indexUrl: options.indexUrl,
+      signal: options.signal,
+    })
+    if (!knowledgeRuntime.ok) {
+      // 只记日志：这条链没有会把该状态渲染出去的消费者，凭空虚设一个字段等于留死代码。
+      // 用户侧看到的是知识库页的"服务不可用"，而定位问题看这行日志。
+      logMain('warn', `知识库索引服务未就绪：${knowledgeRuntime.message || knowledgeRuntime.reason}`)
+    }
+    knowledgeLaunch = components.resolveKnowledgeServiceLaunch({
+      userDataPath: app.getPath('userData'),
+    })
+  } catch (err) {
+    // 安装器本身出错也不该拖垮本地模式
+    logMain('warn', `知识库索引服务准备失败：${err?.message || err}`)
+  }
+
+  try {
+    const port =
+      Number(options.gatewayPort) > 0 ? Number(options.gatewayPort) : await components.pickFreePort()
+
+    const started = await stack.startLocalStack({
+      launcher: { command: launch.command, cwd: launch.cwd },
+      dataDir,
+      exe: gatewayExe,
+      port,
+      appSecret: ensureAppSecret(dataDir),
+      engine: engineLaunch || undefined,
+      knowledge: knowledgeLaunch || undefined,
+      // 桌面态的模型配置在 safeStorage 里（`secrets.bin`），`local-stack.cjs` 是纯
+      // Node 模块读不到 —— 必须在这里解密后交下去。缺了它 pageindex-search 会自报
+      // `status: "disabled"`，知识库建索引全部失败。
+      knowledgeSecrets: (await resolveKnowledgeSecrets()) || undefined,
+      onEngineExit: notifyEngineExit,
+      // 自愈放弃才通知：这条是"放弃了"，与上一条"抖了一下"必须能区分开。
+      onSupervisorGiveUp: notifySupervisorGiveUp,
+    })
+
+    logMain(
+      'info',
+      `本地网关就绪 ${started.baseUrl}（pg=${started.launcher?.pgBackend} redis=${started.launcher?.redisBackend}）`,
+    )
+    // PG、Redis、引擎都是强依赖，能走到这里说明三者都起来了（缺一个 startLocalStack 就会抛）
+    logMain('info', `python-engine 就绪 ${started.engine?.address || '（接管既有实例）'}`)
+    // 新一轮运行重新计一次提示额度：上一轮崩过不该让这一轮的崩溃从此无声
+    engineExitNotified = false
+    return {
+      ok: true,
+      baseUrl: started.baseUrl,
+      token: '',
+      dataDir,
+      // 进程归属标记：PG/Redis/引擎/网关由 local-stack.cjs 拉起，停止也必须走它
+      //（见 stopLocalBackend 的注释 —— 停错那套等于什么都没停）。
+      via: 'go-stack',
+      reason: '',
+      message: '',
+    }
+  } catch (err) {
+    const message = err?.message || String(err)
+    logMain('error', `本地网关启动失败：${message}`)
+    // 带 reason 往上抛：startLocalBackend 会把它放进返回状态，恢复对话框与错误页
+    // 才有的可显示；只留一句"启动失败"等于让用户对着黑箱猜。
+    const error = err instanceof Error ? err : new Error(message)
+    error.reason = error.reason || 'gateway-stack-failed'
+    throw error
+  }
+}
+
+/**
+ * 找 Go 网关可执行文件。
+ *
+ * 打包态在 `resources/chiron.exe`（见 electron-builder.yml 的 extraResources），
+ * 开发态在仓库根。找不到就返回空串，由调用方退回旧路径。
+ */
+function resolveGatewayExe() {
+  const exeName = process.platform === 'win32' ? 'chiron.exe' : 'chiron'
+  const candidates = []
+  if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, exeName))
+  candidates.push(path.join(__dirname, '..', '..', exeName))
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return ''
+}
+
+/**
+ * 引擎就位：**用到才装**，然后给出启动信息。
+ *
+ * 解释器选择与依赖安装都在 `components.cjs`（`ensureEngineRuntime` /
+ * `resolveEngineLaunch`）：那里才有"随包 vs 开发态"的唯一判据，写在两处必然漂移。
+ * 壳这一层只做两件事 —— 起栈之前把依赖装上（进度照样推给进度窗），
+ * 以及把装不出来时的原因**如实上抛**（不吞掉、不回退）。
+ *
+ * 返回 null 只有一种含义：这台机器上没有可用的 python-engine（既没随包源码也没有
+ * 开发态源码）。网关随后会因"引擎未启动"整体失败，而不是悄悄少一块功能。
+ */
+async function prepareEngine(components, options) {
+  await components.ensureEngineRuntime(options)
+  return components.resolveEngineLaunch({ userDataPath: app.getPath('userData') })
+}
+
+/**
+ * 把用户在「设置 → 本地模型」里配的模型，解析成知识库服务要的三项。
+ *
+ * **为什么必须由主进程来做**：模型配置存在 safeStorage 加密的 `secrets.bin`
+ * （`secrets.cjs`），而 `local-stack.cjs` 是纯 Node 模块（单测里没有 Electron
+ * 运行时），读不了它。所以解密只能在壳这一层完成，再把解析结果交下去。
+ *
+ * **为什么以前不生效**：`buildKnowledgeServiceEnv` 只从 `process.env` 取
+ * `OPENAI_MODEL` / `LLM_MODEL` —— 打包态从开始菜单启动根本没有 shell 可以设，
+ * 于是 pageindex-search 虽然起来了、端口也通，`/healthz` 却回
+ * `status: "disabled"`（`selfhosted_ready()` 要 index/chat 两个模型名都非空），
+ * 建索引全部失败。桌面用户看到的只有"知识库服务不可用"。
+ *
+ * 返回 `null` 表示"没配过 / 读不到"，调用方据此退回环境变量那条老路径。
+ * **绝不记录 apiKey**（契约 §8：provider key 不进日志）。
+ */
+async function resolveKnowledgeSecrets() {
+  const mod = loadOptionalModule('./secrets.cjs')
+  if (!mod || typeof mod.readSecrets !== 'function') return null
+  let secrets
+  try {
+    secrets = await mod.readSecrets()
+  } catch (err) {
+    logMain('warn', `读取模型配置失败，知识库将退回环境变量: ${err?.message || err}`)
+    return null
+  }
+  if (!secrets || typeof secrets !== 'object') return null
+
+  const providers = secrets.providers && typeof secrets.providers === 'object' ? secrets.providers : {}
+  const pick = name => (providers[name] && typeof providers[name] === 'object' ? providers[name] : null)
+  // 与 inference-proxy 同一套别名口径：openai 与 openai-compatible 是同一个桶
+  const active = String(secrets.active || '').trim().toLowerCase()
+  const wanted = active === 'openai' ? 'openai-compatible' : active
+  const entry =
+    pick(wanted) ||
+    pick('openai-compatible') ||
+    pick('openai') ||
+    pick('ollama')
+  if (!entry) return null
+
+  const model = String(entry.model || '').trim()
+  if (!model) return null
+  return {
+    model,
+    baseUrl: String(entry.baseUrl || '').trim(),
+    apiKey: String(entry.apiKey || '').trim(),
+  }
+}
+
+/**
+ * 取（或首次生成）网关的 APP_SECRET。
+ *
+ * 必须**跨重启稳定**：JWT_SECRET 与 INTERNAL_TOKEN 都由它派生，每次启动换新密钥
+ * 会让所有已登录会话失效、用户被反复踢下线。
+ * 长度 32 是网关的硬要求（`config/config.go` 强制），生成的 hex 有 64 字符。
+ */
+function ensureAppSecret(dataDir) {
+  const file = path.join(dataDir, 'auth', 'app-secret')
+  try {
+    const existing = fs.readFileSync(file, 'utf8').trim()
+    if (existing.length >= 32) return existing
+  } catch {
+    /* 不存在则生成 */
+  }
+  const secret = crypto.randomBytes(32).toString('hex')
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, secret, { mode: 0o600 })
+  } catch (err) {
+    logMain('warn', `无法持久化 APP_SECRET：${err?.message || err}`)
+  }
+  return secret
+}
+
+/**
+ * 本地数据目录：`<userData>/local`，或被显式指定时用指定的那个。
+ *
+ * 抽成函数是因为它现在有**三个**读者，而它们必须指向同一处：
+ *   - `startLocalBackend` 把它交给 `startLocalStack`（引擎/网关的落盘路径全在它下面）；
+ *   - 引擎开关配置 `engine-env.json` 写在它里面（`engine-env.cjs`）；
+ *   - 清空数据 / 账户验证失败时要把这个路径告诉用户。
+ *
+ * 三处各写一遍 `path.join(app.getPath('userData'), 'local')` 的后果是：
+ * 以后改目录名会漏掉一处，于是"界面上设了开关但引擎没读到"——而那条链上
+ * 没有任何报错，只有行为不对。
+ */
+function resolveLocalDataDir(explicit) {
+  return explicit ? String(explicit) : path.join(app.getPath('userData'), 'local')
+}
+
+async function startLocalBackend(options = {}) {
+  // 显式守卫：云端模式下**一律不启动**本地 core（以及它拉起的 PG / redis）。
+  // 调用点目前都在 `currentMode === 'local'` 分支里，但这条不变量不能只靠调用方自律 ——
+  // 以后新增一处调用就可能让云端用户白起一套数据库。放在这里，误用会立刻变成可读状态。
+  if (currentMode !== 'local') {
+    return {
+      ok: false,
+      baseUrl: '',
+      token: '',
+      dataDir: '',
+      reason: 'not-local',
+      message: `当前是${currentMode}模式，不启动本地后端`,
+    }
+  }
+  const components = loadOptionalModule('./components.cjs')
+  if (!components) {
+    return {
+      ok: false,
+      baseUrl: '',
+      token: '',
+      dataDir: '',
+      reason: 'components-missing',
+      message: '本地组件未随此版本安装',
+    }
+  }
+  // 本地模式**只有一条**启动链：引导器 → python-engine → Go 网关。
+  //
+  // 这里刻意没有回退分支。过去 `tryStartGoStack` 返回 null（找不到 chiron.exe /
+  // 运行时没装）就会落到 desktop-local core 那条「自带 HTTP 服务」的老路径上，
+  // 而那条路径已经随业务层一起删除（见 desktop-local/app/launcher.py 的模块文档：
+  // 引导器只起 PG/Redis，不再提供任何 HTTP 端点）。留着回退只会让"网关二进制缺失"
+  // 这个真实故障变成"起来了但所有业务端点 404"，用户和日志都无从判断。
+  //
+  // 因此：能起就起，起不来就把可读原因交回去（恢复对话框与错误页据此显示）。
+  try {
+    const goStack = await tryStartGoStack(options)
+    if (goStack && goStack.ok) return goStack
+  } catch (err) {
+    const message = err?.message || String(err)
+    logMain('error', `本地网关链路失败：${message}`)
+    // 用户主动取消要能和真正的失败区分开：它的正确反应是"回到界面/再试一次"，
+    // 而不是"排查安装包"。取消时不再弹恢复对话框（见启动循环里的 cancelled 分支）。
+    const cancelled = isAbortError(err) || /安装已被取消|用户取消了这次安装/.test(message)
+    return {
+      ok: false,
+      baseUrl: '',
+      token: '',
+      dataDir: '',
+      reason: cancelled ? 'install-cancelled' : err?.reason || 'stack-failed',
+      message,
+    }
+  }
+
+  // tryStartGoStack 返回 null 只有两种可能（见其注释）：缺网关二进制、或缺运行时。
+  // 两种情况都必须让用户看到具体缺什么，而不是静默降级。
+  return {
+    ok: false,
+    baseUrl: '',
+    token: '',
+    dataDir: '',
+    reason: 'gateway-unavailable',
+    message:
+      '本地网关不可用：未找到 chiron 二进制或本地运行时尚未就绪。' +
+      '请确认安装包完整（resources/chiron），或先执行一次运行时安装后重启应用。',
+  }
+}
+
+/**
+ * 建安装进度窗口。
+ *
+ * 为什么单独建一个 520×620 的窗口而不是复用主窗口：安装发生在 createWindow 之前，
+ * 那时主窗口还不存在；而安装一旦开始就是几分钟的网络下载，没有反馈会被当成卡死。
+ * 装完立刻销毁，主界面完全不感知它的存在。
+ */
+function openInstallWindow() {
+  if (installWindow && !installWindow.isDestroyed()) return installWindow
+  installWindow = new BrowserWindow({
+    width: 520,
+    height: 620,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    backgroundColor: WINDOW_BACKGROUND,
+    show: false,
+    title: 'Chiron — 正在准备本地环境',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      partition: partitionFor('local'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      // 进度页也用 preload 的订阅能力；模式按 local 注入，与它实际服务的东西一致
+      additionalArguments: [`${MODE_ARG_PREFIX}local`, `${TITLEBAR_ARG_PREFIX}native`],
+    },
+  })
+  installWindow.once('ready-to-show', () => {
+    if (installWindow && !installWindow.isDestroyed()) installWindow.show()
+  })
+  installWindow.on('closed', () => {
+    installWindow = null
+  })
+  installWindow.loadFile(path.join(__dirname, 'install.html')).catch(err => {
+    logMain('warn', `install page load failed: ${err?.message || err}`)
+  })
+  return installWindow
+}
+
+/** 关掉进度窗口。安装结束（成功或失败）必须调，否则它会一直盖在屏幕上 */
+function closeInstallWindow() {
+  const win = installWindow
+  installWindow = null
+  if (win && !win.isDestroyed()) win.destroy()
+}
+
+/**
+ * 把安装阶段推给进度窗口。
+ * 窗口不在就丢弃：安装也可能由"重启本地后端"触发，那时用户已经在主界面里了。
+ */
+function broadcastRuntimeStage(info) {
+  const win = installWindow
+  if (!win || win.isDestroyed()) return
+  try {
+    win.webContents.send(RUNTIME_STAGE_CHANNEL, info)
+  } catch {
+    /* 窗口正在销毁：进度丢了不影响安装本身 */
+  }
+}
+
+/**
+/** 判断一个错误是不是「用户取消」：AbortError 或我们自己的取消文案 */
+function isAbortError(err) {
+  if (!err) return false
+  if (err.name === 'AbortError') return true
+  return err.code === 'ABORT_ERR'
+}
+
+/**
+ * 本轮安装的取消与换源控制器。
+ * 为什么用 AbortController 而不是在 IPC 里直接 `kill` 进程：安装链是
+ * `prepareCoreLaunch → ensureRuntime → runCommand`，中间还夹着 uv 的解析/下载/安装
+ * 三个阶段与引擎那一套。只有让信号沿着这条链一路透传，才能保证"取消"之后**不会**
+ * 又在下一阶段悄悄拉起一个新进程。换源同理：它必须作用在**下一次**尝试上，
+ * 所以先 abort 当前这轮，再由启动循环带着新 indexUrl 重跑。
+ */
+const runtimeInstallControl = {
+  controller: null,
+  indexUrl: '',
+
+  /** 每次启动一轮安装前生成新的 controller；旧的必须已经 abort 掉 */
+  reset() {
+    if (this.controller) {
+      try {
+        this.controller.abort('安装已重新开始')
+      } catch {
+        /* 已经结束 */
+      }
+    }
+    this.controller = new AbortController()
+    return this.controller
+  },
+
+  cancel(reason = '用户取消了这次安装') {
+    const controller = this.controller
+    if (!controller || controller.signal.aborted) return { ok: false, reason: 'not-running' }
+    try {
+      controller.abort(reason)
+    } catch {
+      /* 忽略 */
+    }
+    logMain('info', `运行时安装已取消：${reason}`)
+    return { ok: true }
+  },
+
+  signal() {
+    return this.controller ? this.controller.signal : undefined
+  },
+}
+
+/**
+ * 安装页的"取消"。
+ *
+ * 取消后不退出应用：把进度窗关掉、让启动流程带着"用户取消"的结论往下走，
+ * 于是主窗口的恢复对话框会出现（重试/退出）—— 用户随时能再来一次。
+ */
+function handleRuntimeCancel() {
+  const result = runtimeInstallControl.cancel()
+  if (result.ok) {
+    broadcastRuntimeStage({
+      stage: 'cancelled',
+      message: '已取消安装。可以重试，或改用镜像源后重试。',
+      failed: true,
+      retryableWithMirror: true,
+    })
+  }
+  return result
+}
+
+/**
+ * 安装页的"改用国内镜像重试"。
+ *
+ * 只做两件事：记下用户选的源、中止当前这轮。真正的重跑由启动循环负责 ——
+ * 在 IPC 里直接调 startLocalBackend 会绕过主流程的单实例与状态管理。
+ */
+function handleRuntimeMirrorRetry() {
+  const mirror = PIP_INDEX_MIRRORS[0]
+  if (!mirror) return { ok: false, reason: 'no-mirror' }
+  runtimeInstallControl.indexUrl = mirror.url
+  logMain('info', `运行时安装改用镜像源：${mirror.label} ${mirror.url}`)
+  runtimeInstallControl.cancel(`改用镜像源 ${mirror.label} 重试`)
+  return { ok: true, mirror }
+}
+
+/**
+ * 只读询问：本地运行时现在能不能直接用。
+ * 内部任何失败都当作"就绪"，让启动照原路走 —— 进度窗只是个提示，不该成为新的失败点。
+ */
+function inspectLocalRuntime() {
+  const components = loadOptionalModule('./components.cjs')
+  if (!components || typeof components.inspectLocalRuntime !== 'function') {
+    return { ready: true, reason: 'unknown', message: '' }
+  }
+  try {
+    const result = components.inspectLocalRuntime()
+    // 就地改绑是"零成本修好、但用户永远看不见"的那类自愈：不在日志里留一行，
+    // 下次出问题就没法区分"环境从没装过"与"绑定还跟着上一个包跑"。
+    // 记的是 `rebinds`（core + 引擎两套）而不是 `result.binding`（只有最终返回那套）：
+    // core 修好后函数会继续判引擎，返回值带的是引擎的绑定，core 那次就没人记了。
+    for (const b of Array.isArray(result?.rebinds) ? result.rebinds : []) {
+      if (!b || !b.rebound) continue
+      logMain('info', `runtime python binding rebound (${b.target}): ${b.from} -> ${b.to}`)
+    }
+    return result && typeof result === 'object' ? result : { ready: true, reason: 'unknown', message: '' }
+  } catch (err) {
+    logMain('warn', `runtime inspect failed: ${err?.message || err}`)
+    return { ready: true, reason: 'unknown', message: '' }
+  }
+}
+
+/**
+ * 停止本地后端：退出前与切换模式时都要调；没接线就当作已经停了。
+ *
+ * **两条链路各有各的停止函数，停错那套等于什么都没停。** 真机现场（Windows 安装包）：
+ * 打包态走「引导器 → PG/Redis → 引擎 → Go 网关」，进程归 `local-stack.cjs` 所有，
+ * 而这里过去只调 `components.stopCore` —— 那条链没起 core，`state.core` 为空，
+ * stopCore 直接返回 false，日志照样打 `local backend stopped`。结果是退出之后
+ * postgres 与 redis-server 仍在监听、仍占着 data dir；下一次启动又拉起一套 PG，
+ * 两套实例抢同一个目录（本轮能连续启动成功只因为上一套是被我手动清掉的）。
+ *
+ * 现在按启动时记下的 `via` 分派，并把每一条的回收结果如实写进日志。
+ * 是否要停只看 `localBackend.ok`（成功启动过才谈得上停）—— 归属是 ok 之后才会写的
+ * 从属信息，拿它当入口闸门等于把不变量抄两份，改一处忘一处就回到"静默没停"。
+ * `via` 为空 = 从没成功起过本地后端，没什么要停，直接返回 false（不打"stopped"）。
+ */
+async function stopLocalBackend() {
+  if (localBackendStopped || !localBackend.ok) return false
+  const ownership = localBackend
+  localBackend = blankLocalBackend()
+  localBackendStopped = true
+
+  const via = ownership.via
+  if (!via) {
+    logMain('info', 'local backend 未曾成功启动，无需停止')
+    return false
+  }
+
+  const stoppers = {
+    'go-stack': () => {
+      const stack = loadOptionalModule('./local-stack.cjs')
+      return stack && typeof stack.stopLocalStack === 'function' ? stack.stopLocalStack() : null
+    },
+  }
+  const stopper = stoppers[via]
+  if (!stopper) {
+    // 未知链路必须响：静默返回 true 就是上面那个 bug 的翻版（换了 owner 却没换停止函数）。
+    logMain('warn', `本地后端链路未知（via=${via}），没有对应的停止函数：进程可能未被回收`)
+    return false
+  }
+
+  try {
+    const result = await stopper()
+    if (result === null) {
+      logMain('warn', `本地后端链路 ${via} 的停止函数不可用：进程可能未被回收`)
+      return false
+    }
+    // go-stack 返回三条回收结果；core 返回布尔。有明细就打明细，别看板报"stopped"了事。
+    const detail =
+      via === 'go-stack' && result && typeof result === 'object'
+        ? `（gateway=${Boolean(result.gatewayStopped)} engine=${Boolean(result.engineStopped)} launcher=${Boolean(result.launcherStopped)}）`
+        : `（core=${Boolean(result)}）`
+    logMain('info', `local backend stopped ${via}${detail}`)
+    return true
+  } catch (err) {
+    logMain('warn', `local backend stop failed (${via}): ${err?.message || err}`)
+    return false
+  }
+}
+
+/**
+ * 窗口 session 的通用配置：CORS/CSP 补头、权限、下载日志。
+ *
+ * 窗口用一个持久 partition（persist:chiron-local），所以这些监听必须挂在
+ * 窗口真正使用的 session 上，不能再写死 session.defaultSession —— 否则补头会落在
+ * 没人用的默认 session 上，界面会缺 CSP / CORS。
+ */
+function configureSession(partition) {
+  const winSession = session.fromPartition(partition)
+  if (configuredSessions.has(winSession)) return winSession
+  configuredSessions.add(winSession)
+
+  // 桌面壳从 file:// 访问 API：浏览器把 Origin 序列化成 null，后端 CORS 白名单
+  // 不会为 null 返回 Access-Control-Allow-Origin，带 Authorization 的预检会被
+  // 浏览器直接拒绝（表现为登录后所有请求失败）。这里只给用户配置的 API 前缀
+  // 补上精确匹配的 null（不是 *），其它站点响应不受影响。
+  winSession.webRequest.onHeadersReceived((details, callback) => {
+    const responseHeaders = details.responseHeaders || {}
+    const isApiRequest =
+      currentApiUrl &&
+      (details.url === currentApiUrl || details.url.startsWith(`${currentApiUrl}/`))
+    if (isApiRequest) {
+      responseHeaders['Access-Control-Allow-Origin'] = ['null']
+    }
+    // file:// 主文档默认没有 CSP，Electron 会直接报安全警告；只放行本地资源
+    // 与用户配置的 API/WS origin，XSS 无法把数据外传到任意站点。
+    // 判据抽在 shared.cjs：辅助页自带 meta CSP 且依赖内联脚本，注入响应头会让
+    // 两者取交集后拒掉内联脚本，整页按钮静默失效（详见该函数的注释与单测）。
+    if (shared.shouldInjectHeaderCsp(details)) {
+      responseHeaders['Content-Security-Policy'] = [buildCsp()]
+    }
+    callback({ responseHeaders })
+  })
+
+  // 权限：只允许本地应用页面使用麦克风（语音输入）、剪贴板读写与全屏。
+  //
+  // 白名单本身在 `shared.cjs`（`ALLOWED_PERMISSIONS` / `isAllowedPermission`）：
+  // 这些是 Chromium 的内部字符串名，写错一个不会报错、只会让对应能力静默失效，
+  // 所以它必须被单测钉住 —— 而 main.cjs 一 require 就起 Electron，测不了。
+  // 踩过的坑是 `clipboard-sanitized-write`：页面侧调 `navigator.clipboard.writeText()`，
+  // Chromium 对外暴露的权限名就是它（不是 `clipboard-write`），漏了它桌面端
+  // **所有复制按钮一起失效**，且不抛错、只在控制台留一条 unhandled rejection。
+  winSession.setPermissionRequestHandler((wc, permission, callback, details) => {
+    const requestingUrl = details?.requestingUrl || wc.getURL()
+    if (!isTrustedUrl(requestingUrl) || !isAllowedPermission(permission)) {
+      logMain('warn', `denied permission ${permission} from ${requestingUrl}`)
+      callback(false)
+      return
+    }
+    if (permission === 'media') {
+      const types = details?.mediaTypes || []
+      callback(types.length === 0 || types.every(type => type === 'audio'))
+      return
+    }
+    callback(true)
+  })
+  winSession.setPermissionCheckHandler((wc, permission, requestingOrigin, details) => {
+    const requestingUrl = details?.requestingUrl || wc.getURL() || requestingOrigin
+    if (!isTrustedUrl(requestingUrl) || !isAllowedPermission(permission)) return false
+    if (permission === 'media' && details?.mediaType === 'video') return false
+    return true
+  })
+
+  // 下载走 Electron 默认保存流程，记录到本地日志便于排查
+  winSession.on('will-download', (_event, item) => {
+    logMain('info', `download start: ${item.getFilename()} ${item.getURL()}`)
+    item.once('done', (_e, state) => {
+      logMain(
+        state === 'completed' ? 'info' : 'warn',
+        `download ${state}: ${item.getFilename()} -> ${item.getSavePath()}`,
+      )
+    })
+  })
+
+  return winSession
+}
+
+/**
+ * 首启选择运行模式（契约 §1）。
+ *
+ * 两种情形共用这一处询问，但**判据不同**：
+ *   - 全新安装：磁盘上连配置文件都没有（`configExists=false`），用户从未选过 → 必须问；
+ *   - 老配置迁移：有配置文件但没有 `mode` → 也必须问，且要提示它原来用的云端地址。
+ *
+ * 为什么不沿用 `needsMigration` 一个字段：它含 `configExists` 条件，全新安装恒为 false，
+ * 结果就是"首启一声不响按默认值起步" —— 用户从未做过选择。这里改用 `needsModeChoice`
+ * （只取决于 `modeChosen`），迁移文案再按 `needsMigration` 细分。
+ *
+ * 默认按钮是「本地模式」：本地是默认选项，但必须由用户确认后才继续。
+ * 用户直接关掉对话框（取消）时按**本地**继续而不是退出应用 —— 点图标毫无反应
+ * 比"按默认值开始"更糟，且模式随时可在菜单里切换、不会丢数据。
+ */
+async function askInitialMode(settings) {
+  if (!settings.needsModeChoice) return false
+  // 云端模式废除后只剩本地一种运行方式，首启再弹「选本地还是云端」已无意义 ——
+  // 直接把唯一选项落盘，让配置文件离开「未选择」状态即可。
+  // 老配置里残留的 mode:"cloud" 也在这里被覆盖成 local。
+  saveMode('local')
+  logMain('info', `initial mode recorded: local (was ${settings.mode})`)
+  return true
+}
+
+/** 菜单里的模式切换：默认保留本地数据（契约 §1 规定默认不删 userData/local） */
+async function confirmModeSwitch(nextMode) {
+  const label = nextMode === 'local' ? '本地模式' : '云端模式'
+  const detail =
+    nextMode === 'local'
+      ? '应用会重启并尝试启动本机后端；本地组件未安装时会显示提示页。本地数据目录不会被删除。'
+      : '应用会重启，并清空本地模式下的登录状态与缓存。本地数据目录不会被删除。'
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    title: '切换运行模式',
+    message: `切换到${label}？`,
+    detail,
+    buttons: ['切换并重启', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  })
+  if (response !== 0) return
+  try {
+    await applyModeSwitch(nextMode, {})
+  } catch (err) {
+    dialog.showErrorBox('切换运行模式失败', err?.message || String(err))
+  }
+}
+
+/** 记下最近一次本地后端的启动信息（契约 §1 的 local.lastStartedAt / local.dataDir） */
+function recordLocalStart(status) {
+  if (!status || !status.ok) return
+  try {
+    const patch = { local: { lastStartedAt: new Date().toISOString() } }
+    if (status.dataDir) patch.local.dataDir = String(status.dataDir)
+    saveDeviceSettings(patch)
+  } catch (err) {
+    logMain('warn', `record local start failed: ${err?.message || err}`)
+  }
+}
+
+/**
+ * 切换模式：清零离开模式的会话数据 → 写盘 → relaunch。
+ * 实际流程在 mode-switch.cjs（可单测），这里只负责注入 Electron 侧的回调：
+ * 停止本地后端是必须的，否则重启后两个后端会抢同一个数据目录。
+ */
+async function applyModeSwitch(mode, opts) {
+  const result = await switchMode({
+    nextMode: mode,
+    deleteLocalData: Boolean(opts && opts.deleteLocalData),
+    stopBackend: async () => {
+      if (currentMode === 'local') {
+        // 标记由 stopLocalBackend 自己置位；这里再置一次只会掩盖"到底停没停"
+        await stopLocalBackend()
+      }
+    },
+    electron: { app, session },
+    log: logMain,
+  })
+  return result
+}
+
+/** 重启应用（不改模式）：本地后端先停，避免 restart 后两个后端抢端口 */
+function restartNow() {
+  void (async () => {
+    try {
+      if (currentMode === 'local') {
+        await stopLocalBackend()
+      }
+    } catch (err) {
+      logMain('warn', `stop before restart failed: ${err?.message || err}`)
+    }
+    app.relaunch()
+    // 让 IPC 回复先发出，再杀进程，否则渲染进程只会看到 "frame was disposed"
+    setImmediate(() => app.exit(0))
+  })()
+}
+
+/**
+ * 本地模式启动失败时的恢复选项。
+ * 用原生对话框而不是自建页面：这时前端 dist 还没被信任能跑（后端可能压根没起），
+ * 而用户需要的是两个明确动作：重试 / 退出，不要静默卡在白屏上。
+ * （云端模式已废除，原来那个「切回云端」的去路一并去掉。）
+ */
+async function askLocalBackendRecovery(status) {
+  const actions = ['retry', 'quit']
+  // 安装失败与二进制缺失要给**不同**的话术。原先两种情况都落到 reason='gateway-unavailable'
+  // 上，文案一律让用户"确认安装包完整（resources/chiron）"—— 真机现场是 PyPI 超时导致
+  // 装依赖失败，用户照着这句去查安装包，永远查不到问题所在。
+  const installFailed =
+    status?.reason === 'runtime-unavailable' || status?.reason === 'install-failed'
+  const message = installFailed
+    ? '本地运行时没能装好，Chiron 打不开主界面'
+    : '本机后端没能启动，Chiron 打不开主界面'
+  const hint = installFailed
+    ? '这是首次启动准备 Python 环境时的失败，通常与网络有关（下载依赖超时）。\n' +
+      '可以重试一次；若反复失败，请检查网络或在安装窗口里切换镜像源。'
+    : '可以重试一次，或退出应用排查安装。'
+  try {
+    const { response } = await dialog.showMessageBox({
+      type: 'warning',
+      title: '本地模式未就绪',
+      message,
+      detail: `${status.message || '未知原因'}\n\n${hint}`,
+      buttons: ['重试启动', '退出'],
+      defaultId: 0,
+      cancelId: 2,
+      noLink: true,
+    })
+    return actions[response] || 'quit'
+  } catch (err) {
+    logMain('warn', `local recovery dialog failed: ${err?.message || err}`)
+    return 'quit'
+  }
+}
+
+/**
+ * 引擎在**运行中**退出。
+ *
+ * 这是本地模式里最难自己发现的一种故障：界面还活着，网关还活着，只有聊天会在
+ * SSE 上回一句"服务暂时不可用"、并把这一轮标成 failed —— 用户完全看不出原因。
+ * 网关侧对引擎是按请求解析地址、不探活也不熔断，所以它自己也不会主动宣告引擎掉了。
+ *
+ * 所以这里做三件事：写一条**带退出码**的错误日志；只提示一次（反复崩不该弹一串窗）；
+ * 给一个真的能按的按钮（重启应用），而不是只说"请重启"。
+ */
+let engineExitNotified = false
+
+function notifyEngineExit(info = {}) {
+  const how =
+    info.code === null || info.code === undefined
+      ? `信号 ${info.signal || '未知'}`
+      : `退出码 ${info.code}`
+  const tail = String(info.stderrTail || '').trim().split('\n').slice(-8).join('\n')
+  logMain('error', `python-engine 运行中退出（${how}）${tail ? `\n${tail}` : ''}`)
+  if (engineExitNotified) return
+  engineExitNotified = true
+
+  const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+  if (!win) return
+  dialog
+    .showMessageBox(win, {
+      type: 'error',
+      title: '本地 AI 引擎已停止',
+      message: '聊天、知识库与记忆现在都不可用',
+      detail:
+        `python-engine 进程退出了（${how}）。界面与本地数据库还在，所以其它页面照常，` +
+        '但一发消息就会失败。\n\n' +
+        (tail ? `引擎输出（尾部）：\n${tail}\n\n` : '') +
+        '可以立刻重启应用；若反复出现，请连同这条信息一起反馈。',
+      buttons: ['重启应用', '稍后手动重启'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    })
+    .then(({ response }) => {
+      if (response === 0) restartNow()
+    })
+    .catch(err => logMain('warn', `engine exit dialog failed: ${err?.message || err}`))
+}
+
+/**
+ * 崩溃自愈放弃后的收口。
+ *
+ * 为什么必须通知：自愈失败意味着本地后端**再也起不来了**，而界面还活着 —— 用户点任何
+ * 功能都只会得到一句"服务暂时不可用"。不告诉他"已经试过 N 次、不会再试了"，他唯一的
+ * 选择就是反复点重试，然后再也等不到结论。这与引擎崩溃那条提示不同：那条是"抖了一下"，
+ * 这条是"放弃"。
+ */
+let supervisorGaveUpNotified = false
+
+function notifySupervisorGiveUp(role, info = {}) {
+  const label = role === 'gateway' ? '本地网关' : role === 'engine' ? '本地 AI 引擎' : String(role)
+  const tail = String(info.stderrTail || '').trim().split('\n').slice(-8).join('\n')
+  logMain(
+    'error',
+    `本地组件 ${role} 连续崩溃已达上限，停止自愈（code=${info.code} signal=${info.signal || ''}）` +
+      (tail ? `\n${tail}` : ''),
+  )
+  if (supervisorGaveUpNotified) return
+  supervisorGaveUpNotified = true
+
+  const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+  if (!win) return
+  dialog
+    .showMessageBox(win, {
+      type: 'error',
+      title: `${label}反复崩溃，已停止自动重启`,
+      message: '本地后端无法自行恢复，功能会持续不可用',
+      detail:
+        `${label}在短时间内连续崩溃，已经自动重启到上限（3 次）仍不稳定，` +
+        '为避免反复重建拖垮机器，已停止自动重启。\n\n' +
+        (tail ? `最近的输出（尾部）：\n${tail}\n\n` : '') +
+        '重启应用会重新尝试一次完整的启动。若反复出现，请连同这条信息一起反馈。',
+      buttons: ['重启应用', '稍后手动重启'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    })
+    .then(({ response }) => {
+      if (response === 0) restartNow()
+    })
+    .catch(err => logMain('warn', `supervisor give-up dialog failed: ${err?.message || err}`))
+}
+
+/**
+ * 需要装环境时把进度窗开起来，装完（成败都算）关掉。
+ *
+ * 首启那条路径自己管窗口（启动循环期间窗口一直开着，重试不闪窗），这里服务的是
+ * **已经进了主界面之后**再起本地后端的情况（菜单/前端的"重启本地后端"）。那时
+ * 安装一跑就是几分钟，没有窗口就等于让界面静默假死。
+ */
+async function startLocalBackendWithProgress(options = {}) {
+  const runtime = inspectLocalRuntime()
+  // 与首启那条判定保持一致：知识库环境缺失也算"需要装"，否则升级上来的用户会在
+  // 主界面里静默下载几百 MB，且没有任何进度提示。
+  const knowledgeNeedsInstall = Boolean(runtime.knowledge) && runtime.knowledge.ready === false
+  if (runtime.ready && !knowledgeNeedsInstall) return startLocalBackend(options)
+  logMain(
+    'info',
+    runtime.ready
+      ? `knowledge runtime not ready (${runtime.knowledge?.reason}): ${runtime.knowledge?.message || ''}`
+      : `local runtime not ready (${runtime.reason}): ${runtime.message || ''}`,
+  )
+  openInstallWindow()
+  try {
+    return await startLocalBackend({
+      ...options,
+      onRuntimeStage: info => broadcastRuntimeStage(info),
+      onRuntimeLine: line => logMain('info', `[runtime] ${line}`),
+    })
+  } finally {
+    closeInstallWindow()
+  }
+}
+
+/**
+ * 建窗口：模式决定加载目标与 session 分区。
+ *   local 且本地后端就绪 → 主界面（apiUrl = 本地 baseUrl）
+ *   local 且未就绪 → 先给恢复选项，仍失败则落到 error.html（提示原因，不崩溃）
+ * 云端模式已废除，不再有「填服务地址」的分流。
+ */
+/**
+ * 启动时的 Windows Hello 二次确认。
+ *
+ * 为什么需要：本地身份来自 OS 账户，免口令会话由网关按 loopback 直接签发 ——
+ * 能坐到这台机器前的人自动就是"账户主人"。共用工作站上，登录 Windows 的人
+ * 走开而屏幕未锁时，回来的是另一个人。这道确认证明"仍是同一个已通过 OS 登录
+ * 的人在场"。
+ *
+ * 分级处理（**不能一刀切锁死**）：
+ *   · `Available` 且 `Verified`        → 放行
+ *   · `Available` 但 `Canceled` /
+ *     `RetriesExhausted`               → 用户明确没通过，退出应用
+ *   · 设备不可用（`DeviceNotPresent`
+ *     / `NotConfiguredForUser` / …）   → 跳过。加固不该让没有 Hello 硬件的
+ *                                        机器永远进不去
+ *   · 探测或调用本身失败（组策略禁用
+ *     powershell、脚本异常）           → 跳过，只记日志
+ *
+ * @returns {Promise<boolean>} 是否继续启动
+ */
+async function confirmUnlockWithHello(options = {}) {
+  const message = options.message || '确认是您本人正在打开 Chiron'
+  const failTitle = options.failTitle || '未通过身份确认'
+  const failBody =
+    options.failBody || 'Chiron 需要先确认是您本人才能打开。请重新启动应用并完成 Windows Hello 验证。'
+  if (process.platform !== 'win32') return true
+
+  let availability = null
+  try {
+    availability = await windowsHello.checkAvailability()
+  } catch (err) {
+    logMain('warn', `Windows Hello 可用性探测失败，跳过确认：${err?.message || err}`)
+    return true
+  }
+  if (availability !== 'Available') {
+    logMain('info', `Windows Hello 不可用（${availability || 'unknown'}），跳过二次确认`)
+    return true
+  }
+
+  let result = null
+  try {
+    result = await windowsHello.requestVerificationResult(message)
+  } catch (err) {
+    logMain('warn', `Windows Hello 确认调用失败，跳过：${err?.message || err}`)
+    return true
+  }
+
+  if (result === 'Verified') {
+    logMain('info', 'Windows Hello 二次确认通过')
+    return true
+  }
+
+  // 走到这里说明设备可用、用户却没过：取消或重试耗尽。这是明确的拒绝。
+  logMain('warn', `Windows Hello 二次确认未通过（${result || 'unknown'}），退出应用`)
+  dialog.showErrorBox(failTitle, failBody)
+  return false
+}
+
+/**
+ * 敏感操作（清空数据）的身份确认。
+ *
+ * 与启动时的 `confirmUnlockWithHello` 关键差别：**Hello 不可用时不放行**，
+ * 而是要求用户输入当前 Windows 账户密码。
+ *
+ * 为什么不能沿用「不可用就跳过」：跳过等于零验证，而清空数据不可逆。
+ * Windows 的 PIN 属于 Hello 体系（配了 PIN 时 CheckAvailability 报 Available），
+ * 所以「Hello 不可用」通常意味着这台机器两者都没配 —— 此时密码是唯一还能
+ * 证明「你是这个账户主人」的东西。
+ *
+ * @returns {Promise<{ok:boolean, reason:string, message:string}>}
+ *   reason: `verified` / `denied`（Hello 上被拒绝）/ `needs-password` /
+ *           `bad-credential` / `account-issue` / `error`
+ */
+async function confirmSensitiveAction(options = {}) {
+  const message = options.message || '确认执行此操作'
+  const password = typeof options.password === 'string' ? options.password : ''
+
+  if (process.platform !== 'win32') {
+    // 非 Windows 没有 Hello 也没有这份密码校验，只能依赖 OS 层面的账户隔离
+    return { ok: true, reason: 'verified', message: '' }
+  }
+
+  let availability = null
+  try {
+    availability = await windowsHello.checkAvailability()
+  } catch (err) {
+    logMain('warn', `Windows Hello 探测失败，转密码验证：${err?.message || err}`)
+    availability = null
+  }
+
+  // ① Hello 可用：先走它。用户明确拒绝就不再给密码这条路（拒绝就是拒绝）
+  if (availability === 'Available') {
+    let result = null
+    try {
+      result = await windowsHello.requestVerificationResult(message)
+    } catch (err) {
+      logMain('warn', `Windows Hello 调用失败，转密码验证：${err?.message || err}`)
+      result = null
+    }
+    if (result === 'Verified') return { ok: true, reason: 'verified', message: '' }
+    if (result === 'Canceled' || result === 'RetriesExhausted') {
+      return { ok: false, reason: 'denied', message: '身份确认未通过' }
+    }
+    // 其他（DeviceBusy / 脚本异常）继续往下降级
+  }
+
+  // ② Hello 不可用：必须给密码。没给就先要一次，别直接执行
+  if (!password) {
+    return {
+      ok: false,
+      reason: 'needs-password',
+      message: '未检测到可用的 Windows Hello，请输入当前 Windows 账户密码以确认身份',
+    }
+  }
+
+  // ③ 验密码（主进程内完成，密码不落库、不进日志、不回传）
+  const account = dataDirAcl.currentAccount()
+  const result = await accountVerify.verifyAccountPassword({ account, password })
+  if (result.ok) return { ok: true, reason: 'verified', message: '' }
+
+  // ④ 验证基础设施本身不可用（断网 / 域控不可达 / RPC 不通）：用户没错，
+  //    这台机器此刻没法完成验证。不能报成「密码错」让人反复重试，
+  //    也不能无声放行 —— 交给调用方给出可诊断的降级出口。
+  if (result.reason === 'unavailable' || result.reason === 'unsupported') {
+    logMain('warn', `账户验证不可用：${result.message || result.reason}`)
+    return { ok: false, reason: 'verification-unavailable', message: result.message }
+  }
+
+  logMain('warn', `账户密码验证未通过：${result.reason}`)
+  return { ok: false, reason: result.reason, message: result.message }
+}
+
+function createWindow() {
+  const settings = readDeviceSettings()
+  currentMode = resolveMode(settings)
+  const partition = partitionFor(currentMode)
+
+  const route = resolveStartupWindow({
+    localBackend,
+  })
+  const apiUrl = route.apiUrl
+  const target = route.target
+  currentApiUrl = apiUrl
+  // 会话监听必须在建窗之前挂好：窗口一创建就开始发首次请求
+  configureSession(partition)
+
+  // 配置页与本机错误页都是单栏布局，主界面才用大窗口
+  const isDialog = target !== 'app'
+
+  // 只有主界面自绘标题栏：setup/error.html 是独立静态页，没有标题栏组件，
+  // 去掉系统框之后用户既拖不动也关不掉窗口，所以它们一律保留原生窗口框。
+  const frameless = USE_CUSTOM_TITLEBAR && target === 'app'
+  const windowChrome = target !== 'app' ? {} : frameless ? { frame: false } : { titleBarStyle: 'hiddenInset' }
+
+  // 每次创建窗口现传模式 / 地址 / token：渲染进程的 process.env 是启动时继承的，
+  // 用户保存新地址后旧 env 不会更新。
+  const additionalArguments = [`${MODE_ARG_PREFIX}${currentMode}`]
+  if (apiUrl) additionalArguments.push(`${API_URL_ARG_PREFIX}${apiUrl}`)
+  // 本地模式的设备 token 由网关侧提供；拿到 token 才注入。
+  if (currentMode === 'local' && localBackend.token) {
+    additionalArguments.push(`${DEVICE_TOKEN_ARG_PREFIX}${localBackend.token}`)
+  }
+  // 标题栏形态（custom / inset / native）：页面据此决定是否画自绘控制按钮。
+  // 必须与上面的 windowChrome 用同一个判断 —— 两者各自按平台推算的话，
+  // 一旦有一边改了口径，页面就会在没有系统标题栏的窗口里不画按钮（窗口关不掉）。
+  const titleBarMode = target !== 'app' ? 'native' : frameless ? 'custom' : 'inset'
+  additionalArguments.push(`${TITLEBAR_ARG_PREFIX}${titleBarMode}`)
+
+  mainWindow = new BrowserWindow({
+    width: isDialog ? 520 : 1440,
+    height: isDialog ? 620 : 900,
+    minWidth: isDialog ? 420 : 960,
+    minHeight: isDialog ? 480 : 640,
+    resizable: !isDialog,
+    backgroundColor: WINDOW_BACKGROUND,
+    show: false, // 等首帧就绪再显示，避免白屏闪一下
+    autoHideMenuBar: true,
+    // 去掉系统窗口框：Windows 上那圈 1px 描边 + 系统标题栏与这套界面不同源，
+    // 放在一起像嵌套了另一个程序。标题栏改由页面自绘（TitleBar.vue）。
+    //
+    // 只有主界面（target === 'app'）自绘：setup / error 是独立的单栏静态页，
+    // 里面没有标题栏组件，frameless 之后既拖不动也关不掉，所以它们保留系统框。
+    // macOS 一律保留原生红绿灯，只让内容顶到标题栏区域。
+    ...windowChrome,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      // 双模式各用一个持久分区：cookie / localStorage / IndexedDB 互不可见；
+      // 切换模式时 mode-switch.cjs 清的就是「离开模式」的那个分区。
+      partition,
+      contextIsolation: true,
+      nodeIntegration: false,
+      // preload 要读 process.argv / versions，故不开 sandbox；
+      // contextIsolation 已经隔离了页面与 preload 的执行上下文。
+      sandbox: false,
+      // PDF 预览依赖 Chromium 内置的 PDF 查看器，而它是**以插件形式**注册的：
+      // 不开这个开关，`<iframe src="blob:…pdf">` 只会得到一片空白（图片不受影响，
+      // 因为 <img> 不走插件），用户看到的就是「图片能看、PDF 打不开」。
+      plugins: true,
+      additionalArguments,
+    },
+  })
+
+  mainWindow.once('ready-to-show', () => mainWindow.show())
+
+  // 主界面最小化即收进托盘（原因见 createTray 的说明）。
+  //
+  // 用 'minimize' 而不是拦截标题栏按钮：自绘标题栏、系统快捷键（Win+↓）、
+  // 任务栏右键都会走到同一个窗口事件，只挂在标题栏上会漏掉后两条。
+  // setup / error 不做 —— 它们收起来就没有恢复入口。
+  if (target === 'app') {
+    createTray()
+    // 最小化即"收进托盘"：只摘掉任务栏按钮，**不做 hide()**。
+    //
+    // hide() 会让窗口进入「已最小化 + 已隐藏」的复合态：Windows 认为它仍是最小化的，
+    // Chromium 又认为它被遮挡，从托盘恢复时两边的状态对不上 —— 窗口框回来了，内容
+    // 却是冻住的旧画面，点哪都没反应（用户报的"还原后卡死"）。
+    // 让窗口保持为普通的最小化状态、只摘任务栏按钮，恢复就走标准的 restore()，
+    // 两边状态始终一致。托盘图标缺失时不动任务栏：否则窗口最小化后既没有任务栏
+    // 按钮、也没有托盘入口，等于把它弄丢了。
+    mainWindow.on('minimize', () => {
+      if (!tray || !mainWindow || mainWindow.isDestroyed()) return
+      mainWindow.setSkipTaskbar(true)
+    })
+    mainWindow.on('restore', () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return
+      mainWindow.setSkipTaskbar(false)
+    })
+
+    // 关窗 = 收进托盘，**不退出应用**：核心 Agent 跑在本地后端（网关 + 引擎进程）里，
+    // 退出应用会把它们一起停掉，正在跑的回合就此中断。用户点 × 的意图是"先把窗口收起来"，
+    // 不是"掐掉后台任务"；真要退出走托盘菜单「退出 Chiron」。
+    //
+    // 托盘缺失时**不拦**（`!tray` 直接放行）：没有托盘入口还把窗口藏起来，
+    // 窗口就再也找不回来了 —— 那比"关窗即退出"更糟。
+    mainWindow.on('close', event => {
+      if (isQuitting) return
+      if (!tray || !mainWindow || mainWindow.isDestroyed()) return
+      event.preventDefault()
+      // 这里用 hide() 是安全的：窗口此时并没有处于最小化状态，不存在
+      // minimize 分支里那个"已最小化 + 已隐藏"的复合态问题。
+      mainWindow.hide()
+      showTrayHintOnce()
+      logMain('info', 'main window hidden to tray; local backend and agent keep running')
+    })
+  }
+
+  // 自绘标题栏要跟着窗口状态（最大化/全屏）换图标，事件源必须在建窗时就挂上
+  attachWindowStateBroadcast(mainWindow)
+
+  // 外部链接交给系统浏览器：壳内不该出现第二个浏览器的地址栏
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:/i.test(url)) shell.openExternal(url)
+    return { action: 'deny' }
+  })
+
+  // 同窗口导航限制：只允许本地 app 根目录 / 开发服务器；外部 http(s) 交系统浏览器
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isTrustedUrl(url)) return
+    event.preventDefault()
+    if (/^https?:/i.test(url)) shell.openExternal(url)
+    else logMain('warn', `blocked navigation: ${url}`)
+  })
+
+  // 主文档加载失败：切到本地错误页，而不是留一个空白窗口
+  mainWindow.webContents.on('did-fail-load', (_event, code, description, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return
+    showLoadError(code, description, validatedURL)
+  })
+
+  // 渲染进程崩溃：记录并给用户选择重载
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    logMain('error', `renderer gone: ${details.reason} exitCode=${details.exitCode}`)
+    if (details.reason === 'clean-exit' || !mainWindow || mainWindow.isDestroyed()) return
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'error',
+      title: '页面进程已退出',
+      message: `界面进程异常退出（${details.reason}）。`,
+      buttons: ['重新加载', '关闭'],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    if (choice === 0) mainWindow.reload()
+  })
+
+  // 界面长时间无响应：记录并让用户决定是否重载
+  mainWindow.on('unresponsive', () => {
+    logMain('warn', 'window unresponsive')
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: 'warning',
+      title: '界面无响应',
+      message: '界面暂时没有响应，是否重新加载？',
+      buttons: ['继续等待', '重新加载'],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    if (choice === 1) mainWindow.reload()
+  })
+
+  if (isDev && target === 'app') {
+    mainWindow.loadURL(DEV_URL)
+    mainWindow.webContents.openDevTools({ mode: 'detach' })
+  } else if (target === 'setup') {
+    mainWindow.loadFile(path.join(__dirname, 'setup.html'))
+  } else if (target === 'error') {
+    // 本地模式但后端没起来：复用通用错误页，把原因写进详情
+    mainWindow.loadFile(path.join(__dirname, 'error.html'), {
+      query: {
+        code: localBackend.reason || '',
+        desc: localBackend.message || '本地后端未就绪',
+        url: '',
+        retry: '',
+      },
+    })
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+  }
+
+  mainWindow.on('closed', () => {
+    mainWindow = null
+  })
+}
+
+/** 保存地址后重建窗口：尺寸、preload 注入的地址、加载目标都要换 */
+function relaunchIntoApp() {
+  const old = mainWindow
+  mainWindow = null
+  holdingWindowQuota(() => {
+    if (old) old.destroy()
+    createWindow()
+  })
+}
+
+/**
+ * 从「连接设置…」菜单进入配置页。
+ * 走"重建窗口"而不是在同窗口 loadFile：配置页是 520×620 的单栏布局，
+ * 塞进 1440 宽的主窗口会显得空荡；重建一次反而干净（代价是主界面重载，可接受）。
+ */
+function relaunchIntoSetup() {
+  const old = mainWindow
+  mainWindow = null
+  holdingWindowQuota(() => {
+    if (old) old.destroy()
+    // createWindow 会重新读配置：此时若已有地址，会直接进主界面 —— 所以这里
+    // 先把窗口配置成"强制 setup"模式，避免用户点了"连接设置"却又弹回主界面。
+    forceSetup = true
+    createWindow()
+    forceSetup = false
+  })
+}
+
+/**
+ * 打包后才检查更新：开发环境没有 app-update.yml，也没有签名产物。
+ * 更新源在 electron-builder.yml 的 publish 段（GitHub Releases）。
+ */
+function setupAutoUpdater() {
+  if (!app.isPackaged) return
+  let autoUpdater
+  try {
+    ;({ autoUpdater } = require('electron-updater'))
+  } catch (err) {
+    logMain('warn', `electron-updater unavailable: ${err.message}`)
+    return
+  }
+  autoUpdater.autoDownload = true
+  autoUpdater.autoInstallOnAppQuit = true
+  autoUpdater.on('error', err => logMain('warn', `update error: ${err?.message || err}`))
+  autoUpdater.on('update-available', info => logMain('info', `update available: ${info?.version || ''}`))
+  autoUpdater.on('update-not-available', () => logMain('info', 'update not available'))
+  autoUpdater.on('update-downloaded', info => {
+    logMain('info', `update downloaded: ${info?.version || ''}`)
+    void dialog
+      .showMessageBox({
+        type: 'info',
+        title: '更新已下载',
+        message: `Chiron ${info?.version || '新版本'} 已准备好，重启后生效。`,
+        buttons: ['立即重启', '稍后'],
+        defaultId: 0,
+        cancelId: 1,
+      })
+      .then(({ response }) => {
+        if (response === 0) autoUpdater.quitAndInstall()
+      })
+  })
+  // 延迟到首屏之后再检查，避免和首页资源抢带宽
+  setTimeout(() => {
+    autoUpdater.checkForUpdatesAndNotify().catch(err => {
+      logMain('warn', `update check failed: ${err?.message || err}`)
+    })
+  }, 8000)
+}
+
+// userData 根必须在这里定下来，**早于单实例锁与 whenReady**：
+// 锁文件、config.json、日志、两套 venv、PG 数据目录全都在它下面。晚一步定，就会出现
+// 「锁在旧根、数据在新根」这种同一进程内两套目录并存的局面。
+//
+// 为什么不靠 package.json 的 name：那是 `frontend-vue`，安装后的数据目录叫
+// `%APPDATA%\frontend-vue`，用户既认不出也不敢删。`resolveUserDataDir` 把它换成
+// 可识别的固定名，同时保留 CHIRON_DESKTOP_USER_DATA 的显式覆盖。
+//
+// Electron 的 `appData` 在 ready 之前就能读（它只依赖 APPDATA 环境变量），
+// 因此这里不会因为过早调用而拿到空值；拿不到就保持默认，不拿空串去 setPath。
+// 隔离模式：本地模式的数据必须留在**当前 OS 用户的 appData** 之内。
+// 判据取自 config.json 里已持久化的运行模式；全新安装（还没有 mode）按本地处理 ——
+// 那是桌面端的主路径，宁可多收一次口子，也不要让首启就落在一个共享目录里。
+// 云端模式已废除 ⇒ 数据永远留在本机，隔离恒开。
+const enforceUserDataIsolation = true
+
+try {
+  const resolvedUserData = shared.resolveUserDataDir({
+    appData: app.getPath('appData'),
+    override: process.env.CHIRON_DESKTOP_USER_DATA,
+    enforceIsolation: enforceUserDataIsolation,
+  })
+  if (resolvedUserData) app.setPath('userData', resolvedUserData)
+} catch (err) {
+  // 定目录失败不能让应用起不来：保持 Electron 默认值，后续安装/启动各自会报自己的错
+  logMain('warn', `userData 目录改写失败，沿用默认值：${err?.message || err}`)
+}
+
+// 数据目录收口：本地模式的数据必须只有当前 OS 用户与 SYSTEM 可访问。
+// 必须在单实例锁之前做 —— 锁文件本身就在这个目录里。
+//
+// 时机说明：这里只对**已存在**的 userData 根收口；`local/` 子树由引导器与
+// Electron 后续创建，会继承根的 ACL，所以不必逐个子目录递归。
+// 失败只记日志：权限操作可能因组策略/网络盘失败，那不该让应用起不来。
+if (enforceUserDataIsolation) {
+  try {
+    const aclResult = dataDirAcl.hardenDataDir({ dir: app.getPath('userData') })
+    if (!aclResult.ok) {
+      logMain('warn', `数据目录权限收口未完成：${aclResult.reason}`)
+    }
+  } catch (err) {
+    logMain('warn', `数据目录权限收口异常：${err?.message || err}`)
+  }
+}
+
+// 单实例：第二次启动时聚焦已有窗口，而不是再开一个进程
+const gotLock = app.requestSingleInstanceLock()
+if (!gotLock) {
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    // 走 showMainWindow 而不是只 focus()：窗口可能正最小化在托盘里，
+    // 单靠 focus() 不会把它从最小化状态里拉回来。
+    showMainWindow()
+  })
+
+  app.whenReady().then(async () => {
+    // Windows 通知/任务栏需要显式的 AppUserModelId，且要与打包 appId 一致
+    if (process.platform === 'win32') app.setAppUserModelId(APP_ID)
+
+    // 1) 首启选择运行模式：必须在建窗之前完成 —— 它决定 session 分区、启动分流与注入的地址。
+    //    全新安装与老配置迁移都走这里（判据是 needsModeChoice，见 askInitialMode）。
+    try {
+      await askInitialMode(readDeviceSettings())
+    } catch (err) {
+      logMain('warn', `initial mode selection failed: ${err?.message || err}`)
+    }
+
+    // 2) 二次确认：本地身份来自 OS 账户，补一道"人在场"的证明。
+    //    必须在任何业务启动之前 —— 确认没过就不该建窗、不该拉后端。
+    currentMode = resolveMode(readDeviceSettings())
+    if (currentMode === 'local' && enforceUserDataIsolation) {
+      if (!(await confirmUnlockWithHello())) {
+        app.quit()
+        return
+      }
+    }
+
+    // 3) 按模式准备后端：本地模式先把本机后端拉起来（未安装则提示并给恢复选项）
+    logMain('info', `starting in ${currentMode} mode`)
+    if (currentMode === 'local') {
+      // 首次启动（或运行时被破坏）时，安装要跑几分钟。此时主窗口还不存在，
+      // 所以先弹一个进度窗口 —— 否则用户看到的是"点了图标，什么都没有"。
+      // 已就绪就完全不建这个窗口，避免正常启动时闪一下。
+      const runtimeState = inspectLocalRuntime()
+      // 知识库索引服务（pageindex）的依赖是**可选但会静默下载几百 MB** 的那一类：
+      // 老用户升级上来时它必然缺失。若只按 core/引擎判定，进度窗不会打开，那几百 MB
+      // 就在后台默默下载 —— 用户看到的是"自托管用不了"，且没有任何进度提示。
+      // 所以把它一并纳入判定（它 miss 不影响主栈启动，只影响窗口要不要出现）。
+      const knowledgeNeedsInstall =
+        Boolean(runtimeState.knowledge) && runtimeState.knowledge.ready === false
+      const needsInstall = !runtimeState.ready || knowledgeNeedsInstall
+      if (needsInstall) {
+        const why = runtimeState.ready
+          ? `knowledge runtime not ready (${runtimeState.knowledge?.reason}): ${runtimeState.knowledge?.message || ''}`
+          : `local runtime not ready (${runtimeState.reason}): ${runtimeState.message || ''}`
+        logMain('info', why)
+        openInstallWindow()
+      }
+
+      // 进度/输出行只推给安装窗口；它在装完后会被销毁，广播会自行丢弃
+      const runtimeHooks = needsInstall
+        ? {
+            onRuntimeStage: info => broadcastRuntimeStage(info),
+            onRuntimeLine: line => logMain('info', `[runtime] ${line}`),
+          }
+        : {}
+
+      // 每轮都带一个新的取消信号与用户选的源：上一轮被取消/换源之后，
+      // 这里必须拿到干净的状态，否则重试会立刻又一次 abort。
+      const runOnce = () => {
+        const controller = runtimeInstallControl.reset()
+        return startLocalBackend({
+          ...runtimeHooks,
+          signal: controller.signal,
+          indexUrl: runtimeInstallControl.indexUrl || undefined,
+        })
+      }
+
+      try {
+        localBackend = await runOnce()
+        let attempts = 0
+        // 最多再重试两次；仍失败就继续建窗口，让错误页把原因写在界面上
+        while (!localBackend.ok && attempts < 2) {
+          // 失败事件必须标记 failed，安装页据此才露出"换源重试"。
+          // 用户主动取消时不再弹恢复对话框，直接进主界面看错误页。
+          const cancelled = localBackend.reason === 'install-cancelled'
+          broadcastRuntimeStage({
+            stage: 'failed',
+            message: localBackend.message || '安装未完成',
+            failed: true,
+            retryableWithMirror: !cancelled,
+          })
+          if (cancelled) break
+          attempts += 1
+          const action = await askLocalBackendRecovery(localBackend)
+          if (action === 'quit') {
+            app.quit()
+            return
+          }
+          localBackend = await runOnce()
+        }
+      } finally {
+        // 无论成败都必须关掉：失败时留着它会盖住后面的错误页
+        closeInstallWindow()
+      }
+      recordLocalStart(localBackend)
+    }
+
+    // 3) 精简菜单：保留复制/粘贴/全选/重载/开发者工具，去掉 Electron 默认的多余项
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate([
+        {
+          label: app.name,
+          submenu: [
+            { role: 'about' },
+            { type: 'separator' },
+            { role: 'hide' },
+            { role: 'hideOthers' },
+            { role: 'unhide' },
+            { type: 'separator' },
+            { role: 'quit' },
+          ],
+        },
+        {
+          label: '编辑',
+          submenu: [
+            { role: 'undo' },
+            { role: 'redo' },
+            { type: 'separator' },
+            { role: 'cut' },
+            { role: 'copy' },
+            { role: 'paste' },
+            { role: 'selectAll' },
+          ],
+        },
+        {
+          label: '视图',
+          submenu: [
+            { role: 'reload' },
+            { role: 'forceReload' },
+            { role: 'toggleDevTools' },
+            { type: 'separator' },
+            { role: 'resetZoom' },
+            { role: 'zoomIn' },
+            { role: 'zoomOut' },
+            { type: 'separator' },
+            { role: 'togglefullscreen' },
+            { type: 'separator' },
+          ],
+        },
+      ]),
+    )
+
+    // 配置页的两个动作。地址校验与持久化都在 config.cjs 里，主进程只做转发。
+    // 同时校验 sender：只有应用自身页面（或开发服务器）能改服务地址。
+    ipcMain.handle('desktop:test-api-url', (event, url) => {
+      assertTrustedSender(event)
+      return probe(url)
+    })
+
+    // 自绘标题栏的三个动作。target 一律从 event.sender 反查窗口，而不是用
+    // 模块级的 mainWindow：安装窗口（openInstallWindow）也建在 createWindow 之前，
+    // 用 mainWindow 会作用到错误的窗口，或者干脆什么都没发生。
+    registerWindowControlIpc()
+
+    // 安装页的「取消」与「换源重试」。
+    // 只允许安装窗口自己触发：这两个动作会中止本进程里正在跑的 uv，
+    // 从主界面或任何其它页面打过来都该拒绝。
+    ipcMain.handle(RUNTIME_CANCEL_CHANNEL, event => {
+      assertTrustedSender(event)
+      return handleRuntimeCancel()
+    })
+    ipcMain.handle(RUNTIME_MIRROR_CHANNEL, event => {
+      assertTrustedSender(event)
+      return handleRuntimeMirrorRetry()
+    })
+    ipcMain.handle('desktop:set-api-url', (event, url) => {
+      assertTrustedSender(event)
+      saveApiUrl(url)
+      relaunchIntoApp()
+      return true
+    })
+
+    // 「修改服务地址」的界面入口（设置页与登录页用）。
+    // 在此之前唯一的入口是菜单里那个「连接设置…」—— 快捷键 Ctrl+,，而菜单栏默认隐藏，
+    // 等于没有入口：地址填错时主界面连不上后端，设置页又在登录之后，用户只能手改 config.json。
+    ipcMain.handle('desktop:open-setup', event => {
+      assertTrustedSender(event)
+      relaunchIntoSetup()
+      return true
+    })
+
+    // token：异步读取（safeStorage 的 async API），保存/清除走 invoke；全部校验 sender。
+    ipcMain.handle('desktop:get-token', async event => {
+      assertTrustedSender(event)
+      return readToken()
+    })
+    ipcMain.handle('desktop:save-token', (event, token) => {
+      assertTrustedSender(event)
+      return writeToken(String(token || ''))
+    })
+    ipcMain.handle('desktop:clear-token', event => {
+      assertTrustedSender(event)
+      return clearToken()
+    })
+
+    // 设备设置与模式：真相在主进程的 config.json（契约 §1），渲染进程读到的只是它。
+    //
+    // 用 `readRuntimeDeviceSettings` 而不是 `readDeviceSettings`：后者会把磁盘上
+    // 残留的 `mode:"cloud"`（云端模式已废除）原样交给渲染层，渲染层 `loadSettings()`
+    // 拿它覆盖运行模式，「退出登录」就走云端分支真登出并清会话 —— 而云端登录页
+    // 早已删除，用户被永久留在首页只剩「登录已过期，请重新登录」。详见 config.cjs。
+    ipcMain.handle('desktop:get-device-settings', event => {
+      assertTrustedSender(event)
+      return readRuntimeDeviceSettings()
+    })
+
+    /**
+     * 复制文本（主进程通道）。
+     *
+     * 页面侧的 `navigator.clipboard.writeText()` 在桌面端有三道闸门：Chromium 权限
+     * 白名单、文档焦点（`Document is not focused` 直接抛错）、安全上下文。任何一道
+     * 没开都是**静默失败**，而调用点普遍不接 catch —— 用户看到的就是"所有复制按钮
+     * 都没反应"。Electron 的 `clipboard` 模块在主进程里不受这三条约束，所以这里给它
+     * 一条确定的通道（前端 `utils/clipboard.ts` 的标准通道失败后降级到这里）。
+     *
+     * 只接受字符串并截断到合理长度：剪贴板 IPC 能被页面任意调用，不该成为
+     * "把 100MB 塞进系统剪贴板"的入口。
+     */
+    ipcMain.handle('desktop:copy-text', (event, text) => {
+      assertTrustedSender(event)
+      if (typeof text !== 'string') return { ok: false, reason: 'not-a-string' }
+      const MAX_COPY_LENGTH = 4 * 1024 * 1024
+      if (text.length > MAX_COPY_LENGTH) return { ok: false, reason: 'too-large' }
+      try {
+        clipboard.writeText(text)
+        return { ok: true }
+      } catch (err) {
+        logMain('warn', `clipboard write failed: ${err?.message || err}`)
+        return { ok: false, reason: 'write-failed', message: err?.message || String(err) }
+      }
+    })
+
+    /**
+     * 引擎环境变量开关（白名单，见 engine-env.cjs）。
+     *
+     * 为什么这条 IPC 必须存在：`SUPERAGENT_TAKEOVER_ENABLED` 这类开关只认进程
+     * 环境变量，而打包态从开始菜单启动、没有 shell 可设。没有界面入口就等于
+     * "这个功能永远是关的"—— 用户只能改服务端环境变量，而桌面端根本没有服务端。
+     *
+     * 只返回**白名单内**的项与它们的说明，不接受任意键：`APP_SECRET` /
+     * `SANDBOX_BACKEND` 这类值不可由渲染进程改写（安全边界，理由见该模块文档）。
+     */
+    ipcMain.handle('desktop:get-engine-env-settings', event => {
+      assertTrustedSender(event)
+      const dataDir = resolveLocalDataDir()
+      return {
+        ok: true,
+        dataDir,
+        // 界面要能显示"这项是布尔、默认关"，所以把规格一起下发而不是让前端另写一份
+        toggles: engineEnvSettings.ENGINE_TOGGLES.map(spec => ({ ...spec })),
+        values: engineEnvSettings.readEngineEnvSettings(dataDir),
+      }
+    })
+
+    /**
+     * 保存开关。写入后**不会**自动重启引擎：重启会中断正在进行的会话，
+     * 这一步留给用户显式触发（界面上的「重启本地后端」）。
+     * 返回写入后的值，让界面显示真相而不是它自己以为的值。
+     */
+    ipcMain.handle('desktop:save-engine-env-settings', (event, toggles) => {
+      assertTrustedSender(event)
+      try {
+        const dataDir = resolveLocalDataDir()
+        const saved = engineEnvSettings.writeEngineEnvSettings(dataDir, toggles)
+        logMain('info', `engine env toggles saved: ${JSON.stringify(saved)}`)
+        return { ok: true, values: saved }
+      } catch (err) {
+        // 写盘失败要如实回传：界面不能显示"已保存"然后重启后一切照旧
+        return { ok: false, reason: 'write-failed', message: err?.message || String(err) }
+      }
+    })
+
+    // 当前 OS 账户：本地模式下它**就是**应用用户（一个 OS 账户一套数据，
+    // 见 data-dir-acl.cjs 与 userData 的隔离根）。账户页显示它，用户才知道
+    // 自己看到的是哪一份数据。
+    ipcMain.handle('desktop:get-os-account', event => {
+      assertTrustedSender(event)
+      return dataDirAcl.currentAccount()
+    })
+
+    /**
+     * 验证当前 Windows 账户密码 —— 本地模式「锁定」后的解锁入口。
+     *
+     * ## 为什么要这一条
+     *
+     * 本地模式的身份来自 OS 账户（一个 Windows 用户 = 一个应用用户），网关按本机
+     * 回环来源免口令签发会话。也就是说**坐到这台机器前的人就自动是账户主人**。
+     * 共用工作站上这不够：登录 Windows 后人走开、屏幕没锁，回来的是另一个人。
+     *
+     * 此前「退出登录」在本地模式下会**立刻重建同一个会话**（等于没登出），用户点完
+     * 只看到界面闪一下；而若把重建去掉，就变成"点一次登出整个应用永久不可用"。
+     * 两条路都不对 —— 正确的语义是**锁定**：证明"还是同一个人"之后回到原状态。
+     *
+     * ## 为什么直接验密码，不先试 Windows Hello
+     *
+     * 这里的语义是"解锁"，必须**确定**会要密码，界面才能一次把输入框摆出来。
+     * Hello 弹窗与密码框二选一会让界面先猜一次；而这个判断在主进程里随时可能变
+     * （设备忙 / 组策略）。清空数据那条路仍走 `confirmSensitiveAction`（Hello 优先），
+     * 因为那是不可逆动作，能上强认证就上强认证。
+     *
+     * ## 失败原因必须分类
+     *
+     * `bad-credential`（密码错，可重试）与 `verification-unavailable`（断网 / 域控
+     * 不可达，用户没错）是两件完全不同的事。后者若也报"密码错误"，用户会反复试一个
+     * 正确的密码。
+     *
+     * 密码只在本次调用内存在：不写日志、不落盘、不进返回值。
+     */
+    ipcMain.handle('desktop:verify-lock-password', async (event, payload) => {
+      assertTrustedSender(event)
+      if (currentMode !== 'local') {
+        // 云端模式的身份不来自 OS 账户，解锁没有可验证的对象。
+        return { ok: false, reason: 'not-local', message: '只有本地模式需要解锁' }
+      }
+      const password = payload && typeof payload.password === 'string' ? payload.password : ''
+      const secondFactor = payload && typeof payload.token === 'string' ? payload.token : ''
+      if (!password) {
+        return { ok: false, reason: 'needs-password', message: '请输入当前 Windows 账户密码' }
+      }
+      const account = dataDirAcl.currentAccount()
+      const result = await accountVerify.verifyAccountPassword({ account, password })
+      if (!result.ok) {
+        // 环境原因（不可用 / 平台不支持）：用户没错，别报成密码错。
+        if (result.reason === 'unavailable' || result.reason === 'unsupported') {
+          logMain('warn', `解锁验证不可用：${result.message || result.reason}`)
+          return {
+            ok: false,
+            reason: 'verification-unavailable',
+            message: result.message,
+            // 附上 OS 账户名：界面要能说清"正在验证哪一个账户"
+            account,
+          }
+        }
+        logMain('warn', `解锁验证未通过：${result.reason}`)
+        return { ok: false, reason: result.reason, message: result.message, account }
+      }
+
+      // ── 第二因素（可选）──
+      //
+      // 顺序是刻意的：**先验 OS 密码，再验 TOTP**。反过来的话，攻击者可以先拿
+      // 无限次的验证码猜错去试探"这台机器有没有开 2FA"，而 OS 密码验证本身就是
+      // 一道昂贵闸门（LogonUser + 账户锁定策略）。
+      //
+      // 未启用 2FA 时 `verify()` 返回 `{ok:true, skipped:true}` —— 不能因为用户
+      // 没开第二因素就拒绝解锁（那会让升级上来的用户直接进不去）。
+      const status = await twoFactor.getStatus()
+      if (status.unreadable) {
+        // 配置密文读不出来：如实告知，而不是假装"没启用"。本机第一因素仍然有效，
+        // 所以这里**放行**（否则用户永远进不来），但界面必须看到这个事实。
+        logMain('warn', '2FA 配置不可读，按未启用放行')
+      }
+      if (status.enabled) {
+        if (!secondFactor) {
+          // 让界面切到"输入验证码"那一步，而不是报"密码错误"
+          return { ok: false, reason: 'needs-second-factor', message: '请输入验证码', account }
+        }
+        const second = await twoFactor.verify(secondFactor)
+        if (!second.ok) {
+          logMain('warn', `第二因素验证未通过：${second.reason}`)
+          // 原因**原样**带出去：`replayed`（这个码刚用过，等 30 秒）与 `mismatch`
+          // （码不对）对用户是两条不同的行动指引，混成一句只会让人反复试同一个码。
+          return {
+            ok: false,
+            reason:
+              second.reason === 'needs-token'
+                ? 'needs-second-factor'
+                : second.reason || 'bad-second-factor',
+            message: second.reason === 'replayed' ? '这个验证码刚用过，请等下一个' : '验证码不正确',
+            account,
+          }
+        }
+      }
+
+      logMain('info', '解锁验证通过')
+      return { ok: true, reason: 'verified', message: '' }
+    })
+
+    // ── 可选第二因素（TOTP）──
+    //
+    // 为什么配置动作全部放主进程：`two-factor.bin` 是 safeStorage 加密的，
+    // 渲染进程既读不到、也不该读。它只能拿到"开没开 / 还剩几个恢复码"这类
+    // 状态，以及启用那一刻**唯一一次**的明文恢复码。
+    ipcMain.handle('desktop:get-two-factor-status', async event => {
+      assertTrustedSender(event)
+      return { ok: true, status: await twoFactor.getStatus() }
+    })
+
+    /**
+     * 开始启用：生成候选密钥 + otpauth URI，但**不落盘**。
+     *
+     * 密钥会回给渲染进程（它要显示出来供手动输入，或编码成二维码）。这不是泄露：
+     * 它此刻还没生效，用户不确认就等于什么都没发生；而确认要求回填一个当前有效的
+     * 验证码 —— 手机没配对成功就不可能通过。
+     */
+    ipcMain.handle('desktop:begin-two-factor', async event => {
+      assertTrustedSender(event)
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '只有本地模式支持第二因素' }
+      }
+      const status = await twoFactor.getStatus()
+      if (status.enabled) {
+        return { ok: false, reason: 'already-enabled', message: '第二因素已启用' }
+      }
+      const started = twoFactor.beginEnrollment({ account: dataDirAcl.currentAccount() })
+      return { ok: true, secret: started.secret, otpauth: started.otpauth }
+    })
+
+    /**
+     * 确认启用：验证用户回填的验证码。
+     *
+     * 返回**明文恢复码**（唯一一次）。文案里必须强调这一点 —— 关掉弹窗就再也
+     * 拿不到了，而它们是 TOTP 设备丢失时唯一的出路。
+     */
+    ipcMain.handle('desktop:confirm-two-factor', async (event, payload) => {
+      assertTrustedSender(event)
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '只有本地模式支持第二因素' }
+      }
+      const token = payload && typeof payload.token === 'string' ? payload.token : ''
+      const result = await twoFactor.confirmEnrollment(token, {
+        account: dataDirAcl.currentAccount(),
+      })
+      if (!result.ok) {
+        logMain('warn', `第二因素启用失败：${result.reason}`)
+        return { ok: false, reason: result.reason, message: '验证码不正确或配置写入失败' }
+      }
+      logMain('info', '第二因素已启用')
+      return { ok: true, recoveryCodes: result.recoveryCodes }
+    })
+
+    /** 停用：删掉配置。需要密码 —— 否则旁人拿到未锁的窗口就能把第二因素关掉。 */
+    ipcMain.handle('desktop:disable-two-factor', async (event, payload) => {
+      assertTrustedSender(event)
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '只有本地模式支持第二因素' }
+      }
+      const password = payload && typeof payload.password === 'string' ? payload.password : ''
+      if (!password) {
+        return { ok: false, reason: 'needs-password', message: '停用第二因素需要验证账户密码' }
+      }
+      const account = dataDirAcl.currentAccount()
+      const verified = await accountVerify.verifyAccountPassword({ account, password })
+      if (!verified.ok) {
+        return {
+          ok: false,
+          reason: verified.reason === 'bad-credential' ? 'bad-credential' : 'verify-failed',
+          message: verified.message || '账户密码验证未通过',
+        }
+      }
+      const result = await twoFactor.disable()
+      if (!result.ok) return { ok: false, reason: result.reason, message: '删除配置失败' }
+      logMain('info', '第二因素已停用')
+      return { ok: true }
+    })
+
+    /** 重新生成恢复码（旧的立即失效）。需要密码，理由同停用。 */
+    ipcMain.handle('desktop:regenerate-recovery-codes', async (event, payload) => {
+      assertTrustedSender(event)
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '只有本地模式支持第二因素' }
+      }
+      const password = payload && typeof payload.password === 'string' ? payload.password : ''
+      if (!password) {
+        return { ok: false, reason: 'needs-password', message: '重新生成恢复码需要验证账户密码' }
+      }
+      const verified = await accountVerify.verifyAccountPassword({
+        account: dataDirAcl.currentAccount(),
+        password,
+      })
+      if (!verified.ok) {
+        return {
+          ok: false,
+          reason: verified.reason === 'bad-credential' ? 'bad-credential' : 'verify-failed',
+          message: verified.message || '账户密码验证未通过',
+        }
+      }
+      const result = await twoFactor.regenerateRecoveryCodes()
+      if (!result.ok) return { ok: false, reason: result.reason, message: '写入失败' }
+      return { ok: true, recoveryCodes: result.recoveryCodes }
+    })
+
+    ipcMain.handle('desktop:set-mode', (event, mode, opts) => {
+      assertTrustedSender(event)
+      return applyModeSwitch(mode, opts)
+    })
+    ipcMain.handle('desktop:restart', event => {
+      assertTrustedSender(event)
+      restartNow()
+      return true
+    })
+
+    /**
+     * 清空本机数据 —— 设置页「运行模式」标签页里唯一的破坏性动作。
+     *
+     * **为什么 Hello 确认放在主进程**：渲染进程只是界面，它说"用户确认过了"
+     * 不等于真的确认过；一个被注入的页面可以照样调这个 IPC。
+     * 所以核对身份的这一步必须在主进程、在真正动手之前完成。
+     *
+     * 分批次的确认（勾选 → 手打确认词）在渲染进程做，那是防误触；
+     * 这里是防冒用，两者不能互相替代。
+     *
+     * 失败返回结构化结果而不是抛错：界面要能区分"用户拒绝"（不该报错弹窗）
+     * 与"清空过程出错"（要给出可读原因）。
+     */
+    /**
+     * 本机 Windows Hello 是否可用。渲染进程据此决定要不要显示密码输入框 ——
+     * 不可用时主进程不会放行清空操作，界面应提前告知，而不是等两次确认后才发现。
+     */
+    ipcMain.handle('desktop:get-hello-availability', async event => {
+      assertTrustedSender(event)
+      if (process.platform !== 'win32') {
+        return { available: false, platform: process.platform }
+      }
+      try {
+        const availability = await windowsHello.checkAvailability()
+        return { available: availability === 'Available', availability: availability || 'unknown' }
+      } catch (err) {
+        logMain('warn', `Windows Hello 可用性探测失败：${err?.message || err}`)
+        return { available: false, availability: 'unknown' }
+      }
+    })
+
+    ipcMain.handle('desktop:wipe-local-data', async (event, payload) => {
+      assertTrustedSender(event)
+
+      // 只有本地模式才有"本机数据"可清
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '当前不是本地模式' }
+      }
+
+      // 破坏性动作：必须验证身份。**Hello 不可用时不再放行**，改要账户密码 ——
+      // 放行等于零验证，而这一步不可逆（见 confirmSensitiveAction 的说明）。
+      // 密码只在本次调用内存在：不写日志、不落盘、不进返回值。
+      const auth = await confirmSensitiveAction({
+        message: '确认清空 Chiron 的全部本机数据',
+        password: payload && typeof payload.password === 'string' ? payload.password : '',
+      })
+      if (!auth.ok) {
+        // 需要密码时把 reason 原样带回，界面据此显示密码输入框。
+        // 验证基础设施不可用时附上数据目录：这是绕开验证的**唯一诚实出路** ——
+        // 用户本来就能在资源管理器里删掉它，应用内假装"验证失败就放行"没有
+        // 任何安全收益，只会让界面对安全状态撒谎。
+        const dataDir = currentMode === 'local'
+          ? path.join(app.getPath('userData'), 'local')
+          : ''
+        return { ok: false, reason: auth.reason, message: auth.message, dataDir }
+      }
+
+      try {
+        const result = await wipeLocalData({
+          electron: { app, session },
+          stopBackend: async () => {
+            if (currentMode === 'local') await stopLocalBackend()
+          },
+          tokenStore: { clearToken },
+          log: logMain,
+        })
+        // 数据已删：重启到干净状态。重启失败不算清空失败 —— 数据已经没了，
+        // 用户手动重开即可，这时报"清空失败"反而是误导。
+        const relaunched = relaunchAfterWipe({ app }, logMain)
+        return {
+          ok: true,
+          relaunched,
+          cleaned: result.cleaned,
+          warnings: result.warnings,
+        }
+      } catch (err) {
+        logMain('error', `wipe local data failed: ${err?.message || err}`)
+        return { ok: false, reason: 'wipe-failed', message: err?.message || String(err) }
+      }
+    })
+
+    // ── 本地文档选择（契约 §2 的 `pickDocument`）──
+    //
+    // 只回 `{ path, name }`，**不读内容**：文档正文属于用户数据，读取与抽取由本地链路
+    // 按需处理，主进程不在这里把它带进内存。用户取消返回 `null`（不是错误）。
+    //
+    // 对话框归属发起请求的窗口：`BrowserWindow.fromWebContents(event.sender)` 而不是
+    // 模块级的 `mainWindow` —— 设置页开在独立窗口时，模态父窗口必须是它自己。
+    // 不加 `filters`：本地抽取接受任意文件，限死扩展名只会让用户选不到自己的文档。
+    ipcMain.handle('desktop:pick-document', async event => {
+      assertTrustedSender(event)
+      const owner = BrowserWindow.fromWebContents(event.sender)
+      const options = { title: '选择文档', properties: ['openFile'] }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return shared.pickDocumentResult(result)
+    })
+
+    // ── 本地目录选择（项目根目录）──
+    //
+    // 与 `pick-document` 同一套约定：只回 `{ path, name }`，取消返回 `null`，
+    // 不在这里做路径合法性判断 —— 那是后端 `validateRootPath` 的职责
+    //（绝对路径 / 存在 / 是目录 / 非系统目录）。主进程多做一遍只会让两处判据漂移。
+    //
+    // `createDirectory` 允许用户在选择对话框里直接新建文件夹：让用户被迫先到资源管理器
+    // 建目录再回来选，是没必要的往返。
+    ipcMain.handle('desktop:pick-directory', async event => {
+      assertTrustedSender(event)
+      const owner = BrowserWindow.fromWebContents(event.sender)
+      const options = {
+        title: '选择项目文件夹',
+        properties: ['openDirectory', 'createDirectory'],
+      }
+      const result = owner
+        ? await dialog.showOpenDialog(owner, options)
+        : await dialog.showOpenDialog(options)
+      return shared.pickDirectoryResult(result)
+    })
+
+    // ── 本地模型配置（provider / 端点 / 模型名 / key）──
+    //
+    // 三个动作都不抛异常给渲染进程：IPC 抛错会被 Electron 包成
+    // "Error invoking remote method '...': Error: ..." 的一大串，界面只能整段回显。
+    // 统一返回 { ok, message } —— message 是给人看的一句话（含原因），界面直接显示。
+    //
+    // 明文 apiKey 只在这一层与 secrets.cjs 之间流动：读回的配置里只有 hasKey 布尔，
+    // 保存时也不回显、不写日志（契约 §8：不要把用户 provider key 写入日志/明文）。
+    const MODEL_CONFIG_PROVIDERS = new Set(['ollama', 'openai-compatible'])
+
+    function optionalSecrets() {
+      const mod = loadOptionalModule('./secrets.cjs')
+      if (!mod || typeof mod.readSecrets !== 'function' || typeof mod.writeSecrets !== 'function') {
+        return null
+      }
+      return mod
+    }
+
+    /**
+     * 合并单个 provider 条目：
+     *   · baseUrl / model 显式给出才覆盖（允许清成空串 —— 用户主动恢复默认）；
+     *   · apiKey 空白视为"保持不变"（界面上不回显 key，用户不重填就不该被清掉）；
+     *   · clearApiKey === true 时删除已存的 key（明确的删密钥动作）。
+     */
+    function mergeProviderEntry(previous, patch) {
+      const merged = { ...(previous && typeof previous === 'object' ? previous : {}) }
+      for (const field of ['baseUrl', 'model']) {
+        if (typeof patch[field] === 'string') merged[field] = patch[field].trim()
+      }
+      if (typeof patch.apiKey === 'string' && patch.apiKey.trim()) merged.apiKey = patch.apiKey.trim()
+      if (patch.clearApiKey === true) delete merged.apiKey
+      return merged
+    }
+
+    ipcMain.handle('desktop:get-model-config', async event => {
+      assertTrustedSender(event)
+      const mod = optionalSecrets()
+      if (!mod || typeof mod.readPublicSecrets !== 'function') {
+        return { ok: false, reason: 'secrets-unavailable', message: '当前版本不支持模型配置（secrets.cjs 未随包发布）' }
+      }
+      try {
+        return { ok: true, config: await mod.readPublicSecrets() }
+      } catch (err) {
+        return { ok: false, reason: 'read-failed', message: err?.message || String(err) }
+      }
+    })
+
+    ipcMain.handle('desktop:save-model-config', async (event, payload) => {
+      assertTrustedSender(event)
+      const mod = optionalSecrets()
+      if (!mod) {
+        return { ok: false, reason: 'secrets-unavailable', message: '当前版本不支持模型配置（secrets.cjs 未随包发布）' }
+      }
+      try {
+        const incoming = payload && typeof payload === 'object' ? payload : {}
+        const current = await mod.readSecrets()
+        const next = {
+          version: current && current.version ? current.version : undefined,
+          active: current && typeof current.active === 'string' ? current.active : '',
+          providers: { ...(current && current.providers ? current.providers : {}) },
+        }
+        if (typeof incoming.active === 'string') next.active = incoming.active.trim().toLowerCase()
+        const patches = incoming.providers && typeof incoming.providers === 'object' ? incoming.providers : {}
+        for (const [name, patch] of Object.entries(patches)) {
+          if (!MODEL_CONFIG_PROVIDERS.has(name)) {
+            return { ok: false, reason: 'unknown-provider', message: `未知的模型服务：${name}` }
+          }
+          next.providers[name] = mergeProviderEntry(next.providers[name], patch && typeof patch === 'object' ? patch : {})
+        }
+        const written = await mod.writeSecrets(next)
+        if (!written) {
+          // 最常见的原因：Linux 上没有可用的系统密钥环 / Windows DPAPI 被策略禁用
+          return {
+            ok: false,
+            reason: 'write-failed',
+            message: '无法写入密钥库：系统加密存储（safeStorage）不可用或写入失败，配置未保存',
+          }
+        }
+        logMain('info', `model config saved (active: ${next.active || 'default'})`)
+        const config = typeof mod.readPublicSecrets === 'function' ? await mod.readPublicSecrets() : null
+        return { ok: true, config }
+      } catch (err) {
+        return { ok: false, reason: 'save-failed', message: err?.message || String(err) }
+      }
+    })
+
+    /**
+     * 重启本地后端（改完模型配置后让核心重新握手；不需要重启整个应用）。
+     * 只允许本地模式调用 —— 云端模式下没有本地后端，静默成功会让用户以为生效了。
+     *
+     * ⚠ **网关端口会变**：`startLocalBackend` 每次都用 `pickFreePort()` 挑新端口，
+     * 而 preload 的 `apiUrl` 是**建窗时**通过 `additionalArguments` 固定注入的。
+     * 只重启进程、不重建窗口的后果是：渲染进程继续打那个已经不存在的端口，
+     * 每个请求都失败 —— 用户看到的正是「开关保存了但什么都没生效」（甚至更糟：
+     * 整个界面失灵，只有重启应用才能恢复）。
+     *
+     * 所以这里在**返回值送出之后**重建窗口。顺序不能颠倒：重建会销毁渲染进程，
+     * 提前重建会让这次 IPC 的 promise 永远不 resolve，界面停在"正在重启…"。
+     */
+    ipcMain.handle('desktop:restart-local-backend', async event => {
+      assertTrustedSender(event)
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '当前不是本地模式，没有可重启的本地后端' }
+      }
+      try {
+        await stopLocalBackend()
+        // stopLocalBackend 里有"只停一次"的标志位，重启要把它复位，否则下次退出不会停
+        localBackendStopped = false
+        // 走带进度窗的那一条：引擎依赖是"用到才装"的，从主界面重启后端时
+        // 完全可能撞上从没装过的引擎环境，不弹窗就是静默假死几分钟。
+        localBackend = await startLocalBackendWithProgress()
+        recordLocalStart(localBackend)
+        const nextBaseUrl = localBackend.ok ? String(localBackend.baseUrl || '') : ''
+        // 端口没变（比如接管了同一套栈）就不必重建：重建会打断用户正在做的事。
+        const needsRebuild = Boolean(nextBaseUrl) && nextBaseUrl !== currentApiUrl
+        if (needsRebuild) {
+          logMain('info', `本地后端端口已变（${currentApiUrl || '(空)'} → ${nextBaseUrl}），重建窗口以换掉注入的 API 地址`)
+          // 让本次 IPC 先把结果送回渲染进程，再动窗口。
+          setImmediate(() => {
+            try {
+              relaunchIntoApp()
+            } catch (err) {
+              logMain('warn', `重建窗口失败：${err && err.message ? err.message : err}`)
+            }
+          })
+        }
+        return {
+          ok: Boolean(localBackend.ok),
+          reason: localBackend.reason,
+          message: localBackend.message,
+          baseUrl: nextBaseUrl,
+          // 界面据此决定"要不要提示用户稍候" —— 重建窗口时页面会被重新加载
+          reloading: needsRebuild,
+        }
+      } catch (err) {
+        return { ok: false, reason: 'restart-failed', message: err?.message || String(err) }
+      }
+    })
+
+    /**
+     * 重启**单个**子组件（健康面板的「重启」按钮）。
+     *
+     * 与 `desktop:restart-local-backend` 的区别：那个是整栈重启，网关会挑新端口、
+     * 必须重建窗口；这里的 `restartProcess` 用**原端口**重建，`apiUrl` 不变，
+     * 所以**不**重建窗口 —— 用户不该因为重启了引擎就丢掉正在编辑的草稿。
+     *
+     * 只接受白名单内的组件名：渲染进程能触发的动作必须在这里收敛，
+     * 否则等于把一个"能起停任意子进程"的开关交给页面。
+     *
+     * 接管来的栈（`state.attached`）没有 `restartCtx`，`restartProcess` 会回
+     * `no-context` —— 如实透传：那些进程不归本实例所有，重启会打断别人。
+     */
+    ipcMain.handle('desktop:restart-component', async (event, payload) => {
+      assertTrustedSender(event)
+      if (currentMode !== 'local') {
+        return { ok: false, reason: 'not-local', message: '当前不是本地模式，没有本地组件可重启' }
+      }
+      const name = String((payload && payload.name) || '')
+      const ALLOWED = new Set(['engine', 'gateway', 'knowledge'])
+      if (!ALLOWED.has(name)) {
+        return { ok: false, reason: 'unknown-component', message: `不支持重启的组件：${name || '(空)'}` }
+      }
+      const stack = loadOptionalModule('./local-stack.cjs')
+      if (!stack || typeof stack.restartProcess !== 'function') {
+        return { ok: false, reason: 'unsupported', message: '当前外壳版本不支持单组件重启' }
+      }
+      try {
+        const result = await stack.restartProcess(name)
+        const ok = Boolean(result && result.ok)
+        logMain(ok ? 'info' : 'warn', `重启组件 ${name}：${ok ? '成功' : (result && result.reason) || '失败'}`)
+        return {
+          ok,
+          reason: (result && result.reason) || '',
+          message: (result && result.message) || '',
+        }
+      } catch (err) {
+        return { ok: false, reason: 'restart-failed', message: err?.message || String(err) }
+      }
+    })
+
+    /**
+     * 用系统默认程序打开一个本地路径，或在文件管理器里定位它。
+     *
+     * 这里不判"这个路径该不该给用户看"（那是后端 `validateRootPath` 的职责，主进程
+     * 再判一遍只会让两处判据漂移），但必须挡住"渲染层随手把任意字符串丢给 shell"：
+     * 只接受**已存在的绝对路径**。`shell.openPath` 对不存在的路径只回一个无意义的
+     * 错误码，对 UNC / 断开的网络共享则会挂起到超时 —— 先 access 一次能把这两种情况
+     * 在进入系统调用之前分开。
+     *
+     * 回结构化结果而不是抛错：调用方要能区分"文件没了"与"没有关联程序"。
+     */
+    ipcMain.handle('desktop:open-path', async (event, payload) => {
+      assertTrustedSender(event)
+      const target = payload && typeof payload === 'object' ? String(payload.path || '') : ''
+      const reveal = Boolean(payload && payload.reveal)
+      if (!target) return { ok: false, reason: 'empty-path', message: '路径为空' }
+      if (!path.isAbsolute(target)) {
+        return { ok: false, reason: 'not-absolute', message: '只能打开绝对路径' }
+      }
+      try {
+        await fs.promises.access(target, fs.constants.F_OK)
+      } catch {
+        return { ok: false, reason: 'missing', message: '路径不存在' }
+      }
+      if (reveal) {
+        shell.showItemInFolder(target)
+        return { ok: true }
+      }
+      // openPath 用空串表示成功，非空串是系统给出的错误描述
+      const failure = await shell.openPath(target)
+      if (failure) return { ok: false, reason: 'open-failed', message: failure }
+      return { ok: true }
+    })
+
+    createWindow()
+    // 主窗口已建出来，启动流程到此结束。此后 window-all-closed 才代表"用户真的关了窗口"；
+    // 之前没有窗口只是启动期的正常中间态（见 window-all-closed 里的说明）。
+    startupComplete = true
+    setupAutoUpdater()
+
+    // macOS：点 Dock 图标且没有窗口时重开
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    })
+  })
+
+  // macOS 习惯：关掉窗口不退出应用
+  app.on('window-all-closed', () => {
+    if (
+      !shouldQuitOnAllWindowsClosed({
+        platform: process.platform,
+        startupComplete,
+        holdingWindows,
+      })
+    ) {
+      // 不能静默：真·退出和"被启动流程误伤"在日志里必须能区分开
+      logMain(
+        'info',
+        `window-all-closed ignored (startupComplete=${startupComplete}, holdingWindows=${holdingWindows})`,
+      )
+      return
+    }
+    app.quit()
+  })
+
+  // 退出前停掉本地后端：否则 embedded-postgres / 推理代理会留成孤儿进程。
+  // 停的过程是异步的，所以先 preventDefault，停完再真的 quit。
+  // "只停一次"的标记由 stopLocalBackend 自己维护：它一进门就清空 localBackend 的归属，
+  // 这里若再置一次，等于在壳里留第二个状态真值来源。
+  app.on('before-quit', event => {
+    // 真正的退出从这里开始（托盘菜单、系统关机、菜单栏退出都会走到）。
+    // 必须先立标志：紧接着派发的 close 若还看到 isQuitting=false，
+    // 就会把它当成"用户关窗"拦下来 —— 系统关机也会被卡住。
+    isQuitting = true
+    // Windows 上不销毁托盘图标会在通知区留下一个点不动的幽灵图标，
+    // 直到用户把鼠标划过去才消失。这里先摘掉，再走后面的停后端流程。
+    if (tray) {
+      tray.destroy()
+      tray = null
+    }
+    if (currentMode !== 'local' || localBackendStopped || !localBackend.ok) return
+    event.preventDefault()
+    void stopLocalBackend().finally(() => app.quit())
+  })
+}
+
+/**
+ * 仅供诊断脚本 / 单测引用注入前缀，避免第二处再抄一遍字面量。
+ * `electron .` 加载主进程入口时不看这个导出，写在这里无副作用。
+ */
+module.exports = { DEVICE_TOKEN_ARG_PREFIX }
