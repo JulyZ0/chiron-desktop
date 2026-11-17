@@ -118,6 +118,18 @@ contextBridge.exposeInMainWorld('chironDesktop', {
    * "开没开 / 还剩几个恢复码"这类状态，以及启用那一刻**唯一一次**的明文恢复码。
    */
   getTwoFactorStatus: () => ipcRenderer.invoke('desktop:get-two-factor-status'),
+  /**
+   * 订阅**被动锁定**信号（系统锁屏 / 休眠 / 空闲超时）。
+   *
+   * 返回取消订阅函数。老外壳没有这条通道时返回一个空的取消函数 —— 界面照常
+   * 可用，只是没有被动锁定；这比让调用点存不存在都要判断一层更简单。
+   */
+  onAutoLock: callback => {
+    if (typeof callback !== 'function') return () => {}
+    const handler = (_event, payload) => callback(payload || {})
+    ipcRenderer.on(shared.AUTO_LOCK_CHANNEL, handler)
+    return () => ipcRenderer.removeListener(shared.AUTO_LOCK_CHANNEL, handler)
+  },
   beginTwoFactor: () => ipcRenderer.invoke('desktop:begin-two-factor'),
   confirmTwoFactor: token => ipcRenderer.invoke('desktop:confirm-two-factor', { token: token || '' }),
   disableTwoFactor: password =>

@@ -13,6 +13,7 @@ export default {
   login: 'Sign in',
   register: 'Register',
   logout: 'Log out',
+  lock_now: 'Lock',
   lock_title: 'Locked',
   lock_hint: 'Enter your current Windows account password to continue.',
   lock_account: 'Account: {account}',

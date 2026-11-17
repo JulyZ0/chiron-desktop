@@ -9,6 +9,7 @@ import {
 } from '../api'
 import type { LlmModel, SSEHandle } from '../api'
 import { getSessionMetrics, getSessionRuntime, putSessionRuntime, type SessionRuntime } from '../api/sessionRuntime'
+import { getProjectVcs, initProjectVcs } from '../api/projectVcs'
 import FloatingPanel from '../components/common/FloatingPanel.vue'
 import SubAgentPanel from '../components/chat/SubAgentPanel.vue'
 import SessionStatsPanel from '../components/chat/SessionStatsPanel.vue'
@@ -2715,10 +2716,115 @@ function onSSEMessage(raw: unknown, sid: string) {
   }
 }
 
+/**
+ * 首次向某个项目提问前，确认它已纳入版本控制。
+ *
+ * **为什么必须在这里**：还原点建立在 git 对象库上。项目目录不是 git 工作树时，
+ * 引擎每一轮快照第一步就报 `fatal: not a git repository`，于是还原点全是
+ * `state='failed'` —— 列表里看得见、点回滚必然失败。用户看到的正是
+ * 「还原点功能从不正确工作」。等到他去翻还原点页才发现，保护已经空了整场对话。
+ *
+ * **为什么只问一次，且问过就不再问**：这是"要不要在你目录里建 .git"的授权。
+ * 每次发消息都问会把对话变成问卷；而拒绝也不该被反复劝。记在 localStorage 里
+ * （跨刷新有效），用户之后想开可以在还原点页随时点。
+ *
+ * **读不出状态就放行**：检测本身失败（网关重启、网络断）不该拦下用户的消息 ——
+ * 还原点是辅助能力，为它挡住对话是更严重的损失。
+ */
+const VCS_PROMPT_KEY = 'chiron.vcs.prompted'
+
+/**
+ * localStorage 不可用时的兜底（隐私模式 / 存储被清）。
+ *
+ * 没有它，"不再主动打扰"这个承诺在其中一条路径上是空的：`localStorage` 抛异常时
+ * 每次读都得到新的空集合，于是**每一条**消息都会再弹一次同一个确认框 ——
+ * 那是问卷，不是询问。
+ */
+const vcsPromptedMemory = new Set<string>()
+
+function vcsPrompted(): Set<string> {
+  try {
+    const raw = localStorage.getItem(VCS_PROMPT_KEY)
+    const list = raw ? (JSON.parse(raw) as unknown) : []
+    const stored = Array.isArray(list) ? list.filter((x): x is string => typeof x === 'string') : []
+    return new Set([...stored, ...vcsPromptedMemory])
+  } catch {
+    // 隐私模式 / 损坏的旧值：退化成内存态（本次会话内不重复问）
+    return new Set(vcsPromptedMemory)
+  }
+}
+
+function markVcsPrompted(projectId: string) {
+  // 内存态先写：即使下面落盘失败，本次会话内也不会再问第二遍。
+  vcsPromptedMemory.add(projectId)
+  try {
+    localStorage.setItem(VCS_PROMPT_KEY, JSON.stringify([...vcsPrompted()]))
+  } catch {
+    // 落盘失败不影响本次判断：内存态已经兜住了。
+  }
+}
+
+/** 并发的两次发送共享同一次询问，避免弹出两个一模一样的确认框 */
+let vcsCheckInFlight: Promise<void> | null = null
+
+function ensureProjectVcs(): Promise<void> {
+  if (vcsCheckInFlight) return vcsCheckInFlight
+  vcsCheckInFlight = checkProjectVcs().finally(() => {
+    vcsCheckInFlight = null
+  })
+  return vcsCheckInFlight
+}
+
+async function checkProjectVcs(): Promise<void> {
+  const projectId = activeProjectId.value
+  if (!projectId) return
+  if (vcsPrompted().has(projectId)) return
+  let state
+  try {
+    state = await getProjectVcs(projectId)
+  } catch {
+    return
+  }
+  if (state.repo) return
+  // 没装 git：装不装不是这里能解决的问题，问了也没用
+  if (state.git_missing) {
+    markVcsPrompted(projectId)
+    return
+  }
+  // 先标记再问：点掉弹窗的那一刻就决定了"不再主动打扰"，
+  // 与用户之后是否真去还原点页启用无关。
+  markVcsPrompted(projectId)
+  const agreed = await new Promise<boolean>((resolve) => {
+    Modal.confirm({
+      title: t('chat.checkpoint_enable_vcs_title'),
+      content: t('chat.checkpoint_vcs_ask_confirm'),
+      okText: t('chat.checkpoint_enable_vcs_ok'),
+      cancelText: t('chat.checkpoint_vcs_later'),
+      onOk: () => resolve(true),
+      onCancel: () => resolve(false),
+    })
+  })
+  if (!agreed) return
+  try {
+    const next = await initProjectVcs(projectId)
+    if (next.repo) notify.success(t('chat.checkpoint_enable_vcs_done'))
+    else notify.error(t('chat.checkpoint_enable_vcs_failed'))
+  } catch (e) {
+    // 启用失败**不拦消息**：用户的提问比还原点重要。
+    notify.error(describeApiError(e))
+  }
+}
+
 /** 发送一条消息。**返回值 = 是否已送达服务端** —— 未送达的会被暂存到本地队列
  *  （见 failedOutbox.ts），Composer 顶部横幅据此提供重发。
  *  既有调用方全部忽略返回值，所以把返回类型改成 boolean 不会影响它们。 */
 async function sendMessage(text: string, attachments?: ChatAttachment[]): Promise<boolean> {
+  // 首次提问前确认项目已纳入版本控制（见 checkProjectVcs）。**不 await**：
+  // 它要先查一次网关（网关慢/重启时那是秒级），把它放在这里会让"点发送"到
+  // "loading 亮起"之间空等一个往返 —— 用户看到的是"发出去没反应"。
+  // 还原点是辅助能力，代价只能是"这一轮的 pre_turn 可能仍失败"，不能是对话被拖住。
+  // 尾随 catch 是必须的：`void` 一个会 reject 的 Promise 等于留下一条未处理拒绝。
+  void ensureProjectVcs().catch(() => {})
   // 互联互通：统一任务模式 → POST /v1/chat/submit（与 SSE 流式并列的新路径）
   if (unifiedMode.value && unifiedSessionId.value) {
     await sendUnified(text, attachments)

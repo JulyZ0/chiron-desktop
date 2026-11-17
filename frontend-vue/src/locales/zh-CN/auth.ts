@@ -16,6 +16,7 @@ export default {
   register: '注册',
   logout: '退出登录',
   /** 本地模式的"退出登录"实际是锁定：身份来自 OS 账户，锁定后用该账户凭据解锁 */
+  lock_now: '锁定',
   lock_title: '已锁定',
   lock_hint: '输入当前 Windows 账户密码以继续。',
   lock_account: '当前账户：{account}',

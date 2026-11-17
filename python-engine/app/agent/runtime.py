@@ -803,6 +803,34 @@ def _record_recovery(
         state.record_success()
 
 
+def _tool_parameters(tool: dict[str, Any]) -> dict[str, Any]:
+    """工具定义的 JSON schema —— **绝不抛**。
+
+    ``parameters_json`` 可能是坏 JSON（插件/远端工具表写坏、被截断的缓存），
+    原先无条件 ``json.loads`` 会让**整轮对话**在建请求时抛 `JSONDecodeError`
+    （外层包成 ``provider ... stream failed``），而工具本身根本没用上。
+    坏/缺一律退化成宽松 schema：少一层参数约束，好过整个 agent 跑不起来。
+    """
+    raw = tool.get("parameters")
+    if isinstance(raw, dict):
+        return raw
+    # 兼容两种键序：显式 `parameters` 优先，退回序列化形态 `parameters_json`
+    if raw is None:
+        raw = tool.get("parameters_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(
+                "tool %s has non-JSON parameter schema; falling back to permissive schema",
+                tool.get("name") or "<unnamed>",
+            )
+            return {"type": "object", "properties": {}}
+        if isinstance(parsed, dict):
+            return parsed
+    return {"type": "object", "properties": {}}
+
+
 def _truncation_recovery_hint(tool_name: str) -> str:
     """截断之后给模型的**可执行**出路。
 
@@ -2075,6 +2103,20 @@ class AgentRuntime:
 
         # M7：交互闸门的簿记是实例级的，而实例是**每会话**复用的 ⇒ 每轮开头清一次。
         self._reset_interaction_state()
+
+        # 工具上下文必须先于回合起点检查点：钩子读 contextvar 的 `project_root` /
+        # `session_id`，任一为空即返回 None；而完整的 `set_tool_context(...)` 在下面
+        # 「0.5」段才执行 ⇒ `pre_turn` 从未被创建，「回滚到这一轮开始之前」因此不成立。
+        # `project_root` 必须显式传空串：合并语义下省略会保留上一轮的值，而 Agent 实例
+        # 每会话复用，那会给上一个项目的目录建检查点。
+        from app.tools.context import set_tool_context
+
+        set_tool_context(
+            session_id=task.session_id,
+            user_id=task.user_id,
+            tenant_id=task.tenant_id,
+            project_root=_project_root_of(task.workbench_context),
+        )
 
         # 回合起点检查点（fail-open）：钩子内部吞掉所有异常，未绑定项目时直接跳过。
         # 放在这里而不是工具执行前，是因为"这一轮开始前的状态"才是回滚目标。
@@ -4148,11 +4190,7 @@ class AgentRuntime:
                     "function": {
                         "name": tool.get("name", ""),
                         "description": tool.get("description", ""),
-                        "parameters": (
-                            json.loads(tool.get("parameters_json", "{}"))
-                            if isinstance(tool.get("parameters_json"), str)
-                            else tool.get("parameters", {})
-                        ),
+                        "parameters": _tool_parameters(tool),
                     },
                 }
             )

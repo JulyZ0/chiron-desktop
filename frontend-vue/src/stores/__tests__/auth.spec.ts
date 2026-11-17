@@ -336,5 +336,61 @@ describe('auth store', () => {
       expect(result.ok).toBe(true)
       expect(store.locked).toBe(false)
     })
+
+    it('★ 已启用第二因素时启动即锁（否则重启就绕过了验证码）', async () => {
+      installHost(async () => ({ ok: true, reason: 'verified', message: '' }))
+      ;(globalThis as { chironDesktop?: Record<string, unknown> }).chironDesktop = {
+        ...(globalThis as { chironDesktop?: Record<string, unknown> }).chironDesktop,
+        getTwoFactorStatus: async () => ({
+          ok: true,
+          status: { enabled: true, enabledAt: '', recoveryCodesLeft: 3, unreadable: false },
+        }),
+      }
+      vi.mocked(api.post).mockResolvedValue({ data: { data: {} } })
+
+      const store = useAuthStore()
+      await store.initToken()
+
+      // initToken 刻意不 await 这次查询（会把首帧拖在 IPC 上），所以等它落地
+      await vi.waitFor(() => expect(store.locked).toBe(true))
+    })
+
+    it('未启用第二因素时启动不锁（人刚过完 OS 登录，再问一遍是骚扰）', async () => {
+      ;(globalThis as { chironDesktop?: Record<string, unknown> }).chironDesktop = {
+        isDesktop: true,
+        mode: 'local',
+        verifyLockPassword: async () => ({ ok: true, reason: 'verified', message: '' }),
+        getTwoFactorStatus: async () => ({
+          ok: true,
+          status: { enabled: false, enabledAt: '', recoveryCodesLeft: 0, unreadable: false },
+        }),
+      }
+      vi.mocked(api.post).mockResolvedValue({ data: { data: {} } })
+
+      const store = useAuthStore()
+      await store.initToken()
+      // 给它同样的落地机会；断言的是"没有发生"
+      await new Promise((r) => setTimeout(r, 0))
+
+      expect(store.locked).toBe(false)
+    })
+
+    it('外壳不支持查询状态时不锁（拿不到状态宁可保持原体验，也不能凭空把人挡在门外）', async () => {
+      ;(globalThis as { chironDesktop?: unknown }).chironDesktop = { isDesktop: true, mode: 'local' }
+      vi.mocked(api.post).mockResolvedValue({ data: { data: {} } })
+
+      const store = useAuthStore()
+      await store.initToken()
+      await new Promise((r) => setTimeout(r, 0))
+
+      expect(store.locked).toBe(false)
+    })
+
+    it('云端模式下 lock() 不生效（锁屏是本地模式的加固，云端走登出）', async () => {
+      setActiveMode(null)
+      const store = useAuthStore()
+      store.lock()
+      expect(store.locked).toBe(false)
+    })
   })
 })

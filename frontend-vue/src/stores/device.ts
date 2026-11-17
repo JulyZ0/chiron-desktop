@@ -83,6 +83,14 @@ export interface ChironDesktopHost {
    * "启用那一刻唯一一次"的明文恢复码。老外壳没有这些成员 ⇒ 界面按"不支持"降级。
    */
   getTwoFactorStatus?: () => Promise<{ ok: boolean; status?: TwoFactorStatus }>
+  /**
+   * 订阅**被动锁定**信号（系统锁屏 / 休眠 / 恢复）。
+   *
+   * 主进程只在已启用第二因素时广播 —— 没开 2FA 的账户刚在系统锁屏里输过
+   * Windows 密码，应用再问一遍同一个密码是骚扰。返回取消订阅函数；老外壳
+   * 没有这条通道时返回一个空的取消函数。
+   */
+  onAutoLock?: (callback: (payload: { reason?: string }) => void) => () => void
   beginTwoFactor?: () => Promise<{ ok: boolean; secret?: string; otpauth?: string; reason?: string; message?: string }>
   confirmTwoFactor?: (token: string) => Promise<{ ok: boolean; recoveryCodes?: string[]; reason?: string; message?: string }>
   disableTwoFactor?: (password: string) => Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -641,6 +649,22 @@ export const useDeviceStore = defineStore('device', () => {
     }
   }
 
+  /**
+   * 订阅被动锁定信号（系统锁屏 / 休眠）。返回取消订阅函数。
+   *
+   * 主进程侧只在已启用 2FA 时广播；这里不做二次判断（判断要有第二份
+   * "2FA 是否启用"的真值来源，正是该避免的）。
+   */
+  function subscribeAutoLock(callback: (payload: { reason?: string }) => void): () => void {
+    const host = desktopHost()
+    if (!host || typeof host.onAutoLock !== 'function') return () => {}
+    try {
+      return host.onAutoLock(callback)
+    } catch {
+      return () => {}
+    }
+  }
+
   /** 开始启用：拿候选密钥与 otpauth URI（**未生效**，需确认验证码）。 */
   async function beginTwoFactor(): Promise<{
     ok: boolean
@@ -864,6 +888,7 @@ export const useDeviceStore = defineStore('device', () => {
     checkHelloAvailability,
     verifyLockPassword,
     getTwoFactorStatus,
+    subscribeAutoLock,
     beginTwoFactor,
     confirmTwoFactor,
     disableTwoFactor,

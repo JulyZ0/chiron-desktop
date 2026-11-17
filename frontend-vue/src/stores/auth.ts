@@ -86,6 +86,12 @@ export const useAuthStore = defineStore('auth', () => {
           const deviceToken = desktopDeviceToken()
           if (deviceToken) applyToken(deviceToken)
           void ensureLocalSession()
+          // 已启用第二因素时**启动即锁**。
+          //
+          // `locked` 不持久化是有意的（没开 2FA 时，人刚过完 OS 登录，再问一次
+          // 同一个密码是骚扰）。但那个理由在启用 2FA 之后不成立了：重启就能绕过
+          // 验证码，等于"开了也白开" —— 正是用户报的"启用形同虚设"。
+          void lockIfSecondFactorEnabled()
           return
         }
         // 开发环境绕过：浏览器直连 vite 时既没有 preload、也没有登录页。
@@ -180,6 +186,36 @@ export const useAuthStore = defineStore('auth', () => {
    * OS 登录，再要他输一次密码只是骚扰。
    */
   const locked = ref(false)
+
+  /**
+   * 显式锁定界面（本地模式）。
+   *
+   * 这是「两步验证真的会被问到」的第一条路：`logout()` 在本地模式也走锁定，
+   * 但那是个语义上叫"退出登录"的菜单项 —— 用户想的是离开账户，不是暂时挡住屏幕。
+   * 缺一个叫"锁定"的入口时，共用工作站上的人根本不会去点"退出登录"来走开。
+   *
+   * 幂等：已锁定时再点一次不产生任何可见变化（菜单会被遮罩挡住，本来就点不到）。
+   */
+  function lock() {
+    if (!isLocalMode()) return
+    locked.value = true
+  }
+
+  /**
+   * 启动时按「是否启用了第二因素」决定要不要锁。
+   *
+   * 为什么不能无条件启动即锁：没开 2FA 时，人刚在 OS 登录界面输过 Windows 密码，
+   * 应用再问一遍同一个密码只是骚扰。而启用 2FA 之后情形正相反 —— 不锁的话，
+   * 重启应用就绕过了验证码，"启用"等于没启用。
+   *
+   * 查询失败（老外壳没有 getTwoFactorStatus、主进程还没就绪）一律**不锁**：
+   * 拿不到状态时宁可保持原来的体验，也不要凭空把人挡在门外。
+   */
+  async function lockIfSecondFactorEnabled(): Promise<void> {
+    if (!isLocalMode()) return
+    const status = await device.getTwoFactorStatus()
+    if (status?.enabled) locked.value = true
+  }
 
   // 本地模式：没有"登录"这回事，界面一律视为已登录（否则每个 requiresAuth 页都会弹回登录页，
   // 而登录页本身在本地模式是被拦截的云专属路由）。
@@ -365,6 +401,7 @@ export const useAuthStore = defineStore('auth', () => {
     fetchProfile,
     bootstrapSession,
     applySession,
+    lock,
     logout,
     unlock,
   }

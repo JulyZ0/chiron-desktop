@@ -316,19 +316,66 @@ def _trim_values(value: Any, *, budget: int) -> Any:
 
 
 def _skeleton(raw: str, limit: int) -> str:
-    """把超长 arguments 压到 limit 以内，并**标注**截断（不假装是原文）。"""
+    """把超长 arguments 压到 limit 以内，并**标注**截断（不假装是原文）。
+
+    **产出始终是合法 JSON**。旧实现在压不进 limit 时直接 ``text[:keep] +
+    TRUNCATION_MARK``，写进历史的就是半截 JSON —— 而历史里的 `arguments` 会在之后
+    **每一轮**被重新解析（Anthropic 路径要把它变成结构化的 `tool_use.input`），于是
+    一次截断换来此后每轮都失败的 `JSONDecodeError: Unterminated string`。
+    压不进就退化成"占位对象"，而不是留下一个解析不了的开头。
+    """
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        # 不是 JSON：只能文本截断（仍然标注，避免被当成完整参数）
-        keep = max(0, limit - len(TRUNCATION_MARK))
-        return raw[:keep] + TRUNCATION_MARK
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _placeholder_json(raw, limit)
 
+    # 第 1 档：截短长字符串值，保留键结构与值的形状
     text = json.dumps(_trim_values(parsed, budget=max(64, limit // 2)), ensure_ascii=False)
     if len(text) <= limit:
         return text
-    keep = max(0, limit - len(TRUNCATION_MARK))
-    return text[:keep] + TRUNCATION_MARK
+    # 第 2 档：所有值换成标注本身，只留键骨架（仍看得出是 write_file 的哪些参数）
+    if isinstance(parsed, dict):
+        skeleton = json.dumps(
+            {key: TRUNCATION_MARK for key in parsed}, ensure_ascii=False
+        )
+        if len(skeleton) <= limit:
+            return skeleton
+        keys_only = json.dumps(
+            {"_keys": list(parsed), "_note": TRUNCATION_MARK}, ensure_ascii=False
+        )
+        if len(keys_only) <= limit:
+            return keys_only
+    # 第 3 档：原文头部 + 标注（合法对象；不再是半截 JSON 文本）
+    return _placeholder_json(raw, limit)
+
+
+def _placeholder_json(raw: str, limit: int) -> str:
+    """``{"_raw": <原文头部>, "_note": <标注>}`` —— 合法 JSON 的兜底形态。
+
+    刻意**不**直接留着原文：``limit`` 是个硬上限，"截到一半的 JSON 文本"既超不了
+    体积也解析不了，两头都做不到。这里保留头部是给模型认出"这是我上次那个调用"，
+    而不是让它以为参数本来就是空的。
+    """
+
+    def build(keep: int) -> str:
+        return json.dumps(
+            {"_raw": raw[:keep], "_note": TRUNCATION_MARK}, ensure_ascii=False
+        )
+
+    text = build(len(raw))
+    if len(text) <= limit:
+        return text
+    keep = max(0, len(raw) - (len(text) - limit))
+    # 转义（引号/换行/中文）会让"少留 n 个字符"不等于"短 n 个字符"，收紧几轮即可收敛
+    for _ in range(8):
+        text = build(keep)
+        if len(text) <= limit or keep == 0:
+            break
+        keep = max(0, keep - (len(text) - limit))
+    if len(text) <= limit:
+        return text
+    # limit 小到连标注都装不下：空对象是唯一既合法又最省的选择（标注已在日志里）
+    return "{}"
 
 
 def truncate_tool_call_arguments(

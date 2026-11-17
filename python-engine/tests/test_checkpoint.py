@@ -346,3 +346,110 @@ async def test_runtime_merges_inherited_turn_ids(monkeypatch: pytest.MonkeyPatch
 
     assert captured["turn_ids"] == ["turn-0", "turn-1"]
     assert captured["turn_ids_truncated"] is False
+
+
+# ── pre_turn 接线的先后顺序 ───────────────────────────────────────────────
+
+
+async def _run_one_turn(
+    runtime: Any, *, session_id: str, workbench_context: dict[str, Any]
+) -> None:
+    """让 `runtime.run()` 跑完一个无工具调用的回合（一次 LLM 往返即收尾）。"""
+    from unittest.mock import MagicMock
+
+    from app.agent.runtime import AgentTask
+    from app.gateway.provider import ChatResponse
+
+    gateway = MagicMock()
+
+    async def fake_stream(**kwargs: Any):
+        yield ChatResponse(content="done", finish_reason="stop")
+
+    gateway.chat_stream = fake_stream
+    runtime._gateway = gateway
+
+    task = AgentTask(
+        id=f"task-{session_id}",
+        tenant_id=1,
+        user_id="u1",
+        session_id=session_id,
+        content="hi",
+        turn_id="turn-1",
+        system_prompt="sp",
+        llm_config={"mode": "normal", "tools_mode": "yolo"},
+        max_turns=2,
+        workbench_context=workbench_context,
+    )
+    _ = [event async for event in runtime.run(task)]
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_hook_sees_tool_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Any):
+    """`pre_turn` 钩子执行时工具上下文必须已就绪。
+
+    钩子从 contextvar 读 `session_id` / `project_root`，任一为空就直接返回 None。
+    旧实现里完整的 `set_tool_context(...)` 在「0.5 设置工具执行上下文」那一段才跑，
+    **晚于**回合起点检查点 —— 于是 `pre_turn` 从来没被创建过，时间线上只剩
+    `post_turn`。「回滚到这一轮开始之前」是这个功能的核心语义，它因此完全不成立。
+    """
+    from app.agent import checkpoint_hooks
+    from app.agent.runtime import AgentRuntime
+    from app.tools.context import get_tool_context
+
+    captured: list[tuple[str, str, str]] = []
+
+    def fake_record(kind: str, *, state_dir: Any) -> None:
+        captured.append(
+            (kind, get_tool_context("session_id"), get_tool_context("project_root"))
+        )
+        return None
+
+    monkeypatch.setattr(checkpoint_hooks, "turn_checkpoint_record", fake_record)
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    await _run_one_turn(
+        AgentRuntime(gateway=None), session_id="s-pre", workbench_context={"root_path": str(root)}
+    )
+
+    pre = [c for c in captured if c[0] == "pre_turn"]
+    assert pre, "pre_turn 钩子一次都没被调用"
+    _, sid, project = pre[0]
+    assert sid == "s-pre", f"进入钩子时 session_id 尚未就绪: {sid!r}"
+    assert project == str(root), f"进入钩子时 project_root 尚未就绪: {project!r}"
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_context_does_not_leak_between_turns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+):
+    """上一轮的项目根**不能**漏进这一轮。
+
+    `set_tool_context` 是合并语义：省略 `project_root` 会保留上一轮的值，而 Agent
+    实例是**每会话复用**的。所以预置时必须显式传空串 —— 否则用户从项目会话切到
+    画布会话后，引擎仍在往上一个项目的目录里写还原点。
+    """
+    from app.agent import checkpoint_hooks
+    from app.agent.runtime import AgentRuntime
+    from app.tools.context import get_tool_context
+
+    captured: list[tuple[str, str, str]] = []
+
+    def fake_record(kind: str, *, state_dir: Any) -> None:
+        captured.append(
+            (kind, get_tool_context("session_id"), get_tool_context("project_root"))
+        )
+        return None
+
+    monkeypatch.setattr(checkpoint_hooks, "turn_checkpoint_record", fake_record)
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    runtime = AgentRuntime(gateway=None)
+    await _run_one_turn(runtime, session_id="s1", workbench_context={"root_path": str(root)})
+    await _run_one_turn(runtime, session_id="s2", workbench_context={})
+
+    last = [c for c in captured if c[0] == "pre_turn"][-1]
+    assert last[0] == "pre_turn"
+    assert last[1] == "s2"
+    assert last[2] == "", f"上一轮的项目根泄漏到了这一轮: {last[2]!r}"

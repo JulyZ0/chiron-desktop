@@ -150,6 +150,11 @@ const settingsOpen = ref(false)
 
 async function handleUserMenuClick(info: { key: string | number }) {
   const key = String(info.key)
+  if (key === 'lock') {
+    // 显式锁定：此后解锁要过 OS 密码（+ 已启用时的 TOTP）。见 stores/auth.ts::lock。
+    authStore.lock()
+    return
+  }
   if (key === 'logout') {
     await authStore.logout()
     // 本地模式下 logout 是**锁定**（遮罩挡住界面），跳转纯属多余 —— 而且解锁后

@@ -73,6 +73,10 @@ func registerConversationRoutes(
 	// 检查点时间线（只读）：回答"过去哪些时刻可以回滚回去"。
 	// 与 /changes 分开是因为数据源不同 —— 那条读用户仓库，这条读 Chiron 自己记的表。
 	mux.Handle("GET /v1/session-map/projects/{id}/checkpoints", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectCheckpoints))))
+	// 版本控制状态与启用（还原点的前提）。GET 只读；POST 是**写操作**（建 `.git`），
+	// 只由用户明确同意后触发。缺这对端点时，非 git 项目的还原点只能全是 `state='failed'`。
+	mux.Handle("GET /v1/session-map/projects/{id}/vcs", authMW(rlMW(http.HandlerFunc(smHandler.GetProjectVCS))))
+	mux.Handle("POST /v1/session-map/projects/{id}/vcs/init", authMW(rlMW(http.HandlerFunc(smHandler.InitProjectVCS))))
 	// 未归入任何项目的会话：存量会话全无归属，没有这个分组它们在改造后会从侧边栏消失。
 	mux.Handle("GET /v1/session-map/unassigned-sessions", authMW(rlMW(http.HandlerFunc(smHandler.ListUnassignedSessions))))
 	// 会话 → 项目反查：`@` 引用项目文件需要知道搜哪个目录（见 SessionProject 的注释）。

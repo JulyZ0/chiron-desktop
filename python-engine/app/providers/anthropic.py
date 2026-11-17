@@ -1,6 +1,7 @@
 # Anthropic Provider — 使用 anthropic SDK
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -69,6 +70,108 @@ def _anthropic_cache_write(usage: object) -> int:
         return 0
     created = getattr(usage, "cache_creation_input_tokens", 0)
     return int(created) if isinstance(created, int) and created > 0 else 0
+
+
+#: 半截 arguments 回放时的预览长度。取 2000 是因为它约等于一个中等文件的头部 ——
+#: 模型据此能认出"这是我上次被截断的那次 write_file"，而不会把整段内容再塞一遍。
+_TRUNCATED_INPUT_PREVIEW = 2000
+
+#: 已经告警过的 tool_call id —— 历史每轮重发，同一个坏参数会重复告警到刷屏。
+#: **有界**：call id 每个请求都不同，无界集合会在长会话里一直长（进程常驻）。
+_WARNED_TRUNCATED_LIMIT = 256
+_warned_truncated_ids: set[str] = set()
+
+
+def _warn_once_for(call_id: str) -> bool:
+    """这个 call id 是否**首次**见到（是 ⇒ 调用方应当告警）。"""
+    if not call_id:
+        return False
+    if call_id in _warned_truncated_ids:
+        return False
+    if len(_warned_truncated_ids) >= _WARNED_TRUNCATED_LIMIT:
+        _warned_truncated_ids.clear()
+    _warned_truncated_ids.add(call_id)
+    return True
+
+
+def _truncated_tool_input(raw: str, call_id: str) -> dict[str, Any]:
+    """把**不是合法 JSON** 的 arguments 包成一个合法 object（协议要求 input 是 object）。
+
+    ## 为什么不能抛、也不能丢
+
+    `tool_use.input` 之于 Anthropic 是**结构化对象**，历史里必须与 `tool_result` 配对。
+    半截 JSON（`finish_reason=length` 留下的、或压缩链标注过的）有两个错误方向：
+
+    - 抛 `JSONDecodeError`：整轮对话在建请求阶段就失败，用户看到
+      ``provider opencode-go-anthropic stream failed: JSONDecodeError: Unterminated
+      string``，且此后**每一次**请求都会再炸一遍 —— 历史没有自愈能力。
+    - 丢这条 tool_use：与它的 tool_result 变成孤儿，直接 400
+      （`unexpected tool_result`），同样整轮不可用，还丢了上下文。
+
+    所以保留成 object，并把原文头部放进 ``_raw``：结构合法、配对完整、模型看得出
+    "这里当时是被截断的"。工具本就不会再执行它 —— 执行发生在当时那一轮。
+    """
+    if _warn_once_for(call_id):
+        logger.warning(
+            "Anthropic history has non-JSON tool arguments (call=%s, %d chars); "
+            "replaying as placeholder instead of failing the request",
+            call_id,
+            len(raw),
+        )
+    return {
+        "_raw": raw[:_TRUNCATED_INPUT_PREVIEW],
+        "_note": (
+            "arguments were not valid JSON (truncated by max_tokens or repaired); "
+            "this call was not executed"
+        ),
+    }
+
+
+def _tool_arguments_to_input(raw: Any, *, call_id: str = "") -> dict[str, Any]:
+    """历史 tool_call 的 arguments → Anthropic 的 ``tool_use.input``（**绝不抛**）。
+
+    合法对象 → 原样；合法但非对象（数组/标量）→ 包一层 ``_raw``（协议要求 object）；
+    空串/None → ``{}``（无参调用）；**坏 JSON → 占位 object**（见
+    :func:`_truncated_tool_input`，这是"经常触发 Unterminated string"的根因）。
+    """
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return {}
+    text = raw if isinstance(raw, str) else str(raw)
+    if not text.strip():
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return _truncated_tool_input(text, call_id)
+    if isinstance(parsed, dict):
+        return parsed
+    return {"_raw": text[:_TRUNCATED_INPUT_PREVIEW]}
+
+
+def _schema_to_input_schema(raw: Any, *, tool_name: str = "") -> dict[str, Any]:
+    """工具定义的 ``parameters`` → Anthropic 的 ``input_schema``（**绝不抛**）。
+
+    同一类炸点：``func.get("parameters", json.loads(parameters_json))`` 的默认值是
+    **提前求值**的 —— 哪怕 ``parameters`` 已存在，坏掉的 ``parameters_json`` 也会让整轮
+    请求在建参数时抛 `JSONDecodeError`。缺/坏一律退化成"接受任意对象"，与 Anthropic
+    对缺失 schema 的默认行为一致：宁可少一层约束，也不要整轮不可用。
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(
+                "tool %s has non-JSON parameter schema; falling back to permissive schema",
+                tool_name or "<unnamed>",
+            )
+            return {"type": "object", "properties": {}}
+        if isinstance(parsed, dict):
+            return parsed
+    return {"type": "object", "properties": {}}
 
 
 class AnthropicProvider(LLMProvider):
@@ -430,14 +533,17 @@ class AnthropicProvider(LLMProvider):
                 if isinstance(msg.content, str) and msg.content:
                     content.append({"type": "text", "text": msg.content})
                 for tc in msg.tool_calls:
-                    import json as _json
-
                     content.append(
                         {
                             "type": "tool_use",
                             "id": tc.id,
                             "name": tc.name,
-                            "input": _json.loads(tc.arguments) if tc.arguments else {},
+                            # **绝不抛**：历史里的半截 arguments 以前在这里炸成
+                            # `JSONDecodeError: Unterminated string`，让整轮（且此后每一轮）
+                            # 请求在建参数阶段就失败。见 `_tool_arguments_to_input`。
+                            "input": _tool_arguments_to_input(
+                                tc.arguments, call_id=tc.id
+                            ),
                         }
                     )
                 result.append({"role": "assistant", "content": content})
@@ -469,17 +575,22 @@ class AnthropicProvider(LLMProvider):
     @staticmethod
     def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """OpenAI tools 格式 → Anthropic tools 格式"""
-        import json as _json
-
         converted = []
         for t in tools:
             func = t.get("function", t)
+            # **不能**写成 ``func.get("parameters", json.loads(func.get("parameters_json", "{}")))``：
+            # `dict.get` 的默认值**提前求值** —— `parameters` 明明存在，坏掉的
+            # `parameters_json` 也会让整轮请求在这里抛 `JSONDecodeError`。
+            # 见 `_schema_to_input_schema`。
+            raw_schema = func.get("parameters")
+            if raw_schema is None:
+                raw_schema = func.get("parameters_json")
             converted.append(
                 {
                     "name": func.get("name", ""),
                     "description": func.get("description", ""),
-                    "input_schema": func.get(
-                        "parameters", _json.loads(func.get("parameters_json", "{}"))
+                    "input_schema": _schema_to_input_schema(
+                        raw_schema, tool_name=str(func.get("name", ""))
                     ),
                 }
             )

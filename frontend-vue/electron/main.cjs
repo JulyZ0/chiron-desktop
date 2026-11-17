@@ -31,6 +31,7 @@ const {
   Tray,
   nativeImage,
   clipboard,
+  powerMonitor,
 } = require('electron')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
@@ -67,6 +68,7 @@ const {
   PIP_INDEX_MIRRORS,
   RUNTIME_CANCEL_CHANNEL,
   RUNTIME_MIRROR_CHANNEL,
+  AUTO_LOCK_CHANNEL,
   TITLEBAR_ARG_PREFIX,
   WINDOW_CHANNELS,
 } = shared
@@ -411,6 +413,44 @@ function attachWindowStateBroadcast(win) {
   }
   for (const evt of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen', 'focus', 'blur', 'resize']) {
     win.on(evt, push)
+  }
+}
+
+/**
+ * 被动锁定：系统锁屏 / 休眠回到桌面时，通知渲染层把界面锁上。
+ *
+ * 为什么必须挂在主进程：渲染层拿不到系统级锁屏与休眠事件。`visibilityState`
+ * 只在窗口被遮住时变化，机器休眠时更是什么都收不到 —— 于是"人走开"之后
+ * 应用一直保持解锁，与两步验证的启用状态完全无关。
+ *
+ * 只在**已启用第二因素**时广播。没开 2FA 的用户刚在系统锁屏里输过 Windows
+ * 密码，再让应用问一遍同一个密码不是加固，是骚扰；而"解锁要多证明一件事"
+ * 这件事本身只有启用 2FA 之后才存在。
+ *
+ * 监听 `resume` 而不只是 `suspend`：休眠时渲染进程会被冻住，那一刻发出去的
+ * IPC 有可能丢；回来时补发一次，代价只是对已锁的界面重复置真（幂等）。
+ */
+function registerAutoLock() {
+  const push = reason => {
+    if (currentMode !== 'local') return
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (win.isDestroyed() || win.webContents.isDestroyed()) continue
+      win.webContents.send(AUTO_LOCK_CHANNEL, { reason })
+    }
+  }
+  const maybeLock = reason => {
+    if (currentMode !== 'local') return
+    twoFactor
+      .getStatus()
+      .then(status => {
+        if (!status.enabled) return
+        logMain('info', `auto-lock on ${reason}`)
+        push(reason)
+      })
+      .catch(err => logMain('warn', `auto-lock status failed: ${err?.message || err}`))
+  }
+  for (const evt of ['lock-screen', 'suspend', 'resume']) {
+    powerMonitor.on(evt, () => maybeLock(evt))
   }
 }
 
@@ -1968,6 +2008,7 @@ if (!gotLock) {
     // 模块级的 mainWindow：安装窗口（openInstallWindow）也建在 createWindow 之前，
     // 用 mainWindow 会作用到错误的窗口，或者干脆什么都没发生。
     registerWindowControlIpc()
+    registerAutoLock()
 
     // 安装页的「取消」与「换源重试」。
     // 只允许安装窗口自己触发：这两个动作会中止本进程里正在跑的 uv，

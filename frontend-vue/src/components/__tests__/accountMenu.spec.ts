@@ -60,6 +60,14 @@ describe('buildAccountMenuItems · 本地模式', () => {
     expect(keysOf(true)).not.toContain('logout')
   })
 
+  it('★ 必须展示「锁定」：否则本地模式没有任何入口能走到第二步验证', () => {
+    // 本地模式原先既没有 logout 也没有 lock —— 而 `locked` 只有这两条路能置真，
+    // 于是启用过的 TOTP 永远不会被问到（用户报的"启用形同虚设"）。
+    expect(keysOf(true)).toContain('lock')
+    // 云端没有这个语义：那边是退出登录，也不走 OS 凭据 + TOTP 的锁屏
+    expect(keysOf(false)).not.toContain('lock')
+  })
+
   it('仍保留 settings / profile（本地也有界面偏好与个人信息）', () => {
     const keys = keysOf(true)
     expect(keys).toContain('settings')
@@ -106,6 +114,10 @@ describe('accountMenuRoute · 纯跳转映射', () => {
   it('settings 与 logout 返回 null（它们有副作用，由组件自己处理）', () => {
     expect(accountMenuRoute('settings')).toBeNull()
     expect(accountMenuRoute('logout')).toBeNull()
+  })
+
+  it('lock 返回 null：它要置 auth.locked，不能当成一条路由跳走', () => {
+    expect(accountMenuRoute('lock')).toBeNull()
   })
 
   it('未知 key 返回 null，不会误跳', () => {

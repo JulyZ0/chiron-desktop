@@ -52,6 +52,8 @@ const errorText = ref('')
 const needSecondFactor = ref(false)
 const inputRef = ref<HTMLInputElement | null>(null)
 const secondInputRef = ref<HTMLInputElement | null>(null)
+/** 被动锁定订阅的退订函数（未订阅时是空函数，调用无副作用） */
+let unsubscribeAutoLock: () => void = () => {}
 
 /** 正在验证的账户：`DOMAIN\username`，让用户知道要输哪一个账户的密码 */
 const account = computed(() => device.osAccount || '')
@@ -158,10 +160,14 @@ onMounted(() => {
   window.addEventListener('keydown', swallowKeys, true)
   void device.ensureReady()
   void nextTick(() => inputRef.value?.focus())
+  // 被动锁定：系统锁屏 / 休眠 / 恢复时主进程推一条信号（仅在已启用 2FA 时）。
+  // 挂在这里而不是 App.vue，是因为锁屏组件本来就是常驻单例，卸载才该退订。
+  unsubscribeAutoLock = device.subscribeAutoLock(() => auth.lock())
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', swallowKeys, true)
+  unsubscribeAutoLock()
 })
 
 // 重新锁定时清掉上次的残影（错误文案 / 残留密码）

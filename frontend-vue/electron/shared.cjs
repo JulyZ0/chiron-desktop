@@ -99,6 +99,18 @@ const RUNTIME_CANCEL_CHANNEL = 'desktop:runtime-cancel'
 const RUNTIME_MIRROR_CHANNEL = 'desktop:runtime-mirror'
 
 /**
+ * 主进程 → 渲染进程：**被动锁定**信号（系统锁屏 / 休眠）。
+ *
+ * 在这条通道之前，本地模式的锁屏只可能由「用户主动点锁定」触发，而那个入口
+ * 本身也不存在 —— 于是两步验证只有在一种永远不会发生的场景下才会被问到。
+ * 被动锁定是它真正的用武之地：人离开、屏幕锁上、机器休眠，回来的是另一个人。
+ *
+ * 只传 `{ reason }`，不传任何凭据：锁定是纯界面状态，解锁仍要回到
+ * `desktop:verify-lock-password`（先 OS 密码、后 TOTP）。
+ */
+const AUTO_LOCK_CHANNEL = 'desktop:auto-lock'
+
+/**
  * 主进程建窗时把「这个窗口有没有系统标题栏」告诉 preload。
  *
  * 取值 `custom` | `inset` | `native`（见 preload 的 titleBar.mode 注释）。
@@ -288,6 +300,7 @@ module.exports = {
   PARTITION_PREFIX,
   RUNTIME_CANCEL_CHANNEL,
   RUNTIME_MIRROR_CHANNEL,
+  AUTO_LOCK_CHANNEL,
   TITLEBAR_ARG_PREFIX,
   WINDOW_CHANNELS,
   PIP_INDEX_MIRRORS,

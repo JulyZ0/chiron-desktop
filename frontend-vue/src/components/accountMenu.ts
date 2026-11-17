@@ -2,6 +2,7 @@ import { h, type VNode } from 'vue'
 import {
   BellOutlined,
   KeyOutlined,
+  LockOutlined,
   LogoutOutlined,
   SettingOutlined,
   UserSwitchOutlined,
@@ -77,9 +78,15 @@ export function buildAccountMenuItems(
     })
   }
 
-  // 本地模式没有"登出"这回事：stores/auth.ts::logout 在本地会立刻重建同一个本地会话，
-  // 点下去没有任何可见变化 —— 不放一个空按钮。
-  if (!isLocal) {
+  // 本地模式没有"登出"（身份来自 OS 账户，销毁会话既没必要也危险），但有**锁定**：
+  // 挡住界面直到用该账户凭据证明"还是同一个人"。
+  //
+  // 这一项此前缺失，代价不只是少一个按钮 —— `locked` 只有 `logout()` 会置真，
+  // 而本地模式又不出登出项，于是锁屏永不出现，第二步验证（TOTP）也就永远
+  // 不会被问到。启用形同虚设的根因就在这里。
+  if (isLocal) {
+    items.push({ key: 'lock', label: tr('auth.lock_now'), icon: () => h(LockOutlined) })
+  } else {
     items.push({ key: 'logout', label: tr('auth.logout'), icon: () => h(LogoutOutlined) })
   }
 

@@ -17,6 +17,7 @@ from app.agent.media_offload import (
     DEFAULT_MIN_BYTES,
     TRUNCATION_MARK,
     _attr,
+    _skeleton,
     offload_inline_media,
     truncate_tool_call_arguments,
 )
@@ -88,6 +89,14 @@ def test_disabled_when_zero():
 
 
 def test_non_json_arguments_truncated_and_marked():
+    """非 JSON 参数也要被标注、且**留下的仍是合法 JSON**。
+
+    旧实现把原文硬截一刀（``raw[:keep] + TRUNCATION_MARK``）—— 标注有了，但写进历史的
+    是半截文本。历史每轮都会重发并被重新解析（Anthropic 要把它变成结构化的
+    `tool_use.input`），于是截断一次就让此后每一轮都抛
+    `JSONDecodeError: Unterminated string`。所以这里钉住的不是"结尾有标注"，
+    而是 **可解析 + 有标注 + 不超限**。
+    """
     messages = [
         {
             "role": "assistant",
@@ -97,7 +106,31 @@ def test_non_json_arguments_truncated_and_marked():
     out = truncate_tool_call_arguments(messages, CompactionConfig(arg_max_chars=100))
     value = out[0]["tool_calls"][0]["arguments"]
     assert len(value) <= 100
-    assert value.endswith(TRUNCATION_MARK)
+    parsed = json.loads(value)  # 不抛 = 历史可用
+    assert TRUNCATION_MARK in value
+    assert "not json" in json.dumps(parsed, ensure_ascii=False), "原文头部要保留，供模型认出来"
+
+
+def test_truncation_output_is_always_valid_json():
+    """回归：**任何**输入 + 任何 limit，产出都必须是合法 JSON。
+
+    这是"程序经常触发 `Unterminated string`"的根源之一：压缩链把参数压成
+    ``text[:keep] + 标注``，历史从此不可解析。逐个形状钉住，避免有人再把
+    "截断"写成"直接切字符串"。
+    """
+    shapes = [
+        json.dumps({"path": "a.txt", "content": "z" * 5000}),
+        json.dumps({"deep": {"nested": ["x" * 3000]}}),
+        "not json " * 500,
+        '{"path": ',  # 已经是半截 JSON
+        "x" * 10000,
+        "",
+    ]
+    for raw in shapes:
+        for limit in (1, 20, 50, 100, 500, 2000):
+            value = _skeleton(raw, limit)
+            assert len(value) <= limit or limit < len("{}"), (raw[:20], limit, value[:40])
+            json.loads(value)  # 不抛即可
 
 
 def test_compact_messages_applies_truncation():

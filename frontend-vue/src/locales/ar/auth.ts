@@ -13,6 +13,7 @@ export default {
   login: 'تسجيل الدخول',
   register: 'تسجيل',
   logout: 'تسجيل الخروج',
+  lock_now: 'قفل',
   lock_title: 'مقفل',
   lock_hint: 'أدخل كلمة مرور حساب Windows الحالي للمتابعة.',
   lock_account: 'الحساب الحالي: {account}',

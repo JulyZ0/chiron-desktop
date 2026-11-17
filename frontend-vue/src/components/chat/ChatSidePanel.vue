@@ -60,6 +60,11 @@ const userMenuItems = computed<AccountMenuItem[]>(() =>
 
 async function handleUserMenuClick(info: { key: string | number }) {
   const key = String(info.key)
+  if (key === 'lock') {
+    // 显式锁定（本地模式）。此后解锁要过 OS 密码 + 已启用时的 TOTP。
+    authStore.lock()
+    return
+  }
   if (key === 'logout') {
     await authStore.logout()
     // 本地模式：logout 是锁定，不跳路由（解锁后停在原会话上）。见 stores/auth.ts。

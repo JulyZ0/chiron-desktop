@@ -24,6 +24,7 @@ import {
   type ProjectCheckpoint,
   type RestoreResult,
 } from '../../api/checkpoints'
+import { getProjectVcs, initProjectVcs, type ProjectVCS } from '../../api/projectVcs'
 import { formatSmart } from '../../utils/datetime'
 import { describeApiError } from '../../utils/apiError'
 import { notify } from '../../utils/notify'
@@ -59,6 +60,25 @@ const lastCheckpoint = ref<ProjectCheckpoint | null>(null)
 const hasProject = computed(() => !!props.projectId)
 
 /**
+ * 项目根的版本控制状态。
+ *
+ * `null` = 还没读到（或读失败）。读不到时**不**显示"启用"入口 ——
+ * 拿不到状态就问用户"要不要在这个目录里建 .git"，是在让用户为一个
+ * 我们没看清的事实做决定。
+ */
+const vcs = ref<ProjectVCS | null>(null)
+/** 正在执行 git init（写用户磁盘），用来禁用重复点击 */
+const enabling = ref(false)
+
+/**
+ * 需要提示"启用版本跟踪" = 确认不在工作树内，且机器上有 git。
+ *
+ * `git_missing` 排除掉：那种情况下按钮点不动，用户该去装 git —— 显示一个
+ * 永远失败的按钮比不显示更糟。
+ */
+const needsVcs = computed(() => !!vcs.value && !vcs.value.repo && !vcs.value.git_missing)
+
+/**
  * 请求代次。
  *
  * 与 `WorkbenchPanel` 的 `treeGeneration` 同一个理由：切项目时上一个项目的
@@ -73,6 +93,10 @@ async function load() {
   const gen = generation
   loading.value = true
   error.value = ''
+  // 状态与时间线并行：两者互不依赖，串行会让"打开还原点页"多等一个往返。
+  // vcs 的失败**不**进 error —— 读不出状态只影响"要不要显示启用入口"，
+  // 不该把整个时间线变成一条红字。
+  const vcsPromise = getProjectVcs(props.projectId).catch(() => null)
   try {
     const list = await listProjectCheckpoints(props.projectId)
     if (gen !== generation) return
@@ -86,6 +110,8 @@ async function load() {
     // 会闪一下"还没有还原点"。
     if (gen === generation) loading.value = false
   }
+  const state = await vcsPromise
+  if (gen === generation) vcs.value = state
 }
 
 watch(
@@ -96,6 +122,10 @@ watch(
     items.value = []
     lastResult.value = null
     lastCheckpoint.value = null
+    // vcs 必须一起清空：否则切到新项目的那一瞬间，界面上还挂着上一个项目的
+    // 状态，用户会对着"A 目录没有版本控制"的提示去给 B 目录启用。
+    vcs.value = null
+    enabling.value = false
     error.value = ''
     loading.value = false
     void load()
@@ -117,6 +147,50 @@ function kindLabel(kind: string): string {
 /** 可回滚 = 状态 ok。其它状态（写失败/半截）一律禁用。 */
 function canRestore(c: ProjectCheckpoint): boolean {
   return c.state === 'ok' && !restoring.value
+}
+
+/**
+ * 在项目根启用版本跟踪（写用户磁盘）。
+ *
+ * 走二次确认，且文案要说清代价：只建 `.git`、不提交任何东西、不改动任何文件
+ * 内容。用户同意的是"让还原点能工作"，不是"把我的项目提交一遍" ——
+ * 这两件事混淆会让人以为自己的代码被推送到了哪里。
+ *
+ * **成功后重新拉时间线**：之前那些 `state='failed'` 的点是"目录不在版本控制下"
+ * 留下的，现在目录已经纳入版本控制，但旧点本身无法补救（快照当时就没写出来）——
+ * 界面必须刷新，让用户看到的是"从现在起会正常记录"，而不是继续盯着旧失败点。
+ */
+function requestEnableVcs() {
+  if (!props.projectId || enabling.value) return
+  Modal.confirm({
+    title: tr('chat.checkpoint_enable_vcs_title'),
+    content: tr('chat.checkpoint_enable_vcs_confirm'),
+    okText: tr('chat.checkpoint_enable_vcs_ok'),
+    cancelText: tr('common.cancel'),
+    onOk: () => doEnableVcs(),
+  })
+}
+
+async function doEnableVcs() {
+  if (!props.projectId || enabling.value) return
+  enabling.value = true
+  try {
+    const state = await initProjectVcs(props.projectId)
+    vcs.value = state
+    if (state.repo) {
+      notify.success(tr('chat.checkpoint_enable_vcs_done'))
+      // 刷新时间线：失败态的点不会消失（它们真的没写出来），但用户需要
+      // 一个"现在状态如何"的当前视图，而不是停在启用之前的快照上。
+      void load()
+    } else {
+      // init 返回成功但目录仍不在工作树内（权限等）：如实说没成。
+      notify.error(tr('chat.checkpoint_enable_vcs_failed'))
+    }
+  } catch (e) {
+    notify.error(describeApiError(e))
+  } finally {
+    enabling.value = false
+  }
 }
 
 function requestRestore(c: ProjectCheckpoint) {
@@ -236,6 +310,24 @@ async function doDeleteNew() {
     class="cp-empty"
   >{{ tr('common.loading') }}</div>
   <template v-else>
+    <!-- 版本控制提示：项目目录不在 git 工作树里时，还原点**永远**只能是
+         `state='failed'`（引擎快照第一步就报 not a git repository）。所以这里
+         必须在"还没有还原点"之前说清楚根因，并给出一次性的启用入口 ——
+         只显示一句"还没有还原点"会让用户一直等一个永远不会出现的点。 -->
+    <div
+      v-if="needsVcs"
+      class="cp-vcs"
+    >
+      <div class="cp-vcs-text">{{ tr('chat.checkpoint_need_vcs') }}</div>
+      <button
+        type="button"
+        class="cp-btn cp-btn-primary"
+        :disabled="enabling"
+        @click="requestEnableVcs"
+      >
+        {{ enabling ? tr('chat.checkpoint_enable_vcs_running') : tr('chat.checkpoint_enable_vcs') }}
+      </button>
+    </div>
     <div
       v-if="!items.length"
       class="cp-empty"
@@ -361,6 +453,21 @@ async function doDeleteNew() {
 
 <style scoped>
 .cp-empty { padding: 10px 12px; font-size: 12px; color: var(--text-tertiary); }
+/* 版本控制提示块：它是"还原点为什么记不下来"的唯一解释，视觉上不能与普通空态
+   混在一起。用逻辑属性写内外边距，RTL 下同样成立。 */
+.cp-vcs {
+  margin-block: 8px;
+  margin-inline: 12px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: var(--bg-card);
+  font-size: 12px;
+}
+.cp-vcs-text {
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.cp-vcs .cp-btn-primary { margin-block-start: 6px; }
 .cp-error { padding: 10px 12px; font-size: 12px; color: var(--danger); }
 .cp-row {
   padding: 6px 12px;
