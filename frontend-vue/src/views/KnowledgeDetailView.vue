@@ -82,19 +82,6 @@ interface KnowledgeDocument {
   created_at?: string
 }
 
-/** POST /v1/kb/{id}/query 的返回：答案 + 引用（推理式检索没有"片段分数"这一层） */
-interface Citation {
-  doc_name?: string
-  page?: number | null
-  block_id?: string
-  snippet?: string
-}
-interface KnowledgeAnswer {
-  provider?: string
-  answer?: string
-  citations?: Citation[]
-}
-
 /** GET /v1/media 的 items[]（媒体库选取弹窗用到的字段） */
 interface MediaFileItem {
   id: string
@@ -114,9 +101,6 @@ const loading = ref(true)
 const building = ref(false)
 const kb = ref<KnowledgeBase | null>(null)
 const documents = ref<KnowledgeDocument[]>([])
-const showQueryModal = ref(false)
-const queryText = ref('')
-const queryAnswer = ref<KnowledgeAnswer | null>(null)
 const buildProgress = ref(0)
 
 // 文档列表列定义
@@ -491,24 +475,6 @@ async function buildKnowledgeBase() {
   }
 }
 
-async function queryKnowledgeBase() {
-  if (!queryText.value.trim()) {
-    message.warning(t('common.please_enter_search_content'))
-    return
-  }
-
-  queryAnswer.value = null
-  try {
-    const res = await api.post(`/v1/kb/${kbId}/query`, { query: queryText.value })
-    queryAnswer.value = (res.data?.data || null) as KnowledgeAnswer | null
-    if (!queryAnswer.value?.answer) {
-      message.info(t('errors.no_relevant_content_found'))
-    }
-  } catch (error) {
-    message.error(kbErrorText(error, t('errors.query_failed')))
-  }
-}
-
 // 互联互通：携带知识库上下文跳转到对话工作台
 function askInChat() {
   router.push({ path: '/chat', query: { kb: kbId } })
@@ -528,33 +494,6 @@ function formatSize(bytes: number): string {
   const sizes = ['B', 'KB', 'MB', 'GB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
-}
-
-/** 搜索关键词高亮 — 将查询文本按关键词分割并标记高亮段 */
-function highlightSegments(text: string): Array<{ text: string; highlight: boolean }> {
-  if (!text || !queryText.value.trim()) {
-    return [{ text: text || '', highlight: false }]
-  }
-  const keywords = queryText.value.trim().split(/\s+/).filter(Boolean)
-  if (keywords.length === 0) {
-    return [{ text, highlight: false }]
-  }
-  // 用正则匹配所有关键词
-  const pattern = new RegExp(`(${keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
-  const parts: Array<{ text: string; highlight: boolean }> = []
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push({ text: text.slice(lastIndex, match.index), highlight: false })
-    }
-    parts.push({ text: match[0], highlight: true })
-    lastIndex = pattern.lastIndex
-  }
-  if (lastIndex < text.length) {
-    parts.push({ text: text.slice(lastIndex), highlight: false })
-  }
-  return parts.length > 0 ? parts : [{ text, highlight: false }]
 }
 </script>
 
@@ -586,9 +525,6 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
           @click="openAttach"
         >
           {{ $t('agent.assemble_to_agent') }}
-        </Button>
-        <Button @click="showQueryModal = true">
-          {{ $t('knowledge.query_knowledge_base') }}
         </Button>
         <Button
           v-if="kb?.status !== 'building'"
@@ -825,77 +761,6 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
         </Card>
       </div>
     </Spin>
-
-    <!-- 查询弹窗 -->
-    <Modal
-      v-model:visible="showQueryModal"
-      :title="$t('knowledge.query_knowledge_base')"
-      :footer="null"
-      :style="{ maxWidth: '600px' }"
-    >
-      <Input.TextArea
-        v-model:value="queryText"
-        :placeholder="$t('common.enter_search_content')"
-        :rows="3"
-      />
-      <div class="modal-footer">
-        <Button @click="showQueryModal = false">
-          {{ $t('common.close') }}
-        </Button>
-        <Button
-          type="primary"
-          @click="queryKnowledgeBase"
-        >
-          {{ $t('common.query') }}
-        </Button>
-      </div>
-
-      <!-- 查询结果：答案 + 引用（PageIndex 返回推理结果，不是相似度片段） -->
-      <div
-        v-if="queryAnswer"
-        class="query-results"
-      >
-        <h3>{{ $t('knowledge.answer') }}</h3>
-        <p class="result-content">
-          <span
-            v-for="(seg, segIdx) in highlightSegments(queryAnswer.answer || '')"
-            :key="segIdx"
-          >
-            <mark
-              v-if="seg.highlight"
-              class="search-highlight"
-            >{{ seg.text }}</mark>
-            <template v-else>{{ seg.text }}</template>
-          </span>
-        </p>
-        <template v-if="(queryAnswer.citations || []).length">
-          <h4 class="citations-title">
-            {{ $t('knowledge.citations') }}
-          </h4>
-          <div
-            v-for="(cite, index) in queryAnswer.citations"
-            :key="index"
-            class="query-result-item"
-          >
-            <div class="result-header">
-              <Tag v-if="cite.page">
-                P{{ cite.page }}
-              </Tag>
-              <span
-                v-if="cite.doc_name"
-                class="result-source"
-              >📄 {{ cite.doc_name }}</span>
-            </div>
-            <p
-              v-if="cite.snippet"
-              class="result-content"
-            >
-              {{ cite.snippet }}
-            </p>
-          </div>
-        </template>
-      </div>
-    </Modal>
 
     <!-- 从媒体库选取弹窗 -->
     <Modal
