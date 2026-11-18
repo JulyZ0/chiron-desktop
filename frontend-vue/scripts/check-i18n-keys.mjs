@@ -41,6 +41,8 @@ const DOMAIN_PREFIXES = [
   'workflow.', 'agent.', 'knowledge.', 'mail.', 'memory.', 'media.', 'billing.', 'settings.',
   // 通知中心（P2-3）
   'notifications.',
+  // 资源市场（/market）。按源分 tab，语义域 key 全是 `market.*`。
+  'market.',
 ]
 
 const WRITE = process.argv.includes('--write-baseline')

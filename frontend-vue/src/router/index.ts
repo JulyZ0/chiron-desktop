@@ -96,6 +96,15 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    // 资源市场：按**源**分 tab 浏览 agents / skills / knowledge / mcp 并安装到本机。
+    // 不属于五大工作台 —— 它是「去哪找资源」的入口，不是一种工作形态，
+    // 所以不进 WORKSTATION_ROUTES（那五个是工作台定义，受 shared/workstations.json 约束）。
+    path: '/market',
+    name: 'Market',
+    component: () => import('../views/MarketView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/knowledge/settings',
     name: 'KnowledgeSettings',
     component: () => import('../views/KnowledgeSettingsView.vue'),
