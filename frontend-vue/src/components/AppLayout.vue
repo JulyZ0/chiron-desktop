@@ -105,6 +105,8 @@ const menuItems = computed<MenuItem[]>(() => {
     { key: WORKSTATION_ROUTES.skill, label: WORKSTATION_LABELS.skill, icon: () => h(BlockOutlined) },
     { key: '/media', label: tr('common.media'), icon: () => h(PictureOutlined) },
     { key: WORKSTATION_ROUTES.knowledge, label: WORKSTATION_LABELS.knowledge, icon: () => h(BookOutlined) },
+    // 资源市场：知识库之后 —— 「看已有知识」到「找更多资源」是相邻的一步。
+    { key: '/market', label: tr('market.nav'), icon: () => h(AppstoreOutlined) },
     { key: '/memory', label: tr('memory.memory_2'), icon: () => h(HistoryOutlined) },
     { key: WORKSTATION_ROUTES.plugin, label: WORKSTATION_LABELS.plugin, icon: () => h(ThunderboltOutlined) },
     // 计费页已收窄为「本地用量统计」，本地模式同样需要入口，不再按模式隐藏。
@@ -189,6 +191,7 @@ const dockItems: DockItem[] = [
   { key: WORKSTATION_ROUTES.agent, label: WORKSTATION_LABELS.agent, desc: WORKSTATION_DESCRIPTIONS.agent, icon: RobotOutlined },
   { key: WORKSTATION_ROUTES.skill, label: WORKSTATION_LABELS.skill, desc: WORKSTATION_DESCRIPTIONS.skill, icon: ThunderboltOutlined },
   { key: WORKSTATION_ROUTES.knowledge, label: WORKSTATION_LABELS.knowledge, desc: WORKSTATION_DESCRIPTIONS.knowledge, icon: BookOutlined },
+  { key: '/market', label: tr('market.nav'), desc: tr('market.subtitle'), icon: AppstoreOutlined },
   { key: WORKSTATION_ROUTES.plugin, label: WORKSTATION_LABELS.plugin, desc: WORKSTATION_DESCRIPTIONS.plugin, icon: AppstoreOutlined },
 ]
 
