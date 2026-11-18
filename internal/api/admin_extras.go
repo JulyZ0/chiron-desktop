@@ -469,6 +469,10 @@ var settingsCategories = []string{
 	"rate_limit", "degradation", "cache", "api_key",
 	"agent", "llm", "storage", "payment", "redis", "postgres", "cors", "s3",
 	"python",
+	// market：资源市场外部源配置（remote_enabled / catalog_sources /
+	// allow_user_sources / allow_remote_mcp / max_sources）。不在此表里的话
+	// 后台保存会被 400 拒绝，于是"能在后台配置源"就只是句空话。
+	"market",
 }
 
 func validSettingsCategory(c string) bool {

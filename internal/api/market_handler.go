@@ -13,18 +13,32 @@ import (
 // `internal/market`。这样聚合逻辑可以脱离 HTTP 单测，外部源抓取也能单独替换。
 type MarketHandler struct {
 	svc *market.Service
+	// sources 是源管理的 HTTP 适配层（见 market_sources.go）。共用同一个 svc：
+	// 源管理改的是配置，目录读取读的是同一份配置，两处必须看到同一个实例。
+	sources *MarketSourceHandler
 }
 
 // NewMarketHandler 构造市场 handler。svc 不可为 nil —— 内置目录随包发布，
 // 不依赖任何外部服务，没有"市场功能不可用"的合法状态。
 func NewMarketHandler(svc *market.Service) *MarketHandler {
-	return &MarketHandler{svc: svc}
+	return &MarketHandler{svc: svc, sources: NewMarketSourceHandler(svc)}
 }
 
-// RegisterRoutes 注册市场只读路由。写操作（安装/卸载/源管理）在后续阶段注册。
+// RegisterRoutes 注册市场路由。
+//
+// 分两段：上面是**只读目录**（所有人可用），下面是**源管理**（写操作，语义独立，
+// 见 market_sources.go）。分段是为了并行合并时能整段识别/挪动，不必逐行 diff。
 func (h *MarketHandler) RegisterRoutes(mux *http.ServeMux, authMW, rlMW routeMiddleware) {
 	mux.Handle("GET /v1/market/catalog", authMW(rlMW(http.HandlerFunc(h.Catalog))))
 	mux.Handle("GET /v1/market/items/{source}/{id}", authMW(rlMW(http.HandlerFunc(h.Item))))
+
+	// ── 源管理路由（外部源的后台配置 + 用户自建源）──
+	// GET    列出全部源（内置/运维/用户）与能力上限；
+	// POST   用户新增自建源（allow_user_sources=false → 403，上限 → 409，URL 非法 → 400）；
+	// DELETE 删除**用户**源（内置/运维 → 403），幂等。
+	mux.Handle("GET /v1/market/sources", authMW(rlMW(http.HandlerFunc(h.sources.List))))
+	mux.Handle("POST /v1/market/sources", authMW(rlMW(http.HandlerFunc(h.sources.Create))))
+	mux.Handle("DELETE /v1/market/sources/{id}", authMW(rlMW(http.HandlerFunc(h.sources.Delete))))
 }
 
 // catalogResponse 是目录列表的响应体。
@@ -48,6 +62,9 @@ type catalogResponse struct {
 // 查询参数：kind / q / tag / source / page / page_size。
 // kind 非法时返回 400 而不是静默返回空列表 —— 空列表会让前端把拼错的类型
 // 显示成"这个分类没有内容"。
+//
+// 按**当前用户**加载（LoadFor）：用户自建源是 per-user 的，用 Load(ctx) 会让
+// A 用户看到 B 加过的源。
 func (h *MarketHandler) Catalog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
@@ -61,7 +78,7 @@ func (h *MarketHandler) Catalog(w http.ResponseWriter, r *http.Request) {
 		kind = parsed
 	}
 
-	snap := h.svc.Load(r.Context())
+	snap := h.svc.LoadFor(r.Context(), marketUserID(r))
 	filtered := market.Filter(snap.Items, market.Query{
 		Kind:   kind,
 		Q:      q.Get("q"),
@@ -102,7 +119,7 @@ func (h *MarketHandler) Item(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap := h.svc.Load(r.Context())
+	snap := h.svc.LoadFor(r.Context(), marketUserID(r))
 	it, ok := market.Find(snap.Items, source, id)
 	if !ok {
 		NotFound(w, "market item not found: "+source+"/"+id)
