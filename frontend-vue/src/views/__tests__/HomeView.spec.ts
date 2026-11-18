@@ -30,7 +30,8 @@ if (!('ResizeObserver' in globalThis)) {
 }
 
 const apiMocks = vi.hoisted(() => ({
-  get: vi.fn((): Promise<unknown> => Promise.resolve({ data: { data: [] } })),
+  // 调用签名带 url：下面的 routeGet() 按 URL 分派响应；实现本身忽略入参
+  get: vi.fn<(url: string) => Promise<unknown>>(() => Promise.resolve({ data: { data: [] } })),
 }))
 
 const quickMocks = vi.hoisted(() => ({
