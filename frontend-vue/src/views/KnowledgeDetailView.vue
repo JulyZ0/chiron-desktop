@@ -6,7 +6,7 @@ import {
   Progress, message, Modal, Input, Checkbox, Popconfirm,
 } from 'ant-design-vue'
 import {
-  ArrowLeftOutlined, CloudUploadOutlined,
+  ArrowLeftOutlined, CloudUploadOutlined, DeleteOutlined, FolderOutlined,
   PlayCircleOutlined, PictureOutlined, SearchOutlined,
   MessageOutlined, EyeOutlined, ReloadOutlined,
 } from '@ant-design/icons-vue'
@@ -98,6 +98,14 @@ interface MediaFileItem {
   file_url: string
   mime_type?: string
 }
+
+/** 媒体库文件夹（`type === 'folder'`）。与文件同列返回，只能进入、不能被选中。 */
+function isMediaFolder(item: MediaFileItem): boolean {
+  return item.type === 'folder'
+}
+
+/** 弹窗一次拉取的上限 —— 与服务端 parsePagination 的 pageSize 上限一致（200）。 */
+const MEDIA_PICKER_PAGE_SIZE = 200
 
 /** Upload 的 customRequest 参数：从 antd 的 props 推导，避免手抄内部类型名 */
 type UploadRequestOptions = Parameters<NonNullable<UploadProps['customRequest']>>[0]
@@ -238,6 +246,24 @@ const loadingMedia = ref(false)
 const importingMedia = ref(false)
 const mediaSearchQuery = ref('')
 
+// ── 选取弹窗的目录导航 ──
+// 媒体库的文件夹与文件**同列返回**（`type === 'folder'`）。此前弹窗把它们当普通条目
+// 列出来：点一下只会把文件夹 id 塞进选中集合，接着 importFromMedia 取不到 file_url、
+// 静默 `continue` —— 用户看到"已导入 0 个文件"，却没有任何解释。
+// 现在文件夹变成可进入的一层：面包屑与媒体库页一致，根目录 id 为空串（服务端约定）。
+const mediaBreadcrumbs = ref<{ id: string; name: string }[]>([{ id: '', name: '' }])
+const mediaParentId = computed(
+  () => mediaBreadcrumbs.value[mediaBreadcrumbs.value.length - 1].id,
+)
+
+/**
+ * 已选条目本身（id → item），而不只是 id。
+ *
+ * 选中可以**跨越多个文件夹**，而 `mediaFiles` 只装当前目录。若只存 id，切一次目录
+ * 后再导入，`find` 必然落空，用户点的导入就变成"成功 0 个"。
+ */
+const pickedMedia = ref<Record<string, MediaFileItem>>({})
+
 const kbId = route.params.id as string
 
 onMounted(async () => {
@@ -371,19 +397,44 @@ async function flushUploadBatch() {
 }
 
 async function openMediaModal() {
-  loadingMedia.value = true
   showMediaModal.value = true
   selectedMediaIds.value = []
+  pickedMedia.value = {}
   mediaSearchQuery.value = ''
+  mediaBreadcrumbs.value = [{ id: '', name: '' }]
+  await loadMediaFiles()
+}
 
+/**
+ * 拉取当前目录的内容。
+ *
+ * `parent_id` 必须显式传空串（不是省略）：服务端按 `COALESCE(parent_id, '')` 比较，
+ * 省略同样落到空串，但显式传能让"根目录"这件事在代码里写清楚。
+ */
+async function loadMediaFiles() {
+  loadingMedia.value = true
   try {
-    const res = await api.get('/v1/media')
+    const res = await api.get('/v1/media', {
+      params: { parent_id: mediaParentId.value, page_size: MEDIA_PICKER_PAGE_SIZE },
+    })
     mediaFiles.value = res.data?.data?.items || []
   } catch {
+    mediaFiles.value = []
     message.error(t('errors.failed_to_load_media_library'))
   } finally {
     loadingMedia.value = false
   }
+}
+
+/** 进入子文件夹。搜索词保留 —— 用户往往是在搜到的东西里继续往里翻。 */
+async function enterMediaFolder(item: MediaFileItem) {
+  mediaBreadcrumbs.value.push({ id: item.id, name: item.name })
+  await loadMediaFiles()
+}
+
+async function goMediaBreadcrumb(idx: number) {
+  mediaBreadcrumbs.value = mediaBreadcrumbs.value.slice(0, idx + 1)
+  await loadMediaFiles()
 }
 
 async function importFromMedia() {
@@ -396,8 +447,10 @@ async function importFromMedia() {
   let successCount = 0
   let failCount = 0
 
+  // 从 pickedMedia 取条目（而不是当前目录列表）：选择可以跨文件夹，只查 mediaFiles
+  // 会把其他目录里选中的文件漏掉，导入结果少得莫名其妙。
   for (const fileId of selectedMediaIds.value) {
-    const file = mediaFiles.value.find((f) => f.id === fileId)
+    const file = pickedMedia.value[fileId]
     if (!file) continue
 
     try {
@@ -428,22 +481,43 @@ async function importFromMedia() {
   }
 }
 
-function toggleMediaSelection(id: string) {
-  const index = selectedMediaIds.value.indexOf(id)
+function toggleMediaSelection(item: MediaFileItem) {
+  const index = selectedMediaIds.value.indexOf(item.id)
   if (index === -1) {
-    selectedMediaIds.value.push(id)
+    selectedMediaIds.value.push(item.id)
+    pickedMedia.value[item.id] = item
   } else {
     selectedMediaIds.value.splice(index, 1)
+    delete pickedMedia.value[item.id]
   }
 }
 
+/** 全选当前目录的**文件**（文件夹不是可导入对象，不能进选中集合）。 */
 function selectAllMedia() {
-  selectedMediaIds.value = filteredMediaFiles.value.map(f => f.id)
+  const files = filteredMediaFiles.value.filter((f) => !isMediaFolder(f))
+  for (const f of files) pickedMedia.value[f.id] = f
+  selectedMediaIds.value = files.map((f) => f.id)
 }
 
 function deselectAllMedia() {
   selectedMediaIds.value = []
+  pickedMedia.value = {}
 }
+
+/** 当前目录里还有没有可导入的文件（用来区分"目录是空的"和"只有文件夹"）。 */
+const hasSelectableMedia = computed(() =>
+  filteredMediaFiles.value.some((f) => !isMediaFolder(f)),
+)
+
+/**
+ * 当前目录的可导入文件数。
+ *
+ * 计数不能直接用 `filteredMediaFiles.length`：文件夹也在这份列表里，把它们算进
+ * "共 N 项"会让「全选」后的选中数永远追不上总数，看着像功能坏了。
+ */
+const selectableMediaCount = computed(
+  () => filteredMediaFiles.value.filter((f) => !isMediaFolder(f)).length,
+)
 
 /** 库上的索引错误原因（worker 写在 `error_message`，如"文档 X: 缺少原文对象"）。 */
 function kbErrorMessage(): string {
@@ -828,9 +902,10 @@ function formatSize(bytes: number): string {
           </template>
         </Input>
         <div class="media-actions">
-          <span class="selected-count">{{ $t('common.selected_sel_total_items', { sel: selectedMediaIds.length, total: filteredMediaFiles.length }) }}</span>
+          <span class="selected-count">{{ $t('common.selected_sel_total_items', { sel: selectedMediaIds.length, total: selectableMediaCount }) }}</span>
           <Button
             size="small"
+            :disabled="!hasSelectableMedia"
             @click="selectAllMedia"
           >
             {{ $t('common.select_all') }}
@@ -844,33 +919,65 @@ function formatSize(bytes: number): string {
         </div>
       </div>
 
+      <!-- 目录面包屑：与媒体库页同构（末项是当前位置，不做按钮）。
+           根目录回退用 all_files，与媒体库页的文案一致。 -->
+      <div class="media-breadcrumb">
+        <template
+          v-for="(cr, i) in mediaBreadcrumbs"
+          :key="cr.id || 'root'"
+        >
+          <span
+            class="crumb"
+            :class="{ active: i === mediaBreadcrumbs.length - 1 }"
+            :role="i === mediaBreadcrumbs.length - 1 ? undefined : 'button'"
+            :tabindex="i === mediaBreadcrumbs.length - 1 ? undefined : 0"
+            :aria-current="i === mediaBreadcrumbs.length - 1 ? 'page' : undefined"
+            @click="i < mediaBreadcrumbs.length - 1 && goMediaBreadcrumb(i)"
+            @keydown.enter.prevent="i < mediaBreadcrumbs.length - 1 && goMediaBreadcrumb(i)"
+          >{{ cr.name || $t('media.all_files') }}</span>
+          <span
+            v-if="i < mediaBreadcrumbs.length - 1"
+            class="crumb-sep"
+            aria-hidden="true"
+          >/</span>
+        </template>
+      </div>
+
       <Spin :spinning="loadingMedia">
         <div
           v-if="filteredMediaFiles.length === 0 && !loadingMedia"
           class="media-empty"
         >
-          <Empty :description="mediaSearchQuery ? $t('media.no_matching_files') : $t('media.media_library_is_empty')" />
+          <Empty :description="mediaSearchQuery ? $t('media.no_matching_files') : $t('media.no_files_yet')" />
         </div>
         <div
           v-else
           class="media-list"
         >
+          <!-- 文件夹与文件混在一列返回：文件夹渲染成"进入"按钮，不参与勾选 -->
           <div
             v-for="item in filteredMediaFiles"
             :key="item.id"
-            :class="['media-item', { selected: selectedMediaIds.includes(item.id) }]"
-            role="checkbox"
-            :aria-checked="selectedMediaIds.includes(item.id)"
+            :class="['media-item', { selected: !isMediaFolder(item) && selectedMediaIds.includes(item.id) }]"
+            :role="isMediaFolder(item) ? 'button' : 'checkbox'"
+            :aria-checked="isMediaFolder(item) ? undefined : selectedMediaIds.includes(item.id)"
             tabindex="0"
-            @click="toggleMediaSelection(item.id)"
-            @keydown.enter.prevent="toggleMediaSelection(item.id)"
-            @keydown.space.prevent="toggleMediaSelection(item.id)"
+            @click="isMediaFolder(item) ? enterMediaFolder(item) : toggleMediaSelection(item)"
+            @keydown.enter.prevent="isMediaFolder(item) ? enterMediaFolder(item) : toggleMediaSelection(item)"
+            @keydown.space.prevent="isMediaFolder(item) ? enterMediaFolder(item) : toggleMediaSelection(item)"
           >
+            <!-- 文件夹没有勾选框：放进一个不会被点到的 Checkbox 只会让人以为能选 -->
+            <FolderOutlined
+              v-if="isMediaFolder(item)"
+              class="media-folder-icon"
+              aria-hidden="true"
+            />
             <!-- 内层 Checkbox 只作视觉：语义与键盘操作已由外层的 role="checkbox" + aria-checked
                  承担。若不排除它，这一行会出现两个可聚焦点表达同一件事（Tab 要经过两次、
                  读屏要读两遍）；aria-hidden 配合 tabindex="-1" 才是合法组合
                  （aria-hidden 的元素不允许仍可聚焦）。 -->
             <Checkbox
+              v-else
               :checked="selectedMediaIds.includes(item.id)"
               :tabindex="-1"
               aria-hidden="true"
@@ -878,8 +985,14 @@ function formatSize(bytes: number): string {
             <div class="media-info">
               <span class="media-name">{{ item.name }}</span>
               <span class="media-meta">
-                <span class="media-type">{{ item.type }}</span>
-                <span class="media-size">{{ formatSize(item.size) }}</span>
+                <span
+                  v-if="!isMediaFolder(item)"
+                  class="media-type"
+                >{{ item.type }}</span>
+                <span
+                  v-if="!isMediaFolder(item)"
+                  class="media-size"
+                >{{ formatSize(item.size) }}</span>
               </span>
             </div>
           </div>
@@ -947,6 +1060,15 @@ function formatSize(bytes: number): string {
 .media-actions { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .selected-count { font-size: 13px; color: var(--text-secondary); }
 .media-empty { padding: 40px 0; }
+/* 目录面包屑：与媒体库页 .breadcrumb 的观感保持一致 */
+.media-breadcrumb { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; margin-bottom: 10px; font-size: 13px; }
+.media-breadcrumb .crumb { color: var(--text-secondary); border-radius: var(--radius-sm, 4px); padding: 2px 4px; }
+.media-breadcrumb .crumb[role="button"] { cursor: pointer; }
+.media-breadcrumb .crumb[role="button"]:hover { color: var(--primary-color, #1677ff); background: var(--bg-hover, rgba(0,0,0,0.03)); }
+.media-breadcrumb .crumb.active { color: var(--text-primary); font-weight: var(--fw-medium); }
+.media-breadcrumb .crumb-sep { color: var(--text-tertiary); }
+/* 首列图标位与 Checkbox 同宽，让文件夹行与文件行左边缘对齐 */
+.media-folder-icon { font-size: 14px; color: var(--warning-color, #faad14); flex: none; }
 .media-list { border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-lg); overflow: hidden; max-height: 400px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .media-item { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: var(--hairline-width) solid var(--border-card); cursor: pointer; transition: background var(--dur-normal); }
 .media-item:last-child { border-bottom: none; }
