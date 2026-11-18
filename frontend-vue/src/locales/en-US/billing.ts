@@ -1,6 +1,5 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
-  build_started_estimated_cost_n_credits: "Build started; estimated cost {n} credits",
   help_me_make_a_project_plan: "Help me make a project plan",
   planning: "Planning",
   session_stats_tokens_cost_cache_hits_throughput_popover: "Session stats: tokens / cost / cache hits / throughput (popover)",

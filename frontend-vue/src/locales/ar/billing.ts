@@ -1,6 +1,5 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
-  build_started_estimated_cost_n_credits: "بدأ البناء؛ التكلفة المقدّرة {n} رصيد",
   help_me_make_a_project_plan: "ساعدني في وضع خطة مشروع",
   planning: "تخطيط",
   session_stats_tokens_cost_cache_hits_throughput_popover: "إحصائيات الجلسة: الرموز / التكلفة / إصابات الذاكرة المؤقتة / الإنتاجية (نافذة منبثقة)",

@@ -27,6 +27,7 @@ from app.config import DEFAULT_TENANT_ID
 from app.db import get_pool
 from app.kb_access import kb_access_allowed
 from app.knowledge import blob, settings_store
+from app.knowledge import status as kb_status
 from app.knowledge.errors import KnowledgeError, ProviderUnavailableError
 from app.knowledge.providers import registry
 from app.knowledge.providers.base import (
@@ -35,7 +36,7 @@ from app.knowledge.providers.base import (
     STATUS_ERROR,
     is_known_provider,
 )
-from app.knowledge.service import answer_question
+from app.knowledge.service import answer_question, kb_enabled
 from app.tools.context import to_tenant_int
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,14 @@ class KnowledgeBaseUpdate(BaseModel):
     visibility: str | None = None
 
 
+class KBEnabledUpdate(BaseModel):
+    """用户开关。字段名就叫 ``enabled``，不叫 ``status`` —— 后者是索引状态机的名字
+    （见 ``app/knowledge/status.py``），两条语义在本体上是正交的，请求体沿用错名字
+    会让调用方以为自己在改索引状态。"""
+
+    enabled: bool
+
+
 class DocumentUpload(BaseModel):
     name: str
     file_type: str = ""
@@ -101,6 +110,24 @@ class UserSettingsUpdate(BaseModel):
 
 # ── Serialization ──
 
+#: 知识库行的标准列集合。抽成常量而不是各处以字符串重复：``enabled`` 属于"用户开关"，
+#: 一旦某处 SELECT 漏了它，序列化就只能靠回退值猜 —— 表现是界面开关永远显示"启用"，
+#: 而库里其实是停用的。集中一处后新增列只改这里。
+_KB_COLUMNS = (
+    "id, name, COALESCE(description, '') AS description, provider, visibility, status, enabled, "
+    "document_count, total_size_bytes, config, error_message, created_at, updated_at"
+)
+
+
+def _row_enabled(data: dict[str, Any]) -> bool:
+    """行里的 ``enabled``；缺列（旧 SQL/测试桩）时按"启用"处理。
+
+    回退 ``True`` 而不是 ``False``：``enabled`` 的语义是"用户显式停用"，缺信息时
+    误判成停用会让存量库**突然查不到** —— 这是比"开关显示不对"严重得多的故障。
+    """
+    value = data.get("enabled")
+    return True if value is None else bool(value)
+
 
 def _serialize_kb(row: Any) -> dict[str, Any]:
     data = dict(row)
@@ -110,7 +137,11 @@ def _serialize_kb(row: Any) -> dict[str, Any]:
         "description": data.get("description") or "",
         "provider": data["provider"],
         "visibility": data["visibility"],
+        # `status` = 索引状态（disabled/indexing/ready/error），由索引流程写；
+        # `enabled` = 用户开关（能否参与检索与索引），由 PUT /{id}/status 写。
+        # 两者**正交**，前端要分别展示（见 migrations/versions/0006_kb_enabled.py）。
         "status": data["status"],
+        "enabled": _row_enabled(data),
         "document_count": data.get("document_count", 0),
         "total_size_bytes": data.get("total_size_bytes", 0),
         "credits_consumed": data.get("credits_consumed", 0),
@@ -214,9 +245,7 @@ async def list_knowledge_bases(user_id: str, tenant_id: int = 0) -> dict[str, An
         return {"knowledge_bases": [], "count": 0}
 
     rows = await pool.fetch(
-        """SELECT id, name, COALESCE(description, '') AS description, provider, visibility, status,
-                  document_count, total_size_bytes, config, error_message,
-                  created_at, updated_at
+        f"""SELECT {_KB_COLUMNS}
              FROM knowledge_bases
             WHERE user_id = $1
                OR visibility = 'public'
@@ -283,9 +312,7 @@ async def get_knowledge_base(kb_id: str, user_id: str, tenant_id: int = 0) -> di
     """取单个知识库（可见性规则与列表**同一份**，否则会出现"列表看不到但猜到 id 能读"）。"""
     pool = get_pool()
     row = await pool.fetchrow(
-        """SELECT id, name, COALESCE(description, '') AS description, provider, visibility, status,
-                  document_count, total_size_bytes, config, error_message,
-                  created_at, updated_at
+        f"""SELECT {_KB_COLUMNS}
              FROM knowledge_bases
             WHERE id = $1
               AND (user_id = $2
@@ -346,6 +373,49 @@ async def update_knowledge_base(
         *params,
     )
     return {"id": kb_id, "updated": True}
+
+
+async def set_knowledge_base_enabled(
+    kb_id: str, user_id: str, enabled: bool, tenant_id: int = 0
+) -> dict[str, Any]:
+    """启用 / 停用知识库（**真正生效**：停用后不参与检索，也不能构建索引）。
+
+    ## 越权一律 404，不回 403
+
+    403 等于告诉调用方"这个 id 存在，只是不归你" —— 对猜 id 的探测者这就是一次
+    存在性确认。知识库 id 是 uuid，本就难以枚举，没有必要额外泄漏。因此：
+    "不存在"与"存在但不可写"返回**同一个** 404。
+
+    *可写 = 属主本人*（``user_id`` 相等）。同租户共享库（``visibility='tenant'``）与
+    公开库对其他成员是**只读**的：能查不能停 —— 否则任何租户成员都能把别人的库
+    停掉，那是最低成本的拒绝服务。
+
+    **管理员也没有这条特权**：与 ``delete_knowledge_base`` 不同，"停用别人的库"
+    没有对应的运维诉求（要停就直接删，或让属主自己停），而放开它等于给管理员一个
+    能悄悄降低他人检索能力的开关 —— 排查时极难发现。因此这里刻意不接
+    ``is_admin``，越权与非属主一样 404。
+
+    ## 语义与 ``status`` 的关系
+
+    只写 ``enabled``，**不碰** ``status``：停用不销毁索引（重新启用不需要重建，
+    也不重复花 LLM 钱）；``status`` 归索引流程写（见 ``app/knowledge/status.py``）。
+    """
+    pool = get_pool()
+    row = await pool.fetchrow(
+        "SELECT id, user_id FROM knowledge_bases WHERE id = $1", kb_id
+    )
+    if row is None or str(row["user_id"] or "") != user_id:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+
+    await pool.execute(
+        """UPDATE knowledge_bases
+              SET enabled = $2, updated_at = NOW()
+            WHERE id = $1""",
+        kb_id,
+        bool(enabled),
+    )
+    logger.info("knowledge base enabled=%s id=%s", bool(enabled), kb_id)
+    return {"id": kb_id, "enabled": bool(enabled)}
 
 
 async def delete_knowledge_base(
@@ -635,10 +705,15 @@ async def _enqueue_kb_index(
 async def build_knowledge_base(
     kb_id: str, user_id: str, tenant_id: int = 0, force: bool = False
 ) -> dict[str, Any]:
-    """投递索引任务（把 pending 文档交给 ``kb_index``）。"""
+    """投递索引任务（把 pending 文档交给 ``kb_index``）。
+
+    已停用的库直接拒掉：队列里的任务会被 worker 领走并花掉真实 LLM 费用，用户明说
+    "停用"之后再悄悄烧一次钱是最糟的组合。校验放在**投递前**而不是 worker 里，
+    是为了让用户当场看到"去把开关打开"，而不是等一个注定被丢弃的任务超时。
+    """
     pool = get_pool()
     kb = await pool.fetchrow(
-        "SELECT id, user_id, provider, status, document_count FROM knowledge_bases WHERE id = $1",
+        "SELECT id, user_id, provider, status, enabled, document_count FROM knowledge_bases WHERE id = $1",
         kb_id,
     )
     if kb is None:
@@ -646,6 +721,11 @@ async def build_knowledge_base(
     if kb["user_id"] != user_id:
         raise HTTPException(
             status_code=403, detail="not authorized to build this knowledge base"
+        )
+    if not kb_enabled(kb):
+        raise HTTPException(
+            status_code=409,
+            detail="knowledge base is disabled; enable it before building the index",
         )
     if (kb["document_count"] or 0) == 0:
         raise HTTPException(
@@ -659,7 +739,8 @@ async def build_knowledge_base(
         kb_id=kb_id, user_id=user_id, tenant_id=tenant_id, force=force
     )
     return {
-        "status": "indexing",
+        # 用统一常量而不是字面量：这个值前端要拿来对齐轮询，写死在两处必然漂移
+        "status": kb_status.STATUS_INDEXING,
         "task_id": task_id,
         "provider": kb["provider"],
         "force": bool(force),
@@ -752,9 +833,7 @@ async def admin_list_knowledge_bases() -> dict[str, Any]:
         return {"knowledge_bases": [], "count": 0}
 
     rows = await pool.fetch(
-        """SELECT id, name, COALESCE(description, '') AS description, provider, visibility, status,
-                  document_count, total_size_bytes, config, error_message,
-                  created_at, updated_at
+        f"""SELECT {_KB_COLUMNS}
              FROM knowledge_bases
             WHERE visibility = 'public'
             ORDER BY created_at DESC""",
@@ -1067,6 +1146,23 @@ async def query_kb(
         top_k=body.top_k,
         tenant_id=tenant_id,
     )
+
+
+@router.put("/{kb_id}/status")
+async def set_kb_enabled(
+    kb_id: str,
+    body: KBEnabledUpdate,
+    user_id: str = Query("", alias="user_id"),
+) -> dict[str, Any]:
+    """启用 / 停用知识库：`enabled` 是用户开关，与索引状态 `status` 正交。
+
+    路径用 `/status` 而不是 `/enabled`：前端与网关两侧都按「切换这个库的状态」
+    来叫，且 `/status` 不会与将来可能出现的只读 `GET .../status` 抢语义
+    （只读的那条会读索引状态，是另一件事）。
+    """
+    if not user_id:
+        raise HTTPException(status_code=401, detail="user_id required")
+    return await set_knowledge_base_enabled(kb_id, user_id, body.enabled)
 
 
 @router.get("/{kb_id}/documents/{doc_id}/preview")

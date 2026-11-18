@@ -109,4 +109,11 @@ export default {
   status_ready: "已就绪",
   status_error: "异常",
   index_now: "构建索引",
+  enabled: "启用",
+  kb_enabled: "已启用该知识库",
+  kb_disabled: "已停用该知识库",
+  kb_enabled_hint: "启用中：参与检索，可构建索引",
+  kb_disabled_hint: "已停用：不参与检索、不能构建索引；索引仍保留，重新启用即可用",
+  index_build_started: "索引任务已提交，正在后台执行",
+  index_still_running: "索引仍在后台执行，可稍后刷新查看状态",
 }

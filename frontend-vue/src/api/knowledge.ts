@@ -15,6 +15,27 @@ export type ProviderName = 'selfhosted' | 'cloud'
 export type KbStatus = 'disabled' | 'indexing' | 'ready' | 'error'
 export type KbVisibility = 'public' | 'private' | 'tenant'
 
+/**
+ * 索引状态的判据集合 —— 逐项镜像引擎侧 `python-engine/app/knowledge/status.py`。
+ *
+ * 这里**必须**是唯一一份前端判据：此前详情页把"构建完成"写成 `status === 'active'`、
+ * 把"正在构建"写成 `'building'`，而这两个取值**从未被任何写入方写过**（worker 只写
+ * `indexing` / `ready` / `error`）。后果是索引真跑完、库早已 `ready`，界面仍轮询到超时
+ * 后默默放弃；"构建中"的按钮分支也永远不生效。
+ */
+export const KB_BUILDING_STATUSES: readonly KbStatus[] = ['indexing']
+export const KB_TERMINAL_STATUSES: readonly KbStatus[] = ['ready', 'error']
+
+/** 是否正在索引（读的是**库上的 status**，不是本地 loading 标志）。 */
+export function isKbBuilding(status?: string | null): boolean {
+  return KB_BUILDING_STATUSES.includes(status as KbStatus)
+}
+
+/** 是否已到终态（`error` 也算终态：继续轮询一个失败的库只会让用户干等）。 */
+export function isKbTerminal(status?: string | null): boolean {
+  return KB_TERMINAL_STATUSES.includes(status as KbStatus)
+}
+
 export interface KnowledgeBase {
   id: string
   name: string
@@ -22,6 +43,14 @@ export interface KnowledgeBase {
   provider: ProviderName
   visibility: KbVisibility
   status: KbStatus
+  /**
+   * 用户开关：这个库是否参与检索与索引。
+   *
+   * 与 `status` **正交**（见 `migrations/versions/0006_kb_enabled.py`）：
+   * `status` 说索引跑到哪一步，`enabled` 说用户让不让用。停用不销毁索引，
+   * 重新启用不需要重建。
+   */
+  enabled: boolean
   document_count: number
   total_size_bytes: number
   credits_consumed: number
@@ -126,6 +155,20 @@ export async function setKnowledgeBaseVisibility(
   visibility: KbVisibility,
 ): Promise<unknown> {
   const resp = await api.put(`/v1/kb/${id}/visibility`, { visibility })
+  return unwrap<unknown>(resp)
+}
+
+/**
+ * 启用 / 停用知识库（`enabled`，与索引状态 `status` 无关）。
+ *
+ * 停用**不删索引**：重新启用就能直接检索，不重复花索引费用。停用后该库不再参与
+ * 检索，也不能投递构建任务（后端会回 409）。
+ */
+export async function setKnowledgeBaseEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<unknown> {
+  const resp = await api.put(`/v1/kb/${id}/status`, { enabled })
   return unwrap<unknown>(resp)
 }
 

@@ -2,15 +2,20 @@
 import { ref, onMounted, computed, markRaw } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  Card, Button, Upload, Table, Spin, Empty, Tag, Space,
+  Card, Button, Upload, Table, Spin, Empty, Tag, Space, Switch,
   Progress, message, Modal, Input, Checkbox, Popconfirm,
 } from 'ant-design-vue'
 import {
-  ArrowLeftOutlined, CloudUploadOutlined,
+  ArrowLeftOutlined, CloudUploadOutlined, DeleteOutlined, FolderOutlined,
   PlayCircleOutlined, PictureOutlined, SearchOutlined,
   MessageOutlined, EyeOutlined, ReloadOutlined,
 } from '@ant-design/icons-vue'
 import { api, resolveMediaUrl } from '../api'
+import {
+  buildKnowledgeBase as requestBuildIndex,
+  isKbBuilding,
+  isKbTerminal,
+} from '../api/knowledge'
 import { errorDetail } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
 import { kbAcceptAttr, isSupportedKbFile } from '../config/kbFileTypes'
@@ -61,11 +66,15 @@ interface KnowledgeBase {
   name?: string
   description?: string
   status?: string
+  /** 用户开关（与 `status` 正交）；旧后端不返回时按启用处理。 */
+  enabled?: boolean
   provider?: string
   visibility?: string
   document_count?: number
   total_size_bytes?: number
   credits_consumed?: number
+  /** 索引失败原因（worker 写入；成功时为空串）。 */
+  error_message?: string
 }
 
 /** GET /v1/kb/{id}/documents 的 documents[] */
@@ -80,19 +89,6 @@ interface KnowledgeDocument {
   created_at?: string
 }
 
-/** POST /v1/kb/{id}/query 的返回：答案 + 引用（推理式检索没有"片段分数"这一层） */
-interface Citation {
-  doc_name?: string
-  page?: number | null
-  block_id?: string
-  snippet?: string
-}
-interface KnowledgeAnswer {
-  provider?: string
-  answer?: string
-  citations?: Citation[]
-}
-
 /** GET /v1/media 的 items[]（媒体库选取弹窗用到的字段） */
 interface MediaFileItem {
   id: string
@@ -103,6 +99,14 @@ interface MediaFileItem {
   mime_type?: string
 }
 
+/** 媒体库文件夹（`type === 'folder'`）。与文件同列返回，只能进入、不能被选中。 */
+function isMediaFolder(item: MediaFileItem): boolean {
+  return item.type === 'folder'
+}
+
+/** 弹窗一次拉取的上限 —— 与服务端 parsePagination 的 pageSize 上限一致（200）。 */
+const MEDIA_PICKER_PAGE_SIZE = 200
+
 /** Upload 的 customRequest 参数：从 antd 的 props 推导，避免手抄内部类型名 */
 type UploadRequestOptions = Parameters<NonNullable<UploadProps['customRequest']>>[0]
 
@@ -112,9 +116,6 @@ const loading = ref(true)
 const building = ref(false)
 const kb = ref<KnowledgeBase | null>(null)
 const documents = ref<KnowledgeDocument[]>([])
-const showQueryModal = ref(false)
-const queryText = ref('')
-const queryAnswer = ref<KnowledgeAnswer | null>(null)
 const buildProgress = ref(0)
 
 // 文档列表列定义
@@ -226,11 +227,10 @@ async function batchReindexDocs() {
   if (!ids.length) { message.warning(t('knowledge.please_select_a_document_first')); return }
   reindexingIds.value = ids
   try {
-    // 调用知识库构建接口（会重新索引所有文档）
-    // 如果只想重新索引选中的文档，需要后台支持部分重新索引
-    // 当前实现：先触发构建（会重新索引知识库所有文档）
-    await api.post(`/v1/kb/${kbId}/build`)
-    message.success(t('workflow.re_indexing_triggered_please_check_status_later'))
+    // 与顶部「构建索引」走同一个客户端函数：重建是全库重建（后端没有部分重建的参数），
+    // 提示语如实说明"全库"，免得用户以为只重跑勾选的那几篇。
+    await requestBuildIndex(kbId)
+    message.success(t('knowledge.index_build_started'))
   } catch (e) {
     message.error(kbErrorText(e, t('errors.re_index_failed')))
   } finally {
@@ -245,6 +245,24 @@ const selectedMediaIds = ref<string[]>([])
 const loadingMedia = ref(false)
 const importingMedia = ref(false)
 const mediaSearchQuery = ref('')
+
+// ── 选取弹窗的目录导航 ──
+// 媒体库的文件夹与文件**同列返回**（`type === 'folder'`）。此前弹窗把它们当普通条目
+// 列出来：点一下只会把文件夹 id 塞进选中集合，接着 importFromMedia 取不到 file_url、
+// 静默 `continue` —— 用户看到"已导入 0 个文件"，却没有任何解释。
+// 现在文件夹变成可进入的一层：面包屑与媒体库页一致，根目录 id 为空串（服务端约定）。
+const mediaBreadcrumbs = ref<{ id: string; name: string }[]>([{ id: '', name: '' }])
+const mediaParentId = computed(
+  () => mediaBreadcrumbs.value[mediaBreadcrumbs.value.length - 1].id,
+)
+
+/**
+ * 已选条目本身（id → item），而不只是 id。
+ *
+ * 选中可以**跨越多个文件夹**，而 `mediaFiles` 只装当前目录。若只存 id，切一次目录
+ * 后再导入，`find` 必然落空，用户点的导入就变成"成功 0 个"。
+ */
+const pickedMedia = ref<Record<string, MediaFileItem>>({})
 
 const kbId = route.params.id as string
 
@@ -271,6 +289,26 @@ async function loadDocuments() {
     documents.value = res.data?.data?.documents || []
   } catch {
     // 静默失败
+  }
+}
+
+// ── 启用 / 停用（owner-only）──
+// `enabled` 是用户开关，与索引状态 `status` 正交：停用不销毁索引，重新启用直接可用。
+// 非属主后端回 404（不回 403，免得确认库是否存在），这里统一给一句"只能操作自己的"。
+const enabledToggling = ref(false)
+
+async function toggleEnabled(next: boolean) {
+  enabledToggling.value = true
+  try {
+    await api.put(`/v1/kb/${kbId}/status`, { enabled: next })
+    if (kb.value) kb.value.enabled = next
+    message.success(next ? t('knowledge.kb_enabled') : t('knowledge.kb_disabled'))
+  } catch (e) {
+    message.error(kbErrorText(e, t('knowledge.can_only_operate_knowledge_bases_you_created')))
+    // 失败回读真实状态：开关不能停在用户以为成功的位置
+    await loadKnowledgeBase()
+  } finally {
+    enabledToggling.value = false
   }
 }
 
@@ -359,19 +397,44 @@ async function flushUploadBatch() {
 }
 
 async function openMediaModal() {
-  loadingMedia.value = true
   showMediaModal.value = true
   selectedMediaIds.value = []
+  pickedMedia.value = {}
   mediaSearchQuery.value = ''
+  mediaBreadcrumbs.value = [{ id: '', name: '' }]
+  await loadMediaFiles()
+}
 
+/**
+ * 拉取当前目录的内容。
+ *
+ * `parent_id` 必须显式传空串（不是省略）：服务端按 `COALESCE(parent_id, '')` 比较，
+ * 省略同样落到空串，但显式传能让"根目录"这件事在代码里写清楚。
+ */
+async function loadMediaFiles() {
+  loadingMedia.value = true
   try {
-    const res = await api.get('/v1/media')
+    const res = await api.get('/v1/media', {
+      params: { parent_id: mediaParentId.value, page_size: MEDIA_PICKER_PAGE_SIZE },
+    })
     mediaFiles.value = res.data?.data?.items || []
   } catch {
+    mediaFiles.value = []
     message.error(t('errors.failed_to_load_media_library'))
   } finally {
     loadingMedia.value = false
   }
+}
+
+/** 进入子文件夹。搜索词保留 —— 用户往往是在搜到的东西里继续往里翻。 */
+async function enterMediaFolder(item: MediaFileItem) {
+  mediaBreadcrumbs.value.push({ id: item.id, name: item.name })
+  await loadMediaFiles()
+}
+
+async function goMediaBreadcrumb(idx: number) {
+  mediaBreadcrumbs.value = mediaBreadcrumbs.value.slice(0, idx + 1)
+  await loadMediaFiles()
 }
 
 async function importFromMedia() {
@@ -384,8 +447,10 @@ async function importFromMedia() {
   let successCount = 0
   let failCount = 0
 
+  // 从 pickedMedia 取条目（而不是当前目录列表）：选择可以跨文件夹，只查 mediaFiles
+  // 会把其他目录里选中的文件漏掉，导入结果少得莫名其妙。
   for (const fileId of selectedMediaIds.value) {
-    const file = mediaFiles.value.find((f) => f.id === fileId)
+    const file = pickedMedia.value[fileId]
     if (!file) continue
 
     try {
@@ -416,21 +481,84 @@ async function importFromMedia() {
   }
 }
 
-function toggleMediaSelection(id: string) {
-  const index = selectedMediaIds.value.indexOf(id)
+function toggleMediaSelection(item: MediaFileItem) {
+  const index = selectedMediaIds.value.indexOf(item.id)
   if (index === -1) {
-    selectedMediaIds.value.push(id)
+    selectedMediaIds.value.push(item.id)
+    pickedMedia.value[item.id] = item
   } else {
     selectedMediaIds.value.splice(index, 1)
+    delete pickedMedia.value[item.id]
   }
 }
 
+/** 全选当前目录的**文件**（文件夹不是可导入对象，不能进选中集合）。 */
 function selectAllMedia() {
-  selectedMediaIds.value = filteredMediaFiles.value.map(f => f.id)
+  const files = filteredMediaFiles.value.filter((f) => !isMediaFolder(f))
+  for (const f of files) pickedMedia.value[f.id] = f
+  selectedMediaIds.value = files.map((f) => f.id)
 }
 
 function deselectAllMedia() {
   selectedMediaIds.value = []
+  pickedMedia.value = {}
+}
+
+/** 当前目录里还有没有可导入的文件（用来区分"目录是空的"和"只有文件夹"）。 */
+const hasSelectableMedia = computed(() =>
+  filteredMediaFiles.value.some((f) => !isMediaFolder(f)),
+)
+
+/**
+ * 当前目录的可导入文件数。
+ *
+ * 计数不能直接用 `filteredMediaFiles.length`：文件夹也在这份列表里，把它们算进
+ * "共 N 项"会让「全选」后的选中数永远追不上总数，看着像功能坏了。
+ */
+const selectableMediaCount = computed(
+  () => filteredMediaFiles.value.filter((f) => !isMediaFolder(f)).length,
+)
+
+/** 库上的索引错误原因（worker 写在 `error_message`，如"文档 X: 缺少原文对象"）。 */
+function kbErrorMessage(): string {
+  return kb.value?.error_message || ''
+}
+
+/**
+ * 轮询到索引进入终态。
+ *
+ * 判据来自 `api/knowledge.ts` 的 `isKbTerminal`（镜像引擎的 `status.py`）——
+ * 这里**不能**再写一个字面量：上一版写 `status === 'active'`，而 worker 只会写
+ * `ready`/`error`，于是索引早已跑完界面还在轮询，十轮后默默放弃。
+ *
+ * `baseline` 是投递前的库状态，用来区分"这次构建真的跑完了"和"库里本来就停在终态"：
+ * 对已 `ready` 的库做重建时，worker 取件前 `status` 仍是 `ready`，不加这层判断就会
+ * 在第一次轮询时谎报"构建完成"。所以只有**观察到 `indexing` 过**或**状态已偏离基线**
+ * 时才认终态。
+ *
+ * 返回 `pending` 表示超时未定：任务可能仍在 worker 里排着，界面只报"仍在进行"。
+ */
+async function waitForBuildToSettle(
+  baseline?: string | null,
+  attempts = 30,
+  intervalMs = 500,
+): Promise<'ready' | 'error' | 'pending'> {
+  let sawBuilding = false
+  for (let i = 0; i < attempts; i++) {
+    await new Promise(resolve => setTimeout(resolve, intervalMs))
+    buildProgress.value = Math.min(90, Math.round(((i + 1) / attempts) * 90))
+    await loadKnowledgeBase()
+    const status = kb.value?.status
+    if (isKbBuilding(status)) {
+      sawBuilding = true
+      continue
+    }
+    if (isKbTerminal(status) && (sawBuilding || status !== baseline)) {
+      if (status === 'ready') buildProgress.value = 100
+      return status === 'ready' ? 'ready' : 'error'
+    }
+  }
+  return 'pending'
 }
 
 async function buildKnowledgeBase() {
@@ -438,52 +566,32 @@ async function buildKnowledgeBase() {
     building.value = true
     buildProgress.value = 0
 
-    const res = await api.post(`/v1/kb/${kbId}/build`)
-    const data = res.data?.data || res.data
+    // 投递前的库状态：重建一个已 `ready` 的库时，worker 取件前 status 仍是 `ready`，
+    // 轮询必须靠它区分"本来就完成的旧状态"和"这次真的跑完了"。
+    const baseline = kb.value?.status ?? null
 
-    message.success(t('billing.build_started_estimated_cost_n_credits', { n: data.estimated_cost }))
+    // 服务端只回 status / task_id / provider —— **没有** `estimated_cost` 这个字段
+    // （计费口径未定，见 python-engine/app/api/knowledge.py 的文件头）。旧提示语把
+    // `{ n: undefined }` 插进「预计消耗 {n} credits」，用户看到的是「预计消耗 undefined
+    // credits」。这里改成"已投递"，不自造一个后端不存在的估算值。
+    await requestBuildIndex(kbId)
+    message.success(t('knowledge.index_build_started'))
 
-    // 等待构建完成（轮询状态）
-    const checkStatus = async () => {
-      for (let i = 0; i < 10; i++) {
-        await new Promise(resolve => setTimeout(resolve, 500))
-        buildProgress.value = Math.min(90, (i + 1) * 10)
-        await loadKnowledgeBase()
-        if (kb.value?.status === 'active') {
-          buildProgress.value = 100
-          message.success(t('common.build_complete'))
-          await loadDocuments()
-          return
-        }
-      }
-      await loadKnowledgeBase()
-      await loadDocuments()
+    const outcome = await waitForBuildToSettle(baseline)
+    if (outcome === 'ready') {
+      message.success(t('common.build_complete'))
+    } else if (outcome === 'error') {
+      message.error(kbErrorMessage() || t('errors.build_failed'))
+    } else {
+      // 超时不等于失败：任务可能还在 worker 里跑，如实说"仍在进行"比谎报完成好
+      message.info(t('knowledge.index_still_running'))
     }
-
-    await checkStatus()
+    await loadDocuments()
   } catch (error) {
     message.error(kbErrorText(error, t('errors.build_failed')))
   } finally {
     building.value = false
     buildProgress.value = 0
-  }
-}
-
-async function queryKnowledgeBase() {
-  if (!queryText.value.trim()) {
-    message.warning(t('common.please_enter_search_content'))
-    return
-  }
-
-  queryAnswer.value = null
-  try {
-    const res = await api.post(`/v1/kb/${kbId}/query`, { query: queryText.value })
-    queryAnswer.value = (res.data?.data || null) as KnowledgeAnswer | null
-    if (!queryAnswer.value?.answer) {
-      message.info(t('errors.no_relevant_content_found'))
-    }
-  } catch (error) {
-    message.error(kbErrorText(error, t('errors.query_failed')))
   }
 }
 
@@ -506,33 +614,6 @@ function formatSize(bytes: number): string {
   const sizes = ['B', 'KB', 'MB', 'GB']
   const i = Math.floor(Math.log(bytes) / Math.log(k))
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
-}
-
-/** 搜索关键词高亮 — 将查询文本按关键词分割并标记高亮段 */
-function highlightSegments(text: string): Array<{ text: string; highlight: boolean }> {
-  if (!text || !queryText.value.trim()) {
-    return [{ text: text || '', highlight: false }]
-  }
-  const keywords = queryText.value.trim().split(/\s+/).filter(Boolean)
-  if (keywords.length === 0) {
-    return [{ text, highlight: false }]
-  }
-  // 用正则匹配所有关键词
-  const pattern = new RegExp(`(${keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
-  const parts: Array<{ text: string; highlight: boolean }> = []
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      parts.push({ text: text.slice(lastIndex, match.index), highlight: false })
-    }
-    parts.push({ text: match[0], highlight: true })
-    lastIndex = pattern.lastIndex
-  }
-  if (lastIndex < text.length) {
-    parts.push({ text: text.slice(lastIndex), highlight: false })
-  }
-  return parts.length > 0 ? parts : [{ text, highlight: false }]
 }
 </script>
 
@@ -565,14 +646,12 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
         >
           {{ $t('agent.assemble_to_agent') }}
         </Button>
-        <Button @click="showQueryModal = true">
-          {{ $t('knowledge.query_knowledge_base') }}
-        </Button>
         <Button
-          v-if="kb?.status !== 'building'"
+          v-if="!isKbBuilding(kb?.status)"
           type="primary"
           :loading="building"
-          :disabled="building"
+          :disabled="building || kb?.enabled === false"
+          :title="kb?.enabled === false ? $t('knowledge.kb_disabled_hint') : undefined"
           @click="buildKnowledgeBase"
         >
           <template #icon>
@@ -613,6 +692,21 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
               <Tag :color="kbStatusColor(kb.status)">
                 {{ kbStatusLabel(kb.status) }}
               </Tag>
+            </div>
+            <!-- 用户开关：与上面那个索引状态正交（停用不销毁索引，重新启用即可用） -->
+            <div class="info-item">
+              <span class="label">{{ $t('knowledge.enabled') }}</span>
+              <span
+                class="enabled-toggle"
+                :title="kb.enabled === false ? $t('knowledge.kb_disabled_hint') : $t('knowledge.kb_enabled_hint')"
+              >
+                <Switch
+                  :checked="kb.enabled !== false"
+                  :loading="enabledToggling"
+                  size="small"
+                  @change="(v: any) => toggleEnabled(Boolean(v))"
+                />
+              </span>
             </div>
             <div class="info-item">
               <span class="label">{{ $t('knowledge.documents') }}</span>
@@ -789,77 +883,6 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
       </div>
     </Spin>
 
-    <!-- 查询弹窗 -->
-    <Modal
-      v-model:visible="showQueryModal"
-      :title="$t('knowledge.query_knowledge_base')"
-      :footer="null"
-      :style="{ maxWidth: '600px' }"
-    >
-      <Input.TextArea
-        v-model:value="queryText"
-        :placeholder="$t('common.enter_search_content')"
-        :rows="3"
-      />
-      <div class="modal-footer">
-        <Button @click="showQueryModal = false">
-          {{ $t('common.close') }}
-        </Button>
-        <Button
-          type="primary"
-          @click="queryKnowledgeBase"
-        >
-          {{ $t('common.query') }}
-        </Button>
-      </div>
-
-      <!-- 查询结果：答案 + 引用（PageIndex 返回推理结果，不是相似度片段） -->
-      <div
-        v-if="queryAnswer"
-        class="query-results"
-      >
-        <h3>{{ $t('knowledge.answer') }}</h3>
-        <p class="result-content">
-          <span
-            v-for="(seg, segIdx) in highlightSegments(queryAnswer.answer || '')"
-            :key="segIdx"
-          >
-            <mark
-              v-if="seg.highlight"
-              class="search-highlight"
-            >{{ seg.text }}</mark>
-            <template v-else>{{ seg.text }}</template>
-          </span>
-        </p>
-        <template v-if="(queryAnswer.citations || []).length">
-          <h4 class="citations-title">
-            {{ $t('knowledge.citations') }}
-          </h4>
-          <div
-            v-for="(cite, index) in queryAnswer.citations"
-            :key="index"
-            class="query-result-item"
-          >
-            <div class="result-header">
-              <Tag v-if="cite.page">
-                P{{ cite.page }}
-              </Tag>
-              <span
-                v-if="cite.doc_name"
-                class="result-source"
-              >📄 {{ cite.doc_name }}</span>
-            </div>
-            <p
-              v-if="cite.snippet"
-              class="result-content"
-            >
-              {{ cite.snippet }}
-            </p>
-          </div>
-        </template>
-      </div>
-    </Modal>
-
     <!-- 从媒体库选取弹窗 -->
     <Modal
       v-model:visible="showMediaModal"
@@ -879,9 +902,10 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
           </template>
         </Input>
         <div class="media-actions">
-          <span class="selected-count">{{ $t('common.selected_sel_total_items', { sel: selectedMediaIds.length, total: filteredMediaFiles.length }) }}</span>
+          <span class="selected-count">{{ $t('common.selected_sel_total_items', { sel: selectedMediaIds.length, total: selectableMediaCount }) }}</span>
           <Button
             size="small"
+            :disabled="!hasSelectableMedia"
             @click="selectAllMedia"
           >
             {{ $t('common.select_all') }}
@@ -895,33 +919,65 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
         </div>
       </div>
 
+      <!-- 目录面包屑：与媒体库页同构（末项是当前位置，不做按钮）。
+           根目录回退用 all_files，与媒体库页的文案一致。 -->
+      <div class="media-breadcrumb">
+        <template
+          v-for="(cr, i) in mediaBreadcrumbs"
+          :key="cr.id || 'root'"
+        >
+          <span
+            class="crumb"
+            :class="{ active: i === mediaBreadcrumbs.length - 1 }"
+            :role="i === mediaBreadcrumbs.length - 1 ? undefined : 'button'"
+            :tabindex="i === mediaBreadcrumbs.length - 1 ? undefined : 0"
+            :aria-current="i === mediaBreadcrumbs.length - 1 ? 'page' : undefined"
+            @click="i < mediaBreadcrumbs.length - 1 && goMediaBreadcrumb(i)"
+            @keydown.enter.prevent="i < mediaBreadcrumbs.length - 1 && goMediaBreadcrumb(i)"
+          >{{ cr.name || $t('media.all_files') }}</span>
+          <span
+            v-if="i < mediaBreadcrumbs.length - 1"
+            class="crumb-sep"
+            aria-hidden="true"
+          >/</span>
+        </template>
+      </div>
+
       <Spin :spinning="loadingMedia">
         <div
           v-if="filteredMediaFiles.length === 0 && !loadingMedia"
           class="media-empty"
         >
-          <Empty :description="mediaSearchQuery ? $t('media.no_matching_files') : $t('media.media_library_is_empty')" />
+          <Empty :description="mediaSearchQuery ? $t('media.no_matching_files') : $t('media.no_files_yet')" />
         </div>
         <div
           v-else
           class="media-list"
         >
+          <!-- 文件夹与文件混在一列返回：文件夹渲染成"进入"按钮，不参与勾选 -->
           <div
             v-for="item in filteredMediaFiles"
             :key="item.id"
-            :class="['media-item', { selected: selectedMediaIds.includes(item.id) }]"
-            role="checkbox"
-            :aria-checked="selectedMediaIds.includes(item.id)"
+            :class="['media-item', { selected: !isMediaFolder(item) && selectedMediaIds.includes(item.id) }]"
+            :role="isMediaFolder(item) ? 'button' : 'checkbox'"
+            :aria-checked="isMediaFolder(item) ? undefined : selectedMediaIds.includes(item.id)"
             tabindex="0"
-            @click="toggleMediaSelection(item.id)"
-            @keydown.enter.prevent="toggleMediaSelection(item.id)"
-            @keydown.space.prevent="toggleMediaSelection(item.id)"
+            @click="isMediaFolder(item) ? enterMediaFolder(item) : toggleMediaSelection(item)"
+            @keydown.enter.prevent="isMediaFolder(item) ? enterMediaFolder(item) : toggleMediaSelection(item)"
+            @keydown.space.prevent="isMediaFolder(item) ? enterMediaFolder(item) : toggleMediaSelection(item)"
           >
+            <!-- 文件夹没有勾选框：放进一个不会被点到的 Checkbox 只会让人以为能选 -->
+            <FolderOutlined
+              v-if="isMediaFolder(item)"
+              class="media-folder-icon"
+              aria-hidden="true"
+            />
             <!-- 内层 Checkbox 只作视觉：语义与键盘操作已由外层的 role="checkbox" + aria-checked
                  承担。若不排除它，这一行会出现两个可聚焦点表达同一件事（Tab 要经过两次、
                  读屏要读两遍）；aria-hidden 配合 tabindex="-1" 才是合法组合
                  （aria-hidden 的元素不允许仍可聚焦）。 -->
             <Checkbox
+              v-else
               :checked="selectedMediaIds.includes(item.id)"
               :tabindex="-1"
               aria-hidden="true"
@@ -929,8 +985,14 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
             <div class="media-info">
               <span class="media-name">{{ item.name }}</span>
               <span class="media-meta">
-                <span class="media-type">{{ item.type }}</span>
-                <span class="media-size">{{ formatSize(item.size) }}</span>
+                <span
+                  v-if="!isMediaFolder(item)"
+                  class="media-type"
+                >{{ item.type }}</span>
+                <span
+                  v-if="!isMediaFolder(item)"
+                  class="media-size"
+                >{{ formatSize(item.size) }}</span>
               </span>
             </div>
           </div>
@@ -975,6 +1037,7 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
 .kb-detail-header h1 { flex: 1; margin: 0; font-size: 24px; font-weight: var(--fw-semibold); color: var(--text-primary); }
 .info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
 .info-item { display: flex; flex-direction: column; gap: 4px; }
+.enabled-toggle { display: inline-flex; align-items: center; }
 .info-item .label { font-size: 13px; color: var(--text-tertiary); }
 .info-item .value { color: var(--text-primary); }
 .kb-description { margin-top: 16px; padding-top: 16px; border-top: var(--hairline-width) solid var(--border-card); color: var(--text-secondary); line-height: 1.6; }
@@ -997,6 +1060,15 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
 .media-actions { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .selected-count { font-size: 13px; color: var(--text-secondary); }
 .media-empty { padding: 40px 0; }
+/* 目录面包屑：与媒体库页 .breadcrumb 的观感保持一致 */
+.media-breadcrumb { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; min-width: 0; margin-bottom: 10px; font-size: 13px; }
+.media-breadcrumb .crumb { color: var(--text-secondary); border-radius: var(--radius-sm, 4px); padding: 2px 4px; }
+.media-breadcrumb .crumb[role="button"] { cursor: pointer; }
+.media-breadcrumb .crumb[role="button"]:hover { color: var(--primary-color, #1677ff); background: var(--bg-hover, rgba(0,0,0,0.03)); }
+.media-breadcrumb .crumb.active { color: var(--text-primary); font-weight: var(--fw-medium); }
+.media-breadcrumb .crumb-sep { color: var(--text-tertiary); }
+/* 首列图标位与 Checkbox 同宽，让文件夹行与文件行左边缘对齐 */
+.media-folder-icon { font-size: 14px; color: var(--warning-color, #faad14); flex: none; }
 .media-list { border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-lg); overflow: hidden; max-height: 400px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .media-item { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: var(--hairline-width) solid var(--border-card); cursor: pointer; transition: background var(--dur-normal); }
 .media-item:last-child { border-bottom: none; }

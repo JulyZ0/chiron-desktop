@@ -26,11 +26,13 @@ from app.knowledge.providers.base import (
     AnswerResult,
     ProviderContext,
 )
+from app.knowledge.status import STATUS_INDEXING
 from app.tools.context import to_tenant_int
 
 logger = logging.getLogger(__name__)
 
-STATUS_INDEXING = "indexing"
+#: 兼容旧引用（曾在此就地定义）；取值权威源是 ``app/knowledge/status.py``。
+__all__ = ["STATUS_INDEXING"]
 
 
 async def _pool() -> Any:
@@ -75,8 +77,14 @@ async def _set_kb_status(pool: Any, kb_id: str, status: str, error_message: str 
 
 
 async def _load_kb(pool: Any, kb_id: str) -> Any:
+    """取 KB 行（含 ``enabled``）。
+
+    ``enabled`` 必须一起取：检索入口要靠它判断"这个库被停用了没有"。漏掉这一列
+    会让下面 ``_require_enabled`` 的判定静默失效（Row 取不存在的键会抛，但从
+    dict 取不会）—— 于是"停用"退化成纯展示字段。
+    """
     kb = await pool.fetchrow(
-        """SELECT id, tenant_id, user_id, provider, index_ref, config, status
+        """SELECT id, tenant_id, user_id, provider, index_ref, config, status, enabled
              FROM knowledge_bases WHERE id = $1""",
         kb_id,
     )
@@ -98,6 +106,40 @@ async def index_knowledge_base(*, kb_id: str, user_id: str) -> dict[str, Any]:
     )
 
 
+class KnowledgeBaseDisabledError(KnowledgeError):
+    """知识库已被停用（用户开关关闭）。
+
+    单独一个类型（而不是复用 ``ProviderUnavailableError``）：前者是**用户意图**、
+    调用方应当提示"去把开关打开"，后者是**配置/上游故障**、提示"检查设置"。混在一起
+    时前端只能给一句"不可用"，用户照着去查设置却找不到问题。
+    """
+
+
+def kb_enabled(kb_row: Any) -> bool:
+    """行里的 ``enabled``；缺列时按启用处理（见 ``app/api/knowledge.py::_row_enabled``）。"""
+    try:
+        keys = kb_row.keys()
+    except AttributeError:  # dict 之外的实现
+        return True
+    if "enabled" not in keys:
+        return True
+    value = kb_row["enabled"]
+    return True if value is None else bool(value)
+
+
+def _require_enabled(kb: Any) -> None:
+    """**检索与索引的公共闸门**：停用的库在这里被拦住。
+
+    放在 service 层而不是只放在 API 层：``kb_search``（Agent 工具）与 ``kb_index``
+    （队列 worker 调用的 handle 路径）都走 service，只在 API 加等于留了两个后门 ——
+    Agent 照样能检索停用的库，队列里排着的任务照样会给停用的库建索引。
+    """
+    if not kb_enabled(kb):
+        raise KnowledgeBaseDisabledError(
+            "该知识库已停用；请在知识库详情页重新启用后再检索"
+        )
+
+
 async def answer_question(
     *, kb_id: str, user_id: str, question: str
 ) -> tuple[AnswerResult, str]:
@@ -108,6 +150,7 @@ async def answer_question(
     """
     pool = await _pool()
     kb = await _load_kb(pool, kb_id)
+    _require_enabled(kb)
 
     provider, _settings, health = await registry.resolve_for_user(
         user_id, folder_id=str(kb["index_ref"] or "")

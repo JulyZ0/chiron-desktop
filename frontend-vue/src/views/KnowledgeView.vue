@@ -2,11 +2,11 @@
 import { ref, onMounted, computed, markRaw } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  Alert, Button, Modal, Input, Radio, Tag, Popconfirm, message,
+  Alert, Button, Modal, Input, Radio, Switch, Tag, Popconfirm, message,
 } from 'ant-design-vue'
 import { BookOutlined, PlusOutlined, DeleteOutlined, SearchOutlined, EditOutlined, FileTextOutlined, DatabaseOutlined, TeamOutlined, LockOutlined } from '@ant-design/icons-vue'
 import { api, listAgents, setKBVisibility } from '../api'
-import { getKnowledgeSettings } from '../api/knowledge'
+import { getKnowledgeSettings, setKnowledgeBaseEnabled } from '../api/knowledge'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import { collectKbUsage, kbUsageOf, type KbUsage } from '../utils/kbUsage'
@@ -22,6 +22,11 @@ interface KnowledgeBase {
   provider: 'selfhosted' | 'cloud'
   visibility: 'public' | 'private' | 'tenant'
   status: 'disabled' | 'indexing' | 'ready' | 'error'
+  /**
+   * 用户开关（与 `status` 正交）。旧后端不返回该字段，按「启用」处理 ——
+   * 误判成停用会让存量库突然查不到，比开关显示不对严重得多。
+   */
+  enabled?: boolean
   error_message?: string
   document_count: number
   total_size_bytes: number
@@ -196,6 +201,31 @@ async function toggleVisibility(kb: KnowledgeBase) {
   }
 }
 
+// ── 启用 / 停用（owner-only）──
+// `enabled` 与索引状态 `status` 正交：停用不销毁索引，重新启用直接可用，不重复花索引费用。
+// 所以这里只改开关，绝不动 `status` —— 否则"停用"会连带把索引状态抹成分不清的值。
+const enabledTogglingId = ref('')
+
+async function toggleEnabled(kb: KnowledgeBase, next: boolean) {
+  enabledTogglingId.value = kb.id
+  try {
+    await setKnowledgeBaseEnabled(kb.id, next)
+    // 就地改而不是重拉列表：重拉会让整页 loading 闪一下，用户刚点的开关"跳没了"再出现
+    kb.enabled = next
+    message.success(next ? t('knowledge.kb_enabled') : t('knowledge.kb_disabled'))
+  } catch (e) {
+    const msg = serverErrorDetail(e, '')
+    if (errorStatus(e) === 404) {
+      message.error(t('knowledge.can_only_operate_knowledge_bases_you_created') + (msg ? `：${msg}` : ''))
+    } else {
+      message.error(t('errors.operation_failed') + (msg ? `：${msg}` : ''))
+    }
+    // 失败不改本地值：开关停在原处，用户看到的就是库的真实状态
+  } finally {
+    enabledTogglingId.value = ''
+  }
+}
+
 function openKnowledgeBase(kb: KnowledgeBase) {
   router.push(`/knowledge/${kb.id}`)
 }
@@ -357,6 +387,21 @@ function statusLabel(status: string): string {
               <Tag :color="statusColor(kb.status)">
                 {{ statusLabel(kb.status) }}
               </Tag>
+              <!-- 用户开关：与索引状态正交，停用后不参与检索也不能构建索引 -->
+              <label
+                class="stat kb-enabled-toggle"
+                :title="kb.enabled === false ? $t('knowledge.kb_disabled_hint') : $t('knowledge.kb_enabled_hint')"
+                @click.stop
+              >
+                <span>{{ $t('knowledge.enabled') }}</span>
+                <Switch
+                  :checked="kb.enabled !== false"
+                  :loading="enabledTogglingId === kb.id"
+                  size="small"
+                  @change="(v: any) => toggleEnabled(kb, Boolean(v))"
+                  @click.stop
+                />
+              </label>
               <Tag
                 v-if="usageLabel(kb.id)"
                 color="blue"
@@ -604,6 +649,8 @@ function statusLabel(status: string): string {
 .kb-stats { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .stat { font-size: 12px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
 .stat :deep(svg) { font-size: 12px; color: var(--text-tertiary); }
+/* 启用开关：与其它 stat 同一行时垂直居中，文字与开关之间留一点呼吸 */
+.kb-enabled-toggle { gap: 6px; cursor: pointer; user-select: none; }
 .kb-footer { display: flex; justify-content: space-between; align-items: center; border-top: var(--hairline-width) solid var(--border-card); padding-top: 10px; }
 .kb-time { font-size: var(--fs-xs); color: var(--text-tertiary); }
 .footer-actions { display: flex; gap: 2px; }
