@@ -3,20 +3,20 @@ import { ref, computed, onMounted, markRaw } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Button, Input, Tabs, TabPane, Switch, Tag, Modal, InputNumber,
-  Select, Alert, Dropdown, Menu, MenuItem, message,
+  Select, Dropdown, Menu, MenuItem, message,
 } from 'ant-design-vue'
 import {
-  ThunderboltOutlined, DownloadOutlined, DeleteOutlined, PlayCircleOutlined,
+  DeleteOutlined, PlayCircleOutlined,
   SearchOutlined, CodeOutlined, MessageOutlined, ShopOutlined, RobotOutlined,
 } from '@ant-design/icons-vue'
-import { api, listAgents, discoverSkills, type DiscoveredSkill, type SkillDiscovery } from '../api'
+import { api, listAgents } from '../api'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import AttachToAgentDialog from '../components/common/AttachToAgentDialog.vue'
 import { collectSkillUsage, usageOf, type SkillUsage } from '../utils/skillUsage'
 
 import { useI18n } from 'vue-i18n'
-import { serverErrorDetail, errorMessageText } from '../utils/apiError'
+import { serverErrorDetail } from '../utils/apiError'
 const { t: tr } = useI18n()
 interface SkillParam {
   name: string
@@ -238,104 +238,15 @@ function renderResult(res: unknown): string {
   return JSON.stringify(res, null, 2)
 }
 
-// ── 安装 ──
-const installURL = ref('')
-const installInline = ref('')
-const installLoading = ref(false)
-
-async function handleInstall() {
-  const body: Record<string, unknown> = {}
-  if (installURL.value) body.url = installURL.value
-  else if (installInline.value) body.inline = installInline.value
-  else { message.error(tr('common.please_enter_a_url_or_inline_json')); return }
-  installLoading.value = true
-  try {
-    await api.post('/v1/skills/install', body)
-    message.success(tr('agent.skill_installed'))
-    installURL.value = ''
-    installInline.value = ''
-    await loadSkills()
-    activeTab.value = 'list'
-  } catch (e) {
-    message.error(tr('errors.install_failed_error', { error: serverErrorDetail(e, '') }))
-  } finally {
-    installLoading.value = false
-  }
-}
-
-// ── 生成 ──
-const genDesc = ref('')
-/** POST /v1/skills/generate 返回的 skill 摘要（模板直接读 name/description） */
-interface GeneratedSkill {
-  name?: string
-  description?: string
-}
-const genResult = ref<GeneratedSkill | null>(null)
-const genLoading = ref(false)
-
-async function handleGenerate() {
-  if (!genDesc.value.trim()) { message.error(tr('common.please_enter_a_description')); return }
-  genLoading.value = true
-  genResult.value = null
-  try {
-    const response = await api.post('/v1/skills/generate', {
-      description: genDesc.value,
-      auto_install: true,
-    })
-    genResult.value = response.data?.data?.skill || response.data?.data
-    message.success(tr('agent.skill_generated_and_installed'))
-    await loadSkills()
-  } catch (e) {
-    message.error(tr('errors.generation_failed_error', { error: serverErrorDetail(e, '') }))
-  } finally {
-    genLoading.value = false
-  }
-}
-
-// ── 发现（GET /v1/skills/discover）──
-//
-// 这是**唯一**能看到"远端有、本地没有"的入口：此前前端只有安装（要用户自己知道地址）
-// 与列表（只看已装），中间的"发现 → 挑选 → 安装"整段是断的。
-const catalogUrl = ref('')
-const discovery = ref<SkillDiscovery>({ local: [], remote: [] })
-const discoverLoading = ref(false)
-const discoverError = ref('')
-/** 是否已经拉过一次目录 —— 用来区分"还没拉"与"拉了但目录是空的" */
-const discoverDone = ref(false)
-
-async function handleDiscover() {
-  discoverLoading.value = true
-  discoverError.value = ''
-  try {
-    discovery.value = await discoverSkills(catalogUrl.value.trim() || undefined)
-    discoverDone.value = true
-  } catch (e) {
-    // 就地报错：拉取失败必须与"目录里确实没有技能"区分开，否则用户以为目录是空的。
-    discoverError.value = errorMessageText(e, tr('errors.operation_failed'))
-    discovery.value = { local: [], remote: [] }
-    discoverDone.value = false
-  } finally {
-    discoverLoading.value = false
-  }
-}
-
-/** 把发现结果里的条目装进本地（复用安装端点，装完刷新列表与发现结果） */
-async function installDiscovered(item: DiscoveredSkill) {
-  if (!item.source) {
-    message.warning(tr('agent.discover_no_install_url'))
-    return
-  }
-  installLoading.value = true
-  try {
-    await api.post('/v1/skills/install', { url: item.source })
-    message.success(tr('agent.skill_installed'))
-    await loadSkills()
-    await handleDiscover()
-  } catch (e) {
-    message.error(tr('errors.install_failed_error', { error: serverErrorDetail(e, '') }))
-  } finally {
-    installLoading.value = false
-  }
+/**
+ * 空状态引导去市场装技能。
+ *
+ * 安装/发现/AI 生成三个页签已撤下：技能的定义与「装进来」这件事统一由市场承担
+ * （带 `kind=skill` 跳 `/market`，来源与签名在市场页标注），页面上只保留已有技能的
+ * 启停、运行、装配、删除。
+ */
+function goToMarket() {
+  void router.push({ path: '/market', query: { kind: 'skill' } })
 }
 </script>
 
@@ -350,15 +261,6 @@ async function installDiscovered(item: DiscoveredSkill) {
           {{ $t('agent.extend_agent_custom_capabilities_enable_run_and_ai_generate_them') }}
         </p>
       </div>
-      <Button
-        type="primary"
-        @click="activeTab = 'install'"
-      >
-        <template #icon>
-          <DownloadOutlined />
-        </template>
-        {{ $t('agent.install_skill') }}
-      </Button>
     </div>
 
     <Tabs
@@ -414,8 +316,19 @@ async function installDiscovered(item: DiscoveredSkill) {
           size="page"
           :icon="markRaw(CodeOutlined)"
           :description="searchQuery || typeFilter !== 'all' ? $t('agent.no_matching_skills') : $t('agent.no_skills')"
-          :hint="searchQuery || typeFilter !== 'all' ? $t('common.try_adjusting_search_keywords_or_type_filters') : $t('agent.install_skills_from_the_market_or_upload_a_local_skill_package')"
-        />
+          :hint="searchQuery || typeFilter !== 'all' ? $t('common.try_adjusting_search_keywords_or_type_filters') : $t('agent.install_skills_from_the_market_to_get_started')"
+        >
+          <Button
+            v-if="!searchQuery && typeFilter === 'all'"
+            type="primary"
+            @click="goToMarket"
+          >
+            <template #icon>
+              <ShopOutlined />
+            </template>
+            {{ $t('agent.browse_market') }}
+          </Button>
+        </EmptyState>
 
         <div
           v-else
@@ -567,197 +480,6 @@ async function installDiscovered(item: DiscoveredSkill) {
           </div>
         </div>
       </TabPane>
-
-      <!-- ── 安装技能 ── -->
-      <TabPane
-        key="install"
-        :tab="$t('agent.install_skill')"
-      >
-        <div class="panel-card">
-          <h3 class="panel-title">
-            <DownloadOutlined /> {{ $t('common.install_from_url') }}
-          </h3>
-          <Input
-            v-model:value="installURL"
-            placeholder="https://example.com/my-skill.skill.json"
-          />
-          <div class="or-divider">
-            {{ $t('common.or') }}
-          </div>
-          <h3 class="panel-title">
-            <CodeOutlined /> {{ $t('common.inline_json') }}
-          </h3>
-          <Input.TextArea
-            v-model:value="installInline"
-            :rows="6"
-            placeholder="{&quot;name&quot;:&quot;my-skill&quot;,&quot;description&quot;:&quot;...&quot;,&quot;exec&quot;:{&quot;type&quot;:&quot;prompt&quot;,&quot;source&quot;:&quot;...&quot;},&quot;parameters&quot;:[]}"
-            class="mono-input"
-          />
-          <Button
-            type="primary"
-            :loading="installLoading"
-            class="install-btn"
-            @click="handleInstall"
-          >
-            <template #icon>
-              <DownloadOutlined />
-            </template>
-            {{ $t('common.install') }}
-          </Button>
-        </div>
-      </TabPane>
-
-      <!-- ── 发现（远端目录）── -->
-      <TabPane
-        key="discover"
-        :tab="$t('agent.discover_skills')"
-      >
-        <div class="panel-card">
-          <h3 class="panel-title">
-            <ShopOutlined /> {{ $t('agent.skill_catalog_url') }}
-          </h3>
-          <Input
-            v-model:value="catalogUrl"
-            placeholder="https://example.com/skills.json"
-            :disabled="discoverLoading"
-            @press-enter="handleDiscover"
-          />
-          <p class="panel-hint">
-            {{ $t('agent.skill_catalog_hint') }}
-          </p>
-          <Button
-            type="primary"
-            :loading="discoverLoading"
-            class="install-btn"
-            @click="handleDiscover"
-          >
-            <template #icon>
-              <ShopOutlined />
-            </template>
-            {{ $t('agent.discover_pull') }}
-          </Button>
-        </div>
-
-        <!-- 拉取失败就地报错：不能让它显示成「目录里没有技能」 -->
-        <Alert
-          v-if="discoverError"
-          type="error"
-          show-icon
-          class="discover-alert"
-          :message="$t('errors.load_failed_please_retry_later')"
-          :description="discoverError"
-        />
-
-        <div
-          v-if="discovery.remote.length"
-          class="discover-list"
-        >
-          <div
-            v-for="item in discovery.remote"
-            :key="item.name"
-            class="discover-item"
-          >
-            <div class="discover-main">
-              <div class="card-name-line">
-                <span class="card-name">{{ item.name }}</span>
-                <Tag
-                  v-if="item.version"
-                  class="exec-tag"
-                >
-                  v{{ item.version }}
-                </Tag>
-                <Tag
-                  v-if="item.installed"
-                  color="green"
-                  class="exec-tag"
-                >
-                  {{ $t('agent.discover_installed_tag') }}
-                </Tag>
-              </div>
-              <span class="card-desc">{{ item.description }}</span>
-              <span
-                v-if="item.author"
-                class="discover-author"
-              >{{ item.author }}</span>
-            </div>
-            <Button
-              v-if="!item.installed"
-              type="primary"
-              ghost
-              :loading="installLoading"
-              :disabled="!item.source"
-              :title="item.source ? '' : $t('agent.discover_no_install_url')"
-              @click="installDiscovered(item)"
-            >
-              <template #icon>
-                <DownloadOutlined />
-              </template>
-              {{ $t('common.install') }}
-            </Button>
-          </div>
-        </div>
-        <EmptyState
-          v-else-if="!discoverLoading && !discoverError && discoverDone && catalogUrl.trim() && discovery.remote.length === 0"
-          size="page"
-          :icon="markRaw(ShopOutlined)"
-          :description="$t('agent.discover_remote_empty')"
-        />
-
-        <div
-          v-if="discovery.local.length"
-          class="discover-local"
-        >
-          <span class="detail-label">{{ $t('agent.skill_list') }}</span>
-          <div class="card-meta">
-            <Tag
-              v-for="s in discovery.local"
-              :key="s.name"
-            >
-              {{ s.name }}
-            </Tag>
-          </div>
-        </div>
-      </TabPane>
-
-      <!-- ── AI 生成 ── -->
-      <TabPane
-        key="generate"
-        :tab="$t('common.ai_generated')"
-      >
-        <div class="panel-card">
-          <h3 class="panel-title">
-            <ThunderboltOutlined /> {{ $t('agent.describe_the_skill_in_one_sentence') }}
-          </h3>
-          <Input.TextArea
-            v-model:value="genDesc"
-            :rows="4"
-            :placeholder="$t('errors.e_g_create_a_skill_that_analyzes_jenkins_build_logs_and_summarizes_failure_causes')"
-          />
-          <Button
-            type="primary"
-            :loading="genLoading"
-            class="install-btn"
-            @click="handleGenerate"
-          >
-            <template #icon>
-              <ThunderboltOutlined />
-            </template>
-            {{ $t('common.generate_and_install') }}
-          </Button>
-          <Alert
-            v-if="genResult"
-            type="success"
-            show-icon
-            class="gen-alert"
-            :message="$t('common.generated_name', { name: genResult.name })"
-            :description="genResult.description"
-          />
-          <pre
-            v-if="genResult"
-            class="gen-pre"
-          >{{ JSON.stringify(genResult, null, 2) }}</pre>
-        </div>
-      </TabPane>
     </Tabs>
 
     <!-- ── 运行 Modal ── -->
@@ -901,32 +623,6 @@ async function installDiscovered(item: DiscoveredSkill) {
 .detail-label { font-size: var(--fs-xs); color: var(--text-tertiary); font-weight: var(--fw-medium); }
 .detail-value { font-size: 12px; color: var(--text-primary); }
 .detail-pre { margin: 0; padding: 8px; background: var(--bg-secondary); border-radius: var(--radius-lg); font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-secondary); white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; }
-
-.panel-card { max-width: 640px; border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-lg); background: var(--bg-card); box-shadow: var(--shadow-md); padding: 20px; }
-.panel-title { font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
-.or-divider { text-align: center; color: var(--text-tertiary); margin: 14px 0; }
-.mono-input :deep(textarea) { font-family: var(--font-mono); font-size: 12px; }
-.install-btn { margin-top: 14px; }
-.panel-hint { margin: 8px 0 0; font-size: var(--fs-xs); color: var(--text-tertiary); line-height: 1.5; }
-
-/* 发现页签：左侧条目信息、右侧安装按钮，窄屏时上下堆叠 */
-.discover-alert { margin-top: 14px; }
-.discover-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
-.discover-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 16px;
-  border: var(--hairline-width) solid var(--border-card);
-  border-radius: var(--radius-lg);
-  background: var(--bg-card);
-}
-.discover-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.discover-author { font-size: var(--fs-xs); color: var(--text-tertiary); }
-.discover-local { display: flex; flex-direction: column; gap: 6px; margin-top: 20px; }
-.gen-alert { margin-top: 14px; }
-.gen-pre { margin: 12px 0 0; padding: 10px; background: var(--bg-secondary); border-radius: var(--radius-lg); font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-secondary); white-space: pre-wrap; max-height: 260px; overflow-y: auto; }
 
 .run-desc { font-size: 13px; color: var(--text-secondary); margin-bottom: 14px; }
 .run-form { display: flex; flex-direction: column; gap: 12px; }

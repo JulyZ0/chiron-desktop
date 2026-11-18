@@ -11,7 +11,7 @@ export default {
   n_params: "{n} 参数",
   n_tools: "{n} 工具",
   subject_will_be_appended_to_the_agent_s_existing_bindings_without_overwriting_others: "{subject}会追加到该 Agent 的已有绑定，不覆盖其它项。",
-  install_skills_from_the_market_or_upload_a_local_skill_package: "从市场安装技能或上传本地技能包",
+  install_skills_from_the_market_to_get_started: "到市场装一个技能就能开始使用",
   multi_agent_collaboration: "多智能体协同",
   upload_this_conversation_s_body_n_characters_as_a_markdown_document_reasoning_and_tool_calls_are_not_included: "将上传本次对话的正文（{n} 字符）为 Markdown 文档；思考过程与工具调用不会写入。",
   show_tool_list: "展开工具列表",

@@ -11,7 +11,7 @@ export default {
   n_params: "{n} معامل",
   n_tools: "{n} أداة",
   subject_will_be_appended_to_the_agent_s_existing_bindings_without_overwriting_others: "{subject} ستُضاف إلى ارتباطات الوكيل الحالية دون الكتابة فوق غيرها.",
-  install_skills_from_the_market_or_upload_a_local_skill_package: "ثبّت المهارات من السوق أو ارفع حزمة مهارات محلية",
+  install_skills_from_the_market_to_get_started: "ثبّت مهارة من السوق لتبدأ الاستخدام",
   multi_agent_collaboration: "تعاون متعدد الوكلاء",
   upload_this_conversation_s_body_n_characters_as_a_markdown_document_reasoning_and_tool_calls_are_not_included: "سيتم رفع نص هذه المحادثة ({n} حرف) كمستند Markdown؛ ولن تُكتب عملية التفكير واستدعاءات الأدوات.",
   show_tool_list: "عرض قائمة الأدوات",
