@@ -15,6 +15,27 @@ export type ProviderName = 'selfhosted' | 'cloud'
 export type KbStatus = 'disabled' | 'indexing' | 'ready' | 'error'
 export type KbVisibility = 'public' | 'private' | 'tenant'
 
+/**
+ * 索引状态的判据集合 —— 逐项镜像引擎侧 `python-engine/app/knowledge/status.py`。
+ *
+ * 这里**必须**是唯一一份前端判据：此前详情页把"构建完成"写成 `status === 'active'`、
+ * 把"正在构建"写成 `'building'`，而这两个取值**从未被任何写入方写过**（worker 只写
+ * `indexing` / `ready` / `error`）。后果是索引真跑完、库早已 `ready`，界面仍轮询到超时
+ * 后默默放弃；"构建中"的按钮分支也永远不生效。
+ */
+export const KB_BUILDING_STATUSES: readonly KbStatus[] = ['indexing']
+export const KB_TERMINAL_STATUSES: readonly KbStatus[] = ['ready', 'error']
+
+/** 是否正在索引（读的是**库上的 status**，不是本地 loading 标志）。 */
+export function isKbBuilding(status?: string | null): boolean {
+  return KB_BUILDING_STATUSES.includes(status as KbStatus)
+}
+
+/** 是否已到终态（`error` 也算终态：继续轮询一个失败的库只会让用户干等）。 */
+export function isKbTerminal(status?: string | null): boolean {
+  return KB_TERMINAL_STATUSES.includes(status as KbStatus)
+}
+
 export interface KnowledgeBase {
   id: string
   name: string

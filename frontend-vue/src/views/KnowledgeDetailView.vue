@@ -11,6 +11,11 @@ import {
   MessageOutlined, EyeOutlined, ReloadOutlined,
 } from '@ant-design/icons-vue'
 import { api, resolveMediaUrl } from '../api'
+import {
+  buildKnowledgeBase as requestBuildIndex,
+  isKbBuilding,
+  isKbTerminal,
+} from '../api/knowledge'
 import { errorDetail } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
 import { kbAcceptAttr, isSupportedKbFile } from '../config/kbFileTypes'
@@ -68,6 +73,8 @@ interface KnowledgeBase {
   document_count?: number
   total_size_bytes?: number
   credits_consumed?: number
+  /** 索引失败原因（worker 写入；成功时为空串）。 */
+  error_message?: string
 }
 
 /** GET /v1/kb/{id}/documents 的 documents[] */
@@ -212,11 +219,10 @@ async function batchReindexDocs() {
   if (!ids.length) { message.warning(t('knowledge.please_select_a_document_first')); return }
   reindexingIds.value = ids
   try {
-    // 调用知识库构建接口（会重新索引所有文档）
-    // 如果只想重新索引选中的文档，需要后台支持部分重新索引
-    // 当前实现：先触发构建（会重新索引知识库所有文档）
-    await api.post(`/v1/kb/${kbId}/build`)
-    message.success(t('workflow.re_indexing_triggered_please_check_status_later'))
+    // 与顶部「构建索引」走同一个客户端函数：重建是全库重建（后端没有部分重建的参数），
+    // 提示语如实说明"全库"，免得用户以为只重跑勾选的那几篇。
+    await requestBuildIndex(kbId)
+    message.success(t('knowledge.index_build_started'))
   } catch (e) {
     message.error(kbErrorText(e, t('errors.re_index_failed')))
   } finally {
@@ -439,34 +445,74 @@ function deselectAllMedia() {
   selectedMediaIds.value = []
 }
 
+/** 库上的索引错误原因（worker 写在 `error_message`，如"文档 X: 缺少原文对象"）。 */
+function kbErrorMessage(): string {
+  return kb.value?.error_message || ''
+}
+
+/**
+ * 轮询到索引进入终态。
+ *
+ * 判据来自 `api/knowledge.ts` 的 `isKbTerminal`（镜像引擎的 `status.py`）——
+ * 这里**不能**再写一个字面量：上一版写 `status === 'active'`，而 worker 只会写
+ * `ready`/`error`，于是索引早已跑完界面还在轮询，十轮后默默放弃。
+ *
+ * `baseline` 是投递前的库状态，用来区分"这次构建真的跑完了"和"库里本来就停在终态"：
+ * 对已 `ready` 的库做重建时，worker 取件前 `status` 仍是 `ready`，不加这层判断就会
+ * 在第一次轮询时谎报"构建完成"。所以只有**观察到 `indexing` 过**或**状态已偏离基线**
+ * 时才认终态。
+ *
+ * 返回 `pending` 表示超时未定：任务可能仍在 worker 里排着，界面只报"仍在进行"。
+ */
+async function waitForBuildToSettle(
+  baseline?: string | null,
+  attempts = 30,
+  intervalMs = 500,
+): Promise<'ready' | 'error' | 'pending'> {
+  let sawBuilding = false
+  for (let i = 0; i < attempts; i++) {
+    await new Promise(resolve => setTimeout(resolve, intervalMs))
+    buildProgress.value = Math.min(90, Math.round(((i + 1) / attempts) * 90))
+    await loadKnowledgeBase()
+    const status = kb.value?.status
+    if (isKbBuilding(status)) {
+      sawBuilding = true
+      continue
+    }
+    if (isKbTerminal(status) && (sawBuilding || status !== baseline)) {
+      if (status === 'ready') buildProgress.value = 100
+      return status === 'ready' ? 'ready' : 'error'
+    }
+  }
+  return 'pending'
+}
+
 async function buildKnowledgeBase() {
   try {
     building.value = true
     buildProgress.value = 0
 
-    const res = await api.post(`/v1/kb/${kbId}/build`)
-    const data = res.data?.data || res.data
+    // 投递前的库状态：重建一个已 `ready` 的库时，worker 取件前 status 仍是 `ready`，
+    // 轮询必须靠它区分"本来就完成的旧状态"和"这次真的跑完了"。
+    const baseline = kb.value?.status ?? null
 
-    message.success(t('billing.build_started_estimated_cost_n_credits', { n: data.estimated_cost }))
+    // 服务端只回 status / task_id / provider —— **没有** `estimated_cost` 这个字段
+    // （计费口径未定，见 python-engine/app/api/knowledge.py 的文件头）。旧提示语把
+    // `{ n: undefined }` 插进「预计消耗 {n} credits」，用户看到的是「预计消耗 undefined
+    // credits」。这里改成"已投递"，不自造一个后端不存在的估算值。
+    await requestBuildIndex(kbId)
+    message.success(t('knowledge.index_build_started'))
 
-    // 等待构建完成（轮询状态）
-    const checkStatus = async () => {
-      for (let i = 0; i < 10; i++) {
-        await new Promise(resolve => setTimeout(resolve, 500))
-        buildProgress.value = Math.min(90, (i + 1) * 10)
-        await loadKnowledgeBase()
-        if (kb.value?.status === 'active') {
-          buildProgress.value = 100
-          message.success(t('common.build_complete'))
-          await loadDocuments()
-          return
-        }
-      }
-      await loadKnowledgeBase()
-      await loadDocuments()
+    const outcome = await waitForBuildToSettle(baseline)
+    if (outcome === 'ready') {
+      message.success(t('common.build_complete'))
+    } else if (outcome === 'error') {
+      message.error(kbErrorMessage() || t('errors.build_failed'))
+    } else {
+      // 超时不等于失败：任务可能还在 worker 里跑，如实说"仍在进行"比谎报完成好
+      message.info(t('knowledge.index_still_running'))
     }
-
-    await checkStatus()
+    await loadDocuments()
   } catch (error) {
     message.error(kbErrorText(error, t('errors.build_failed')))
   } finally {
@@ -527,10 +573,11 @@ function formatSize(bytes: number): string {
           {{ $t('agent.assemble_to_agent') }}
         </Button>
         <Button
-          v-if="kb?.status !== 'building'"
+          v-if="!isKbBuilding(kb?.status)"
           type="primary"
           :loading="building"
-          :disabled="building"
+          :disabled="building || kb?.enabled === false"
+          :title="kb?.enabled === false ? $t('knowledge.kb_disabled_hint') : undefined"
           @click="buildKnowledgeBase"
         >
           <template #icon>

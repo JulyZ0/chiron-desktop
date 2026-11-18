@@ -1,6 +1,5 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
-  build_started_estimated_cost_n_credits: "构建已启动，预计消耗 {n} credits",
   help_me_make_a_project_plan: "帮我做一个项目计划",
   planning: "方案策划",
   session_stats_tokens_cost_cache_hits_throughput_popover: "会话统计：tokens / 费用 / 缓存命中 / 吞吐（悬浮窗）",

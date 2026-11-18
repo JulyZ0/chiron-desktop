@@ -114,4 +114,6 @@ export default {
   kb_disabled: "Knowledge base disabled",
   kb_enabled_hint: "Enabled: searchable, and the index can be built",
   kb_disabled_hint: "Disabled: not searchable and cannot be indexed; the index is kept, so enabling again works immediately",
+  index_build_started: "Index task submitted and running in the background",
+  index_still_running: "Indexing is still running in the background; refresh later to check the status",
 }
