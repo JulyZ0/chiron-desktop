@@ -309,6 +309,124 @@ export async function getSettings(category: string): Promise<Record<string, unkn
   return data?.data?.config ?? {}
 }
 
+// ── 资源市场「外部源」配置（system_settings 的 market 分类）──────────────
+//
+// 为什么要这层封装而不是各处直接 getSettings('market')：
+//   1) 键名是**后端契约**（remote_enabled / catalog_sources / allow_user_sources /
+//      allow_remote_mcp / max_sources）。散落在组件里迟早写错一个字符 —— 而配置键写错
+//      **不报错**，只是静默不生效，现象是"配了没反应"，最难排。
+//   2) **20 是产品硬上限**，只在这里定义一次：UI 不给可编辑输入框，保存时也恒提交 20，
+//      避免任何一处放宽口径。
+//   3) 后端对未配置项可能返回 null / 空串 / 非数组，读取侧统一归一，组件里不必到处判空。
+//
+// HTTP 逻辑复用上面通用的 getSettings / saveSettings（同一端点、同一鉴权），不重复造请求。
+
+/** 系统设置分类名（与后端 settingsCategories 逐字一致） */
+export const MARKET_SETTINGS_CATEGORY = 'market'
+
+/** 外部源条数硬上限 —— 产品决策，不接受配置调大 */
+export const MAX_MARKET_SOURCES = 20
+
+export interface MarketSettingsConfig {
+  /** 外部源总开关；**初装默认关闭** */
+  remote_enabled: boolean
+  /** 外部目录源地址列表（字符串数组，不是逗号分隔串） */
+  catalog_sources: string[]
+  /** 允许用户自建源；默认关闭（开启等于把 SSRF 面变成自助入口） */
+  allow_user_sources: boolean
+  /** 允许外部源提供的 MCP；默认关闭 */
+  allow_remote_mcp: boolean
+  /** 条数上限，恒为 MAX_MARKET_SOURCES */
+  max_sources: number
+}
+
+/** 初装/空态：四个开关全关、无源 —— 与产品决策「初次安装完的状态是关闭的」一致 */
+export function emptyMarketSettings(): MarketSettingsConfig {
+  return {
+    remote_enabled: false,
+    catalog_sources: [],
+    allow_user_sources: false,
+    allow_remote_mcp: false,
+    max_sources: MAX_MARKET_SOURCES,
+  }
+}
+
+/**
+ * 宽松取布尔：后端可能给 true / "true" / 1。
+ * 认不出来一律 false —— 安全开关的未知态必须是"关"，不能是"开"。
+ */
+function asBool(value: unknown): boolean {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase()
+    return v === 'true' || v === '1' || v === 'yes'
+  }
+  return false
+}
+
+/**
+ * 归一 catalog_sources：接受数组，或后端可能以 JSON 字符串形式落库的形态。
+ * 元素只保留非空字符串并去重（重复 URL 会在列表里产生重复行，按值删除时会误删）。
+ */
+export function parseCatalogSources(value: unknown): string[] {
+  let raw: unknown = value
+  if (typeof raw === 'string') {
+    try {
+      raw = JSON.parse(raw)
+    } catch {
+      return []
+    }
+  }
+  if (!Array.isArray(raw)) return []
+  const out: string[] = []
+  for (const item of raw) {
+    if (typeof item !== 'string') continue
+    const url = item.trim()
+    if (url && !out.includes(url)) out.push(url)
+  }
+  return out
+}
+
+/**
+ * 把后端返回的原始 config 归一成面板状态。
+ *
+ * 刻意**不截断**超过 20 条的存量：静默丢用户数据比显示"超限、需删减"更糟
+ * （界面显示「已配置 23 / 20」并禁用「添加」，由用户自己删到 20 以内）。
+ */
+export function normalizeMarketSettings(raw: Record<string, unknown> | null | undefined): MarketSettingsConfig {
+  if (!raw) return emptyMarketSettings()
+  return {
+    remote_enabled: asBool(raw.remote_enabled),
+    catalog_sources: parseCatalogSources(raw.catalog_sources),
+    allow_user_sources: asBool(raw.allow_user_sources),
+    allow_remote_mcp: asBool(raw.allow_remote_mcp),
+    // 上限恒为产品值：忽略后端可能回传的其它数字
+    max_sources: MAX_MARKET_SOURCES,
+  }
+}
+
+/** 读取 market 分类配置（无记录时返回全关的空态） */
+export async function getMarketSettings(): Promise<MarketSettingsConfig> {
+  return normalizeMarketSettings(await getSettings(MARKET_SETTINGS_CATEGORY))
+}
+
+/**
+ * 保存 market 分类配置。
+ *
+ * payload 逐键显式赋值（不用展开）：键名即契约，读代码时一眼能核对，
+ * 也避免意外把 UI 内部状态带进请求。max_sources 恒提交 MAX_MARKET_SOURCES。
+ */
+export async function saveMarketSettings(config: MarketSettingsConfig): Promise<void> {
+  await saveSettings(MARKET_SETTINGS_CATEGORY, {
+    remote_enabled: config.remote_enabled,
+    catalog_sources: [...config.catalog_sources],
+    allow_user_sources: config.allow_user_sources,
+    allow_remote_mcp: config.allow_remote_mcp,
+    max_sources: MAX_MARKET_SOURCES,
+  })
+}
+
 // ── D1：自诊断（"配了但不生效"的可自答清单）──────────────────────────────
 
 export type DiagnosticStatus = 'ok' | 'warn' | 'fail' | 'skipped'

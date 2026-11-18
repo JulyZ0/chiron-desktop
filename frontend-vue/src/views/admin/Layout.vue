@@ -28,6 +28,7 @@ import {
   TeamOutlined,
   SafetyOutlined,
   MedicineBoxOutlined,
+  ShopOutlined,
   BarChartOutlined,
   IdcardOutlined,
   WalletOutlined,
@@ -99,6 +100,8 @@ const menuGroups = computed(() => [
       { key: '/admin/datastores', label: t('common.data_storage'), icon: () => h(DatabaseOutlined) },
       // D1：自诊断 —— 与设置/数据存储同属"系统"类：都是"让部署正确运转"的操作面。
       { key: '/admin/diagnostics', label: t('admin.diagnostics'), icon: () => h(MedicineBoxOutlined) },
+      // 资源市场「外部源」：初装默认关闭；开启后本机才开始访问第三方 URL。
+      { key: '/admin/market', label: t('admin.market.page_title'), icon: () => h(ShopOutlined) },
     ],
   },
 ])
