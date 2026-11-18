@@ -186,6 +186,14 @@ const routes = [
         component: () => import('../views/admin/DiagnosticsView.vue'),
         meta: { title: t('admin.diagnostics') },
       },
+      // 资源市场「外部源」：初装默认关闭，开启后本机才开始访问第三方 URL。
+      // 与「系统设置」相邻 —— 它同样是影响部署行为的系统级配置。
+      {
+        path: 'market',
+        name: 'AdminMarketSources',
+        component: () => import('../views/admin/MarketSourcesPanel.vue'),
+        meta: { title: t('admin.market.page_title') },
+      },
       // ── 旧入口重定向（书签 / 文档 / 告警链接兼容）──
       { path: 'redis', redirect: { path: '/admin/datastores', query: { tab: 'redis' } } },
       { path: 'database', redirect: { path: '/admin/datastores', query: { tab: 'database' } } },
