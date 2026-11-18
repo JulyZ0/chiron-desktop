@@ -182,7 +182,11 @@ type Config struct {
 	MarketCatalogSources []string // MARKET_CATALOG_SOURCES：运维级源 URL（唯一信任入口）
 	MarketAllowUserSources bool  // MARKET_ALLOW_USER_SOURCES：是否允许用户自行加源，默认 false
 	MarketAllowRemoteMCP bool    // MARKET_ALLOW_REMOTE_MCP：外部源能否装 MCP，默认 false
-	MarketMaxSources int         // MARKET_MAX_SOURCES：源总数上限，默认 20
+	// MarketMaxSources 是源总数上限，默认 20。
+	//
+	// **>20 会被 internal/market 截到 20**：上限若可配大就等于没有上限，
+	// 每个外部源都是一条能拖慢市场页的抓取链路。只允许往小配。
+	MarketMaxSources int // MARKET_MAX_SOURCES：源总数上限，默认 20，>20 会被截到 20
 	MarketCatalogTTL time.Duration // MARKET_CATALOG_TTL：目录缓存时长，默认 5m
 	MarketFetchTimeout time.Duration // MARKET_FETCH_TIMEOUT：单次抓取超时，默认 8s
 	// MarketTrustedKeys 是 key_id → base64 Ed25519 公钥（MARKET_TRUSTED_KEYS）。
@@ -324,6 +328,7 @@ func loadConfig() *Config {
 		MarketCatalogSources:  getStringSlice("MARKET_CATALOG_SOURCES", []string{}),
 		MarketAllowUserSources: isTruthy(getEnv("MARKET_ALLOW_USER_SOURCES", "")),
 		MarketAllowRemoteMCP:  isTruthy(getEnv("MARKET_ALLOW_REMOTE_MCP", "")),
+		// 默认 20；填更大也会被 internal/market 截到 20（见字段注释）。
 		MarketMaxSources:      getInt("MARKET_MAX_SOURCES", 20),
 		MarketCatalogTTL:      getDuration("MARKET_CATALOG_TTL", 5*time.Minute),
 		MarketFetchTimeout:    getDuration("MARKET_FETCH_TIMEOUT", 8*time.Second),

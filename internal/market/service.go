@@ -3,6 +3,10 @@ package market
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -85,17 +89,35 @@ type Fetcher interface {
 // 内置目录永远可用（随包发布），因此 Service 失败的上限是"少几个外部源"，
 // 绝不会让市场页变空。
 type Service struct {
-	// fetcher 为空表示未启用外部源（MARKET_REMOTE_ENABLED=0，桌面版默认）。
+	// fetcher 为空表示抓取层未注入（外部源即使配置了也不参与拉取）。
 	fetcher Fetcher
 
 	mu sync.RWMutex
-	// externals 是运维/用户配置的外部源（由 SetExternals 热更新）。
+	// externals 是**已解析好的**外部源列表（由 SetExternals 直接灌入）。
+	//
+	// 它保留给"调用方已经自己算好源列表"的场景（含单测）。正常路径走
+	// Configure + ResolveSources：配置是 URL 字符串，解析与去重在那里做。
 	externals []Source
+
+	cfgMu sync.RWMutex
+	// config 是源管理配置（后台可热更新，见 Configure）。零值即"初装形态"：
+	// 外部源关闭、不允许用户加源、无运维源。
+	config Config
+	// configured 表示配置已被显式设置（Configure 调用过）。
+	//
+	// 未设置时总开关按"抓取层是否注入"推断：fetcher != nil 视为启用 ——
+	// 这是 Service 的**历史语义**（注入 fetcher 本身就代表调用方要抓外部源），
+	// 保留它让既有构造路径与单测的行为不变。生产路径总会 Configure，
+	// 因此"初装默认关闭"依然由配置（而非这里）保证。
+	configured bool
+
+	// userStore 是用户自建源的持久化层，可为 nil（没有落盘位置）。
+	userStore SourceStore
 }
 
 // NewService 构造市场聚合服务。fetcher 可为 nil（只吃内置目录）。
 func NewService(fetcher Fetcher) *Service {
-	return &Service{fetcher: fetcher}
+	return &Service{fetcher: fetcher, config: Config{}.Normalized()}
 }
 
 // SetExternals 热更新外部源列表（后台配置改动后调用）。
@@ -112,6 +134,222 @@ func (s *Service) Externals() []Source {
 	return append([]Source(nil), s.externals...)
 }
 
+// Configure 热更新源管理配置（后台保存 market 分组后调用）。
+//
+// 只影响"源从哪来、能不能加、加几个"，不影响 fetcher：TrustedKeys 之类属于
+// 抓取层的参数由装配处（internal/api/market_wiring.go）在构造 fetcher 时读取。
+func (s *Service) Configure(cfg Config) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.config = cfg.Normalized()
+	s.configured = true
+}
+
+// Config 返回当前配置的副本（已规整、已深拷贝）。
+func (s *Service) Config() Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	if !s.configured {
+		// 未显式配置：总开关随抓取层走（见 configured 的注释）。
+		return Config{RemoteEnabled: s.fetcher != nil}.Normalized()
+	}
+	return s.config.Normalized()
+}
+
+// SetUserStore 装配用户源存储。传 nil 表示该部署没有用户级源落盘位置
+// （此时 add/remove 返回 ErrSourceStoreUnavailable，而不是静默丢数据）。
+func (s *Service) SetUserStore(store SourceStore) {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.userStore = store
+}
+
+// UserSources 返回该用户自建的源（读失败时返回空并记日志 —— 单个用户的源文件
+// 坏掉不能让他的市场页整体失败）。
+func (s *Service) UserSources(userID string) []Source {
+	store := s.store()
+	if store == nil || strings.TrimSpace(userID) == "" {
+		return nil
+	}
+	srcs, err := store.List(context.Background(), userID)
+	if err != nil {
+		slog.Warn("market: list user sources failed", "user", userID, "error", err)
+		return nil
+	}
+	return srcs
+}
+
+func (s *Service) store() SourceStore {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.userStore
+}
+
+// ResolveSources 返回**全部**源（内置 + 运维 + 用户）用于展示与合并抓取。
+//
+// 与 LoadFor 的关键区别（两条语义，别混）：
+//   - ResolveSources 回答"这个部署/用户有哪些源"——即使外部源总开关是关的，
+//     也照样列出来，只是 Enabled=false。管理页要能显示"你配了这些，但没启用"，
+//     否则用户永远看不到自己刚加的源。
+//   - LoadFor 回答"这一轮真正能拿到哪些内容"——总开关关着时，外部源一条都不抓。
+//
+// 排序经 sortedSources：内置恒在首位（页面默认落在内置 Tab），同类型内按名字稳定
+// 排序，避免两次请求间 Tab 顺序抖动。
+func (s *Service) ResolveSources(userID string) []Source {
+	cfg := s.Config()
+	max := cfg.MaxSourcesNormalized()
+
+	// 内置源不计入 max：它随包发布、不可配置、永远存在。
+	out := []Source{{
+		ID:      SourceBuiltin,
+		Name:    "builtin",
+		Type:    SourceTypeBuiltin,
+		Enabled: true,
+	}}
+
+	externals := make([]Source, 0, len(cfg.OperatorSources)+len(s.Externals())+2)
+	seen := make(map[string]bool, len(cfg.OperatorSources)+2)
+	add := func(src Source, origin string) {
+		key := strings.TrimSpace(src.ID)
+		if key == "" {
+			key = strings.TrimSpace(src.URL)
+		}
+		if key == "" {
+			return
+		}
+		if seen[key] {
+			return
+		}
+		if u := strings.TrimSpace(src.URL); u != "" {
+			// 同一 URL 经不同路径（运维/用户各自加了一遍）只能有一个 Tab：
+			// 两批同名条目分不清谁是谁。
+			if seen[u] {
+				return
+			}
+			seen[u] = true
+		}
+		if len(externals) >= max {
+			slog.Warn("market: source limit reached, ignoring the rest",
+				"max", max, "ignored", key, "origin", origin)
+			return
+		}
+		seen[key] = true
+		externals = append(externals, src)
+	}
+
+	// 顺序即优先级：运维源在前（部署方白名单），其后是 SetExternals 直接注入的源，
+	// 最后才是用户自建源 —— 截断发生时被丢掉的应该是最"自发"的那一批。
+	for _, src := range cfg.OperatorSourceList() {
+		add(src, "operator")
+	}
+	for _, src := range s.Externals() {
+		add(src, "externals")
+	}
+	for _, src := range s.UserSources(userID) {
+		add(src, "user")
+	}
+
+	if !cfg.RemoteEnabled {
+		// 总开关关着：源仍列出（管理页要看到），但标 Enabled=false 表示
+		// "存在但不参与拉取"。
+		for i := range externals {
+			externals[i].Enabled = false
+		}
+	}
+	return sortedSources(append(out, externals...))
+}
+
+// AddUserSource 为用户新增一个自建源，返回规整后的源。
+//
+// 返回的错误是可区分的（HTTP 层据此映射状态码）：
+//   - ErrUserSourcesDisabled → 403（用户级源把 SSRF 面变成自助入口，默认不开放）；
+//   - ErrTooManySources      → 409（源总数硬上限）；
+//   - *SourceError           → 400（URL 形状不合法）。
+func (s *Service) AddUserSource(ctx context.Context, userID, rawURL, name string) (Source, error) {
+	cfg := s.Config()
+	if !cfg.AllowUserSources {
+		return Source{}, ErrUserSourcesDisabled
+	}
+	store := s.store()
+	if store == nil {
+		return Source{}, ErrSourceStoreUnavailable
+	}
+	if strings.TrimSpace(userID) == "" {
+		// 无身份就没有"用户的源"这个概念：写进 unknown 目录会让所有匿名请求
+		// 共享同一份源列表。
+		return Source{}, ErrUserSourcesDisabled
+	}
+
+	norm, err := ValidateSourceURL(rawURL)
+	if err != nil {
+		return Source{}, err
+	}
+	id := SourceIDFromURL(norm)
+
+	// 已有源（运维或用户）：重复添加是幂等操作，不占额度、不产生第二个 Tab。
+	// 用 URL 比较而不是只比 id：id 是 URL 的指纹，但外部注入的源可能带尾斜杠差异。
+	count := 0
+	max := cfg.MaxSourcesNormalized()
+	for _, src := range s.ResolveSources(userID) {
+		if src.Type == SourceTypeBuiltin {
+			continue
+		}
+		count++
+		if src.ID == id || (src.URL != "" && strings.EqualFold(strings.TrimSpace(src.URL), norm)) {
+			return src, nil
+		}
+	}
+	if count >= max {
+		return Source{}, fmt.Errorf("%w: max %d sources (hard cap %d)",
+			ErrTooManySources, max, DefaultMaxSources)
+	}
+
+	display := truncateRunes(strings.TrimSpace(name), maxSourceNameRunes)
+	if display == "" {
+		display = SourceNameFromURL(norm)
+	}
+	src := Source{
+		ID:   id,
+		Name: display,
+		URL:  norm,
+		Type: SourceTypeUser,
+		// Enabled 如实反映"这一轮会不会真的抓它"：总开关关着时刚加的源在页面上
+		// 也应是"未启用"状态，否则用户会以为它立刻在拉内容。
+		Enabled: cfg.RemoteEnabled,
+	}
+	if err := store.Put(ctx, userID, src); err != nil {
+		return Source{}, err
+	}
+	return src, nil
+}
+
+// RemoveUserSource 删除一个用户自建源。
+//
+// 只有 user 类型可删：内置源是随包发布的目录，运维源是部署方白名单 —— 让页面
+// 上的删除按钮能删掉它们，等于给了普通用户改运维配置的能力。
+// 幂等：删不存在的 id 也返回 nil（前端重复点击不该报错）。
+func (s *Service) RemoveUserSource(ctx context.Context, userID, id string) error {
+	store := s.store()
+	if store == nil {
+		return ErrSourceStoreUnavailable
+	}
+	if strings.TrimSpace(userID) == "" {
+		return ErrSourceStoreUnavailable
+	}
+	for _, src := range s.UserSources(userID) {
+		if src.ID == id {
+			return store.Delete(ctx, userID, id)
+		}
+	}
+	// 不是用户源：若它确实存在（内置/运维）则明确拒绝，让前端知道"按钮不该出现在这里"。
+	for _, src := range s.ResolveSources(userID) {
+		if src.ID == id {
+			return fmt.Errorf("%w: %s source", ErrSourceNotRemovable, src.Type)
+		}
+	}
+	return nil
+}
+
 // Snapshot 是一次目录读取的完整结果。
 type Snapshot struct {
 	Sources  []Source
@@ -119,31 +357,46 @@ type Snapshot struct {
 	Warnings []Warning
 }
 
-// Load 读取全部来源的目录。
+// Load 读取全部来源的目录（不区分用户）。
+//
+// 签名**刻意保持不变**：并行分支仍在调用它，且"内置目录 + 运维源"这个语义
+// 对不需要用户身份的调用点依然正确。用户自建源需要身份，走 LoadFor。
+func (s *Service) Load(ctx context.Context) Snapshot {
+	return s.LoadFor(ctx, "")
+}
+
+// LoadFor 读取该用户的完整目录。
 //
 // 顺序固定：内置在前、外部在后（页面默认落在内置 Tab）。外部源并发抓取但
 // 结果按配置顺序拼回，保证分页稳定。
-func (s *Service) Load(ctx context.Context) Snapshot {
+//
+// 与 ResolveSources 的语义差别（**两种语义，别合并**）：
+//   - 这里要的是"这一轮真的能给出什么内容"，所以 remote_enabled=false 时
+//     **一条外部源都不抓**（Items 只有内置目录）；
+//   - 但源列表**仍然列出**外部源（Enabled=false + remote_disabled 告警）：
+//     静默隐藏会让用户以为"我配的源凭空消失了"，市场页的 Tab 也要能解释
+//     为什么那几栏没有内容。
+func (s *Service) LoadFor(ctx context.Context, userID string) Snapshot {
 	builtin := BuiltinItems()
-	out := Snapshot{
-		Sources: []Source{{
-			ID:      SourceBuiltin,
-			Name:    "builtin",
-			Type:    SourceTypeBuiltin,
-			Enabled: true,
-			Count:   len(builtin),
-		}},
-		Items: builtin,
-	}
+	out := Snapshot{Items: builtin}
 
-	externals := s.Externals()
+	externals := make([]Source, 0, 4)
+	for _, src := range s.ResolveSources(userID) {
+		if src.Type == SourceTypeBuiltin {
+			src.Count = len(builtin)
+			out.Sources = append(out.Sources, src)
+			continue
+		}
+		externals = append(externals, src)
+	}
 	if len(externals) == 0 {
 		return out
 	}
-	if s.fetcher == nil {
-		// 配了外部源但抓取层未启用：如实告知，而不是静默当成"没有外部源"。
+	// 抓取层未注入（fetcher == nil）或总开关关着：源如实列出，但一律不抓。
+	if s.fetcher == nil || !s.Config().RemoteEnabled {
 		for _, src := range externals {
 			src.Count = 0
+			src.Enabled = false
 			out.Sources = append(out.Sources, src)
 			out.Warnings = append(out.Warnings, Warning{
 				Source: src.ID,
@@ -261,4 +514,39 @@ func (e *SourceError) Detail() string { return e.DetailText }
 // NewSourceError 构造一个抓取错误。
 func NewSourceError(code, detail string) *SourceError {
 	return &SourceError{Code: code, DetailText: detail}
+}
+
+// sourceTypeRank 决定源在页面上的分组顺序：内置 → 运维 → 用户。
+//
+// 依据是**信任级别递减**：内置随包发布、运维是部署方白名单、用户源由使用者
+// 自己负责。把排序显式化，避免"用户源混到内置前面"这类误解。
+func sourceTypeRank(t SourceType) int {
+	switch t {
+	case SourceTypeBuiltin:
+		return 0
+	case SourceTypeOperator:
+		return 1
+	case SourceTypeUser:
+		return 2
+	}
+	return 3
+}
+
+// sortedSources 稳定排序源列表（type → name → id）。
+//
+// 必须稳定：Tab 顺序在两次请求间抖动会让用户点错源。同类型内按 name 而非 URL
+// 排序，因为用户看得到 name、看不到指纹化的 id。
+func sortedSources(srcs []Source) []Source {
+	out := append([]Source(nil), srcs...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := sourceTypeRank(out[i].Type), sourceTypeRank(out[j].Type)
+		if ri != rj {
+			return ri < rj
+		}
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }

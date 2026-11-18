@@ -443,9 +443,11 @@ func NewGatewayRouter(
 
 	// 资源市场（agents / skills / knowledge / mcp 四类统一入口）。
 	// 目录聚合层在 internal/market：内置目录随二进制发布（//go:embed），
-	// 因此不依赖任何外部服务。外部源**默认关闭**（MARKET_REMOTE_ENABLED=0），
-	// 初装时市场页只有内置 Tab。
-	marketHandler := NewMarketHandler(newMarketService(cfg, pythonClient))
+	// 因此不依赖任何外部服务。外部源**默认关闭**，初装时市场页只有内置 Tab；
+	// 开启入口有两处 —— env（MARKET_REMOTE_ENABLED）或后台「系统设置 → market」
+	// （system_settings 的 market 分类，DB 覆盖 env），见 market_wiring.go。
+	// settingsStore 可能为 nil（无 DB 的本地模式），此时纯用 env。
+	marketHandler := NewMarketHandler(newMarketService(cfg, pythonClient, settingsStore))
 	marketHandler.RegisterRoutes(mux, authMW, rlMW)
 
 	// 工具授权模式（GET/POST /v1/mode）已移除：模式不再是服务端状态，而是前端随
