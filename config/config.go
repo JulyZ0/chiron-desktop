@@ -171,6 +171,27 @@ type Config struct {
 	PluginsConfigPath string // path to plugins.json (MCP server config)
 	PluginDataDir     string // per-user plugin config root: {PluginDataDir}/{user_id}/plugins.json
 
+	// Market（资源市场：agents / skills / knowledge / mcp）
+	//
+	// 内置目录随二进制发布（internal/market/catalog 的 //go:embed），**不是**配置项：
+	// 它必须永远可用，否则离线桌面版的市场页就是空的。
+	//
+	// 外部源全部默认关闭 —— 初装即"只吃内置目录"是发布形态的默认语义，
+	// 打开外部源意味着本机开始访问第三方 URL，这必须由部署方或用户显式决定。
+	MarketRemoteEnabled bool     // MARKET_REMOTE_ENABLED：总开关，默认 false
+	MarketCatalogSources []string // MARKET_CATALOG_SOURCES：运维级源 URL（唯一信任入口）
+	MarketAllowUserSources bool  // MARKET_ALLOW_USER_SOURCES：是否允许用户自行加源，默认 false
+	MarketAllowRemoteMCP bool    // MARKET_ALLOW_REMOTE_MCP：外部源能否装 MCP，默认 false
+	MarketMaxSources int         // MARKET_MAX_SOURCES：源总数上限，默认 20
+	MarketCatalogTTL time.Duration // MARKET_CATALOG_TTL：目录缓存时长，默认 5m
+	MarketFetchTimeout time.Duration // MARKET_FETCH_TIMEOUT：单次抓取超时，默认 8s
+	// MarketTrustedKeys 是 key_id → base64 Ed25519 公钥（MARKET_TRUSTED_KEYS）。
+	//
+	// **签名不强制**：为空时外部条目一律标"未签名"并给出提醒，但仍可安装。
+	// 配置了才具备验证能力 —— 把"签名"做成必填只会让发布方绕过它（自签自验），
+	// 不如让用户看见"这条有没有来源背书"。
+	MarketTrustedKeys map[string]string
+
 	// DataDir is the runtime data directory (backups, skills, media, etc.)
 	DataDir string
 }
@@ -297,6 +318,16 @@ func loadConfig() *Config {
 
 		PluginsConfigPath: getEnv("PLUGINS_CONFIG_PATH", filepath.Join(GetDefaultDataDir(), "config", "plugins.json")),
 		PluginDataDir:     getEnv("PLUGIN_DATA_DIR", filepath.Join(GetDefaultDataDir(), "plugins")),
+		// 市场：外部源**默认全关**。初装只吃随包发布的内置目录，
+		// 打开外部源必须显式配置 MARKET_REMOTE_ENABLED=1。
+		MarketRemoteEnabled:   isTruthy(getEnv("MARKET_REMOTE_ENABLED", "")),
+		MarketCatalogSources:  getStringSlice("MARKET_CATALOG_SOURCES", []string{}),
+		MarketAllowUserSources: isTruthy(getEnv("MARKET_ALLOW_USER_SOURCES", "")),
+		MarketAllowRemoteMCP:  isTruthy(getEnv("MARKET_ALLOW_REMOTE_MCP", "")),
+		MarketMaxSources:      getInt("MARKET_MAX_SOURCES", 20),
+		MarketCatalogTTL:      getDuration("MARKET_CATALOG_TTL", 5*time.Minute),
+		MarketFetchTimeout:    getDuration("MARKET_FETCH_TIMEOUT", 8*time.Second),
+		MarketTrustedKeys:     getStringMap("MARKET_TRUSTED_KEYS"),
 		DataDir:           getEnv("CHIRON_DATA_DIR", GetDefaultDataDir()),
 	}
 
@@ -428,6 +459,37 @@ func getStringSlice(key string, fallback []string) []string {
 		}
 	}
 	return fallback
+}
+
+// getStringMap 解析 `a=v1,b=v2` 形态的配置项。
+//
+// 缺失或格式不良的项**被跳过**而不是让整项失效：`MARKET_TRUSTED_KEYS` 里
+// 一个写错的行不应该让其它公钥一起消失（那会把所有已签名的源判成验签失败）。
+func getStringMap(key string) map[string]string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	out := make(map[string]string, 4)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		if k == "" || v == "" {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // isTruthy returns true if s is "true", "1", "yes", or "on" (case-insensitive).

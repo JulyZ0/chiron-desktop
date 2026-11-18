@@ -1,0 +1,42 @@
+[
+  {
+    "kind": "mcp",
+    "id": "mcp:filesystem",
+    "name": "filesystem",
+    "description": "MCP 文件系统服务：在指定目录内读写文件。装完需在插件页授权才能真正执行。",
+    "version": "0.1.0",
+    "author": "chiron",
+    "tags": ["files"],
+    "homepage": "https://github.com/modelcontextprotocol/servers",
+    "payload": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "description": "MCP filesystem server",
+      "version": "0.1.0",
+      "read_only": false
+    },
+    "requires": {
+      "approval": true
+    }
+  },
+  {
+    "kind": "mcp",
+    "id": "mcp:memory",
+    "name": "memory",
+    "description": "MCP 记忆服务：提供可持久化的键值知识图谱。装完需在插件页授权才能真正执行。",
+    "version": "0.1.0",
+    "author": "chiron",
+    "tags": ["memory"],
+    "homepage": "https://github.com/modelcontextprotocol/servers",
+    "payload": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"],
+      "description": "MCP memory server",
+      "version": "0.1.0",
+      "read_only": false
+    },
+    "requires": {
+      "approval": true
+    }
+  }
+]

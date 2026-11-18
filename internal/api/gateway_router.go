@@ -441,6 +441,13 @@ func NewGatewayRouter(
 	// Skills (auth + rate limited + prompt sanitized, proxies to Python)
 	skillHandler.RegisterRoutes(mux, authMW, rlMW, sanitizeMW)
 
+	// 资源市场（agents / skills / knowledge / mcp 四类统一入口）。
+	// 目录聚合层在 internal/market：内置目录随二进制发布（//go:embed），
+	// 因此不依赖任何外部服务。外部源**默认关闭**（MARKET_REMOTE_ENABLED=0），
+	// 初装时市场页只有内置 Tab。
+	marketHandler := NewMarketHandler(newMarketService(cfg, pythonClient))
+	marketHandler.RegisterRoutes(mux, authMW, rlMW)
+
 	// 工具授权模式（GET/POST /v1/mode）已移除：模式不再是服务端状态，而是前端随
 	// 每次提交携带的请求参数（llm_config.tools_mode）。见 mode.go 的说明。
 	//

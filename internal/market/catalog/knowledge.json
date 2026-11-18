@@ -1,0 +1,28 @@
+[
+  {
+    "kind": "knowledge",
+    "id": "knowledge:blank",
+    "name": "空白知识库",
+    "description": "创建一个空知识库模板：装完即可上传自己的文档并构建索引。市场不复制他人的文档内容。",
+    "version": "0.1.0",
+    "author": "chiron",
+    "tags": ["template"],
+    "payload": {
+      "description": "空白知识库（由市场模板创建）",
+      "visibility": "private"
+    }
+  },
+  {
+    "kind": "knowledge",
+    "id": "knowledge:team-shared",
+    "name": "团队共享知识库",
+    "description": "创建一个可见性为「租户」的空知识库模板，装完后同租户成员都能检索其中的文档。",
+    "version": "0.1.0",
+    "author": "chiron",
+    "tags": ["template", "team"],
+    "payload": {
+      "description": "团队共享知识库（由市场模板创建）",
+      "visibility": "tenant"
+    }
+  }
+]
