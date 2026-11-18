@@ -2,7 +2,7 @@
 import { ref, onMounted, computed, markRaw } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  Card, Button, Upload, Table, Spin, Empty, Tag, Space,
+  Card, Button, Upload, Table, Spin, Empty, Tag, Space, Switch,
   Progress, message, Modal, Input, Checkbox, Popconfirm,
 } from 'ant-design-vue'
 import {
@@ -61,6 +61,8 @@ interface KnowledgeBase {
   name?: string
   description?: string
   status?: string
+  /** 用户开关（与 `status` 正交）；旧后端不返回时按启用处理。 */
+  enabled?: boolean
   provider?: string
   visibility?: string
   document_count?: number
@@ -271,6 +273,26 @@ async function loadDocuments() {
     documents.value = res.data?.data?.documents || []
   } catch {
     // 静默失败
+  }
+}
+
+// ── 启用 / 停用（owner-only）──
+// `enabled` 是用户开关，与索引状态 `status` 正交：停用不销毁索引，重新启用直接可用。
+// 非属主后端回 404（不回 403，免得确认库是否存在），这里统一给一句"只能操作自己的"。
+const enabledToggling = ref(false)
+
+async function toggleEnabled(next: boolean) {
+  enabledToggling.value = true
+  try {
+    await api.put(`/v1/kb/${kbId}/status`, { enabled: next })
+    if (kb.value) kb.value.enabled = next
+    message.success(next ? t('knowledge.kb_enabled') : t('knowledge.kb_disabled'))
+  } catch (e) {
+    message.error(kbErrorText(e, t('knowledge.can_only_operate_knowledge_bases_you_created')))
+    // 失败回读真实状态：开关不能停在用户以为成功的位置
+    await loadKnowledgeBase()
+  } finally {
+    enabledToggling.value = false
   }
 }
 
@@ -613,6 +635,21 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
               <Tag :color="kbStatusColor(kb.status)">
                 {{ kbStatusLabel(kb.status) }}
               </Tag>
+            </div>
+            <!-- 用户开关：与上面那个索引状态正交（停用不销毁索引，重新启用即可用） -->
+            <div class="info-item">
+              <span class="label">{{ $t('knowledge.enabled') }}</span>
+              <span
+                class="enabled-toggle"
+                :title="kb.enabled === false ? $t('knowledge.kb_disabled_hint') : $t('knowledge.kb_enabled_hint')"
+              >
+                <Switch
+                  :checked="kb.enabled !== false"
+                  :loading="enabledToggling"
+                  size="small"
+                  @change="(v: any) => toggleEnabled(Boolean(v))"
+                />
+              </span>
             </div>
             <div class="info-item">
               <span class="label">{{ $t('knowledge.documents') }}</span>
@@ -975,6 +1012,7 @@ function highlightSegments(text: string): Array<{ text: string; highlight: boole
 .kb-detail-header h1 { flex: 1; margin: 0; font-size: 24px; font-weight: var(--fw-semibold); color: var(--text-primary); }
 .info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; }
 .info-item { display: flex; flex-direction: column; gap: 4px; }
+.enabled-toggle { display: inline-flex; align-items: center; }
 .info-item .label { font-size: 13px; color: var(--text-tertiary); }
 .info-item .value { color: var(--text-primary); }
 .kb-description { margin-top: 16px; padding-top: 16px; border-top: var(--hairline-width) solid var(--border-card); color: var(--text-secondary); line-height: 1.6; }

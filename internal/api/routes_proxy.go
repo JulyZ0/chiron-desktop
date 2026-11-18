@@ -188,6 +188,10 @@ func registerProxyRoutes(
 	// 知识库删除文档（P1 修复：Python 端已有 DELETE /{kb_id}/documents?doc_id=，
 	// 网关此前缺失该路由导致前端删除文档 404）
 	mux.Handle("PUT /v1/kb/{id}/visibility", authMW(kbRateMW(http.HandlerFunc(handleKBVisibility))))
+	// 知识库启用/停用（用户开关，与索引状态 status 正交）。与 visibility 不同，这里
+	// 不自己碰库：属主校验、enabled 列写入都在引擎侧一处实现，网关只做鉴权与转发，
+	// 免得两处各判一次属主、口径漂移时就出现"网关放行、引擎拒绝"或反之。
+	mux.Handle("PUT /v1/kb/{id}/status", authMW(kbRateMW(kbP(pathParamSuffix("/v1/kb", "/status")))))
 	mux.Handle("DELETE /v1/kb/{id}/documents", authMW(kbRateMW(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if pythonClient == nil {
 			InternalError(w, "python engine not available")

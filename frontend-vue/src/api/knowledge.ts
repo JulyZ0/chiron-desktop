@@ -22,6 +22,14 @@ export interface KnowledgeBase {
   provider: ProviderName
   visibility: KbVisibility
   status: KbStatus
+  /**
+   * 用户开关：这个库是否参与检索与索引。
+   *
+   * 与 `status` **正交**（见 `migrations/versions/0006_kb_enabled.py`）：
+   * `status` 说索引跑到哪一步，`enabled` 说用户让不让用。停用不销毁索引，
+   * 重新启用不需要重建。
+   */
+  enabled: boolean
   document_count: number
   total_size_bytes: number
   credits_consumed: number
@@ -126,6 +134,20 @@ export async function setKnowledgeBaseVisibility(
   visibility: KbVisibility,
 ): Promise<unknown> {
   const resp = await api.put(`/v1/kb/${id}/visibility`, { visibility })
+  return unwrap<unknown>(resp)
+}
+
+/**
+ * 启用 / 停用知识库（`enabled`，与索引状态 `status` 无关）。
+ *
+ * 停用**不删索引**：重新启用就能直接检索，不重复花索引费用。停用后该库不再参与
+ * 检索，也不能投递构建任务（后端会回 409）。
+ */
+export async function setKnowledgeBaseEnabled(
+  id: string,
+  enabled: boolean,
+): Promise<unknown> {
+  const resp = await api.put(`/v1/kb/${id}/status`, { enabled })
   return unwrap<unknown>(resp)
 }
 

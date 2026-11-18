@@ -109,4 +109,9 @@ export default {
   status_ready: "Ready",
   status_error: "Error",
   index_now: "Build index",
+  enabled: "مُفعّل",
+  kb_enabled: "تم تفعيل قاعدة المعرفة",
+  kb_disabled: "تم تعطيل قاعدة المعرفة",
+  kb_enabled_hint: "مُفعّلة: قابلة للبحث، ويمكن بناء الفهرس",
+  kb_disabled_hint: "مُعطّلة: لا تُبحث ولا يُبنى فهرسها؛ الفهرس محفوظ، وإعادة التفعيل تكفي",
 }
