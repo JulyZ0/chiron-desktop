@@ -1,28 +1,45 @@
-"""权威基线：一次性描述全部 schema（瘦身后的本地 agent 形态）。
+"""权威基线：一次性描述全部 schema（Resource Market 与知识库启停落地后的终态）。
 
-由 `pg_dump --schema-only` 从「原迁移链 0001..0022 全部跑完、再按裁剪清单删表删列」
-的库导出后固化，因此**全新库 `alembic upgrade head` 即为终态**。
+由 `pg_dump --schema-only` 从「原迁移链 0001..0005 跑完、再加 kb 与 market-install
+两条 0006 分支」的库导出后固化，因此**全新库 `alembic upgrade head` 即为终态**。
 
-本轮相对旧基线的变更：
-  - 删除 SaaS / 企业 / 计费 / 工作流 / 通知 / 事件线程域共 42 张表；
-  - 46 张表的 `tenant_id` **列保留**（降为隐含，代码层不再读取）；
-  - `tenants` 表保留为 tenant_id 外键锚点（`internal/db/seed.go` 写入 id=1 的默认行）；
-  - 删除失效列：`admin_model_configs` 七个模型治理列、`knowledge_bases.index_engine`
-    与 `credits_consumed`、`users.credits`、`agents.workflows`；
-  - 以 tenant_id 打头的复合索引重建为无租户版本；`users` 邮箱唯一性改为全局唯一。
+## 为什么这次把 0001..0005 与两个 0006 合成一个文件
+
+分头开发让两条 0006 的 `down_revision` 都指向 `0005`，合并后形成**两个 head**：
+`alembic upgrade head` 直接报 Multiple head revisions；更麻烦的是 Go 侧
+`internal/db/schema_version.go` 的 `ParseMigrationHead` 会返回 "multiple migration
+heads" 错误，而 `cmd/chiron/main.go` 的 `verifySchemaVersion` 对该错误只记一条 Warn
+就 return —— schema 守卫被**静默绕过**，应用照常启动。与其加一条 merge revision 把
+分叉永久留在链上，不如按本仓「单一权威基线」的既定架构重新固化。
+
+## 本轮相对旧基线（0001）的增量
+
+  - 新增表 `market_installations`（市场安装记录，唯一约束
+    `(tenant_id, user_id, source, kind, market_id)` 是幂等的落点）；
+  - 新增列 `knowledge_bases.enabled`（用户意图，与索引状态机 `status` 正交）。
+
+其余 schema 与合并前的目标状态**逐字一致** —— 基线不再承载"逐步演进"的历史，
+它只描述终态。
+
+## 合并进基线时丢掉的东西
+
+被合并的 `0005_checkpoint_seq_unique` 在 upgrade 里有一条 `DELETE FROM
+project_checkpoints`，用于在建唯一索引前清掉历史重复行。基线里没有数据可清
+（全新库为空），因此该 DML 不再出现；`ux_project_checkpoints_session_seq_kind`
+唯一约束本身仍然存在。
 
 **改 schema 的方式：不要修改本文件，追加新的 revision。**
 单一 head 是硬要求，分叉会被 `internal/db/schema_version.go` 直接判为错误。
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 from alembic import op
 
 revision: str = "0001_authoritative_baseline"
-down_revision: Union[str, Sequence[str], None] = None
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 # 顺序即 pg_dump 的可重放顺序：建表 → 序列与 OWNED BY → 列默认值 → 约束 → 索引。
 # 不要重排：默认值依赖先建好的序列，主键约束依赖先建好的表。
@@ -105,6 +122,12 @@ _DDL: tuple[str, ...] = (
     ip_address character varying(45),
     created_at timestamp without time zone
 )""",
+    """CREATE TABLE public.checkpoint_untracked (
+    checkpoint_id character varying(64) NOT NULL,
+    path character varying(1024) NOT NULL,
+    sha256 character varying(64) NOT NULL,
+    size bigint DEFAULT 0 NOT NULL
+)""",
     """CREATE TABLE public.conversation_shares (
     id character varying(36) NOT NULL,
     session_id character varying(128),
@@ -130,7 +153,8 @@ _DDL: tuple[str, ...] = (
     total_size_bytes bigint DEFAULT 0 NOT NULL,
     error_message text,
     created_at timestamp without time zone DEFAULT now() NOT NULL,
-    updated_at timestamp without time zone DEFAULT now() NOT NULL
+    updated_at timestamp without time zone DEFAULT now() NOT NULL,
+    enabled boolean DEFAULT true NOT NULL
 )""",
     """CREATE TABLE public.knowledge_documents (
     id character varying(36) NOT NULL,
@@ -170,6 +194,18 @@ _DDL: tuple[str, ...] = (
     created_at timestamp with time zone,
     updated_at timestamp with time zone,
     weight integer DEFAULT 1 NOT NULL
+)""",
+    """CREATE TABLE public.market_installations (
+    id character varying(36) NOT NULL,
+    tenant_id smallint NOT NULL,
+    user_id character varying(36) NOT NULL,
+    source character varying(64) NOT NULL,
+    kind character varying(16) NOT NULL,
+    market_id character varying(255) NOT NULL,
+    ref json DEFAULT '{}'::json NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 )""",
     """CREATE TABLE public.media_assets (
     id character varying(36) NOT NULL,
@@ -229,14 +265,6 @@ _DDL: tuple[str, ...] = (
     tool_call_id character varying(128),
     blob_ref character varying(64)
 )""",
-    """ALTER TABLE public.messages ALTER COLUMN seq ADD GENERATED ALWAYS AS IDENTITY (
-    SEQUENCE NAME public.messages_seq_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1
-)""",
     """CREATE TABLE public.model_prices (
     model character varying(128) NOT NULL,
     provider character varying(50) DEFAULT ''::character varying NOT NULL,
@@ -267,6 +295,31 @@ _DDL: tuple[str, ...] = (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     expires_at timestamp with time zone DEFAULT (now() + '24:00:00'::interval) NOT NULL
+)""",
+    """CREATE TABLE public.project_checkpoints (
+    id character varying(64) NOT NULL,
+    tenant_id smallint NOT NULL,
+    user_id character varying(36),
+    workspace_id character varying(64) NOT NULL,
+    session_id character varying(36),
+    turn_id character varying(36),
+    seq bigint NOT NULL,
+    commit_sha character varying(64) NOT NULL,
+    tree_sha character varying(64) NOT NULL,
+    parent_sha character varying(64),
+    head_sha character varying(64),
+    ref_name character varying(255) NOT NULL,
+    kind character varying(16) NOT NULL,
+    state character varying(16) DEFAULT 'ok'::character varying NOT NULL,
+    error_code character varying(64),
+    error_msg text,
+    label character varying(255) DEFAULT ''::character varying NOT NULL,
+    file_count integer DEFAULT 0 NOT NULL,
+    skipped_count integer DEFAULT 0 NOT NULL,
+    byte_size bigint DEFAULT 0 NOT NULL,
+    branch_name character varying(255),
+    applied_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 )""",
     """CREATE TABLE public.run_lineage_ledger (
     root_run_id character varying(64) NOT NULL,
@@ -314,7 +367,9 @@ _DDL: tuple[str, ...] = (
     name character varying(255) DEFAULT ''::character varying NOT NULL,
     viewport jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp without time zone DEFAULT now() NOT NULL,
-    updated_at timestamp without time zone DEFAULT now() NOT NULL
+    updated_at timestamp without time zone DEFAULT now() NOT NULL,
+    root_path character varying(1024) DEFAULT ''::character varying NOT NULL,
+    sort_index integer DEFAULT 0 NOT NULL
 )""",
     """CREATE TABLE public.sessions (
     id character varying(36) NOT NULL,
@@ -348,13 +403,6 @@ _DDL: tuple[str, ...] = (
     output_tokens integer DEFAULT 0 NOT NULL,
     created_at timestamp without time zone DEFAULT now() NOT NULL
 )""",
-    """CREATE SEQUENCE public.subagent_run_steps_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1""",
-    """ALTER SEQUENCE public.subagent_run_steps_id_seq OWNED BY public.subagent_run_steps.id""",
     """CREATE TABLE public.subagent_runs (
     id character varying(64) NOT NULL,
     root_session_id character varying(128) NOT NULL,
@@ -393,6 +441,38 @@ _DDL: tuple[str, ...] = (
     resume_at_step integer,
     root_run_id character varying(64)
 )""",
+    """CREATE TABLE public.superagent_settings (
+    tenant_id smallint NOT NULL,
+    user_id character varying(36) NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    max_sessions integer DEFAULT 5 NOT NULL,
+    day_token_budget integer DEFAULT 600000 NOT NULL,
+    idle_minutes integer DEFAULT 10 NOT NULL,
+    updated_at timestamp without time zone DEFAULT now()
+)""",
+    """CREATE TABLE public.superagent_takeovers (
+    id character varying(36) NOT NULL,
+    tenant_id smallint NOT NULL,
+    user_id character varying(36) NOT NULL,
+    session_id character varying(64) NOT NULL,
+    enabled boolean DEFAULT false NOT NULL,
+    schedule_kind character varying(16) DEFAULT 'interval'::character varying NOT NULL,
+    once_at timestamp without time zone,
+    interval_seconds integer DEFAULT 1800,
+    tools_mode character varying(16) DEFAULT 'auto'::character varying NOT NULL,
+    daily_token_budget integer DEFAULT 120000 NOT NULL,
+    tokens_used_today integer DEFAULT 0 NOT NULL,
+    budget_day date,
+    last_run_at timestamp without time zone,
+    last_verdict character varying(24),
+    last_reason text,
+    melt_state character varying(16) DEFAULT ''::character varying NOT NULL,
+    melt_reason text,
+    cooldown_until timestamp without time zone,
+    consecutive_failures integer DEFAULT 0 NOT NULL,
+    created_at timestamp without time zone DEFAULT now(),
+    updated_at timestamp without time zone DEFAULT now()
+)""",
     """CREATE TABLE public.system_settings (
     id integer NOT NULL,
     category character varying(32),
@@ -402,14 +482,6 @@ _DDL: tuple[str, ...] = (
     updated_by character varying(36),
     encrypted boolean
 )""",
-    """CREATE SEQUENCE public.system_settings_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1""",
-    """ALTER SEQUENCE public.system_settings_id_seq OWNED BY public.system_settings.id""",
     """CREATE TABLE public.task_idempotency (
     idempotency_key character varying(255) NOT NULL,
     task_id character varying(64),
@@ -441,14 +513,6 @@ _DDL: tuple[str, ...] = (
     created_at timestamp without time zone,
     status character varying(16)
 )""",
-    """CREATE SEQUENCE public.tenants_id_seq
-    AS smallint
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1""",
-    """ALTER SEQUENCE public.tenants_id_seq OWNED BY public.tenants.id""",
     """CREATE TABLE public.tool_calls (
     id character varying(36) NOT NULL,
     session_id character varying(36),
@@ -487,14 +551,6 @@ _DDL: tuple[str, ...] = (
     error text NOT NULL,
     created_at timestamp without time zone
 )""",
-    """CREATE SEQUENCE public.unified_messages_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1""",
-    """ALTER SEQUENCE public.unified_messages_id_seq OWNED BY public.unified_messages.id""",
     """CREATE TABLE public.unified_sessions (
     id character varying(36) NOT NULL,
     tenant_id smallint NOT NULL,
@@ -537,13 +593,6 @@ _DDL: tuple[str, ...] = (
     cost_cents integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 )""",
-    """CREATE SEQUENCE public.usage_events_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1""",
-    """ALTER SEQUENCE public.usage_events_id_seq OWNED BY public.usage_events.id""",
     """CREATE TABLE public.user_knowledge_settings (
     user_id character varying(36) NOT NULL,
     tenant_id smallint NOT NULL,
@@ -609,6 +658,52 @@ _DDL: tuple[str, ...] = (
     password_set boolean,
     settings json
 )""",
+    """ALTER TABLE public.messages ALTER COLUMN seq ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.messages_seq_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+)""",
+    """CREATE SEQUENCE public.subagent_run_steps_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1""",
+    """CREATE SEQUENCE public.system_settings_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1""",
+    """CREATE SEQUENCE public.tenants_id_seq
+    AS smallint
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1""",
+    """CREATE SEQUENCE public.unified_messages_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1""",
+    """CREATE SEQUENCE public.usage_events_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1""",
+    """ALTER SEQUENCE public.subagent_run_steps_id_seq OWNED BY public.subagent_run_steps.id""",
+    """ALTER SEQUENCE public.system_settings_id_seq OWNED BY public.system_settings.id""",
+    """ALTER SEQUENCE public.tenants_id_seq OWNED BY public.tenants.id""",
+    """ALTER SEQUENCE public.unified_messages_id_seq OWNED BY public.unified_messages.id""",
+    """ALTER SEQUENCE public.usage_events_id_seq OWNED BY public.usage_events.id""",
     """ALTER TABLE ONLY public.subagent_run_steps ALTER COLUMN id SET DEFAULT nextval('public.subagent_run_steps_id_seq'::regclass)""",
     """ALTER TABLE ONLY public.system_settings ALTER COLUMN id SET DEFAULT nextval('public.system_settings_id_seq'::regclass)""",
     """ALTER TABLE ONLY public.tenants ALTER COLUMN id SET DEFAULT nextval('public.tenants_id_seq'::regclass)""",
@@ -628,6 +723,8 @@ _DDL: tuple[str, ...] = (
     ADD CONSTRAINT api_keys_pkey PRIMARY KEY (id)""",
     """ALTER TABLE ONLY public.audit_logs
     ADD CONSTRAINT audit_logs_pkey PRIMARY KEY (id)""",
+    """ALTER TABLE ONLY public.checkpoint_untracked
+    ADD CONSTRAINT checkpoint_untracked_pkey PRIMARY KEY (checkpoint_id, path)""",
     """ALTER TABLE ONLY public.conversation_shares
     ADD CONSTRAINT conversation_shares_pkey PRIMARY KEY (id)""",
     """ALTER TABLE ONLY public.knowledge_bases
@@ -640,6 +737,8 @@ _DDL: tuple[str, ...] = (
     ADD CONSTRAINT llm_provider_keys_key_hash_key UNIQUE (key_hash)""",
     """ALTER TABLE ONLY public.llm_provider_keys
     ADD CONSTRAINT llm_provider_keys_pkey PRIMARY KEY (id)""",
+    """ALTER TABLE ONLY public.market_installations
+    ADD CONSTRAINT market_installations_pkey PRIMARY KEY (id)""",
     """ALTER TABLE ONLY public.media_assets
     ADD CONSTRAINT media_assets_pkey PRIMARY KEY (id)""",
     """ALTER TABLE ONLY public.memory_summaries
@@ -652,6 +751,8 @@ _DDL: tuple[str, ...] = (
     ADD CONSTRAINT model_prices_pkey PRIMARY KEY (model, provider)""",
     """ALTER TABLE ONLY public.pending_interactions
     ADD CONSTRAINT pending_interactions_pkey PRIMARY KEY (id)""",
+    """ALTER TABLE ONLY public.project_checkpoints
+    ADD CONSTRAINT project_checkpoints_pkey PRIMARY KEY (id)""",
     """ALTER TABLE ONLY public.run_lineage_ledger
     ADD CONSTRAINT run_lineage_ledger_pkey PRIMARY KEY (root_run_id)""",
     """ALTER TABLE ONLY public.session_folds
@@ -666,6 +767,12 @@ _DDL: tuple[str, ...] = (
     ADD CONSTRAINT subagent_run_steps_pkey PRIMARY KEY (id)""",
     """ALTER TABLE ONLY public.subagent_runs
     ADD CONSTRAINT subagent_runs_pkey PRIMARY KEY (id)""",
+    """ALTER TABLE ONLY public.superagent_settings
+    ADD CONSTRAINT superagent_settings_pkey PRIMARY KEY (tenant_id, user_id)""",
+    """ALTER TABLE ONLY public.superagent_takeovers
+    ADD CONSTRAINT superagent_takeovers_pkey PRIMARY KEY (id)""",
+    """ALTER TABLE ONLY public.superagent_takeovers
+    ADD CONSTRAINT superagent_takeovers_tenant_id_user_id_session_id_key UNIQUE (tenant_id, user_id, session_id)""",
     """ALTER TABLE ONLY public.system_settings
     ADD CONSTRAINT system_settings_pkey PRIMARY KEY (id)""",
     """ALTER TABLE ONLY public.task_idempotency
@@ -698,62 +805,6 @@ _DDL: tuple[str, ...] = (
     ADD CONSTRAINT user_onboarding_pkey PRIMARY KEY (user_id, step)""",
     """ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id)""",
-    """CREATE INDEX agents_kind_idx ON public.agents USING btree (kind)""",
-    """CREATE INDEX idx_usage_events_session ON public.usage_events USING btree (session_id)""",
-    """CREATE INDEX idx_usage_events_user_model_time ON public.usage_events USING btree (user_id, model, created_at DESC)""",
-    """CREATE INDEX idx_usage_events_user_time ON public.usage_events USING btree (user_id, created_at DESC)""",
-    """CREATE INDEX idx_user_onboarding_step ON public.user_onboarding USING btree (step)""",
-    """CREATE INDEX ix_agent_runs_session_updated ON public.agent_runs USING btree (session_id, updated_at DESC)""",
-    """CREATE INDEX ix_agent_runs_status_cp ON public.agent_runs USING btree (status, checkpoint_at)""",
-    """CREATE INDEX ix_agent_sessions_user_created ON public.agent_sessions USING btree (user_id, created_at DESC)""",
-    """CREATE INDEX ix_audit_logs_created ON public.audit_logs USING btree (created_at DESC)""",
-    """CREATE INDEX ix_knowledge_bases_owner ON public.knowledge_bases USING btree (tenant_id, user_id)""",
-    """CREATE INDEX ix_knowledge_bases_status ON public.knowledge_bases USING btree (tenant_id, status)""",
-    """CREATE INDEX ix_knowledge_documents_kb ON public.knowledge_documents USING btree (knowledge_base_id, status)""",
-    """CREATE INDEX ix_llm_provider_keys_provider ON public.llm_provider_keys USING btree (provider)""",
-    """CREATE INDEX ix_media_assets_user_parent ON public.media_assets USING btree (user_id, parent_id)""",
-    """CREATE INDEX ix_message_archives_session ON public.message_archives USING btree (session_id)""",
-    """CREATE INDEX ix_messages_session_created ON public.messages USING btree (session_id, created_at DESC, id DESC)""",
-    """CREATE UNIQUE INDEX ix_messages_session_seq ON public.messages USING btree (session_id, seq)""",
-    """CREATE INDEX ix_messages_turn_id ON public.messages USING btree (turn_id)""",
-    """CREATE INDEX ix_model_prices_verified_at ON public.model_prices USING btree (verified_at)""",
-    """CREATE INDEX ix_pending_interactions_expiry ON public.pending_interactions USING btree (status, expires_at) WHERE ((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('answered'::character varying)::text]))""",
-    """CREATE INDEX ix_pending_interactions_grant ON public.pending_interactions USING btree (session_id, args_hash) WHERE ((status)::text = 'answered'::text)""",
-    """CREATE INDEX ix_pending_interactions_session_open ON public.pending_interactions USING btree (session_id, created_at) WHERE ((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('answered'::character varying)::text]))""",
-    """CREATE INDEX ix_run_lineage_ledger_paused ON public.run_lineage_ledger USING btree (tenant_id, updated_at) WHERE paused""",
-    """CREATE INDEX ix_session_folds_session ON public.session_folds USING btree (session_id, covered_to DESC)""",
-    """CREATE INDEX ix_sessions_parent_session_id ON public.sessions USING btree (parent_session_id)""",
-    """CREATE INDEX ix_sessions_tag ON public.sessions USING btree (tag)""",
-    """CREATE INDEX ix_subagent_runs_root_run_id ON public.subagent_runs USING btree (root_run_id)""",
-    """CREATE INDEX ix_task_idempotency_status ON public.task_idempotency USING btree (status)""",
-    """CREATE INDEX ix_task_idempotency_status_updated ON public.task_idempotency USING btree (status, updated_at)""",
-    """CREATE INDEX ix_task_idempotency_task_id ON public.task_idempotency USING btree (task_id)""",
-    """CREATE INDEX ix_tool_calls_session_created ON public.tool_calls USING btree (session_id, created_at DESC, id DESC)""",
-    """CREATE INDEX ix_tool_calls_turn_id ON public.tool_calls USING btree (turn_id)""",
-    """CREATE INDEX ix_turns_created_at ON public.turns USING btree (created_at)""",
-    """CREATE INDEX ix_turns_session_id ON public.turns USING btree (session_id)""",
-    """CREATE INDEX ix_turns_status ON public.turns USING btree (status)""",
-    """CREATE INDEX ix_turns_status_created ON public.turns USING btree (status, created_at)""",
-    """CREATE INDEX ix_uploads_user_status ON public.uploads USING btree (user_id, status)""",
-    """CREATE INDEX ix_user_memory_entries_lookup ON public.user_memory_entries USING btree (tenant_id, user_id, status)""",
-    """CREATE INDEX ix_user_memory_entries_project ON public.user_memory_entries USING btree (tenant_id, user_id, project, status)""",
-    """CREATE INDEX ix_users_created ON public.users USING btree (created_at DESC)""",
-    """CREATE INDEX session_map_nodes_session_idx ON public.session_map_nodes USING btree (session_id)""",
-    """CREATE INDEX session_map_nodes_workspace_idx ON public.session_map_nodes USING btree (workspace_id)""",
-    """CREATE INDEX session_map_workspaces_owner_idx ON public.session_map_workspaces USING btree (tenant_id, user_id)""",
-    """CREATE UNIQUE INDEX subagent_run_steps_seq_idx ON public.subagent_run_steps USING btree (run_id, seq)""",
-    """CREATE INDEX subagent_runs_parent_idx ON public.subagent_runs USING btree (parent_run_id)""",
-    """CREATE INDEX subagent_runs_tree_idx ON public.subagent_runs USING btree (root_session_id, created_at)""",
-    """CREATE INDEX subagent_runs_turn_idx ON public.subagent_runs USING btree (turn_id)""",
-    """CREATE INDEX turns_session_created_idx ON public.turns USING btree (session_id, created_at)""",
-    """CREATE UNIQUE INDEX ux_agent_runs_session_active ON public.agent_runs USING btree (session_id) WHERE ((status)::text = ANY (ARRAY[('running'::character varying)::text, ('checkpointed'::character varying)::text, ('resuming'::character varying)::text]))""",
-    """CREATE UNIQUE INDEX ux_api_keys_key_hash_active ON public.api_keys USING btree (key_hash) WHERE (COALESCE(revoked, false) = false)""",
-    """CREATE UNIQUE INDEX ux_knowledge_bases_index_ref ON public.knowledge_bases USING btree (provider, index_ref) WHERE (index_ref IS NOT NULL)""",
-    """CREATE UNIQUE INDEX ux_knowledge_documents_pageindex ON public.knowledge_documents USING btree (knowledge_base_id, pageindex_doc_id) WHERE (pageindex_doc_id IS NOT NULL)""",
-    """CREATE UNIQUE INDEX ux_pending_interactions_open ON public.pending_interactions USING btree (session_id, tool_call_id) WHERE ((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('answered'::character varying)::text]))""",
-    """CREATE UNIQUE INDEX ux_session_folds_range ON public.session_folds USING btree (session_id, covered_from, covered_to)""",
-    """CREATE UNIQUE INDEX ux_system_settings_category_key ON public.system_settings USING btree (category, key)""",
-    """CREATE UNIQUE INDEX ux_users_email ON public.users USING btree (email)""",
     """ALTER TABLE ONLY public.agent_sessions
     ADD CONSTRAINT agent_sessions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id)""",
     """ALTER TABLE ONLY public.agent_sessions
@@ -768,6 +819,8 @@ _DDL: tuple[str, ...] = (
     ADD CONSTRAINT audit_logs_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id)""",
     """ALTER TABLE ONLY public.audit_logs
     ADD CONSTRAINT audit_logs_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id)""",
+    """ALTER TABLE ONLY public.checkpoint_untracked
+    ADD CONSTRAINT checkpoint_untracked_checkpoint_fk FOREIGN KEY (checkpoint_id) REFERENCES public.project_checkpoints(id) ON DELETE CASCADE""",
     """ALTER TABLE ONLY public.knowledge_bases
     ADD CONSTRAINT knowledge_bases_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id)""",
     """ALTER TABLE ONLY public.knowledge_bases
@@ -820,6 +873,73 @@ _DDL: tuple[str, ...] = (
     ADD CONSTRAINT user_onboarding_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE""",
     """ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id)""",
+    """CREATE INDEX agents_kind_idx ON public.agents USING btree (kind)""",
+    """CREATE INDEX idx_superagent_takeovers_user ON public.superagent_takeovers USING btree (tenant_id, user_id, enabled)""",
+    """CREATE INDEX idx_usage_events_session ON public.usage_events USING btree (session_id)""",
+    """CREATE INDEX idx_usage_events_user_model_time ON public.usage_events USING btree (user_id, model, created_at DESC)""",
+    """CREATE INDEX idx_usage_events_user_time ON public.usage_events USING btree (user_id, created_at DESC)""",
+    """CREATE INDEX idx_user_onboarding_step ON public.user_onboarding USING btree (step)""",
+    """CREATE INDEX ix_agent_runs_session_updated ON public.agent_runs USING btree (session_id, updated_at DESC)""",
+    """CREATE INDEX ix_agent_runs_status_cp ON public.agent_runs USING btree (status, checkpoint_at)""",
+    """CREATE INDEX ix_agent_sessions_user_created ON public.agent_sessions USING btree (user_id, created_at DESC)""",
+    """CREATE INDEX ix_audit_logs_created ON public.audit_logs USING btree (created_at DESC)""",
+    """CREATE INDEX ix_checkpoint_untracked_sha ON public.checkpoint_untracked USING btree (sha256)""",
+    """CREATE INDEX ix_knowledge_bases_disabled ON public.knowledge_bases USING btree (tenant_id, user_id) WHERE (enabled = false)""",
+    """CREATE INDEX ix_knowledge_bases_owner ON public.knowledge_bases USING btree (tenant_id, user_id)""",
+    """CREATE INDEX ix_knowledge_bases_status ON public.knowledge_bases USING btree (tenant_id, status)""",
+    """CREATE INDEX ix_knowledge_documents_kb ON public.knowledge_documents USING btree (knowledge_base_id, status)""",
+    """CREATE INDEX ix_llm_provider_keys_provider ON public.llm_provider_keys USING btree (provider)""",
+    """CREATE INDEX ix_market_installations_owner ON public.market_installations USING btree (tenant_id, user_id, kind)""",
+    """CREATE INDEX ix_media_assets_user_parent ON public.media_assets USING btree (user_id, parent_id)""",
+    """CREATE INDEX ix_message_archives_session ON public.message_archives USING btree (session_id)""",
+    """CREATE INDEX ix_messages_session_created ON public.messages USING btree (session_id, created_at DESC, id DESC)""",
+    """CREATE UNIQUE INDEX ix_messages_session_seq ON public.messages USING btree (session_id, seq)""",
+    """CREATE INDEX ix_messages_turn_id ON public.messages USING btree (turn_id)""",
+    """CREATE INDEX ix_model_prices_verified_at ON public.model_prices USING btree (verified_at)""",
+    """CREATE INDEX ix_pending_interactions_expiry ON public.pending_interactions USING btree (status, expires_at) WHERE ((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('answered'::character varying)::text]))""",
+    """CREATE INDEX ix_pending_interactions_grant ON public.pending_interactions USING btree (session_id, args_hash) WHERE ((status)::text = 'answered'::text)""",
+    """CREATE INDEX ix_pending_interactions_session_open ON public.pending_interactions USING btree (session_id, created_at) WHERE ((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('answered'::character varying)::text]))""",
+    """CREATE INDEX ix_project_checkpoints_project ON public.project_checkpoints USING btree (workspace_id, created_at DESC)""",
+    """CREATE INDEX ix_project_checkpoints_session ON public.project_checkpoints USING btree (session_id, seq DESC)""",
+    """CREATE INDEX ix_run_lineage_ledger_paused ON public.run_lineage_ledger USING btree (tenant_id, updated_at) WHERE paused""",
+    """CREATE INDEX ix_session_folds_session ON public.session_folds USING btree (session_id, covered_to DESC)""",
+    """CREATE INDEX ix_sessions_parent_session_id ON public.sessions USING btree (parent_session_id)""",
+    """CREATE INDEX ix_sessions_tag ON public.sessions USING btree (tag)""",
+    """CREATE INDEX ix_smn_project_lookup ON public.session_map_nodes USING btree (workspace_id, edge_kind, created_at)""",
+    """CREATE INDEX ix_subagent_runs_root_run_id ON public.subagent_runs USING btree (root_run_id)""",
+    """CREATE INDEX ix_task_idempotency_status ON public.task_idempotency USING btree (status)""",
+    """CREATE INDEX ix_task_idempotency_status_updated ON public.task_idempotency USING btree (status, updated_at)""",
+    """CREATE INDEX ix_task_idempotency_task_id ON public.task_idempotency USING btree (task_id)""",
+    """CREATE INDEX ix_tool_calls_session_created ON public.tool_calls USING btree (session_id, created_at DESC, id DESC)""",
+    """CREATE INDEX ix_tool_calls_turn_id ON public.tool_calls USING btree (turn_id)""",
+    """CREATE INDEX ix_turns_created_at ON public.turns USING btree (created_at)""",
+    """CREATE INDEX ix_turns_session_id ON public.turns USING btree (session_id)""",
+    """CREATE INDEX ix_turns_status ON public.turns USING btree (status)""",
+    """CREATE INDEX ix_turns_status_created ON public.turns USING btree (status, created_at)""",
+    """CREATE INDEX ix_uploads_user_status ON public.uploads USING btree (user_id, status)""",
+    """CREATE INDEX ix_user_memory_entries_lookup ON public.user_memory_entries USING btree (tenant_id, user_id, status)""",
+    """CREATE INDEX ix_user_memory_entries_project ON public.user_memory_entries USING btree (tenant_id, user_id, project, status)""",
+    """CREATE INDEX ix_users_created ON public.users USING btree (created_at DESC)""",
+    """CREATE INDEX session_map_nodes_session_idx ON public.session_map_nodes USING btree (session_id)""",
+    """CREATE INDEX session_map_nodes_workspace_idx ON public.session_map_nodes USING btree (workspace_id)""",
+    """CREATE INDEX session_map_workspaces_owner_idx ON public.session_map_workspaces USING btree (tenant_id, user_id)""",
+    """CREATE UNIQUE INDEX subagent_run_steps_seq_idx ON public.subagent_run_steps USING btree (run_id, seq)""",
+    """CREATE INDEX subagent_runs_parent_idx ON public.subagent_runs USING btree (parent_run_id)""",
+    """CREATE INDEX subagent_runs_tree_idx ON public.subagent_runs USING btree (root_session_id, created_at)""",
+    """CREATE INDEX subagent_runs_turn_idx ON public.subagent_runs USING btree (turn_id)""",
+    """CREATE INDEX turns_session_created_idx ON public.turns USING btree (session_id, created_at)""",
+    """CREATE UNIQUE INDEX ux_agent_runs_session_active ON public.agent_runs USING btree (session_id) WHERE ((status)::text = ANY (ARRAY[('running'::character varying)::text, ('checkpointed'::character varying)::text, ('resuming'::character varying)::text]))""",
+    """CREATE UNIQUE INDEX ux_api_keys_key_hash_active ON public.api_keys USING btree (key_hash) WHERE (COALESCE(revoked, false) = false)""",
+    """CREATE UNIQUE INDEX ux_knowledge_bases_index_ref ON public.knowledge_bases USING btree (provider, index_ref) WHERE (index_ref IS NOT NULL)""",
+    """CREATE UNIQUE INDEX ux_knowledge_documents_pageindex ON public.knowledge_documents USING btree (knowledge_base_id, pageindex_doc_id) WHERE (pageindex_doc_id IS NOT NULL)""",
+    """CREATE UNIQUE INDEX ux_market_installations_owner_item ON public.market_installations USING btree (tenant_id, user_id, source, kind, market_id)""",
+    """CREATE UNIQUE INDEX ux_pending_interactions_open ON public.pending_interactions USING btree (session_id, tool_call_id) WHERE ((status)::text = ANY (ARRAY[('pending'::character varying)::text, ('answered'::character varying)::text]))""",
+    """CREATE UNIQUE INDEX ux_project_checkpoints_session_seq_kind ON public.project_checkpoints USING btree (session_id, seq, kind)""",
+    """CREATE UNIQUE INDEX ux_session_folds_range ON public.session_folds USING btree (session_id, covered_from, covered_to)""",
+    """CREATE UNIQUE INDEX ux_smn_project_session ON public.session_map_nodes USING btree (session_id) WHERE (((edge_kind)::text = 'project'::text) AND (session_id IS NOT NULL) AND ((session_id)::text <> ''::text))""",
+    """CREATE UNIQUE INDEX ux_smn_project_workspace_session ON public.session_map_nodes USING btree (workspace_id, session_id) WHERE (((edge_kind)::text = 'project'::text) AND (session_id IS NOT NULL))""",
+    """CREATE UNIQUE INDEX ux_system_settings_category_key ON public.system_settings USING btree (category, key)""",
+    """CREATE UNIQUE INDEX ux_users_email ON public.users USING btree (email)""",
 )
 
 _TABLES: tuple[str, ...] = (
@@ -829,17 +949,20 @@ _TABLES: tuple[str, ...] = (
     "agents",
     "api_keys",
     "audit_logs",
+    "checkpoint_untracked",
     "conversation_shares",
     "knowledge_bases",
     "knowledge_documents",
     "llm_models",
     "llm_provider_keys",
+    "market_installations",
     "media_assets",
     "memory_summaries",
     "message_archives",
     "messages",
     "model_prices",
     "pending_interactions",
+    "project_checkpoints",
     "run_lineage_ledger",
     "session_folds",
     "session_map_nodes",
@@ -847,6 +970,8 @@ _TABLES: tuple[str, ...] = (
     "sessions",
     "subagent_run_steps",
     "subagent_runs",
+    "superagent_settings",
+    "superagent_takeovers",
     "system_settings",
     "task_idempotency",
     "tasks",
