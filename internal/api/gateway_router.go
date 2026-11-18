@@ -445,8 +445,16 @@ func NewGatewayRouter(
 	// 目录聚合层在 internal/market：内置目录随二进制发布（//go:embed），
 	// 因此不依赖任何外部服务。外部源**默认关闭**（MARKET_REMOTE_ENABLED=0），
 	// 初装时市场页只有内置 Tab。
-	marketHandler := NewMarketHandler(newMarketService(cfg, pythonClient))
+	marketSvc := newMarketService(cfg, pythonClient)
+	marketHandler := NewMarketHandler(marketSvc)
 	marketHandler.RegisterRoutes(mux, authMW, rlMW)
+
+	// 安装流水线（独立 handler，便于与源管理分支并行合并）：
+	// 只读目录在 market_handler.go，写路径（装/卸/已安装列表）在 market_install.go。
+	// 编排（幂等 / 内外源默认启用 / 外部 MCP 门禁）在 internal/market/install.go，
+	// 落点（agents 表、plugins.json、Python 技能与知识库）由本层注入。
+	NewMarketInstallHandler(marketSvc, pythonClient, pluginHandler, cfg).
+		RegisterRoutes(mux, authMW, rlMW)
 
 	// 工具授权模式（GET/POST /v1/mode）已移除：模式不再是服务端状态，而是前端随
 	// 每次提交携带的请求参数（llm_config.tools_mode）。见 mode.go 的说明。
