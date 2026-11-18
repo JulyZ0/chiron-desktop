@@ -5,7 +5,7 @@ import {
   Button, Input, Modal, Switch, Tag, Popconfirm, Tabs, TabPane, message,
 } from 'ant-design-vue'
 import {
-  ThunderboltOutlined, PlusOutlined, DeleteOutlined, SearchOutlined,
+  ThunderboltOutlined, DeleteOutlined, SearchOutlined,
   EditOutlined, ExperimentOutlined, DownOutlined, UpOutlined, ShopOutlined,
   MessageOutlined, RobotOutlined,
 } from '@ant-design/icons-vue'
@@ -169,11 +169,15 @@ function openAttach(p: Plugin) {
   attachOpen.value = true
 }
 
-// ── 新建/编辑 ──
-function openCreate() {
-  editingName.value = ''
-  form.value = { name: '', command: '', argsText: '', envText: '', description: '', version: '1.0.0' }
-  editorOpen.value = true
+// ── 编辑 ──
+/**
+ * 空状态引导去市场装插件。
+ *
+ * 新建入口已撤下：插件的安装参数（command / args / env）与「装进来」这件事
+ * 统一由市场承担，页面上只保留已有插件的编辑、启停、装配、卸载。
+ */
+function goToMarket() {
+  void router.push({ path: '/market', query: { kind: 'plugin' } })
 }
 
 function openEdit(p: Plugin) {
@@ -215,18 +219,12 @@ async function savePlugin() {
   }
   saving.value = true
   try {
-    if (editingName.value) {
-      // 编辑：更新配置（PUT）；名称不可改
-      await api.put(`/v1/plugins/${encodeURIComponent(editingName.value)}`, {
-        command: body.command, args: body.args, env: body.env,
-        description: body.description, version: body.version,
-      })
-      message.success(t('common.saved'))
-    } else {
-      // 新建：install（POST）
-      await api.post(`/v1/plugins/${encodeURIComponent(body.name)}/install`, body)
-      message.success(t('common.plugin_created'))
-    }
+    // 只有编辑路径：新建入口已撤下，编辑器只由 openEdit 打开；名称不可改
+    await api.put(`/v1/plugins/${encodeURIComponent(editingName.value)}`, {
+      command: body.command, args: body.args, env: body.env,
+      description: body.description, version: body.version,
+    })
+    message.success(t('common.saved'))
     editorOpen.value = false
     await loadPlugins()
   } catch (e) {
@@ -308,15 +306,6 @@ async function testPlugin(p: Plugin) {
             @change="(v: any) => toggleCommandsEnabled(Boolean(v))"
           />
         </label>
-        <Button
-          type="primary"
-          @click="openCreate"
-        >
-          <template #icon>
-            <PlusOutlined />
-          </template>
-          {{ $t('common.new_plugin') }}
-        </Button>
       </div>
     </div>
 
@@ -368,17 +357,17 @@ async function testPlugin(p: Plugin) {
           size="page"
           :icon="markRaw(ThunderboltOutlined)"
           :description="searchQuery ? $t('common.no_matching_plugins') : $t('common.no_plugins')"
-          :hint="searchQuery ? $t('common.try_adjusting_your_search_keywords') : $t('agent.click_new_plugin_at_the_top_right_to_configure_cli_tool_integration')"
+          :hint="searchQuery ? $t('common.try_adjusting_your_search_keywords') : $t('agent.install_plugins_from_the_market_to_get_started')"
         >
           <Button
             v-if="!searchQuery"
             type="primary"
-            @click="openCreate"
+            @click="goToMarket"
           >
             <template #icon>
-              <PlusOutlined />
+              <ShopOutlined />
             </template>
-            {{ $t('common.new_plugin') }}
+            {{ $t('agent.browse_market') }}
           </Button>
         </EmptyState>
 
@@ -555,13 +544,12 @@ async function testPlugin(p: Plugin) {
           </div>
         </div>
       </TabPane>
-
     </Tabs>
 
-    <!-- 新建/编辑 Modal -->
+    <!-- 编辑 Modal（新建入口已撤下，只保留编辑） -->
     <Modal
       :open="editorOpen"
-      :title="editingName ? $t('common.edit_name', { name: editingName }) : $t('agent.new_mcp_plugin')"
+      :title="$t('common.edit_name', { name: editingName })"
       :confirm-loading="saving"
       width="520px"
       :ok-text="$t('common.save')"

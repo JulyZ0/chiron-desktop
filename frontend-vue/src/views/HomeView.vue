@@ -1,138 +1,169 @@
 <script setup lang="ts">
-import { copyTextOrThrow } from '../utils/clipboard'
-import { markRaw, onMounted, onUnmounted, ref } from 'vue'
+/**
+ * 首页 = 工作台仪表盘（原来是一张营销落地页：特性卡片 + 假窗口截图 + docker compose
+ * 终端块）。落地页对**已经装好并每天在用**的人来说全是噪音 —— 他要的是"接着上次干"
+ * 和"这个月烧了多少"。所以首页改为三块真数据：快捷入口、最近会话、用量概览。
+ *
+ * 数据来源（都是既有端点，不新增后端）：
+ *   - `GET /v1/conversations?per_page=N` → 最近会话（后端已按 pinned DESC, updated_at DESC
+ *     排序，前端只截取前 N 条，不自己重排）；
+ *   - `GET /v1/billing/usage?groupBy=day&range=7d` → 用量概览（`usage_events` 聚合，
+ *     金额单位是**分**，前端按既有的 "credits" 标签展示，与计费页口径一致）；
+ *   - 快捷命令复用 `executeQuickCommand`：建 uni 会话 → /v1/quick-execute → 跳
+ *     /chat?task=，与停靠坞里那条路径**同一份实现**，不复制一份。
+ *
+ * 失败降级：两块数据各自独立加载、独立报错 —— 会话拉不到不该让用量卡片也变成错误态
+ * （反过来也一样）。首页是入口页，任何一块坏了都只该影响它自己。
+ */
+import { computed, markRaw, onMounted, ref } from 'vue'
 import type { Component } from 'vue'
 import { useRouter } from 'vue-router'
-import { Button } from 'ant-design-vue'
+import { Button, Input } from 'ant-design-vue'
 import {
   MessageOutlined, UserOutlined, HistoryOutlined, BlockOutlined,
-  BookOutlined, ThunderboltOutlined, ArrowRightOutlined, ArrowUpOutlined,
+  BookOutlined, ThunderboltOutlined, ArrowRightOutlined,
 } from '@ant-design/icons-vue'
+import { api } from '../api'
+import { executeQuickCommand } from '../components/WorkstationNav.vue'
 import HomeScene3D from '../components/home/HomeScene3D.vue'
-import WorkstationNav from '../components/WorkstationNav.vue'
+import EmptyState from '../components/common/EmptyState.vue'
+import { useAuthStore } from '../stores/auth'
+import { formatSmart } from '../utils/datetime'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
 const router = useRouter()
+const auth = useAuthStore()
 
-interface Feature {
-  title: string
-  en: string
-  desc: string
+/** 最近会话只取一屏（更多交给「查看全部」） */
+const RECENT_LIMIT = 6
+
+// ── 快捷入口 ──
+// 图标必须 markRaw：图标是静态组件，被 Vue 响应式代理会破坏渲染。
+interface Entry {
   path: string
+  label: string
+  desc: string
   icon: Component
 }
 
-// 图标组件需 markRaw：避免被 Vue 响应式代理（图标是静态组件，代理会破坏渲染）
-const features: Feature[] = [
-  { title: t('chat.chat'), en: 'CHAT', desc: t('agent.normal_minimal_ptc_creative_modes_tool_calls_are_fully_visualized'), path: '/chat', icon: markRaw(MessageOutlined) },
-  { title: 'Agent', en: 'AGENTS', desc: t('workflow.multi_agent_collaboration_task_dispatch_and_result_tracking'), path: '/agents', icon: markRaw(UserOutlined) },
-  { title: t('memory.memory_2'), en: 'MEMORY', desc: t('memory.record_user_preferences_and_long_term_context_auto_attached_in_future_conversations'), path: '/memory', icon: markRaw(HistoryOutlined) },
-  { title: t('agent.skill'), en: 'SKILLS', desc: t('agent.pluggable_skill_marketplace_load_and_unload_on_demand'), path: '/skills', icon: markRaw(BlockOutlined) },
-  { title: t('knowledge.knowledge_base'), en: 'KNOWLEDGE', desc: t('agent.document_ingestion_and_vector_retrieval_give_agents_a_solid_basis'), path: '/knowledge', icon: markRaw(BookOutlined) },
-  { title: t('common.plugin'), en: 'PLUGINS', desc: t('agent.mcp_service_config_extends_the_agent_s_capability_boundary'), path: '/plugins', icon: markRaw(ThunderboltOutlined) },
-]
+// computed 而不是模块级常量：文案要跟随界面语言切换（模块级 `t()` 只在首次 import 时求值，
+// 切语言后标签会停在旧语言上 —— 停靠坞用的 WORKSTATION_LABELS 就是那个行为，这里不跟）。
+const entries = computed<Entry[]>(() => [
+  { path: '/chat', label: t('chat.chat'), desc: t('chat.ai_chat_assistant'), icon: markRaw(MessageOutlined) },
+  { path: '/agents', label: 'Agent', desc: t('agent.multi_agent_collaboration'), icon: markRaw(UserOutlined) },
+  { path: '/memory', label: t('memory.memory_2'), desc: t('memory.record_user_preferences_and_long_term_context_auto_attached_in_future_conversations'), icon: markRaw(HistoryOutlined) },
+  { path: '/skills', label: t('agent.skill'), desc: t('agent.tool_mcp'), icon: markRaw(BlockOutlined) },
+  { path: '/knowledge', label: t('knowledge.knowledge_base'), desc: t('knowledge.rag_retrieval_augmentation'), icon: markRaw(BookOutlined) },
+  { path: '/plugins', label: t('common.plugin'), desc: t('common.extensions'), icon: markRaw(ThunderboltOutlined) },
+])
 
-const QUICKSTART_CMD = 'docker compose up -d postgres redis\ncp .env.example .env\npython run.py start'
+// ── 快速命令：一句话直接开工 ──
+const quickInput = ref('')
+const quickRunning = ref(false)
 
-const copied = ref(false)
-
-async function copyQuickstart() {
+async function runQuickCommand() {
+  const command = quickInput.value.trim()
+  if (!command || quickRunning.value) return
+  quickRunning.value = true
   try {
-    await copyTextOrThrow(QUICKSTART_CMD)
-    copied.value = true
-    setTimeout(() => { copied.value = false }, 2000)
-  } catch { /* clipboard unavailable */ }
+    await executeQuickCommand(command)
+    quickInput.value = ''
+  } catch {
+    // 失败提示由 api 拦截器统一给出；这里保留输入内容让用户重试
+  } finally {
+    quickRunning.value = false
+  }
 }
 
-function scrollToFeatures() {
-  document.getElementById('features')?.scrollIntoView({ behavior: 'smooth' })
+// ── 最近会话 ──
+interface SessionRow {
+  id?: string
+  title?: string
+  alias?: string
+  pinned?: boolean
+  updated_at?: string
 }
 
-// ── 特性卡片：IntersectionObserver 交错入场 + hover 3D tilt ──
-// 触屏设备禁用 3D tilt 和 CTA 磁吸（无鼠标 hover 语义，且会触发误触抖动）
-const isTouch = typeof window !== 'undefined'
-  && ('ontouchstart' in window || navigator.maxTouchPoints > 0)
+const sessions = ref<SessionRow[]>([])
+const sessionsLoading = ref(false)
+const sessionsError = ref('')
 
-const cardEls = ref<(HTMLElement | null)[]>([])
-let cardObserver: IntersectionObserver | null = null
-let cardFallbackTimer: number | undefined
-
-function setCardRef(el: HTMLElement | null, index: number) {
-  cardEls.value[index] = el
+async function loadSessions() {
+  if (!auth.isAuthenticated) return
+  sessionsLoading.value = true
+  sessionsError.value = ''
+  try {
+    const { data } = await api.get('/v1/conversations', { params: { per_page: RECENT_LIMIT } })
+    const payload = data?.data
+    sessions.value = (Array.isArray(payload) ? payload : []).slice(0, RECENT_LIMIT)
+  } catch {
+    sessions.value = []
+    sessionsError.value = t('errors.failed_to_load')
+  } finally {
+    sessionsLoading.value = false
+  }
 }
 
-function revealCards() {
-  cardEls.value.forEach(el => el?.classList.add('visible'))
-  cardObserver?.disconnect()
+/** 展示名：别名优先（用户改过的名字比自动标题更可读），没有就退回标题 */
+function sessionName(s: SessionRow): string {
+  return (s.alias || '').trim() || (s.title || '').trim() || t('common.no_title_yet')
+}
+
+function openSession(id?: string) {
+  if (!id) return
+  router.push({ path: '/chat', query: { session: id } })
+}
+
+// ── 用量概览 ──
+interface DailyRow {
+  day: string
+  tx_count: number
+  credits_spent: number
+}
+
+interface UsageData {
+  daily?: DailyRow[]
+  /** 区间累计花费（单位：分，沿用计费页的 "credits" 展示口径） */
+  total_spent?: number
+  period_days?: number
+}
+
+const usage = ref<UsageData | null>(null)
+const usageLoading = ref(false)
+const usageError = ref('')
+
+/** 区间内 LLM 调用次数：`daily[].tx_count` 是每天的事件数，合计即总量 */
+const usageCalls = computed(() =>
+  (usage.value?.daily ?? []).reduce((sum, d) => sum + (Number(d.tx_count) || 0), 0),
+)
+
+async function loadUsage() {
+  if (!auth.isAuthenticated) return
+  usageLoading.value = true
+  usageError.value = ''
+  try {
+    const { data } = await api.get('/v1/billing/usage', { params: { groupBy: 'day', range: '7d' } })
+    usage.value = (data?.data as UsageData | undefined) ?? null
+  } catch {
+    // 库未就绪时后端回 503 —— 那是"暂时读不到"，与"这周没用过"不同，所以走错误态
+    // 而不是 0，否则用户会以为统计坏了。
+    usage.value = null
+    usageError.value = t('errors.failed_to_load')
+  } finally {
+    usageLoading.value = false
+  }
 }
 
 onMounted(() => {
-  cardObserver = new IntersectionObserver(
-    (entries) => {
-      for (const entry of entries) {
-        if (entry.isIntersecting) {
-          entry.target.classList.add('visible')
-          cardObserver?.unobserve(entry.target)
-        }
-      }
-    },
-    { threshold: 0.12 },
-  )
-  cardEls.value.forEach(el => el && cardObserver?.observe(el))
-  // 兜底：即使 IO 未触发（滚动容器异常等），2s 后强制显示所有卡片
-  cardFallbackTimer = window.setTimeout(revealCards, 2000)
-  window.addEventListener('scroll', onScroll, { passive: true })
+  void loadSessions()
+  void loadUsage()
 })
-onUnmounted(() => {
-  cardObserver?.disconnect()
-  if (cardFallbackTimer !== undefined) window.clearTimeout(cardFallbackTimer)
-  window.removeEventListener('scroll', onScroll)
-})
-
-function onCardMove(e: MouseEvent) {
-  if (isTouch) return
-  const card = e.currentTarget as HTMLElement
-  const r = card.getBoundingClientRect()
-  const px = (e.clientX - r.left) / r.width - 0.5
-  const py = (e.clientY - r.top) / r.height - 0.5
-  card.style.transform =
-    `perspective(600px) translateY(-3px) rotateX(${(-py * 6).toFixed(2)}deg) rotateY(${(px * 6).toFixed(2)}deg)`
-}
-
-function onCardLeave(e: MouseEvent) {
-  const card = e.currentTarget as HTMLElement
-  card.style.transform = ''
-}
-
-// ── CTA 磁吸：按钮轻微跟随鼠标 ──
-function onCtaMove(e: MouseEvent) {
-  if (isTouch) return
-  const btn = e.currentTarget as HTMLElement
-  const r = btn.getBoundingClientRect()
-  const dx = (e.clientX - r.left - r.width / 2) * 0.12
-  const dy = (e.clientY - r.top - r.height / 2) * 0.12
-  btn.style.transform = `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px)`
-}
-
-function onCtaLeave(e: MouseEvent) {
-  const btn = e.currentTarget as HTMLElement
-  btn.style.transform = ''
-}
-
-// ── 滚动到顶部按钮（长页面导航辅助） ──
-const showTop = ref(false)
-function onScroll() {
-  showTop.value = window.scrollY > 600
-}
-function scrollToTop() {
-  window.scrollTo({ top: 0, behavior: 'smooth' })
-}
 </script>
 
 <template>
   <div class="home">
-    <!-- Hero：Three.js 粒子场 + 渐变光晕 + 网格纹理 + 入场动画 -->
+    <!-- Hero：3D 粒子背景 + 一句话快速命令（首页的主操作就是"直接开工"） -->
     <section class="hero">
       <div
         class="hero-glow"
@@ -150,158 +181,132 @@ function scrollToTop() {
         <h1 class="hero-title">
           {{ $t('agent.let_the_agent') }}
           <span class="hero-title-accent">{{ $t('common.continuous_work') }}</span>
-          <br>{{ $t('common.in_real_scenarios') }}
         </h1>
         <p class="hero-sub">
-          {{ $t('workflow.chat_agent_workflow_skill_knowledge_base_and_plugins_unified_full_stack_capabilities_combine_freely') }}
-          <br class="hero-br">{{ $t('common.traceable_visible_process_your_local_intelligent_workspace') }}
+          {{ $t('common.traceable_visible_process_your_local_intelligent_workspace') }}
         </p>
-        <div class="hero-actions">
+        <div class="hero-quick">
+          <Input
+            v-model:value="quickInput"
+            size="large"
+            class="quick-input"
+            :placeholder="$t('common.quick_command_placeholder')"
+            :disabled="quickRunning"
+            @press-enter="runQuickCommand"
+          />
           <Button
             type="primary"
             size="large"
-            class="hero-cta glow"
-            @mousemove="onCtaMove"
-            @mouseleave="onCtaLeave"
-            @click="router.push('/chat')"
+            class="quick-run"
+            :loading="quickRunning"
+            @click="runQuickCommand"
           >
-            {{ $t('chat.start_conversation') }}
+            {{ $t('common.execute') }}
             <ArrowRightOutlined />
           </Button>
-          <Button
-            size="large"
-            class="hero-cta ghost"
-            @mousemove="onCtaMove"
-            @mouseleave="onCtaLeave"
-            @click="scrollToFeatures"
+        </div>
+      </div>
+    </section>
+
+    <section class="dashboard">
+      <!-- 快捷入口：六大工作台 -->
+      <div class="dash-block entries">
+        <div class="dash-head">
+          <h2 class="dash-title">
+            {{ $t('common.quick_start') }}
+          </h2>
+        </div>
+        <div class="entry-grid">
+          <button
+            v-for="e in entries"
+            :key="e.path"
+            type="button"
+            class="entry-card"
+            @click="router.push(e.path)"
           >
-            {{ $t('common.browse_features') }}
-          </Button>
+            <span class="entry-icon"><component :is="e.icon" /></span>
+            <span class="entry-name">{{ e.label }}</span>
+            <span class="entry-desc">{{ e.desc }}</span>
+          </button>
         </div>
       </div>
-    </section>
 
-    <!-- 六大工作台统一入口：快速命令 + 工作台网格 + 最近活动（互联互通） -->
-    <WorkstationNav />
-
-    <section
-      id="features"
-      class="features"
-    >
-      <h2 class="section-title">
-        {{ $t('common.six_capabilities_one_console') }}
-      </h2>
-      <p class="section-sub">
-        {{ $t('common.each_capability_can_be_used_independently_or_freely_combined') }}
-      </p>
-      <div class="feature-grid">
-        <div
-          v-for="(f, i) in features"
-          :key="f.title"
-          :ref="(el: any) => setCardRef(el as HTMLElement | null, i)"
-          class="feature-card"
-          :style="{ '--card-delay': `${i * 60}ms` }"
-          role="link"
-          tabindex="0"
-          @mousemove="onCardMove"
-          @mouseleave="onCardLeave"
-          @click="router.push(f.path)"
-          @keydown.enter="router.push(f.path)"
-        >
-          <span class="feature-icon-wrap">
-            <component
-              :is="f.icon"
-              class="feature-icon"
-            />
-          </span>
-          <span class="feature-en">{{ f.en }}</span>
-          <div class="feature-title">
-            {{ f.title }}
+      <div class="dash-cols">
+        <!-- 最近会话 -->
+        <div class="dash-block">
+          <div class="dash-head">
+            <h2 class="dash-title">
+              {{ $t('common.recent_sessions') }}
+            </h2>
+            <button
+              type="button"
+              class="dash-link"
+              @click="router.push('/chat')"
+            >
+              {{ $t('common.view_all') }}
+            </button>
           </div>
-          <div class="feature-desc">
-            {{ f.desc }}
+          <div
+            v-if="sessionsLoading"
+            class="dash-hint"
+          >
+            {{ $t('common.loading') }}
           </div>
-          <span class="feature-go">{{ $t('common.enter') }} <ArrowRightOutlined /></span>
+          <EmptyState
+            v-else-if="!sessions.length"
+            :description="sessionsError || $t('common.no_sessions_yet')"
+            size="list"
+          />
+          <ul
+            v-else
+            class="session-list"
+          >
+            <li
+              v-for="s in sessions"
+              :key="s.id"
+            >
+              <button
+                type="button"
+                class="session-row"
+                @click="openSession(s.id)"
+              >
+                <span class="session-title">{{ sessionName(s) }}</span>
+                <span class="session-time">{{ formatSmart(s.updated_at) }}</span>
+              </button>
+            </li>
+          </ul>
         </div>
-      </div>
-    </section>
 
-    <!-- 产品展示：真实工作台窗口预览（玻璃拟态） -->
-    <section class="showcase">
-      <h2 class="section-title">
-        {{ $t('common.a_real_workbench_seen_through_at_a_glance') }}
-      </h2>
-      <p class="section-sub">
-        {{ $t('agent.chat_trace_and_tool_calls_the_whole_process_is_visible') }}
-      </p>
-      <div class="showcase-grid">
-        <!-- 窗口 1：对话界面 -->
-        <div class="window-card">
-          <div class="window-chrome">
-            <span class="win-dot red" /><span class="win-dot yellow" /><span class="win-dot green" />
-            <span class="win-title">{{ $t('chat.chiron_conversation') }}</span>
+        <!-- 用量概览（近 7 天） -->
+        <div class="dash-block">
+          <div class="dash-head">
+            <h2 class="dash-title">
+              {{ $t('common.usage_overview') }}
+            </h2>
+            <span class="dash-range">{{ $t('common.last_7_days') }}</span>
           </div>
-          <div class="window-body chat-preview">
-            <div class="pv-msg assistant">
-              <div class="pv-bubble">
-                {{ $t('workflow.i_will_help_you_analyze_this_data_first_let_me_break_the_requirements_into_a_few_steps') }}
-              </div>
-            </div>
-            <div class="pv-msg user">
-              <div class="pv-bubble user">
-                {{ $t('common.please_use_python_to_generate_a_quarterly_trend_chart') }}
-              </div>
-            </div>
-            <div class="pv-msg assistant">
-              <div class="pv-tool">
-                <span class="pv-tool-dot" />{{ $t('common.python_exec_running') }}
-              </div>
-              <div class="pv-bubble">
-                {{ $t('common.trend_chart_generated_q2_up_23_qoq_code_and_chart_below') }}
-              </div>
-            </div>
-            <div class="pv-input">
-              <span>{{ $t('chat.send_message') }}</span>
-            </div>
+          <div
+            v-if="usageLoading"
+            class="dash-hint"
+          >
+            {{ $t('common.loading') }}
           </div>
-        </div>
-        <!-- 窗口 2：历史导航（轨迹 + 会话） -->
-        <div class="window-card">
-          <div class="window-chrome">
-            <span class="win-dot red" /><span class="win-dot yellow" /><span class="win-dot green" />
-            <span class="win-title">{{ $t('common.chiron_history_navigation') }}</span>
-          </div>
-          <div class="window-body panel-preview">
-            <div class="pv-panel-head">
-              <span class="pv-panel-title">{{ $t('chat.session_data_analysis') }}</span><span class="pv-panel-caret">▶</span>
+          <EmptyState
+            v-else-if="!usage"
+            :description="usageError || $t('common.no_usage_data_yet')"
+            size="list"
+          />
+          <div
+            v-else
+            class="usage-stats"
+          >
+            <div class="usage-stat">
+              <span class="usage-value">{{ usageCalls }}</span>
+              <span class="usage-label">{{ $t('billing.usage_col_events') }}</span>
             </div>
-            <div class="pv-timeline">
-              <div class="pv-timeline-track">
-                <span
-                  class="pv-span"
-                  style="left: 0%; width: 26%"
-                />
-                <span
-                  class="pv-span"
-                  style="left: 34%; width: 18%"
-                />
-                <span
-                  class="pv-span"
-                  style="left: 60%; width: 32%"
-                />
-              </div>
-            </div>
-            <div class="pv-row">
-              <span class="pv-dot" />{{ $t('common.analyze_the_trend_in_this_data') }}
-            </div>
-            <div class="pv-row active">
-              <span class="pv-dot" />{{ $t('common.generate_quarterly_trend_chart') }}
-            </div>
-            <div class="pv-row">
-              <span class="pv-dot" />{{ $t('common.compare_with_same_period_last_year') }}
-            </div>
-            <div class="pv-row">
-              <span class="pv-dot" />{{ $t('common.summarize_as_weekly_report') }}
+            <div class="usage-stat">
+              <span class="usage-value">{{ usage.total_spent ?? 0 }}</span>
+              <span class="usage-label">{{ $t('billing.usage_col_cost') }}</span>
             </div>
           </div>
         </div>
@@ -314,20 +319,6 @@ function scrollToTop() {
       </span>
       <span class="home-footer-note">{{ $t('common.self_hosted_open_source_your_data_stays_on_your_machine') }}</span>
     </footer>
-
-    <!-- 滚动到顶部按钮（长页面辅助导航） -->
-    <Transition name="top-fade">
-      <button
-        v-if="showTop"
-        type="button"
-        class="scroll-top"
-        :title="$t('common.back_to_top')"
-        :aria-label="$t('common.back_to_top')"
-        @click="scrollToTop"
-      >
-        <ArrowUpOutlined />
-      </button>
-    </Transition>
   </div>
 </template>
 
@@ -339,8 +330,9 @@ function scrollToTop() {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: min(560px, 72vh);
-  padding: 72px 24px 64px;
+  /* 仪表盘页首屏要让出空间给数据 —— 原来 72vh 的 Hero 会把三块内容全挤到折叠线以下 */
+  min-height: min(380px, 52vh);
+  padding: 56px 24px 44px;
   text-align: center;
   overflow: hidden;
 }
@@ -367,7 +359,7 @@ function scrollToTop() {
   pointer-events: none;
   opacity: 0.5;
 }
-.hero-content { position: relative; z-index: var(--z-local); max-width: 760px; }
+.hero-content { position: relative; z-index: var(--z-local); width: 100%; max-width: 720px; }
 .hero-badge {
   display: inline-flex;
   align-items: center;
@@ -380,25 +372,18 @@ function scrollToTop() {
   font-weight: var(--fw-medium);
   color: var(--text-secondary);
   box-shadow: var(--shadow-sm);
-  animation: heroReveal var(--dur-page) ease-out both;
 }
 .hero-badge-dot {
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--primary);
-  animation: dotPulse var(--dur-pulse) ease-in-out infinite;
-}
-@keyframes dotPulse {
-  0%, 100% { box-shadow: 0 0 4px var(--primary); }
-  50% { box-shadow: 0 0 12px var(--primary); }
 }
 .hero-title {
-  margin: 22px 0 16px;
-  font-size: clamp(34px, 5.5vw, 56px);
-  line-height: 1.15;
+  margin: 20px 0 12px;
+  font-size: clamp(28px, 4.4vw, 44px);
+  line-height: 1.18;
   font-weight: var(--fw-bold);
   letter-spacing: -0.02em;
   color: var(--text-primary);
-  animation: heroReveal var(--dur-page) 0.08s cubic-bezier(0.22, 0.8, 0.36, 1) both;
 }
 .hero-title-accent {
   background: linear-gradient(100deg, var(--primary), var(--accent));
@@ -409,248 +394,185 @@ function scrollToTop() {
 }
 .hero-sub {
   margin: 0 auto;
-  font-size: 15px;
-  line-height: 26px;
+  font-size: 14px;
+  line-height: 24px;
   color: var(--text-secondary);
   max-width: 560px;
-  animation: heroReveal var(--dur-page) 0.16s cubic-bezier(0.22, 0.8, 0.36, 1) both;
 }
-.hero-actions { display: flex; gap: 12px; justify-content: center; margin-top: 30px; animation: heroReveal var(--dur-page) 0.24s cubic-bezier(0.22, 0.8, 0.36, 1) both; }
-@keyframes heroReveal {
-  from { opacity: 0; transform: translateY(16px); }
-  to { opacity: 1; transform: translateY(0); }
+
+/* 快速命令：输入框与按钮同高、同一行；窄屏自动换行 */
+.hero-quick {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+  margin: 26px auto 0;
+  max-width: 620px;
 }
-.hero-cta {
-  position: relative;
-  overflow: hidden;
+.quick-input { flex: 1; min-width: 0; }
+.quick-run {
+  flex: none;
+  height: auto;
   border-radius: var(--radius-xl);
-  padding: 0 26px;
-  height: 44px;
-  font-size: 14px;
+  padding: 0 22px;
   font-weight: var(--fw-semibold);
-  transition: transform var(--dur-normal) ease-out, box-shadow var(--dur-normal) ease, border-color var(--dur-normal) ease, background var(--dur-normal) ease;
-}
-.hero-cta.glow {
   box-shadow: var(--shadow-md), 0 4px 14px var(--primary-bg);
 }
-.hero-cta.glow:hover { box-shadow: var(--shadow-lg), 0 6px 20px var(--primary-bg); }
-.hero-cta.ghost {
-  border-color: var(--border-default);
-  color: var(--text-primary);
-  background: var(--bg-surface);
-}
-.hero-cta.ghost:hover { border-color: var(--primary); color: var(--primary); }
 
-/* ── 特性网格 ── */
-.features { max-width: 1080px; margin: 0 auto; padding: 40px 24px 56px; position: relative; }
-.section-title { font-size: 28px; font-weight: var(--fw-bold); letter-spacing: -0.01em; text-align: center; }
-.section-sub { margin-top: 8px; text-align: center; font-size: 14px; color: var(--text-tertiary); }
-.feature-grid {
-  position: relative;
-  z-index: var(--z-content);
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  gap: 14px;
-  margin-top: 34px;
-}
-.feature-card {
-  position: relative;
+/* ── 仪表盘 ── */
+.dashboard {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 8px 24px 48px;
   display: flex;
   flex-direction: column;
-  padding: 22px 20px 18px;
+  gap: 16px;
+}
+.dash-block {
   border: var(--hairline-width) solid var(--border-default);
   border-radius: var(--comp-card-radius);
   background: var(--bg-surface);
   box-shadow: var(--shadow-sm);
-  cursor: pointer;
-  transition: transform var(--dur-normal) var(--ease-out),
-              border-color var(--dur-normal) var(--ease-out),
-              box-shadow var(--dur-normal) var(--ease-out);
+  padding: 18px 20px 20px;
 }
-.feature-card.visible {
-  animation: cardIn var(--dur-page) cubic-bezier(0.22, 0.8, 0.36, 1) both;
-  animation-delay: var(--card-delay, 0ms);
-}
-@keyframes cardIn {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: none; }
-}
-.feature-card:hover {
-  transform: translateY(-2px);
-  border-color: var(--primary);
-  box-shadow: var(--shadow-md), 0 0 0 3px var(--primary-bg);
-}
-.feature-card:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-ring-offset); }
-.feature-icon-wrap {
-  width: 42px; height: 42px;
-  display: inline-flex; align-items: center; justify-content: center;
-  border-radius: var(--sig-radius-card);
-  background: var(--primary-bg);
-  color: var(--primary);
-  margin-bottom: 14px;
-}
-.feature-icon { font-size: 20px; }
-.feature-en {
-  font-size: var(--fs-xs);
-  font-weight: var(--fw-semibold);
-  letter-spacing: 0.16em;
-  color: var(--text-tertiary);
-  text-transform: uppercase;
-  margin-bottom: 4px;
-}
-.feature-title { font-size: 15px; font-weight: var(--fw-semibold); color: var(--text-primary); }
-.feature-desc { margin-top: 6px; font-size: 13px; line-height: 20px; color: var(--text-secondary); flex: 1; }
-.feature-go { margin-top: 12px; font-size: 12px; color: var(--primary); opacity: 0; transform: translateX(-4px); transition: opacity var(--dur-normal) ease, transform var(--dur-normal) ease; }
-.feature-card:hover .feature-go { opacity: 1; transform: translateX(0); }
-
-/* ── 产品展示：工作台窗口预览 ── */
-.showcase { max-width: 1080px; margin: 0 auto; padding: 24px 24px 56px; position: relative; }
-.showcase-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 18px;
-  margin-top: 34px;
-}
-.window-card {
-  border-radius: var(--sig-radius-card);
-  overflow: hidden;
-  border: var(--hairline-width) solid var(--border-default);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-md);
-  transition: transform var(--dur-normal) ease, box-shadow var(--dur-normal) ease;
-}
-.window-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-lg); }
-.window-chrome {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  height: 36px;
-  padding: 0 12px;
-  border-bottom: var(--hairline-width) solid var(--border-subtle);
-  background: var(--bg-surface-hover);
-}
-.win-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-.win-dot.red { background: var(--traffic-red); }
-.win-dot.yellow { background: var(--traffic-amber); }
-.win-dot.green { background: var(--traffic-green); }
-.win-title { flex: 1; text-align: center; font-size: var(--fs-xs); color: var(--text-tertiary); margin-inline-end: 30px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.window-body { padding: 16px; }
-
-.chat-preview { display: flex; flex-direction: column; gap: 10px; min-height: 200px; }
-.pv-msg { display: flex; }
-.pv-msg.user { justify-content: flex-end; }
-.pv-bubble {
-  max-width: 82%;
-  padding: 8px 12px;
-  border-radius: var(--sig-radius-bubble);
-  border-bottom-left-radius: 4px;
-  background: var(--bg-code);
-  border: var(--hairline-width) solid var(--border-subtle);
-  font-size: 12px;
-  line-height: 19px;
-  color: var(--text-primary);
-}
-.pv-msg.user .pv-bubble {
-  border-radius: var(--sig-radius-bubble);
-  border-bottom-right-radius: 4px;
-  background: var(--primary-bg);
-  border-color: var(--primary-border);
-}
-.pv-tool {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 6px;
-  padding: 3px 10px;
-  border-radius: var(--radius-full);
-  background: var(--bg-surface-hover);
-  border: var(--hairline-width) solid var(--border-subtle);
-  font-size: var(--fs-xs);
-  color: var(--text-secondary);
-  font-family: var(--font-mono);
-}
-.pv-tool-dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: var(--primary);
-}
-.pv-input {
-  margin-top: 2px;
-  padding: 8px 12px;
-  border-radius: var(--radius-xl);
-  border: var(--hairline-width) solid var(--border-default);
-  background: var(--bg-surface-hover);
-  font-size: 12px;
-  color: var(--text-tertiary);
-}
-
-.panel-preview { display: flex; flex-direction: column; gap: 6px; min-height: 200px; }
-.pv-panel-head {
+.dash-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 4px 8px 8px;
-  border-bottom: var(--hairline-width) solid var(--border-subtle);
-  margin-bottom: 4px;
+  gap: 12px;
+  margin-bottom: 14px;
 }
-.pv-panel-title { font-size: 12px; font-weight: var(--fw-semibold); color: var(--text-primary); }
-.pv-panel-caret { font-size: var(--fs-xs); color: var(--text-tertiary); }
-.pv-timeline {
-  height: 34px;
+.dash-title {
+  font-size: 15px;
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+}
+.dash-link {
+  flex: none;
+  border: 0;
+  background: transparent;
+  padding: 2px 4px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  color: var(--primary);
+  cursor: pointer;
+  transition: background var(--dur-fast) ease;
+}
+.dash-link:hover { background: var(--primary-bg); }
+.dash-range { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); }
+.dash-hint { padding: 24px 0; text-align: center; font-size: 13px; color: var(--text-tertiary); }
+
+/* 快捷入口网格 */
+.entry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+.entry-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: start;
+  padding: 14px 14px 16px;
+  border: var(--hairline-width) solid var(--border-subtle);
+  border-radius: var(--sig-radius-card);
+  background: var(--bg-surface-hover);
+  color: inherit;
+  cursor: pointer;
+  transition: transform var(--dur-fast) var(--ease-out),
+              border-color var(--dur-fast) var(--ease-out),
+              box-shadow var(--dur-fast) var(--ease-out);
+}
+.entry-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--primary);
+  box-shadow: var(--shadow-md);
+}
+.entry-card:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-ring-offset); }
+.entry-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  margin-bottom: 6px;
+  border-radius: var(--radius-md);
+  background: var(--primary-bg);
+  color: var(--primary);
+  font-size: 16px;
+}
+.entry-name { font-size: 13px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+.entry-desc {
+  font-size: var(--fs-xs);
+  line-height: 17px;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* 最近会话 + 用量：并排，窄屏堆叠 */
+.dash-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 16px;
+}
+.session-list { display: flex; flex-direction: column; gap: 2px; }
+.session-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  color: inherit;
+  text-align: start;
+  cursor: pointer;
+  transition: background var(--dur-fast) ease;
+}
+.session-row:hover { background: var(--bg-surface-hover); }
+.session-row:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-ring-offset); }
+.session-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-time { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+
+/* 用量数字 */
+.usage-stats {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  padding: 6px 0 4px;
+}
+.usage-stat {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
   border-radius: var(--radius-lg);
   background: var(--bg-surface-hover);
   border: var(--hairline-width) solid var(--border-subtle);
-  position: relative;
 }
-.pv-timeline-track { position: absolute; inset: 12px 10px; }
-.pv-span {
-  position: absolute;
-  top: 0;
-  height: 8px;
-  border-radius: var(--radius-xs);
-  background: linear-gradient(90deg, var(--primary), var(--accent));
-  opacity: 0.85;
+.usage-value {
+  font-size: 24px;
+  font-weight: var(--fw-bold);
+  line-height: 1.1;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
 }
-.pv-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border-radius: var(--radius-lg);
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-.pv-row.active { background: var(--primary-bg); color: var(--primary); font-weight: var(--fw-semibold); }
-.pv-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--primary); opacity: 0.7; }
-
-/* ── 快速开始：终端代码块 ── */
-.quickstart { max-width: 760px; margin: 0 auto; padding: 24px 24px 64px; }
-.terminal-card {
-  margin-top: 30px;
-  border-radius: var(--sig-radius-card);
-  overflow: hidden;
-  border: var(--hairline-width) solid var(--border-default);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-md);
-}
-.terminal-card .window-chrome { background: var(--bg-surface-hover); }
-.term-copy {
-  flex: none;
-  margin-inline-start: auto;
-  min-height: 28px;
-  border: var(--hairline-width) solid var(--border-default);
-  border-radius: var(--radius-md);
-  background: transparent;
-  color: var(--text-tertiary);
-  font-size: var(--fs-xs);
-  padding: 4px 12px;
-  cursor: pointer;
-  transition: color var(--dur-fast) ease, border-color var(--dur-fast) ease;
-}
-.term-copy:hover { color: var(--primary); border-color: var(--primary); }
-.terminal-body { padding: 16px 18px; font-family: var(--font-mono); font-size: 12.5px; line-height: 24px; background: var(--bg-code); }
-.term-line { color: var(--text-primary); white-space: pre-wrap; word-break: break-all; }
-.term-prompt { color: var(--primary); font-weight: var(--fw-semibold); margin-inline-end: 8px; }
-.term-out { color: var(--text-tertiary); margin-top: 6px; }
+.usage-label { font-size: var(--fs-xs); color: var(--text-tertiary); }
 
 /* ── 页脚 ── */
 .home-footer {
@@ -672,61 +594,22 @@ function scrollToTop() {
   display: inline-flex; align-items: center; justify-content: center;
 }
 
+@media (max-width: 900px) {
+  .dash-cols { grid-template-columns: 1fr; }
+}
 @media (max-width: 640px) {
-  .hero { min-height: 520px; padding: 56px 20px 40px; }
-  .hero-br { display: none; }
-  .hero-actions { flex-direction: column; align-items: center; }
-  .feature-grid { grid-template-columns: 1fr; }
-  .showcase-grid { grid-template-columns: 1fr; }
+  .hero { min-height: 320px; padding: 44px 18px 34px; }
+  .hero-quick { flex-direction: column; }
+  .quick-run { width: 100%; height: 40px; }
+  .dashboard { padding-inline: 16px; }
+  .entry-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .usage-stats { flex-direction: column; }
   .home-footer { flex-direction: column; text-align: center; }
 }
-@media (max-width: 768px) and (min-width: 641px) {
-  .feature-grid { grid-template-columns: repeat(2, 1fr); }
-  .showcase-grid { grid-template-columns: 1fr; }
-  .hero-title { font-size: clamp(30px, 6vw, 44px); }
-}
-@media (max-width: 640px) {
-  .features, .showcase { padding-inline-start: 16px; padding-inline-end: 16px; }
-  .quickstart { padding-inline-start: 16px; padding-inline-end: 16px; }
-  .feature-grid { gap: 12px; }
-  .hero-cta { width: 100%; max-width: 320px; }
-}
 @media (hover: none) {
-  .feature-card:hover { transform: none; }
-  .hero-cta:hover { transform: none; }
+  .entry-card:hover { transform: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .hero-badge, .hero-title, .hero-sub, .hero-actions,
-  .feature-card.visible, .hero-badge-dot { animation: none; }
-  .feature-card { opacity: 1; }
-  .hero-cta { transition: none; }
-  .scroll-top { transition: none; }
+  .entry-card { transition: none; }
 }
-
-.scroll-top {
-  position: fixed;
-  right: 24px;
-  bottom: 24px;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  border: var(--hairline-width) solid var(--border-default);
-  background: var(--bg-surface);
-  color: var(--text-primary);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  z-index: var(--z-sticky);
-  box-shadow: var(--shadow-md);
-  transition: transform var(--dur-normal) ease, border-color var(--dur-normal) ease, background var(--dur-normal) ease;
-}
-.scroll-top:hover {
-  transform: translateY(-2px);
-  border-color: var(--primary);
-  color: var(--primary);
-}
-.scroll-top:active { transform: translateY(0) scale(0.94); }
-.top-fade-enter-active, .top-fade-leave-active { transition: opacity var(--dur-normal) ease, transform var(--dur-normal) ease; }
-.top-fade-enter-from, .top-fade-leave-to { opacity: 0; transform: translateY(8px); }
 </style>

@@ -7,13 +7,13 @@ import {
   Alert, Dropdown, Menu, MenuItem, Select, message,
 } from 'ant-design-vue'
 import {
-  PlusOutlined, PlayCircleOutlined, EditOutlined, DeleteOutlined,
+  PlayCircleOutlined, EditOutlined, DeleteOutlined,
   StopOutlined, ClockCircleOutlined, CheckCircleOutlined,
   CloseCircleOutlined, SyncOutlined, RobotOutlined, HistoryOutlined,
   MessageOutlined, ShopOutlined, TeamOutlined, LockOutlined,
 } from '@ant-design/icons-vue'
 import {
-  listAgents, createAgent, updateAgent, deleteAgent,
+  listAgents, updateAgent, deleteAgent,
   runAgent, listAgentSessions, getAgentSession,
 setAgentVisibility,
 } from '../api'
@@ -174,22 +174,14 @@ async function loadBindingOptions() {
   }
 }
 
-function resetBinding() {
-  formKbId.value = undefined
-  formSkills.value = []
-  formPlugins.value = []
-}
-
-function openCreate() {
-  editingId.value = ''
-  form.value = {
-    id: '', name: '', description: '', system_prompt: '',
-    tools_text: '[]', model: 'deepseek-chat', max_tokens: 4096,
-    temperature: 0.6, max_turns: 5, timeout_seconds: 120, enabled: true,
-  }
-  resetBinding()
-  void loadBindingOptions()
-  editorOpen.value = true
+/**
+ * 空状态引导去市场装 Agent。
+ *
+ * 新建入口已撤下：Agent 的定义（prompt / 工具集 / 绑定）与「装进来」这件事
+ * 统一由市场承担，页面上只保留已有 Agent 的编辑、启停、派发、删除。
+ */
+function goToMarket() {
+  void router.push({ path: '/market', query: { kind: 'agent' } })
 }
 
 function openEdit(a: Agent) {
@@ -248,13 +240,9 @@ async function saveEditor() {
   }
   editorSaving.value = true
   try {
-    if (editingId.value) {
-      await updateAgent(editingId.value, body)
-      message.success(t('common.saved'))
-    } else {
-      await createAgent(body)
-      message.success(t('common.created'))
-    }
+    // 只有编辑路径：新建入口已撤下，编辑器只由 openEdit 打开
+    await updateAgent(editingId.value, body)
+    message.success(t('common.saved'))
     editorOpen.value = false
     await loadAgents()
   } catch (e) {
@@ -474,15 +462,6 @@ function toolCount(a: Agent): number {
           {{ $t('agent.create_a_dedicated_agent_define_its_prompt_and_tools_and_dispatch_it_to_actually_run_with_one_click') }}
         </p>
       </div>
-      <Button
-        type="primary"
-        @click="openCreate"
-      >
-        <template #icon>
-          <PlusOutlined />
-        </template>
-        {{ $t('agent.new_agent_2') }}
-      </Button>
     </div>
 
     <Tabs
@@ -520,16 +499,16 @@ function toolCount(a: Agent): number {
           size="page"
           :icon="markRaw(RobotOutlined)"
           :description="$t('agent.no_agents_yet')"
-          :hint="$t('workflow.click_new_agent_at_the_top_right_to_define_its_prompt_and_tools_then_start_dispatching_tasks')"
+          :hint="$t('agent.install_agents_from_the_market_to_get_started')"
         >
           <Button
             type="primary"
-            @click="openCreate"
+            @click="goToMarket"
           >
             <template #icon>
-              <PlusOutlined />
+              <ShopOutlined />
             </template>
-            {{ $t('agent.new_agent_2') }}
+            {{ $t('agent.browse_market') }}
           </Button>
         </EmptyState>
         <div
@@ -735,10 +714,10 @@ function toolCount(a: Agent): number {
       </TabPane>
     </Tabs>
 
-    <!-- ── 新建/编辑 Modal ── -->
+    <!-- ── 编辑 Modal（新建入口已撤下，只保留编辑） ── -->
     <Modal
       :open="editorOpen"
-      :title="editingId ? $t('agent.edit_agent') : $t('agent.new_agent_2')"
+      :title="$t('agent.edit_agent')"
       :confirm-loading="editorSaving"
       width="720px"
       :ok-text="$t('common.save')"

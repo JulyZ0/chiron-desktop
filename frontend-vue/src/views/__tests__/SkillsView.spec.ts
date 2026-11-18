@@ -38,15 +38,11 @@ const apiMocks = vi.hoisted(() => ({
   post: vi.fn((): Promise<unknown> => Promise.resolve({ data: {} })),
   put: vi.fn((): Promise<unknown> => Promise.resolve({ data: {} })),
   delete: vi.fn((): Promise<unknown> => Promise.resolve({ data: {} })),
-  // 发现页签走独立封装（`api/index.ts:discoverSkills`），不是裸 api.get
-  discoverSkills: vi.fn((): Promise<unknown> =>
-    Promise.resolve({ local: [], remote: [] })),
 }))
 
 vi.mock('../../api', () => ({
   api: { get: apiMocks.get, post: apiMocks.post, put: apiMocks.put, delete: apiMocks.delete },
   listAgents: apiMocks.listAgents,
-  discoverSkills: apiMocks.discoverSkills,
 }))
 
 import SkillsView from '../SkillsView.vue'
@@ -83,11 +79,13 @@ describe('SkillsView（此前零测试）', () => {
     expect(() => wrapper.unmount()).not.toThrow()
   })
 
-  it('初始加载不主动发现（发现是显式动作，不能凭空多打一次远端）', async () => {
+  it('页面上没有安装/发现入口：装技能统一走市场（避免两条安装路径并存）', async () => {
     const wrapper = mountView()
     await flushPromises()
 
-    expect(apiMocks.discoverSkills).not.toHaveBeenCalled()
+    // 三个页签已撤下，只剩技能列表；安装端点也不该再被这个页面调起
+    expect(wrapper.findAll('.ant-tabs-tab')).toHaveLength(1)
+    expect(apiMocks.post).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 
