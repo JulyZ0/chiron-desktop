@@ -447,8 +447,16 @@ func NewGatewayRouter(
 	// 开启入口有两处 —— env（MARKET_REMOTE_ENABLED）或后台「系统设置 → market」
 	// （system_settings 的 market 分类，DB 覆盖 env），见 market_wiring.go。
 	// settingsStore 可能为 nil（无 DB 的本地模式），此时纯用 env。
-	marketHandler := NewMarketHandler(newMarketService(cfg, pythonClient, settingsStore))
+	marketSvc := newMarketService(cfg, pythonClient, settingsStore)
+	marketHandler := NewMarketHandler(marketSvc)
 	marketHandler.RegisterRoutes(mux, authMW, rlMW)
+
+	// 安装流水线（独立 handler，便于与源管理分支并行合并）：
+	// 只读目录在 market_handler.go，写路径（装/卸/已安装列表）在 market_install.go。
+	// 编排（幂等 / 内外源默认启用 / 外部 MCP 门禁）在 internal/market/install.go，
+	// 落点（agents 表、plugins.json、Python 技能与知识库）由本层注入。
+	NewMarketInstallHandler(marketSvc, pythonClient, pluginHandler, cfg).
+		RegisterRoutes(mux, authMW, rlMW)
 
 	// 工具授权模式（GET/POST /v1/mode）已移除：模式不再是服务端状态，而是前端随
 	// 每次提交携带的请求参数（llm_config.tools_mode）。见 mode.go 的说明。
