@@ -25,6 +25,10 @@
    转成 ``"\\344\\270\\255.py"``，按行解析直接拿到错误文件名。
 4. 恢复 ``added`` 类文件前必须 ``mkdir -p`` 父目录，否则报
    ``No such file or directory`` —— 而且**退出码可能仍是 0**，不能只看返回值。
+5. 动手前必须校验"仓库顶层 == ``root``"（:func:`verify_repo_root`）。git 会向上
+   查找父仓库：项目根若是某个大仓库的子目录，``write-tree`` 照样成功 —— 但它快照的是
+   **父仓库**的工作区，ref/commit 也写进父仓库，而上报的却是 ``state='ok'``。
+   这是"检查点看起来从没正确跑过"的根因之一，务必不要为了省一次 ``rev-parse`` 去掉它。
 
 D4（未跟踪文件）：默认**不进 git 对象库**，而进本模块自带的按 sha256 分片的
 内容寻址存储（``UntrackedStore``）。理由：agent 新建的文件数量不可控，塞进用户的
@@ -302,6 +306,19 @@ class GitError(RuntimeError):
     """git 子命令失败（非零退出）。"""
 
 
+#: 显式指定 git 可执行文件的设置项（值为绝对路径）。
+#:
+#: 打包运行时（Electron 主进程拉起的引擎）PATH 往往只有系统默认几项，用户自己装
+#: 在别处的 git 会找不到 —— 症状是"时间线一直空白"，而原因埋在子进程异常里
+#: （``[WinError 2]`` 对用户没有任何行动价值）。因此允许多一条显式路径。
+GIT_BIN_ENV = "CHIRON_GIT_BIN"
+
+
+def git_bin() -> str:
+    """git 可执行文件名/路径：``CHIRON_GIT_BIN`` 优先，否则用 PATH 里的 ``git``。"""
+    return (os.environ.get(GIT_BIN_ENV) or "").strip() or "git"
+
+
 #: 这些变量会让 git 指向**另一个**仓库。必须清掉，否则在用户的
 #: ``GIT_DIR`` 环境里调用会静默操作到别处（跨仓库写入是最坏的一类 bug）。
 _UNSAFE_GIT_ENV = (
@@ -345,20 +362,38 @@ def _run_git(
     stdin: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     """跑一条 git 命令，返回原始 bytes（不解码 —— 文件名与二进制内容都要保真）。"""
-    cmd = ["git", "-C", str(root), *args]
+    exe = git_bin()
+    cmd = [exe, "-C", str(root), *args]
     kwargs: dict[str, object] = {}
     if os.name == "nt":
         # 后台打包运行时不能弹黑框。
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        input=stdin,
-        env=dict(env) if env is not None else _git_env(),
-        timeout=timeout,
-        check=False,
-        **kwargs,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            input=stdin,
+            env=dict(env) if env is not None else _git_env(),
+            timeout=timeout,
+            check=False,
+            **kwargs,
+        )
+    except FileNotFoundError as exc:
+        # ``subprocess`` 的原始异常是 ``[WinError 2] 系统找不到指定的文件``：
+        # 它既没说是"哪个东西"没找到，也没给出下一步。对用户而言这条链路
+        # 表现为"还原点一直是空的"，完全无法自助排查。
+        raise GitError(
+            f"未找到 git（git executable not found）: {exe!r}；"
+            f"检查点已跳过。请安装 git，或设置环境变量 {GIT_BIN_ENV} "
+            f"指向 git 可执行文件的绝对路径。"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        # 同上：``TimeoutExpired`` 不是 ``OSError``，直接抛出去会被上层归到
+        # "unknown" 错误码，前端就只能显示一个无法分类的原因。
+        raise GitError(
+            f"git {' '.join(args)} timed out after {timeout}s "
+            f"(repository too large or locked by another process)"
+        ) from exc
 
 
 def _must(proc: subprocess.CompletedProcess[bytes], what: str) -> bytes:
@@ -371,6 +406,65 @@ def _must(proc: subprocess.CompletedProcess[bytes], what: str) -> bytes:
 def _split_z(raw: bytes) -> list[str]:
     """按 NUL 切分 git 的输出。**唯一**可靠的解析方式。"""
     return [os.fsdecode(item) for item in raw.split(b"\0") if item]
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    """两个路径是否指同一个目录（跟随符号链接，Windows 大小写不敏感）。
+
+    ``rev-parse --show-toplevel`` 输出的是 git 自己的路径风格（Windows 上是
+    ``C:/Users/...`` 正斜杠），与 ``Path`` 的 ``\\`` 写法不能直接比较字符串；
+    而 macOS 的 ``/var`` → ``/private/var``、Windows 的大小写差异都会让
+    "同一个目录"被判成不同。因此先 ``realpath`` 再 ``normcase``。
+    """
+    try:
+        left = os.path.normcase(os.path.realpath(a))
+        right = os.path.normcase(os.path.realpath(b))
+    except OSError:
+        return False
+    return left == right
+
+
+def verify_repo_root(root: Path) -> None:
+    """校验 ``root`` **本身就是**它所在 git 仓库的工作区顶层；不是就抛 ``GitError``。
+
+    为什么必须校验（这是"检查点从没正确跑过"的根因之一）：
+
+    git 会**向上查找**父仓库。项目根若是某个大仓库的子目录（把
+    ``~/bigrepo/projects/demo`` 当项目根，或用户目录本身嵌在仓库里），
+    ``git -C demo write-tree`` 会成功，但它写的是**父仓库**的工作区：
+
+    * 快照里是父仓库的文件（用户以为保护了 demo，实际保护了别处）；
+    * commit / ref（``refs/chiron/checkpoints/...``）写进父仓库 ——
+      在别人的仓库里留下 ref 与对象；
+    * 失败是**静默**的：``state='ok'`` 报上去，而 ``ls-tree`` 在子目录里按
+      git 的路径前缀过滤，读回来是空清单 —— 时间线上看起来"这一刻保护成功、
+      0 个文件"，回滚却指向父仓库的历史。
+
+    所以正确行为是**拒绝**：让上层落一条 ``state='failed'`` 的可读记录
+    （"project root is inside another git repository"），而不是错误快照。
+    未 ``git init`` 的项目同样落在这里 —— 明确的失败比伪装成成功的空快照好。
+    """
+    root = Path(root)
+    proc = _run_git(root, "rev-parse", "--show-toplevel")
+    detail = proc.stderr.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        raise GitError(
+            f"not a git repository: {root}"
+            + (f" ({detail})" if detail else "")
+            + "；检查点需要版本控制，请先在该目录执行 git init。"
+        )
+    top_raw = proc.stdout.decode("utf-8", errors="replace").strip()
+    if not top_raw:
+        # 正常仓库不会走到这里；保底也拒绝，避免"空值当成匹配"。
+        raise GitError(f"git rev-parse --show-toplevel returned nothing for {root}")
+    top = Path(top_raw)
+    if not _same_dir(top, root):
+        raise GitError(
+            f"project root is inside another git repository: {root} "
+            f"(repository top-level: {top_raw})；"
+            "检查点不会快照父仓库的内容，请在项目根执行 git init，"
+            "或把项目根指向仓库顶层目录。"
+        )
 
 
 def _repo_objects_bytes(root: Path) -> int:
@@ -544,8 +638,13 @@ def snapshot(
 
     ``limits`` 显式传入时优先；否则按 ``settings``（D7 用户配置）+ 仓库对象体积
     解析 —— 单次预算硬下限 4 GB，用户设置只能往上调。
+
+    第一步**必须**是 :func:`verify_repo_root`：git 会向上找父仓库，不校验就会
+    把父仓库当工作区快照（见该函数的说明）。这一步失败抛 ``GitError``，
+    上层据此落 ``state='failed'`` 记录。
     """
     root = Path(root)
+    verify_repo_root(root)
     index_file = Path(index_file)
     index_file.parent.mkdir(parents=True, exist_ok=True)
     env = _git_env(index_file)
@@ -1146,8 +1245,17 @@ def list_checkpoint_refs(root: Path, session_id: str, *, index_file: Path | None
 
     `for-each-ref` 同时覆盖松散与打包 ref，也不关心 `.git` 是目录还是文件。
     命令失败时返回空列表（调用方据此从 1 开始）—— 与"没有检查点"同义，且不抛。
+
+    **项目根不是本目录自己的仓库时同样返回空**：否则子目录里的项目会读到
+    **父仓库**里同名会话的 ref，序号凭空进位（"这个会话已经有 7 个点"），
+    而随后写 ref 却因 ``verify_repo_root`` 被拒 —— 用户只能看到序号很怪、
+    且一条失败记录接着一条。父仓库的 ref 与本次会话无关，不该参与序号计算。
     """
     prefix = checkpoint_ref_prefix(session_id)
+    try:
+        verify_repo_root(root)
+    except GitError:
+        return []
     proc = _run_git(
         root,
         "for-each-ref",

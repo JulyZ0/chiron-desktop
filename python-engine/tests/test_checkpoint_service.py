@@ -91,3 +91,95 @@ def test_attempt_checkpoint_reports_failure_state(tmp_path: Path) -> None:
 def test_empty_session_id_is_rejected_without_touching_git(tmp_path: Path) -> None:
     root = _repo(tmp_path)
     assert cs.create_checkpoint(root, session_id="", seq=1, kind="pre_turn", state_dir=tmp_path / "s") is None
+
+
+# ---------------------------------------------------------------------------
+# 根因回归：git 会向上找父仓库 ⇒ 必须校验"仓库顶层 == 项目根"
+# ---------------------------------------------------------------------------
+
+
+def _nested(tmp_path: Path) -> tuple[Path, Path]:
+    """``outer/`` 是仓库，``outer/inner`` 是"被当成项目根"的子目录。"""
+    outer = _repo(tmp_path)
+    inner = outer / "inner"
+    inner.mkdir()
+    (inner / "x.py").write_text("print(1)\n", encoding="utf-8")
+    return outer, inner
+
+
+def _all_refs(root: Path) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(root), "for-each-ref", "refs/chiron"],
+        capture_output=True,
+        check=False,
+    )
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def test_nested_project_root_does_not_snapshot_parent_repo(tmp_path: Path) -> None:
+    """★★ 项目根套在父仓库里 ⇒ 必须失败，**绝不**快照父仓库内容。
+
+    缺陷形态（实测）：``git -C inner write-tree`` 在子目录里同样成功 —— git 向上
+    找到了父仓库。于是
+      * 快照里是**父仓库**的文件（``outer_secret.py``），而不是 inner 里的；
+      * commit / ref 写进父仓库（``refs/chiron/checkpoints/...``）；
+      * 上报的却是 ``state='ok'``，且 ``ls-tree`` 在子目录下被路径前缀过滤成空清单
+        ⇒ 时间线上显示"这一刻保护成功、0 个文件"。
+
+    判据三条：失败态 + 可读原因 + 父仓库里一个 chiron ref 都没有。
+    """
+    outer, inner = _nested(tmp_path)
+    rec = cs.attempt_checkpoint(
+        inner, session_id="s-nest", seq=1, kind="pre_turn", state_dir=tmp_path / "state"
+    )
+    assert rec is not None
+    assert rec.state == "failed", "嵌套在父仓库里的项目根不能报成功"
+    assert "inside another git repository" in rec.error, rec.error
+    assert rec.error_code == "git"
+    assert rec.commit_sha == "" and rec.ref_name == ""
+    assert _all_refs(outer) == "", "检查点 ref 绝不能写进父仓库"
+    assert len(rec.untracked) == 0, "父仓库的未跟踪文件也绝不能进本次快照"
+
+
+def test_uninitialized_project_fails_with_actionable_message(tmp_path: Path) -> None:
+    """未 ``git init`` 的项目 ⇒ 失败态记录里的原因要能告诉用户"先 git init"。
+
+    与上一条同源：此前非 git 目录若恰好位于某个仓库之下，会"成功"快照父仓库；
+    现在的行为是**明确失败**，前端因此能显示"这一刻没保护成功 + 原因"。
+
+    原因有两种正确的说法，取决于临时目录落在哪里 —— 这**不是**测试的模糊地带，
+    而是两条不同的真实分支：普通目录得到 ``not a git repository``；
+    而临时目录若正好在某个仓库里（本仓库的父目录、或 ``--basetemp`` 指到了仓库内），
+    得到的是 ``inside another git repository``。两种都必须带 ``git init`` 这一行动项。
+    """
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    rec = cs.attempt_checkpoint(
+        plain, session_id="s-plain", seq=1, kind="pre_turn", state_dir=tmp_path / "state"
+    )
+    assert rec is not None and rec.state == "failed"
+    assert rec.error_code == "git"
+    assert (
+        "not a git repository" in rec.error
+        or "inside another git repository" in rec.error
+    ), rec.error
+    assert "git init" in rec.error, "原因里要给出下一步动作，而不只是结论"
+
+
+def test_missing_git_binary_failure_is_actionable(tmp_path: Path, monkeypatch) -> None:
+    """找不到 git 可执行文件 ⇒ 错误信息必须点名 CHIRON_GIT_BIN，而不是 WinError 2。
+
+    打包运行时（Electron 拉起的引擎）PATH 常常只有系统默认几项。此前 ``_run_git``
+    直接把 ``FileNotFoundError`` 漏出去，用户看到的是 ``[WinError 2] 系统找不到
+    指定的文件`` —— 既没说找不到什么，也没给出路。
+    """
+    root = _repo(tmp_path)
+    monkeypatch.setenv("CHIRON_GIT_BIN", str(tmp_path / "no-such-git-binary"))
+    rec = cs.attempt_checkpoint(
+        root, session_id="s-bin", seq=1, kind="pre_turn", state_dir=tmp_path / "state"
+    )
+    assert rec is not None and rec.state == "failed"
+    assert rec.error_code == "git"
+    assert "未找到 git" in rec.error, rec.error
+    assert "CHIRON_GIT_BIN" in rec.error, "必须告诉用户可以用哪个设置补救"
+
