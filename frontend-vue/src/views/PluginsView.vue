@@ -715,8 +715,8 @@ async function testPlugin(p: Plugin) {
 .action-right { margin-inline-start: auto; display: flex; gap: 2px; }
 .test-result { font-size: 12px; padding: 6px 10px; border-radius: var(--radius-lg); background: var(--error-bg); color: var(--error); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .test-result.ok { background: var(--success-bg); color: var(--success); }
-.allowlist-cta { margin-left: auto; }
-.allowlist-hint { margin-left: auto; font-size: var(--fs-xs); opacity: 0.8; }
+.allowlist-cta { margin-inline-start: auto; }
+.allowlist-hint { margin-inline-start: auto; font-size: var(--fs-xs); opacity: 0.8; }
 .plugin-detail { display: flex; flex-direction: column; gap: 8px; border-top: var(--hairline-width) solid var(--border-card); padding-top: 10px; }
 .detail-row { display: flex; flex-direction: column; gap: 4px; }
 .detail-label { font-size: var(--fs-xs); color: var(--text-tertiary); font-weight: var(--fw-medium); }

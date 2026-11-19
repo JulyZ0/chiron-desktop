@@ -90,6 +90,18 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	r.HandleFunc("PUT /settings", h.SaveSettings)
 	r.HandleFunc("GET /settings", h.GetSettings)
 
+	// 「服务」页：局域网/广域网访问范围与对外域名（见 admin_service.go）。
+	// 读的是"当前生效"与"已保存待生效"两组事实，写的是 system_settings 的 service 分类。
+	r.HandleFunc("GET /service", h.GetServiceInfo)
+	r.HandleFunc("PUT /service", h.SaveServiceInfo)
+
+	// 「知识库」页：本地模式 ↔ 外部 pageindex 服务（见 admin_knowledge.go）。
+	// 与「服务」页同一形态：读回"已保存"与"引擎生效中"两组事实，由页面呈现差异。
+	r.HandleFunc("GET /knowledge", h.GetKnowledgeInfo)
+	r.HandleFunc("PUT /knowledge", h.SaveKnowledgeInfo)
+	// 测试连接：让**引擎**去探候选地址（保存前就能验），响应恒 200。
+	r.HandleFunc("POST /knowledge/test", h.TestKnowledgeService)
+
 }
 
 func (h *AdminHandler) Metrics(w http.ResponseWriter, r *http.Request) {

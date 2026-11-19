@@ -17,7 +17,16 @@ type Config struct {
 	AppSecret string
 
 	// Server
-	Port         string
+	Port string
+	// BindHost 是 HTTP 监听地址（空 = 监听全部网卡，即历史上 `":port"` 的行为）。
+	//
+	// 它是"谁能访问这台机器上的服务"的根开关：只填 `127.0.0.1` 就只有本机可达，
+	// 填 `0.0.0.0` 或留空则局域网/公网可达。后台「服务」页改的就是它（见
+	// internal/api/admin_service.go），但监听套接字绑在启动时，改完要重启网关。
+	//
+	// 注意：桌面壳（frontend-vue/electron/local-stack.cjs）只给网关设 `PORT`，
+	// **从不设 `BIND_HOST`** —— 本地模式默认同样是全部网卡，别指望壳会兜回环。
+	BindHost     string
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
@@ -241,6 +250,7 @@ func loadConfig() *Config {
 	cfg := &Config{
 		AppSecret:                 getSecret("APP_SECRET", ""),
 		Port:                      getEnv("PORT", "8080"),
+		BindHost:                  getEnv("BIND_HOST", ""),
 		ReadTimeout:               getDuration("READ_TIMEOUT", 10*time.Second),
 		WriteTimeout:              getDuration("WRITE_TIMEOUT", 60*time.Second),
 		IdleTimeout:               getDuration("IDLE_TIMEOUT", 120*time.Second),
@@ -498,6 +508,30 @@ func getStringMap(key string) map[string]string {
 }
 
 // isTruthy returns true if s is "true", "1", "yes", or "on" (case-insensitive).
+func isTruthy(s string) bool {
+	switch s {
+	case "true", "1", "yes", "on", "TRUE", "YES", "ON":
+		return true
+	}
+	return false
+}
+
+// ListenAddr 返回 http.Server 用的监听地址（`host:port`）。
+//
+// BindHost 为空时退回 `":port"` —— 与历史行为逐字一致（监听全部网卡），
+// 这样没配 BIND_HOST 的部署升级后不会突然只在回环上，把外部访问断掉。
+func (c *Config) ListenAddr() string {
+	host := strings.TrimSpace(c.BindHost)
+	if host == "" {
+		return ":" + c.Port
+	}
+	// IPv6 字面量必须带方括号，否则 `::1:8080` 会被 SplitHostPort 判成非法。
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
+	}
+	return host + ":" + c.Port
+}
+
 // cookieSecure 决定会话 cookie 是否带 Secure 标志。
 //
 // 取值顺序：
@@ -514,14 +548,6 @@ func cookieSecure() bool {
 	}
 	return strings.HasPrefix(
 		strings.ToLower(strings.TrimSpace(getEnv("PUBLIC_BASE_URL", ""))), "https://")
-}
-
-func isTruthy(s string) bool {
-	switch s {
-	case "true", "1", "yes", "on", "TRUE", "YES", "ON":
-		return true
-	}
-	return false
 }
 
 // loadDotEnv reads .env file and sets environment variables if not already set.

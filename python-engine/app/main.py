@@ -196,6 +196,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 订阅同一广播，storage 分类到达即热切换媒体后端（app/media/reload.py）。
     _storage_task = _start_storage_watch()
 
+    # 后台「知识库」配置：本地模式 ↔ 外部 pageindex 服务，随时切换、即时生效。
+    # 先补拉一次（覆盖重启），再订阅广播（覆盖运行期保存）——见 app/knowledge/runtime.py。
+    _knowledge_task = _start_knowledge_watch()
+
     # M28：按模型的公开价格同步（多源 + 交叉验证）。`start_price_sync()` 自己判开关，
     # 未启用时立刻返回 ⇒ 这里可以无条件创建（默认关 = 什么都不做）。
     _price_sync_task = _start_price_sync()
@@ -242,6 +246,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         retention_task=_retention_task,
         harness_task=_harness_task,
         storage_task=_storage_task,
+        knowledge_task=_knowledge_task,
         price_sync_task=_price_sync_task,
         engine_registry=_engine_registry,
         liveness=_liveness,
@@ -964,6 +969,21 @@ def _start_storage_watch() -> Any:
     return asyncio.create_task(_listen_storage_changes())
 
 
+def _start_knowledge_watch() -> Any:
+    """订阅设置变更广播、热切换知识库索引服务地址（从 `lifespan` 抽出）；**返回句柄**。
+
+    后台「知识库」页要能"随时"在本地模式与外部 pageindex 服务之间切换 —— 而索引
+    地址在历史上是启动 env 定死的，改后台对引擎无效（页面上是新值、检索仍打旧服务）。
+    本任务先补拉一次配置（覆盖重启），再订阅广播（覆盖运行期保存），见
+    `app/knowledge/runtime.py` 的模块文档。
+
+    Redis 不可用时退避重试，不影响启动；取消即退出（与 harness/storage 同一范式）。
+    """
+    from app.knowledge.runtime import listen_for_changes as _listen_knowledge_changes
+
+    return asyncio.create_task(_listen_knowledge_changes())
+
+
 #: 密钥变更订阅断线后的重连间隔（与 harness / storage watcher 同一范式）。
 _LLM_KEYS_RECONNECT_SECONDS = 5.0
 
@@ -1242,6 +1262,7 @@ async def _shutdown_lifespan(
     retention_task: Any = None,
     harness_task: Any = None,
     storage_task: Any = None,
+    knowledge_task: Any = None,
     price_sync_task: Any = None,
     engine_registry: Any = None,
     liveness: Any = None,
@@ -1297,6 +1318,16 @@ async def _shutdown_lifespan(
             pass
         except Exception as e:  # noqa: BLE001
             logger.warning("storage settings listener shutdown failed: %s", e)
+
+    # 知识库索引服务地址订阅（同上）。取消即断开 —— 悬着的 pubsub 会拖到事件循环销毁之后。
+    if knowledge_task is not None:
+        knowledge_task.cancel()
+        try:
+            await knowledge_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("knowledge settings listener shutdown failed: %s", e)
 
     # M52：停 provider 密钥变更订阅（`_start_gateway` 起的后台任务）。
     # 与 harness/storage 同一范式：取消后 await 一次，让 CancelledError 走完 finally 里的

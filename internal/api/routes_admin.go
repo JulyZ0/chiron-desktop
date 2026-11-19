@@ -141,6 +141,19 @@ func registerAdminRoutes(
 	mux.Handle("GET /v1/admin/settings", authMW(rlMW(platformReadMW(adminStrip))))
 	mux.Handle("PUT /v1/admin/settings", authMW(rlMW(platformWriteMW(adminStrip))))
 
+	// 「服务」页：监听地址（局域网/广域网）与对外域名。
+	// 与 settings 同口径 —— 它改的是"这台机器对谁可见"，属平台级部署配置，
+	// 租户 admin 不该改（改错一次就是全网可达或全网不可达）。
+	mux.Handle("GET /v1/admin/service", authMW(rlMW(platformReadMW(adminStrip))))
+	mux.Handle("PUT /v1/admin/service", authMW(rlMW(platformWriteMW(adminStrip))))
+
+	// 「知识库」页：本地模式 ↔ 外部 pageindex 服务（见 admin_knowledge.go）。
+	// 平台级：它决定**全站**的检索后端，租户 admin 改它等于替所有人换服务。
+	mux.Handle("GET /v1/admin/knowledge", authMW(rlMW(platformReadMW(adminStrip))))
+	mux.Handle("PUT /v1/admin/knowledge", authMW(rlMW(platformWriteMW(adminStrip))))
+	// 测试连接：会主动打外部地址，属"探测"性质，与写同口径（能改就能验）。
+	mux.Handle("POST /v1/admin/knowledge/test", authMW(rlMW(platformWriteMW(adminStrip))))
+
 	// 插件命令白名单：可直接决定**宿主机能执行哪些命令**，属平台级安全边界。
 	// 读用 platformReadMW；写用 platformWriteMW —— 加白即时生效（无需重启网关/引擎），
 	// 放开一条命令等于放开一类二进制，与 queue/flush 同口径。

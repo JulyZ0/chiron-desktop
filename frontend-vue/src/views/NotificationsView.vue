@@ -303,7 +303,7 @@ onMounted(load)
   font-size: 13px;
   font-weight: normal;
   color: var(--text-secondary);
-  margin-left: 4px;
+  margin-inline-start: 4px;
 }
 
 .notification-list {
@@ -327,8 +327,8 @@ onMounted(load)
 
 /* 未读用左侧色条标记，而不是整行换底色：整行着色在暗色主题下会盖掉正文对比度 */
 .notification-row.is-unread {
-  border-left: 3px solid var(--node-indigo);
-  padding-left: 12px;
+  border-inline-start: 3px solid var(--node-indigo);
+  padding-inline-start: 12px;
 }
 
 .row-main {

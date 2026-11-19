@@ -289,7 +289,10 @@ func main() {
 
 	// ── HTTP Server ──
 	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
+		// 监听地址来自 BIND_HOST（空 = 全部网卡，与历史行为一致）。后台「服务」页
+		// 里的"仅本机 / 局域网"选择就落在这个值上 —— 它是"谁能连上这台机器"的根开关，
+		// 改它必须重启网关（监听套接字不能在进程内热换）。
+		Addr:              cfg.ListenAddr(),
 		Handler:           router,
 		ReadTimeout:       cfg.ReadTimeout,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -431,6 +434,28 @@ func applyDBSettingsAfterConnect(ctx context.Context, cfg *config.Config) {
 		}
 		if v, ok := m["alipay_gateway"].(string); ok && v != "" {
 			cfg.AlipayGateway = v
+		}
+	})
+
+	// service：后台「服务」页（见 internal/api/admin_service.go）。
+	// 放在这里而不是热更路径：监听地址要绑套接字，只能启动时定。
+	apply("service", func(m map[string]interface{}) {
+		if v, ok := m["bind_host"].(string); ok {
+			// 空串是合法值（= 全部网卡），所以这里不能沿用 `v != ""` 的过滤 ——
+			// 那会让"显式改成全网卡"在重启后静默无效。
+			cfg.BindHost = v
+		}
+		if v, ok := m["public_base_url"].(string); ok && v != "" {
+			// 与上方 payment 同键：service 分类是它的新归属
+			//（两个分类不会都配，配了以新页为准）。
+			cfg.PublicBaseURL = v
+			// `CookieSecure` 在 loadConfig 时按当时的 PUBLIC_BASE_URL 协议推导过；
+			// DB 覆盖了对外地址就得跟着重算，否则 https 部署重启后 cookie 仍不带
+			// Secure。**只在没显式配 COOKIE_SECURE 时才重算** —— 显式值对应
+			// "反代终止 TLS、容器内仍是 HTTP"这类拓扑，任何情况下都不该被覆盖。
+			if strings.TrimSpace(os.Getenv("COOKIE_SECURE")) == "" {
+				cfg.CookieSecure = strings.HasPrefix(strings.ToLower(v), "https://")
+			}
 		}
 	})
 }

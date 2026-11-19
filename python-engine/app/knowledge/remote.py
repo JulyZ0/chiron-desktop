@@ -59,7 +59,15 @@ class RemoteProvider:
     # ── 传输 ──
 
     def _base_url(self) -> str:
-        return str(getattr(settings, "knowledge_service_url", "") or "").rstrip("/")
+        """索引服务地址 —— **唯一读取入口**（见 ``app/knowledge/runtime.py``）。
+
+        不直接读 ``settings.knowledge_service_url``：那个值会被后台「知识库」配置热改写，
+        而本类实例可能早就建好了。经由 ``runtime.current_url()`` 读取，才能让
+        "后台切了服务"对**下一次请求**立刻生效，而不是等下一个请求重新构造 provider。
+        """
+        from app.knowledge import runtime
+
+        return runtime.current_url()
 
     async def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         import httpx

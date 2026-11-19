@@ -211,6 +211,22 @@ const routes = [
         component: () => import('../views/admin/DiagnosticsView.vue'),
         meta: { title: t('admin.diagnostics') },
       },
+      // 「服务」页：这台机器对谁可见（监听地址 / 对外域名）。
+      // 与「系统设置」相邻 —— 它同样是决定部署形态的配置，而不是某个业务功能。
+      {
+        path: 'service',
+        name: 'AdminService',
+        component: () => import('../views/admin/ServiceView.vue'),
+        meta: { title: t('admin.service.page_title') },
+      },
+      // 「知识库」页：索引服务用本地模式还是外部 pageindex 服务。
+      // 紧挨「服务」：两者都是"这台机器依赖谁"的部署级选择，而不是业务配置。
+      {
+        path: 'knowledge',
+        name: 'AdminKnowledgeConfig',
+        component: () => import('../views/admin/KnowledgeConfigView.vue'),
+        meta: { title: t('admin.knowledge.page_title') },
+      },
       // 资源市场「外部源」：初装默认关闭，开启后本机才开始访问第三方 URL。
       // 与「系统设置」相邻 —— 它同样是影响部署行为的系统级配置。
       {

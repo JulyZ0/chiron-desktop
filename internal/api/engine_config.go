@@ -65,3 +65,35 @@ func EngineConfig(cfg *config.Config) http.HandlerFunc {
 		OK(w, m)
 	}
 }
+
+// KnowledgeConfig GET /v1/internal/knowledge-config
+//
+// 引擎侧「知识库用本地模式还是外部 pageindex 服务」的权威配置下发口
+// （消费方 `app/knowledge/runtime.py::hydrate`）。
+//
+// 为什么需要它，而 engine-config 不够：`engine-config` 只下发 `python` 分类，
+// 而这条配置属于 `knowledge` 分类 —— 它同时被后台「知识库」页与 Redis 广播
+// （`chiron:settings:changed` 的 `knowledge`）消费。两条路径读的必须是**同一份**
+// 数据，否则会出现"保存后页面上是新值、引擎重启后又变回旧值"。
+//
+// 引擎不缓存失败：网关没起来 / DB 不可用都返回错误码，引擎据此沿用启动注入地址
+// （见 runtime.py 的 fail-open 说明），绝不因为读不到配置而清空当前服务地址。
+func KnowledgeConfig(cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if db.Pool == nil {
+			NotFound(w, "database unavailable")
+			return
+		}
+		store := settings.New(db.Pool, cfg.AppSecret)
+		m, err := store.LoadConfig(r.Context(), "knowledge")
+		if err != nil {
+			slog.Error("knowledge config load failed", "error", err)
+			InternalError(w, "failed to load knowledge config")
+			return
+		}
+		if m == nil {
+			m = map[string]interface{}{}
+		}
+		OK(w, m)
+	}
+}

@@ -593,3 +593,94 @@ export async function updatePluginAllowlist(commands: string[]): Promise<PluginA
   const { data } = await api.put('/v1/admin/plugin-allowlist', { commands })
   return data?.data ?? { commands: [], file_commands: [], env_commands: [], configured: false }
 }
+
+// ── 「服务」页（局域网/广域网访问 + 对外域名）──────────────────────────
+//
+// 后端：GET/PUT /v1/admin/service（internal/api/admin_service.go）。
+// 关键点：**两项都要重启网关才真正生效** —— 监听地址绑在套接字上，对外地址在
+// 启动时读入并据此推导 Cookie 的 Secure。因此响应里同时给「生效值」与「已保存值」，
+// 页面据此显示"需要重启"，而不是让用户以为改完就生效了。
+
+export interface AdminServiceInfo {
+  /** 实际绑定的 host:port */
+  listen_addr: string
+  port: string
+  /** 生效中的绑定地址（0.0.0.0 = 全部网卡） */
+  bind_host: string
+  /** 生效中的对外地址（空 = 未配置） */
+  public_base_url: string
+  /** Cookie 是否带 Secure（由对外地址协议推导） */
+  cookie_secure: boolean
+  /** 已保存的绑定地址与生效值不同 ⇒ 必须重启网关 */
+  restart_required: boolean
+  saved_bind_host: string
+  saved_public_base_url: string
+  /** 本机非回环 IPv4 地址：告诉同事"用这个访问"时的来源 */
+  local_addresses: string[]
+  /** 这组配置的后果提示（空 = 无） */
+  warning: string
+}
+
+export async function getServiceInfo(): Promise<AdminServiceInfo> {
+  const { data } = await api.get('/v1/admin/service')
+  return data?.data
+}
+
+/** 保存服务配置；返回保存后的事实（含 restart_required / warning）。 */
+export async function saveServiceInfo(payload: {
+  bind_host?: string
+  public_base_url?: string
+}): Promise<AdminServiceInfo> {
+  const { data } = await api.put('/v1/admin/service', payload)
+  return data?.data
+}
+
+// ── 「知识库」页（本地模式 ↔ 外部 pageindex 服务）────────────────────────
+//
+// 后端：internal/api/admin_knowledge.go。
+// 关键点：**这一页保存即生效**（引擎订阅广播后热切地址），但"保存成功"不等于
+// "引擎已采纳" —— 广播可能丢失、引擎可能没起。所以响应里同时给 saved 与
+// runtime 两组事实，`pending_restart` 表示两者已经分叉，页面据此提示，而不是
+// 假装已经生效。
+
+export interface AdminKnowledgeInfo {
+  /** 库里已持久化的配置（下次启动 / 广播会用它） */
+  saved: { mode?: string; service_url?: string } & Record<string, unknown>
+  /** 引擎当前生效的运行时事实（未启用 / 不可达时为 null） */
+  runtime: {
+    mode?: string
+    service_url?: string
+    bootstrap_url?: string
+    using_bootstrap?: boolean
+    probe?: { ok: boolean; status_code: number; detail: string }
+  } | null
+  /** 引擎是否给出了运行时事实（false 不代表配置错，只是读不到） */
+  engine_available: boolean
+  /** 保存值与引擎生效值已分叉（引擎还没采纳） */
+  pending_restart: boolean
+}
+
+export async function getKnowledgeInfo(): Promise<AdminKnowledgeInfo> {
+  const { data } = await api.get('/v1/admin/knowledge')
+  return data?.data
+}
+
+export async function saveKnowledgeInfo(payload: {
+  mode?: 'local' | 'remote'
+  service_url?: string
+}): Promise<AdminKnowledgeInfo> {
+  const { data } = await api.put('/v1/admin/knowledge', payload)
+  return data?.data
+}
+
+/** 让**引擎**去探一个候选地址（空串 = 探当前生效的）。响应恒 200，连不上是业务结果。 */
+export async function testKnowledgeService(serviceUrl: string): Promise<{
+  ok: boolean
+  engine_available: boolean
+  detail: string
+  status_code?: number
+  target?: string
+}> {
+  const { data } = await api.post('/v1/admin/knowledge/test', { service_url: serviceUrl })
+  return data?.data
+}

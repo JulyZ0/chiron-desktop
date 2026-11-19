@@ -9,6 +9,7 @@ from app.api.checkpoints import router as checkpoints_router
 from app.api.context import router as context_router
 from app.api.desktop_infer import router as desktop_infer_router
 from app.api.interactions import router as interactions_router
+from app.api.internal_knowledge import router as internal_knowledge_router
 from app.api.internal_market import router as internal_market_router
 from app.api.internal_subagent import router as internal_subagent_router
 from app.api.isolation import router as isolation_router
@@ -28,6 +29,7 @@ api_router.include_router(tools_router)
 api_router.include_router(agents_router)
 api_router.include_router(internal_subagent_router)
 api_router.include_router(internal_market_router)
+api_router.include_router(internal_knowledge_router)
 api_router.include_router(interactions_router)
 api_router.include_router(skills_router)
 api_router.include_router(knowledge_router)

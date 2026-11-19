@@ -473,6 +473,12 @@ var settingsCategories = []string{
 	// allow_user_sources / allow_remote_mcp / max_sources）。不在此表里的话
 	// 后台保存会被 400 拒绝，于是"能在后台配置源"就只是句空话。
 	"market",
+	// service：「服务」页配置（bind_host / public_base_url）。同样必须先登记，
+	// 否则页面保存直接被 400 拒绝。
+	"service",
+	// knowledge：知识库用「本地模式」还是外部 pageindex 服务（mode / service_url）。
+	// 引擎侧由 app/knowledge/runtime.py 消费（订阅广播 + 启动补拉）。
+	"knowledge",
 }
 
 func validSettingsCategory(c string) bool {

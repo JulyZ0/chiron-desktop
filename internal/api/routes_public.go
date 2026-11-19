@@ -48,6 +48,11 @@ func registerPublicEndpoints(
 	// 引擎配置下发（X-Internal-Token 保护，Python 引擎启动拉取）
 	mux.Handle("GET /v1/internal/engine-config", rlMW(internalTokenMW(cfg, EngineConfig(cfg))))
 
+	// 知识库运行模式下发（本地模式 / 外部 pageindex 服务）：引擎启动与订阅重连时拉取。
+	// 与上面的 engine-config 分开是因为它属于 `knowledge` 分类，同时被后台页面与
+	// Redis 广播消费 —— 两处必须读同一份数据（见 internal/api/engine_config.go）。
+	mux.Handle("GET /v1/internal/knowledge-config", rlMW(internalTokenMW(cfg, KnowledgeConfig(cfg))))
+
 	// 模型路由配置同步（X-Internal-Token 保护，Python 引擎启动时拉取）。
 	// 租户模型路由层已随 SaaS 域删除，本地形态恒返回空列表：引擎据此走
 	// "无租户路由覆盖"的默认路径（provider 直接由 key 配置决定）。
