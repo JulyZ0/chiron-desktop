@@ -28,11 +28,24 @@ const routes = [
     component: () => import('../views/ModelsView.vue'),
     meta: { requiresAuth: true, requiresAdmin: true },
   },
+  // 分享落地页（匿名可访问）。两条路径指向同一个页面：
+  // - `/s/:token` 是**对外发出去**的短链形态（见 utils/shareLink.ts）；
+  // - `/share/:id` 是早期链接的兼容别名 —— 链接发出去就收不回来，只能加别名，
+  //   不能改旧路径，否则已经散落在聊天记录里的链接全部变 404。
+  // 两者都必须标 `meta.public`：守卫据此跳过 `fetchProfile`，匿名访客没有身份可拉，
+  // 多打一次 `/v1/auth/profile` 只会在控制台留下一条 401。
+  // 无 requiresAuth：权限判定在后端（`GET /v1/share/{id}` 只放行未撤销、未过期的分享）。
+  {
+    path: '/s/:token',
+    name: 'ShareShort',
+    component: () => import('../views/ShareView.vue'),
+    meta: { public: true },
+  },
   {
     path: '/share/:id',
     name: 'Share',
     component: () => import('../views/ShareView.vue'),
-    // 注意：无 requiresAuth — 共享会话可能公开访问，后端应验证 share_id 的权限范围
+    meta: { public: true },
   },
   {
     path: '/agents',

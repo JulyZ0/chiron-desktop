@@ -16,6 +16,7 @@ import { useI18n } from 'vue-i18n'
 import { listAdminShares, revokeAdminShare, type AdminShareItem } from '@/api/admin'
 import { serverErrorMessage } from '../../utils/apiError'
 import { copyTextOrThrow } from '../../utils/clipboard'
+import { shareUrl as buildShareUrl } from '../../utils/shareLink'
 
 const { t } = useI18n()
 
@@ -33,7 +34,8 @@ const filtered = computed(() => {
 })
 
 function shareUrl(id: string): string {
-  return `${window.location.origin}/share/${id}`
+  // 与用户侧两个入口共用同一前缀（见 utils/shareLink.ts）。
+  return buildShareUrl(id)
 }
 
 function formatTime(value: string): string {

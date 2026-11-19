@@ -1,4 +1,5 @@
 import { copyTextOrThrow } from '../utils/clipboard'
+import { shareUrl as buildShareUrl } from '../utils/shareLink'
 import { ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
@@ -83,7 +84,8 @@ export function useSettingsShares() {
   }
 
   function shareURL(id: string) {
-    return `${window.location.origin}/share/${id}`
+    // 与聊天页 / 后台分享管理共用同一个前缀（见 utils/shareLink.ts）。
+    return buildShareUrl(id)
   }
 
   async function copyShareURL(id: string) {

@@ -15,7 +15,7 @@ import (
 	"github.com/athenavi/chiron/internal/session"
 )
 
-// ShareHandler manages public conversation shares (rendered at /share/{id}
+// ShareHandler manages public conversation shares (rendered at /s/{token}
 // without authentication, like chat.deepseek.com/share/{id}).
 type ShareHandler struct {
 	authenticator *auth.Authenticator

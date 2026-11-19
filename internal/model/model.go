@@ -38,7 +38,7 @@ type Session struct {
 }
 
 // ConversationShare is a public snapshot of selected conversation messages
-// (rendered at /share/{id} without authentication).
+// (rendered at /s/{token} without authentication).
 type ConversationShare struct {
 	ID         string     `json:"id"`
 	SessionID  string     `json:"session_id"`

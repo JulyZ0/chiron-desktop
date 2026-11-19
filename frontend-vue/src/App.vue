@@ -22,7 +22,13 @@ const antdLocale = computed(() => languageMeta(locale.value).antd)
 const themeStore = useThemeStore()
 // 实例化即应用持久化的排版偏好（store 内 immediate watch 写入 <html> 变量）
 useTypographyStore()
-const showLayout = computed(() => !['Login', 'Register'].includes(route.name as string))
+// 匿名分享落地页（`/s/:token`、`/share/:id`）不套应用壳：侧栏、命令面板、
+// 接管轮询都假定"有一个登录用户 + 一个当前会话"，匿名访客挂上去只会每 5 秒
+// 打一次 401（见 TakeoverOverlay 的挂载条件注释），而且落地页本来就该是干净的单页。
+// 因此 `meta.public` 与 Login/Register 一样走裸 `router-view`。
+const showLayout = computed(
+  () => !['Login', 'Register'].includes(route.name as string) && route.meta.public !== true,
+)
 
 const themeConfig = computed(() => ({
   algorithm: themeStore.isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,

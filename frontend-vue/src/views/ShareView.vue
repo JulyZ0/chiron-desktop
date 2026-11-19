@@ -78,7 +78,8 @@ function handleClick(e: MouseEvent) {
 }
 
 onMounted(async () => {
-  const id = String(route.params.id || '')
+  // 短链 `/s/:token` 与兼容别名 `/share/:id` 共用本页，参数名不同，两处都读。
+  const id = String(route.params.token || route.params.id || '')
   try {
     share.value = await getPublicShare(id)
   } catch (e) {

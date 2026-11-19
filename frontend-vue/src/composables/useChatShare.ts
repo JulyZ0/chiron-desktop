@@ -7,6 +7,7 @@
  * 分享弹窗里的游客提示）。
  */
 import { copyTextOrThrow } from '../utils/clipboard'
+import { shareUrl as buildShareUrl } from '../utils/shareLink'
 import { computed, ref } from 'vue'
 import type { Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -105,7 +106,8 @@ export function useChatShare(deps: ChatShareDeps) {
   }
 
   function shareUrl(): string {
-    return `${window.location.origin}/share/${shareInfo.value?.share_id || ''}`
+    // 统一出口：前缀与编码规则见 utils/shareLink.ts（此前这里自己拼 `/share/`）。
+    return buildShareUrl(shareInfo.value?.share_id || '')
   }
 
   async function copyShareLink() {

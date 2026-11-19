@@ -63,6 +63,16 @@ describe('authGuard', () => {
     expect(next).toHaveBeenCalledWith()
   })
 
+  it('meta.public（分享落地页）匿名访问时不拉 profile', async () => {
+    // 匿名访客没有身份可拉；多打一次 /v1/auth/profile 只会在控制台留一条 401，
+    // 且在云端残留态下还会触发登出逻辑。
+    makeStore({ role: null, isAuthenticated: false })
+    const next = fakeNext()
+    await authGuard(fakeRoute({ public: true }), {} as RouteLocationNormalized, next)
+    expect(mocks.fetchProfileMock).not.toHaveBeenCalled()
+    expect(next).toHaveBeenCalledWith()
+  })
+
   describe('requiresAdmin', () => {
     it('后端 profile 返回 admin 放行', async () => {
       const store = makeStore({ role: 'user' }) // localStorage 为 user
