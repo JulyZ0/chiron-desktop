@@ -175,10 +175,17 @@ export default {
   isolation_degraded_body: "配置请求「{requested}」，本机实际生效「{effective}」。原因：",
   isolation_below_floor_title: "低于安全底线",
   isolation_below_floor_body:
-    "当前生效档位低于底线，工具执行会被拒绝。这是预期行为 —— 隔离不可用时宁可拒绝执行，也不退回进程内直跑。请在下方选择一个不低于底线的档位。",
-  isolation_below_floor_hint: "此档位低于安全底线（{floor}），不可选。",
+    "本机机制缺失，导致实际档位跌到安全底线以下。这是**没有人同意**的降级，工具执行会被拒绝 —— 隔离不可用时宁可拒绝执行，也不退回进程内直跑。修好机制或选择一个本机可用的档位后再试。",
+  isolation_below_floor_selected_title: "低于安全底线（由你选定）",
+  isolation_below_floor_selected_body:
+    "当前档位是你本人选定的，低于安全底线（{floor}）。工具执行**不会被拒绝**，但它正以更弱的边界运行。恢复为配置值或选择更高档位即可撤销这个决定。",
   isolation_unavailable_hint: "本机无法启用此档位：{reason}",
-  isolation_floor_note: "安全底线：{floor}。低于该档位的选择会被自动抬升到底线，不会被静默接受。",
+  isolation_unavailable_unknown: "本机无法启用此档位。",
+  isolation_confirm_title: "确认关闭隔离？",
+  isolation_confirm_body:
+    "「{level}」会让工具以主进程同等权限直跑，**没有任何文件或网络边界**。这个决定只在本次运行生效，并会写入审计流水。",
+  isolation_confirm_ok: "我确认，关闭隔离",
+  isolation_floor_note: "安全底线：{floor}。低于它的档位可以手动选择，但需要你显式确认；配置文件里写低档位仍会被抬回底线。",
   isolation_floor_badge: "底线",
   isolation_active_badge: "生效中",
   isolation_pick: "选择档位",

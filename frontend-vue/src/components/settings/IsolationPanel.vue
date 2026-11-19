@@ -6,7 +6,8 @@
  *
  * 1. **现在是什么档位？** 显示 `requested`（配置请求）与 `effective`（实际生效）
  *    两个值。两者不同就是发生了降级 —— 必须显式展示，否则就是静默降级。
- * 2. **能改成什么？** 只列出 `selectable` 里的档位；低于硬底线的置灰不可选。
+ * 2. **能改成什么？** 只列出 `selectable` 里的档位（本机真能做到的）。
+ *    低于安全底线的 `job` 可直接选；`none` 要先二次确认 —— 它等于完全没有边界。
  * 3. **怎么撤销？** 两个层次：撤销设置（回到配置文件）+ 撤销磁盘产物
  *    （AppContainer profile、目录完整性标签）。前者免费，后者必要 ——
  *    不撤销会让工作区目录长期是 Low 标签，影响后续未隔离使用。
@@ -304,11 +305,19 @@ onMounted(load)
         />
         <a-alert
           v-if="status.below_floor"
-          type="error"
+          :type="status.user_selected ? 'warning' : 'error'"
           show-icon
           class="iso-alert"
-          :message="$t('settings.isolation_below_floor_title')"
-          :description="$t('settings.isolation_below_floor_body')"
+          :message="
+            status.user_selected
+              ? $t('settings.isolation_below_floor_selected_title')
+              : $t('settings.isolation_below_floor_title')
+          "
+          :description="
+            status.user_selected
+              ? $t('settings.isolation_below_floor_selected_body', { floor: levelLabel(status.floor) })
+              : $t('settings.isolation_below_floor_body')
+          "
         />
         <div class="iso-floor-hint">
           <WarningOutlined />

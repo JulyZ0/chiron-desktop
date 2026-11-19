@@ -65,6 +65,9 @@ SE_GROUP_ENABLED = 0x4
 #: `TokenLogonSid`（`TOKEN_INFORMATION_CLASS`）
 TOKEN_LOGON_SID = 28
 
+#: `TokenUser`（`TOKEN_INFORMATION_CLASS`）
+TOKEN_USER = 1
+
 #: `ConvertSidToStringSidW` 返回值的释放方式
 _LOCAL_FREE = None
 
@@ -247,6 +250,48 @@ def _sid_to_string(sid_ptr: int) -> str:
         return out.value or ""
     finally:
         k32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+
+
+def current_user_sid() -> str:
+    """当前进程令牌的**用户 SID**（字符串形式），取不到返回空串。
+
+    独立桌面的 DACL 必须显式包含它，否则连**创建者自己**都打不开那个桌面。
+
+    这不是推测，是本机实测的失败原因：
+
+        SDDL = "D:(A;;GA;;;S-1-0-0)(A;;GA;;;SY)(A;;GA;;;BA)"
+        CreateDesktopW(新名字) -> 成功
+        CreateDesktopW/OpenDesktopW(同名) -> err=5 (ACCESS_DENIED)
+
+    即 `S-1-0-0` 是 NULL SID，而 NULL SID 在访问检查里**不匹配任何主体**
+    （它只对"匿名"这一抽象主体有意义），于是那份 DACL 实际上只授权了
+    SYSTEM 与 Administrators。UAC 下的普通令牌里 `BUILTIN\\Administrators`
+    是 deny-only 组，提权后也不是"当前用户"，两种情况都过不了检查 ——
+    所以"以管理员身份运行"救不了它，只会换一个同样打不开的身份。
+    """
+    adv = _advapi()
+    k32 = _k32()
+    if adv is None or k32 is None:
+        return ""
+    own = wt.HANDLE()
+    if not k32.OpenProcessToken(
+        k32.GetCurrentProcess(), win.TOKEN_QUERY, ctypes.byref(own)
+    ):
+        logger.debug("current_user_sid: OpenProcessToken failed err=%s", ctypes.get_last_error())
+        return ""
+    try:
+        need = wt.DWORD(0)
+        adv.GetTokenInformation(own, TOKEN_USER, None, 0, ctypes.byref(need))
+        if need.value == 0:
+            return ""
+        buf = ctypes.create_string_buffer(need.value)
+        if not adv.GetTokenInformation(own, TOKEN_USER, buf, need.value, ctypes.byref(need)):
+            return ""
+        # TOKEN_USER 就是一个 SID_AND_ATTRIBUTES，Sid 在偏移 0
+        sid_ptr = ctypes.cast(buf, ctypes.POINTER(win._SID_AND_ATTRIBUTES)).contents.Sid  # noqa: SLF001
+        return _sid_to_string(int(sid_ptr or 0))
+    finally:
+        k32.CloseHandle(own)
 
 
 def _logon_sid(token: Any) -> tuple[bytes | None, str]:

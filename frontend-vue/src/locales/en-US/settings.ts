@@ -175,10 +175,17 @@ export default {
   isolation_degraded_body: "Configured \"{requested}\", actually effective on this machine: \"{effective}\". Reasons:",
   isolation_below_floor_title: "Below the safety floor",
   isolation_below_floor_body:
-    "The effective tier is below the floor, so tool execution will be refused. That is intended behaviour: when isolation is unavailable we refuse to run rather than silently falling back to in-process execution. Pick a tier at or above the floor below.",
-  isolation_below_floor_hint: "This tier is below the safety floor ({floor}) and cannot be selected.",
+    "A missing mechanism on this machine dropped the effective tier below the safety floor. Nobody agreed to that, so tool execution is refused — when isolation is unavailable we refuse to run rather than silently falling back to in-process execution. Fix the mechanism or pick a tier this machine can actually run.",
+  isolation_below_floor_selected_title: "Below the safety floor (chosen by you)",
+  isolation_below_floor_selected_body:
+    "This tier is your own choice and sits below the safety floor ({floor}). Tool execution is **not** refused, but it runs with a weaker boundary. Reset to the configured value or pick a higher tier to undo that decision.",
   isolation_unavailable_hint: "This tier cannot be enabled on this machine: {reason}",
-  isolation_floor_note: "Safety floor: {floor}. Selections below it are raised to the floor rather than accepted silently.",
+  isolation_unavailable_unknown: "This tier cannot be enabled on this machine.",
+  isolation_confirm_title: "Turn isolation off?",
+  isolation_confirm_body:
+    "\"{level}\" runs tools with the same privileges as the main process and **no file or network boundary at all**. The decision only applies to this run and is written to the audit log.",
+  isolation_confirm_ok: "Turn isolation off",
+  isolation_floor_note: "Safety floor: {floor}. Tiers below it can be selected by hand, but only after an explicit confirmation; a low tier in the config file is still raised to the floor.",
   isolation_floor_badge: "Floor",
   isolation_active_badge: "Active",
   isolation_pick: "Choose a tier",

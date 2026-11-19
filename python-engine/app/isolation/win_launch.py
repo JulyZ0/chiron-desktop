@@ -206,10 +206,14 @@ def _k32() -> Any:
 
 
 def _user32() -> Any:
-    """`CreateDesktopW` / `CloseDesktop` 属于 **user32**，不在 kernel32。
+    """`CreateDesktopW` / `OpenDesktopW` / `CloseDesktop` 属于 **user32**，不在 kernel32。
 
     这个归属很容易记错（桌面听起来像内核对象），实测 `kernel32.CreateDesktopW`
     会直接 `AttributeError: function not found`。
+
+    **必须显式声明 `restype = wt.HANDLE`**：ctypes 默认返回 `c_int`，在 64 位下
+    句柄会被截断成 32 位，后续用这个残缺句柄去建进程只会拿到莫名其妙的失败
+    （`CreateProcessAsUserW` 的 `lpDesktop` 打不开）。
     """
     lib = ctypes.WinDLL("user32", use_last_error=True)
     lib.CreateDesktopW.restype = wt.HANDLE
@@ -221,6 +225,9 @@ def _user32() -> Any:
         wt.DWORD,
         ctypes.c_void_p,
     ]
+    # `OpenDesktopW(lpszDesktop, dwFlags, fInherit, dwDesiredAccess)`
+    lib.OpenDesktopW.restype = wt.HANDLE
+    lib.OpenDesktopW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.BOOL, wt.DWORD]
     lib.CloseDesktop.restype = wt.BOOL
     lib.CloseDesktop.argtypes = [wt.HANDLE]
     return lib
@@ -247,39 +254,53 @@ def _advapi() -> Any:
 
 # ── 独立桌面 ────────────────────────────────────────────────────
 
-#: 桌面 DACL：合成 SID / SYSTEM / Administrators 完全控制。
+#: 桌面 DACL 模板：**当前用户** / 合成 SID / SYSTEM / Administrators 完全控制。
 #:
-#: 为什么必须显式给合成 SID：受限令牌做**写**访问检查时，必须由 restricting SID
-#: 之一满足（`WRITE_RESTRICTED` 的确切语义）。桌面创建与窗口创建都是写操作，
-#: 只给 Everyone 权限在受限令牌下不够 —— 这是实测过的失败点，不是推测。
-_DESKTOP_SDDL = "D:(A;;GA;;;S-1-0-0)(A;;GA;;;SY)(A;;GA;;;BA)"
+#: 三件事缺一不可，每一件都对应一次实测失败：
+#:
+#: 1. **当前用户 SID** —— 没有它，连创建者自己都打不开这个桌面。
+#:    实测：`D:(A;;GA;;;S-1-0-0)(A;;GA;;;SY)(A;;GA;;;BA)` 下，
+#:    `CreateDesktopW(新名字)` 成功但随后 `OpenDesktopW(同名)` 恒 `err=5`；
+#:    把当前用户 SID 加进 DACL 后立刻 `err=0`。
+#:    这是"多实例 / 残留桌面"场景的**唯一**错误来源，此前被误归因为
+#:    "缺 `SeIncreaseQuotaPrivilege`"，于是用户去提权 —— 而提权只会换一个
+#:    同样打不开的身份（UAC 下 `BUILTIN\\Administrators` 是 deny-only 组）。
+#: 2. **合成 SID `S-1-0-0`** —— 受限令牌带 `WRITE_RESTRICTED`，做**写**访问检查时
+#:    必须由 restricting SID 之一命中 DACL。`create_restricted_token()` 把
+#:    `WinNullSid` 放进 `SidsToRestrict`，所以这条 ACE 是受限子进程能打开桌面的前提。
+#:    注意它**不能**代替第 1 条：NULL SID 不匹配普通（未受限）主体。
+#: 3. **SY / BA** —— 服务账户与管理员会话的正常路径。
+_DESKTOP_SDDL_TEMPLATE = "D:(A;;GA;;;{user})(A;;GA;;;S-1-0-0)(A;;GA;;;SY)(A;;GA;;;BA)"
 
 _desktop_handle: Any = None
 _desktop_error: str = ""
+#: 实际使用的桌面名。多实例场景下可能不是 `win_token.DESKTOP_NAME`（见 `ensure_desktop`）。
+_desktop_name: str = win_token.DESKTOP_NAME
 
 
-def ensure_desktop() -> tuple[bool, str]:
-    """创建（或复用）独立桌面 `ChironSandbox`。成功返回 `(True, "")`。
+def _desktop_sddl() -> str:
+    """按当前用户构造桌面 DACL。取不到用户 SID 返回空串（宁可失败也不要无权桌面）。"""
+    user = win_token.current_user_sid()
+    if not user:
+        return ""
+    return _DESKTOP_SDDL_TEMPLATE.format(user=user)
 
-    句柄在本进程内缓存并不主动关闭：桌面在**创建它的进程退出时**自动销毁，
-    这正是我们要的语义（引擎重启 ⇒ 桌面重建，不残留）。
+
+def _create_or_open_desktop(name: str, sddl: str) -> tuple[Any, str]:
+    """创建桌面；同名桌面已存在时改为打开它。
+
+    返回 `(handle, 错误)`。`handle` 为 `None` 时 `错误` 非空。
+
+    为什么要"创建失败再打开"：桌面名在**窗口站**范围内全局唯一。引擎多实例
+    （或旧进程留下的同名桌面）时 `CreateDesktopW` 会因 `ERROR_ACCESS_DENIED(5)`
+    失败，而那份桌面可能完全可用 —— 直接判"机制不可用"等于让多个实例互相排斥。
     """
-    global _desktop_handle, _desktop_error
-    if not win.IS_WINDOWS:
-        return False, "not windows"
-    if _desktop_handle:
-        return True, ""
-    if _desktop_error:
-        return False, _desktop_error
-
     k32, adv, u32 = _k32(), _advapi(), _user32()
     sd = ctypes.c_void_p()
     if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-        _DESKTOP_SDDL, 1, ctypes.byref(sd), None
+        sddl, 1, ctypes.byref(sd), None
     ):
-        _desktop_error = f"SDDL 转换失败 err={ctypes.get_last_error()}"
-        logger.warning("ensure_desktop: %s", _desktop_error)
-        return False, _desktop_error
+        return None, f"SDDL 转换失败 err={ctypes.get_last_error()}"
 
     sa = _SECURITY_ATTRIBUTES(
         nLength=ctypes.sizeof(_SECURITY_ATTRIBUTES),
@@ -295,26 +316,83 @@ def ensure_desktop() -> tuple[bool, str]:
         # lpszDesktop 只接受**桌面名本身**，不接受 `WinSta0\` 前缀 ——
         # 带前缀会稳定返回 ERROR_BAD_PATHNAME(161)。窗口站是隐含的（当前就是
         # WinSta0）；`STARTUPINFOW.lpDesktop` 那边才需要 `WinSta0\名称` 全路径。
-        handle = u32.CreateDesktopW(
-            win_token.DESKTOP_NAME,
-            None,
-            None,
-            0,
-            DESKTOP_ALL_ACCESS,
-            ctypes.byref(sa),
-        )
+        handle = u32.CreateDesktopW(name, None, None, 0, DESKTOP_ALL_ACCESS, ctypes.byref(sa))
         err = ctypes.get_last_error()
     finally:
         k32.LocalFree(sd)
 
-    if not handle:
-        _desktop_error = f"CreateDesktopW 失败 err={err}"
+    if handle:
+        return handle, ""
+
+    # 已存在但当前令牌打不开：先试打开（DACL 合规的同名桌面可被多实例共享），
+    # 仍失败则把两个错误都带上 —— 只说 CreateDesktopW 的 err 会掩盖"桌面残留"
+    # 这个真正的原因。
+    create_err = err
+    ctypes.set_last_error(0)
+    handle = u32.OpenDesktopW(name, 0, False, DESKTOP_ALL_ACCESS)
+    open_err = ctypes.get_last_error()
+    if handle:
+        logger.info("复用已存在的独立桌面: %s", name)
+        return handle, ""
+    return None, (
+        f"桌面 {name} 既无法创建（err={create_err}）也无法打开（err={open_err}）；"
+        "多半是旧进程残留了同名桌面且 DACL 不含当前用户，重启该进程后再试"
+    )
+
+
+def ensure_desktop() -> tuple[bool, str]:
+    """创建（或复用）独立桌面 `ChironSandbox`。成功返回 `(True, "")`。
+
+    句柄在本进程内缓存并不主动关闭：桌面在**创建它的进程退出时**自动销毁，
+    这正是我们要的语义（引擎重启 ⇒ 桌面重建，不残留）。
+
+    名字被占用时依次退回 `<名字>-<pid>`：窗口站内桌面名唯一，而"创建失败"
+    并不等于"不可用"——
+      · 同名桌面已存在且 DACL 含当前用户 ⇒ `_create_or_open_desktop` 直接打开它；
+      · DACL 不含当前用户（旧版本残留）⇒ 打不开，此时换一个带 pid 的名字新建，
+        而不是让整个 `restricted` 档对本进程永久不可用。
+    """
+    global _desktop_handle, _desktop_error, _desktop_name
+    if not win.IS_WINDOWS:
+        return False, "not windows"
+    if _desktop_handle:
+        return True, ""
+    if _desktop_error:
+        return False, _desktop_error
+
+    sddl = _desktop_sddl()
+    if not sddl:
+        _desktop_error = "无法取得当前用户 SID，拒绝创建权限不明的桌面"
         logger.warning("ensure_desktop: %s", _desktop_error)
         return False, _desktop_error
 
-    _desktop_handle = handle
-    logger.info("独立桌面已创建: %s", win_token.DESKTOP_NAME)
-    return True, ""
+    base = win_token.DESKTOP_NAME
+    candidates = [base, f"{base}-{os.getpid()}"]
+    errors: list[str] = []
+    first_error = ""
+    for name in candidates:
+        handle, err = _create_or_open_desktop(name, sddl)
+        if handle:
+            _desktop_handle = handle
+            _desktop_name = name
+            if first_error:
+                logger.warning(
+                    "独立桌面 %s 不可用（%s），改用 %s", base, first_error, name
+                )
+            logger.info("独立桌面已就绪: %s", name)
+            return True, ""
+        errors.append(err)
+        if not first_error:
+            first_error = err
+
+    _desktop_error = "；".join(errors)
+    logger.warning("ensure_desktop: %s", _desktop_error)
+    return False, _desktop_error
+
+
+def desktop_name() -> str:
+    """当前**实际**使用的桌面名（多实例时可能带 pid 后缀）。"""
+    return _desktop_name
 
 
 def desktop_ready() -> bool:
@@ -400,7 +478,9 @@ def launch_restricted(
         si.hStdInput = wt.HANDLE()
         si.hStdOutput = out_w
         si.hStdError = err_w
-        si.lpDesktop = f"WinSta0\\{win_token.DESKTOP_NAME}"
+        # 用**实际**桌面名：名字被占用时 `ensure_desktop` 会退回带 pid 的名字，
+        # 这里若仍写常量，子进程就会被丢到一个不存在（或不属于本进程）的桌面上。
+        si.lpDesktop = f"WinSta0\\{_desktop_name}"
 
         started = adv.CreateProcessAsUserW(
             token,
@@ -1091,7 +1171,7 @@ def open_restricted_session(
         si.hStdInput = in_r
         si.hStdOutput = out_w
         si.hStdError = err_w
-        si.lpDesktop = f"WinSta0\\{win_token.DESKTOP_NAME}"
+        si.lpDesktop = f"WinSta0\\{_desktop_name}"
 
         started = adv.CreateProcessAsUserW(
             token,
@@ -1237,12 +1317,14 @@ def exec_error() -> str:
 
 def reset_probe() -> None:
     """清缓存，供测试与运行时切换档位后重新探测。"""
-    global _smoke_ok, _smoke_error, _desktop_handle, _desktop_error
+    global _smoke_ok, _smoke_error, _desktop_handle, _desktop_error, _desktop_name
     global _appcontainer_ok, _appcontainer_error
     _smoke_ok = None
     _smoke_error = ""
     _desktop_handle = None
     _desktop_error = ""
+    # 名字一并复位：上次可能退到了带 pid 的名字，重新探测应当从首选名字开始。
+    _desktop_name = win_token.DESKTOP_NAME
     # AppContainer 的探测结果同样要清：重新探测的前提是"上次的结论不再可信"。
     _appcontainer_ok = None
     _appcontainer_error = ""
@@ -1256,6 +1338,7 @@ __all__ = [
     "appcontainer_exec_ready",
     "appcontainer_smoke_test",
     "build_env_block",
+    "desktop_name",
     "desktop_ready",
     "ensure_desktop",
     "exec_error",

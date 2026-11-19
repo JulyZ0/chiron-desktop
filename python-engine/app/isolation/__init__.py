@@ -924,14 +924,12 @@ def status() -> dict[str, Any]:
         "downgrade_allowed": downgrade_allowed(),
         #: 前端据此决定选项卡是否置灰。
         "selectable": selectable_values,
-        #: 选择这些档位时必须先二次确认（低于安全底线且仍有隔离概念）。
+        #: 选择这些档位时必须先二次确认。
         #:
-        #: `job` 不在此列：它仍有 Job Object 边界，为它加确认会把"切一下看看"
-        #: 变得很贵。`none` 才是"完全没有边界"，必须让用户明确点头。
+        #: 只有 `none`（完全没有边界）在此列。`job` 仍有 Job Object 边界，
+        #: 为它加门槛会把"切一下看看"变得很贵，却换不来对应的安全。
         "acknowledge_required": [
-            lv.value
-            for lv in selectable
-            if lv.rank < FLOOR_LEVEL.rank and lv.rank < Level.JOB.rank
+            lv.value for lv in selectable if lv.rank < Level.JOB.rank
         ],
         #: 不可选档位的**原因**，按档位名索引。只描述"本机缺机制"，
         #: 后者要告诉用户去做什么（如"以管理员身份运行"），而不是让他去改配置。
