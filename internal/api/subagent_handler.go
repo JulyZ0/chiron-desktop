@@ -431,9 +431,20 @@ func intOf(v interface{}) int {
 	switch value := v.(type) {
 	case int:
 		return value
+	// `int16` = Postgres `smallint`。**不能省**：`FetchOne`/`FetchAll` 把行扫进
+	// `*interface{}`，pgx 走 `DecodeValue`，int2 给的就是 int16（int4→int32、
+	// int8→int64）。漏掉它时唯一出路是 default 分支的 0 —— 而 `tenant_id` 正是
+	// smallint：落库时租户被写成 0，随后按真实租户查就一行也查不到。
+	// 实测症状：检查点上报"成功"，但时间线永远是空的。
+	case int8:
+		return int(value)
+	case int16:
+		return int(value)
 	case int32:
 		return int(value)
 	case int64:
+		return int(value)
+	case uint16:
 		return int(value)
 	case float64:
 		return int(value)

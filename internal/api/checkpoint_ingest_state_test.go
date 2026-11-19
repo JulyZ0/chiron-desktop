@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // TestIngestCheckpointAcceptsFailureStateWithoutSHAs 固定住"失败态也能上报"这条校验契约。
@@ -63,5 +65,34 @@ func TestIngestCheckpointDefaultsOmittedStateToOK(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("缺省 state 应等价于 ok（因此缺 sha 要 400），实际 %d", rec.Code)
+	}
+}
+
+// TestCheckpointTenantIDFromSmallint 固定住"上报的检查点能按租户查出来"这条前提。
+//
+// 缺陷形态（两个环节拼起来才是完整的 bug）：
+//
+//  1. `FetchOne` 把行扫进 `*interface{}`，pgx 走 `DecodeValue`，Postgres 的
+//     `smallint` 解出来是 **int16**（int4→int32、int8→int64）；
+//  2. `intOf` 只认 int / int32 / int64 / float64 / string ⇒ int16 落进 default，
+//     返回 0。
+//
+// 而 `project_checkpoints.tenant_id` 与 `session_map_workspaces.tenant_id` 都是
+// smallint，于是上报时租户被写成 **0**：INSERT 成功、日志一片安静，但时间线按真实
+// 租户（"1"）查永远查不到 —— 用户看到的就是"检查点从没工作过"。
+//
+// 这里用 pgtype 直接解码一段 int2 二进制来做**前置证明**，避免"假设驱动"的修复。
+func TestCheckpointTenantIDFromSmallint(t *testing.T) {
+	m := pgtype.NewMap()
+	var decoded any
+	// int2 的二进制表示是 2 字节大端；3 => 0x00 0x03
+	if err := m.Scan(pgtype.Int2OID, pgtype.BinaryFormatCode, []byte{0x00, 0x03}, &decoded); err != nil {
+		t.Fatalf("decode int2: %v", err)
+	}
+	if _, ok := decoded.(int16); !ok {
+		t.Fatalf("前提不成立：pgx 把 int2 解成了 %T（期望 int16）", decoded)
+	}
+	if got := intOf(decoded); got != 3 {
+		t.Fatalf("intOf(smallint 3) = %d，期望 3 —— 租户会被写成 0，时间线恒空", got)
 	}
 }
