@@ -49,7 +49,11 @@ async def authorize(
     import aiohttp
 
     payload = {
-        "tenant_id": tenant_id,
+        # **必须是字符串**：Go 侧 `toolAuthorizeRequest.TenantID` 是 `string`（与
+        # `internal/api/tenant.go: tenantStr` 的仓内契约一致）。发 JSON number 会让
+        # `json.Decode` 直接失败 ⇒ 400 ⇒ 引擎 fail-closed 拒绝执行所有危险工具，
+        # 报错还只是"HTTP 400"，看不出是类型问题。
+        "tenant_id": str(tenant_id),
         "user_id": user_id,
         "session_id": session_id,
         "tool_call_id": tool_call_id,
@@ -65,7 +69,10 @@ async def authorize(
             timeout=aiohttp.ClientTimeout(total=AUTHORIZE_TIMEOUT_SECONDS),
         ) as resp:
             if resp.status != 200:
-                raise RuntimeError(f"tool broker HTTP {resp.status}")
+                # 带上响应体：只报 "HTTP 400" 时运维无从下手（这次就是类型不匹配，
+                # 而报错里一个字段名都没有）。
+                detail = (await resp.text())[:500]
+                raise RuntimeError(f"tool broker HTTP {resp.status}: {detail}".rstrip(": "))
             data = await resp.json()
 
     # 网关的统一外壳 {"success": true, "data": {...}}

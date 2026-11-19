@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/athenavi/chiron/internal/db"
@@ -27,8 +30,54 @@ import (
 // 注意：本端点解决"判定权威"，不解决"引擎绕过"。真正的硬约束是"引擎侧没有直连危险工具的
 // 能力"（MCP 收窄 + 出口凭据不进引擎），见 docs/agent-safety-and-reliability.md §1.4。
 
+// flexTenantID 是 `tenant_id` 的**宽容**解码类型：字符串与数字都收。
+//
+// 仓内契约是字符串（`tenantStr` / `parseTenantID` 一对），但引擎早期按 JSON number
+// 发送。Go 的 `json.Decode` 遇到类型不匹配会**整段**失败 —— 于是整个请求变成 400，
+// 引擎侧 fail-closed 拒掉所有 delete/external 级工具（`shell_exec`、`web_fetch`…），
+// 而报错只说 "HTTP 400"，一个字段名都没有。
+//
+// 契约该收紧，但**收在服务端解码上不是正确位置**：只要客户端版本落后一步（用户跑的是
+// 旧打包版），危险工具就全线不可用，且故障表现与"授权服务挂了"无法区分。所以这里两种
+// 形态都收，再交给 `parseTenantID` 统一归一（非法值回落 0 = 未绑定租户，与既有语义一致）。
+type flexTenantID string
+
+func (f *flexTenantID) UnmarshalJSON(b []byte) error {
+	raw := strings.TrimSpace(string(b))
+	if raw == "" || raw == "null" {
+		*f = ""
+		return nil
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		*f = flexTenantID(strings.TrimSpace(s))
+		return nil
+	}
+	// 数字形态：按整数归一。`7.0` 这类整值浮点也要落成 `"7"` —— 否则
+	// `parseTenantID` 的 `strconv.Atoi` 解析失败会回落 0，同一租户在审计里
+	// 就被记成"未绑定"，而 `/v1/internal/tool-authorize` 的判定本身仍照常生效，
+	// 这种"看起来成功、审计错位"最难发现。
+	var num json.Number
+	if err := json.Unmarshal(b, &num); err != nil {
+		return fmt.Errorf("tenant_id must be a string or a number")
+	}
+	if i, err := num.Int64(); err == nil {
+		*f = flexTenantID(strconv.FormatInt(i, 10))
+		return nil
+	}
+	fl, err := num.Float64()
+	if err != nil || fl != math.Trunc(fl) || math.IsInf(fl, 0) {
+		return fmt.Errorf("tenant_id must be a string or an integer")
+	}
+	*f = flexTenantID(strconv.FormatInt(int64(fl), 10))
+	return nil
+}
+
 type toolAuthorizeRequest struct {
-	TenantID   string          `json:"tenant_id"`
+	TenantID   flexTenantID    `json:"tenant_id"`
 	UserID     string          `json:"user_id"`
 	SessionID  string          `json:"session_id"`
 	ToolCallID string          `json:"tool_call_id"`
@@ -92,7 +141,7 @@ func ToolAuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 		if resp.Enforced {
 			detail += " enforced"
 		}
-		db.AuditLog(r.Context(), body.UserID, parseTenantID(body.TenantID),
+		db.AuditLog(r.Context(), body.UserID, parseTenantID(string(body.TenantID)),
 			"tool.authorize", "tool:"+body.ToolName, detail, remoteIP(r),
 			map[string]interface{}{
 				"tool":       body.ToolName,

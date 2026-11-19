@@ -103,3 +103,64 @@ func TestToolAuthorizeRejectsMissingToolName(t *testing.T) {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
+
+// tenant_id 的两种形态都必须收 —— 这是**故障隔离**问题，不是宽松问题。
+//
+// 历史事故：引擎按 JSON number 发送，而本结构体声明为 string，`json.Decode`
+// 整段失败 → 400 → 引擎 fail-closed 拒掉**所有** delete/external 级工具
+// （`shell_exec`、`web_fetch`…）。报错只有 "HTTP 400"，既没有字段名，也与
+// "授权服务挂了"表现一致，排查代价极高。
+//
+// 而且当用户跑的是落后一步的打包版时，收紧服务端解码等于让旧客户端全线瘫痪。
+// 所以两种形态都在这里收下，由 `parseTenantID` 统一归一。
+func TestToolAuthorizeAcceptsBothTenantIDForms(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"string", `{"tenant_id":"7","tool_name":"shell_exec","tools_mode":"auto"}`},
+		{"number", `{"tenant_id":7,"tool_name":"shell_exec","tools_mode":"auto"}`},
+		{"number as float", `{"tenant_id":7.0,"tool_name":"shell_exec","tools_mode":"auto"}`},
+		{"null", `{"tenant_id":null,"tool_name":"shell_exec","tools_mode":"auto"}`},
+		{"absent", `{"tool_name":"shell_exec","tools_mode":"auto"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/internal/tool-authorize", strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			ToolAuthorizeHandler(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200（tenant_id 形态不该让整个请求失败）: body = %s",
+					rec.Code, rec.Body.String())
+			}
+			var envelope struct {
+				Data toolAuthorizeResponse `json:"data"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+			}
+			// 判定必须照常生效：收下请求不等于放行危险工具。
+			if !envelope.Data.Allowed {
+				t.Error("allowed 应为 true")
+			}
+			if !envelope.Data.RequiresUserApproval || !envelope.Data.RequiresSecondCheck {
+				t.Errorf("delete 级仍应要求确认 + 二次校验：%+v", envelope.Data)
+			}
+		})
+	}
+}
+
+// 两种形态必须归一到**同一个**租户值，否则审计会把同一租户记成两条。
+func TestFlexTenantIDNormalizesBothForms(t *testing.T) {
+	for _, body := range []string{`"7"`, `7`, `7.0`} {
+		var got struct {
+			TenantID flexTenantID `json:"tenant_id"`
+		}
+		if err := json.Unmarshal([]byte(`{"tenant_id":`+body+`}`), &got); err != nil {
+			t.Fatalf("%s: decode: %v", body, err)
+		}
+		if id := parseTenantID(string(got.TenantID)); id != 7 {
+			t.Errorf("%s: parseTenantID = %d, want 7", body, id)
+		}
+	}
+}
