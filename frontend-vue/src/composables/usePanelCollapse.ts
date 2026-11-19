@@ -11,7 +11,7 @@
  *
  * 返回 `open` 是可直接绑定的 ref；`setOpen/toggle` 是用户动作入口（写存储）。
  */
-import { onBeforeUnmount, ref } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 
 export interface PanelCollapseOptions {
   /** localStorage 键（每个面板独立：同时打开多个面板时互不干扰） */
@@ -52,15 +52,35 @@ export function usePanelCollapse(options: PanelCollapseOptions) {
   const isNarrow = ref(media?.matches ?? false)
   // 窄屏期间的"宽屏偏好"快照：进入窄屏时保存，离开时恢复
   let wideOpen = stored ?? options.defaultOpen()
-  const open = ref(isNarrow.value ? false : wideOpen)
+  const state = ref(isNarrow.value ? false : wideOpen)
+
+  function persist(value: boolean): void {
+    wideOpen = value
+    writeStored(options.storageKey, value)
+  }
+
+  /**
+   * 对外的 `open`：**直接赋值也写入存储**。
+   *
+   * 视图里到处是 `panelOpen.value = false`（点关闭、切视图自动收起），若只把它做成
+   * 普通 ref，这些路径都不会持久化 —— "关掉后刷新又回来"的老问题会从另一个入口复现。
+   * 自动收起（进入窄屏）走内部 `state`，不写存储。
+   */
+  const open = computed<boolean>({
+    get: () => state.value,
+    set: value => {
+      state.value = value
+      persist(value)
+    },
+  })
 
   function onMediaChange(event: MediaQueryListEvent): void {
     isNarrow.value = event.matches
     if (event.matches) {
       // 进入窄屏：收起，但不改 wideOpen（用户的选择留给宽屏恢复）
-      open.value = false
+      state.value = false
     } else {
-      open.value = wideOpen
+      state.value = wideOpen
     }
   }
 
@@ -77,12 +97,10 @@ export function usePanelCollapse(options: PanelCollapseOptions) {
   /** 用户动作：写存储（窄屏下也写 —— 它表达的是"我这次要打开"，宽屏恢复时沿用） */
   function setOpen(value: boolean): void {
     open.value = value
-    wideOpen = value
-    writeStored(options.storageKey, value)
   }
 
   function toggle(): void {
-    setOpen(!open.value)
+    open.value = !open.value
   }
 
   onBeforeUnmount(() => {

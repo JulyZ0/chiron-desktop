@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, h, watch } from 'vue'
+import { ref, computed, h, watch, onBeforeUnmount } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '../../stores/auth'
 import { useThemeStore } from '../../stores/theme'
@@ -54,8 +54,24 @@ const route = useRoute()
 const authStore = useAuthStore()
 const themeStore = useThemeStore()
 
-// 折叠态：桌面端用 v-model，移动端用抽屉
-const collapsed = ref(false)
+// 折叠态：桌面端用 v-model，移动端用抽屉。
+// 折叠选择要**记住**：刷新后回到用户上次的状态，而不是每次重新展开。
+const ADMIN_NAV_COLLAPSED_KEY = 'chiron:admin-nav:collapsed:v1'
+function readCollapsed(): boolean {
+  try {
+    return localStorage.getItem(ADMIN_NAV_COLLAPSED_KEY) === '1'
+  } catch {
+    return false // 隐私模式：按默认展开
+  }
+}
+const collapsed = ref(readCollapsed())
+watch(collapsed, value => {
+  try {
+    localStorage.setItem(ADMIN_NAV_COLLAPSED_KEY, value ? '1' : '0')
+  } catch {
+    /* 存不下只在本次运行内生效 */
+  }
+})
 // 移动端抽屉可见性（< 960px 触发抽屉模式）
 const isMobile = ref(false)
 const drawerOpen = ref(false)
@@ -68,6 +84,9 @@ if (typeof window !== 'undefined') {
   checkMobile()
   window.addEventListener('resize', checkMobile)
 }
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', checkMobile)
+})
 
 // 路由切换时关闭移动端抽屉
 watch(() => route.path, () => { drawerOpen.value = false })
