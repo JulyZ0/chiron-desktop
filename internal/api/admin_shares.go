@@ -37,6 +37,9 @@ type AdminShareItem struct {
 	MessageCount int       `json:"message_count"`
 	CreatedAt    time.Time `json:"created_at"`
 	ExpiresAt    time.Time `json:"expires_at"`
+	// URL 是绝对分享地址（PUBLIC_BASE_URL 或按请求推导）。桌面端页面在 file:// 下
+	// 自己拼 origin 得到的是坏链，所以链接必须以服务端产出为准。
+	URL string `json:"url"`
 }
 
 // ListShares 列出本租户内的有效分享（GET /v1/admin/shares）。
@@ -75,6 +78,7 @@ func (h *AdminHandler) ListShares(w http.ResponseWriter, r *http.Request) {
 			logAndRespond(w, err, http.StatusInternalServerError, "scan admin share failed")
 			return
 		}
+		it.URL = sharePublicURL(h.cfg, r, it.ShareID)
 		items = append(items, it)
 	}
 	if err := rows.Err(); err != nil {

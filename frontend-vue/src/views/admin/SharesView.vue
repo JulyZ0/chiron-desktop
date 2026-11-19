@@ -17,7 +17,7 @@ import { listAdminShares, revokeAdminShare, type AdminShareItem } from '@/api/ad
 import { serverErrorMessage } from '../../utils/apiError'
 import { copyTextOrThrow } from '../../utils/clipboard'
 import { formatDateTime } from '../../utils/datetime'
-import { shareUrl as buildShareUrl } from '../../utils/shareLink'
+import { resolveShareUrl, ShareLinkUnavailableError } from '../../utils/shareLink'
 
 const { t } = useI18n()
 
@@ -34,9 +34,9 @@ const filtered = computed(() => {
       .some(field => (field ?? '').toLowerCase().includes(kw)))
 })
 
-function shareUrl(id: string): string {
-  // 与用户侧两个入口共用同一前缀（见 utils/shareLink.ts）。
-  return buildShareUrl(id)
+function shareUrl(item: AdminShareItem): string {
+  // 服务端的 url 是权威值（桌面端 file:// 下 origin 不可用）；拿不到时按 origin 兜底。
+  return resolveShareUrl(item.url, window.location.origin, item.share_id)
 }
 
 /** 时间列走统一入口：`toLocaleString()` 跟的是操作系统 locale，不是界面语言。 */
@@ -76,9 +76,13 @@ function asShare(record: Record<string, unknown>): AdminShareItem {
 async function copyLink(record: Record<string, unknown>) {
   const item = asShare(record)
   try {
-    await copyTextOrThrow(shareUrl(item.share_id))
+    await copyTextOrThrow(shareUrl(item))
     message.success(t('common.share_link_copied'))
-  } catch {
+  } catch (e) {
+    if (e instanceof ShareLinkUnavailableError) {
+      message.error(t('errors.share_link_unavailable_please_configure_public_base_url'))
+      return
+    }
     message.warning(t('errors.copy_failed_please_copy_manually'))
   }
 }

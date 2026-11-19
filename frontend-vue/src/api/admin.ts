@@ -641,6 +641,8 @@ export interface AdminShareItem {
   message_count: number
   created_at: string
   expires_at: string
+  /** 服务端产出的绝对分享地址（桌面端 file:// 下 origin 拼出来的是坏链） */
+  url?: string
 }
 
 /** 列出本租户内全部**有效**分享（已撤销 / 已过期的不会返回） */
