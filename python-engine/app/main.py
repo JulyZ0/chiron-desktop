@@ -1979,6 +1979,13 @@ async def agent_submit(
     llm_config = body.get("llm_config", {}) or {}
     if agent_conf and agent_conf.get("model"):
         llm_config["model"] = str(agent_conf["model"])
+    # Agent 的采样参数**只在该字段真的配了时**才覆盖：网关只在非空时下发
+    # （见 internal/api/agent_context.go 的 agentContextPayload），这里再守一次，
+    # 直连引擎的调用方也不会把 0/None 当成"改成 0"。
+    if agent_conf:
+        agent_temperature = agent_conf.get("temperature")
+        if isinstance(agent_temperature, (int, float)) and agent_temperature > 0:
+            llm_config["temperature"] = float(agent_temperature)
     if llm_config.get("deep_reasoning"):
         reasoning_note = (
             "First output your reasoning process inside "

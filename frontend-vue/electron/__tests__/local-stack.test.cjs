@@ -160,6 +160,23 @@ test('buildGatewayEnv 打开本地会话引导：不打开就没有任何身份�
   assert.equal(env[stack.LOCAL_BOOTSTRAP_ENV], '1')
 })
 
+test('buildGatewayEnv 注入前端产物目录：网关据此托管 SPA，分享链接才有可打开的宿主', () => {
+  const env = stack.buildGatewayEnv(
+    { pgDsn: 'postgresql://x', redisAddr: '' },
+    { appSecret: VALID_SECRET, port: 9100, env: {}, webRoot: 'C:\app\resources\web' },
+  )
+
+  assert.equal(env.CHIRON_WEB_ROOT, 'C:\app\resources\web')
+})
+
+test('buildGatewayEnv 没有 webRoot 时不写 CHIRON_WEB_ROOT（网关不托管，行为与引入前一致）', () => {
+  const env = stack.buildGatewayEnv(
+    { pgDsn: 'postgresql://x', redisAddr: '' },
+    { appSecret: VALID_SECRET, port: 9100, env: {} },
+  )
+  assert.equal(env.CHIRON_WEB_ROOT, undefined)
+})
+
 test('buildGatewayEnv 强制关闭注册：本地模式没有任何"新账号"可注册', () => {
   const env = stack.buildGatewayEnv(
     { pgDsn: 'postgresql://x', redisAddr: '' },

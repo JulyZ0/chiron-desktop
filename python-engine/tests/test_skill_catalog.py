@@ -16,8 +16,12 @@ import pytest
 
 from app.tools.registry import registry
 from app.tools.skill_catalog import (
+    BODY_MARKER,
     CATALOG_MARKER,
+    CHARS_PER_TOKEN,
     MAX_WARNINGS,
+    SKILL_BODY_BUDGET_TOKENS,
+    TRUNCATION_NOTE,
     WARNINGS_MARKER,
     build_skill_catalog,
     skill_path,
@@ -142,3 +146,112 @@ async def test_warnings_shown_even_without_skills(monkeypatch):
     catalog = await build_skill_catalog()
 
     assert WARNINGS_MARKER in catalog and CATALOG_MARKER not in catalog
+
+
+# ── 选中技能的正文注入（with_bodies）──────────────────────────────────
+#
+# 只有"名字 + 描述"时，模型得再 read_file 一次才看得到正文；实测表现就是
+# "配了 Skill 却像没用上"。选中即注入正文，但必须有预算，避免几个大技能挤爆上下文。
+
+
+def _skill(
+    name: str,
+    *,
+    body: str = "",
+    exec_type: str = "prompt",
+    description: str = "desc",
+    enabled: bool = True,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "enabled": enabled,
+        "exec": {"type": exec_type, "source": body},
+    }
+
+
+async def test_selected_skill_body_injected(monkeypatch):
+    _patch_skill_list(
+        monkeypatch,
+        {"skills": [_skill("git-helper", body="# Git 工作流\n先 rebase 再提交", description="Git 辅助")]},
+    )
+
+    catalog = await build_skill_catalog(selected=["git-helper"], with_bodies=True)
+
+    assert BODY_MARKER in catalog
+    assert "先 rebase 再提交" in catalog, "选中的技能正文必须进上下文"
+    assert 'name="git-helper"' in catalog
+    assert "Git 辅助" in catalog, "正文段要带描述（名字 + 描述 + 正文）"
+
+
+async def test_bodies_off_by_default(monkeypatch):
+    """默认不注入正文：老调用点逐字不变（前缀缓存不受影响）。"""
+    _patch_skill_list(
+        monkeypatch, {"skills": [_skill("git-helper", body="SECRET_BODY")]}
+    )
+
+    catalog = await build_skill_catalog(selected=["git-helper"])
+
+    assert "SECRET_BODY" not in catalog
+    assert BODY_MARKER not in catalog
+
+
+async def test_unselected_skill_body_not_injected(monkeypatch):
+    _patch_skill_list(
+        monkeypatch,
+        {
+            "skills": [
+                _skill("keep", body="KEEP_BODY"),
+                _skill("drop", body="DROP_BODY"),
+            ]
+        },
+    )
+
+    catalog = await build_skill_catalog(selected=["keep"], with_bodies=True)
+
+    assert "KEEP_BODY" in catalog
+    assert "DROP_BODY" not in catalog, "未选中的技能不得注入正文"
+
+
+async def test_no_selection_means_no_bodies(monkeypatch):
+    """没选技能时不注入任何正文 —— 否则每一轮都被全部技能正文占满。"""
+    _patch_skill_list(monkeypatch, {"skills": [_skill("a", body="A_BODY")]})
+
+    catalog = await build_skill_catalog(with_bodies=True)
+
+    assert "A_BODY" not in catalog
+    assert BODY_MARKER not in catalog
+
+
+async def test_non_prompt_skill_body_not_injected(monkeypatch):
+    """python/shell 类技能的 source 是**脚本代码**，不是说明文档，不能当提示词注入。"""
+    _patch_skill_list(
+        monkeypatch,
+        {"skills": [_skill("runner", body="print('hi')", exec_type="python")]},
+    )
+
+    catalog = await build_skill_catalog(selected=["runner"], with_bodies=True)
+
+    assert "print('hi')" not in catalog
+
+
+async def test_body_truncated_with_note(monkeypatch):
+    huge = "x" * (SKILL_BODY_BUDGET_TOKENS * CHARS_PER_TOKEN + 500)
+    _patch_skill_list(monkeypatch, {"skills": [_skill("huge", body=huge)]})
+
+    catalog = await build_skill_catalog(selected=["huge"], with_bodies=True)
+
+    assert TRUNCATION_NOTE in catalog, "超预算必须注明已截断，不能让模型以为看完了全文"
+    # 正文确实被剪到预算以内（外围还有目录/标签/告警等固定开销，不看总长）。
+    assert catalog.count("x") <= SKILL_BODY_BUDGET_TOKENS * CHARS_PER_TOKEN
+
+
+async def test_missing_selected_skill_warns_without_failing(monkeypatch):
+    """选中了但没加载出来：告警但不阻断（对话照常进行）。"""
+    _patch_skill_list(monkeypatch, {"skills": [_skill("present", body="B")]})
+
+    catalog = await build_skill_catalog(selected=["ghost"], with_bodies=True)
+
+    assert WARNINGS_MARKER in catalog
+    assert "ghost" in catalog
+    assert "not installed or failed to load" in catalog

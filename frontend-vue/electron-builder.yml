@@ -51,6 +51,18 @@ asar: true
 # **注意这条只对 components 成立** —— 缺了它功能只是少一块可选能力。
 # 网关那种"缺了就没业务入口"的资产不能用同样的取舍，见下面 extraResources 的第一条。
 extraResources:
+  # 前端产物**额外**放一份到 resources/web：Go 网关要托管它（CHIRON_WEB_ROOT），
+  # 分享链接（/share/<token>）才有一个别人也能打开的宿主。
+  #
+  # 为什么不直接给 asar 里的 dist：asar 是归档，只有 Node 的 fs 能透明读；
+  # 网关是独立的 Go 进程，普通文件 API 打不开归档内路径 —— 表现为"托管成功但永远 404"。
+  # 壳层按 `path.join(process.resourcesPath, 'web')` 定位（main.cjs 的 resolveWebRoot），
+  # 两侧路径必须一致。体积代价是 dist 多存一份（dist 已在 files 里进 asar，主窗口仍
+  # loadFile 读它）；这是"链接可分享"的必要成本。
+  - from: dist
+    to: web
+    filter:
+      - "**/*"
   # Go 网关：本地模式的**唯一业务入口**。
   #
   # 放 resources/ 而不是 asar：它是原生可执行文件，asar 里无法直接执行

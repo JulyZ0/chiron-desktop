@@ -385,6 +385,18 @@ function buildGatewayEnv(info, options = {}) {
   const engineAddr = String(options.pythonEngineAddress || '').trim()
   if (engineAddr) env.PYTHON_ENGINE_ADDRESS = engineAddr
 
+  // 前端产物目录：让网关托管同一套 SPA，分享链接才有**别人也能打开**的宿主。
+  //
+  // 不注入的话，网关只提供 JSON 接口，`/share/<token>` 在任何 host 上都不存在 ——
+  // 桌面端的分享链接只能是 `file://`，换台机器就是「找不到文件」。
+  //
+  // 路径由壳层算好（`resolveWebRoot()`）：打包态是 `resources/web`（见
+  // electron-builder.yml 的 extraResources —— **不能**用 asar 里的 dist，
+  // Go 进程读不了归档），开发态是 `frontend-vue/dist`。
+  // 空串 = 不托管，网关行为与引入前一致（配错路径不该阻断本地栈）。
+  const webRoot = String(options.webRoot || '').trim()
+  if (webRoot) env.CHIRON_WEB_ROOT = webRoot
+
   // 本地模式身份：打开网关的免口令会话引导（`POST /v1/auth/session`）。
   //
   // 必须由这里显式打开：网关侧默认关（那是给云端多租户部署定的口径），而本地模式

@@ -2545,8 +2545,13 @@ class AgentRuntime:
             if mode_cfg.include_context:
                 from app.tools.skill_catalog import build_skill_catalog
 
+                # with_bodies：**选中的**技能把 SKILL.md 正文一并注入（预算约 8k tokens，
+                # 超出截断并注明）。只给名字+描述时模型得再 read_file 一次才看得到正文，
+                # 实际表现是"配了 Skill 却像没用上"；而未选中的技能不注入正文，
+                # 否则每轮上下文都被全部技能正文占满。
                 catalog = await build_skill_catalog(
-                    selected=(task.workbench_context or {}).get("skill_names") or ()
+                    selected=(task.workbench_context or {}).get("skill_names") or (),
+                    with_bodies=True,
                 )
                 if catalog:
                     task.system_prompt = (

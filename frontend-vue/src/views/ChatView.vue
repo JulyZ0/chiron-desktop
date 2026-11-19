@@ -2334,7 +2334,7 @@ function requestDelete(id: string) {
 // 状态与操作已抽到 `useChatShare`（L3-4 拆簇）；模板引用的名字不变。
 const {
   shareOpen, shareTarget, shareInfo, shareLoading, shareRevoking, shareError,
-  shareMessageIds, isGuest, shareCandidates,
+  shareMessageIds, isGuest, shareCandidates, shareLinkUnavailable,
   openShare, toggleShareMessage, generateShare, revokeCurrentShare, shareUrl, copyShareLink,
 } = useChatShare({ items, sessions, activeSessionId, switchSession })
 
@@ -3814,6 +3814,7 @@ function continueGeneration() {
         <div class="share-link-row">
           <Input
             :model-value="shareUrl()"
+            :placeholder="shareLinkUnavailable ? $t('errors.share_link_unavailable_please_configure_public_base_url') : ''"
             readonly
             class="share-link-input"
           >
@@ -3823,6 +3824,7 @@ function continueGeneration() {
           </Input>
           <Button
             type="primary"
+            :disabled="shareLinkUnavailable"
             @click="copyShareLink"
           >
             <template #icon>
@@ -3830,6 +3832,11 @@ function continueGeneration() {
             </template>
             {{ $t('common.copy_link') }}
           </Button>
+        </div>
+        <!-- 链接主机是部署事实（PUBLIC_BASE_URL），前端猜不出来：说清去哪配，
+             而不是给一条打不开的相对路径。 -->
+        <div v-if="shareLinkUnavailable" class="share-manage-hint">
+          {{ $t('errors.share_link_unavailable_please_configure_public_base_url') }}
         </div>
         <div class="share-manage">
           <span class="share-manage-hint">{{ $t('common.link_is_public_anyone_with_the_link_can_view_it') }}</span>

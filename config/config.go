@@ -124,8 +124,13 @@ type Config struct {
 	// Log
 	LogLevel string // debug / info / warn / error
 
-	PublicBaseURL         string
-	FrontendURL           string
+	PublicBaseURL string
+	FrontendURL   string
+	// WebRoot 指向前端构建产物目录（含 index.html）。非空时网关会额外托管这套 SPA：
+	// 未命中 API 的 GET 请求回落 index.html —— 否则分享链接（/share/<token>）只在
+	// 桌面壳的 file:// 下存在，任何其它人拿到链接都是 404。
+	// 默认空 = 不托管（行为与引入前完全一致）。
+	WebRoot               string
 	AlipayAppID           string
 	AlipayPrivateKey      string
 	AlipayPublicKey       string
@@ -297,6 +302,7 @@ func loadConfig() *Config {
 		// 支付（支付宝/微信）
 		PublicBaseURL:         getEnv("PUBLIC_BASE_URL", ""),
 		FrontendURL:           getEnv("FRONTEND_URL", ""),
+		WebRoot:               getEnv("CHIRON_WEB_ROOT", ""),
 		AlipayAppID:           getEnv("ALIPAY_APP_ID", ""),
 		AlipayPrivateKey:      getEnv("ALIPAY_PRIVATE_KEY", ""),
 		AlipayPublicKey:       getEnv("ALIPAY_PUBLIC_KEY", ""),

@@ -7,7 +7,6 @@
  * 分享弹窗里的游客提示）。
  */
 import { copyTextOrThrow } from '../utils/clipboard'
-import { shareUrl as buildShareUrl } from '../utils/shareLink'
 import { computed, ref } from 'vue'
 import type { Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -18,6 +17,7 @@ import type { ShareInfo } from '../api'
 import { useAuthStore } from '../stores/auth'
 import type { ChatItem, ChatSession } from '../components/chat/chat-types'
 import { serverErrorMessage } from '../utils/apiError'
+import { resolveShareUrl, safeShareUrl, ShareLinkUnavailableError } from '../utils/shareLink'
 
 export interface ChatShareDeps {
   /** 当前会话的消息列表（分享候选的来源） */
@@ -37,7 +37,7 @@ export function useChatShare(deps: ChatShareDeps) {
 
   const shareOpen = ref(false)
   const shareTarget = ref<ChatSession | null>(null)
-  const shareInfo = ref<ShareInfo | null>(null)
+  const shareInfo = ref<(ShareInfo & { url?: string }) | null>(null)
   const shareLoading = ref(false)
   const shareRevoking = ref(false)
   const shareError = ref('')
@@ -106,22 +106,37 @@ export function useChatShare(deps: ChatShareDeps) {
   }
 
   function shareUrl(): string {
-    // 统一出口：前缀与编码规则见 utils/shareLink.ts（此前这里自己拼 `/share/`）。
-    return buildShareUrl(shareInfo.value?.share_id || '')
+    // 链接以后端返回的 url 为准（桌面端是 file://，origin 拼出来的是坏链）。
+    // 拿不到可达链接时返回空串（模板里直接绑定，不能抛），提示由
+    // `shareLinkUnavailable` 驱动、复制按钮给出可读错误。
+    return safeShareUrl(shareInfo.value?.url, window.location.origin, shareInfo.value?.share_id || '')
   }
+
+  /** 有分享但链接不可达（后端没给 url 且页面不在 http(s) 上）—— 用来显示配置提示 */
+  const shareLinkUnavailable = computed(() => Boolean(shareInfo.value) && !shareUrl())
 
   async function copyShareLink() {
     try {
-      await copyTextOrThrow(shareUrl())
+      const url = resolveShareUrl(
+        shareInfo.value?.url,
+        window.location.origin,
+        shareInfo.value?.share_id || '',
+      )
+      await copyTextOrThrow(url)
       message.success(t('common.link_copied'))
-    } catch {
+    } catch (e) {
+      if (e instanceof ShareLinkUnavailableError) {
+        // 可读提示 + 指向真正的修复点：链接主机是部署配置，不是前端能猜的。
+        message.error(t('errors.share_link_unavailable_please_configure_public_base_url'))
+        return
+      }
       message.error(t('errors.copy_failed'))
     }
   }
 
   return {
     shareOpen, shareTarget, shareInfo, shareLoading, shareRevoking, shareError,
-    shareMessageIds, isGuest, shareCandidates,
+    shareMessageIds, isGuest, shareCandidates, shareLinkUnavailable,
     openShare, toggleShareMessage, generateShare, revokeCurrentShare, shareUrl, copyShareLink,
   }
 }

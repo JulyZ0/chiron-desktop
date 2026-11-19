@@ -148,6 +148,7 @@ export default {
   assignment_failed: "فشل التعيين",
   failed_to_load_shares: "فشل تحميل المشاركات",
   share_cancelled_link_is_invalid: "تم إلغاء المشاركة، والرابط غير صالح",
+  share_link_unavailable_please_configure_public_base_url: "لا يتوفر رابط مشاركة قابل للاستخدام بعد. اضبط عنوان الوصول العام من «لوحة الإدارة ← الخدمة ← العنوان العام» ثم أعد المحاولة.",
   failed_to_load_provider_catalog: "فشل تحميل كتالوج المزوّدين",
   copy_failed: "فشل النسخ",
   copy_failed_please_copy_manually: "فشل النسخ، يرجى النسخ يدويًا",

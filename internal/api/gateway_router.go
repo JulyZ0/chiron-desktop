@@ -283,7 +283,7 @@ func NewGatewayRouter(
 
 	// Conversation
 	conversationHandler := NewConversationHandler(authenticator, sessionMgr)
-	shareHandler := NewShareHandler(authenticator, sessionMgr)
+	shareHandler := NewShareHandler(authenticator, sessionMgr, cfg)
 
 	// Tool (proxies to Python)
 	toolHandler := NewToolHandler(pythonClient, authenticator)
@@ -472,6 +472,14 @@ func NewGatewayRouter(
 	// （前端经 /v1/agent/approval 提交决定），避免 Go/Python 双实现漂移。
 
 	registerAdminRoutes(mux, authMW, rlMW, adminHandler, pythonClient)
+
+	// 可选 SPA 静态托管（CHIRON_WEB_ROOT）：分享链接要有一个**别人也能打开**的宿主。
+	// 不配置时不注册任何东西，"GET /" 仍是 404 —— 行为与引入前完全一致。
+	// 必须放在所有 API 路由之后：ServeMux 按最具体的 pattern 匹配，不依赖注册顺序，
+	// 但把兜底放在最后读起来才不会被误认为"吞掉 API"。
+	if cfg != nil {
+		mountSPA(mux, cfg.WebRoot)
+	}
 
 	// Wrap main mux with public middleware.
 	return publicMW(mux)

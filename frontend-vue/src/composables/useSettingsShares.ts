@@ -1,10 +1,10 @@
 import { copyTextOrThrow } from '../utils/clipboard'
-import { shareUrl as buildShareUrl } from '../utils/shareLink'
 import { ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import { api } from '../api'
 import { serverErrorMessage } from '../utils/apiError'
+import { resolveShareUrl, safeShareUrl, ShareLinkUnavailableError } from '../utils/shareLink'
 import { tallyCache, scheduleTally } from '../utils/tallyCache'
 
 export interface ShareItem {
@@ -13,6 +13,8 @@ export interface ShareItem {
   title: string
   message_count: number
   created_at: string
+  /** 后端产出的绝对链接（见 api 的 ShareInfo.url）；旧后端没有该字段 */
+  url?: string
 }
 
 /**
@@ -83,16 +85,21 @@ export function useSettingsShares() {
     }
   }
 
-  function shareURL(id: string) {
-    // 与聊天页 / 后台分享管理共用同一个前缀（见 utils/shareLink.ts）。
-    return buildShareUrl(id)
+  /** 分享条的链接：优先后端 url；拿不到可达链接时返回空串（界面禁用复制） */
+  function shareURL(item: ShareItem): string {
+    return safeShareUrl(item?.url, window.location.origin, item?.share_id || '')
   }
 
-  async function copyShareURL(id: string) {
+  async function copyShareURL(item: ShareItem) {
     try {
-      await copyTextOrThrow(shareURL(id))
+      const url = resolveShareUrl(item?.url, window.location.origin, item?.share_id || '')
+      await copyTextOrThrow(url)
       message.success(t('common.share_link_copied'))
-    } catch {
+    } catch (e) {
+      if (e instanceof ShareLinkUnavailableError) {
+        message.error(t('errors.share_link_unavailable_please_configure_public_base_url'))
+        return
+      }
       message.warning(t('errors.copy_failed_please_copy_manually'))
     }
   }

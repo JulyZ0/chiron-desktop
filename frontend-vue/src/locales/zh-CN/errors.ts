@@ -154,6 +154,7 @@ export default {
   assignment_failed: "分配失败",
   failed_to_load_shares: "分享列表加载失败",
   share_cancelled_link_is_invalid: "分享已取消，链接已失效",
+  share_link_unavailable_please_configure_public_base_url: "暂时拿不到可分享的链接地址。请到「管理后台 → 服务 → 对外地址」配置对外访问地址后重试。",
   failed_to_load_provider_catalog: "服务提供商目录加载失败",
   copy_failed: "复制失败",
   copy_failed_please_copy_manually: "复制失败，请手动复制",

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/athenavi/chiron/config"
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
 	"github.com/athenavi/chiron/internal/model"
@@ -20,10 +21,13 @@ import (
 type ShareHandler struct {
 	authenticator *auth.Authenticator
 	sessionMgr    *session.Manager
+	// cfg 只用于两件事：PUBLIC_BASE_URL（分享链接的对外基址）与 TRUSTED_PROXY_CIDRS
+	// （是否采信 X-Forwarded-*）。允许为 nil（测试）：此时按请求的 scheme+Host 推导。
+	cfg *config.Config
 }
 
-func NewShareHandler(a *auth.Authenticator, sm *session.Manager) *ShareHandler {
-	return &ShareHandler{authenticator: a, sessionMgr: sm}
+func NewShareHandler(a *auth.Authenticator, sm *session.Manager, cfg *config.Config) *ShareHandler {
+	return &ShareHandler{authenticator: a, sessionMgr: sm, cfg: cfg}
 }
 
 // shareToken generates a random unguessable share id (80 bits entropy, base32
@@ -130,7 +134,11 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing != nil {
-		OK(w, map[string]interface{}{"share_id": existing.ID, "created_at": existing.CreatedAt})
+		OK(w, map[string]interface{}{
+			"share_id":   existing.ID,
+			"created_at": existing.CreatedAt,
+			"url":        sharePublicURL(h.cfg, r, existing.ID),
+		})
 		return
 	}
 
@@ -155,7 +163,11 @@ func (h *ShareHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	OK(w, map[string]interface{}{"share_id": token, "created_at": time.Now()})
+	OK(w, map[string]interface{}{
+		"share_id":   token,
+		"created_at": time.Now(),
+		"url":        sharePublicURL(h.cfg, r, token),
+	})
 }
 
 // GetActive returns the active share for a conversation (GET /v1/conversations/{id}/share).
@@ -187,7 +199,11 @@ func (h *ShareHandler) GetActive(w http.ResponseWriter, r *http.Request) {
 		NotFound(w, "no active share")
 		return
 	}
-	OK(w, map[string]interface{}{"share_id": share.ID, "created_at": share.CreatedAt})
+	OK(w, map[string]interface{}{
+		"share_id":   share.ID,
+		"created_at": share.CreatedAt,
+		"url":        sharePublicURL(h.cfg, r, share.ID),
+	})
 }
 
 // Revoke cancels the active share (DELETE /v1/conversations/{id}/share).
@@ -265,6 +281,9 @@ func (h *ShareHandler) List(w http.ResponseWriter, r *http.Request) {
 			"title":         title,
 			"message_count": msgCount,
 			"created_at":    createdAt,
+			// url 与 Create/GetActive 同一口径：前端不再自己用 window.location.origin
+			// 拼（桌面端那是 file://，拼出来的链接谁也打不开）。
+			"url": sharePublicURL(h.cfg, r, shareID),
 		})
 	}
 	if err := rows.Err(); err != nil {

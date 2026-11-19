@@ -151,6 +151,7 @@ export default {
   assignment_failed: "Assignment failed",
   failed_to_load_shares: "Failed to load shares",
   share_cancelled_link_is_invalid: "Share cancelled, link is invalid",
+  share_link_unavailable_please_configure_public_base_url: "No shareable link is available yet. Set the public base URL under Admin → Service → Public URL, then try again.",
   failed_to_load_provider_catalog: "Failed to load provider catalog",
   copy_failed: "Copy failed",
   copy_failed_please_copy_manually: "Copy failed, please copy manually",

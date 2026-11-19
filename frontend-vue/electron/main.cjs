@@ -616,6 +616,9 @@ async function tryStartGoStack(options = {}) {
       // Node 模块读不到 —— 必须在这里解密后交下去。缺了它 pageindex-search 会自报
       // `status: "disabled"`，知识库建索引全部失败。
       knowledgeSecrets: (await resolveKnowledgeSecrets()) || undefined,
+      // 网关托管前端产物（resources/web）：分享链接必须有一个别人也能打开的宿主，
+      // 否则链接只能是 file://，换台机器就是「找不到文件」。空串 = 不托管。
+      webRoot: resolveWebRoot(),
       onEngineExit: notifyEngineExit,
       // 自愈放弃才通知：这条是"放弃了"，与上一条"抖了一下"必须能区分开。
       onSupervisorGiveUp: notifySupervisorGiveUp,
@@ -664,6 +667,26 @@ function resolveGatewayExe() {
   candidates.push(path.join(__dirname, '..', '..', exeName))
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) return candidate
+  }
+  return ''
+}
+
+/**
+ * 找前端产物目录（含 index.html），交给网关托管（`CHIRON_WEB_ROOT`）。
+ *
+ * **为什么不能复用 asar 里的 `dist/`**：asar 是归档格式，只有 Node 的 fs 能透明读，
+ * Go 子进程用普通文件 API 打不开 —— 交给它一个 asar 内路径，结果是"托管成功但永远
+ * 404"。所以 electron-builder.yml 里额外把 `dist/` 复制到 `resources/web`
+ * （extraResources），这里按那个路径找；开发态回落到源码目录的 `dist/`。
+ *
+ * 找不到就返回空串：网关不托管，本地栈照常启动（分享链接退化为不可对外）。
+ */
+function resolveWebRoot() {
+  const candidates = []
+  if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'web'))
+  candidates.push(path.join(__dirname, '..', 'dist'))
+  for (const candidate of candidates) {
+    if (fs.existsSync(path.join(candidate, 'index.html'))) return candidate
   }
   return ''
 }
