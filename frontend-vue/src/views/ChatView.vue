@@ -53,6 +53,7 @@ import { useTodoPanel } from '../composables/useTodoPanel'
 import { boardFromHistory } from '../components/chat/todoProjection'
 import TodoPanel from '../components/chat/TodoPanel.vue'
 import { useSessionMeta } from '../composables/useSessionMeta'
+import { usePanelCollapse } from '../composables/usePanelCollapse'
 import { useMessageFailure } from '../composables/useMessageFailure'
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
 import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
@@ -1505,8 +1506,16 @@ watch(() => items.value.length, async () => {
   if (el) el.scrollTop = el.scrollHeight
 })
 
-// 侧面板（主从时间线：轨迹 / 会话历史）；上下文面板：桌面端（>1025px）默认展开常驻，≤1024px 折叠为抽屉
-const panelOpen = ref(window.matchMedia('(min-width: 1025px)').matches)
+// 侧面板（主从时间线：轨迹 / 会话历史）。
+//
+// 折叠状态统一交给 usePanelCollapse：宽屏默认常驻展开、≤1024px 默认抽屉收起，
+// 并且**记住用户的选择**（此前每次刷新都回到按屏幕算出来的默认值，用户把侧栏关掉后
+// 一刷新它又自己回来了）。窄屏自动收起不会覆盖宽屏偏好，详见 composable 注释。
+const { open: panelOpen } = usePanelCollapse({
+  storageKey: 'chiron:chat-side-panel:v1',
+  defaultOpen: () => window.matchMedia('(min-width: 1025px)').matches,
+  narrowQuery: '(max-width: 1024px)',
+})
 const panelView = ref<'trajectory' | 'sessions' | 'agents' | 'stats'>('trajectory')
 /**
  * 会话地图：**独立的整屏大窗格**（不是侧栏里的一个小视图 —— 侧栏太窄，
@@ -1615,15 +1624,58 @@ const subagentLiveEvents = computed<SubagentEvent[]>({
 })
 
 const SUBAGENT_LIVE_MAX = 500
+/**
+ * 子 Agent 卡片「重试」：把失败任务放回输入框，而不是替用户再派发一次。
+ *
+ * 后端没有"重跑某个 run"的端点（run 是父 Agent 的工具调用产物），前端伪造一次
+ * 派发只能编造上下文；把文本交给用户确认，是唯一不撒谎的重试路径。
+ */
+function onSubagentRetry(payload: { runId: string; text: string }) {
+  const text = String(payload?.text || '').trim()
+  if (!text) return
+  chatInputRef.value?.setDraft?.(text)
+}
+/** 合批窗口：子 Agent 一轮工具调用会连发几十条事件，逐条写响应式数组会让面板
+ *  （以及侧栏角标、会话状态点）每秒重算几十次 —— 这才是"响应式风暴"的来源。
+ *  50ms 合批后最多 20 次/秒，肉眼无差别，重算次数降一个量级。 */
+const SUBAGENT_FLUSH_MS = 50
 
-/** 把一条子 Agent 事件并入当前会话的实时缓冲（两个来源共用，见 ensureSubagentStream）。 */
+/**
+ * 待落盘的事件缓冲：**按 run 状态对象分组**，而不是一个全局数组。
+ *
+ * 分组是必须的：用户可能在 50ms 内切了会话，若把缓冲统一写进"当前会话"，A 会话的
+ * 子 Agent 事件就会串到 B 会话的面板里（正是这个文件此前修过的那个 bug）。
+ * 记下事件到达时属于哪个 run 状态，切会话也不会写错地方。
+ */
+type RunStateLike = (typeof currentRun)['value']
+const subagentBuffer = new Map<RunStateLike, SubagentEvent[]>()
+let subagentFlushHandle: number | null = null
+
+function flushSubagentBuffer() {
+  subagentFlushHandle = null
+  if (!subagentBuffer.size) return
+  for (const [run, events] of subagentBuffer) {
+    if (!events.length) continue
+    // 一次性拼接 + 截断：整个批次只触发一次响应式更新
+    const merged = [...run.subagentEvents, ...events]
+    run.subagentEvents = merged.length > SUBAGENT_LIVE_MAX
+      ? merged.slice(merged.length - SUBAGENT_LIVE_MAX)
+      : merged
+  }
+  subagentBuffer.clear()
+}
+
+/** 把一条子 Agent 事件并入所属会话的实时缓冲（两个来源共用，见 ensureSubagentStream）。 */
 function pushSubagentEvent(raw: unknown) {
   const event = raw as SubagentEvent
   const type = typeof event?.type === 'string' ? event.type : ''
   if (!type.startsWith('subagent.') || !event?.run_id) return
-  subagentLiveEvents.value.push(event)
-  if (subagentLiveEvents.value.length > SUBAGENT_LIVE_MAX) {
-    subagentLiveEvents.value.splice(0, subagentLiveEvents.value.length - SUBAGENT_LIVE_MAX)
+  const run = writingRun.value ?? currentRun.value
+  const pending = subagentBuffer.get(run)
+  if (pending) pending.push(event)
+  else subagentBuffer.set(run, [event])
+  if (subagentFlushHandle === null) {
+    subagentFlushHandle = window.setTimeout(flushSubagentBuffer, SUBAGENT_FLUSH_MS)
   }
 }
 
@@ -1834,6 +1886,13 @@ onUnmounted(() => {
   stopTurnTimer()
   if (activeSSE) { activeSSE.close(); activeSSE = null }
   closeSubagentStream()
+  // 合批缓冲：卸载时先把没落盘的那批冲刷掉（否则最后几十条事件随组件一起消失），
+  // 再清掉定时器，避免回调在已卸载的组件上继续写状态。
+  if (subagentFlushHandle !== null) {
+    clearTimeout(subagentFlushHandle)
+    subagentFlushHandle = null
+    flushSubagentBuffer()
+  }
   if (unifiedDoneTimer) { clearTimeout(unifiedDoneTimer); unifiedDoneTimer = null }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null }
@@ -3090,17 +3149,24 @@ function continueGeneration() {
          交换布局（侧边栏进左）时它**必须跟着移到最右**：否则左侧同时挤着
          侧边栏与工作台，而 `is-swapped` 本来就是为了把主会话还给中间。
          移动只改 `order` 与 `handle-side` —— DOM 位置不动，手柄仍贴着真正的窗口边缘。 -->
-    <WorkbenchPanel
-      v-if="workbenchOpen"
-      :project-id="activeProjectId"
-      :project-name="activeProject?.name || ''"
-      :project-error="activeProjectError"
-      :agent-written-paths="agentWrittenPaths"
-      :handle-side="layoutSwapped ? 'left' : 'right'"
-      @close="toggleWorkbench()"
-      @reference="onWorkbenchReference"
-      @retry-project="refreshActiveProject"
-    />
+    <!-- 折叠/展开 200ms 过渡：只动 opacity + transform（合成层属性），
+         不动 width/flex-basis —— 后者每一帧都要重排整条 flex 行，长会话的
+         transcript 测量账本会被反复触发（见 transcriptMeasurementLedger）。
+         因此这里刻意用位移+淡入代替"宽度伸缩"。 -->
+    <Transition name="panel-slide">
+      <WorkbenchPanel
+        v-if="workbenchOpen"
+        id="workbench-panel"
+        :project-id="activeProjectId"
+        :project-name="activeProject?.name || ''"
+        :project-error="activeProjectError"
+        :agent-written-paths="agentWrittenPaths"
+        :handle-side="layoutSwapped ? 'left' : 'right'"
+        @close="toggleWorkbench()"
+        @reference="onWorkbenchReference"
+        @retry-project="refreshActiveProject"
+      />
+    </Transition>
     <SessionPreviewPane
       v-if="splitSessionId"
       :session-id="splitSessionId"
@@ -3121,6 +3187,7 @@ function continueGeneration() {
       :handle-side="layoutSwapped ? 'left' : 'right'"
       :focus-run-id="subagentFocusRequest?.runId || ''"
       :focus-seq="subagentFocusRequest?.seq || 0"
+      @retry-run="onSubagentRetry"
       @close="setSubagentDockOpen(false)"
     />
     <div class="chat-main">
@@ -3162,12 +3229,16 @@ function continueGeneration() {
             >
               {{ splitSessionId ? $t('common.collapse_reference') : $t('common.split_view') }}
             </button>
-            <!-- 工作台开关：与分屏一样是"并排看别的东西"的维度，所以并排放在这里 -->
+            <!-- 工作台开关：与分屏一样是"并排看别的东西"的维度，所以并排放在这里。
+                 `aria-expanded` + `aria-controls`：折叠态由 CSS/Transition 表达，
+                 读屏只能从这里知道"现在是开还是关"。 -->
             <button
               type="button"
               class="toolbar-mode"
               :class="{ active: workbenchOpen }"
               :title="$t('chat.workbench_title')"
+              :aria-expanded="workbenchOpen"
+              aria-controls="workbench-panel"
               @click="toggleWorkbench()"
             >
               {{ $t('chat.workbench_title') }}
@@ -3192,6 +3263,8 @@ function continueGeneration() {
               class="toolbar-btn"
               :class="{ active: panelOpen && panelView === 'sessions' }"
               :title="panelOpen && panelView === 'sessions' ? $t('chat.collapse_session_list') : $t('chat.conversation_history')"
+              :aria-expanded="panelOpen && panelView === 'sessions'"
+              aria-controls="chat-side-panel"
               @click="openPanel('sessions')"
             >
               <template #icon>
@@ -3205,6 +3278,8 @@ function continueGeneration() {
               class="toolbar-btn"
               :class="{ active: panelOpen && panelView === 'trajectory' }"
               :title="panelOpen && panelView === 'trajectory' ? $t('common.collapse_trace') : $t('common.view_past_questions')"
+              :aria-expanded="panelOpen && panelView === 'trajectory'"
+              aria-controls="chat-side-panel"
               @click="openPanel('trajectory')"
             >
               <template #icon>
@@ -3721,6 +3796,7 @@ function continueGeneration() {
       />
     </Transition>
     <ChatSidePanel
+      id="chat-side-panel"
       :open="panelOpen"
       :view="panelView"
       :items="items"
@@ -4219,5 +4295,38 @@ function continueGeneration() {
   inset-block-end: 0;
   z-index: var(--z-viewer);
   background: var(--bg-page);
+}
+</style>
+<!-- 非 scoped：Transition 的类名挂在**子组件根元素**上（.workbench-panel / .side-panel），
+     带 ChatView 的 data-v 作用域选择器永远匹配不到。与 CollapseTransition.vue 同样的
+     处置（那里也是非 scoped，理由写在组件注释里）。 -->
+<style>
+/* 工作台折叠/展开：200ms，只动 opacity + transform。
+   为什么不动 width：工作台是 flex 行里的一个子项，宽度动画会让整条 flex 行每帧重排，
+   而聊天区正在跑 transcript 的测量账本 —— 重排会把它的高度读数冲掉，表现为滚动位置
+   抖动。位移+淡入同样给出"它是从侧边推进来/收回去"的方向感。 */
+.panel-slide-enter-active,
+.panel-slide-leave-active {
+  transition: opacity var(--dur-normal) ease, transform var(--dur-normal) ease;
+  will-change: opacity, transform;
+}
+
+.panel-slide-enter-from,
+.panel-slide-leave-to {
+  opacity: 0;
+  transform: translateX(-12px);
+}
+
+.panel-slide-enter-to,
+.panel-slide-leave-from {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel-slide-enter-active,
+  .panel-slide-leave-active {
+    transition: none;
+  }
 }
 </style>

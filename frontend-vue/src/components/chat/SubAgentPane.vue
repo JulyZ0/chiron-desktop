@@ -35,7 +35,11 @@ const props = withDefaults(defineProps<{
   focusSeq?: number
 }>(), { sessionId: '', liveEvents: () => [], handleSide: 'right', focusRunId: '', focusSeq: 0 })
 
-const emit = defineEmits<{ (e: 'close'): void }>()
+const emit = defineEmits<{
+  (e: 'close'): void
+  /** 面板里点「重试」：把失败任务交回输入框（ChatView 负责落到草稿） */
+  (e: 'retry-run', payload: { runId: string; text: string }): void
+}>()
 
 const {
   paneRef,
@@ -107,6 +111,7 @@ const runningCount = computed(() => {
         :focus-run-id="focusRunId"
         :focus-seq="focusSeq"
         hide-header
+        @retry-run="emit('retry-run', $event)"
       />
     </div>
   </aside>

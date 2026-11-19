@@ -24,6 +24,7 @@ import {
 } from '../../api/subagent'
 import SubAgentApprovalCard from './SubAgentApprovalCard.vue'
 import AskCard from './AskCard.vue'
+import SubagentRunCard from '../agent/SubagentRunCard.vue'
 // 与主对话流**同一套**工具渲染：子 Agent 的工具调用同样是"调了什么 + 结果如何"，
 // 换一份长得差不多的实现只会让两边的摘要/展开/失败配色各自漂移。
 import ToolCallCard from './ToolCallCard.vue'
@@ -32,6 +33,29 @@ import { projectSubagentOutput } from './subagentOutput'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
+
+/**
+ * 「重试」：把失败任务放回输入框。
+ *
+ * 后端没有"重跑某个 run"的端点（run 是父 Agent 的工具调用产物），在这里直接重发
+ * 只能伪造上下文；把摘要交回输入框、由用户确认后再派发，是唯一不撒谎的重试。
+ */
+const emit = defineEmits<{
+  (e: 'retry-run', payload: { runId: string; text: string }): void
+}>()
+
+/** 统一时钟：只在有活跃 run 时每秒推进（父面板只有一个定时器，卡片共用这个值）。 */
+const nowTick = ref(Date.now())
+let nowTimer: ReturnType<typeof globalThis.setInterval> | null = null
+
+function emitRetry(run: SubagentRunView) {
+  const summary = (run.summary || '').trim()
+  const name = run.profile || run.run_id
+  emit('retry-run', {
+    runId: run.run_id,
+    text: summary || `${name} 的子任务失败了，请重新执行。`,
+  })
+}
 
 const props = withDefaults(defineProps<{
   /** 当前会话 id；为空时面板提示"无会话" */
@@ -182,8 +206,26 @@ const displayRuns = computed(() => {
  */
 const liveTail = computed(() => liveScan.value.tails)
 
+/** 已到终态的 run 状态（这些状态之后不再有增量，只补一次尾巴） */
+const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'killed', 'stopped', 'lost', 'done'])
+
 /** 是否还有运行中的 run（决定「全部停止」是否出现） */
 const hasRunning = computed(() => displayRuns.value.some(r => !TERMINAL_STATUSES.has(r.status)))
+
+// 时钟只在有活跃 run 时推进：终态列表不需要每秒重算耗时。
+watch(
+  hasRunning,
+  active => {
+    if (active && nowTimer === null) {
+      nowTick.value = Date.now()
+      nowTimer = globalThis.setInterval(() => { nowTick.value = Date.now() }, 1000)
+    } else if (!active && nowTimer !== null) {
+      globalThis.clearInterval(nowTimer)
+      nowTimer = null
+    }
+  },
+  { immediate: true },
+)
 
 /** 已请求取消的 run（本地即时反馈；终态到达后由事件/轮询清掉） */
 const cancelling = ref<Set<string>>(new Set())
@@ -551,8 +593,6 @@ async function selectRun(runId: string) {
   }
 }
 
-/** 已到终态的 run 状态（这些状态之后不再有增量，只补一次尾巴） */
-const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'killed', 'stopped', 'lost', 'done'])
 /** 已经为某个 run 补过"终态尾巴"的标记（避免终态后继续空轮询） */
 const tailLoaded = new Set<string>()
 
@@ -689,6 +729,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (timer) globalThis.clearInterval(timer)
+  if (nowTimer !== null) globalThis.clearInterval(nowTimer)
 })
 </script>
 
@@ -770,7 +811,7 @@ onBeforeUnmount(() => {
       />
       <div
         v-else
-        class="tree"
+        class="timeline"
       >
         <!-- 一次清场：只在确实有运行中的 run 时才出现 -->
         <div
@@ -785,68 +826,26 @@ onBeforeUnmount(() => {
             {{ $t('agent.stop_all_sub_agents') }}
           </button>
         </div>
-        <div
+        <!-- 每个 run 一张时间线卡片。`key` 用 run_id：事件更新只改 props，
+             不会重建卡片（整表重渲染正是要避免的）。 -->
+        <SubagentRunCard
           v-for="run in visibleRuns"
           :key="run.run_id"
-          class="tree-row"
-          :class="{ active: run.run_id === selectedRunId }"
-          :style="{ paddingLeft: `${8 + (run.depth - 1) * 14}px` }"
-          role="button"
-          tabindex="0"
-          @click="selectRun(run.run_id)"
-          @keydown.enter.prevent="selectRun(run.run_id)"
-          @keydown.space.prevent="selectRun(run.run_id)"
-        >
-          <button
-            v-if="childCount.get(run.run_id)"
-            type="button"
-            class="twisty"
-            @click.stop="toggleCollapse(run.run_id)"
-          >
-            {{ collapsed.has(run.run_id) ? '▸' : '▾' }}
-          </button>
-          <span
-            v-else
-            class="twisty placeholder"
-          />
-          <Tag :color="STATUS_COLOR[run.status] || 'default'">
-            {{ run.status }}
-          </Tag>
-          <span class="run-profile">{{ run.profile || run.run_id }}</span>
-          <!-- 运行中的实时预览：最后一段输出（点开该 run 可看完整事件流） -->
-          <span
-            v-if="liveTail[run.run_id] && !TERMINAL_STATUSES.has(run.status)"
-            class="run-tail"
-            :title="liveTail[run.run_id]"
-          >{{ liveTail[run.run_id] }}</span>
-          <!-- 待处理（审批/提问）：不点开该 run 也要看得见（点它跳到可操作卡片） -->
-          <button
-            v-if="pendingByRun[run.run_id]"
-            type="button"
-            class="run-approval"
-            :title="$t('agent.sub_agent_is_waiting_for_your_confirmation_or_answer')"
-            @click.stop="focusApprovals(run.run_id)"
-          >
-            ⚠ {{ $t('common.pending') }}{{ pendingByRun[run.run_id] > 1 ? ` ×${pendingByRun[run.run_id]}` : '' }}
-          </button>
-          <span class="run-usage">↑{{ run.usage?.input_tokens || 0 }}/↓{{ run.usage?.output_tokens || 0 }}</span>
-          <!-- 中止：只在运行中的 run 上出现（终态没什么可停的） -->
-          <button
-            v-if="!TERMINAL_STATUSES.has(run.status)"
-            type="button"
-            class="run-stop"
-            :disabled="cancelling.has(run.run_id)"
-            :title="$t('agent.stop_this_sub_agent')"
-            @click.stop="stopRun(run.run_id)"
-          >
-            {{ cancelling.has(run.run_id) ? '…' : '■' }}
-          </button>
-          <span
-            v-if="run.redacted_count"
-            class="run-redacted"
-            :title="$t('common.sensitive_snippets_desensitized_before_storage')"
-          >🔒{{ run.redacted_count }}</span>
-        </div>
+          :run="run"
+          :depth="run.depth"
+          :selected="run.run_id === selectedRunId"
+          :child-count="childCount.get(run.run_id) || 0"
+          :collapsed="collapsed.has(run.run_id)"
+          :live-tail="liveTail[run.run_id] || ''"
+          :pending="pendingByRun[run.run_id] || 0"
+          :cancelling="cancelling.has(run.run_id)"
+          :now="nowTick"
+          @select="selectRun(run.run_id)"
+          @toggle="toggleCollapse(run.run_id)"
+          @stop="stopRun(run.run_id)"
+          @pending="focusApprovals(run.run_id)"
+          @retry="emitRetry(run)"
+        />
       </div>
     </Spin>
 
@@ -1154,7 +1153,7 @@ onBeforeUnmount(() => {
 .panel-meta { color: var(--text-tertiary, #8c8c8c); font-size: 12px; display: flex; align-items: center; gap: 6px; }
 .source-tag { margin: 0; }
 
-.tree { display: flex; flex-direction: column; }
+.timeline { display: flex; flex-direction: column; }
 .tree-row {
   display: flex; align-items: center; gap: 6px;
   padding: 4px 8px; border-radius: var(--radius-md); cursor: pointer;
