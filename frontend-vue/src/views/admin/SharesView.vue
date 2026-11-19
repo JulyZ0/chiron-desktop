@@ -16,6 +16,7 @@ import { useI18n } from 'vue-i18n'
 import { listAdminShares, revokeAdminShare, type AdminShareItem } from '@/api/admin'
 import { serverErrorMessage } from '../../utils/apiError'
 import { copyTextOrThrow } from '../../utils/clipboard'
+import { formatDateTime } from '../../utils/datetime'
 import { shareUrl as buildShareUrl } from '../../utils/shareLink'
 
 const { t } = useI18n()
@@ -38,20 +39,20 @@ function shareUrl(id: string): string {
   return buildShareUrl(id)
 }
 
+/** 时间列走统一入口：`toLocaleString()` 跟的是操作系统 locale，不是界面语言。 */
 function formatTime(value: string): string {
-  if (!value) return '—'
-  const d = new Date(value)
-  return Number.isNaN(d.getTime()) ? value : d.toLocaleString()
+  return formatDateTime(value, '—')
 }
 
-const columns: TableColumnsType = [
+// 必须 computed：`t()` 在 setup 顶层只求值一次，切语言后表头会停在旧语言。
+const columns = computed<TableColumnsType>(() => [
   { title: t('admin.share_col_title'), dataIndex: 'title', key: 'title', ellipsis: true },
   { title: t('admin.share_col_owner'), dataIndex: 'user_email', key: 'user_email', width: 220, ellipsis: true },
   { title: t('admin.share_col_messages'), dataIndex: 'message_count', key: 'message_count', width: 110 },
   { title: t('admin.share_col_created'), dataIndex: 'created_at', key: 'created_at', width: 190 },
   { title: t('admin.share_col_expires'), dataIndex: 'expires_at', key: 'expires_at', width: 190 },
   { title: t('admin.share_col_actions'), key: 'actions', width: 200, fixed: 'right' },
-]
+])
 
 async function load() {
   loading.value = true
