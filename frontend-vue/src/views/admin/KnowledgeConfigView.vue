@@ -299,9 +299,11 @@ onMounted(load)
           </h3>
           <div class="field">
             <label class="field-label">{{ $t('admin.knowledge.saved_mode') }}</label>
-            <Tag>{{ savedMode === 'remote'
-              ? $t('admin.knowledge.mode_remote')
-              : $t('admin.knowledge.mode_local') }}</Tag>
+            <Tag>
+              {{ savedMode === 'remote'
+                ? $t('admin.knowledge.mode_remote')
+                : $t('admin.knowledge.mode_local') }}
+            </Tag>
           </div>
           <div
             v-if="savedMode === 'remote'"

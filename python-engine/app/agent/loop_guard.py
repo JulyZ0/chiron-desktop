@@ -112,6 +112,19 @@ class LoopGuard:
         self._calls.clear()
         self._results.clear()
 
+    def configure(
+        self,
+        *,
+        no_progress_threshold: int | None = None,
+    ) -> None:
+        """热更新阈值（后台「Agent 运行配置」保存后即时生效）。
+
+        只改阈值、**不清空窗口**：后台改一次配置不该把"已经在重复"的判定证据抹掉，
+        否则用户点一下保存就成了绕过护栏的手段。0 = 关闭该规则（与构造时同义）。
+        """
+        if no_progress_threshold is not None:
+            self._no_progress_threshold = max(0, int(no_progress_threshold))
+
     # ── 判定 ──
 
     def _detect_repeat(self) -> LoopVerdict:

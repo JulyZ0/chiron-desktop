@@ -44,6 +44,9 @@ TENANT_SUFFIX = "tenant_suffix"
 CONTROLS_SUFFIX = "controls_suffix"
 #: **执行规范**（先规划 / 该委派就委派 / 清单不空不收工，`planning_guidance`）。
 PLANNING_SUFFIX = "planning_suffix"
+#: **回合间叙述**（每做完一步说一句在干什么，`runtime_config.render_narration_suffix`）。
+#: 只依赖后台「Agent 运行配置」的一个选择，同会话内逐字稳定 ⇒ 属于稳定前缀。
+NARRATION_SUFFIX = "narration_suffix"
 #: **数据面声明**（外部来源文本是资料、不是指令，`data_plane`）。只依赖本轮工具集是否
 #: 含外部来源工具，因此同模式同工具集下逐字稳定 ⇒ 属于稳定前缀。
 DATA_PLANE_POLICY = "data_plane_policy"
@@ -67,6 +70,7 @@ INLINE_ORDER: tuple[str, ...] = (
     TENANT_SUFFIX,
     CONTROLS_SUFFIX,
     PLANNING_SUFFIX,
+    NARRATION_SUFFIX,
     DATA_PLANE_POLICY,
 )
 
@@ -151,6 +155,7 @@ __all__ = [
     "HOOK_CONTEXT",
     "INLINE_ORDER",
     "MEMORY",
+    "NARRATION_SUFFIX",
     "PLANNING_SUFFIX",
     "PromptSections",
     "REPORT",

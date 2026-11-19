@@ -99,6 +99,7 @@ from app.agent.prompt_sections import (
     HARNESS_SUFFIX,
     HOOK_CONTEXT,
     MEMORY,
+    NARRATION_SUFFIX,
     PLANNING_SUFFIX,
     REPORT,
     STABLE_PREFIX,
@@ -108,6 +109,13 @@ from app.agent.prompt_sections import (
     diff_sections,
     render_inline,
     standalone_texts,
+)
+from app.agent.runtime_config import (
+    no_progress_notice_enabled,
+    no_progress_threshold,
+    plan_approval_required,
+    render_narration_suffix,
+    token_window_ratio,
 )
 from app.agent.runtime_types import (  # noqa: F401 — 再导出：既有 import 路径不变
     DECISION_APPROVE as DECISION_APPROVE,
@@ -464,6 +472,7 @@ def _build_system_sections(
     extra_suffix: str = "",
     controls_suffix: str = "",
     planning_suffix: str = "",
+    narration_suffix: str = "",
     tool_change_notice: str = "",
     data_plane_policy: str = "",
 ) -> PromptSections:
@@ -504,6 +513,10 @@ def _build_system_sections(
         # persona 之上，所以 "Reply briefly" 那类措辞压不住"该做的步骤别省"。
         # 空串 = 该模式没有 todo_write / subagent ⇒ 逐字不变。
         inline[PLANNING_SUFFIX] = planning_suffix
+        # 回合间叙述（后台「Agent 运行配置」的 narration）：``off``（默认）为空串 ⇒
+        # system 段与引入前**逐字相同**；非默认时同位置 —— 稳定前缀末尾，同选择下逐字
+        # 稳定 ⇒ 前缀缓存仍命中。
+        inline[NARRATION_SUFFIX] = narration_suffix
         # 数据面声明（autoloop §1）：只在**本轮工具集真的含外部来源工具**时非空。
         # 与上面几段同位置 —— 稳定前缀末尾，同模式同工具集下逐字稳定 ⇒ 缓存仍命中；
         # 不含外部工具的会话逐字不变。
@@ -541,6 +554,7 @@ def _apply_system_prefix(
     extra_suffix: str = "",
     controls_suffix: str = "",
     planning_suffix: str = "",
+    narration_suffix: str = "",
     tool_change_notice: str = "",
     data_plane_policy: str = "",
     out_sections: dict[str, str] | None = None,
@@ -570,6 +584,7 @@ def _apply_system_prefix(
         extra_suffix=extra_suffix,
         controls_suffix=controls_suffix,
         planning_suffix=planning_suffix,
+        narration_suffix=narration_suffix,
         tool_change_notice=tool_change_notice,
         data_plane_policy=data_plane_policy,
     )
@@ -1053,9 +1068,34 @@ class AgentRuntime:
         self._trace_writer = None
         # 循环护栏：同一提交内检测"重复调用 / 无进展 / 来回摆动"。
         # 现有各轴预算都拦不住这种形态：轮次没超、时间没超、token 还在涨，只是原地打转。
+        # 「无进展」阈值来自后台「Agent 运行配置」（`agent_no_progress_threshold`）；
+        # 这里只是构造期的初值，`run()` 开头会再按最新配置刷一次（后台改了不用重启）。
         from app.agent.loop_guard import LoopGuard
 
-        self._loop_guard = LoopGuard()
+        self._loop_guard = LoopGuard(no_progress_threshold=no_progress_threshold())
+        #: 本轮是否已经给用户看过计划（`plan_approval=always` 时每次提交问一次）。
+        self._plan_approved: bool = False
+        #: 自上次「有进展」以来累计的输入 token（token 倍数后备线，见 `run()`）。
+        self._tokens_since_progress: int = 0
+        #: 本轮的 token 后备线是否已经提醒过（一轮提醒一次，避免每轮刷屏）。
+        self._token_notice_sent: bool = False
+        #: 本轮的上下文窗口（token 后备线要用；查不到时 0 = 不判定）。
+        self._context_window: int = 0
+        #: 本轮连续命中「无进展」的次数。第 1 次只提醒 + 回灌模型，第 2 次**暂停本轮** ——
+        #: 一次抖动（比如同一个 grep 换个写法）不该直接掐断，但两次就是"它确实在打转"。
+        self._no_progress_hits: int = 0
+        #: 本轮给用户的「无进展」提醒是否已发（只发一次，连续命中不刷屏）。
+        self._no_progress_notice_sent: bool = False
+        #: 待发给用户的「无进展」提醒（批次收尾时才发 —— 批次中间插 assistant 消息会
+        #: 打断 assistant.tool_calls 与 tool 消息的配对）。
+        self._no_progress_notice: str = ""
+        #: 非空 = 本批工具结果落完之后**暂停这一轮**（值为给用户看的说明）。
+        #: 与 `_awaiting_input` 同款"事后收口"：在批次中间 return 会漏掉本批 tool 消息的落库。
+        self._no_progress_pause: str = ""
+        #: 本轮的暂停是否已经收口（标过 `awaiting_input`）。与 `_no_progress_pause`
+        #: 分开是因为后者会被消费方清空（清空表示"这条说明已经发出去了"），
+        #: 而回合末的终态判定要读到"这一轮是暂停结束的"。
+        self._paused_for_user: bool = False
         # 任务预算与步数计数：由 run() 开头按环境变量重建（见 0.4b）
         self._budget: TaskBudget | None = None
         #: 上一轮稳定前缀的指纹（`(system 段, 工具表)` 两个哈希）。runtime 是**每会话**的
@@ -2189,6 +2229,20 @@ class AgentRuntime:
         budget = _budget_from_env(max_segments=DEFAULT_MAX_SEGMENTS)
         self._budget = budget
         self._tool_steps = 0
+        # 后台「Agent 运行配置」在**每轮开头**刷一次（而不是只在构造时读一次）：
+        # 配置是热更的（`runtime_config.listen_for_changes` 写回 `settings`），而 runtime
+        # 实例是**每会话复用**的 —— 只在 `__init__` 读，后台改了要等新会话才生效。
+        # 阈值 0 = 关闭该规则，与构造期同义；`configure` 只改阈值、不清窗口。
+        self._loop_guard.configure(no_progress_threshold=no_progress_threshold())
+        self._plan_approved = False
+        self._tokens_since_progress = 0
+        self._token_notice_sent = False
+        self._context_window = 0
+        self._no_progress_hits = 0
+        self._no_progress_notice_sent = False
+        self._no_progress_notice = ""
+        self._no_progress_pause = ""
+        self._paused_for_user = False
         # P5：恢复状态（每次 run 新建）—— 判据是"同一个失败操作"，不是"试了几次"。
         from app.agent import recovery as _recovery_mod
 
@@ -2553,6 +2607,9 @@ class AgentRuntime:
                     has_todo="todo_write" in _tool_names,
                     has_subagent="subagent" in _tool_names,
                 ),
+                # 回合间叙述（后台「Agent 运行配置」）：``off``（默认）渲染空串 ⇒
+                # system 段与引入本项之前逐字相同。
+                narration_suffix=render_narration_suffix(),
                 tool_change_notice=tool_change_notice,
                 data_plane_policy=_data_plane_policy,
                 out_sections=_system_sections,
@@ -2576,7 +2633,12 @@ class AgentRuntime:
             # 撞穿固定的 400k，而 1M 窗口的模型在同样轮数下只用掉小头。共用一条线
             # 的结果是小模型先被截断、大模型白白受限。这里只放大不缩小（显式配置与
             # 默认值仍是地板），窗口查不到时保持原值。
-            budget.scale_to_window(context_window)
+            #
+            # 倍数来自后台「Agent 运行配置」（`agent_token_window_ratio`）：它调的是
+            # **硬预算的放大倍数**，与下面那条"自上次有进展以来的累计输入达到窗口 N 倍
+            # 就提醒用户"的后备线共用同一个数，语义一致。
+            budget.scale_to_window(context_window, token_window_ratio())
+            self._context_window = int(context_window or 0)
 
             # ── max_tokens：按**模型**取上限，而不是按对话模式硬编码 ──
             # 同一个模式换个模型，输出上限本来就该变（deepseek-chat 8192 与
@@ -3405,6 +3467,33 @@ class AgentRuntime:
                                 logger.warning("loop guard: %s", progress_verdict.detail)
                                 tool_result = _loop_guard_result(progress_verdict, tool_result)
                                 batch_results[call["id"]] = tool_result
+                                # 后台「Agent 运行配置」的 no_progress_notice：**提醒用户**
+                                # （不只是回灌模型）。模型自己看不到"我在打转"，用户看得见 ——
+                                # 让他有机会补一句方向，比让 agent 烧完预算更有价值。
+                                #
+                                # 第一次只提醒、放它继续（一次抖动不该掐断）；连续第二次
+                                # 就是"确实在原地转" ⇒ 暂停本轮，把选择权交给用户。
+                                self._no_progress_hits += 1
+                                if no_progress_notice_enabled():
+                                    if self._no_progress_hits == 1:
+                                        self._no_progress_notice = (
+                                            f"连续几次工具调用的结果完全一样（{progress_verdict.detail}），"
+                                            "看起来没在推进。我会再换一次思路；如果你有更明确的方向，"
+                                            "现在补一句会很有帮助。"
+                                        )
+                                    else:
+                                        self._no_progress_pause = (
+                                            "连续多轮没有进展（工具调用反复拿到相同结果），我先停在这里，"
+                                            "以免继续消耗额度。请告诉我该换哪个方向、或哪一步其实不需要做。"
+                                        )
+                            else:
+                                # 有进展 ⇒ 连续命中计数与「自上次有进展以来的输入」都归零。
+                                # 这两条后备线判的都是"多久没拿到新信息"，不是"一共花了多少"：
+                                # 长任务花得多是常态，只有"花了却毫无推进"才值得打断。
+                                self._no_progress_hits = 0
+                                self._tokens_since_progress = (
+                                    resumed_input_tokens + total_input_tokens
+                                )
 
                         # ── 预算：步数轴 ──
                         # `max_turns` 限的是"轮"，而一轮里可以调任意多次工具 —— 这是最直接的漏口。
@@ -3533,6 +3622,30 @@ class AgentRuntime:
                         if _mc_notice is not None:
                             yield _mc_notice
 
+                    # ── 后台「Agent 运行配置」：把「无进展」告诉**用户** ──
+                    # 放在批次收尾：此刻本批 tool 消息已全部落盘，插一条 assistant 叙述
+                    # 不会打断 `assistant.tool_calls` 与 tool 消息的配对。
+                    # 事件 + 历史双写：事件只走流（用户关掉客户端就看不见），历史是回来
+                    # 一定读得到的通道 —— 与 `_persist_terminal_notice` 同一取舍。
+                    if self._no_progress_notice:
+                        _np_notice = self._no_progress_notice
+                        self._no_progress_notice = ""
+                        self._no_progress_notice_sent = True
+                        messages.append(_normalize_msg(role="assistant", content=_np_notice))
+                        yield AgentEvent(type="text", content=_np_notice, trace_id=trace_id)
+
+                    if self._no_progress_pause:
+                        # 连续两次命中 / token 后备线到点 ⇒ **停下来把选择权交给用户**。
+                        # 与 M7 的挂起同一条收口：说明写进历史与事件，然后 `break` 走正常
+                        # 回合末出口（保存 session 缓存），终态标 `awaiting_input` ——
+                        # 它不在活跃集合里，所以 reconciler 不会替无人值守的回合"自动接着转"。
+                        _pause_text = self._no_progress_pause
+                        self._no_progress_pause = ""
+                        self._paused_for_user = True
+                        await self._persist_terminal_notice(task, messages, _pause_text)
+                        _answered = True
+                        yield AgentEvent(type="text", content=_pause_text, trace_id=trace_id)
+
                     if self._awaiting_input is not None:
                         # M7：**先**把"这一步在等你"写进历史与事件，**再**落 checkpoint ——
                         # 顺序反了，续跑那一轮看到的现场就没有这句解释（而用户看到的最后一条
@@ -3602,6 +3715,16 @@ class AgentRuntime:
                         #
                         # 迁出活跃集合的三个后果都是要的：唯一索引释放会话（用户可以接着聊别的）、
                         # reconciler 不可能接管一个等人的回合、陈旧挂起快照不会被无关消息复活。
+                        from app.agent.checkpoint import STATUS_AWAITING_INPUT
+
+                        await self._mark_run_status(task, STATUS_AWAITING_INPUT)
+                        break
+
+                    if self._paused_for_user:
+                        # 「无进展」/ token 后备线到点 ⇒ 与挂起同一收口：这一轮**没有完成**，
+                        # 也不可能由 reconciler 自动接着转（它只接管 running/checkpointed）。
+                        # 复用 `awaiting_input` 而不是新状态：语义就是"在等用户给个方向"，
+                        # 而多一个状态要同步唯一索引谓词、reconciler 扫描与前端展示三处。
                         from app.agent.checkpoint import STATUS_AWAITING_INPUT
 
                         await self._mark_run_status(task, STATUS_AWAITING_INPUT)

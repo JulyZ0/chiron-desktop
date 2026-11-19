@@ -582,6 +582,33 @@ class Settings(BaseSettings):
     # 这条不变量由 `_interaction_wait_seconds()` 兜底 clamp，配错也不会破。
     agent_interaction_ttl_seconds: int = 24 * 3600
 
+    # ── Agent 行为配置（后台「全局配置 → Agent 运行配置」，`agent` 分类）──
+    #
+    # 这些是**行为策略**，不是安全边界：配错只让 agent 更啰嗦或更早收手，不会放开
+    # 任何被拦下的操作。权威值在网关 `system_settings` 的 `agent` 分类，引擎经
+    # `app/agent/runtime_config.py` 的广播订阅 + 启动补拉获取；下面只是 env 兜底
+    # （网关不可达时的默认策略）。
+    #
+    # 计划批准：「计划做好后要不要先给你看」。
+    #   ``never``（默认）= 直接开工，与引入本项之前**逐字相同**；
+    #   ``always``      = 第一次写清单前先向用户确认计划。
+    agent_plan_approval: str = "never"
+    # 回合间叙述：「每做完一步要不要说一句在干什么」。
+    #   ``off``（默认）= 不注入任何叙述要求 ⇒ system 段逐字不变；
+    #   ``brief``      = 一句话交代当前步骤；
+    #   ``detailed``   = 说清这一步做了什么、为什么、下一步是什么。
+    agent_narration: str = "off"
+    # 长时间无进展：连续多轮工具结果完全相同时**提醒用户**（不只是回灌给模型）。
+    agent_no_progress_notice: bool = True
+    # 判为「无进展」所需的连续相同结果次数（`LoopGuard` 的 no_progress 阈值）。
+    # 0 = 关闭这条规则。
+    agent_no_progress_threshold: int = 3
+    # 输入 token 后备线：**自上次有进展以来**的累计输入达到模型上下文窗口的这个倍数时，
+    # 与「连续无进展轮数」一样**暂停并提醒用户**（不是硬失败 —— 硬失败由
+    # `TaskBudget` 的 token 轴负责，那是另一条线，见 app/agent/task_budget.py）。
+    # 与模型无关：窗口表查不到时按 `MAX_CONTEXT_TOKENS` 兜底。
+    agent_token_window_ratio: float = 8.0
+
     # 为空则引擎不向 Redis 注册,网关回退静态 PYTHON_ENGINE_ADDRESS。
     engine_advertise_url: str = ""
 
