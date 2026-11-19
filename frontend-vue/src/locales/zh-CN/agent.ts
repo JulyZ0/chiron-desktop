@@ -338,7 +338,6 @@ export default {
   filter_no_match_skills: "没有匹配的技能",
   filter_no_match_hint: "换个关键词或切换分组再试",
   select_agent_hint: "从左侧选择一个 Agent，或新建一个开始配置",
-  select_skill_hint: "从左侧选择一个技能查看详情",
   read_only_shared_agent: "该 Agent 由他人共享：可以查看与使用，但不能修改",
   detail_basics: "基础信息",
   detail_runtime: "运行参数",
@@ -368,5 +367,23 @@ export default {
   subagent_card_children_n: "{n} 个子任务",
   subagent_card_depth: "第 {n} 层",
   subagent_card_retry_hint: "把这条任务放回输入框，由你决定是否重新派发",
+  subagent_card_retry_default: "{name} 的子任务失败了，请重新执行。",
   subagent_card_empty_summary: "（还没有摘要，点开看事件流）",
+  // ── 两栏工作台（Agents / Skills 重构）──
+  // 左栏列表、右栏详情，窄屏回退单栏。文案集中在这里，模板不写死中文。
+  list_pane_title: "Agent 列表",
+  group_filter_label: "按分组筛选",
+  filter_all: "全部",
+  detail_title: "Agent 详情",
+  select_detail_hint: "从左侧选择一个 Agent 查看配置，或新建一个 Agent",
+  no_matching_agents: "没有匹配的 Agent",
+  discard_unsaved_title: "放弃未保存的修改？",
+  discard_unsaved_content: "当前修改尚未保存，切换后将丢失。",
+  all_changes_saved: "已保存",
+
+  skill_detail_title: "技能详情",
+  select_skill_hint: "从左侧选择一个技能查看详情与 SKILL.md 正文",
+  skill_md_preview: "SKILL.md 正文",
+  skill_no_preview: "该技能没有可预览的正文",
+  source_shared: "公共共享",
 }

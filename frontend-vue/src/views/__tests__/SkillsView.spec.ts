@@ -83,8 +83,8 @@ describe('SkillsView（此前零测试）', () => {
     const wrapper = mountView()
     await flushPromises()
 
-    // 三个页签已撤下，只剩技能列表；安装端点也不该再被这个页面调起
-    expect(wrapper.findAll('.ant-tabs-tab')).toHaveLength(1)
+    // 页签全部撤下（两栏工作台直接展示技能列表）；安装端点也不该再被这个页面调起
+    expect(wrapper.findAll('.ant-tabs-tab')).toHaveLength(0)
     expect(apiMocks.post).not.toHaveBeenCalled()
     wrapper.unmount()
   })

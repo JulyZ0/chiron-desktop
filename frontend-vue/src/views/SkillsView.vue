@@ -3,20 +3,22 @@ import { ref, computed, onMounted, markRaw } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   Button, Input, Tabs, TabPane, Switch, Tag, Modal, InputNumber,
-  Select, Dropdown, Menu, MenuItem, message,
+  Select, Alert, Dropdown, Menu, MenuItem, message,
 } from 'ant-design-vue'
 import {
-  DeleteOutlined, PlayCircleOutlined,
+  ThunderboltOutlined, DownloadOutlined, DeleteOutlined, PlayCircleOutlined,
   SearchOutlined, CodeOutlined, MessageOutlined, ShopOutlined, RobotOutlined,
+  ArrowLeftOutlined, MoreOutlined,
 } from '@ant-design/icons-vue'
-import { api, listAgents } from '../api'
+import { api, listAgents, discoverSkills, type DiscoveredSkill, type SkillDiscovery } from '../api'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import AttachToAgentDialog from '../components/common/AttachToAgentDialog.vue'
+import SkillDocPreview from '../components/skills/SkillDocPreview.vue'
 import { collectSkillUsage, usageOf, type SkillUsage } from '../utils/skillUsage'
 
 import { useI18n } from 'vue-i18n'
-import { serverErrorDetail } from '../utils/apiError'
+import { serverErrorDetail, errorMessageText } from '../utils/apiError'
 const { t: tr } = useI18n()
 interface SkillParam {
   name: string
@@ -37,6 +39,11 @@ interface Skill {
   parameters: SkillParam[]
   installed_at?: number
   enabled?: boolean
+  /**
+   * 技能所在层（后端 `SkillStore` 的 scope）：user / tenant / shared / builtin。
+   * 老版本后端可能不带这个字段 —— 详情里的来源徽标对缺失值按"自定义"处理。
+   */
+  source?: string
 }
 
 const skills = ref<Skill[]>([])
@@ -114,9 +121,45 @@ const execTypes = computed(() => {
   return Array.from(set)
 })
 
+// ── 两栏工作台：左栏筛选 + 列表，右栏详情 ──
+/** 来源分组：内置（builtin/shared 只读层）/ 自定义（user/root 私有层）/ 团队（tenant 共享层） */
+type SkillGroup = 'all' | 'builtin' | 'custom' | 'team'
+const groupFilter = ref<SkillGroup>('all')
+const selectedSkillName = ref('')
+
+function sourceKey(s: Skill): Exclude<SkillGroup, 'all'> {
+  const src = (s.source || '').toLowerCase()
+  if (src === 'tenant') return 'team'
+  if (src === 'shared' || src === 'builtin') return 'builtin'
+  // user / root / 老后端缺字段 —— 都归到"自定义"（用户可写的那一层）
+  return 'custom'
+}
+
+function sourceLabel(s: Skill): string {
+  switch (sourceKey(s)) {
+    case 'team': return tr('common.team_shared')
+    case 'builtin': return (s.source || '').toLowerCase() === 'builtin'
+      ? tr('common.built_in')
+      : tr('agent.source_shared')
+    default: return tr('common.custom')
+  }
+}
+
+const selectedSkill = computed<Skill | null>(
+  () => skills.value.find(s => s.name === selectedSkillName.value) ?? null,
+)
+const detailVisible = computed(() => selectedSkillName.value !== '')
+
+const groupCounts = computed(() => {
+  const counts = { all: skills.value.length, builtin: 0, custom: 0, team: 0 }
+  for (const s of skills.value) counts[sourceKey(s)] += 1
+  return counts
+})
+
 const filteredSkills = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
   return skills.value.filter((s) => {
+    if (groupFilter.value !== 'all' && sourceKey(s) !== groupFilter.value) return false
     if (typeFilter.value !== 'all' && s.exec?.type !== typeFilter.value) return false
     if (!q) return true
     return (s.name || '').toLowerCase().includes(q)
@@ -124,6 +167,28 @@ const filteredSkills = computed(() => {
       || (s.tags || []).some(t => t.toLowerCase().includes(q))
   })
 })
+
+/** SKILL.md 正文：prompt 型技能的 exec.source 就是正文；脚本型技能的 source 是代码 */
+const docBody = computed(() => {
+  const s = selectedSkill.value
+  if (!s || s.exec?.type !== 'prompt') return ''
+  return s.exec?.source || ''
+})
+
+/** 非 prompt 型技能的执行内容（脚本 / 端点），用等宽块展示而不是当 Markdown 渲染 */
+const execSourceCode = computed(() => {
+  const s = selectedSkill.value
+  if (!s || s.exec?.type === 'prompt') return ''
+  return s.exec?.source || ''
+})
+
+function selectSkill(s: Skill) {
+  selectedSkillName.value = s.name
+}
+
+function closeDetail() {
+  selectedSkillName.value = ''
+}
 
 // ── 启停 ──
 async function toggleEnabled(s: Skill, v: boolean) {
@@ -149,21 +214,14 @@ function requestDelete(s: Skill) {
       try {
         await api.delete(`/v1/skills/${encodeURIComponent(s.name)}`)
         message.success(tr('common.deleted'))
+        // 删掉的正是右栏在看的那个：清空详情，别留一份指向已删除技能的界面
+        if (selectedSkillName.value === s.name) selectedSkillName.value = ''
         await loadSkills()
       } catch {
         message.error(tr('errors.delete_failed'))
       }
     },
   })
-}
-
-// ── 详情展开 ──
-const expandedNames = ref<Set<string>>(new Set())
-function toggleDetail(name: string) {
-  const next = new Set(expandedNames.value)
-  if (next.has(name)) next.delete(name)
-  else next.add(name)
-  expandedNames.value = next
 }
 
 // ── 互联互通：在对话中使用该技能 ──
@@ -238,21 +296,110 @@ function renderResult(res: unknown): string {
   return JSON.stringify(res, null, 2)
 }
 
-/**
- * 空状态引导去市场装技能。
- *
- * 安装/发现/AI 生成三个页签已撤下：技能的定义与「装进来」这件事统一由市场承担
- * （带 `kind=skill` 跳 `/market`，来源与签名在市场页标注），页面上只保留已有技能的
- * 启停、运行、装配、删除。
- */
-function goToMarket() {
-  void router.push({ path: '/market', query: { kind: 'skill' } })
+// ── 安装 ──
+const installURL = ref('')
+const installInline = ref('')
+const installLoading = ref(false)
+
+async function handleInstall() {
+  const body: Record<string, unknown> = {}
+  if (installURL.value) body.url = installURL.value
+  else if (installInline.value) body.inline = installInline.value
+  else { message.error(tr('common.please_enter_a_url_or_inline_json')); return }
+  installLoading.value = true
+  try {
+    await api.post('/v1/skills/install', body)
+    message.success(tr('agent.skill_installed'))
+    installURL.value = ''
+    installInline.value = ''
+    await loadSkills()
+    activeTab.value = 'list'
+  } catch (e) {
+    message.error(tr('errors.install_failed_error', { error: serverErrorDetail(e, '') }))
+  } finally {
+    installLoading.value = false
+  }
+}
+
+// ── 生成 ──
+const genDesc = ref('')
+/** POST /v1/skills/generate 返回的 skill 摘要（模板直接读 name/description） */
+interface GeneratedSkill {
+  name?: string
+  description?: string
+}
+const genResult = ref<GeneratedSkill | null>(null)
+const genLoading = ref(false)
+
+async function handleGenerate() {
+  if (!genDesc.value.trim()) { message.error(tr('common.please_enter_a_description')); return }
+  genLoading.value = true
+  genResult.value = null
+  try {
+    const response = await api.post('/v1/skills/generate', {
+      description: genDesc.value,
+      auto_install: true,
+    })
+    genResult.value = response.data?.data?.skill || response.data?.data
+    message.success(tr('agent.skill_generated_and_installed'))
+    await loadSkills()
+  } catch (e) {
+    message.error(tr('errors.generation_failed_error', { error: serverErrorDetail(e, '') }))
+  } finally {
+    genLoading.value = false
+  }
+}
+
+// ── 发现（GET /v1/skills/discover）──
+//
+// 这是**唯一**能看到"远端有、本地没有"的入口：此前前端只有安装（要用户自己知道地址）
+// 与列表（只看已装），中间的"发现 → 挑选 → 安装"整段是断的。
+const catalogUrl = ref('')
+const discovery = ref<SkillDiscovery>({ local: [], remote: [] })
+const discoverLoading = ref(false)
+const discoverError = ref('')
+/** 是否已经拉过一次目录 —— 用来区分"还没拉"与"拉了但目录是空的" */
+const discoverDone = ref(false)
+
+async function handleDiscover() {
+  discoverLoading.value = true
+  discoverError.value = ''
+  try {
+    discovery.value = await discoverSkills(catalogUrl.value.trim() || undefined)
+    discoverDone.value = true
+  } catch (e) {
+    // 就地报错：拉取失败必须与"目录里确实没有技能"区分开，否则用户以为目录是空的。
+    discoverError.value = errorMessageText(e, tr('errors.operation_failed'))
+    discovery.value = { local: [], remote: [] }
+    discoverDone.value = false
+  } finally {
+    discoverLoading.value = false
+  }
+}
+
+/** 把发现结果里的条目装进本地（复用安装端点，装完刷新列表与发现结果） */
+async function installDiscovered(item: DiscoveredSkill) {
+  if (!item.source) {
+    message.warning(tr('agent.discover_no_install_url'))
+    return
+  }
+  installLoading.value = true
+  try {
+    await api.post('/v1/skills/install', { url: item.source })
+    message.success(tr('agent.skill_installed'))
+    await loadSkills()
+    await handleDiscover()
+  } catch (e) {
+    message.error(tr('errors.install_failed_error', { error: serverErrorDetail(e, '') }))
+  } finally {
+    installLoading.value = false
+  }
 }
 </script>
 
 <template>
   <div class="skills-page">
-    <div class="page-header">
+    <header class="page-header">
       <div class="page-header-text">
         <h1 class="page-title">
           {{ $t('agent.skill') }}
@@ -261,139 +408,282 @@ function goToMarket() {
           {{ $t('agent.extend_agent_custom_capabilities_enable_run_and_ai_generate_them') }}
         </p>
       </div>
-    </div>
+    </header>
 
-    <Tabs
-      v-model:active-key="activeTab"
-      class="skills-tabs"
-    >
-      <!-- ── 技能列表 ── -->
-      <TabPane
-        key="list"
-        :tab="$t('agent.skill_list')"
-      >
-        <div class="list-toolbar">
-          <Input
-            v-model:value="searchQuery"
-            :placeholder="$t('common.search_name_description_tags')"
-            allow-clear
-            class="search-input"
-          >
-            <template #prefix>
-              <SearchOutlined />
-            </template>
-          </Input>
-          <Select
-            v-model:value="typeFilter"
-            class="type-filter"
-            :options="[{ value: 'all', label: $t('common.all_types') }, ...execTypes.map(t => ({ value: t, label: t }))]"
-          />
-        </div>
-
-        <PageSkeleton
-          v-if="loading"
-          variant="cards"
-          :columns="3"
-          :rows="6"
-          :header="false"
-        />
-        <EmptyState
-          v-else-if="error"
-          size="page"
-          :icon="markRaw(CodeOutlined)"
-          :description="$t('errors.failed_to_load')"
-          :hint="$t('agent.unable_to_fetch_skill_list_please_retry_later')"
-        >
-          <Button
-            type="primary"
-            @click="loadSkills"
-          >
-            {{ $t('common.retry') }}
-          </Button>
-        </EmptyState>
-        <EmptyState
-          v-else-if="filteredSkills.length === 0"
-          size="page"
-          :icon="markRaw(CodeOutlined)"
-          :description="searchQuery || typeFilter !== 'all' ? $t('agent.no_matching_skills') : $t('agent.no_skills')"
-          :hint="searchQuery || typeFilter !== 'all' ? $t('common.try_adjusting_search_keywords_or_type_filters') : $t('agent.install_skills_from_the_market_to_get_started')"
-        >
-          <Button
-            v-if="!searchQuery && typeFilter === 'all'"
-            type="primary"
-            @click="goToMarket"
-          >
-            <template #icon>
-              <ShopOutlined />
-            </template>
-            {{ $t('agent.browse_market') }}
-          </Button>
-        </EmptyState>
-
+    <div class="skills-tabs">
         <div
-          v-else
-          class="skill-grid stagger-in"
+          class="workspace"
+          :class="{ 'has-selection': detailVisible }"
         >
-          <div
-            v-for="s in filteredSkills"
-            :key="s.name"
-            class="skill-card"
-            :class="{ disabled: s.enabled === false }"
+          <!-- 左栏：筛选 + 列表 -->
+          <aside
+            class="pane pane-list"
+            :aria-label="$t('agent.skill_list')"
           >
-            <div class="card-top">
-              <span class="card-icon-tile"><CodeOutlined /></span>
-              <div class="card-titles">
-                <div class="card-name-line">
-                  <span class="card-name">{{ s.name }}</span>
-                  <Tag
-                    :color="execColors[s.exec?.type] || 'default'"
-                    class="exec-tag"
-                  >
-                    {{ s.exec?.type || 'unknown' }}
-                  </Tag>
-                </div>
-                <span class="card-desc">{{ s.description || $t('common.no_description') }}</span>
+            <div class="pane-head">
+              <Input
+                v-model:value="searchQuery"
+                :placeholder="$t('common.search_name_description_tags')"
+                allow-clear
+                class="pane-search"
+              >
+                <template #prefix>
+                  <SearchOutlined />
+                </template>
+              </Input>
+              <Select
+                v-model:value="typeFilter"
+                class="type-filter"
+                :options="[{ value: 'all', label: $t('common.all_types') }, ...execTypes.map(t => ({ value: t, label: t }))]"
+              />
+              <div
+                class="group-nav"
+                role="group"
+                :aria-label="$t('agent.group_filter_label')"
+              >
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'all' }"
+                  :aria-pressed="groupFilter === 'all'"
+                  @click="groupFilter = 'all'"
+                >
+                  {{ $t('agent.filter_all') }}
+                  <span class="group-count">{{ groupCounts.all }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'builtin' }"
+                  :aria-pressed="groupFilter === 'builtin'"
+                  @click="groupFilter = 'builtin'"
+                >
+                  {{ $t('common.built_in') }}
+                  <span class="group-count">{{ groupCounts.builtin }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'custom' }"
+                  :aria-pressed="groupFilter === 'custom'"
+                  @click="groupFilter = 'custom'"
+                >
+                  {{ $t('common.custom') }}
+                  <span class="group-count">{{ groupCounts.custom }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'team' }"
+                  :aria-pressed="groupFilter === 'team'"
+                  @click="groupFilter = 'team'"
+                >
+                  {{ $t('common.team_shared') }}
+                  <span class="group-count">{{ groupCounts.team }}</span>
+                </button>
               </div>
-              <Switch
-                :checked="s.enabled !== false"
-                size="small"
-                :checked-children="$t('common.on')"
-                :un-checked-children="$t('common.off')"
-                @change="(v: any) => toggleEnabled(s, Boolean(v))"
+            </div>
+
+            <div class="pane-body">
+              <PageSkeleton
+                v-if="loading"
+                variant="list"
+                :rows="6"
+                :header="false"
+              />
+              <Alert
+                v-else-if="error"
+                type="error"
+                show-icon
+                :message="$t('errors.failed_to_load')"
+                :description="$t('agent.unable_to_fetch_skill_list_please_retry_later')"
+              >
+                <template #action>
+                  <Button
+                    size="small"
+                    @click="loadSkills"
+                  >
+                    {{ $t('common.retry') }}
+                  </Button>
+                </template>
+              </Alert>
+              <EmptyState
+                v-else-if="skills.length === 0"
+                :icon="markRaw(CodeOutlined)"
+                :description="$t('agent.no_skills')"
+                :hint="$t('agent.install_skills_from_the_market_or_upload_a_local_skill_package')"
+              />
+              <EmptyState
+                v-else-if="filteredSkills.length === 0"
+                :icon="markRaw(SearchOutlined)"
+                :description="$t('agent.no_matching_skills')"
+                :hint="$t('common.try_adjusting_search_keywords_or_type_filters')"
+              />
+              <ul
+                v-else
+                class="item-list"
+                role="listbox"
+                :aria-label="$t('agent.skill_list')"
+              >
+                <li
+                  v-for="s in filteredSkills"
+                  :key="s.name"
+                  class="item"
+                  :class="{
+                    active: selectedSkillName === s.name,
+                    muted: s.enabled === false,
+                  }"
+                  role="option"
+                  :aria-selected="selectedSkillName === s.name"
+                  tabindex="0"
+                  @click="selectSkill(s)"
+                  @keydown.enter.prevent="selectSkill(s)"
+                  @keydown.space.prevent="selectSkill(s)"
+                >
+                  <span class="item-icon"><CodeOutlined /></span>
+                  <span class="item-main">
+                    <span class="item-title-line">
+                      <span class="item-name">{{ s.name }}</span>
+                      <Tag
+                        :color="execColors[s.exec?.type] || 'default'"
+                        class="item-tag"
+                      >
+                        {{ s.exec?.type || 'unknown' }}
+                      </Tag>
+                    </span>
+                    <span class="item-desc">{{ s.description || $t('common.no_description') }}</span>
+                    <span class="item-meta">
+                      <span
+                        v-if="usageLabel(s.name)"
+                        class="item-usage"
+                        :title="usageTitle(s.name)"
+                      >{{ $t('common.used_by_label', { label: usageLabel(s.name) }) }}</span>
+                      <span
+                        v-else
+                        class="item-meta-text"
+                      >v{{ s.version }}</span>
+                      <span
+                        v-if="s.parameters?.length"
+                        class="item-meta-text"
+                      >· {{ $t('agent.n_params', { n: s.parameters.length }) }}</span>
+                    </span>
+                  </span>
+                  <Switch
+                    :checked="s.enabled !== false"
+                    size="small"
+                    class="item-switch"
+                    :aria-label="s.name"
+                    @click.stop
+                    @change="(v: any) => toggleEnabled(s, Boolean(v))"
+                  />
+                </li>
+              </ul>
+            </div>
+          </aside>
+
+          <!-- 右栏：详情 + SKILL.md 正文 -->
+          <section
+            class="pane pane-detail"
+            :aria-label="$t('agent.skill_detail_title')"
+          >
+            <button
+              type="button"
+              class="back-btn"
+              @click="closeDetail"
+            >
+              <ArrowLeftOutlined />
+              {{ $t('common.back_to_list') }}
+            </button>
+
+            <div
+              v-if="!detailVisible || !selectedSkill"
+              class="detail-placeholder"
+            >
+              <EmptyState
+                size="page"
+                :icon="markRaw(CodeOutlined)"
+                :description="$t('agent.skill_detail_title')"
+                :hint="$t('agent.select_skill_hint')"
+                :auto-pad="false"
               />
             </div>
-            <div class="card-meta">
-              <Tag>v{{ s.version }}</Tag>
-              <Tag v-if="s.parameters?.length">
-                {{ $t('agent.n_params', { n: s.parameters.length }) }}
-              </Tag>
-              <Tag
-                v-for="t in (s.tags || []).slice(0, 3)"
-                :key="t"
-              >
-                {{ t }}
-              </Tag>
-              <Tag
-                v-if="usageLabel(s.name)"
-                color="blue"
-                :title="usageTitle(s.name)"
-              >
-                {{ $t('common.used_by_label', { label: usageLabel(s.name) }) }}
-              </Tag>
-            </div>
-            <div class="card-actions">
-              <Button
-                size="small"
-                type="text"
-                @click="toggleDetail(s.name)"
-              >
-                {{ expandedNames.has(s.name) ? $t('common.collapse_details') : $t('common.view_details') }}
-              </Button>
-              <div class="action-right">
+
+            <template v-else>
+              <div class="detail-head">
+                <span class="detail-icon"><CodeOutlined /></span>
+                <div class="detail-titles">
+                  <h2 class="detail-name">
+                    {{ selectedSkill.name }}
+                  </h2>
+                  <p class="detail-sub">
+                    {{ selectedSkill.description || $t('common.no_description') }}
+                  </p>
+                </div>
+                <div class="detail-actions">
+                  <Button
+                    size="small"
+                    type="primary"
+                    :disabled="selectedSkill.enabled === false"
+                    @click="openRun(selectedSkill)"
+                  >
+                    <template #icon>
+                      <PlayCircleOutlined />
+                    </template>
+                    {{ $t('common.run') }}
+                  </Button>
+                  <Dropdown
+                    trigger="click"
+                    placement="bottomRight"
+                  >
+                    <Button
+                      type="text"
+                      size="small"
+                      :title="$t('common.more_actions')"
+                    >
+                      <template #icon>
+                        <MoreOutlined />
+                      </template>
+                    </Button>
+                    <template #overlay>
+                      <Menu class="card-menu">
+                        <MenuItem
+                          key="delete"
+                          danger
+                          @click="requestDelete(selectedSkill)"
+                        >
+                          <DeleteOutlined class="menu-icon" />{{ $t('common.delete') }}
+                        </MenuItem>
+                      </Menu>
+                    </template>
+                  </Dropdown>
+                </div>
+              </div>
+
+              <div class="detail-badges">
+                <Tag :color="execColors[selectedSkill.exec?.type] || 'default'">
+                  {{ selectedSkill.exec?.type || 'unknown' }}
+                </Tag>
+                <Tag>{{ $t('common.source') }}: {{ sourceLabel(selectedSkill) }}</Tag>
+                <Tag>v{{ selectedSkill.version }}</Tag>
+                <Tag v-if="selectedSkill.parameters?.length">
+                  {{ $t('agent.n_params', { n: selectedSkill.parameters.length }) }}
+                </Tag>
+                <span class="detail-enable">
+                  <span class="enable-label">{{ $t('common.enable') }}</span>
+                  <Switch
+                    :checked="selectedSkill.enabled !== false"
+                    size="small"
+                    :aria-label="selectedSkill.name"
+                    @change="(v: any) => selectedSkill && toggleEnabled(selectedSkill, Boolean(v))"
+                  />
+                </span>
+              </div>
+
+              <div class="detail-actions-row">
                 <Button
                   size="small"
                   :title="$t('agent.use_this_skill_in_the_conversation')"
-                  @click="useInChat(s)"
+                  @click="useInChat(selectedSkill)"
                 >
                   <template #icon>
                     <MessageOutlined />
@@ -403,84 +693,103 @@ function goToMarket() {
                 <Button
                   size="small"
                   :title="$t('agent.assemble_this_skill_into_an_agent_persistent_binding')"
-                  @click="openAttach(s)"
+                  @click="openAttach(selectedSkill)"
                 >
                   <template #icon>
                     <RobotOutlined />
                   </template>
                   {{ $t('agent.assemble_to_agent') }}
                 </Button>
-                <Button
-                  size="small"
-                  :disabled="s.enabled === false"
-                  @click="openRun(s)"
+                <Tag
+                  v-if="usageLabel(selectedSkill.name)"
+                  color="blue"
+                  class="detail-usage"
+                  :title="usageTitle(selectedSkill.name)"
                 >
-                  <template #icon>
-                    <PlayCircleOutlined />
-                  </template>
-                  {{ $t('common.run') }}
-                </Button>
-                <Dropdown
-                  trigger="click"
-                  placement="bottomRight"
-                >
-                  <Button
-                    type="text"
-                    size="small"
-                    :title="$t('common.more_actions')"
-                  >
-                    ⋯
-                  </Button>
-                  <template #overlay>
-                    <Menu class="card-menu">
-                      <MenuItem
-                        key="delete"
-                        danger
-                        @click="requestDelete(s)"
-                      >
-                        <DeleteOutlined class="menu-icon" />{{ $t('common.delete') }}
-                      </MenuItem>
-                    </Menu>
-                  </template>
-                </Dropdown>
+                  {{ $t('common.used_by_label', { label: usageLabel(selectedSkill.name) }) }}
+                </Tag>
               </div>
-            </div>
 
-            <!-- 详情展开 -->
-            <div
-              v-if="expandedNames.has(s.name)"
-              class="skill-detail"
-            >
-              <div class="detail-row">
-                <span class="detail-label">{{ $t('common.execution_type') }}</span>
-                <span class="detail-value">{{ s.exec?.type }}</span>
-              </div>
-              <div
-                v-if="s.exec?.source"
-                class="detail-row"
+              <!-- SKILL.md 正文：prompt 型技能的 exec.source 即正文，走 Markdown 渲染 -->
+              <section class="doc-section">
+                <h3 class="doc-title">
+                  {{ $t('agent.skill_md_preview') }}
+                </h3>
+                <SkillDocPreview
+                  v-if="selectedSkill.exec?.type === 'prompt'"
+                  :source="docBody"
+                  :empty-text="$t('agent.skill_no_preview')"
+                />
+                <template v-else>
+                  <div
+                    v-if="execSourceCode"
+                    class="code-block"
+                  >
+                    <div class="code-block-label">
+                      {{ $t('common.execution_content') }}
+                    </div>
+                    <pre class="code-pre">{{ execSourceCode }}</pre>
+                  </div>
+                  <p
+                    v-else
+                    class="doc-empty"
+                  >
+                    {{ $t('agent.skill_no_preview') }}
+                  </p>
+                </template>
+              </section>
+
+              <!-- 参数：列表比裸 JSON 好读，仍是原始字段，没有改契约 -->
+              <section
+                v-if="selectedSkill.parameters?.length"
+                class="doc-section"
               >
-                <span class="detail-label">{{ $t('common.execution_content') }}</span>
-                <pre class="detail-pre">{{ s.exec.source }}</pre>
-              </div>
+                <h3 class="doc-title">
+                  {{ $t('agent.parameter') }}
+                </h3>
+                <ul class="param-list">
+                  <li
+                    v-for="p in selectedSkill.parameters"
+                    :key="p.name"
+                    class="param-item"
+                  >
+                    <span class="param-name">{{ p.name }}</span>
+                    <span
+                      v-if="p.type"
+                      class="param-type"
+                    >{{ p.type }}</span>
+                    <span
+                      v-if="p.required"
+                      class="param-required"
+                    >*</span>
+                    <span
+                      v-if="p.description"
+                      class="param-desc"
+                    >{{ p.description }}</span>
+                  </li>
+                </ul>
+              </section>
+
               <div
-                v-if="s.parameters?.length"
-                class="detail-row"
+                v-if="selectedSkill.author || (selectedSkill.tags || []).length"
+                class="detail-foot"
               >
-                <span class="detail-label">{{ $t('agent.parameter') }}</span>
-                <pre class="detail-pre">{{ JSON.stringify(s.parameters, null, 2) }}</pre>
+                <span
+                  v-if="selectedSkill.author"
+                  class="detail-meta"
+                >{{ $t('common.author') }}: {{ selectedSkill.author }}</span>
+                <div class="detail-tags">
+                  <Tag
+                    v-for="t in (selectedSkill.tags || []).slice(0, 6)"
+                    :key="t"
+                  >
+                    {{ t }}
+                  </Tag>
+                </div>
               </div>
-              <div
-                v-if="s.author"
-                class="detail-row"
-              >
-                <span class="detail-label">{{ $t('common.author') }}</span>
-                <span class="detail-value">{{ s.author }}</span>
-              </div>
-            </div>
-          </div>
+            </template>
+          </section>
         </div>
-      </TabPane>
-    </Tabs>
 
     <!-- ── 运行 Modal ── -->
     <Modal
@@ -585,44 +894,223 @@ function goToMarket() {
       :label="attachSkill"
     />
   </div>
+    </div>
 </template>
 
 <style scoped>
-.skills-page { max-width: 1080px; margin: 0 auto; padding: 28px 24px 60px; }
+.skills-page { max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }
 .page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: 13px; }
-.skills-tabs :deep(.ant-tabs-nav) { margin-bottom: 20px; }
+.skills-tabs :deep(.ant-tabs-nav) { margin-bottom: 16px; }
 
-.list-toolbar { display: flex; gap: 10px; margin-bottom: 16px; }
-.type-filter { width: 140px; }
-
-.skill-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
-.skill-card {
-  display: flex; flex-direction: column; gap: 12px;
-  padding: 16px;
+/* ── 两栏工作台（与 Agents 页同构）── */
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.pane {
   border: var(--hairline-width) solid var(--border-card);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-xl);
   background: var(--bg-card);
   box-shadow: var(--shadow-md);
-  transition: transform var(--dur-normal) ease, border-color var(--dur-normal) ease, box-shadow var(--dur-normal) ease;
+  min-width: 0;
 }
-.skill-card:hover { transform: translateY(-2px); border-color: var(--primary); box-shadow: var(--shadow-lg); }
-.skill-card.disabled { opacity: 0.65; }
+.pane-list { display: flex; flex-direction: column; overflow: hidden; }
+.pane-head {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px;
+  border-bottom: var(--hairline-width) solid var(--border-subtle);
+}
+.pane-search { width: 100%; }
+.type-filter { width: 100%; }
+.group-nav { display: flex; flex-wrap: wrap; gap: 6px; }
+.group-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 8px;
+  border: var(--hairline-width) solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+.group-chip:hover { border-color: var(--primary); color: var(--text-primary); }
+.group-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.group-chip.active {
+  background: var(--primary-bg);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.group-count {
+  min-width: 18px;
+  padding: 0 4px;
+  border-radius: var(--radius-full);
+  background: var(--bg-secondary);
+  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+  text-align: center;
+}
+.group-chip.active .group-count { background: var(--bg-card); color: var(--primary); }
+
+.pane-body {
+  padding: 8px;
+  max-height: min(62vh, 720px);
+  overflow-y: auto;
+}
+.item-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.item {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px;
+  border: var(--hairline-width) solid transparent;
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+.item:hover { background: var(--bg-secondary); }
+.item:focus-visible { outline: 2px solid var(--primary); outline-offset: -1px; }
+.item.active {
+  background: var(--primary-bg);
+  border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+}
+.item.muted .item-name { color: var(--text-tertiary); }
+.item-icon {
+  flex: none; width: 30px; height: 30px; border-radius: var(--radius-md);
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--primary-bg); color: var(--primary); font-size: 15px;
+}
+.item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.item-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.item-name {
+  font-size: var(--fs-base); font-weight: var(--fw-medium); color: var(--text-primary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.item-tag { flex: none; margin-inline-end: 0; }
+.item-desc {
+  font-size: var(--fs-xs); color: var(--text-tertiary); line-height: var(--lh-normal);
+  overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+  -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.item-meta { display: flex; align-items: center; gap: 4px; font-size: var(--fs-xs); color: var(--text-tertiary); }
+.item-usage { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.item-switch { flex: none; }
+
+/* ── 右栏详情 ── */
+.pane-detail { padding: 18px 20px 20px; display: flex; flex-direction: column; gap: 14px; }
+.back-btn {
+  display: none; align-items: center; gap: 6px;
+  align-self: flex-start;
+  padding: 2px 0;
+  border: none; background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm); cursor: pointer;
+}
+.back-btn:hover { color: var(--primary); }
+.back-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.detail-placeholder { padding: 24px 0; }
+.detail-head { display: flex; align-items: flex-start; gap: 12px; }
+.detail-icon {
+  flex: none; width: 42px; height: 42px; border-radius: var(--sig-radius-card);
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--primary-bg); color: var(--primary); font-size: 20px;
+}
+.detail-titles { flex: 1; min-width: 0; }
+.detail-name {
+  margin: 0;
+  font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.detail-sub { margin: 3px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); line-height: var(--lh-normal); }
+.detail-actions { display: flex; align-items: center; gap: 6px; }
+.detail-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.detail-enable { display: inline-flex; align-items: center; gap: 6px; margin-inline-start: auto; }
+.enable-label { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.detail-actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.detail-usage { margin-inline-start: auto; }
+.doc-section { display: flex; flex-direction: column; gap: 8px; }
+.doc-title {
+  margin: 0;
+  font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-secondary);
+}
+.doc-empty { margin: 0; font-size: var(--fs-sm); color: var(--text-tertiary); }
+.code-block {
+  border: var(--hairline-width) solid var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+.code-block-label {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs); color: var(--text-tertiary);
+  border-bottom: var(--hairline-width) solid var(--border-card);
+}
+.code-pre {
+  margin: 0; padding: var(--space-3);
+  font-family: var(--font-mono); font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed); color: var(--text-primary);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 320px; overflow-y: auto;
+}
+.param-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.param-item {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px;
+  padding: 8px 10px;
+  border: var(--hairline-width) solid var(--border-card);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+.param-name { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-primary); }
+.param-type {
+  font-size: var(--fs-xs); color: var(--text-tertiary);
+  background: var(--bg-secondary); padding: 1px 6px; border-radius: var(--radius-sm);
+}
+.param-required { color: var(--error); }
+.param-desc { flex-basis: 100%; font-size: var(--fs-xs); color: var(--text-tertiary); }
+.detail-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding-top: 10px; flex-wrap: wrap;
+  border-top: var(--hairline-width) solid var(--border-subtle);
+}
+.detail-meta { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.detail-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.card-menu { min-width: 140px; border-radius: var(--sig-radius-card); padding: 4px; box-shadow: var(--shadow-lg); }
+.card-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: var(--radius-md); }
+.menu-icon { font-size: 14px; }
+
+/* ── 安装 / 发现 / 生成（保持原样，仅统一 token）── */
 .card-name-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .card-name { font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .exec-tag { flex: none; }
 .card-desc { display: block; margin-top: 3px; font-size: 12px; color: var(--text-tertiary); line-height: 1.5; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .card-meta { display: flex; flex-wrap: wrap; gap: 4px; }
-.card-actions { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px; }
-.action-right { display: flex; align-items: center; gap: 4px; }
-.card-menu { min-width: 130px; border-radius: var(--sig-radius-card); padding: 4px; box-shadow: var(--shadow-lg); }
-.card-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: var(--radius-md); }
-.menu-icon { font-size: 14px; }
-
-.skill-detail { display: flex; flex-direction: column; gap: 8px; border-top: var(--hairline-width) solid var(--border); padding-top: 12px; }
-.detail-row { display: flex; flex-direction: column; gap: 4px; }
 .detail-label { font-size: var(--fs-xs); color: var(--text-tertiary); font-weight: var(--fw-medium); }
-.detail-value { font-size: 12px; color: var(--text-primary); }
-.detail-pre { margin: 0; padding: 8px; background: var(--bg-secondary); border-radius: var(--radius-lg); font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-secondary); white-space: pre-wrap; word-break: break-all; max-height: 180px; overflow-y: auto; }
+
+.panel-card { max-width: 640px; border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-lg); background: var(--bg-card); box-shadow: var(--shadow-md); padding: 20px; }
+.panel-title { font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+.or-divider { text-align: center; color: var(--text-tertiary); margin: 14px 0; }
+.mono-input :deep(textarea) { font-family: var(--font-mono); font-size: 12px; }
+.install-btn { margin-top: 14px; }
+.panel-hint { margin: 8px 0 0; font-size: var(--fs-xs); color: var(--text-tertiary); line-height: 1.5; }
+
+/* 发现页签：左侧条目信息、右侧安装按钮，窄屏时上下堆叠 */
+.discover-alert { margin-top: 14px; }
+.discover-list { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+.discover-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border: var(--hairline-width) solid var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+}
+.discover-main { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.discover-author { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.discover-local { display: flex; flex-direction: column; gap: 6px; margin-top: 20px; }
+.gen-alert { margin-top: 14px; }
+.gen-pre { margin: 12px 0 0; padding: 10px; background: var(--bg-secondary); border-radius: var(--radius-lg); font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-secondary); white-space: pre-wrap; max-height: 260px; overflow-y: auto; }
 
 .run-desc { font-size: 13px; color: var(--text-secondary); margin-bottom: 14px; }
 .run-form { display: flex; flex-direction: column; gap: 12px; }
@@ -636,13 +1124,21 @@ function goToMarket() {
 .result-label { padding: 8px 12px; font-size: 12px; color: var(--text-tertiary); background: var(--bg-secondary); border-bottom: var(--hairline-width) solid var(--border-card); }
 .result-pre { margin: 0; padding: 12px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
 
+/* ── 窄屏：单栏，列表为主；选中后进详情并带返回 ── */
+@media (max-width: 900px) {
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .workspace .pane-detail { display: none; }
+  .workspace.has-selection .pane-list { display: none; }
+  .workspace.has-selection .pane-detail { display: flex; }
+  .back-btn { display: inline-flex; }
+  .pane-body { max-height: none; }
+}
+
 @media (max-width: 768px) {
   .skills-page { padding: 20px 16px 48px; }
-  .list-toolbar { flex-direction: column; align-items: stretch; }
-  .type-filter { width: 100%; }
 }
 
 @media (max-width: 640px) {
-  .skill-grid { grid-template-columns: 1fr; }
+  .detail-actions { justify-content: flex-start; }
 }
 </style>

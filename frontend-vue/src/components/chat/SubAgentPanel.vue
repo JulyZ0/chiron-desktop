@@ -53,7 +53,7 @@ function emitRetry(run: SubagentRunView) {
   const name = run.profile || run.run_id
   emit('retry-run', {
     runId: run.run_id,
-    text: summary || `${name} 的子任务失败了，请重新执行。`,
+    text: summary || t('agent.subagent_card_retry_default', { name }),
   })
 }
 
