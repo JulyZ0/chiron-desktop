@@ -280,7 +280,10 @@ onMounted(async () => {
         :xs="24"
         :sm="12"
       >
-        <Card :title="$t('admin.agent_runtime_config')">
+        <Card
+          :title="$t('admin.agent_runtime_config')"
+          data-test="agent-config"
+        >
           <Form
             :model="agentConfig"
             layout="vertical"
@@ -297,6 +300,7 @@ onMounted(async () => {
             <FormItem :label="$t('admin.interaction_wait_seconds')">
               <InputNumber
                 v-model:value="agentConfig.interaction_wait_seconds"
+                data-test="agent-interaction-wait"
                 :min="1"
                 :max="86400"
                 :step="30"
@@ -324,6 +328,7 @@ onMounted(async () => {
             <FormItem :label="$t('admin.no_progress_threshold')">
               <InputNumber
                 v-model:value="agentConfig.no_progress_threshold"
+                data-test="agent-no-progress-threshold"
                 :min="0"
                 :max="100"
                 style="width: 100%"
@@ -335,6 +340,7 @@ onMounted(async () => {
             <FormItem :label="$t('admin.token_window_ratio')">
               <InputNumber
                 v-model:value="agentConfig.token_window_ratio"
+                data-test="agent-token-window-ratio"
                 :min="0.5"
                 :max="100"
                 :step="0.5"
@@ -347,6 +353,7 @@ onMounted(async () => {
           </Form>
           <Button
             type="primary"
+            data-test="agent-save"
             :loading="saving"
             @click="saveAgent"
           >
