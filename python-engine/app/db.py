@@ -191,26 +191,36 @@ class _RowDict(dict[str, Any]):
 # migrations/versions/0001_authoritative_baseline.py。
 #
 # 注意：本清单**不得**再列入已不存在的历史表名。曾经的 `conversations` / `workflows`
-# 早已被 `conversation_shares` / `workflow_graphs` / `workflow_instances` 取代，但清单
-# 没跟着改，导致下面这个校验恒为 False、每次启动都误报"缺少 N 张表"。
+# 早已被 `conversation_shares` / `workflow_graphs` 取代；`workflow_instances`、
+# `cron_jobs`、`ent_*` 系列从未进入权威基线。此前清单没跟着改，导致下面这个校验
+# 恒为 False、每次启动都误报"缺少 N 张表"（logs/python-engine.stderr.log 有实证）。
+# tests/test_db.py::test_required_tables_exist_in_baseline 会对照迁移文件把住这条线。
 REQUIRED_TABLES = [
     "users",
     "sessions",
     "agents",
     "messages",
+    "unified_sessions",
+    "unified_messages",
+    "turns",
+    "tool_calls",
+    "agent_runs",
+    "subagent_runs",
+    "pending_interactions",
     "knowledge_bases",
     "knowledge_documents",
     "media_assets",
     "uploads",
-    "workflow_instances",
-    "cron_jobs",
     "audit_logs",
     "usage_events",
-    "ent_oidc_providers",
-    "ent_user_identities",
-    "ent_captcha_config",
-    "ent_quota_pools",
-    "ent_quota_allocations",
+    "project_checkpoints",
+    "checkpoint_untracked",
+    "session_map_workspaces",
+    "session_map_nodes",
+    "task_idempotency",
+    "memory_summaries",
+    "user_memory_entries",
+    "user_memory_profile",
 ]
 
 

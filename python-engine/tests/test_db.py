@@ -43,3 +43,31 @@ async def test_required_tables_excludes_retired_names():
     # 0023_knowledge_pageindex 有意 DROP 了 knowledge_chunks（改用 PageIndex 后
     # 没有切块/向量/FTS），清单没跟着改会让本校验恒为 False。
     assert "knowledge_chunks" not in REQUIRED_TABLES
+
+
+def test_required_tables_exist_in_baseline():
+    """清单里的每张表都必须能在权威基线迁移里找到。
+
+    这是防回归的关键：清单一旦写入基线里不存在的表名，`ensure_tables()`
+    就会在每次启动时恒报缺表（旧清单里的 workflow_instances / ent_* 正是如此），
+    而缺表告警一多，真正缺表时反而没人看。
+    """
+    import re
+    from pathlib import Path
+
+    baseline = (
+        Path(__file__).resolve().parents[2]
+        / "migrations"
+        / "versions"
+        / "0001_authoritative_baseline.py"
+    )
+    assert baseline.is_file(), f"基线迁移不存在: {baseline}"
+    declared = set(
+        re.findall(
+            r"CREATE TABLE public\.([a-z_]+)",
+            baseline.read_text(encoding="utf-8"),
+        )
+    )
+    assert declared, "未能从基线迁移解析出任何表"
+    missing = sorted(set(REQUIRED_TABLES) - declared)
+    assert not missing, f"REQUIRED_TABLES 含基线中不存在的表: {missing}"
