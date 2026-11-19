@@ -53,6 +53,11 @@ func registerPublicEndpoints(
 	// Redis 广播消费 —— 两处必须读同一份数据（见 internal/api/engine_config.go）。
 	mux.Handle("GET /v1/internal/knowledge-config", rlMW(internalTokenMW(cfg, KnowledgeConfig(cfg))))
 
+	// Agent 运行配置下发（计划批准 / 回合间叙述 / 无进展提醒 / token 后备线倍数）：
+	// 同属"后台保存 + Redis 广播 + 引擎启动补拉"三路共用一份数据，理由同上
+	// （见 internal/api/agent_config.go 与 app/agent/runtime_config.py）。
+	mux.Handle("GET /v1/internal/agent-config", rlMW(internalTokenMW(cfg, AgentConfig(cfg))))
+
 	// 模型路由配置同步（X-Internal-Token 保护，Python 引擎启动时拉取）。
 	// 租户模型路由层已随 SaaS 域删除，本地形态恒返回空列表：引擎据此走
 	// "无租户路由覆盖"的默认路径（provider 直接由 key 配置决定）。

@@ -309,6 +309,90 @@ export async function getSettings(category: string): Promise<Record<string, unkn
   return data?.data?.config ?? {}
 }
 
+// ── Agent 运行配置（system_settings 的 agent 分类）──────────────────────
+//
+// 与 market 同一套理由（见上）：键名是**后端契约**，写错不报错、只是静默不生效。
+// 权威消费方是引擎的 `app/agent/runtime_config.py`（订阅 Redis 广播 + 启动补拉），
+// 网关只负责存与广播 —— 所以这里只做"读写这一类配置"的薄封装，不做任何校验。
+//
+// 默认值与引擎侧一致（`python-engine/app/config.py` 的同名字段）：页面在"后台还没有
+// 保存过任何值"时必须显示**引擎实际在用的策略**，否则用户看到的是一个从未生效的值。
+
+/** 系统设置分类名（与后端 settingsCategories 逐字一致） */
+export const AGENT_SETTINGS_CATEGORY = 'agent'
+
+/** 计划批准策略：never = 直接开工（默认）；always = 第一次写清单前先确认计划 */
+export const AGENT_PLAN_APPROVALS = ['never', 'always'] as const
+export type AgentPlanApproval = (typeof AGENT_PLAN_APPROVALS)[number]
+
+/** 回合间叙述详略：off = 不注入（默认）；brief = 一句话；detailed = 说清做了什么与下一步 */
+export const AGENT_NARRATIONS = ['off', 'brief', 'detailed'] as const
+export type AgentNarration = (typeof AGENT_NARRATIONS)[number]
+
+export interface AgentSettingsConfig {
+  /** 计划做好后要不要先给用户看 */
+  plan_approval: AgentPlanApproval
+  /** 等一次人工答复（审批 / 提问）的上限，秒 */
+  interaction_wait_seconds: number
+  /** 每做完一步要不要说一句在干什么 */
+  narration: AgentNarration
+  /** 长时间无进展时是否提醒用户（而不只是告诉模型） */
+  no_progress_notice: boolean
+  /** 判为「无进展」所需的连续相同结果次数；0 = 关闭该规则 */
+  no_progress_threshold: number
+  /** 自上次有进展以来的累计输入达到模型窗口的这个倍数 ⇒ 暂停并提醒 */
+  token_window_ratio: number
+}
+
+/** 默认值（与引擎 `agent_*` 字段一致）；后端无记录时页面显示这一份 */
+export const AGENT_SETTINGS_DEFAULTS: AgentSettingsConfig = {
+  plan_approval: 'never',
+  interaction_wait_seconds: 240,
+  narration: 'off',
+  no_progress_notice: true,
+  no_progress_threshold: 3,
+  token_window_ratio: 8,
+}
+
+function pickChoice<T extends string>(raw: unknown, allowed: readonly T[], fallback: T): T {
+  const v = String(raw ?? '').trim().toLowerCase()
+  return (allowed as readonly string[]).includes(v) ? (v as T) : fallback
+}
+
+function pickNumber(raw: unknown, fallback: number): number {
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/**
+ * 把后端返回的原始配置归一成完整对象。
+ *
+ * 后端对未配置项返回 `undefined`/`null`，直接绑到表单上会让 InputNumber 显示空、
+ * Switch 变成未勾选 —— 看起来像"引擎关了这项"，而实际是"后台从没保存过"。
+ */
+export function normalizeAgentSettings(raw: Record<string, unknown>): AgentSettingsConfig {
+  const d = AGENT_SETTINGS_DEFAULTS
+  return {
+    plan_approval: pickChoice(raw.plan_approval, AGENT_PLAN_APPROVALS, d.plan_approval),
+    interaction_wait_seconds: pickNumber(raw.interaction_wait_seconds, d.interaction_wait_seconds),
+    narration: pickChoice(raw.narration, AGENT_NARRATIONS, d.narration),
+    no_progress_notice:
+      raw.no_progress_notice === undefined || raw.no_progress_notice === null
+        ? d.no_progress_notice
+        : Boolean(raw.no_progress_notice),
+    no_progress_threshold: pickNumber(raw.no_progress_threshold, d.no_progress_threshold),
+    token_window_ratio: pickNumber(raw.token_window_ratio, d.token_window_ratio),
+  }
+}
+
+export async function getAgentSettings(): Promise<AgentSettingsConfig> {
+  return normalizeAgentSettings(await getSettings(AGENT_SETTINGS_CATEGORY))
+}
+
+export async function saveAgentSettings(cfg: AgentSettingsConfig): Promise<void> {
+  await saveSettings(AGENT_SETTINGS_CATEGORY, { ...cfg })
+}
+
 // ── 资源市场「外部源」配置（system_settings 的 market 分类）──────────────
 //
 // 为什么要这层封装而不是各处直接 getSettings('market')：

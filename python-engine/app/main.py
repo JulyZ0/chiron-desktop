@@ -200,6 +200,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 先补拉一次（覆盖重启），再订阅广播（覆盖运行期保存）——见 app/knowledge/runtime.py。
     _knowledge_task = _start_knowledge_watch()
 
+    # 后台「全局配置 → Agent 运行配置」：计划批准 / 提问超时 / 回合间叙述 / 无进展提醒
+    # / token 后备线倍数。同一条"先补拉再订阅"路径（见 app/agent/runtime_config.py）——
+    # 这些值此前要么硬编码在引擎里、要么只能靠 env 在启动时确定，改后台对运行中的引擎无效。
+    _agent_config_task = _start_agent_config_watch()
+
     # M28：按模型的公开价格同步（多源 + 交叉验证）。`start_price_sync()` 自己判开关，
     # 未启用时立刻返回 ⇒ 这里可以无条件创建（默认关 = 什么都不做）。
     _price_sync_task = _start_price_sync()
@@ -247,6 +252,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         harness_task=_harness_task,
         storage_task=_storage_task,
         knowledge_task=_knowledge_task,
+        agent_config_task=_agent_config_task,
         price_sync_task=_price_sync_task,
         engine_registry=_engine_registry,
         liveness=_liveness,
@@ -984,6 +990,21 @@ def _start_knowledge_watch() -> Any:
     return asyncio.create_task(_listen_knowledge_changes())
 
 
+def _start_agent_config_watch() -> Any:
+    """订阅设置变更广播、热更 Agent 运行配置（从 `lifespan` 抽出）；**返回句柄**。
+
+    「计划批准 / 提问超时 / 回合间叙述 / 无进展提醒 / token 后备线倍数」此前要么硬编码在
+    引擎里、要么只能靠 env 在启动时确定 —— 改后台对运行中的引擎无效，表现为"页面上是
+    新值、行为还是旧的"。本任务先补拉一次（覆盖重启），再订阅广播（覆盖运行期保存），
+    见 `app/agent/runtime_config.py` 的模块文档。
+
+    Redis 不可用时退避重试，不影响启动；取消即退出（与 harness/storage/knowledge 同一范式）。
+    """
+    from app.agent.runtime_config import listen_for_changes as _listen_agent_config
+
+    return asyncio.create_task(_listen_agent_config())
+
+
 #: 密钥变更订阅断线后的重连间隔（与 harness / storage watcher 同一范式）。
 _LLM_KEYS_RECONNECT_SECONDS = 5.0
 
@@ -1263,6 +1284,7 @@ async def _shutdown_lifespan(
     harness_task: Any = None,
     storage_task: Any = None,
     knowledge_task: Any = None,
+    agent_config_task: Any = None,
     price_sync_task: Any = None,
     engine_registry: Any = None,
     liveness: Any = None,
@@ -1328,6 +1350,16 @@ async def _shutdown_lifespan(
             pass
         except Exception as e:  # noqa: BLE001
             logger.warning("knowledge settings listener shutdown failed: %s", e)
+
+    # Agent 运行配置订阅（同上）。取消即断开 —— 悬着的 pubsub 会拖到事件循环销毁之后。
+    if agent_config_task is not None:
+        agent_config_task.cancel()
+        try:
+            await agent_config_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("agent runtime config listener shutdown failed: %s", e)
 
     # M52：停 provider 密钥变更订阅（`_start_gateway` 起的后台任务）。
     # 与 harness/storage 同一范式：取消后 await 一次，让 CancelledError 走完 finally 里的

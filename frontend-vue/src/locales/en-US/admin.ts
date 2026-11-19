@@ -87,6 +87,31 @@ export default {
   cache_hit_rate_trend: "Cache hit rate trend",
   cache_config: "Cache config",
   cache_config_saved: "Cache config saved",
+  agent_runtime_config: "Agent runtime config",
+  agent_runtime_config_saved: "Agent runtime config saved",
+  plan_approval: "Plan approval",
+  plan_approval_never: "Start immediately",
+  plan_approval_always: "Confirm the plan first",
+  plan_approval_hint:
+    "With \"Confirm the plan first\", the agent sends you the plan for approval before it writes the task list for the first time.",
+  interaction_wait_seconds: "Wait limit for a human reply (seconds)",
+  interaction_wait_seconds_hint:
+    "If nobody answers an approval or a question within this time, the turn is parked with that step left pending instead of waiting forever.",
+  narration: "Progress narration",
+  narration_off: "Off",
+  narration_brief: "One sentence",
+  narration_detailed: "Detailed",
+  narration_hint:
+    "Whether to say what it is doing after each step. Off saves tokens; on makes progress easier to follow.",
+  no_progress_notice: "Tell me when there is no progress",
+  no_progress_notice_hint:
+    "When tool calls keep returning identical results, the model is told to change approach and you are told about it too.",
+  no_progress_threshold: "Consecutive repeats before it counts as no progress",
+  no_progress_threshold_hint:
+    "This many identical results in a row counts as going in circles; 0 disables the rule.",
+  token_window_ratio: "Token backstop (multiples of the model window)",
+  token_window_ratio_hint:
+    "When input since the last real progress reaches window × this ratio, the turn pauses and asks you instead of burning to the hard cap.",
   cache_stats: "Cache stats",
   cache_miss: "Cache miss",
   role: "Role",

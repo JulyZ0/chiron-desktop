@@ -1075,7 +1075,9 @@ class AgentRuntime:
         self._loop_guard = LoopGuard(no_progress_threshold=no_progress_threshold())
         #: 本轮是否已经给用户看过计划（`plan_approval=always` 时每次提交问一次）。
         self._plan_approved: bool = False
-        #: 自上次「有进展」以来累计的输入 token（token 倍数后备线，见 `run()`）。
+        #: 上一次「有进展」时刻的输入 token **基线**（全程累计口径，含续跑继承段）。
+        #: 判定时取当前累计减它得到"自上次有进展以来的增量"，见 `run()` 的 token 后备线。
+        #: 存基线而不是增量：`run()` 每轮都会重算累计，存增量要每轮回写一次，容易漂。
         self._tokens_since_progress: int = 0
         #: 本轮的 token 后备线是否已经提醒过（一轮提醒一次，避免每轮刷屏）。
         self._token_notice_sent: bool = False
@@ -3398,6 +3400,36 @@ class AgentRuntime:
                                 # 顺序不可颠倒，否则前端收不到事件、任务永久挂起。
                                 yield await self._ask_event(call, task)
                                 tool_result = await self._await_answer(call, task)
+                        elif (
+                            plan_approval_required()
+                            and not self._plan_approved
+                            and not self._unattended
+                            and str(call.get("name", "")) == WRITE_TODOS_TOOL
+                        ):
+                            # 后台「Agent 运行配置」的 plan_approval=always：**开工前先给用户看计划**。
+                            #
+                            # 复用审批那套手续（票据 + 二次校验 + 挂起收口），不另造一条交互通道：
+                            # 前端本来就有审批卡片，网关也有 `/v1/agent/approval`。
+                            #
+                            # 只问一次（批准后 `_plan_approved` 置位）：每改一次清单都问一遍会变成
+                            # 骚扰，而这条配置的价值恰恰在"开工前对齐方向"，不在"每次进度更新"。
+                            # **拒绝则不置位** —— 语义是"计划不行、改完再给我看"，模型重写后会再问。
+                            #
+                            # 无人值守（自动续跑）不参与：没人能答，问了只会把续跑卡在第一步；
+                            # 那种场景下"先把活干完"优先于"先对齐方向"。
+                            _plan_evt = await self._begin_approval(
+                                call,
+                                task,
+                                level="write",
+                                targs=_parse_tool_args(call),
+                                reason="这是本轮的完整计划，确认后我开始按它执行",
+                            )
+                            yield _plan_evt
+                            tool_result = await self._await_approval(call, task)
+                            if not (
+                                isinstance(tool_result, dict) and tool_result.get("error")
+                            ):
+                                self._plan_approved = True
                         else:
                             # 循环护栏（**执行前**）：重复调用与来回摆动必须在这里拦下 ——
                             # 放到执行后就晚了，重复的写操作已经落盘。命中即跳过执行，
@@ -3475,13 +3507,16 @@ class AgentRuntime:
                                 # 就是"确实在原地转" ⇒ 暂停本轮，把选择权交给用户。
                                 self._no_progress_hits += 1
                                 if no_progress_notice_enabled():
-                                    if self._no_progress_hits == 1:
+                                    if (
+                                        self._no_progress_hits == 1
+                                        and not self._no_progress_notice_sent
+                                    ):
                                         self._no_progress_notice = (
                                             f"连续几次工具调用的结果完全一样（{progress_verdict.detail}），"
                                             "看起来没在推进。我会再换一次思路；如果你有更明确的方向，"
                                             "现在补一句会很有帮助。"
                                         )
-                                    else:
+                                    elif self._no_progress_hits >= 2:
                                         self._no_progress_pause = (
                                             "连续多轮没有进展（工具调用反复拿到相同结果），我先停在这里，"
                                             "以免继续消耗额度。请告诉我该换哪个方向、或哪一步其实不需要做。"
@@ -3633,6 +3668,40 @@ class AgentRuntime:
                         self._no_progress_notice_sent = True
                         messages.append(_normalize_msg(role="assistant", content=_np_notice))
                         yield AgentEvent(type="text", content=_np_notice, trace_id=trace_id)
+
+                    # ── token 后备线：自上次有进展以来的累计输入撞到「窗口 × 倍数」 ──
+                    # 与「连续相同结果」判的是同一件事的另一种形态：**很久没拿到新信息**。
+                    # 区别在信号源 —— 重复结果看形态，这条看规模，两者都能在"模型还在说话、
+                    # 但原地打转"时先于硬预算到点（硬预算见 TaskBudget，那是真失败）。
+                    #
+                    # 放在批次收尾：`_tokens_since_progress` 在收尾时才更新完这一批的成果，
+                    # 此刻判定不会读到半批的状态。
+                    if (
+                        not self._paused_for_user
+                        and not self._token_notice_sent
+                        and self._context_window > 0
+                        and no_progress_notice_enabled()
+                    ):
+                        _token_line = int(self._context_window * token_window_ratio())
+                        _spent_since_progress = (
+                            resumed_input_tokens + total_input_tokens
+                        ) - self._tokens_since_progress
+                        if _token_line > 0 and _spent_since_progress >= _token_line:
+                            self._token_notice_sent = True
+                            self._no_progress_pause = (
+                                f"这一轮从上次有进展到现在已经读完约 "
+                                f"{_spent_since_progress // 1000}k 输入（模型窗口的 "
+                                f"{token_window_ratio():.1f} 倍），我再跑下去大概率还是同样的结论。"
+                                "先停在这里 —— 是我漏了哪份材料，还是这一步本来就不需要做？"
+                            )
+                            logger.warning(
+                                "agent paused: %d input tokens since last progress "
+                                "(window=%d, ratio=%.1f, task=%s)",
+                                _spent_since_progress,
+                                self._context_window,
+                                token_window_ratio(),
+                                task.id,
+                            )
 
                     if self._no_progress_pause:
                         # 连续两次命中 / token 后备线到点 ⇒ **停下来把选择权交给用户**。
