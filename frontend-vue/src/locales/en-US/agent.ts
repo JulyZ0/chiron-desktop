@@ -319,4 +319,21 @@ export default {
   superagent_verdict_budget: "Skipped: budget used up",
   superagent_verdict_disabled: "Disabled",
   superagent_interrupt_disabled: "Takeover interrupted; this one-off task is now switched off.",
+
+  // ── Two-pane workspace (Agents / Skills) ──
+  list_pane_title: "Agent list",
+  group_filter_label: "Filter by group",
+  filter_all: "All",
+  detail_title: "Agent details",
+  select_detail_hint: "Pick an agent on the left to inspect its configuration, or create a new one",
+  no_matching_agents: "No matching agents",
+  discard_unsaved_title: "Discard unsaved changes?",
+  discard_unsaved_content: "Your changes have not been saved and will be lost if you switch.",
+  all_changes_saved: "Saved",
+
+  skill_detail_title: "Skill details",
+  select_skill_hint: "Pick a skill on the left to inspect it and preview its SKILL.md body",
+  skill_md_preview: "SKILL.md body",
+  skill_no_preview: "This skill has no body to preview",
+  source_shared: "Public shared",
 }

@@ -319,4 +319,22 @@ export default {
   superagent_verdict_budget: "跳过：预算用尽",
   superagent_verdict_disabled: "已关闭",
   superagent_interrupt_disabled: "已打断接管，这条一次性任务随之关闭。",
+
+  // ── 两栏工作台（Agents / Skills 重构）──
+  // 左栏列表、右栏详情，窄屏回退单栏。文案集中在这里，模板不写死中文。
+  list_pane_title: "Agent 列表",
+  group_filter_label: "按分组筛选",
+  filter_all: "全部",
+  detail_title: "Agent 详情",
+  select_detail_hint: "从左侧选择一个 Agent 查看配置，或新建一个 Agent",
+  no_matching_agents: "没有匹配的 Agent",
+  discard_unsaved_title: "放弃未保存的修改？",
+  discard_unsaved_content: "当前修改尚未保存，切换后将丢失。",
+  all_changes_saved: "已保存",
+
+  skill_detail_title: "技能详情",
+  select_skill_hint: "从左侧选择一个技能查看详情与 SKILL.md 正文",
+  skill_md_preview: "SKILL.md 正文",
+  skill_no_preview: "该技能没有可预览的正文",
+  source_shared: "公共共享",
 }

@@ -319,4 +319,21 @@ export default {
   superagent_verdict_budget: "تم التخطّي: نفدت الميزانية",
   superagent_verdict_disabled: "مُعطّل",
   superagent_interrupt_disabled: "تم مقاطعة التولّي؛ أُوقفت مهمّة المرّة الواحدة هذه.",
+
+  // ── مساحة عمل بعمودين (Agents / Skills) ──
+  list_pane_title: "قائمة الوكلاء",
+  group_filter_label: "التصفية حسب المجموعة",
+  filter_all: "الكل",
+  detail_title: "تفاصيل الوكيل",
+  select_detail_hint: "اختر وكيلاً من اليسار لعرض إعداداته، أو أنشئ وكيلاً جديداً",
+  no_matching_agents: "لا يوجد وكلاء مطابقون",
+  discard_unsaved_title: "هل تريد تجاهل التغييرات غير المحفوظة؟",
+  discard_unsaved_content: "لم تُحفظ تغييراتك وستفقد عند التبديل.",
+  all_changes_saved: "تم الحفظ",
+
+  skill_detail_title: "تفاصيل المهارة",
+  select_skill_hint: "اختر مهارة من اليسار لعرض تفاصيلها ومعاينة نصّ SKILL.md",
+  skill_md_preview: "نصّ SKILL.md",
+  skill_no_preview: "لا يوجد نصّ للمعاينة في هذه المهارة",
+  source_shared: "مشترك عام",
 }

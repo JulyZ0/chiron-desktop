@@ -7,10 +7,11 @@ import {
   Alert, Dropdown, Menu, MenuItem, Select, message,
 } from 'ant-design-vue'
 import {
-  PlusOutlined, PlayCircleOutlined, EditOutlined, DeleteOutlined,
+  PlusOutlined, PlayCircleOutlined, DeleteOutlined,
   StopOutlined, ClockCircleOutlined, CheckCircleOutlined,
   CloseCircleOutlined, SyncOutlined, RobotOutlined, HistoryOutlined,
-  MessageOutlined, ShopOutlined, TeamOutlined, LockOutlined,
+  MessageOutlined, TeamOutlined, LockOutlined, SearchOutlined,
+  ArrowLeftOutlined, MoreOutlined,
 } from '@ant-design/icons-vue'
 import {
   listAgents, createAgent, updateAgent, deleteAgent,
@@ -30,7 +31,7 @@ import { agentResultToMarkdown, parseAgentResult } from '../utils/agentResultMar
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '../stores/auth'
 import { errorDetail } from '../utils/apiError'
-import { serverErrorDetail, errorMessageText, errorStatus } from '../utils/apiError'
+import { serverErrorDetail, errorStatus } from '../utils/apiError'
 const { t } = useI18n()
 // ── 数据 ──
 // 后端列表项可能带 visibility（'private'|'tenant'）；缺失视为 private
@@ -133,7 +134,6 @@ interface EditorState {
   timeout_seconds: number
   enabled: boolean
 }
-const editorOpen = ref(false)
 const editorSaving = ref(false)
 const editingId = ref('')
 const form = ref<EditorState>({
@@ -142,7 +142,7 @@ const form = ref<EditorState>({
   temperature: 0.6, max_turns: 5, timeout_seconds: 120, enabled: true,
 })
 
-// ── 工作台绑定：Agent 自带的知识库 / 技能 / 插件 / 工作流（派发时由引擎消费）──
+// ── 工作台绑定：Agent 自带的知识库 / 技能 / 插件（派发时由引擎消费）──
 // 单独用 ref 而不塞进 EditorState：它们只在编辑器里维护，不该影响既有字段与校验。
 const formKbId = ref<string | undefined>(undefined)
 const formSkills = ref<string[]>([])
@@ -180,20 +180,83 @@ function resetBinding() {
   formPlugins.value = []
 }
 
-function openCreate() {
-  editingId.value = ''
-  form.value = {
-    id: '', name: '', description: '', system_prompt: '',
-    tools_text: '[]', model: 'deepseek-chat', max_tokens: 4096,
-    temperature: 0.6, max_turns: 5, timeout_seconds: 120, enabled: true,
-  }
-  resetBinding()
-  void loadBindingOptions()
-  editorOpen.value = true
+// ── 两栏工作台的状态 ──
+// 左栏筛选 + 列表，右栏详情 + 表单。`creating` 为真时右栏显示空白表单，
+// 此时 `selectedAgentId` 为空 —— 两种「右栏有内容」的情形混在一个布尔里判断。
+const searchQuery = ref('')
+type AgentGroup = 'all' | 'mine' | 'team' | 'disabled'
+const groupFilter = ref<AgentGroup>('all')
+const selectedAgentId = ref('')
+const creating = ref(false)
+/** 右栏操作结果的内联反馈（与 message toast 并行：toast 会消失，这里留在详情里） */
+const feedback = ref<{ type: 'success' | 'error'; text: string } | null>(null)
+/** 最近一次「开始编辑」时的表单快照，用来判断是否有未保存修改 */
+const formBaseline = ref('')
+
+const selectedAgent = computed<AgentRow | null>(
+  () => agents.value.find(a => a.id === selectedAgentId.value) ?? null,
+)
+const detailVisible = computed(() => creating.value || selectedAgent.value !== null)
+
+const groupCounts = computed(() => ({
+  all: agents.value.length,
+  mine: agents.value.filter(canManage).length,
+  team: agents.value.filter(a => a.visibility === 'tenant').length,
+  disabled: agents.value.filter(a => !a.enabled).length,
+}))
+
+const filteredAgents = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  return agents.value.filter((a) => {
+    if (q) {
+      const hay = `${a.name || ''} ${a.description || ''}`.toLowerCase()
+      if (!hay.includes(q)) return false
+    }
+    switch (groupFilter.value) {
+      case 'mine': return canManage(a)
+      case 'team': return a.visibility === 'tenant'
+      case 'disabled': return !a.enabled
+      default: return true
+    }
+  })
+})
+
+function snapshot(): string {
+  return JSON.stringify({
+    form: form.value,
+    kb: formKbId.value ?? '',
+    skills: formSkills.value,
+    plugins: formPlugins.value,
+  })
 }
 
-function openEdit(a: Agent) {
+function markClean() {
+  formBaseline.value = snapshot()
+}
+
+const isDirty = computed(() => formBaseline.value !== '' && snapshot() !== formBaseline.value)
+
+/**
+ * 有未保存修改时先确认，再执行切换动作。
+ * 用 `Modal.confirm` 而不是拦整屏 —— 它只是一个小确认框，焦点仍由用户控制。
+ */
+function guardDirty(next: () => void) {
+  if (!isDirty.value) { next(); return }
+  Modal.confirm({
+    title: t('agent.discard_unsaved_title'),
+    content: t('agent.discard_unsaved_content'),
+    okText: t('common.discard'),
+    okButtonProps: { danger: true },
+    cancelText: t('common.cancel'),
+    onOk: () => { next() },
+  })
+}
+
+/** 把列表项回填到右栏表单（只读展示与编辑共用同一份状态） */
+function applyAgent(a: AgentRow) {
   editingId.value = a.id
+  selectedAgentId.value = a.id
+  creating.value = false
   const llm = a.llm_config || {}
   form.value = {
     id: a.id,
@@ -209,12 +272,46 @@ function openEdit(a: Agent) {
     enabled: a.enabled,
   }
   // 回填工作台绑定（后端未升级时字段为 undefined，视为未绑定）
-  //
   formKbId.value = a.kb_id || undefined
   formSkills.value = Array.isArray(a.skills) ? [...a.skills] : []
   formPlugins.value = Array.isArray(a.plugins) ? [...a.plugins] : []
+  feedback.value = null
   void loadBindingOptions()
-  editorOpen.value = true
+  markClean()
+}
+
+function openCreate() {
+  guardDirty(() => {
+    editingId.value = ''
+    selectedAgentId.value = ''
+    creating.value = true
+    form.value = {
+      id: '', name: '', description: '', system_prompt: '',
+      tools_text: '[]', model: 'deepseek-chat', max_tokens: 4096,
+      temperature: 0.6, max_turns: 5, timeout_seconds: 120, enabled: true,
+    }
+    resetBinding()
+    feedback.value = null
+    void loadBindingOptions()
+    markClean()
+  })
+}
+
+function openEdit(a: AgentRow) {
+  // 重复点当前项不该弹「放弃修改」—— 那只是同一条详情
+  if (a.id === selectedAgentId.value && !creating.value) return
+  guardDirty(() => applyAgent(a))
+}
+
+/** 关闭右栏（窄屏＝返回列表）；有未保存修改时先确认 */
+function closeDetail() {
+  guardDirty(() => {
+    creating.value = false
+    selectedAgentId.value = ''
+    editingId.value = ''
+    feedback.value = null
+    formBaseline.value = ''
+  })
 }
 
 function parseToolsText(): unknown[] | null {
@@ -232,6 +329,7 @@ async function saveEditor() {
   if (!f.name.trim()) { message.warning(t('common.please_enter_a_name_2')); return }
   const tools = parseToolsText()
   if (tools === null) return
+  const isCreate = !editingId.value
   const body: Partial<Agent> = {
     name: f.name.trim(),
     description: f.description,
@@ -247,28 +345,40 @@ async function saveEditor() {
     plugins: formPlugins.value,
   }
   editorSaving.value = true
+  feedback.value = null
   try {
-    if (editingId.value) {
-      await updateAgent(editingId.value, body)
-      message.success(t('common.saved'))
-    } else {
-      await createAgent(body)
-      message.success(t('common.created'))
-    }
-    editorOpen.value = false
+    const saved = isCreate
+      ? await createAgent(body)
+      : await updateAgent(editingId.value, body)
+    const text = isCreate ? t('common.created') : t('common.saved')
+    message.success(text)
+    feedback.value = { type: 'success', text }
     await loadAgents()
+    // 新建成功后直接落到新 Agent 的详情上；更新则回填服务端的最新值（清掉脏标记）
+    const nextId = isCreate ? (saved?.id || '') : editingId.value
+    const fresh = agents.value.find(a => a.id === nextId)
+    if (fresh) applyAgent(fresh)
+    // applyAgent 会清掉 feedback，这里补回操作结果
+    feedback.value = { type: 'success', text }
   } catch (e) {
-    message.error(t('errors.save_failed_error', { error: errorDetail(e, '') }))
+    const text = t('errors.save_failed_error', { error: errorDetail(e, '') })
+    message.error(text)
+    feedback.value = { type: 'error', text }
   } finally {
     editorSaving.value = false
   }
 }
 
 // ── 启停 / 删除 ──
-async function toggleEnabled(a: Agent) {
+async function toggleEnabled(a: AgentRow) {
   try {
     await updateAgent(a.id, { enabled: !a.enabled })
     a.enabled = !a.enabled
+    // 详情正开着且没有别的未保存修改时，让表单里的开关跟着走
+    if (selectedAgentId.value === a.id && !isDirty.value) {
+      form.value.enabled = a.enabled
+      markClean()
+    }
   } catch {
     message.error(t('errors.operation_failed'))
   }
@@ -291,7 +401,7 @@ async function toggleVisibility(a: AgentRow) {
   }
 }
 
-function requestDelete(a: Agent) {
+function requestDelete(a: AgentRow) {
   Modal.confirm({
     title: t('agent.delete_agent'),
     content: t('common.delete_name_its_run_history_will_also_be_removed', { name: a.name }),
@@ -302,6 +412,13 @@ function requestDelete(a: Agent) {
       try {
         await deleteAgent(a.id)
         message.success(t('common.deleted'))
+        // 删掉的正是右栏在看的那个：清空详情，避免留着一份指向已删除实体的表单
+        if (selectedAgentId.value === a.id || editingId.value === a.id) {
+          creating.value = false
+          selectedAgentId.value = ''
+          editingId.value = ''
+          formBaseline.value = ''
+        }
         await loadAgents()
         await loadSessions()
       } catch {
@@ -465,7 +582,7 @@ function toolCount(a: Agent): number {
 
 <template>
   <div class="agents-page">
-    <div class="page-header">
+    <header class="page-header">
       <div class="page-header-text">
         <h1 class="page-title">
           Agents
@@ -483,168 +600,528 @@ function toolCount(a: Agent): number {
         </template>
         {{ $t('agent.new_agent_2') }}
       </Button>
-    </div>
+    </header>
 
     <Tabs
       v-model:active-key="activeTab"
       class="agents-tabs"
     >
-      <!-- ── Tab 1：我的 Agent ── -->
+      <!-- ── Tab 1：我的 Agent（两栏工作台）── -->
       <TabPane
         key="agents"
         :tab="$t('agent.my_agents')"
       >
-        <PageSkeleton
-          v-if="loadingAgents"
-          variant="cards"
-          :columns="3"
-          :rows="6"
-          :header="false"
-        />
-        <EmptyState
-          v-else-if="errorAgents"
-          size="page"
-          :icon="markRaw(RobotOutlined)"
-          :description="$t('errors.failed_to_load')"
-          :hint="$t('agent.unable_to_fetch_agent_list_please_retry_later')"
-        >
-          <Button
-            type="primary"
-            @click="loadAgents"
-          >
-            {{ $t('common.retry') }}
-          </Button>
-        </EmptyState>
-        <EmptyState
-          v-else-if="agents.length === 0"
-          size="page"
-          :icon="markRaw(RobotOutlined)"
-          :description="$t('agent.no_agents_yet')"
-          :hint="$t('workflow.click_new_agent_at_the_top_right_to_define_its_prompt_and_tools_then_start_dispatching_tasks')"
-        >
-          <Button
-            type="primary"
-            @click="openCreate"
-          >
-            <template #icon>
-              <PlusOutlined />
-            </template>
-            {{ $t('agent.new_agent_2') }}
-          </Button>
-        </EmptyState>
         <div
-          v-else
-          class="agent-grid stagger-in"
+          class="workspace"
+          :class="{ 'has-selection': detailVisible }"
         >
-          <div
-            v-for="a in agents"
-            :key="a.id"
-            class="agent-card"
-            :class="{ disabled: !a.enabled }"
+          <!-- 左栏：筛选 + 列表 -->
+          <aside
+            class="pane pane-list"
+            :aria-label="$t('agent.list_pane_title')"
           >
-            <div class="card-top">
-              <span class="card-avatar"><RobotOutlined /></span>
-              <div class="card-titles">
-                <span class="card-name">{{ a.name }}</span>
-                <span class="card-desc">{{ a.description || $t('common.no_description') }}</span>
+            <div class="pane-head">
+              <Input
+                v-model:value="searchQuery"
+                :placeholder="$t('agent.search_agents')"
+                allow-clear
+                class="pane-search"
+              >
+                <template #prefix>
+                  <SearchOutlined />
+                </template>
+              </Input>
+              <div
+                class="group-nav"
+                role="group"
+                :aria-label="$t('agent.group_filter_label')"
+              >
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'all' }"
+                  :aria-pressed="groupFilter === 'all'"
+                  @click="groupFilter = 'all'"
+                >
+                  {{ $t('agent.filter_all') }}
+                  <span class="group-count">{{ groupCounts.all }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'mine' }"
+                  :aria-pressed="groupFilter === 'mine'"
+                  @click="groupFilter = 'mine'"
+                >
+                  {{ $t('common.custom') }}
+                  <span class="group-count">{{ groupCounts.mine }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'team' }"
+                  :aria-pressed="groupFilter === 'team'"
+                  @click="groupFilter = 'team'"
+                >
+                  {{ $t('common.team_shared') }}
+                  <span class="group-count">{{ groupCounts.team }}</span>
+                </button>
+                <button
+                  type="button"
+                  class="group-chip"
+                  :class="{ active: groupFilter === 'disabled' }"
+                  :aria-pressed="groupFilter === 'disabled'"
+                  @click="groupFilter = 'disabled'"
+                >
+                  {{ $t('common.disabled') }}
+                  <span class="group-count">{{ groupCounts.disabled }}</span>
+                </button>
               </div>
-              <Dropdown
-                trigger="click"
-                placement="bottomRight"
+            </div>
+
+            <div class="pane-body">
+              <PageSkeleton
+                v-if="loadingAgents"
+                variant="list"
+                :rows="6"
+                :header="false"
+              />
+              <Alert
+                v-else-if="errorAgents"
+                type="error"
+                show-icon
+                :message="$t('errors.failed_to_load')"
+                :description="$t('agent.unable_to_fetch_agent_list_please_retry_later')"
+              >
+                <template #action>
+                  <Button
+                    size="small"
+                    @click="loadAgents"
+                  >
+                    {{ $t('common.retry') }}
+                  </Button>
+                </template>
+              </Alert>
+              <EmptyState
+                v-else-if="agents.length === 0"
+                :icon="markRaw(RobotOutlined)"
+                :description="$t('agent.no_agents_yet')"
+                :hint="$t('workflow.click_new_agent_at_the_top_right_to_define_its_prompt_and_tools_then_start_dispatching_tasks')"
               >
                 <Button
-                  type="text"
+                  type="primary"
                   size="small"
-                  class="card-more"
-                  :title="$t('common.more_actions')"
-                  @click.stop
+                  @click="openCreate"
                 >
                   <template #icon>
-                    <EditOutlined />
+                    <PlusOutlined />
                   </template>
+                  {{ $t('agent.new_agent_2') }}
                 </Button>
-                <template #overlay>
-                  <Menu class="card-menu">
-                    <MenuItem
-                      key="edit"
-                      :disabled="!canManage(a)"
-                      :title="canManage(a) ? '' : $t('agent.only_creator_can_edit')"
-                      @click="openEdit(a)"
-                    >
-                      <EditOutlined class="menu-icon" />{{ $t('common.edit_2') }}
-                    </MenuItem>
-                    <MenuItem
-                      key="toggle"
-                      @click="toggleEnabled(a)"
-                    >
-                      <template v-if="a.enabled">
-                        <StopOutlined class="menu-icon" />{{ $t('common.disable_2') }}
-                      </template>
-                      <template v-else>
-                        <PlayCircleOutlined class="menu-icon" />{{ $t('common.enable') }}
-                      </template>
-                    </MenuItem>
-                    <MenuItem
-                      key="visibility"
-                      @click="toggleVisibility(a)"
-                    >
-                      <template v-if="a.visibility === 'tenant'">
-                        <LockOutlined class="menu-icon" />{{ $t('common.set_as_private') }}
-                      </template>
-                      <template v-else>
-                        <TeamOutlined class="menu-icon" />{{ $t('common.shared_with_team_2') }}
-                      </template>
-                    </MenuItem>
-                    <MenuItem
-                      key="delete"
-                      danger
-                      :disabled="!canManage(a)"
-                      :title="canManage(a) ? '' : $t('agent.only_creator_can_edit')"
-                      @click="requestDelete(a)"
-                    >
-                      <DeleteOutlined class="menu-icon" />{{ $t('common.delete') }}
-                    </MenuItem>
-                  </Menu>
-                </template>
-              </Dropdown>
-            </div>
-            <div class="card-meta">
-              <Tag
-                v-if="a.visibility === 'tenant'"
-                color="green"
+              </EmptyState>
+              <EmptyState
+                v-else-if="filteredAgents.length === 0"
+                :icon="markRaw(SearchOutlined)"
+                :description="$t('agent.no_matching_agents')"
+                :hint="$t('common.try_adjusting_your_search_keywords')"
+              />
+              <ul
+                v-else
+                class="item-list"
+                role="listbox"
+                :aria-label="$t('agent.list_pane_title')"
               >
-                {{ $t('common.team_shared') }}
-              </Tag>
-              <Tag :color="a.enabled ? 'green' : 'default'">
-                {{ a.enabled ? $t('common.enable') : $t('common.disabled') }}
-              </Tag>
-              <Tag>{{ $t('agent.n_tools', { n: toolCount(a) }) }}</Tag>
-              <Tag>{{ $t('common.up_to_n_rounds', { n: a.max_turns }) }}</Tag>
+                <li
+                  v-for="a in filteredAgents"
+                  :key="a.id"
+                  class="item"
+                  :class="{
+                    active: selectedAgentId === a.id && !creating,
+                    muted: !a.enabled,
+                  }"
+                  role="option"
+                  :aria-selected="selectedAgentId === a.id && !creating"
+                  tabindex="0"
+                  @click="openEdit(a)"
+                  @keydown.enter.prevent="openEdit(a)"
+                  @keydown.space.prevent="openEdit(a)"
+                >
+                  <span class="item-avatar"><RobotOutlined /></span>
+                  <span class="item-main">
+                    <span class="item-title-line">
+                      <span class="item-name">{{ a.name }}</span>
+                      <Tag
+                        v-if="a.visibility === 'tenant'"
+                        color="green"
+                        class="item-tag"
+                      >
+                        {{ $t('common.team_shared') }}
+                      </Tag>
+                      <Tag
+                        v-if="!a.enabled"
+                        class="item-tag"
+                      >
+                        {{ $t('common.disabled') }}
+                      </Tag>
+                    </span>
+                    <span class="item-desc">{{ a.description || $t('common.no_description') }}</span>
+                    <span class="item-meta">
+                      <span class="item-meta-text">{{ $t('agent.n_tools', { n: toolCount(a) }) }}</span>
+                      <span class="item-meta-dot">·</span>
+                      <span class="item-meta-text">{{ $t('common.up_to_n_rounds', { n: a.max_turns }) }}</span>
+                    </span>
+                  </span>
+                </li>
+              </ul>
             </div>
-            <div class="card-actions">
-              <Button
-                type="primary"
-                size="small"
-                :disabled="!a.enabled"
-                @click="openRun(a)"
+          </aside>
+
+          <!-- 右栏：详情 + 编辑表单 -->
+          <section
+            class="pane pane-detail"
+            :aria-label="$t('agent.detail_title')"
+          >
+            <button
+              type="button"
+              class="back-btn"
+              @click="closeDetail"
+            >
+              <ArrowLeftOutlined />
+              {{ $t('common.back_to_list') }}
+            </button>
+
+            <div
+              v-if="!detailVisible"
+              class="detail-placeholder"
+            >
+              <EmptyState
+                size="page"
+                :icon="markRaw(RobotOutlined)"
+                :description="$t('agent.detail_title')"
+                :hint="$t('agent.select_detail_hint')"
+                :auto-pad="false"
               >
-                <template #icon>
-                  <PlayCircleOutlined />
-                </template>
-                {{ $t('common.run') }}
-              </Button>
-              <Button
-                size="small"
-                :title="$t('chat.start_a_session_in_the_conversation')"
-                @click="chatWithAgent(a)"
-              >
-                <template #icon>
-                  <MessageOutlined />
-                </template>
-                {{ $t('chat.start_a_conversation') }}
-              </Button>
+                <Button
+                  type="primary"
+                  @click="openCreate"
+                >
+                  <template #icon>
+                    <PlusOutlined />
+                  </template>
+                  {{ $t('agent.new_agent_2') }}
+                </Button>
+              </EmptyState>
             </div>
-          </div>
+
+            <template v-else>
+              <div class="detail-head">
+                <span class="detail-avatar"><RobotOutlined /></span>
+                <div class="detail-titles">
+                  <h2 class="detail-name">
+                    {{ creating ? $t('agent.new_agent_2') : (selectedAgent?.name || '') }}
+                  </h2>
+                  <p class="detail-sub">
+                    {{ form.description || $t('common.no_description') }}
+                  </p>
+                </div>
+                <div
+                  v-if="!creating && selectedAgent"
+                  class="detail-actions"
+                >
+                  <Button
+                    type="primary"
+                    size="small"
+                    :disabled="!selectedAgent.enabled"
+                    @click="selectedAgent && openRun(selectedAgent)"
+                  >
+                    <template #icon>
+                      <PlayCircleOutlined />
+                    </template>
+                    {{ $t('common.run') }}
+                  </Button>
+                  <Button
+                    size="small"
+                    :title="$t('chat.start_a_session_in_the_conversation')"
+                    @click="selectedAgent && chatWithAgent(selectedAgent)"
+                  >
+                    <template #icon>
+                      <MessageOutlined />
+                    </template>
+                    {{ $t('chat.start_a_conversation') }}
+                  </Button>
+                  <Dropdown
+                    trigger="click"
+                    placement="bottomRight"
+                  >
+                    <Button
+                      type="text"
+                      size="small"
+                      :title="$t('common.more_actions')"
+                    >
+                      <template #icon>
+                        <MoreOutlined />
+                      </template>
+                    </Button>
+                    <template #overlay>
+                      <Menu class="card-menu">
+                        <MenuItem
+                          key="toggle"
+                          @click="selectedAgent && toggleEnabled(selectedAgent)"
+                        >
+                          <template v-if="selectedAgent?.enabled">
+                            <StopOutlined class="menu-icon" />{{ $t('common.disable_2') }}
+                          </template>
+                          <template v-else>
+                            <PlayCircleOutlined class="menu-icon" />{{ $t('common.enable') }}
+                          </template>
+                        </MenuItem>
+                        <MenuItem
+                          key="visibility"
+                          @click="selectedAgent && toggleVisibility(selectedAgent)"
+                        >
+                          <template v-if="selectedAgent?.visibility === 'tenant'">
+                            <LockOutlined class="menu-icon" />{{ $t('common.set_as_private') }}
+                          </template>
+                          <template v-else>
+                            <TeamOutlined class="menu-icon" />{{ $t('common.shared_with_team_2') }}
+                          </template>
+                        </MenuItem>
+                        <MenuItem
+                          key="delete"
+                          danger
+                          :disabled="!selectedAgent || !canManage(selectedAgent)"
+                          :title="selectedAgent && canManage(selectedAgent) ? '' : $t('agent.only_creator_can_edit')"
+                          @click="selectedAgent && requestDelete(selectedAgent)"
+                        >
+                          <DeleteOutlined class="menu-icon" />{{ $t('common.delete') }}
+                        </MenuItem>
+                      </Menu>
+                    </template>
+                  </Dropdown>
+                </div>
+              </div>
+
+              <div class="detail-badges">
+                <Tag :color="form.enabled ? 'green' : 'default'">
+                  {{ form.enabled ? $t('common.enable') : $t('common.disabled') }}
+                </Tag>
+                <Tag
+                  v-if="selectedAgent?.visibility === 'tenant'"
+                  color="green"
+                >
+                  {{ $t('common.team_shared') }}
+                </Tag>
+                <Tag>{{ $t('agent.model') }}: {{ form.model || '—' }}</Tag>
+                <Tag>{{ $t('agent.n_tools', { n: selectedAgent ? toolCount(selectedAgent) : 0 }) }}</Tag>
+                <Tag>{{ $t('agent.n_skills', { n: formSkills.length }) }}</Tag>
+                <Tag>{{ $t('common.n_plugins', { n: formPlugins.length }) }}</Tag>
+              </div>
+
+              <Alert
+                v-if="feedback"
+                :type="feedback.type"
+                show-icon
+                closable
+                class="detail-feedback"
+                :message="feedback.text"
+                @close="feedback = null"
+              />
+
+              <div class="editor-form">
+                <div class="form-row">
+                  <label
+                    class="form-label"
+                    for="agent-form-name"
+                  >{{ $t('common.name_2') }}</label>
+                  <Input
+                    id="agent-form-name"
+                    v-model:value="form.name"
+                    :placeholder="$t('common.e_g_data_analyst')"
+                    :maxlength="60"
+                  />
+                </div>
+                <div class="form-row">
+                  <label
+                    class="form-label"
+                    for="agent-form-desc"
+                  >{{ $t('common.description') }}</label>
+                  <Input
+                    id="agent-form-desc"
+                    v-model:value="form.description"
+                    :placeholder="$t('agent.describe_the_agent_s_responsibility_in_one_sentence')"
+                    :maxlength="200"
+                  />
+                </div>
+                <div class="form-row">
+                  <label
+                    class="form-label"
+                    for="agent-form-prompt"
+                  >{{ $t('agent.system_prompt') }}</label>
+                  <Input.TextArea
+                    id="agent-form-prompt"
+                    v-model:value="form.system_prompt"
+                    :rows="5"
+                    :placeholder="$t('agent.define_the_agent_s_role_behavior_and_goals')"
+                  />
+                </div>
+                <div class="form-grid">
+                  <div class="form-field">
+                    <label
+                      class="form-label"
+                      for="agent-form-model"
+                    >{{ $t('agent.model') }}</label>
+                    <Input
+                      id="agent-form-model"
+                      v-model:value="form.model"
+                      placeholder="deepseek-chat"
+                    />
+                  </div>
+                  <div class="form-field">
+                    <label
+                      class="form-label"
+                      for="agent-form-turns"
+                    >{{ $t('common.max_rounds') }}</label>
+                    <InputNumber
+                      id="agent-form-turns"
+                      v-model:value="form.max_turns"
+                      :min="1"
+                      :max="30"
+                      class="w-full"
+                    />
+                  </div>
+                  <div class="form-field">
+                    <label
+                      class="form-label"
+                      for="agent-form-timeout"
+                    >{{ $t('errors.timeout_seconds') }}</label>
+                    <InputNumber
+                      id="agent-form-timeout"
+                      v-model:value="form.timeout_seconds"
+                      :min="10"
+                      :max="3600"
+                      class="w-full"
+                    />
+                  </div>
+                  <div class="form-field">
+                    <label
+                      class="form-label"
+                      for="agent-form-temp"
+                    >Temperature</label>
+                    <InputNumber
+                      id="agent-form-temp"
+                      v-model:value="form.temperature"
+                      :min="0"
+                      :max="2"
+                      :step="0.1"
+                      class="w-full"
+                    />
+                  </div>
+                  <div class="form-field">
+                    <label
+                      class="form-label"
+                      for="agent-form-tokens"
+                    >Max Tokens</label>
+                    <InputNumber
+                      id="agent-form-tokens"
+                      v-model:value="form.max_tokens"
+                      :min="256"
+                      :max="32768"
+                      :step="512"
+                      class="w-full"
+                    />
+                  </div>
+                  <div class="form-field">
+                    <label
+                      class="form-label"
+                      for="agent-form-enabled"
+                    >{{ $t('common.enable') }}</label>
+                    <Switch
+                      id="agent-form-enabled"
+                      v-model:checked="form.enabled"
+                    />
+                  </div>
+                </div>
+                <div class="form-row">
+                  <label
+                    class="form-label"
+                    for="agent-form-tools"
+                  >{{ $t('agent.tools_json') }}</label>
+                  <Input.TextArea
+                    id="agent-form-tools"
+                    v-model:value="form.tools_text"
+                    :rows="4"
+                    :placeholder="$t('common.jsonexample', { jsonExample: '[{&quot;name&quot;:&quot;shell_exec&quot;,&quot;description&quot;:&quot;执行命令&quot;,&quot;parameters&quot;:{&quot;type&quot;:&quot;object&quot;,&quot;properties&quot;:{}}}]' })"
+                    class="tools-input"
+                  />
+                  <ToolPicker v-model="form.tools_text" />
+                </div>
+                <div class="form-row">
+                  <label class="form-label">{{ $t('knowledge.default_knowledge_base') }}</label>
+                  <Select
+                    v-model:value="formKbId"
+                    :options="kbOptions.map(b => ({ value: b.id, label: b.name }))"
+                    :loading="bindingLoading"
+                    :placeholder="$t('knowledge.use_it_for_retrieval_when_dispatching_optional')"
+                    allow-clear
+                    show-search
+                    option-filter-prop="label"
+                    class="binding-select"
+                  />
+                </div>
+                <div class="form-row">
+                  <label class="form-label">{{ $t('agent.skill') }}</label>
+                  <Select
+                    v-model:value="formSkills"
+                    mode="multiple"
+                    :options="skillOptions.map(s => ({ value: s.name, label: s.name }))"
+                    :loading="bindingLoading"
+                    :placeholder="$t('agent.only_enable_selected_skills_blank_all_installed')"
+                    allow-clear
+                    show-search
+                    option-filter-prop="label"
+                    class="binding-select"
+                  />
+                </div>
+                <div class="form-row">
+                  <label class="form-label">{{ $t('common.plugin') }}</label>
+                  <Select
+                    v-model:value="formPlugins"
+                    mode="multiple"
+                    :options="pluginOptions.map(p => ({ value: p.name, label: p.name }))"
+                    :loading="bindingLoading"
+                    :placeholder="$t('agent.only_tools_from_these_plugins_blank_no_filter')"
+                    allow-clear
+                    show-search
+                    option-filter-prop="label"
+                    class="binding-select"
+                  />
+                </div>
+              </div>
+
+              <div class="detail-footer">
+                <span
+                  class="dirty-flag"
+                  :class="{ dirty: isDirty }"
+                >
+                  {{ isDirty ? $t('common.unsaved') : $t('agent.all_changes_saved') }}
+                </span>
+                <div class="footer-actions">
+                  <Button @click="closeDetail">
+                    {{ $t('common.cancel') }}
+                  </Button>
+                  <Button
+                    type="primary"
+                    :loading="editorSaving"
+                    :disabled="!!selectedAgent && !canManage(selectedAgent)"
+                    :title="selectedAgent && !canManage(selectedAgent) ? $t('agent.only_creator_can_edit') : ''"
+                    @click="saveEditor"
+                  >
+                    {{ $t('common.save') }}
+                  </Button>
+                </div>
+              </div>
+            </template>
+          </section>
         </div>
       </TabPane>
 
@@ -734,147 +1211,6 @@ function toolCount(a: Agent): number {
         <TakeoverPanel />
       </TabPane>
     </Tabs>
-
-    <!-- ── 新建/编辑 Modal ── -->
-    <Modal
-      :open="editorOpen"
-      :title="editingId ? $t('agent.edit_agent') : $t('agent.new_agent_2')"
-      :confirm-loading="editorSaving"
-      width="720px"
-      :ok-text="$t('common.save')"
-      :cancel-text="$t('common.cancel')"
-      @ok="saveEditor"
-      @cancel="editorOpen = false"
-    >
-      <div class="editor-form">
-        <div class="form-row">
-          <label class="form-label">{{ $t('common.name_2') }}</label>
-          <Input
-            v-model:value="form.name"
-            :placeholder="$t('common.e_g_data_analyst')"
-            :maxlength="60"
-          />
-        </div>
-        <div class="form-row">
-          <label class="form-label">{{ $t('common.description') }}</label>
-          <Input
-            v-model:value="form.description"
-            :placeholder="$t('agent.describe_the_agent_s_responsibility_in_one_sentence')"
-            :maxlength="200"
-          />
-        </div>
-        <div class="form-row">
-          <label class="form-label">{{ $t('agent.system_prompt') }}</label>
-          <Input.TextArea
-            v-model:value="form.system_prompt"
-            :rows="5"
-            :placeholder="$t('agent.define_the_agent_s_role_behavior_and_goals')"
-          />
-        </div>
-        <div class="form-row form-grid">
-          <div class="form-field">
-            <label class="form-label">{{ $t('agent.model') }}</label>
-            <Input
-              v-model:value="form.model"
-              placeholder="deepseek-chat"
-            />
-          </div>
-          <div class="form-field">
-            <label class="form-label">{{ $t('common.max_rounds') }}</label>
-            <InputNumber
-              v-model:value="form.max_turns"
-              :min="1"
-              :max="30"
-              class="w-full"
-            />
-          </div>
-          <div class="form-field">
-            <label class="form-label">{{ $t('errors.timeout_seconds') }}</label>
-            <InputNumber
-              v-model:value="form.timeout_seconds"
-              :min="10"
-              :max="3600"
-              class="w-full"
-            />
-          </div>
-          <div class="form-field">
-            <label class="form-label">Temperature</label>
-            <InputNumber
-              v-model:value="form.temperature"
-              :min="0"
-              :max="2"
-              :step="0.1"
-              class="w-full"
-            />
-          </div>
-          <div class="form-field">
-            <label class="form-label">Max Tokens</label>
-            <InputNumber
-              v-model:value="form.max_tokens"
-              :min="256"
-              :max="32768"
-              :step="512"
-              class="w-full"
-            />
-          </div>
-          <div class="form-field">
-            <label class="form-label">{{ $t('common.enable') }}</label>
-            <Switch v-model:checked="form.enabled" />
-          </div>
-        </div>
-        <div class="form-row">
-          <label class="form-label">{{ $t('agent.tools_json') }}</label>
-          <Input.TextArea
-            v-model:value="form.tools_text"
-            :rows="4"
-            :placeholder="$t('common.jsonexample', { jsonExample: '[{&quot;name&quot;:&quot;shell_exec&quot;,&quot;description&quot;:&quot;执行命令&quot;,&quot;parameters&quot;:{&quot;type&quot;:&quot;object&quot;,&quot;properties&quot;:{}}}]' })"
-            class="tools-input"
-          />
-          <ToolPicker v-model="form.tools_text" />
-        </div>
-        <div class="form-row">
-          <label class="form-label">{{ $t('knowledge.default_knowledge_base') }}</label>
-          <Select
-            v-model:value="formKbId"
-            :options="kbOptions.map(b => ({ value: b.id, label: b.name }))"
-            :loading="bindingLoading"
-            :placeholder="$t('knowledge.use_it_for_retrieval_when_dispatching_optional')"
-            allow-clear
-            show-search
-            option-filter-prop="label"
-            class="binding-select"
-          />
-        </div>
-        <div class="form-row">
-          <label class="form-label">{{ $t('agent.skill') }}</label>
-          <Select
-            v-model:value="formSkills"
-            mode="multiple"
-            :options="skillOptions.map(s => ({ value: s.name, label: s.name }))"
-            :loading="bindingLoading"
-            :placeholder="$t('agent.only_enable_selected_skills_blank_all_installed')"
-            allow-clear
-            show-search
-            option-filter-prop="label"
-            class="binding-select"
-          />
-        </div>
-        <div class="form-row">
-          <label class="form-label">{{ $t('common.plugin') }}</label>
-          <Select
-            v-model:value="formPlugins"
-            mode="multiple"
-            :options="pluginOptions.map(p => ({ value: p.name, label: p.name }))"
-            :loading="bindingLoading"
-            :placeholder="$t('agent.only_tools_from_these_plugins_blank_no_filter')"
-            allow-clear
-            show-search
-            option-filter-prop="label"
-            class="binding-select"
-          />
-        </div>
-      </div>
-    </Modal>
 
     <!-- ── 运行 Modal ── -->
     <Modal
@@ -1042,41 +1378,155 @@ function toolCount(a: Agent): number {
 </template>
 
 <style scoped>
-.agents-page { max-width: 1080px; margin: 0 auto; padding: 28px 24px 60px; }
-.result-actions { margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
+.agents-page { max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }
 .page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: 13px; }
-.agents-tabs :deep(.ant-tabs-nav) { margin-bottom: 20px; }
+.agents-tabs :deep(.ant-tabs-nav) { margin-bottom: 16px; }
 
-/* ── Agent 卡片 ── */
-.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
-.agent-card {
-  display: flex; flex-direction: column; gap: 12px;
-  padding: 18px 18px 14px;
+/* ── 两栏工作台 ── */
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+.pane {
   border: var(--hairline-width) solid var(--border-card);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-xl);
   background: var(--bg-card);
   box-shadow: var(--shadow-md);
-  transition: transform var(--dur-normal) ease, border-color var(--dur-normal) ease, box-shadow var(--dur-normal) ease;
+  min-width: 0;
 }
-.agent-card:hover { transform: translateY(-2px); border-color: var(--primary); box-shadow: var(--shadow-lg); }
-.agent-card.disabled { opacity: 0.6; }
-.card-avatar {
-  flex: none; width: 38px; height: 38px; border-radius: var(--sig-radius-card);
-  background: var(--primary-bg); color: var(--primary);
-  display: inline-flex; align-items: center; justify-content: center; font-size: 18px;
+.pane-list { display: flex; flex-direction: column; overflow: hidden; }
+.pane-head {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px;
+  border-bottom: var(--hairline-width) solid var(--border-subtle);
 }
-.card-name { display: block; font-size: 15px; font-weight: var(--fw-semibold); color: var(--text-primary); }
-.card-desc {
-  display: block; margin-top: 3px; font-size: 12px; color: var(--text-tertiary);
-  line-height: 1.5; overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
+.pane-search { width: 100%; }
+.group-nav { display: flex; flex-wrap: wrap; gap: 6px; }
+.group-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 8px;
+  border: var(--hairline-width) solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+.group-chip:hover { border-color: var(--primary); color: var(--text-primary); }
+.group-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.group-chip.active {
+  background: var(--primary-bg);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.group-count {
+  min-width: 18px;
+  padding: 0 4px;
+  border-radius: var(--radius-full);
+  background: var(--bg-secondary);
+  color: var(--text-tertiary);
+  font-size: var(--fs-xs);
+  text-align: center;
+}
+.group-chip.active .group-count { background: var(--bg-card); color: var(--primary); }
+
+.pane-body {
+  padding: 8px;
+  max-height: min(62vh, 720px);
+  overflow-y: auto;
+}
+.item-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.item {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px;
+  border: var(--hairline-width) solid transparent;
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: background var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+.item:hover { background: var(--bg-secondary); }
+.item:focus-visible { outline: 2px solid var(--primary); outline-offset: -1px; }
+.item.active {
+  background: var(--primary-bg);
+  border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+}
+.item.muted .item-name { color: var(--text-tertiary); }
+.item-avatar {
+  flex: none; width: 30px; height: 30px; border-radius: var(--radius-md);
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--primary-bg); color: var(--primary); font-size: 15px;
+}
+.item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.item-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.item-name {
+  font-size: var(--fs-base); font-weight: var(--fw-medium); color: var(--text-primary);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.item-tag { flex: none; margin-inline-end: 0; }
+.item-desc {
+  font-size: var(--fs-xs); color: var(--text-tertiary); line-height: var(--lh-normal);
+  overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
   -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
-.card-more { color: var(--text-tertiary); }
-.card-meta { display: flex; flex-wrap: wrap; gap: 4px; }
-.card-actions { display: flex; justify-content: flex-end; }
-.card-menu { min-width: 140px; border-radius: var(--sig-radius-card); padding: 4px; box-shadow: var(--shadow-lg); }
+.item-meta { display: flex; align-items: center; gap: 4px; font-size: var(--fs-xs); color: var(--text-tertiary); }
+.item-meta-dot { opacity: 0.6; }
+
+/* ── 右栏详情 ── */
+.pane-detail { padding: 18px 20px 20px; display: flex; flex-direction: column; gap: 14px; }
+.back-btn {
+  display: none; align-items: center; gap: 6px;
+  align-self: flex-start;
+  padding: 2px 0;
+  border: none; background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm); cursor: pointer;
+}
+.back-btn:hover { color: var(--primary); }
+.back-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.detail-placeholder { padding: 24px 0; }
+.detail-head { display: flex; align-items: flex-start; gap: 12px; }
+.detail-avatar {
+  flex: none; width: 42px; height: 42px; border-radius: var(--sig-radius-card);
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--primary-bg); color: var(--primary); font-size: 20px;
+}
+.detail-titles { flex: 1; min-width: 0; }
+.detail-name {
+  margin: 0;
+  font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.detail-sub {
+  margin: 3px 0 0;
+  font-size: var(--fs-sm); color: var(--text-tertiary); line-height: var(--lh-normal);
+}
+.detail-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.detail-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.detail-feedback { margin: 0; }
+.card-menu { min-width: 150px; border-radius: var(--sig-radius-card); padding: 4px; box-shadow: var(--shadow-lg); }
 .card-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: var(--radius-md); }
 .menu-icon { font-size: 14px; }
+
+/* ── 表单 ── */
+.editor-form { display: flex; flex-direction: column; gap: 12px; }
+.form-row { display: flex; flex-direction: column; gap: 6px; }
+.form-label { font-size: var(--fs-xs); font-weight: var(--fw-medium); color: var(--text-secondary); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.form-field { display: flex; flex-direction: column; gap: 6px; }
+.w-full { width: 100%; }
+.binding-select { width: 100%; }
+.tools-input :deep(textarea) { font-family: var(--font-mono); font-size: 12px; }
+.detail-footer {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding-top: 12px;
+  border-top: var(--hairline-width) solid var(--border-subtle);
+}
+.dirty-flag { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.dirty-flag.dirty { color: var(--warning); }
+.footer-actions { display: flex; align-items: center; gap: 8px; }
 
 /* ── 运行记录 ── */
 .session-list { display: flex; flex-direction: column; gap: 8px; }
@@ -1099,14 +1549,6 @@ function toolCount(a: Agent): number {
 .session-agent { font-size: 12px; color: var(--text-secondary); }
 .session-time { font-size: 12px; color: var(--text-tertiary); }
 
-/* ── 表单 ── */
-.editor-form { display: flex; flex-direction: column; gap: 12px; }
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.form-field { display: flex; flex-direction: column; gap: 6px; }
-.w-full { width: 100%; }
-.binding-select { width: 100%; }
-.tools-input :deep(textarea) { font-family: var(--font-mono); font-size: 12px; }
-
 /* ── 运行结果 ── */
 .run-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
 .run-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
@@ -1114,10 +1556,22 @@ function toolCount(a: Agent): number {
 .result-label { padding: 8px 12px; font-size: 12px; color: var(--text-tertiary); border-bottom: var(--hairline-width) solid var(--border-card); }
 .result-output { margin: 0; padding: 12px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
 .result-meta { display: flex; flex-wrap: wrap; gap: 4px; }
+.result-actions { margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ── 窄屏：单栏，列表为主；选中后进详情并带返回 ── */
+@media (max-width: 900px) {
+  .workspace { grid-template-columns: minmax(0, 1fr); }
+  .workspace .pane-detail { display: none; }
+  .workspace.has-selection .pane-list { display: none; }
+  .workspace.has-selection .pane-detail { display: flex; }
+  .back-btn { display: inline-flex; }
+  .pane-body { max-height: none; }
+}
 
 @media (max-width: 640px) {
   .agents-page { padding: 20px 16px 48px; }
   .form-grid { grid-template-columns: 1fr; }
+  .detail-actions { justify-content: flex-start; }
 }
 
 @media (max-width: 768px) {
