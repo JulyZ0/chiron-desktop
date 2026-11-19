@@ -247,6 +247,13 @@ const routes = [
         name: 'AdminMarketSources',
         component: () => import('../views/admin/MarketSourcesPanel.vue'),
         meta: { title: t('admin.market.page_title') },
+      // Python 依赖管理：pip list / PyPI 查询 / 安装（后台任务 + 轮询）/ 卸载。
+      // 懒加载，与其它 admin 页一致；后端要求平台 owner（见 internal/api/deps_admin.go）。
+      {
+        path: 'deps',
+        name: 'AdminDeps',
+        component: () => import('../views/admin/DepsView.vue'),
+        meta: { title: t('admin.deps_title') },
       },
       // ── 旧入口重定向（书签 / 文档 / 告警链接兼容）──
       { path: 'redis', redirect: { path: '/admin/datastores', query: { tab: 'redis' } } },

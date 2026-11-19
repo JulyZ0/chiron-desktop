@@ -41,7 +41,8 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   BulbOutlined,
-  
+  DownloadOutlined,
+
   MailOutlined,
 } from '@ant-design/icons-vue'
 
@@ -113,6 +114,8 @@ const menuGroups = computed(() => [
       { key: '/admin/knowledge', label: t('admin.knowledge.page_title'), icon: () => h(BookOutlined) },
       // 资源市场「外部源」：初装默认关闭；开启后本机才开始访问第三方 URL。
       { key: '/admin/market', label: t('admin.market.page_title'), icon: () => h(ShopOutlined) },
+      // Python 依赖管理：装/卸的是**引擎解释器**里的包，同样属于"让系统正确运转"。
+      { key: '/admin/deps', label: t('admin.deps_title'), icon: () => h(DownloadOutlined) },
     ],
   },
 ])

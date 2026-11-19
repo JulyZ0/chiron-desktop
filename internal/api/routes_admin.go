@@ -159,5 +159,9 @@ func registerAdminRoutes(
 	// 放开一条命令等于放开一类二进制，与 queue/flush 同口径。
 	mux.Handle("GET /v1/admin/plugin-allowlist", authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.GetPluginAllowlist)))))
 	mux.Handle("PUT /v1/admin/plugin-allowlist", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.UpdatePluginAllowlist)))))
+	// Python 依赖管理（pip list / PyPI 搜索 / 安装任务 / 卸载）。
+	// 独立文件 deps_admin.go：端点全部**代理到引擎**执行的 pip，权威实现与安全边界
+	// 都写在那里（python-engine/app/api/deps.py）。见该文件头。
+	registerDepsRoutes(mux, authMW, rlMW, pythonClient)
 
 }

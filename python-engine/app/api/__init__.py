@@ -7,6 +7,7 @@ from app.api.audio import router as audio_router
 from app.api.capabilities import router as capabilities_router
 from app.api.checkpoints import router as checkpoints_router
 from app.api.context import router as context_router
+from app.api.deps import router as deps_router
 from app.api.desktop_infer import router as desktop_infer_router
 from app.api.interactions import router as interactions_router
 from app.api.internal_knowledge import router as internal_knowledge_router
@@ -47,3 +48,5 @@ api_router.include_router(checkpoints_router)
 api_router.include_router(superagent_router)
 # 本地语音转写（POST /v1/audio/transcribe，见 app/api/audio.py）
 api_router.include_router(audio_router)
+# 后台「Python 依赖管理」：pip list / PyPI 搜索 / 安装任务 / 卸载（内部 token 鉴权）
+api_router.include_router(deps_router)
