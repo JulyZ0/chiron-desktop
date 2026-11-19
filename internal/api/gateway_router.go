@@ -369,6 +369,8 @@ func NewGatewayRouter(
 	registerSystemRoutes(mux, authMW, rlMW, sanitizeMW, toolHandler, systemHandler, traceHandler)
 	// 六大工作台互联：跨台最近活动聚合（租户+用户隔离）
 	mux.Handle("GET /v1/activities", authMW(rlMW(http.HandlerFunc(handleActivities))))
+	// 通知中心：只读 + 标已读（写入来自网关内部事件，见 notifications.go）
+	NewNotificationHandler().RegisterRoutes(mux, authMW, rlMW)
 	registerConversationRoutes(mux, conversationHandler, shareHandler, authMW, rlMW)
 	registerMediaRoutes(mux, mediaHandler, authMW, rlMW, cfg.StorageRoot)
 	registerPluginRoutes(mux, pluginHandler, authMW, rlMW)

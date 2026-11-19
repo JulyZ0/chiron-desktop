@@ -75,7 +75,74 @@ func StartSubagentEventsRelay(ctx context.Context, hub *broadcast.Hub) {
 					SessionID: sessionID,
 					Data:      payload,
 				})
+
+				// 子 Agent 失败 → 站内通知。
+				//
+				// 只在终态且非正常完成时落：这个中继是所有子 Agent 事件（status/text/
+				// reasoning/...）的公共入口，为每条写通知会把通知中心变成日志流。
+				// 去重靠 `event_id`（引擎逐条附带，多副本下 N 个网关都会看到同一条）。
+				if eventType == "subagent.done" {
+					maybeNotifySubagentFailed(ctx, payload)
+				}
 			}
 		}
 	}()
+}
+
+// maybeNotifySubagentFailed 把"子 Agent 以失败收尾"落成一条站内通知。
+//
+// ## 为什么从库里反查归属，而不是信 payload
+//
+// 引擎的 `SubagentEvent` 是**面向渲染**的（type/run_id/status/summary…），刻意不带
+// `user_id`/`tenant_id` —— 它经 Redis pub/sub 与 SSE 到浏览器，多带一个身份字段只是
+// 多一份可泄露的面。归归属的真相在 `subagent_runs`（引擎落库时写死了 tenant/user），
+// 所以这里按 run_id 回查。查不到就跳过：事件可能早于落库到达，而通知是旁路，
+// 不该为它等待、重试或反查第二次。
+//
+// ## 只认 failed / lost
+//
+// `completed` 与 `partial` 都不是"用户需要知道的事"（partial 的部分产出就在面板里）。
+// 把每条终态都写成通知，通知中心就成了运行日志 —— 那正好是它在 SaaS 残留里失败的方式。
+func maybeNotifySubagentFailed(ctx context.Context, payload map[string]interface{}) {
+	status, _ := payload["status"].(string)
+	if status != "failed" && status != "lost" {
+		return
+	}
+	runID, _ := payload["run_id"].(string)
+	if runID == "" || db.GlobalDBManager == nil {
+		return
+	}
+
+	var (
+		tenantID  int16
+		userID    string
+		errorCode string
+	)
+	// `error_code` 不在 payload 里：`SubagentEvent` 是面向渲染的，只有 status/summary；
+	// 而错误码是"用户该知道的那一句原因"，真相在引擎落库的 `subagent_runs` 里。
+	err := db.GlobalDBManager.QueryRow(ctx,
+		`SELECT tenant_id, COALESCE(user_id, ''), COALESCE(error_code, '')
+		 FROM subagent_runs WHERE id = $1`,
+		runID).Scan(&tenantID, &userID, &errorCode)
+	if err != nil || userID == "" {
+		return
+	}
+
+	sessionID, _ := payload["session_id"].(string)
+	profile, _ := payload["profile"].(string)
+
+	// dedupeKey 用 run_id：同一个 run 只会失败一次，重跑是新 run_id。
+	// 这一条**必须**有 —— 每个网关副本都订阅了同一条 Redis 通道。
+	insertNotification(ctx,
+		NotificationItem{
+			Kind:      NotifSubagentFailed,
+			SessionID: sessionID,
+			Payload: map[string]interface{}{
+				"run_id":     runID,
+				"status":     status,
+				"profile":    profile,
+				"error_code": errorCode,
+			},
+		},
+		tenantID, userID, "subagent_failed:"+runID)
 }

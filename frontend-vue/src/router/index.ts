@@ -117,6 +117,16 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    // 通知中心：账号菜单（components/accountMenu.ts）的 `notifications` 项一直
+    // 返回这个路径，但路由表里此前**没有**它 —— 点进去必然落到 404 兜底页。
+    // 后端是 `GET /v1/notifications`（internal/api/notifications.go），产生方只有
+    // 两个真实事件：子 Agent 失败、分享被管理员撤销。
+    path: '/notifications',
+    name: 'Notifications',
+    component: () => import('../views/NotificationsView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/knowledge/:id',
     name: 'KnowledgeDetail',
     component: () => import('../views/KnowledgeDetailView.vue'),
@@ -182,6 +192,12 @@ const routes = [
       // P1-2：发票审核 —— 与支付渠道同属「钱相关的运营动作」，故相邻。
       // P2-2c：套餐目录 —— 决定用户能买什么、平台收多少，同属商业化运营。
       // ── 数据存储（原「Redis 管理」+「数据库管理」合并）──
+      {
+        path: 'shares',
+        name: 'AdminShares',
+        component: () => import('../views/admin/SharesView.vue'),
+        meta: { title: t('admin.share_management') },
+      },
       {
         path: 'datastores',
         name: 'AdminDataStores',

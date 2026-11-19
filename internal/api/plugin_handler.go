@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -166,7 +167,7 @@ func (h *PluginHandler) Install(w http.ResponseWriter, r *http.Request) {
 		Forbidden(w, "plugin command not allowed")
 		return
 	}
-	if err := checkOperatorAllowlist(body.Command); err != nil {
+	if err := checkOperatorAllowlist(body.Command, h.cfg); err != nil {
 		Forbidden(w, "plugin command not allowed")
 		return
 	}
@@ -320,7 +321,7 @@ func (h *PluginHandler) Update(w http.ResponseWriter, r *http.Request) {
 				Forbidden(w, "plugin command not allowed")
 				return
 			}
-			if err := checkOperatorAllowlist(*body.Command); err != nil {
+			if err := checkOperatorAllowlist(*body.Command, h.cfg); err != nil {
 				Forbidden(w, "plugin command not allowed")
 				return
 			}
@@ -406,12 +407,21 @@ func (h *PluginHandler) Test(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
-	// 执行闸（deny-by-default）：命令形态 + 运维可选上界 + 用户总开关 + 该插件已授权
-	if err := checkPluginExecutionAllowed(*plugin, pf.CommandsEnabled); err != nil {
-		OK(w, map[string]interface{}{
+	// 执行闸（deny-by-default）：命令形态 + 放行名单 + 用户总开关 + 该插件已授权
+	if err := checkPluginExecutionAllowed(*plugin, pf.CommandsEnabled, h.cfg); err != nil {
+		resp := map[string]interface{}{
 			"ok": false, "message": err.Error(),
 			"duration_ms": time.Since(start).Milliseconds(),
-		})
+		}
+		// 命令被放行名单挡下时，前端要能就地弹「加入白名单」——
+		// 只给一句英文错误会让用户卡在"配置了插件却永远连不上"。
+		var allowErr *pluginAllowlistError
+		if errors.As(err, &allowErr) {
+			resp["code"] = "plugin_command_not_allowed"
+			resp["command"] = allowErr.Command
+			resp["from_env"] = allowErr.FromEnv
+		}
+		OK(w, resp)
 		return
 	}
 	// 参数校验：挡控制字符与路径穿越（命令白名单之外的补充，见 checkPluginArgsAllowed）。

@@ -649,7 +649,7 @@ func (m mcpMarketInstaller) Install(ctx context.Context, item market.Item, env m
 	if err := validatePluginCommandShape(p.Command); err != nil {
 		return nil, fmt.Errorf("%w: %v", market.ErrBadRequest, err)
 	}
-	if err := checkOperatorAllowlist(p.Command); err != nil {
+	if err := checkOperatorAllowlist(p.Command, m.plugins.cfg); err != nil {
 		return nil, fmt.Errorf("%w: %v", market.ErrBadRequest, err)
 	}
 	if err := checkPluginArgsAllowed(p.Args); err != nil {
@@ -758,7 +758,7 @@ func (s skillMarketInstaller) Install(ctx context.Context, item market.Item, _ m
 		return nil, fmt.Errorf("%w: skill payload is empty", market.ErrBadRequest)
 	}
 
-	target := "/v1/skills/install?scope=private" + identityQuery(claims)
+	target := withQuery("/v1/skills/install", "scope=private&"+identityQuery(claims))
 	var resp struct {
 		Skill map[string]any `json:"skill"`
 		Scope string         `json:"scope"`
@@ -791,7 +791,7 @@ func (s skillMarketInstaller) Uninstall(ctx context.Context, item market.Item, r
 	if name == "" {
 		return nil
 	}
-	target := "/v1/skills/" + url.PathEscape(name) + identityQuery(claims)
+	target := withQuery("/v1/skills/"+url.PathEscape(name), identityQuery(claims))
 	if err := s.py.DeleteJSON(ctx, target, nil); err != nil {
 		// 引擎侧已经没有这个技能（用户手工删过）→ 幂等成功；
 		// 其它失败如实上抛，避免"记录删了技能还在"。
@@ -843,7 +843,7 @@ func (k knowledgeMarketInstaller) Install(ctx context.Context, item market.Item,
 		"visibility":  visibility,
 	}
 	var resp map[string]any
-	if err := k.py.PostJSON(ctx, "/v1/kb"+identityQuery(claims), body, &resp); err != nil {
+	if err := k.py.PostJSON(ctx, withQuery("/v1/kb", identityQuery(claims)), body, &resp); err != nil {
 		// 引擎的 400 常带可操作原因（"请先在知识库设置中选择 provider"），
 		// classifyUpstream 会把它原样透成 400 而不是含糊的 502。
 		return nil, classifyUpstream("create knowledge base", err)
@@ -870,7 +870,7 @@ func (k knowledgeMarketInstaller) Uninstall(ctx context.Context, item market.Ite
 			"market_id", item.ID)
 		return nil
 	}
-	if err := k.py.DeleteJSON(ctx, "/v1/kb/"+url.PathEscape(kbID)+identityQuery(claims), nil); err != nil {
+	if err := k.py.DeleteJSON(ctx, withQuery("/v1/kb/"+url.PathEscape(kbID), identityQuery(claims)), nil); err != nil {
 		if isUpstreamNotFound(err) {
 			return nil
 		}
@@ -881,12 +881,18 @@ func (k knowledgeMarketInstaller) Uninstall(ctx context.Context, item market.Ite
 
 // ── 小工具 ──────────────────────────────────────────────────
 
-// identityQuery 构造 `?user_id=&tenant_id=`（引擎无鉴权，身份只能由网关注入；
+// identityQuery 构造 `user_id=&tenant_id=`（引擎无鉴权，身份只能由网关注入；
 // 引擎侧从 query 读这两个字段，见 python-engine/app/api/skills.py 与 knowledge.py）。
 //
-// 所有调用点的 path 都**不带**既有 query，因此首字符固定是 `?`。
+// **不带前导 `?`**，调用方一律经 `withQuery` 拼接。
+//
+// 历史缺陷：这里曾返回 `?user_id=…`，而 skill 安装的路径本身已带 `?scope=private`，
+// 于是拼出 `/v1/skills/install?scope=private?user_id=…&tenant_id=…` —— Python 把
+// `user_id` 当成了 `scope` 的一部分，只剩 `tenant_id` 一个身份字段，引擎中间件于是
+// 回 401 `Incomplete gateway identity: tenant_id and user_id are both required`。
+// 市场里"安装技能"因此必然失败，而错误文案指向的是鉴权，离真正的拼接缺陷很远。
 func identityQuery(claims *auth.Claims) string {
-	return "?user_id=" + url.QueryEscape(claims.UserID) +
+	return "user_id=" + url.QueryEscape(claims.UserID) +
 		"&tenant_id=" + url.QueryEscape(tenantStr(claims.TenantID))
 }
 

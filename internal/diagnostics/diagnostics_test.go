@@ -115,22 +115,6 @@ func TestCheckConfigOkForCompleteS3(t *testing.T) {
 	}
 }
 
-func TestCheckConfigFailsWhenSandboxServiceHasNoURL(t *testing.T) {
-	checks := CheckConfig(ConfigFacts{AppSecretSet: true, AppSecretLen: 40, SandboxBackend: "service"})
-	c, _ := find(checks, "config.sandbox")
-	if c.Status != StatusFail {
-		t.Fatalf("service sandbox without URL must fail: %+v", c)
-	}
-}
-
-func TestCheckConfigWarnsOnEmptyTrustedProxy(t *testing.T) {
-	checks := CheckConfig(ConfigFacts{AppSecretSet: true, AppSecretLen: 40})
-	c, _ := find(checks, "config.trusted_proxy")
-	if c.Status != StatusWarn {
-		t.Fatalf("empty TRUSTED_PROXY_CIDRS must warn: %+v", c)
-	}
-}
-
 func TestCheckDependenciesFailWhenUnreached(t *testing.T) {
 	checks := CheckDependencies([]Dep{
 		{ID: "dep.db", Title: "PostgreSQL", Reached: true, Detail: "ok"},
@@ -162,7 +146,7 @@ func TestEveryFailCarriesRemediation(t *testing.T) {
 	// 不变量：**fail 必须给补救办法** —— 只报"坏了"而不说怎么办，等于把问题丢回给用户。
 	facts := []ConfigFacts{
 		{}, // 几乎什么都没配
-		{AppSecretSet: true, AppSecretLen: 8, StorageBackend: "s3", SandboxBackend: "service"},
+		{AppSecretSet: true, AppSecretLen: 8, StorageBackend: "s3"},
 	}
 	for _, f := range facts {
 		for _, c := range CheckConfig(f) {

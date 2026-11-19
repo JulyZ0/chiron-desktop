@@ -1,13 +1,29 @@
 /**
- * Notification center (P2-3).
+ * Notification center.
  *
- * In-app notifications cannot be turned off; these strings only describe the
- * "also send an email" switch. That is why they talk about *email* rather than
- * *notifications* — calling it "turn off notifications" would read as if the
- * in-app entry disappeared too.
+ * ## Only events this repository actually produces
+ *
+ * The previous version copied four event kinds from the SaaS branch (payment
+ * succeeded / package expiring / quota changed / member invited) plus migration
+ * `0011` — but nothing here produces them: there is no payment, no package, no
+ * quota management. The account-menu entry pointed at a page that never existed,
+ * so "Notifications" was a guaranteed 404.
+ *
+ * The server (`internal/api/notifications.go`: the `notifications` table and its
+ * two writers) produces exactly the two kinds below. Adding a kind requires all
+ * three locale files, because the server stores `kind` + `payload`, never the
+ * rendered text.
+ *
+ * ## In-app notifications cannot be turned off
+ *
+ * Hence there is no "disable notifications" switch, only "mark as read". The
+ * former `prefs_*` (email preference) group is gone along with the email
+ * channel — this repository has no mail path, so leaving it in would send users
+ * looking for a setting that does not exist.
  */
 export default {
   title: 'Notifications',
+  subtitle: 'Failed sub-agents and share takedowns show up here.',
   unread_badge: 'Unread notifications',
   empty: 'No notifications yet',
   empty_unread: 'No unread notifications',
@@ -15,48 +31,28 @@ export default {
   filter_unread: 'Unread only',
   mark_all_read: 'Mark all as read',
   mark_read: 'Mark as read',
+  mark_read_failed: 'Failed to mark as read',
   marked_read: '{n} marked as read',
   nothing_to_mark: 'Nothing to mark as read',
   load_failed: 'Failed to load notifications',
-  view_detail: 'View',
+  view_detail: 'Open session',
+  refresh: 'Refresh',
+  unknown_title: 'Notification',
 
-  // Event types: used both as category labels and as preference switch titles.
-  // One-to-one with AllKinds in internal/notify.
+  // Event kinds: category labels in the list and the filter basis.
+  // One-to-one with NotifSubagentFailed / NotifShareRevoked in notifications.go.
   kind: {
-    payment_succeeded: 'Payment succeeded',
-    entitlement_expiring: 'Package expiring soon',
-    quota_changed: 'Quota changed',
-    member_invited: 'Joined a team',
+    subagent_failed: 'Sub-agent failed',
+    share_revoked: 'Share revoked',
   },
 
-  // ── Body templates ──
-  //
-  // Rendered client-side against the *current* UI language, so historical
-  // notifications follow a language switch too — that is why the server stores
-  // only kind + payload instead of rendered text (see 0011 note 6).
+  // Body templates, rendered against the *current* UI language, so historical
+  // notifications follow a language switch too.
   body: {
-    payment_succeeded: '{n} credits have been added to your balance.',
-    payment_succeeded_package: 'Package "{name}" is now active; {n} credits have been added. Entitlements are valid until {date}.',
-    entitlement_expiring: 'Package "{name}" expires on {date}; the related model entitlements will stop working after that. Buy a new package to keep using them.',
-    quota_changed: 'Tenant quota {action}: {resource} is now {n} (period {period}).',
-    quota_action_created: 'created',
-    quota_action_updated: 'updated',
-    member_invited: 'You joined the team "{name}" via an invitation. Your quota and available models are managed by that team.',
+    subagent_failed: 'Sub-task "{profile}" failed ({status}). Error code: {error_code}.',
+    subagent_failed_anonymous: 'A sub-task failed ({status}). Error code: {error_code}.',
+    share_revoked: 'The share link for "{title}" was revoked by an administrator; the old link no longer works.',
+    share_revoked_untitled: 'A conversation share link of yours was revoked by an administrator; the old link no longer works.',
+    no_detail: 'No further details.',
   },
-
-  // ── Title templates ──
-  title_payment_succeeded: 'Payment succeeded',
-  title_package_payment: 'Package purchased',
-  title_entitlement_expiring: 'Package expires within {n} day(s)',
-  title_quota_changed: 'Quota changed',
-  title_member_invited: 'Joined a team',
-
-  // ── Email preferences ──
-  prefs_title: 'Email notification settings',
-  prefs_jump: 'Email settings',
-  prefs_note: 'In-app notifications are always on; this only controls whether an email is sent as well.',
-  prefs_kind_email: 'Email alerts',
-  prefs_saved: 'Settings saved',
-  prefs_save_failed: 'Failed to save settings',
-  prefs_load_failed: 'Failed to load settings',
 }

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/athenavi/chiron/config"
 	"github.com/athenavi/chiron/internal/db"
 	"github.com/athenavi/chiron/internal/diagnostics"
 )
@@ -124,33 +123,15 @@ func (h *AdminHandler) configFacts() diagnostics.ConfigFacts {
 	f.JWTSecretSet = h.cfg.JWTSecret != ""
 	f.InternalSet = h.cfg.InternalToken != ""
 	f.DegradedMode = h.cfg.DegradedMode
-	f.TrustedProxy = h.cfg.TrustedProxyCIDRs
 	f.StorageBackend = h.cfg.StorageBackend
 	f.S3Endpoint = h.cfg.S3Endpoint
 	f.S3Bucket = h.cfg.S3Bucket
 	f.S3AccessKey = h.cfg.S3AccessKey != ""
 	f.S3SecretKey = h.cfg.S3SecretKey != ""
-	f.CORSOrigins = h.cfg.CORSOrigins
 	f.MetricsToken = h.cfg.MetricsToken != ""
 	f.PublicBaseURL = h.cfg.PublicBaseURL
 	f.CookieSecure = h.cfg.CookieSecure
-	f.RedisMode = redisModeOf(h.cfg)
-	// 沙箱模式是**引擎**的配置，网关这里读不到 —— 如实标成 skipped，
-	// 而不是猜一个值（猜错会把"没法确认"说成"配置有问题"）。
-	f.SandboxBackend = ""
-	f.SandboxURL = ""
 	return f
-}
-
-// redisModeOf 从配置推导 Redis 形态。
-//
-// 网关只看得到 sentinel 地址配没配（cluster 形态由部署/引擎侧决定），所以这里**只区分
-// sentinel 与 single** —— 拿不准的形态不猜，宁可少说一句也不误报。
-func redisModeOf(cfg *config.Config) string {
-	if cfg != nil && len(cfg.RedisSentinelAddrs) > 0 {
-		return "sentinel"
-	}
-	return "single"
 }
 
 // probeCapabilities 探测"功能上能不能用"（例如有没有可用模型）。

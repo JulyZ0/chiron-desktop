@@ -1,11 +1,26 @@
 /**
- * 通知中心（P2-3）。
+ * 通知中心。
  *
- * 约定：站内通知**不可关闭**，这里只描述"是否同时发邮件"的开关。所以文案里
- * 反复出现"邮件"而不是"通知"—— 说成"关闭通知"会让用户以为站内信也没了。
+ * ## 这里只列**本仓真实存在**的事件
+ *
+ * 旧版本这份文案照抄了 SaaS 分支的四类事件（支付成功 / 套餐到期 / 配额变更 /
+ * 加入团队）与 `0011` 迁移号 —— 而本仓没有任何代码产生它们（没有支付、没有套餐、
+ * 没有配额管理）。随之而来的账号菜单入口指向了一个不存在的页面，于是"通知中心"
+ * 一直是一条必然 404 的死链。
+ *
+ * 现在服务端（`internal/api/notifications.go` 的 `notifications` 表 + 两个写入方）
+ * 只产生下面两种，文案也一一对应。新增一种 kind 必须同时加三份文案，
+ * 否则界面会退回显示原始 key —— 服务端存的是 kind + payload，不是渲染结果。
+ *
+ * ## 站内通知不可关闭
+ *
+ * 因此这里没有"关闭通知"的开关，只有"标为已读"。曾经属于邮件偏好的
+ * `prefs_*` 一组已随邮件通道一起删除：本仓没有邮件出口，留着只会让用户
+ * 去找一个根本不存在的设置。
  */
 export default {
   title: '通知中心',
+  subtitle: '子 Agent 失败与分享处置会出现在这里。',
   unread_badge: '未读通知',
   empty: '暂无通知',
   empty_unread: '没有未读通知',
@@ -13,49 +28,27 @@ export default {
   filter_unread: '仅未读',
   mark_all_read: '全部标为已读',
   mark_read: '标为已读',
+  mark_read_failed: '标记已读失败',
   marked_read: '已标为 {n} 条已读',
   nothing_to_mark: '没有需要标记的通知',
   load_failed: '通知加载失败',
-  view_detail: '查看',
+  view_detail: '查看会话',
+  refresh: '刷新',
+  unknown_title: '通知',
 
-  // 事件类型：既是分类标签，也是偏好开关的标题。
-  // 与后端 internal/notify 的 AllKinds 一一对应。
+  // 事件类型：既是列表里的分类标签，也是筛选的依据。
+  // 与后端 notifications.go 的 NotifSubagentFailed / NotifShareRevoked 一一对应。
   kind: {
-    payment_succeeded: '支付成功',
-    entitlement_expiring: '套餐即将到期',
-    quota_changed: '配额变更',
-    member_invited: '已加入团队',
+    subagent_failed: '子 Agent 失败',
+    share_revoked: '分享被撤销',
   },
 
-  // ── 正文模板 ──
-  //
-  // 站内信按**当前界面语言**实时渲染，所以历史通知也会跟着语言切换 ——
-  // 这正是服务端只存 kind + payload 而不存渲染结果的原因（见 0011 取舍 6）。
-  // 这些模板与后端 `internal/notify/messages.go` 的同名模板必须同义：
-  // 站内信与邮件是同一条文案的两个出口，措辞漂移会让用户以为收到了两件事。
+  // 正文模板。按**当前界面语言**实时渲染，所以历史通知也会跟着语言切换。
   body: {
-    payment_succeeded: '充值 {n} credits 已到账。',
-    payment_succeeded_package: '套餐「{name}」已生效，{n} credits 已到账。权益有效期至 {date}。',
-    entitlement_expiring: '套餐「{name}」将于 {date} 到期，到期后相关模型权益将失效。如需继续使用请及时续购。',
-    quota_changed: '租户配额{action}：{resource} 为 {n}（周期 {period}）。',
-    quota_action_created: '已创建',
-    quota_action_updated: '已调整',
-    member_invited: '你已通过邀请加入团队「{name}」。你的额度与可用模型由该团队统一管理。',
+    subagent_failed: '子任务「{profile}」运行失败（{status}）。错误码：{error_code}。',
+    subagent_failed_anonymous: '有一个子任务运行失败（{status}）。错误码：{error_code}。',
+    share_revoked: '会话「{title}」的分享链接已被管理员撤销，原链接即刻失效。',
+    share_revoked_untitled: '你分享的一个会话链接已被管理员撤销，原链接即刻失效。',
+    no_detail: '无更多信息。',
   },
-
-  // ── 标题模板 ──
-  title_payment_succeeded: '支付成功',
-  title_package_payment: '套餐购买成功',
-  title_entitlement_expiring: '套餐将在 {n} 天内到期',
-  title_quota_changed: '配额已变更',
-  title_member_invited: '已加入团队',
-
-  // ── 邮件偏好 ──
-  prefs_title: '邮件通知设置',
-  prefs_jump: '邮件设置',
-  prefs_note: '站内通知始终开启，这里只控制是否同时发送邮件。',
-  prefs_kind_email: '邮件提醒',
-  prefs_saved: '设置已保存',
-  prefs_save_failed: '设置保存失败',
-  prefs_load_failed: '设置加载失败',
 }

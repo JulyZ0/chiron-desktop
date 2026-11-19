@@ -545,3 +545,27 @@ export async function getOnboardingFunnel(): Promise<OnboardingFunnel> {
   const { data } = await api.get('/v1/admin/onboarding/funnel')
   return data?.data ?? { entered: 0, finished: 0, finished_rate: 0, steps: [], steps_order: [] }
 }
+
+// ── 分享管理（租户内跨用户） ──
+
+export interface AdminShareItem {
+  share_id: string
+  session_id: string
+  user_id: string
+  user_email: string
+  title: string
+  message_count: number
+  created_at: string
+  expires_at: string
+}
+
+/** 列出本租户内全部**有效**分享（已撤销 / 已过期的不会返回） */
+export async function listAdminShares(): Promise<AdminShareItem[]> {
+  const { data } = await api.get('/v1/admin/shares')
+  return data?.data?.items ?? []
+}
+
+/** 按分享 id 直接撤销（不必知道会话 id）；公开链接随即 410 */
+export async function revokeAdminShare(shareId: string): Promise<void> {
+  await api.delete(`/v1/admin/shares/${encodeURIComponent(shareId)}`)
+}

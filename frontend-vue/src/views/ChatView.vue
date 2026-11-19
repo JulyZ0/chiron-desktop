@@ -3196,6 +3196,19 @@ function continueGeneration() {
               type="text"
               size="small"
               class="toolbar-btn"
+              :class="{ active: synapseMapOpen }"
+              :title="$t('chat.open_session_map')"
+              @click="synapseMapOpen = true"
+            >
+              <template #icon>
+                <PartitionOutlined />
+              </template>
+              <span class="toolbar-label">{{ $t('common.map') }}</span>
+            </Button>
+            <Button
+              type="text"
+              size="small"
+              class="toolbar-btn"
               :class="{ active: searchOpen }"
               :title="searchOpen ? $t('common.close_search') : $t('chat.search_in_this_session_text_and_reasoning')"
               @click="searchOpen ? closeSearch() : openSearch()"

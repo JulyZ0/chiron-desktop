@@ -28,6 +28,7 @@ import {
   TeamOutlined,
   SafetyOutlined,
   MedicineBoxOutlined,
+  ShareAltOutlined,
   ShopOutlined,
   BarChartOutlined,
   IdcardOutlined,
@@ -90,6 +91,9 @@ const menuGroups = computed(() => [
     key: 'g-access', label: t('common.access_security'),
     children: [
       { key: '/admin/api-keys', label: t('common.api_key_management'), icon: () => h(KeyOutlined) },
+      // 分享管理：会话公开链接的运营处置面（谁分享了什么、一键掐断）。
+      // 与 API Key 同属"访问安全"——都决定"外面能拿到什么"。
+      { key: '/admin/shares', label: t('admin.share_management'), icon: () => h(ShareAltOutlined) },
     ],
   },
   {
@@ -183,6 +187,26 @@ async function handleUserAction(info: MenuClickInfo) {
           </template>
         </Menu>
       </div>
+
+      <!-- 用户菜单（资料 / 主题 / 登出）：放在侧边栏底部而不是右上角。
+           右上角按要求不再出现头像；但登出与主题切换必须保留可达路径，
+           所以把入口下移到导航栏底部，与导航同处一条竖轴。 -->
+      <div class="sider-footer">
+        <Dropdown
+          :menu="{ items: userMenuItems, onClick: handleUserAction }"
+          placement="topLeft"
+        >
+          <button
+            type="button"
+            class="sider-user-btn"
+            :title="$t('admin.user_menu')"
+            :aria-label="$t('admin.user_menu')"
+          >
+            <UserOutlined />
+            <span v-if="!collapsed" class="sider-user-label">{{ $t('admin.user_menu') }}</span>
+          </button>
+        </Dropdown>
+      </div>
     </LayoutSider>
 
     <!-- 移动端抽屉 Sider -->
@@ -218,6 +242,24 @@ async function handleUserAction(info: MenuClickInfo) {
           </template>
         </Menu>
       </div>
+
+      <!-- 抽屉模式与桌面端一致：用户入口在导航底部 -->
+      <div class="sider-footer">
+        <Dropdown
+          :menu="{ items: userMenuItems, onClick: handleUserAction }"
+          placement="topLeft"
+        >
+          <button
+            type="button"
+            class="sider-user-btn"
+            :title="$t('admin.user_menu')"
+            :aria-label="$t('admin.user_menu')"
+          >
+            <UserOutlined />
+            <span class="sider-user-label">{{ $t('admin.user_menu') }}</span>
+          </button>
+        </Dropdown>
+      </div>
     </LayoutSider>
     <div
       v-if="isMobile && drawerOpen"
@@ -247,23 +289,6 @@ async function handleUserAction(info: MenuClickInfo) {
               {{ item.title }}
             </BreadcrumbItem>
           </Breadcrumb>
-        </div>
-        <div class="header-actions">
-          <!-- 通知与用户头像按要求移除；用户菜单（资料/主题/登出）保留为纯图标入口，
-               否则登出与主题切换会失去可达路径。 -->
-          <Dropdown
-            :menu="{ items: userMenuItems, onClick: handleUserAction }"
-            placement="bottomRight"
-          >
-            <button
-              type="button"
-              class="header-btn"
-              :title="$t('admin.user_menu')"
-              :aria-label="$t('admin.user_menu')"
-            >
-              <UserOutlined />
-            </button>
-          </Dropdown>
         </div>
       </LayoutHeader>
       <LayoutContent class="admin-content">
@@ -387,16 +412,28 @@ async function handleUserAction(info: MenuClickInfo) {
   font-weight: var(--fw-medium);
 }
 
-.header-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-.header-btn {
-  width: 40px;
-  height: 40px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--text-secondary);
+/* 侧边栏底部用户入口：右上角不再有头像，登出/主题的可达路径下移到这里。 */
+.sider-footer {
+  flex-shrink: 0;
+  padding: 8px;
+  border-block-start: var(--hairline-width) solid var(--border);
 }
-.header-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+.sider-user-btn {
+  width: 100%;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-inline: 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+.sider-user-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
+.sider-user-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── Content ── */
 .admin-content {

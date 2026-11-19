@@ -25,7 +25,7 @@ import {
   Alert, Button, Drawer, Input, Modal, Pagination, Segmented, Select, TabPane, Tabs, Tag, message,
 } from 'ant-design-vue'
 import {
-  AppstoreOutlined, ReloadOutlined, SearchOutlined,
+  ShopOutlined, ReloadOutlined, SearchOutlined,
 } from '@ant-design/icons-vue'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
@@ -524,7 +524,7 @@ function installFromDetail() {
     <EmptyState
       v-else-if="loadFailed"
       size="page"
-      :icon="AppstoreOutlined"
+      :icon="ShopOutlined"
       :description="$t('market.load_failed')"
       :hint="$t('market.load_failed_hint')"
     >
@@ -538,7 +538,7 @@ function installFromDetail() {
     <EmptyState
       v-else-if="isEmpty"
       size="page"
-      :icon="AppstoreOutlined"
+      :icon="ShopOutlined"
       :description="$t('market.empty.title')"
       :hint="$t('market.empty.hint')"
     />
@@ -822,11 +822,15 @@ function installFromDetail() {
 </template>
 
 <style scoped>
+/* 与工作台其它页（技能/插件/知识库/Agent）同一套容器口径：居中 + 1080 上限。
+   原先这里是全宽铺满，卡片在高分辨率下被拉成很宽的一条，反而不好扫读。 */
 .market-view {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 4px 2px 32px;
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 28px 24px 60px;
 }
 
 .header-text { min-width: 0; }
@@ -1021,5 +1025,18 @@ function installFromDetail() {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 8px;
+}
+
+/* 与技能/插件页同一套断点，避免市场页在窄屏上比邻居更挤或多出横向滚动。 */
+@media (max-width: 768px) {
+  .market-view { padding: 20px 16px 48px; }
+  .market-toolbar { flex-direction: column; align-items: stretch; }
+  .toolbar-right { width: 100%; }
+  .search-input { width: 100%; }
+  .tag-filter { min-width: 0; flex: 1; }
+}
+
+@media (max-width: 640px) {
+  .market-grid { grid-template-columns: 1fr; }
 }
 </style>

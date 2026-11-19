@@ -473,17 +473,9 @@ function pickSession(id: string) {
   >
     <!-- 顶部：会话选择器（主从钻取入口）+ 关闭 -->
     <div class="panel-toolbar">
-      <!-- 会话地图入口：地图是**独立的整屏大窗格**（侧栏太窄，装不下"空间记忆"），
-           所以这里只把请求抛给 ChatView，不在侧栏内渲染画布。 -->
-      <button
-        v-if="view === 'sessions'"
-        type="button"
-        class="session-back"
-        :title="$t('chat.open_session_map')"
-        @click="emit('open-map')"
-      >
-        {{ $t('common.map') }}
-      </button>
+      <!-- 会话地图入口曾在这里（仅切到「会话列表」时才出现的文字按钮）。
+           现在挂在对话页工具栏上常驻 —— 地图是「整屏」维度的东西，
+           不该藏在"先点会话列表、再找一个小按钮"两级之下。 -->
       <button
         v-if="view === 'trajectory'"
         type="button"

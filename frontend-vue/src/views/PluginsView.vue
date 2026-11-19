@@ -6,7 +6,7 @@ import {
 } from 'ant-design-vue'
 import {
   ThunderboltOutlined, DeleteOutlined, SearchOutlined,
-  EditOutlined, ExperimentOutlined, DownOutlined, UpOutlined, ShopOutlined,
+  EditOutlined, ExperimentOutlined, DownOutlined, UpOutlined, ShopOutlined, ApiOutlined,
   MessageOutlined, RobotOutlined,
 } from '@ant-design/icons-vue'
 import { api, listAgents } from '../api'
@@ -341,7 +341,7 @@ async function testPlugin(p: Plugin) {
         <EmptyState
           v-else-if="error"
           size="page"
-          :icon="markRaw(ThunderboltOutlined)"
+          :icon="markRaw(ApiOutlined)"
           :description="$t('errors.failed_to_load')"
           :hint="$t('common.unable_to_fetch_plugin_list_please_retry_later')"
         >
@@ -355,7 +355,7 @@ async function testPlugin(p: Plugin) {
         <EmptyState
           v-else-if="filtered.length === 0"
           size="page"
-          :icon="markRaw(ThunderboltOutlined)"
+          :icon="markRaw(ApiOutlined)"
           :description="searchQuery ? $t('common.no_matching_plugins') : $t('common.no_plugins')"
           :hint="searchQuery ? $t('common.try_adjusting_your_search_keywords') : $t('agent.install_plugins_from_the_market_to_get_started')"
         >
@@ -382,7 +382,7 @@ async function testPlugin(p: Plugin) {
             :class="{ inactive: p.status !== 'active' }"
           >
             <div class="card-top">
-              <span class="card-icon-tile"><ThunderboltOutlined /></span>
+              <span class="card-icon-tile"><ApiOutlined /></span>
               <div class="card-titles">
                 <span class="plugin-name">{{ p.name }}</span>
                 <span class="plugin-desc">{{ p.description || $t('common.no_description') }}</span>

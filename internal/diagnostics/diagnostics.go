@@ -146,21 +146,14 @@ type ConfigFacts struct {
 	JWTSecretSet  bool
 	InternalSet   bool
 	DegradedMode  bool
-	TrustedProxy  []string
 	StorageBackend string
 	S3Endpoint    string
 	S3Bucket      string
 	S3AccessKey   bool
 	S3SecretKey   bool
-	CORSOrigins   string
 	MetricsToken  bool
 	PublicBaseURL string
 	CookieSecure  bool
-	// RedisMode 取值 single / sentinel / cluster（来自部署配置）。
-	RedisMode string
-	// SandboxBackend 是**引擎**的沙箱模式（service / local）。
-	SandboxBackend string
-	SandboxURL     string
 }
 
 // CheckConfig 对配置事实做卫生检查（**纯函数**）。
@@ -206,15 +199,6 @@ func CheckConfig(f ConfigFacts) []Check {
 			"未开启：Redis 等依赖不可用时会拒绝启动（fail-closed）。", "")
 	}
 
-	if len(f.TrustedProxy) == 0 {
-		add("config.trusted_proxy", "TRUSTED_PROXY_CIDRS", CategoryConfig, StatusWarn,
-			"未配置受信代理网段。",
-			"经反向代理/LB 部署时必填：否则 IP 限流可被伪造（X-Forwarded-For 被采信），且 SSO 公开列表会 fail-closed 返回空。")
-	} else {
-		add("config.trusted_proxy", "TRUSTED_PROXY_CIDRS", CategoryConfig, StatusOK,
-			"已配置受信代理网段，X-Forwarded-For 仅在来自这些网段时被采信。", "")
-	}
-
 	// 存储：cloud S3 需要端点/桶/凭据齐全；local 不需要。
 	if f.StorageBackend == "s3" {
 		var missing []string
@@ -243,31 +227,6 @@ func CheckConfig(f ConfigFacts) []Check {
 			"STORAGE_BACKEND="+orDash(f.StorageBackend)+"（非 S3，使用本地存储）。", "")
 	}
 
-	// 沙箱：引擎默认 service 且 fail-closed，端点配错 ⇒ 引擎拒绝启动。
-	if f.SandboxBackend == "service" {
-		if f.SandboxURL == "" {
-			add("config.sandbox", "执行沙箱（引擎侧）", CategoryConfig, StatusFail,
-				"SANDBOX_BACKEND=service 但 SANDBOX_SERVICE_URL 为空。",
-				"设置沙箱服务地址（如 http://sandbox-service:8001）。引擎默认 fail-closed：探测失败会拒绝启动。")
-		} else {
-			add("config.sandbox", "执行沙箱（引擎侧）", CategoryConfig, StatusOK,
-				"SANDBOX_BACKEND=service，已配置服务地址。", "")
-		}
-	} else {
-		add("config.sandbox", "执行沙箱（引擎侧）", CategoryConfig, StatusWarn,
-			"SANDBOX_BACKEND="+orDash(f.SandboxBackend)+"：未使用服务化沙箱。",
-			"local 模式会牺牲执行隔离。生产建议 backend=service。")
-	}
-
-	// CORS：留空在生产会导致"前端调不通"，但开发常用。
-	if f.CORSOrigins == "" {
-		add("config.cors", "CORS_ORIGINS", CategoryConfig, StatusWarn,
-			"未配置跨域白名单。",
-			"同源部署（前端反代网关）可忽略；前后端分域部署必须填前端来源。")
-	} else {
-		add("config.cors", "CORS_ORIGINS", CategoryConfig, StatusOK, "已配置跨域白名单。", "")
-	}
-
 	// Cookie Secure 与部署协议必须一致，否则登录态挂了却看不出原因。
 	if f.PublicBaseURL != "" && !f.CookieSecure {
 		add("config.cookie_secure", "Cookie Secure 与部署协议", CategoryConfig, StatusWarn,
@@ -276,16 +235,6 @@ func CheckConfig(f ConfigFacts) []Check {
 	} else {
 		add("config.cookie_secure", "Cookie Secure 与部署协议", CategoryConfig, StatusOK,
 			"与部署协议一致。", "")
-	}
-
-	// 多副本 Redis 形态（单实例在多副本下是可用性单点，但不算"配置错误"，只提示）。
-	if f.RedisMode == "" || f.RedisMode == "single" {
-		add("config.redis_mode", "Redis 形态", CategoryConfig, StatusWarn,
-			"Redis 为单实例（single）。",
-			"多副本生产建议 sentinel 或 cluster：Redis 不可用会触发依赖门禁（拒绝启动/摘流量）。")
-	} else {
-		add("config.redis_mode", "Redis 形态", CategoryConfig, StatusOK,
-			"Redis 形态："+f.RedisMode+"。", "")
 	}
 
 	return out

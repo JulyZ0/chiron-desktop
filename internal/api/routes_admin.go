@@ -91,6 +91,12 @@ func registerAdminRoutes(
 	mux.Handle("POST /v1/admin/queue/flush", authMW(rlMW(platformWriteMW(adminStrip))))
 	mux.Handle("POST /v1/admin/queue/pause", authMW(rlMW(platformWriteMW(adminStrip))))
 
+	// 分享管理：列出租户内全部有效分享、按分享 id 直接撤销。
+	// 读用 platformReadMW、撤销用 platformWriteMW —— 撤销会让一条已发出的公开链接
+	// **立刻 410**，是改变对外可见性的写操作，与 queue/flush 同口径。
+	mux.Handle("GET /v1/admin/shares", authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.ListShares)))))
+	mux.Handle("DELETE /v1/admin/shares/{id}", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.RevokeShare)))))
+
 	// Cache admin routes
 	mux.Handle("GET /v1/admin/cache/stats", authMW(rlMW(platformReadMW(adminStrip))))
 

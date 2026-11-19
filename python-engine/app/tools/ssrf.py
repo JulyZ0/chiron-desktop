@@ -13,6 +13,7 @@ web_fetch/web_search/skill_install 等出站 HTTP 的目标 host 解析后，
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -202,18 +203,67 @@ def _command_path_ok(command: str) -> bool:
     return command.startswith("/") or bool(re.match(r"^[A-Za-z]:[\\/]", command))
 
 
+_ALLOWLIST_FILE_NAME = "command_allowlist.json"
+
+
+def _allowlist_file_path():
+    """白名单文件位置（每次调用时解析，保证后台改了 `PLUGIN_DATA_DIR` 也跟随）。"""
+    from app.plugins.store import plugin_data_dir
+
+    return plugin_data_dir() / _ALLOWLIST_FILE_NAME
+
+
+def plugin_allowlist_file_entries() -> frozenset[str]:
+    """读**后台可编辑**的白名单（`{PLUGIN_DATA_DIR}/command_allowlist.json`）。
+
+    与 Go 网关 `internal/api/plugin_allowlist.go` 读的是**同一份文件**：两侧本就共享
+    `PLUGIN_DATA_DIR`（见 app/plugins/store.py 的 plugin_data_dir），所以管理员在后台
+    加白后引擎无需重启就能拉起命令 —— 否则会出现"测试连接通过、真正连又报错"。
+
+    文件不存在 / 损坏 / 条目非法一律**跳过**，返回空集：调用方按"该来源未配置"处理，
+    绝不能因为读失败而放开（那是 fail-open）。条目只接受**裸 basename**，与 Go 侧
+    `normalizePluginCommandName` 同一约束 —— 带分隔符的条目等于开一条任意路径放行通道。
+    """
+    try:
+        from app.plugins.store import plugin_data_dir
+    except Exception:  # noqa: BLE001 — 导入失败只该让这一来源失效
+        return frozenset()
+    try:
+        path = plugin_data_dir() / _ALLOWLIST_FILE_NAME
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return frozenset()
+    if not isinstance(doc, dict):
+        return frozenset()
+    commands = doc.get("commands")
+    if not isinstance(commands, list):
+        return frozenset()
+    out: set[str] = set()
+    for raw in commands:
+        if not isinstance(raw, str):
+            continue
+        name = raw.strip()
+        # 与 _command_path_ok 的"裸名"口径一致，但这里更严：条目**只**允许裸名。
+        if not name or re.search(r"[\\/\x00\r\n]", name) or name in {".", ".."}:
+            continue
+        out.add(name)
+    return frozenset(out)
+
+
 def command_allowed(command: str) -> bool:
-    """插件命令白名单（与 Go 网关 PLUGIN_COMMAND_ALLOWLIST 保持一致）：
+    """插件命令白名单（与 Go 网关保持一致，口径是 **env ∪ 后台文件**）：
     仅允许白名单内的可执行文件 basename 被拉起为 MCP 插件进程；
-    未配置（空）时禁止所有自定义插件命令（安全默认，防任意命令执行）。
+    两侧都没配置（空）时禁止所有自定义插件命令（安全默认，防任意命令执行）。
 
     路径规则：只接受**裸 basename**（走 PATH）或**绝对路径**；拒绝相对路径、`..`
     与 UNC —— 见 `_command_path_ok`。
     """
     raw = os.getenv("PLUGIN_COMMAND_ALLOWLIST", "").strip()
-    if not raw:
-        return False
     allowed = {part.strip() for part in raw.split(",") if part.strip()}
+    allowed |= plugin_allowlist_file_entries()
+    if not allowed:
+        return False
     if not _command_path_ok(command):
         return False
     base = os.path.basename(command)

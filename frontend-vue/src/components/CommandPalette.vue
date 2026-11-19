@@ -26,8 +26,9 @@ import {
   MessageOutlined,
   RobotOutlined,
   ThunderboltOutlined,
+  ShopOutlined,
+  ApiOutlined,
   BookOutlined,
-  AppstoreOutlined,
   BulbOutlined,
   ConsoleSqlOutlined,
   PlusOutlined,
@@ -91,7 +92,7 @@ const workstationActions: PaletteEntry[] = [
   { id: 'ws_agents', group: tr('common.workstation'), label: WORKSTATION_LABELS.agent, desc: WORKSTATION_DESCRIPTIONS.agent, keywords: tr('workflow.agent_agentic_collaboration_task'), icon: markRaw(RobotOutlined), run: () => void router.push(WORKSTATION_ROUTES.agent) },
   { id: 'ws_skills', group: tr('common.workstation'), label: WORKSTATION_LABELS.skill, desc: WORKSTATION_DESCRIPTIONS.skill, keywords: tr('agent.skill_mcp_tool'), icon: markRaw(ThunderboltOutlined), run: () => void router.push(WORKSTATION_ROUTES.skill) },
   { id: 'ws_knowledge', group: tr('common.workstation'), label: WORKSTATION_LABELS.knowledge, desc: WORKSTATION_DESCRIPTIONS.knowledge, keywords: tr('knowledge.knowledge_rag_retrieval_document'), icon: markRaw(BookOutlined), run: () => void router.push(WORKSTATION_ROUTES.knowledge) },
-  { id: 'ws_plugins', group: tr('common.workstation'), label: WORKSTATION_LABELS.plugin, desc: WORKSTATION_DESCRIPTIONS.plugin, keywords: tr('common.plugin_extension'), icon: markRaw(AppstoreOutlined), run: () => void router.push(WORKSTATION_ROUTES.plugin) },
+  { id: 'ws_plugins', group: tr('common.workstation'), label: WORKSTATION_LABELS.plugin, desc: WORKSTATION_DESCRIPTIONS.plugin, keywords: tr('common.plugin_extension'), icon: markRaw(ApiOutlined), run: () => void router.push(WORKSTATION_ROUTES.plugin) },
 ]
 
 // ── 静态动作：通用操作 ──

@@ -11,7 +11,7 @@
  * 改键状态是模块级共享的（见 `useKeyboardShortcuts.ts` 的 `overrideStores`），
  * 所以在这里改完，回到会话页立刻生效，不需要重新挂载。
  */
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { Button, message } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import {
@@ -42,7 +42,6 @@ const isMac = typeof navigator !== 'undefined'
 const recordingId = ref<string | null>(null)
 
 const GROUPS: readonly ShortcutGroup[] = ['navigation', 'conversation', 'panel']
-
 const grouped = computed(() =>
   GROUPS.map(group => ({
     group,
@@ -79,15 +78,33 @@ function stopRecording() {
 /**
  * 录制期间的按键处理。
  *
- * `prevent` + `stop` 都要：prevent 挡住浏览器默认（如 Ctrl+F 的页面查找），
- * stop 挡住事件继续冒泡到 window 上的全局注册表。
+ * 挂在 `document` 的 **capture 阶段**，而不是录制按钮自己的 `@keydown`：
+ *
+ *  1) 原来的写法有个必现缺陷 —— 录制态与普通态是两个不同的元素（`v-if` / `v-else`），
+ *     点「改键」后 Vue 卸载旧按钮、挂载新按钮，焦点随之落回 `<body>`，之后按下的键
+ *     **根本不会经过那个按钮**，`@keydown` 永不触发 —— 表现就是"改键点了没反应"。
+ *     capture 阶段在 document 上收事件，与焦点在哪里无关。
+ *  2) 它还顺带压过 `window` 上的全局注册表（`useKeyboardShortcuts` 在冒泡阶段监听
+ *     `window`）：录制时按 Ctrl+K 只该被记成新键，不该同时弹出命令面板。
  */
-function onRecordKeydown(e: KeyboardEvent, spec: ShortcutSpec) {
+function onRecordKeydown(e: KeyboardEvent) {
+  const id = recordingId.value
+  if (!id) return
+  const spec = SHORTCUT_CATALOG.find(s => s.id === id)
+  if (!spec) return
+
+  // 录制期间的所有按键都归这里，先拦掉浏览器默认行为（如 Ctrl+F 的页面查找）
+  // 和默认冒泡（否则全局注册表会跟着响应）。
+  e.preventDefault()
+  e.stopPropagation()
+
   if (e.key === 'Escape') {
     // Esc 是"取消录制"，不能拿来当新键 —— 它被逐层关闭占用着一整条链
     stopRecording()
     return
   }
+  // 输入法组合期间不记键：此时 e.key 是中间态
+  if (e.isComposing) return
 
   const combo = eventToCombo(e, isMac)
   // 只按了修饰键：用户还没按完，继续等
@@ -103,6 +120,12 @@ function onRecordKeydown(e: KeyboardEvent, spec: ShortcutSpec) {
   }
 }
 
+/** 录制开关与 document 监听同生共死 —— 漏摘会留下一个持续吞键的监听器。 */
+watch(recordingId, (id, prev) => {
+  if (prev && !id) document.removeEventListener('keydown', onRecordKeydown, true)
+  if (id && !prev) document.addEventListener('keydown', onRecordKeydown, true)
+})
+
 function resetOne(spec: ShortcutSpec) {
   prefs.resetKeys(spec.id)
 }
@@ -112,7 +135,10 @@ function resetAll() {
   message.success(t('settings.shortcut_reset_all'))
 }
 
-onUnmounted(stopRecording)
+onUnmounted(() => {
+  document.removeEventListener('keydown', onRecordKeydown, true)
+  recordingId.value = null
+})
 </script>
 
 <template>
@@ -150,14 +176,15 @@ onUnmounted(stopRecording)
             {{ $t('settings.shortcut_reset') }}
           </Button>
 
-          <!-- 录制态：键盘可直接输入，鼠标点击也能进入 -->
+          <!-- 录制态：按键由 document 上的 capture 监听收取（见 onRecordKeydown 注释），
+               所以这里不挂 @keydown —— 焦点在不在这个按钮上都一样能录到。
+               点一下按钮本身 = 取消录制。 -->
           <Button
             v-if="recordingId === spec.id"
             size="small"
             type="primary"
             class="shortcut-key recording"
             @click="stopRecording"
-            @keydown.prevent.stop="onRecordKeydown($event, spec)"
           >
             {{ $t('settings.shortcut_recording') }}
           </Button>
@@ -168,7 +195,6 @@ onUnmounted(stopRecording)
             :disabled="spec.customizable === false"
             :title="spec.customizable === false ? $t('settings.shortcut_not_customizable') : $t('settings.shortcut_change')"
             @click="startRecording(spec)"
-            @keydown.prevent.stop="onRecordKeydown($event, spec)"
           >
             {{ keysLabel(spec) }}
           </Button>

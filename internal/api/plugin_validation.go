@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/athenavi/chiron/config"
 )
 
 // allowedPluginCommands 返回 PLUGIN_COMMAND_ALLOWLIST 环境变量配置的命令白名单
@@ -73,12 +75,33 @@ func validatePluginCommandShape(command string) error {
 	}
 	return nil
 }
-// checkOperatorAllowlist 运维级命令白名单（**可选上界**）。
+// pluginAllowlistError 表示"命令合法，但不在放行名单里"。
 //
-// 未配置 PLUGIN_COMMAND_ALLOWLIST ⇒ 不下发限制（授权交给**用户级**总开关 + 每插件确认）；
-// 配置了 ⇒ 命令 basename 必须命中，运维可用它对整台网关收紧可执行命令集。
-func checkOperatorAllowlist(command string) error {
-	allowed := allowedPluginCommands()
+// 单独成类型而不是普通 fmt.Errorf：调用方（/test）要据此返回**结构化**信息，
+// 让前端能就地弹「加入白名单」，而不是把用户丢到一句无从下手的英文错误里。
+type pluginAllowlistError struct {
+	// Command 是命令的 basename（弹窗里要加白的就是它）。
+	Command string
+	// FromEnv 为 true 表示该条来自部署环境变量，后台改了也不生效（需改 env 并重启）。
+	FromEnv bool
+}
+
+func (e *pluginAllowlistError) Error() string {
+	if e.FromEnv {
+		return fmt.Sprintf("plugin command %q is not allowed: it is restricted by the operator "+
+			"allowlist in this deployment (PLUGIN_COMMAND_ALLOWLIST), ask an administrator to add it",
+			e.Command)
+	}
+	return fmt.Sprintf("plugin command %q is not allowed: add it to the plugin command allowlist "+
+		"in admin settings, then retry", e.Command)
+}
+
+// checkOperatorAllowlist 运维级命令白名单（**可选上界**，env ∪ 后台文件）。
+//
+// 两侧都没配 ⇒ 不下发限制（授权交给**用户级**总开关 + 每插件确认）；
+// 任一非空 ⇒ 命令 basename 必须命中。后台文件改动即时生效，无需重启。
+func checkOperatorAllowlist(command string, cfg *config.Config) error {
+	allowed := effectivePluginCommands(cfg)
 	if allowed == nil {
 		return nil
 	}
@@ -91,30 +114,32 @@ func checkOperatorAllowlist(command string) error {
 		base = command[i+1:]
 	}
 	if !allowed[base] {
-		return fmt.Errorf("plugin command %q not in operator allowlist (PLUGIN_COMMAND_ALLOWLIST)", base)
+		return &pluginAllowlistError{Command: base}
 	}
 	return nil
 }
 // checkPluginExecutionAllowed 是**执行**插件前的完整闸门（deny-by-default，四层）：
 //
 //  1. 命令形态合法（validatePluginCommandShape）；
-//  2. 运维可选上界命中（checkOperatorAllowlist，未配置即不限制）；
+//  2. 放行名单命中（checkOperatorAllowlist，env ∪ 后台白名单，两侧都没配即不限制）；
 //  3. 用户级总开关 commands_enabled 已开启；
 //  4. 该插件已被用户**一次性授权**（approved）。
 //
 // 创建/更新插件**不**走这里 —— 允许保存配置（未授权状态），只有真正执行才需全部通过。
-func checkPluginExecutionAllowed(plugin MCPPlugin, commandsEnabled bool) error {
+func checkPluginExecutionAllowed(plugin MCPPlugin, commandsEnabled bool, cfg *config.Config) error {
 	if err := validatePluginCommandShape(plugin.Command); err != nil {
 		return err
 	}
-	if err := checkOperatorAllowlist(plugin.Command); err != nil {
+	if err := checkOperatorAllowlist(plugin.Command, cfg); err != nil {
 		return err
 	}
 	if !commandsEnabled {
-		return fmt.Errorf("plugin command execution is disabled for this user: enable it in the plugin settings first")
+		return fmt.Errorf("plugin command execution is disabled for this user: " +
+			"turn on \"allow plugin commands\" on the plugins page first")
 	}
 	if !plugin.Approved {
-		return fmt.Errorf("plugin %q is not approved: approve it before executing", plugin.Name)
+		return fmt.Errorf("plugin %q is not authorized yet: "+
+			"click \"authorize\" on its card before testing", plugin.Name)
 	}
 	return nil
 }

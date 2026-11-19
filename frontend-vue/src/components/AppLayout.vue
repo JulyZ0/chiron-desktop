@@ -29,8 +29,7 @@ import {
   SettingOutlined,
   HistoryOutlined,
   RobotOutlined,
-  AppstoreOutlined,
-  
+  ShopOutlined,
   ApiOutlined,
 } from '@ant-design/icons-vue'
 import CommandPalette from './CommandPalette.vue'
@@ -106,9 +105,11 @@ const menuItems = computed<MenuItem[]>(() => {
     { key: '/media', label: tr('common.media'), icon: () => h(PictureOutlined) },
     { key: WORKSTATION_ROUTES.knowledge, label: WORKSTATION_LABELS.knowledge, icon: () => h(BookOutlined) },
     // 资源市场：知识库之后 —— 「看已有知识」到「找更多资源」是相邻的一步。
-    { key: '/market', label: tr('market.nav'), icon: () => h(AppstoreOutlined) },
+    // 市场用「商店」、插件用「接口/扩展」、技能用「闪电」——三者在导航里必须一眼可分。
+    // 原先市场与插件用的是同一个图标，用户无法靠图标区分这两个入口。
+    { key: '/market', label: tr('market.nav'), icon: () => h(ShopOutlined) },
     { key: '/memory', label: tr('memory.memory_2'), icon: () => h(HistoryOutlined) },
-    { key: WORKSTATION_ROUTES.plugin, label: WORKSTATION_LABELS.plugin, icon: () => h(ThunderboltOutlined) },
+    { key: WORKSTATION_ROUTES.plugin, label: WORKSTATION_LABELS.plugin, icon: () => h(ApiOutlined) },
     // 计费页已收窄为「本地用量统计」，本地模式同样需要入口，不再按模式隐藏。
     { key: '/billing', label: tr('billing.billing'), icon: () => h(CreditCardOutlined) },
     ...(authStore.isAdmin
@@ -191,8 +192,8 @@ const dockItems: DockItem[] = [
   { key: WORKSTATION_ROUTES.agent, label: WORKSTATION_LABELS.agent, desc: WORKSTATION_DESCRIPTIONS.agent, icon: RobotOutlined },
   { key: WORKSTATION_ROUTES.skill, label: WORKSTATION_LABELS.skill, desc: WORKSTATION_DESCRIPTIONS.skill, icon: ThunderboltOutlined },
   { key: WORKSTATION_ROUTES.knowledge, label: WORKSTATION_LABELS.knowledge, desc: WORKSTATION_DESCRIPTIONS.knowledge, icon: BookOutlined },
-  { key: '/market', label: tr('market.nav'), desc: tr('market.subtitle'), icon: AppstoreOutlined },
-  { key: WORKSTATION_ROUTES.plugin, label: WORKSTATION_LABELS.plugin, desc: WORKSTATION_DESCRIPTIONS.plugin, icon: AppstoreOutlined },
+  { key: '/market', label: tr('market.nav'), desc: tr('market.subtitle'), icon: ShopOutlined },
+  { key: WORKSTATION_ROUTES.plugin, label: WORKSTATION_LABELS.plugin, desc: WORKSTATION_DESCRIPTIONS.plugin, icon: ApiOutlined },
 ]
 
 const showDock = computed(() => !!authStore.token && route.path !== '/')
