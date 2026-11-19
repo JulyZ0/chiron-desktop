@@ -925,6 +925,7 @@ export default {
     speed: "语速",
     preview: "预览",
     preview_truncated: "预览已截断",
+    n_more_items_above: "上方还有 {n} 条更早的内容未显示（「事件流」里可看全部）",
     original_size_0: "原始大小（0）",
     reason: "原因",
     allow: "允许",

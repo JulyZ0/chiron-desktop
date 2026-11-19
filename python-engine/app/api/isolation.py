@@ -95,13 +95,22 @@ def _actor(request: Request) -> str:
 class LevelChange(BaseModel):
     """切换请求。
 
-    ``level`` 只接受四个档位字面值。低于硬底线的值**允许传**（不在这里拒绝），
-    因为 ``resolve_level`` 会把它抬到底线并在 ``reasons`` 里说明 —— 拒绝会让前端
-    无法展示"你请求了 none，实际跑 low_il"这条重要信息。
+    ``level`` 只接受五个档位字面值。低于安全底线的值**允许传**：``job`` 直接生效，
+    ``none`` 需要 ``acknowledge_below_floor=true`` —— 不传就被抬到底线，并在
+    ``reasons`` 里说明。这里不拒绝，因为拒绝会让前端无法展示"你请求了 none，
+    实际跑 low_il"这条重要信息。
     """
 
-    level: str = Field(..., description="none | job | low_il | appcontainer")
+    level: str = Field(..., description="none | job | low_il | restricted | appcontainer")
     reason: str = Field("", max_length=500, description="为什么改，写进审计")
+    #: "我确实要这个低于安全底线的档位"的显式声明。
+    #:
+    #: 只对**当前请求的那个档位**有效（见 `iso.resolve_level` 的 ① 段）：
+    #: 用户确认一次 `none` 不会让之后配置里任何低档位都被放行。
+    acknowledge_below_floor: bool = Field(
+        False,
+        description="低于安全底线的档位（如 none）必须显式确认为 true 才生效",
+    )
 
 
 @router.get("/isolation")
@@ -138,7 +147,7 @@ async def set_isolation(body: LevelChange, request: Request) -> dict[str, Any]:
     config_level = iso.configured_level()
     previous_decision = iso.resolve_level()
 
-    iso.set_runtime_level(level)
+    iso.set_runtime_level(level, acknowledge_below_floor=body.acknowledge_below_floor)
     decision = iso.resolve_level()
 
     iso.record_level_change(

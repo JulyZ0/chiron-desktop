@@ -910,6 +910,7 @@ export default {
     speed: "Speed",
     preview: "Preview",
     preview_truncated: "Preview truncated",
+    n_more_items_above: "{n} earlier items are not shown (see the Events tab for all)",
     original_size_0: "Original size (0)",
     reason: "Reason",
     allow: "Allow",

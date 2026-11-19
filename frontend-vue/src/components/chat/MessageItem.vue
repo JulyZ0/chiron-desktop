@@ -44,6 +44,13 @@ const props = defineProps<{
   /** 是否播放一次入场动效。由父组件按「新到的 id」门控 ——
    *  transcript 是窗口化的，滚出再滚回会重新挂载行，不门控就会反复重播。 */
   entering?: boolean
+  /**
+   * 是否在工具结果上给「在对照栏中查看这个子 Agent」的入口。
+   *
+   * 由**有对照栏的那一处**（主对话流）传 true；只读回放（参考栏）不传 ——
+   * 那里没有对照栏可开，画一个点了没反应的按钮比不画更糟。
+   */
+  canOpenSubagent?: boolean
 }>()
 
 /** 正文容器：mermaid 渲染需要拿到已挂载的 DOM */
@@ -155,6 +162,8 @@ const emit = defineEmits<{
   (e: 'quote', text: string): void
   /** 手动修复卡住的会话（同会话还有一轮没收口时，"重试"必然再撞同一道闸门） */
   (e: 'repair-session', itemId: string): void
+  /** 工具结果是某个子 Agent 的返回：请求在对照栏里定位到它 */
+  (e: 'open-subagent', runId: string): void
 }>()
 
 // ── 反向定位：消息 → 来源工作台 chips（assistant metadata 驱动）──
@@ -1013,6 +1022,8 @@ watch(
     v-else-if="item.kind === 'tool_result'"
     :item="item as ToolResultItem"
     :session-id="props.sessionId"
+    :can-open-subagent="props.canOpenSubagent"
+    @open-subagent="(runId: string) => emit('open-subagent', runId)"
   />
   <!-- UI/UX：日期分隔线（deepseek DateDivider） -->
   <div

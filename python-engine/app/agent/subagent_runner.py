@@ -122,11 +122,18 @@ class SubagentRunResult:
     inherited_messages: int = 0
 
     def to_tool_payload(self) -> dict[str, Any]:
-        """工具层返回体（结构化，便于父模型与前端消费）。"""
+        """工具层返回体（结构化，便于父模型与前端消费）。
+
+        字段顺序**有语义**：前端只拿得到列表接口的前 4096 字符预览
+        （见 internal/session 的 outputPreviewBytes），`output` 经常比这长得多。
+        `result_ref` 必须排在 `output` **之前** —— 否则子 Agent 一份长摘要就能把
+        run_id 挤出预览窗口，前端"在对照栏查看这个子 Agent"的入口会静默消失。
+        `status` 同样前置：它是这条结果最便宜的可读摘要。
+        """
         payload: dict[str, Any] = {
             "status": self.status,
-            "output": self.output,
             "result_ref": self.run_id,
+            "output": self.output,
             "usage": {
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
@@ -974,10 +981,37 @@ class SubAgentRunner:
                         sink.emit_progress(run_id=run_id, channel=EV_NOTICE, content=evt.error[:500],
                                            parent_run_id=parent_run_id, depth=child_depth,
                                            profile=profile_name)
-                elif evt.type == "tool_call" and sink is not None:
-                    sink.emit_progress(run_id=run_id, channel=EV_STATUS, status=ST_TOOL,
-                                       parent_run_id=parent_run_id, depth=child_depth,
-                                       profile=profile_name)
+                elif evt.type == "tool_call":
+                    if sink is not None:
+                        sink.emit_progress(run_id=run_id, channel=EV_STATUS, status=ST_TOOL,
+                                           parent_run_id=parent_run_id, depth=child_depth,
+                                           profile=profile_name)
+                        # 与主 Agent 同构：不只发"阶段=tool"，还发**是哪次调用**
+                        # （工具名 + 完整参数）。此前只发 status，前端只能显示一行
+                        # "阶段：tool" —— 用户看不出它读了哪个文件、跑了什么命令。
+                        sink.emit_tool_call(
+                            run_id=run_id,
+                            tool_call_id=evt.tool_call_id or "",
+                            tool_name=evt.tool_name or "",
+                            tool_arguments=evt.tool_arguments or "",
+                            parent_run_id=parent_run_id,
+                            depth=child_depth,
+                            profile=profile_name,
+                        )
+                elif evt.type == "tool_result":
+                    # 结果块：只有调用没有结果时，过程读起来像"卡住了" ——
+                    # 分不清还在跑、失败、还是已经拿到空输出。
+                    if sink is not None:
+                        sink.emit_tool_result(
+                            run_id=run_id,
+                            tool_call_id=evt.tool_call_id or "",
+                            tool_name=evt.tool_name or "",
+                            content=evt.content or "",
+                            error=evt.error or "",
+                            parent_run_id=parent_run_id,
+                            depth=child_depth,
+                            profile=profile_name,
+                        )
                 elif evt.type == "approval":
                     # 子 Agent 的**交互式**事件必须转发出去，而且要能**回传决定**。
                     #
@@ -1049,10 +1083,16 @@ class SubAgentRunner:
                             profile=profile_name,
                         )
                 if self._store is not None:
+                    # `tool_call` 的可读信息在**参数**里（`content` 对它是空的）——
+                    # 落成空串会让历史回放里的调用卡只剩一个工具名，看不出这次调用要做什么。
+                    # 主 Agent 的对话流之所以读得懂"它读了哪个文件"，靠的就是这份参数。
+                    _step_content = evt.content or evt.error or ""
+                    if step_kind == "tool_call" and not _step_content:
+                        _step_content = evt.tool_arguments or ""
                     await self._store.add_step(
                         run_id,
                         kind=step_kind,
-                        content=evt.content or evt.error or "",
+                        content=_step_content,
                         tool_name=evt.tool_name or "",
                         tool_call_id=evt.tool_call_id or "",
                         input_tokens=evt.input_tokens or 0,

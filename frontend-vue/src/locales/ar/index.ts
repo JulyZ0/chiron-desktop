@@ -912,6 +912,7 @@ export default {
     speed: "سرعة الكلام",
     preview: "معاينة",
     preview_truncated: "تم اقتطاع المعاينة",
+    n_more_items_above: "لا تُعرض {n} من العناصر الأقدم (راجع تبويب الأحداث للاطلاع على الكل)",
     original_size_0: "الحجم الأصلي (0)",
     reason: "السبب",
     allow: "السماح",

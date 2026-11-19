@@ -88,8 +88,8 @@ func TestNormalizeRunRowContract(t *testing.T) {
 func TestStepKindToEventTypeCoversApproval(t *testing.T) {
 	cases := map[string]string{
 		"message":     "subagent.text",
-		"tool_call":   "subagent.status",
-		"tool_result": "subagent.status",
+		"tool_call":   "subagent.tool_call",
+		"tool_result": "subagent.tool_result",
 		"approval":    "subagent.approval",
 		"ask":         "subagent.ask",
 		"unknown":     "subagent.notice",

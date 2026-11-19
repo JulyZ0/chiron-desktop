@@ -13,7 +13,6 @@ import type { ToolInfo } from '../../utils/toolList'
 import type { ContextChip } from './contextChips'
 import { formatRelativeTime } from './chat-types'
 import type { ChatItem, ChatSession } from './chat-types'
-import SubAgentPanel from './SubAgentPanel.vue'
 import { mergeTagOptions, normalizeTag, TAG_MAX_LEN } from './sessionTags'
 import SessionStatsPanel from './SessionStatsPanel.vue'
 import ProjectSidebar from '../../views/sessionmap/ProjectSidebar.vue'
@@ -23,7 +22,6 @@ import SettingsPanel from '../settings/SettingsPanel.vue'
 import { useAuthStore } from '../../stores/auth'
 import { useDeviceStore } from '../../stores/device'
 import { buildAccountMenuItems, accountMenuRoute, type AccountMenuItem } from '../accountMenu'
-import type { SubagentEvent } from '../../api/subagent'
 
 import { useI18n } from 'vue-i18n'
 const { t: tr } = useI18n()
@@ -92,13 +90,10 @@ const props = withDefaults(defineProps<{
   userName?: string
   /** 当前会话上下文芯片（知识库/Agent/技能/工作流，可移除） */
   contextChips?: ContextChip[]
-  /** 本会话实时到达的 subagent.* 事件（由 ChatView 从 SSE 分流后传入） */
-  liveEvents?: SubagentEvent[]
   /** 正在流式运行的会话 id 集合：在侧栏会话行上显示呼吸心跳点 */
   runningSessionIds?: Set<string>
 }>(), {
   contextChips: () => [],
-  liveEvents: () => [],
   runningSessionIds: () => new Set<string>(),
 })
 

@@ -6,10 +6,33 @@ import { formatSize } from './chat-types'
 import { looksLikeDiff, parseUnifiedDiff, type ParsedDiff } from './diffParse'
 import { useI18n } from 'vue-i18n'
 import { getToolCallOutput } from '../../api'
+import { subagentRunIdOf } from './subagentOutput'
 
 const { t } = useI18n()
 
-const props = defineProps<{ item: ToolResultItem; sessionId?: string }>()
+const props = defineProps<{
+  item: ToolResultItem
+  sessionId?: string
+  /**
+   * 是否允许「在对照栏中查看这个子 Agent」的入口。
+   *
+   * 只在**有对照栏可开**的地方为真：同一条结果块也被只读回放（参考栏
+   * `SessionPreviewPane`、分享页）渲染，那里没有对照栏 —— 画一个点了没反应的
+   * 按钮比不画更糟。
+   */
+  canOpenSubagent?: boolean
+}>()
+
+const emit = defineEmits<{ (e: 'open-subagent', runId: string): void }>()
+
+/**
+ * 这条结果指向的子 Agent 运行（没有 = 不是子 Agent 的返回，或返回里带了多个）。
+ *
+ * 判断在 `subagentOutput.ts` 里（纯函数、有单测）：`ToolResultItem` 不带工具名，
+ * 唯一可靠的依据是引擎放在返回体顶层的 `result_ref` / `run_id`。
+ */
+const subagentRunId = computed(() => (props.canOpenSubagent ? subagentRunIdOf(props.item.content) : ''))
+
 // 失败结果默认展开：错误信息藏在折叠后面等于没报错
 const expanded = ref(props.item.isError)
 watch(() => props.item.isError, isError => { if (isError) expanded.value = true })
@@ -283,6 +306,26 @@ function todoStatusLabel(status?: string): string {
       <span>{{ $t('errors.tool_execution_failed') }}</span>
     </div>
 
+    <!-- 子 Agent 的返回：给一条通往**对照栏**的入口。
+         为什么放在最上面：这条结果读起来往往是一大段摘要，用户看完的第一反应是
+         "它到底做了什么、和我这份结论差在哪" —— 那正是对照栏要回答的问题，
+         入口得在他开始读之前就在手边，而不是滚到底部。
+         只在正文里能认出**恰好一个** run 时才画（见 subagentOutput.ts）。 -->
+    <button
+      v-if="subagentRunId"
+      class="result-subagent"
+      type="button"
+      :title="$t('chat.open_subagent_in_dock', { run: subagentRunId })"
+      @click="emit('open-subagent', subagentRunId)"
+    >
+      <span
+        class="result-subagent-icon"
+        aria-hidden
+      >⇄</span>
+      <span>{{ $t('chat.view_subagent_in_dock') }}</span>
+      <code class="result-subagent-id">{{ subagentRunId }}</code>
+    </button>
+
     <img
       v-if="isImageData"
       :src="item.content"
@@ -499,6 +542,24 @@ function todoStatusLabel(status?: string): string {
 <style scoped>
 .tool-result { max-width: min(var(--chat-content-width), 92%); margin: 2px auto 8px; }
 .result-error-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; padding: 5px 10px; border-radius: var(--sig-radius-button); background: var(--error-bg); color: var(--error); font-size: 12px; }
+/* 子 Agent 返回 → 对照栏的入口。读起来像一个「横向关联」的动作，所以用低调的
+   描边按钮而不是主色填充：它是**附加的观察路径**，不是这条结果的主要用法。 */
+.result-subagent {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-bottom: 6px; padding: 4px 10px;
+  border: var(--hairline-width) solid var(--border-card);
+  border-radius: var(--radius-full); background: none;
+  color: var(--text-secondary, #595959); font-size: var(--fs-xs); cursor: pointer;
+  transition: color var(--dur-fast) ease, border-color var(--dur-fast) ease, background-color var(--dur-fast) ease;
+}
+.result-subagent:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-bg); }
+.result-subagent:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-ring-offset); }
+.result-subagent-icon { flex: none; font-size: var(--fs-sm); }
+/* run_id 是机器的身份，等宽显示才不会把 rs_ 与后面的十六进制看成两个词 */
+.result-subagent-id {
+  flex: none; max-width: 14ch; overflow: hidden; text-overflow: ellipsis;
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary);
+}
 .result-head {
  display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 0; border: none; background: none; color: var(--text-tertiary); cursor: pointer; font-size: 12px; 
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;

@@ -75,16 +75,29 @@ _ORDER = [Level.NONE, Level.JOB, Level.LOW_IL, Level.RESTRICTED, Level.APPCONTAI
 #: 非 Windows 上自然退化为 `none`（POSIX 继续走 setrlimit）。
 DEFAULT_LEVEL = Level.RESTRICTED
 
-#: **硬底线**：Windows 上实际生效的档位不得低于此值。
+#: **安全底线**：低于它的档位需要用户**显式确认**才能生效。
 #:
-#: 与 `DEFAULT_LEVEL` 的区别很关键：默认值可以被配置改掉，底线**不能**。
-#: `SANDBOX_ISOLATION_ALLOW_DOWNGRADE=true` 的语义是"接受稍弱但仍存在的隔离"，
-#: 不是"关掉隔离"。把这两件事分开，是因为一个布尔开关不该有能力抹掉 README 里
-#: 「执行隔离是默认值 / 沙箱不可用时拒绝启动」这条承诺。
+#: ## 它挡的是"悄悄没有隔离"，不是"用户自己关掉隔离"
+#:
+#: 两层保护必须分开看：
+#:
+#: * **配置层**（`.env` / `SANDBOX_ISOLATION_LEVEL`）：低于底线一律抬到 `FLOOR_LEVEL`。
+#:   这是一条**环境变量改不动**的保护 —— 否则一次拼写误改、一个继承来的旧 `.env`
+#:   就能让整套部署失去隔离，而且没有任何人做过这个决定。
+#: * **运行时显式切换**（设置页 / `PUT /v1/system/isolation` 带
+#:   `acknowledge_below_floor=true`）：**真的生效**。这是用户本人做的决定，
+#:   发生在界面上、有二次确认、会写审计流水、界面持续红标。
+#:
+#: 把这两件事混成一条硬墙的代价是：需求要求的「无隔离 / 作业对象」在界面上
+#: 永远不可达，用户只能改代码 —— 而"悄悄改不动"和"明确地允许"是两回事。
+#:
+#: 与 `DEFAULT_LEVEL` 的区别仍然关键：默认值可以被配置改掉，底线不会。
+#: `SANDBOX_ISOLATION_ALLOW_DOWNGRADE` 的语义也没有变宽：它只放宽"稍弱的隔离"
+#: （如 `appcontainer → low_il`），从不让**配置**降到"没有隔离"。
 #:
 #: 为什么底线选 `low_il` 而不是 `job`：实测（零提权）`job` 只能拦内存爆炸，
 #: 挡不住写用户目录；`low_il` 是**当前这台机器上唯一既零提权又真能挡写**的档位。
-#: 定在 `job` 等于允许"看起来有隔离"的不隔离。
+#: 所以它才是"默认建议的强度"，而不是强制上限。
 #:
 #: 非 Windows 不受此限：Linux 侧保持既有 local 实现（POSIX 走 setrlimit）。
 FLOOR_LEVEL = Level.LOW_IL
@@ -133,31 +146,57 @@ def configured_level() -> Level:
 #: 内存。放在内存里，重启即回到配置文件的值 —— 撤销是免费且必然成功的。
 _runtime_override: Level | None = None
 
+#: 运行时覆盖是否由用户**显式确认过**低于安全底线的那一档。
+#:
+#: 与 `_runtime_override` 同生命周期：`clear_runtime_level()` 一并清掉，换档位时
+#: 由 `set_runtime_level()` 重新赋值。它只回答"这个具体档位是用户确认要的吗"，
+#: 不承担"当前有没有隔离"的判断（那是 `below_floor`）。
+_runtime_acknowledged: bool = False
+
 
 def runtime_override() -> Level | None:
     """当前运行时覆盖值（None = 没有覆盖）。供前端显示"这是临时改动"。"""
     return _runtime_override
 
 
-def set_runtime_level(level: Level) -> Level | None:
+def runtime_acknowledged() -> bool:
+    """当前运行时覆盖是否带用户对低档位的显式确认。"""
+    return _runtime_acknowledged
+
+
+def set_runtime_level(level: Level, *, acknowledge_below_floor: bool = False) -> Level | None:
     """设置运行时档位，返回**被替换掉的旧覆盖值**（供撤销）。
 
-    低于 ``FLOOR_LEVEL`` 的请求在 Windows 上会被抬到底线 —— 这里不抬，
-    因为 ``resolve_level`` 已经统一处理；本函数只负责"记住用户想要什么"，
-    让 ``status()`` 能显示"请求 none、实际 low_il"这段差异。
+    ``acknowledge_below_floor`` 是"我确实要这个低于安全底线的档位"的显式声明。
+    不传它、又请求低于底线的档位时，``resolve_level`` 会把档位抬到底线 ——
+    这与"配置改不动底线"是同一条规则。
+
+    本函数只负责"记住用户想要什么"与"他有没有确认过"，是否真的生效仍由
+    ``resolve_level`` 统一判定（那里还要探测本机机制）。
     """
-    global _runtime_override
+    global _runtime_override, _runtime_acknowledged
     previous = _runtime_override
     _runtime_override = level
-    logger.info("isolation level overridden at runtime: %s -> %s", previous, level)
+    _runtime_acknowledged = bool(acknowledge_below_floor)
+    logger.info(
+        "isolation level overridden at runtime: %s -> %s%s",
+        previous,
+        level,
+        "（已确认低于安全底线）" if _runtime_acknowledged else "",
+    )
     return previous
 
 
 def clear_runtime_level() -> Level | None:
-    """撤销运行时覆盖，返回撤销前的值（None 表示本来就没有覆盖）。"""
-    global _runtime_override
+    """撤销运行时覆盖，返回撤销前的值（None 表示本来就没有覆盖）。
+
+    确认标志一并清掉：它是"对某个低档位的决定"，档位撤了，决定也就不存在了。
+    如果留着，"当前没有覆盖"却仍带着一份确认，会让下一次配置里的低档位被顺带放行。
+    """
+    global _runtime_override, _runtime_acknowledged
     previous = _runtime_override
     _runtime_override = None
+    _runtime_acknowledged = False
     if previous is not None:
         logger.info("isolation level runtime override cleared (was %s)", previous)
     return previous
@@ -184,9 +223,18 @@ class IsolationDecision:
     requested: Level
     effective: Level
     reasons: list[str] = field(default_factory=list)
-    #: 实际档位是否**低于硬底线**（`FLOOR_LEVEL`）。低于底线时**任何配置都不能放行**：
-    #: `allow_downgrade` 管的是"接受稍弱"，不是"接受没有"。
+    #: 生效档位是否**低于安全底线**（`FLOOR_LEVEL`）。
+    #:
+    #: 这是**事实判断**，用于界面红标与提示，不直接决定是否拒绝执行。
     below_floor: bool = False
+    #: 这个档位是否是**用户显式选择**的结果（而非被动降级）。
+    #:
+    #: 区分两件完全不同的事：
+    #: * `below_floor=True, user_selected=True`：用户自己选了低档位（`job`，
+    #:   或确认过的 `none`）。放行 —— 否则"关掉隔离"会连带把工具全废掉。
+    #: * `below_floor=True, user_selected=False`：本机机制缺失导致**被动**掉到低档位，
+    #:   谁都没同意。由 `require_or_raise` 拒绝执行。
+    user_selected: bool = False
 
     @property
     def degraded(self) -> bool:
@@ -204,24 +252,60 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
 
     **不静默降级**：降级时 `reasons` 必非空，调用方据此告警或拒绝执行。
 
-    两条不同的约束，别混为一谈：
+    三条不同的约束，别混为一谈：
 
-    * 请求值**低于** `FLOOR_LEVEL`（显式要 `none`/`job`）⇒ Windows 上按底线执行，
-      并在 `reasons` 说明。这是"配置改不动底线"。
+    * 请求值**低于** `FLOOR_LEVEL` 且**没有用户确认**（配置里写了 `none`/`job`）
+      ⇒ Windows 上按底线执行，并在 `reasons` 说明。这是"配置改不动底线"。
+    * 请求值**低于** `FLOOR_LEVEL` 但**用户显式确认过**（设置页二次确认，
+      落到 `_runtime_acknowledged`）⇒ 如实生效，标 `below_floor=True` 供界面红标，
+      不拒绝执行。这是"用户自己关掉隔离"。
     * 本机机制缺失导致实际档位**落到** `FLOOR_LEVEL` 以下 ⇒ 标记 `below_floor`，
       `require_or_raise` 会拒绝执行，**不看** `allow_downgrade`。
     """
     want = requested or configured_level()
     reasons: list[str] = []
+    #: 这个低档位是否是**用户通过运行时开关显式选的**（而非配置层写死、也非被动跌破）。
+    #:
+    #: 只有它为真时 `require_or_raise` 才放行低于底线的档位。判据绑在
+    #: `_runtime_override` 上而不是"全局有没有确认过"：确认是对某个档位做的决定，
+    #: 换档位就失效。否则用户确认过一次 `none`，之后配置里任何低档位都会被顺带放行
+    #: —— 那等于确认一次、永久有效。
+    user_selected = False
 
     if not win.IS_WINDOWS:
         # Linux 侧保持既有 local 实现（POSIX 走 setrlimit），不受硬底线约束。
         return IsolationDecision(want, Level.NONE, ["非 Windows 平台；POSIX 走 setrlimit"])
 
-    # ① 请求值不得低于底线：显式写 `none` 也不能真的关掉隔离。
+    # ① 低于安全底线：**运行时显式选择**才生效，配置层一律抬到底线。
+    #
+    # 三种来源必须分开，否则会出现"谁都不同意却真的没隔离"：
+    #
+    # * 配置里写了 `none`/`job`（`_runtime_override is None`）⇒ 抬到底线。
+    #   环境变量改不动底线 —— 否则一个拼写误改就能让整套部署失去隔离。
+    # * 用户在设置页选了 `job` ⇒ **直接生效**（`user_selected=True`）。
+    #   `job` 仍有 Job Object 隔离，只是挡不住写用户目录；不值得为它加一道
+    #   二次确认，否则"切一下看看"成本过高。
+    # * 用户在设置页选了 `none` ⇒ 需要**这个具体档位**的显式确认
+    #   （`acknowledge_below_floor=true` 落到 `_runtime_acknowledged`），
+    #   没确认就抬到底线并说明。这是"用户自己关掉隔离"，不是配置能做的事。
     if want.rank < FLOOR_LEVEL.rank:
-        reasons.append(f"请求档位 {want.value} 低于底线 {FLOOR_LEVEL.value}，按底线执行")
-        want = FLOOR_LEVEL
+        if _runtime_override is want and (
+            want.rank >= Level.JOB.rank or _runtime_acknowledged
+        ):
+            reasons.append(
+                f"低于安全底线 {FLOOR_LEVEL.value} 的档位 {want.value} 已由用户显式选择"
+                + ("（并已确认）" if _runtime_acknowledged else "")
+            )
+            user_selected = True
+        elif _runtime_override is want:
+            reasons.append(
+                f"请求档位 {want.value} 低于安全底线 {FLOOR_LEVEL.value}，"
+                "但未做显式确认，按底线执行"
+            )
+            want = FLOOR_LEVEL
+        else:
+            reasons.append(f"请求档位 {want.value} 低于安全底线 {FLOOR_LEVEL.value}，按底线执行")
+            want = FLOOR_LEVEL
 
     # Job Object 是所有高于 none 的档位共同的地基
     if want.rank >= Level.JOB.rank and not _probe_job():
@@ -317,7 +401,18 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
 
         return IsolationDecision(want, want, reasons)
 
-    return IsolationDecision(want, want, reasons)
+    # 走到这里说明请求的档位如实生效了（没有发生降级）。
+    #
+    # `below_floor` 是**事实**（界面红标），`user_selected` 是**许可**
+    # （`require_or_raise` 是否放行）。用户显式选的 `none`/`job` 在这里第一次
+    # 同时带上两者；配置层写死的低档位在 ① 已被抬到底线，走不到这里。
+    return IsolationDecision(
+        want,
+        want,
+        reasons,
+        below_floor=want.rank < FLOOR_LEVEL.rank,
+        user_selected=user_selected,
+    )
 
 
 _job_ok: bool | None = None
@@ -662,23 +757,28 @@ def wrap_async_process(
 
 
 def require_or_raise(decision: IsolationDecision) -> None:
-    """fail-closed 帮手：降级未获同意、或落到硬底线以下时抛错。
+    """fail-closed 帮手：降级未获同意、或**被动**落到安全底线以下时抛错。
 
     与 `local_env_profile.adapt()` 的旧行为正相反 —— 那边是"悄悄改成 local 继续跑"，
     这边是"降级必须经你同意"。
 
-    **两种拒绝，别混为一谈**：
+    **三种情况，别混为一谈**：
 
-    * `below_floor=True`：本机拿不出底线档位（如 Low IL 不可设置）。这**不看**
-      `allow_downgrade` —— 那个开关的语义是"接受稍弱"，不是"接受没有"。降到这里
-      等于没有隔离，而 README 承诺的是"沙箱不可用时拒绝启动"。
+    * `below_floor` 且 `user_selected`：用户在设置页自己选的 `none`/`job`。
+      放行 —— 否则"关掉隔离"会连带把工具全废掉，那不是保护，是罢工。
+    * `below_floor` 且**未**由用户选择：本机拿不出底线档位（如 Low IL 不可设置），
+      或配置里写了低档位却没经确认就被抬升后仍缺机制。拒绝，且**不看**
+      `allow_downgrade` —— 那个开关的语义是"接受稍弱"，不是"接受没有"。
+      这种"谁都没同意"的降级正是 README 里「沙箱不可用时拒绝启动，不偷偷回退」
+      要挡的情况。
     * 普通 `degraded` 且未允许：`appcontainer → low_il` 这类，可经配置放行。
     """
-    if decision.below_floor:
+    if decision.below_floor and not decision.user_selected:
         raise RuntimeError(
-            f"拒绝在没有隔离的档位下执行（硬底线 {FLOOR_LEVEL.value}）：{decision.describe()}。"
+            f"拒绝在没有隔离的档位下执行（安全底线 {FLOOR_LEVEL.value}）：{decision.describe()}。"
             "这一档不受 SANDBOX_ISOLATION_ALLOW_DOWNGRADE 影响 —— 该开关只放宽"
-            "「稍弱的隔离」，不放宽「没有隔离」。修好机制后重启引擎。"
+            "「稍弱的隔离」，不放宽「没有隔离」。修好机制后重启引擎；"
+            "若确实要关闭隔离，请在设置页显式确认（该决定会写审计流水）。"
         )
     if decision.degraded and not downgrade_allowed():
         raise RuntimeError(
@@ -777,16 +877,14 @@ def _level_executable(level: Level) -> bool:
 def _level_unavailable_reason(level: Level) -> str:
     """该档位不可选的**机器原因**（前端悬停/置灰时显示）。
 
-    低于底线与本机缺机制是**两件不同的事**，说错会让用户去做无用功
-    （例如去调配置，而真正缺的是管理员权限）。
+    这里**只**回答"本机缺什么机制"。低于安全底线不再等于不可选 —— 用户可以在
+    设置页显式选择（`job` 直接生效，`none` 需二次确认），所以低于底线本身
+    不是"不可选"的理由，也不需要文案。
 
-    所以这里**只**返回"本机缺机制"那一类；低于底线一律返回空串，由前端用
-    `isolation_below_floor_hint` 表达。这样前端不必去解析中文/英文文案来分类
-    （靠 `"低于底线" in reason` 这种判断在切换语言或改措辞时必然失效）。
+    反过来，某个低档位若真的**不可执行**（如 Job Object 创建失败），仍要给机器
+    原因，否则用户会以为只是策略限制。
     """
     if not win.IS_WINDOWS:
-        return ""
-    if level.rank < FLOOR_LEVEL.rank:
         return ""
     try:
         if level is Level.RESTRICTED:
@@ -805,13 +903,13 @@ def status() -> dict[str, Any]:
     caps = win.capability_report()
     want = configured_level()
     decision = resolve_level(want)
-    # 只列**本机真能做到**且不低于底线的档位：把做不到的列成"可选"，
-    # 等于让用户对着一个永远不生效的开关操作（见 `_level_executable`）。
-    selectable = [
-        lv
-        for lv in _ORDER
-        if (not win.IS_WINDOWS or lv.rank >= FLOOR_LEVEL.rank) and _level_executable(lv)
-    ]
+    # 只列**本机真能做到**的档位。低于安全底线的档位也列出来 —— 它们现在
+    # 可以在设置页被显式选择（`job` 直接生效，`none` 需二次确认）；
+    # 挡在墙外会让"关掉隔离"变成一个只能改代码才可达的选项。
+    #
+    # 但"能做"仍要真探测：把做不到的列成"可选"，等于让用户对着一个永远不生效的
+    # 开关操作（见 `_level_executable`）。
+    selectable = [lv for lv in _ORDER if _level_executable(lv)]
     selectable_values = [lv.value for lv in selectable]
     return {
         "requested": want.value,
@@ -819,11 +917,23 @@ def status() -> dict[str, Any]:
         "degraded": decision.degraded,
         "floor": FLOOR_LEVEL.value,
         "below_floor": decision.below_floor,
+        #: 生效档位是否由用户显式选择（而非被动降级）。前端据此区分
+        #: "你自己关的"与"机制缺失导致跌破"，后者要报错。
+        "user_selected": decision.user_selected,
         "reasons": decision.reasons,
         "downgrade_allowed": downgrade_allowed(),
         #: 前端据此决定选项卡是否置灰。
         "selectable": selectable_values,
-        #: 不可选档位的**原因**，按档位名索引。前端据此区分"低于底线"与"本机缺机制"，
+        #: 选择这些档位时必须先二次确认（低于安全底线且仍有隔离概念）。
+        #:
+        #: `job` 不在此列：它仍有 Job Object 边界，为它加确认会把"切一下看看"
+        #: 变得很贵。`none` 才是"完全没有边界"，必须让用户明确点头。
+        "acknowledge_required": [
+            lv.value
+            for lv in selectable
+            if lv.rank < FLOOR_LEVEL.rank and lv.rank < Level.JOB.rank
+        ],
+        #: 不可选档位的**原因**，按档位名索引。只描述"本机缺机制"，
         #: 后者要告诉用户去做什么（如"以管理员身份运行"），而不是让他去改配置。
         "unavailable_reasons": {
             lv.value: _level_unavailable_reason(lv)

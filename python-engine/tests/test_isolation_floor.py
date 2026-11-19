@@ -98,21 +98,24 @@ def test_missing_low_il_marks_below_floor(windows_healthy, monkeypatch):
 
 
 def test_below_floor_cannot_be_waived_by_downgrade_switch(windows_healthy, monkeypatch):
-    """**核心断言**：allow_downgrade=true 也放不过 below_floor。
+    """**核心断言**：allow_downgrade=true 也放不过**被动**跌破底线的档位。
 
     这是本文件存在的理由。若这条变红，说明开关又变回了"能关掉隔离"。
+    注意与"用户显式选 `none`"的差别：那种情况 `user_selected=True`，是本人决定；
+    这里模拟的是**机制缺失**导致谁也不同意就掉到 `none`。
     """
     monkeypatch.setattr(windows_healthy, "_probe_low_il", lambda: False)
     monkeypatch.setattr(windows_healthy, "downgrade_allowed", lambda: True)
 
     decision = resolve_level(FLOOR_LEVEL)
     assert decision.below_floor
+    assert not decision.user_selected, "机制缺失导致的跌破不该被标成用户选择"
 
     with pytest.raises(RuntimeError) as exc:
         require_or_raise(decision)
 
     message = str(exc.value)
-    assert "硬底线" in message, "拒绝信息必须点明是硬底线，而不是普通降级"
+    assert "安全底线" in message, "拒绝信息必须点明是安全底线，而不是普通降级"
     assert "ALLOW_DOWNGRADE" in message, "要告诉用户那个开关为什么不管用"
 
 
@@ -150,7 +153,12 @@ def test_non_windows_is_not_subject_to_floor(monkeypatch):
 
 
 def test_status_reports_floor_and_selectable(monkeypatch):
-    """前端据此渲染选项卡：低于底线的档位必须不可选。"""
+    """前端据此渲染选项卡：低档位可选，但 `none` 必须二次确认。
+
+    这里锁的是**可达性**：把 `none`/`job` 挡在墙外，用户就只能改代码才能关掉
+    隔离。但"可达"不等于"随手可点" —— `none` 要在 `acknowledge_required` 里，
+    前端据此弹二次确认。
+    """
     monkeypatch.setattr(iso.win, "IS_WINDOWS", True)
     monkeypatch.setattr(iso, "_probe_job", lambda: True)
     monkeypatch.setattr(iso, "_probe_low_il", lambda: True)
@@ -162,9 +170,11 @@ def test_status_reports_floor_and_selectable(monkeypatch):
     assert payload["floor"] == FLOOR_LEVEL.value
     assert "below_floor" in payload
     selectable = payload["selectable"]
-    assert Level.NONE.value not in selectable
-    assert Level.JOB.value not in selectable
+    assert Level.NONE.value in selectable, "none 必须可达，否则关隔离只能改代码"
+    assert Level.JOB.value in selectable, "job 仍有 Job Object 边界，该直接可选"
     assert FLOOR_LEVEL.value in selectable
+    # 只有"完全没有边界"的 none 需要确认；job 不值得为它加一道门槛
+    assert payload["acknowledge_required"] == [Level.NONE.value]
 
 
 def test_selectable_excludes_tiers_this_machine_cannot_run(monkeypatch):

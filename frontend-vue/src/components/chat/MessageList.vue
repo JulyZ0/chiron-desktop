@@ -58,6 +58,13 @@ const props = defineProps<{
    * 所以这个值必须一路传到 `MessageItem`。
    */
   projectId?: string
+  /**
+   * 是否在工具结果上给「在对照栏中查看这个子 Agent」的入口。
+   *
+   * 只有**主对话流**能开对照栏，所以只有它传 true；参考栏与分享回放不传。
+   * 这里不自己判断"有没有对照栏"：那取决于挂载它的视图，而不是列表本身。
+   */
+  canOpenSubagent?: boolean
   /** 行数超过该值才启用窗口化（小会话直接全量渲染，无风险）。 */
   windowingMinRows?: number
 }>()
@@ -74,6 +81,8 @@ const emit = defineEmits<{
   (e: 'retry-failed', itemId: string): void
   /** 选中文本：引用到输入框（由父组件转交给 ChatInput） */
   (e: 'quote-text', text: string): void
+  /** 工具结果是某个子 Agent 的返回：请求在对照栏里定位到它 */
+  (e: 'open-subagent', runId: string): void
 }>()
 
 const scrollRef = ref<HTMLDivElement | null>(null)
@@ -762,11 +771,13 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
               :anchor-key="isUserAnchor((node as any).row.item) ? (node as any).row.index : undefined"
               :highlighted="highlightIndex === (node as any).row.index"
               :entering="enteringIds.has((node as any).row.item.id ?? '')"
+              :can-open-subagent="props.canOpenSubagent"
               @retry-from="(id: string, text: string) => emit('retry-from', id, text)"
               @regenerate="(id: string) => emit('regenerate', id)"
               @continue="(id: string) => emit('continue', id)"
               @retry-failed="(id: string) => emit('retry-failed', id)"
               @quote="(text: string) => emit('quote-text', text)"
+              @open-subagent="(runId: string) => emit('open-subagent', runId)"
             />
             <div
               v-else

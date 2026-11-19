@@ -343,9 +343,17 @@ func (h *SubagentHandler) stepsFromDB(ctx context.Context, runID string, limit i
 		kind := stringOf(row["kind"])
 		row["type"] = stepKindToEventType(kind)
 		row["run_id"] = runID
-		if kind == "tool_call" || kind == "tool_result" {
-			// 这两类的可读信息在 tool_name（content 常是参数 JSON），挂到 status 上供前端展示
-			row["status"] = stringOf(row["tool_name"])
+		if kind == "tool_call" {
+			// 落库时 `tool_call` 的 content 存的是**参数**（见 python-engine 的
+			// subagent_runner 落库点）。前端契约里参数叫 `tool_arguments` —— 不改名的话
+			// 回放出来的调用卡只有工具名、没有参数，和实时那条长得不一样。
+			row["tool_arguments"] = stringOf(row["content"])
+			row["content"] = ""
+			row["status"] = "tool"
+		}
+		if kind == "tool_result" {
+			// 结果的正文留在 content；工具名照旧挂着，便于前端把结果块挂到对应调用卡下。
+			row["status"] = "tool"
 		}
 		out = append(out, row)
 	}
@@ -358,8 +366,10 @@ func stepKindToEventType(kind string) string {
 	switch kind {
 	case "message":
 		return "subagent.text"
-	case "tool_call", "tool_result":
-		return "subagent.status"
+	case "tool_call":
+		return "subagent.tool_call"
+	case "tool_result":
+		return "subagent.tool_result"
 	case "approval":
 		// 审批必须有独立事件名：回放时前端要能重建**可点击**的审批卡片，
 		// 归到 notice 就只剩一行文字，用户看得到却批不了（等于没修）。

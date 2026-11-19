@@ -11,7 +11,14 @@ import type { LlmModel, SSEHandle } from '../api'
 import { getSessionMetrics, getSessionRuntime, putSessionRuntime, type SessionRuntime } from '../api/sessionRuntime'
 import { getProjectVcs, initProjectVcs } from '../api/projectVcs'
 import FloatingPanel from '../components/common/FloatingPanel.vue'
-import SubAgentPanel from '../components/chat/SubAgentPanel.vue'
+import SubAgentPane from '../components/chat/SubAgentPane.vue'
+import {
+  openSubagentDock,
+  setSubagentDockOpen,
+  subagentDockOpen,
+  subagentFocusRequest,
+  toggleSubagentDock,
+} from '../components/chat/useSubAgentDock'
 import SessionStatsPanel from '../components/chat/SessionStatsPanel.vue'
 import ChatHealthPanel from '../components/chat/ChatHealthPanel.vue'
 import { fetchComponentsHealth, isComponentUp, type ComponentsHealth } from '../api/systemHealth'
@@ -258,10 +265,10 @@ const lastTurnStats = computed<TurnStatsItem | null>(() => {
 const lastCompaction = ref<{ beforeTokens?: number; afterTokens?: number; savedTokens?: number } | null>(null)
 
 /**
- * 观测浮层开关。子 Agent 与统计已从侧栏移出：
- * 侧栏只留「导航」（轨迹 / 会话历史），观测类信息按需浮出、看完即关。
+ * 观测浮层开关。统计与组件健康仍是浮层（看完即关）；
+ * 子 Agent 已改为**布局内的对照栏**（`SubAgentPane` + `useSubAgentDock`），
+ * 它跟会话一起长期开着，不再属于"浮出-关闭"这一类。
  */
-const subagentsOpen = ref(false)
 const statsOpen = ref(false)
 
 /**
@@ -1772,7 +1779,7 @@ useKeyboardShortcuts({
     {
       ...specOf('show-shortcuts'),
       // 速查表：只在没有打开任何浮层时响应，免得和 Esc 的逐层关闭抢注意力
-      when: () => !synapseMapOpen.value && !subagentsOpen.value && !statsOpen.value,
+      when: () => !synapseMapOpen.value && !statsOpen.value,
       handler: () => { shortcutsHelpOpen.value = true },
     },
     {
@@ -1787,8 +1794,8 @@ useKeyboardShortcuts({
     },
     {
       ...specOf('close-overlays'),
-      when: () => subagentsOpen.value || statsOpen.value || healthOpen.value,
-      handler: () => { subagentsOpen.value = false; statsOpen.value = false; healthOpen.value = false },
+      when: () => statsOpen.value || healthOpen.value,
+      handler: () => { statsOpen.value = false; healthOpen.value = false },
       // 原实现这两层都不拦默认行为：走到这里说明没有更需要抢占的语义了
       preventDefault: false,
     },
@@ -3103,6 +3110,19 @@ function continueGeneration() {
       :handle-side="layoutSwapped ? 'left' : 'right'"
       @update:session-id="splitSessionId = $event"
     />
+    <!-- 子 Agent **对照栏**（取代此前的右下角浮卡）。
+         位置与参考栏同级：两者都是"读的东西并排摆"，所以留在布局里、不盖正文。
+         可以一直开着：子 Agent 跑着的时候，用户要能一边写主会话一边看它的过程与审批。
+         `focus-*` 来自「对话流里点某条子 Agent 结果」的定位请求（见 useSubAgentDock）。 -->
+    <SubAgentPane
+      v-if="subagentDockOpen"
+      :session-id="activeSessionId"
+      :live-events="subagentLiveEvents"
+      :handle-side="layoutSwapped ? 'left' : 'right'"
+      :focus-run-id="subagentFocusRequest?.runId || ''"
+      :focus-seq="subagentFocusRequest?.seq || 0"
+      @close="setSubagentDockOpen(false)"
+    />
     <div class="chat-main">
       <div
         v-if="connectionLost"
@@ -3426,12 +3446,14 @@ function continueGeneration() {
             :earlier-load-failed="earlierLoadFailed"
             :session-key="activeSessionId"
             :project-id="activeProjectId"
+            can-open-subagent
             @load-earlier="loadEarlier"
             @quote-text="onQuoteText"
             @retry-from="retryFromUserMessage"
             @regenerate="regenerateAssistant"
             @continue="continueGeneration"
             @retry-failed="retryFailedMessage"
+            @open-subagent="openSubagentDock"
           />
           <CallChainTimeline
             v-if="currentTraceId && !loading"
@@ -3604,27 +3626,15 @@ function continueGeneration() {
         :cost-cents="sessionCostCents"
         :subagent-active-count="subagentActiveCount"
         :online="isOnline && !connectionLost && componentsUp"
-        @toggle-subagents="subagentsOpen = !subagentsOpen"
+        @toggle-subagents="toggleSubagentDock()"
         @toggle-stats="statsOpen = !statsOpen"
         @toggle-health="healthOpen = !healthOpen"
       />
 
       <!-- 观测浮层：
            向上弹出 + 右对齐；限高到输入区顶部，因此**不遮挡正在写的草稿**。
-           子 Agent 的内部 tab（运行·输出·用量·事件流）与移动端抽屉在后续批次接入。 -->
-      <FloatingPanel
-        :open="subagentsOpen"
-        :title="$t('agent.sub_agent')"
-        :width="420"
-        :bottom-inset="floatingBottomInset"
-        @close="subagentsOpen = false"
-      >
-        <SubAgentPanel
-          :session-id="activeSessionId"
-          :live-events="subagentLiveEvents"
-        />
-      </FloatingPanel>
-
+           子 Agent 已改为布局内的对照栏（见 `.chat-layout` 里的 `SubAgentPane`），
+           不再占用浮层。 -->
       <FloatingPanel
         :open="statsOpen"
         :title="$t('chat.session_stats')"
@@ -3719,7 +3729,6 @@ function continueGeneration() {
       :active-session-id="activeSessionId"
       :user-name="authStore.user?.name"
       :context-chips="contextChips"
-      :live-events="subagentLiveEvents"
       :running-session-ids="sidebarRunningIds"
       @update:view="(v: 'trajectory' | 'sessions' | 'agents' | 'stats') => (panelView = v)"
       @open-map="synapseMapOpen = true"

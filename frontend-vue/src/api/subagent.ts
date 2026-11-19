@@ -55,6 +55,14 @@ export interface SubagentEvent {
   question?: string
   options?: string[]
   allow_free_text?: boolean
+  /**
+   * 工具结果失败原因（`subagent.tool_result`）。
+   *
+   * 与主 Agent 的 tool_result 事件同名：有这个字段就说明**这次调用失败了**，
+   * 界面据此标红并默认展开 —— 不必去猜 content 里那段 JSON 是失败还是工具的
+   * 正常输出（有些工具的返回体本身就带 `error` 键，但那是成功返回的一部分）。
+   */
+  error?: string
 }
 
 export interface SubagentRunsResponse {

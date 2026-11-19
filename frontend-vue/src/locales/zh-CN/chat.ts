@@ -457,4 +457,8 @@ export default {
   // ── 收尾1：P1 完成判定的界面呈现（实时事件与历史留痕共用同一套措辞） ──
   turn_incomplete_reasons: "本轮未完成（host 证据判定）：{reasons}",
   turn_incomplete_more: "另 {n} 项",
+  // ── s23：子 Agent 结果 → 对照栏 ──
+  // 措辞用"在对照栏中查看"，与浮卡时期区分：它现在是布局里的一栏，不是弹窗。
+  view_subagent_in_dock: "在对照栏中查看这个子 Agent",
+  open_subagent_in_dock: "打开对照栏并定位到 {run}",
 }

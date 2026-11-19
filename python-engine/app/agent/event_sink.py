@@ -48,12 +48,30 @@ EV_NOTICE = "subagent.notice"
 EV_APPROVAL = "subagent.approval"
 EV_ASK = "subagent.ask"
 EV_DONE = "subagent.done"
+#: 工具调用过程（与主 Agent 同构）。
+#:
+#: 此前子 Agent 每次调工具只发一条 ``subagent.status(status=tool)`` —— 前端只看到
+#: "阶段：tool"，不知道调的是哪个工具、参数是什么、结果如何。而主 Agent 的对话流里
+#: 每一步都是「工具调用卡 + 工具结果块」。同一个引擎、同一种过程，观测面却少一半信息，
+#: 于是"子 Agent 到底做了什么"只能靠 L1 摘要猜。
+#:
+#: 因此把 ``tool_call`` / ``tool_result`` 也发出来，字段与主 Agent 的对话流条目同名
+#: （``tool_call_id`` / ``tool_name`` / ``tool_arguments`` / ``content``），前端可以直接
+#: 复用 ``ToolCallCard`` / ``ToolResultBlock`` —— 同一套渲染，用户不必学两遍。
+EV_TOOL_CALL = "subagent.tool_call"
+EV_TOOL_RESULT = "subagent.tool_result"
 
 PREVIEW_EVENTS = frozenset({EV_STATUS, EV_REASONING, EV_TEXT, EV_NOTICE})
 TERMINAL_EVENTS = frozenset({EV_STARTED, EV_DONE})
 #: 必须送达的事件：终态（结论）、审批与提问（用户在等它，丢了就空转到超时）。
 #: 它们**绕过每秒预算**，队列满时也不会被丢弃策略牺牲。
-IMPORTANT_EVENTS = frozenset({EV_STARTED, EV_DONE, EV_APPROVAL, EV_ASK})
+#:
+#: 工具调用/结果也在这里：它们是**离散事件**（一调用一条），不是可再生的增量 ——
+#: 丢了就是过程里少一格，而且丢弃不省任何带宽（本来就不合并）。放进来还能顺带
+#: 保证"调用有卡、结果有块"成对出现，不会只留下半对。
+IMPORTANT_EVENTS = frozenset({
+    EV_STARTED, EV_DONE, EV_APPROVAL, EV_ASK, EV_TOOL_CALL, EV_TOOL_RESULT,
+})
 
 # 阶段取值（与前端徽标一致）
 ST_QUEUED = "queued"
@@ -98,6 +116,10 @@ class SubagentEvent:
     #: 与主 Agent 的 ask 事件同形，因此前端可以复用同一个 AskCard。
     options: list[str] = field(default_factory=list)
     allow_free_text: bool = True
+    #: 工具结果失败原因（``subagent.tool_result``）。
+    #: 与主 Agent 的 ``tool_result`` 事件同名：前端据此把结果块标红并默认展开 ——
+    #: 错误藏在折叠后面等于没报错。
+    error: str = ""
     ts: float = field(default_factory=time.time)
 
     def to_payload(self) -> dict[str, Any]:
@@ -138,6 +160,10 @@ class SubagentEvent:
             payload["question"] = self.content
             payload["options"] = list(self.options)
             payload["allow_free_text"] = self.allow_free_text
+        # 工具结果失败原因：只有失败时才带（前端按"有这个字段"判定标红，
+        # 不必去猜 content 里那句 error JSON 是失败还是工具自己的正常输出）。
+        if self.error:
+            payload["error"] = self.error
         return payload
 
 
@@ -310,6 +336,87 @@ class EventSink:
             allow_free_text=bool(allow_free_text),
         ))
 
+    def emit_tool_call(
+        self,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        tool_name: str,
+        tool_arguments: str = "",
+        parent_run_id: str = "",
+        depth: int = 1,
+        profile: str = "",
+    ) -> None:
+        """子 Agent 发起了一次工具调用 —— 与主 Agent 的对话流条目**同形**。
+
+        字段刻意与 ``AgentEvent(type="tool_call")`` 一致：前端因此能直接复用
+        ``ToolCallCard``（同一套摘要、同一套参数展开），而不必为子 Agent 再写一份
+        "长得差不多但不完全一样"的渲染。
+
+        走必达通道（``IMPORTANT_EVENTS``）：这是**离散事件**（一次调用一条），
+        既不参与内容合并，丢了就是过程里少一格；而它本来也只占几十字节。
+        tool_call_id 缺失时不发 —— 前端要靠它把「调用卡」与「结果块」配成对，
+        没有 id 的两条事件只能各自孤立地渲染，读起来比不发更乱。
+        """
+        if not tool_call_id:
+            logger.debug("subagent %s: tool_call without tool_call_id skipped", run_id)
+            return
+        self._push(SubagentEvent(
+            type=EV_TOOL_CALL,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            depth=depth,
+            profile=profile,
+            status=ST_TOOL,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name or "",
+            tool_arguments=tool_arguments or "",
+        ))
+
+    def emit_tool_result(
+        self,
+        *,
+        run_id: str,
+        tool_call_id: str,
+        tool_name: str = "",
+        content: str = "",
+        error: str = "",
+        parent_run_id: str = "",
+        depth: int = 1,
+        profile: str = "",
+    ) -> None:
+        """子 Agent 的工具**返回了**（成功或失败）—— 与主 Agent 的 ``tool_result`` 同形。
+
+        为什么结果也要发：只有调用没有结果时，用户看到的是"它调了 read_file"然后
+        一片空白 —— 分不清是还在跑、卡住了、还是失败了。结果块补上"看到了什么/错在哪"，
+        这一步才算完整。
+
+        长度在这里就切：工具结果可能是整份文件内容，原样送进 SSE 会把一条事件撑到
+        几百 KB，前端渲染也要跟着为它付一次大字符串解析。截断后仍标明 ``truncated``，
+        让界面如实说明"这只是前段"。
+        """
+        if not tool_call_id:
+            logger.debug("subagent %s: tool_result without tool_call_id skipped", run_id)
+            return
+        text = content or ""
+        truncated = False
+        if len(text.encode("utf-8", "ignore")) > self._buffer_bytes:
+            text = _tail_bytes_head(text, self._buffer_bytes)
+            truncated = True
+        self._push(SubagentEvent(
+            type=EV_TOOL_RESULT,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            depth=depth,
+            profile=profile,
+            status=ST_TOOL,
+            content=text,
+            truncated=truncated,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name or "",
+            error=(error or "")[:500],
+        ))
+
     def emit_done(
         self,
         *,
@@ -455,6 +562,19 @@ def _tail_bytes(text: str, limit: int) -> str:
     if len(encoded) <= limit:
         return text
     return encoded[-limit:].decode("utf-8", "ignore")
+
+
+def _tail_bytes_head(text: str, limit: int) -> str:
+    """按 UTF-8 字节安全地取**前段**。
+
+    工具结果与流式增量相反：增量要最新的（取尾），而结果块要**开头** ——
+    文件内容、命令输出、搜索结果的关键信息都在前面，取尾只会留下一段没头没脑的残片。
+    """
+    encoded = text.encode("utf-8", "ignore")
+    if len(encoded) <= limit:
+        return text
+    # 从 limit 往前退，直到落在字符边界上（错误处理风格 'ignore' 会吞掉半个字符）
+    return encoded[:limit].decode("utf-8", "ignore")
 
 
 def get_event_sink() -> EventSink | None:

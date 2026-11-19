@@ -18,7 +18,7 @@
  * 必须说清楚，否则用户会以为自己在跑 Docker 级隔离。
  */
 import { computed, onMounted, ref } from 'vue'
-import { message } from 'ant-design-vue'
+import { message, Modal } from 'ant-design-vue'
 import { SafetyOutlined, ReloadOutlined, WarningOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
 import {
@@ -62,14 +62,12 @@ function isSelectable(level: IsolationLevel): boolean {
 /**
  * 为什么这个档位不可选 —— 让鼠标悬停时能解释原因，而不是单纯置灰。
  *
- * 两种"不可选"必须分开说，因为用户能做和该做的事完全不同：
- *   · **低于硬底线** —— 改配置也解除不了，只有换档位；
- *   · **本机缺机制** —— 例如 `restricted` 需要引擎以管理员身份运行才能拿到
- *     `SeIncreaseQuotaPrivilege`（实测 err=5）。说成"低于底线"会让用户去翻配置，
- *     而真正缺的是权限。
+ * 现在 `none`/`job` 都出现在 `selectable` 里（可以被显式选择），所以这里只剩
+ * **本机缺机制** 这一种：例如 `restricted` 需要引擎以管理员身份运行才能拿到
+ * `SeIncreaseQuotaPrivilege`（实测 err=5）。把这种情况下说成"低于底线"会让
+ * 用户去翻配置，而真正缺的是权限。
  *
- * 判据来自后端的 `unavailable_reasons`：它只对"本机缺机制"那一类给出文案，
- * 低于底线一律空串（由下面第二条分支兜底）。前端不去解析文本判断分类 ——
+ * 判据来自后端的 `unavailable_reasons`，前端不解析文本分类 ——
  * 那种做法在切换语言或改措辞时必然失效。
  */
 function disabledReason(level: IsolationLevel): string {
@@ -77,7 +75,17 @@ function disabledReason(level: IsolationLevel): string {
   if (isSelectable(level)) return ''
   const reason = (status.value.unavailable_reasons?.[level] || '').trim()
   if (reason) return t('settings.isolation_unavailable_hint', { reason })
-  return t('settings.isolation_below_floor_hint', { floor: status.value.floor })
+  return t('settings.isolation_unavailable_unknown')
+}
+
+/**
+ * 选择该档位是否必须先二次确认（由后端 `acknowledge_required` 决定）。
+ *
+ * 只有 `none`（完全没有边界）在此列。`job` 仍有 Job Object 边界，不值得为它
+ * 加一道门槛 —— 否则"切一下看看"的成本高到没人会用这个面板。
+ */
+function needsAcknowledge(level: IsolationLevel): boolean {
+  return status.value?.acknowledge_required?.includes(level) ?? false
 }
 
 function levelLabel(level: IsolationLevel): string {
@@ -124,15 +132,46 @@ async function load() {
   }
 }
 
+/**
+ * 让用户确认"我要在没有隔离的情况下执行"。
+ *
+ * 返回 `true` 才继续提交。文案直接把后果说清楚（工具将以主进程同等权限直跑），
+ * 而不是问一句含糊的"确定吗" —— 这个决定会写审计流水，用户应当知道自己在点什么。
+ */
+function acknowledgeBelowFloor(level: IsolationLevel): Promise<boolean> {
+  return new Promise((resolve) => {
+    Modal.confirm({
+      title: t('settings.isolation_confirm_title'),
+      content: t('settings.isolation_confirm_body', { level: levelLabel(level) }),
+      okText: t('settings.isolation_confirm_ok'),
+      okType: 'danger',
+      cancelText: t('common.cancel'),
+      onOk: () => resolve(true),
+      onCancel: () => resolve(false),
+    })
+  })
+}
+
 async function applyLevel(level: IsolationLevel) {
   if (!isSelectable(level) || saving.value) return
   // 选的就是当前生效档位：不必往返一次
   if (level === status.value?.runtime_override) return
 
+  // 低于安全底线且**完全没有边界**的档位（目前只有 `none`）要先明确点头。
+  //
+  // 为什么不在这里也拦 `job`：它仍有 Job Object 边界，加门槛会让"切一下看看"
+  // 变得很贵，而用户付出的确认成本换不来对应的安全性。是否要确认由后端
+  // `acknowledge_required` 决定 —— 前端不自己判断档位强弱，避免两边规则漂移。
+  if (needsAcknowledge(level) && !(await acknowledgeBelowFloor(level))) return
+
   saving.value = true
   pendingLevel.value = level
   try {
-    const next = await setIsolationLevel(level, t('settings.isolation_change_reason'))
+    const next = await setIsolationLevel(
+      level,
+      t('settings.isolation_change_reason'),
+      needsAcknowledge(level),
+    )
     status.value = next
     message.success(t('settings.isolation_changed', { level: levelLabel(next.effective) }))
     // 请求值被抬到底线时，明确告诉用户"你要的没生效、实际是这个"

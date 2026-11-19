@@ -24,6 +24,11 @@ import {
 } from '../../api/subagent'
 import SubAgentApprovalCard from './SubAgentApprovalCard.vue'
 import AskCard from './AskCard.vue'
+// 与主对话流**同一套**工具渲染：子 Agent 的工具调用同样是"调了什么 + 结果如何"，
+// 换一份长得差不多的实现只会让两边的摘要/展开/失败配色各自漂移。
+import ToolCallCard from './ToolCallCard.vue'
+import ToolResultBlock from './ToolResultBlock.vue'
+import { projectSubagentOutput } from './subagentOutput'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
@@ -33,7 +38,18 @@ const props = withDefaults(defineProps<{
   sessionId?: string
   /** 父组件累积的实时事件（按到达顺序），只包含当前会话的 subagent.* 事件 */
   liveEvents?: SubagentEvent[]
-}>(), { sessionId: '', liveEvents: () => [] })
+  /**
+   * 外部请求定位的 run（对话流里点某个子 Agent 工具卡时带入）。
+   *
+   * 只在对照栏里用：从浮卡改成栏之后，入口是"点对话里的那一行"，
+   * 而栏可能已经开着在看别的 run —— 此时必须**切到被点的那一个**。
+   */
+  focusRunId?: string
+  /** 请求序号：连点同一个 run 也要能重新定位（只比 id 的话第二次值相同、watch 不触发） */
+  focusSeq?: number
+  /** 隐藏面板自己的标题行（栏外壳已经有标题，重复一层只是噪音） */
+  hideHeader?: boolean
+}>(), { sessionId: '', liveEvents: () => [], focusRunId: '', focusSeq: 0, hideHeader: false })
 
 const runs = ref<SubagentRunView[]>([])
 const loading = ref(false)
@@ -59,9 +75,13 @@ const STATUS_COLOR: Record<string, string> = {
   cancelled: 'default',
 }
 
-/** 是否被某个已折叠的祖先隐藏（沿 parent_run_id 上溯）。 */
-function hiddenByAncestor(run: SubagentRunView): boolean {
-  const byId = new Map(runs.value.map(r => [r.run_id, r]))
+/**
+ * 是否被某个已折叠的祖先隐藏（沿 parent_run_id 上溯）。
+ *
+ * `byId` 由调用方传入：`visibleRuns` 之前对**每个** run 各建一次 Map，
+ * 几十个 run 就是几十次全表扫描（O(n²)），而这张表一次就够。
+ */
+function hiddenByAncestor(run: SubagentRunView, byId: Map<string, SubagentRunView>): boolean {
   let parentId = run.parent_run_id || ''
   let guard = 0
   while (parentId && guard++ < 20) {
@@ -70,6 +90,70 @@ function hiddenByAncestor(run: SubagentRunView): boolean {
   }
   return false
 }
+
+/**
+ * 一次扫描 `liveEvents`，派生面板需要的**全部**实时视图。
+ *
+ * 为什么合并：此前 `liveRuns` / `liveTail` / `approvalEvents` / `pendingQuestions`
+ * 各自完整遍历一遍同一个数组。事件缓冲上限 500，看起来不多，但每个 run 每秒
+ * 都在推增量，四个 computed 又都被模板直接引用 —— 一条事件到达会引发**四次**
+ * O(n) 扫描，而 n 还在增长。合成一次之后，同一条事件的代价与视图数量无关。
+ *
+ * 这里只做**纯提取**（不做过滤/去重策略），策略留给各自的派生 computed：
+ * 谁依赖 `runs`（API 结果）或 `askAnswers`（本地状态）就在谁那里加，
+ * 免得把无关依赖混进这个热点。
+ */
+const liveScan = computed(() => {
+  const runStates: Record<string, SubagentRunView> = {}
+  const tails: Record<string, string> = {}
+  const approvals: Array<{ toolCallId: string; runId: string; toolName: string; args: string; content: string }> = []
+  const questions: Array<{ toolCallId: string; runId: string }> = []
+  const approvalSeen = new Set<string>()
+  const questionSeen = new Set<string>()
+
+  for (const e of props.liveEvents || []) {
+    const id = e?.run_id
+    if (!id) continue
+
+    // ① run 骨架：终态带 summary/usage，其它事件只补层级与 profile
+    const prev = runStates[id]
+    const done = e.type === 'subagent.done'
+    runStates[id] = {
+      run_id: id,
+      parent_run_id: e.parent_run_id || prev?.parent_run_id || '',
+      depth: Number(e.depth ?? prev?.depth ?? 1) || 1,
+      profile: e.profile || prev?.profile || '',
+      status: done ? (e.status || 'done') : (prev?.status || 'running'),
+      summary: done ? (e.summary ?? prev?.summary) : prev?.summary,
+      usage: e.usage ?? prev?.usage,
+      created_at: prev?.created_at,
+    }
+
+    // ② 每个 run 的最新一段输出（列表行上的"它现在在做什么"）
+    if (typeof e.content === 'string' && e.content) {
+      tails[id] = e.content.replace(/\s+/g, ' ').slice(-120)
+    }
+
+    // ③ 审批：按 tool_call_id 去重且保序（同一 id 在历史回放与实时流里各来一次）
+    if (e.type === 'subagent.approval' && e.tool_call_id && !approvalSeen.has(e.tool_call_id)) {
+      approvalSeen.add(e.tool_call_id)
+      approvals.push({
+        toolCallId: e.tool_call_id,
+        runId: id,
+        toolName: e.tool_name || '',
+        args: e.tool_arguments || '',
+        content: e.content || '',
+      })
+    }
+
+    // ④ 提问：同样按 tool_call_id 去重
+    if (e.type === 'subagent.ask' && e.tool_call_id && !questionSeen.has(e.tool_call_id)) {
+      questionSeen.add(e.tool_call_id)
+      questions.push({ toolCallId: e.tool_call_id, runId: id })
+    }
+  }
+  return { runStates, tails, approvals, questions }
+})
 
 /**
  * 从**实时事件**合成的运行条目 —— 观测面的第二个数据源。
@@ -81,24 +165,7 @@ function hiddenByAncestor(run: SubagentRunView): boolean {
  */
 const liveRuns = computed(() => {
   const known = new Set(runs.value.map(r => r.run_id))
-  const out: Record<string, SubagentRunView> = {}
-  for (const e of props.liveEvents) {
-    const id = e.run_id
-    if (!id || known.has(id)) continue // API 已有 → 以 API 为准（它带摘要与用量）
-    const prev = out[id]
-    const done = e.type === 'subagent.done'
-    out[id] = {
-      run_id: id,
-      parent_run_id: e.parent_run_id || prev?.parent_run_id || '',
-      depth: Number(e.depth ?? prev?.depth ?? 1) || 1,
-      profile: e.profile || prev?.profile || '',
-      status: done ? (e.status || 'done') : (prev?.status || 'running'),
-      summary: done ? (e.summary ?? prev?.summary) : prev?.summary,
-      usage: e.usage ?? prev?.usage,
-      created_at: prev?.created_at,
-    }
-  }
-  return Object.values(out)
+  return Object.values(liveScan.value.runStates).filter(r => !known.has(r.run_id))
 })
 
 /** 面板实际展示的运行：**API 结果优先，实时事件补齐**（按 run_id 去重） */
@@ -113,16 +180,7 @@ const displayRuns = computed(() => {
  * 为什么需要：事件流 tab 只渲染选中的 run —— 用户不点开就只看得到状态标签。
  * 这里把每个 run 的最后一段内容（尾部 120 字符）挂到行上，未展开也能看到进度在流动。
  */
-const liveTail = computed(() => {
-  const out: Record<string, string> = {}
-  for (const raw of props.liveEvents || []) {
-    const e = raw as { run_id?: string; content?: string }
-    const id = e?.run_id
-    if (!id || typeof e.content !== 'string' || !e.content) continue
-    out[id] = e.content.replace(/\s+/g, ' ').slice(-120)
-  }
-  return out
-})
+const liveTail = computed(() => liveScan.value.tails)
 
 /** 是否还有运行中的 run（决定「全部停止」是否出现） */
 const hasRunning = computed(() => displayRuns.value.some(r => !TERMINAL_STATUSES.has(r.status)))
@@ -195,23 +253,7 @@ const approvalSubmitting = ref<Set<string>>(new Set())
 const approvalErrors = ref<Record<string, string>>({})
 
 /** 收集所有已到达的 approval 事件（历史回放 + 实时），按 tool_call_id 去重且保序。 */
-const approvalEvents = computed(() => {
-  const seen = new Set<string>()
-  const out: Array<{ toolCallId: string; runId: string; toolName: string; args: string; content: string }> = []
-  for (const e of props.liveEvents || []) {
-    const id = e?.tool_call_id
-    if (e?.type !== 'subagent.approval' || !id || seen.has(id)) continue
-    seen.add(id)
-    out.push({
-      toolCallId: id,
-      runId: e.run_id || '',
-      toolName: e.tool_name || '',
-      args: e.tool_arguments || '',
-      content: e.content || '',
-    })
-  }
-  return out
-})
+const approvalEvents = computed(() => liveScan.value.approvals)
 
 /** 尚未决定、也未被终态作废的审批（子 Agent 已结束 → 卡片自动消失）。 */
 const pendingApprovals = computed(() => {
@@ -250,16 +292,9 @@ const pendingQuestions = computed(() => {
   const terminal = new Set(
     displayRuns.value.filter(r => TERMINAL_STATUSES.has(r.status)).map(r => r.run_id),
   )
-  const seen = new Set<string>()
-  const out: Array<{ toolCallId: string; runId: string }> = []
-  for (const e of props.liveEvents || []) {
-    const id = e?.tool_call_id
-    if (e?.type !== 'subagent.ask' || !id || seen.has(id)) continue
-    if (askAnswers.value[id] || terminal.has(e.run_id || '')) continue
-    seen.add(id)
-    out.push({ toolCallId: id, runId: e.run_id || '' })
-  }
-  return out
+  return liveScan.value.questions.filter(
+    q => !askAnswers.value[q.toolCallId] && !terminal.has(q.runId),
+  )
 })
 
 /**
@@ -351,7 +386,12 @@ function focusApprovals(runId: string) {
   void selectRun(runId)
 }
 
-const visibleRuns = computed(() => displayRuns.value.filter(r => !hiddenByAncestor(r)))
+/** 可见运行：按 parent_run_id 沿祖先上溯，被折叠的那一支整棵隐藏 */
+const visibleRuns = computed(() => {
+  const list = displayRuns.value
+  const byId = new Map(list.map(r => [r.run_id, r]))
+  return list.filter(r => !hiddenByAncestor(r, byId))
+})
 
 const selectedRun = computed<SubagentRunView | null>(() => {
   const id = selectedRunId.value
@@ -361,7 +401,24 @@ const selectedRun = computed<SubagentRunView | null>(() => {
   // 回退到**实时事件合成的条目**：后台 run 往往还没落进 GET /v1/subagent/runs，
   // 而「输出」区（审批卡片就在这里）由 selectedRun 决定是否渲染 ——
   // 只认 API 会让"点得开待确认标记、却看不到卡片"，等于又回到批不了的状态。
-  return (liveRuns.value.find(r => r.run_id === id) as SubagentRunView | undefined) ?? null
+  const live = liveRuns.value.find(r => r.run_id === id) as SubagentRunView | undefined
+  if (live) return live
+  // 第三层回退：**从事件回放合成**。从对话流点进来的 run 可能已经跑完并被轮转掉
+  // （既不在 API 结果里、也不在实时缓冲里），但事件端点仍能回放出它 —— 此时
+  // 「输出」区必须能渲染，否则点了那一行等于没反应。
+  if (historyEvents.value.some(e => e.run_id === id)) {
+    const last = historyEvents.value.filter(e => e.run_id === id).at(-1)
+    return {
+      run_id: id,
+      parent_run_id: last?.parent_run_id || '',
+      depth: Number(last?.depth ?? 1) || 1,
+      profile: last?.profile || '',
+      status: String(last?.status || 'completed'),
+      summary: last?.summary,
+      usage: last?.usage,
+    }
+  }
+  return null
 })
 
 /** 选中 run 的事件流 = 历史（回放）+ 实时（本会话累积中属于该 run 的部分）。 */
@@ -373,6 +430,42 @@ const selectedEvents = computed<SubagentEvent[]>(() => {
   const seen = new Set(historyEvents.value.map(e => e.id).filter(Boolean) as string[])
   return [...historyEvents.value, ...live.filter(e => !e.id || !seen.has(e.id))]
 })
+
+/**
+ * 输出区一次最多渲染多少行。
+ *
+ * 为什么要有上限：一个跑得久的子 Agent 能产出**上千条**事件（每次思考、每段正文、
+ * 每条工具结果各一条）。全量渲染进 DOM，每次新事件到达 Vue 都要为整条列表做
+ * diff —— 事件以每秒数条的速度进来时，这就是卡顿的来源。过程视图是给人"读现在
+ * 在做什么"的，不需要无限历史；更早的部分由「事件流」tab 与轮询回放兜底。
+ */
+const OUTPUT_ROW_LIMIT = 400
+
+/**
+ * 输出区实际渲染的行（**与主 Agent 同构**：工具调用卡 + 工具结果块）。
+ *
+ * 配对规则在 `subagentOutput.ts` 里（纯函数、有单测）；这里只负责截尾：
+ * 超出上限时保留**最近**的若干行 —— 过程视图关心的是"现在"，而不是开头。
+ *
+ * 一次投影同时算出 `hidden`（被折叠掉的行数）：分成两个 computed 会把整条事件流
+ * 投影两遍，而每来一条新事件两个都会失效重算 —— 那正是要避免的开销。
+ */
+const outputView = computed(() => {
+  const rows = projectSubagentOutput(selectedEvents.value)
+  if (rows.length <= OUTPUT_ROW_LIMIT) return { rows, hidden: 0 }
+  return { rows: rows.slice(-OUTPUT_ROW_LIMIT), hidden: rows.length - OUTPUT_ROW_LIMIT }
+})
+const outputRows = computed(() => outputView.value.rows)
+const outputHiddenRows = computed(() => outputView.value.hidden)
+
+/**
+ * 「输出」tab 里的并列 tab 条 —— 哪些 run 值得占一格。
+ *
+ * 取 `visibleRuns`（尊重折叠）而不是 `displayRuns`：用户在「运行」里把一整支折叠掉了，
+ * 输出区却又把它列出来，等于折叠没生效。顺序沿用层级顺序（父在子前），
+ * 与运行树一致 —— 两处对"谁是谁的上层"的判断不该相反。
+ */
+const outputTabs = computed(() => visibleRuns.value)
 
 const totals = computed(() => {
   let input = 0
@@ -562,6 +655,26 @@ watch(() => props.liveEvents?.length || 0, (len, prev) => {
 
 watch(() => props.sessionId, () => { selectedRunId.value = ''; historyEvents.value = []; void loadRuns() })
 
+/**
+ * 外部定位请求（对话流里点了某个子 Agent 工具卡）。
+ *
+ * 为什么看 `focusSeq` 而不是只比 run id：栏已经开着看 A，用户又点了 A —— 只比 id
+ * 时值没变化，`watch` 不触发，"点了没反应"。序号让每次点击都是新值。
+ *
+ * 落在「输出」tab：用户点那一行要的是**过程与审批**（它做了什么、在等什么），
+ * 而不是再看一遍运行列表。
+ */
+watch(
+  () => [props.focusRunId, props.focusSeq] as const,
+  ([id]) => {
+    if (!id) return
+    saTab.value = 'output'
+    if (id !== selectedRunId.value) void selectRun(id)
+    else void pollSelectedEvents()
+  },
+  { immediate: true },
+)
+
 onMounted(() => {
   try {
     showCostHint.value = globalThis.localStorage?.getItem(COST_HINT_KEY) !== '1'
@@ -595,7 +708,12 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <div class="panel-head">
+    <!-- 标题行可关：对照栏的外壳已经有一层标题（栏名 + 运行中计数 + 关闭），
+         面板再画一遍只是同一句话说两次，还白占一行高度。 -->
+    <div
+      v-if="!hideHeader"
+      class="panel-head"
+    >
       <span class="panel-title">{{ $t('agent.sub_agent') }}</span>
       <span class="panel-meta">
         {{ runs.length }} {{ $t('common.running_3') }} ↑{{ totals.input }} / ↓{{ totals.output }}
@@ -840,107 +958,177 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
-    <!-- v-if 负责"无选中不渲染"（同时让 TS 把 selectedRun 收窄为非空），
-         v-show 负责 tab 切换 —— 两者可并用；只写 v-show 会丢掉类型收窄。 -->
+    <!-- 输出区：**与主 Agent 同一套渲染**（工具调用卡 + 工具结果块），
+         再加一条多个 run 的并列 tab 条。
+         外层的 v-show 负责 tab 切换；内层 v-if 负责"无选中不渲染"（同时让 TS 把
+         selectedRun 收窄为非空）。 -->
     <div
-      v-if="selectedRun"
       v-show="saTab === 'output'"
       class="output"
     >
-      <div class="output-head">
-        <span>{{ selectedRun.profile || selectedRun.run_id }}</span>
-        <span class="output-meta">
-          {{ $t('workflow.steps') }} {{ selectedRun.usage?.steps || 0 }}
-        </span>
+      <!-- 多个子 Agent **并列成 tab**：一个会话里常有多个 run（并行委派、嵌套子代理），
+           一次只看一个就逼用户回「运行」页来回点。tab 条让"切到那一个"只需一次点击，
+           与"同一类东西并排摆放"的直觉一致。
+           只有一个 run 时不画这条：多一行 tab 只是噪音。 -->
+      <div
+        v-if="outputTabs.length > 1"
+        class="output-tabs"
+        role="tablist"
+        :aria-label="$t('agent.sub_agent_view')"
+      >
+        <button
+          v-for="run in outputTabs"
+          :key="run.run_id"
+          type="button"
+          role="tab"
+          class="output-tab"
+          :class="{ active: run.run_id === selectedRunId }"
+          :aria-selected="run.run_id === selectedRunId"
+          :title="`${run.profile || run.run_id} · ${run.status}`"
+          @click="selectRun(run.run_id)"
+        >
+          <span
+            class="output-tab-dot"
+            :data-state="TERMINAL_STATUSES.has(run.status) ? 'done' : 'live'"
+            aria-hidden
+          />
+          <span class="output-tab-name">{{ run.profile || run.run_id.slice(0, 8) }}</span>
+          <!-- 待处理（审批/提问）的 run 必须在 tab 上就看得出来：
+               否则用户要逐个点开才知道"哪个在等我"。 -->
+          <span
+            v-if="pendingByRun[run.run_id]"
+            class="output-tab-pending"
+            :title="$t('agent.sub_agent_is_waiting_for_your_confirmation_or_answer')"
+          >⚠{{ pendingByRun[run.run_id] > 1 ? pendingByRun[run.run_id] : '' }}</span>
+        </button>
       </div>
-      <div class="output-summary">
-        {{ selectedRun.summary || $t('common.running_no_summary_yet') }}
-      </div>
-      <Spin :spinning="historyLoading">
-        <div class="stream">
-          <template
-            v-for="(event, index) in selectedEvents"
-            :key="event.id || index"
-          >
-            <div
-              v-if="event.type === 'subagent.reasoning' && event.content"
-              class="line reasoning"
-            >
-              <span class="line-tag">{{ $t('chat.reasoning') }}</span>{{ event.content }}
-            </div>
-            <div
-              v-else-if="event.type === 'subagent.text' && event.content"
-              class="line text"
-            >
-              {{ event.content }}
-            </div>
-            <div
-              v-else-if="event.type === 'subagent.notice' && event.content"
-              class="line notice"
-            >
-              {{ event.content }}
-            </div>
-            <div
-              v-else-if="event.type === 'subagent.approval'"
-              class="line approval"
-            >
-              <SubAgentApprovalCard
-                :tool-name="event.tool_name || ''"
-                :args="event.tool_arguments || ''"
-                :content="event.content || ''"
-                :submitting="approvalSubmitting.has(event.tool_call_id || '')"
-                :decision="approvalDecisions[event.tool_call_id || ''] || ''"
-                :error="approvalErrors[event.tool_call_id || ''] || ''"
-                @decide="(approved: boolean) => resolveApproval({ toolCallId: event.tool_call_id || '' }, approved)"
-                @edit="(args: string) => resolveApproval({ toolCallId: event.tool_call_id || '' }, true, args)"
-              />
-            </div>
-            <div
-              v-else-if="event.type === 'subagent.ask'"
-              class="line ask"
-            >
-              <AskCard
-                :question="event.question || event.content || ''"
-                :options="event.options || []"
-                :allow-free-text="event.allow_free_text !== false"
-                :expired="!!askErrors[event.tool_call_id || '']"
-                @answer="(value: string) => resolveAsk(event.tool_call_id || '', value)"
-              />
-              <div
-                v-if="askAnswers[event.tool_call_id || '']"
-                class="ask-done"
-              >
-                {{ $t('chat.replied') }}：{{ askAnswers[event.tool_call_id || ''] }}
-              </div>
-              <div
-                v-if="askErrors[event.tool_call_id || '']"
-                class="approval-error"
-              >
-                {{ askErrors[event.tool_call_id || ''] }}
-              </div>
-            </div>
-            <div
-              v-else-if="event.type === 'subagent.status'"
-              class="line status"
-            >
-              {{ event.status }}<span v-if="event.truncated"> {{ $t('common.preview_truncated') }}</span>
-            </div>
-            <div
-              v-else-if="event.type === 'subagent.done'"
-              class="line done"
-            >
-              {{ $t('common.end') }}：{{ event.status }}
-              <span v-if="event.usage"> · ↑{{ event.usage.input_tokens || 0 }}/↓{{ event.usage.output_tokens || 0 }}</span>
-            </div>
-          </template>
-          <div
-            v-if="!selectedEvents.length"
-            class="stream-empty"
-          >
-            {{ $t('errors.no_output_yet_running_or_process_expired') }}
-          </div>
+
+      <template v-if="selectedRun">
+        <div class="output-head">
+          <span>{{ selectedRun.profile || selectedRun.run_id }}</span>
+          <span class="output-meta">
+            {{ $t('workflow.steps') }} {{ selectedRun.usage?.steps || 0 }}
+          </span>
         </div>
-      </Spin>
+        <div class="output-summary">
+          {{ selectedRun.summary || $t('common.running_no_summary_yet') }}
+        </div>
+        <Spin :spinning="historyLoading">
+          <!-- 被行数上限折叠掉的部分要如实说明：静默截断会让用户以为
+               "它只做了这么多"，而「事件流」tab 里明明还有更早的内容。 -->
+          <div
+            v-if="outputHiddenRows"
+            class="output-hidden"
+          >
+            {{ $t('common.n_more_items_above', { n: outputHiddenRows }) }}
+          </div>
+          <div class="stream">
+            <template
+              v-for="row in outputRows"
+              :key="row.key"
+            >
+              <div
+                v-if="row.kind === 'reasoning'"
+                class="line reasoning"
+              >
+                <span class="line-tag">{{ $t('chat.reasoning') }}</span>{{ row.content }}
+              </div>
+              <div
+                v-else-if="row.kind === 'text'"
+                class="line text"
+              >
+                {{ row.content }}
+              </div>
+              <div
+                v-else-if="row.kind === 'notice'"
+                class="line notice"
+              >
+                {{ row.content }}
+              </div>
+              <!-- 工具过程：**复用主对话流的组件**。摘要、参数展开、失败配色
+                   都只有一份实现，两个界面不可能漂移。 -->
+              <div
+                v-else-if="row.kind === 'tool'"
+                class="line tool"
+              >
+                <ToolCallCard
+                  v-if="row.call"
+                  :item="row.call"
+                />
+                <ToolResultBlock
+                  v-if="row.result"
+                  :item="row.result"
+                  :session-id="sessionId"
+                />
+              </div>
+              <div
+                v-else-if="row.kind === 'approval'"
+                class="line approval"
+              >
+                <SubAgentApprovalCard
+                  :tool-name="row.event.tool_name || ''"
+                  :args="row.event.tool_arguments || ''"
+                  :content="row.event.content || ''"
+                  :submitting="approvalSubmitting.has(row.event.tool_call_id || '')"
+                  :decision="approvalDecisions[row.event.tool_call_id || ''] || ''"
+                  :error="approvalErrors[row.event.tool_call_id || ''] || ''"
+                  @decide="(approved: boolean) => resolveApproval({ toolCallId: row.event.tool_call_id || '' }, approved)"
+                  @edit="(args: string) => resolveApproval({ toolCallId: row.event.tool_call_id || '' }, true, args)"
+                />
+              </div>
+              <div
+                v-else-if="row.kind === 'ask'"
+                class="line ask"
+              >
+                <AskCard
+                  :question="row.event.question || row.event.content || ''"
+                  :options="row.event.options || []"
+                  :allow-free-text="row.event.allow_free_text !== false"
+                  :expired="!!askErrors[row.event.tool_call_id || '']"
+                  @answer="(value: string) => resolveAsk(row.event.tool_call_id || '', value)"
+                />
+                <div
+                  v-if="askAnswers[row.event.tool_call_id || '']"
+                  class="ask-done"
+                >
+                  {{ $t('chat.replied') }}：{{ askAnswers[row.event.tool_call_id || ''] }}
+                </div>
+                <div
+                  v-if="askErrors[row.event.tool_call_id || '']"
+                  class="approval-error"
+                >
+                  {{ askErrors[row.event.tool_call_id || ''] }}
+                </div>
+              </div>
+              <div
+                v-else-if="row.kind === 'status'"
+                class="line status"
+              >
+                {{ row.event.status }}<span v-if="row.event.truncated"> {{ $t('common.preview_truncated') }}</span>
+              </div>
+              <div
+                v-else-if="row.kind === 'done'"
+                class="line done"
+              >
+                {{ $t('common.end') }}：{{ row.event.status }}
+                <span v-if="row.event.usage"> · ↑{{ row.event.usage.input_tokens || 0 }}/↓{{ row.event.usage.output_tokens || 0 }}</span>
+              </div>
+            </template>
+            <div
+              v-if="!outputRows.length"
+              class="stream-empty"
+            >
+              {{ $t('errors.no_output_yet_running_or_process_expired') }}
+            </div>
+          </div>
+        </Spin>
+      </template>
+      <div
+        v-else
+        class="sa-empty"
+      >
+        {{ $t('agent.select_a_sub_agent_in_run_first') }}
+      </div>
     </div>
   </div>
 </template>
@@ -1020,6 +1208,45 @@ onBeforeUnmount(() => {
 .output { border-top: var(--hairline-width) solid var(--border-color, rgba(127, 127, 127, 0.24)); padding-top: 10px; }
 .output-head { display: flex; justify-content: space-between; font-weight: var(--fw-semibold); }
 .output-meta { font-size: 12px; color: var(--text-tertiary, #8c8c8c); }
+
+/* 多个 run 的并列 tab 条：横向滚动而不是换行 —— 换行会把过程视图挤下去，
+   而这里每一格都只是"切到谁"的入口。 */
+.output-tabs {
+  display: flex; gap: 4px; margin-bottom: 8px;
+  overflow-x: auto; scrollbar-width: thin;
+}
+.output-tab {
+  flex: none; display: inline-flex; align-items: center; gap: 5px;
+  max-width: 180px; padding: 3px 8px;
+  border: var(--hairline-width) solid var(--border-subtle);
+  border-radius: var(--radius-full);
+  background: transparent; color: var(--text-secondary, #595959);
+  font-size: var(--fs-xs); cursor: pointer;
+  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+.output-tab:hover { background: var(--bg-hover); color: var(--text-primary); }
+.output-tab.active { background: var(--primary-bg); border-color: var(--primary); color: var(--primary); }
+.output-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 运行中/已结束的状态点：一点颜色差就能看出"还剩几个在跑" */
+.output-tab-dot {
+  flex: none; width: 6px; height: 6px; border-radius: var(--radius-full);
+  background: var(--text-tertiary, #8c8c8c);
+}
+.output-tab-dot[data-state='live'] { background: var(--primary); animation: sa-pulse var(--dur-pulse) ease-in-out infinite; }
+@keyframes sa-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .output-tab-dot[data-state='live'] { animation: none; }
+}
+/* 待处理角标：哪个 run 在等我，必须在 tab 上就能看出来 */
+.output-tab-pending { flex: none; color: var(--warning, #d97706); font-weight: var(--fw-semibold); }
+
+/* 被行数上限折叠掉的部分：如实说明，而不是静默截断 */
+.output-hidden {
+  margin-bottom: 6px; padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2, rgba(127, 127, 127, 0.06));
+  color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs);
+}
 .output-summary {
   margin: 6px 0; padding: 8px; border-radius: var(--radius-md);
   background: var(--surface-2, rgba(127, 127, 127, 0.06));

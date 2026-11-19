@@ -1205,19 +1205,36 @@ export interface IsolationStatus {
   effective: IsolationLevel
   /** 硬底线：有效档位不得低于它 */
   floor: IsolationLevel
-  /** 生效档位是否已跌破底线（此时执行会被拒绝） */
+  /**
+   * 生效档位是否已跌破安全底线。
+   *
+   * **不再等于"执行会被拒绝"** —— 是否拒绝看 `user_selected`：
+   * 用户自己在设置页关掉隔离是他本人的决定，工具照常执行；
+   * 只有机制缺失导致的**被动**跌破才会被拒绝（README 的 fail-closed）。
+   */
   below_floor: boolean
+  /** 这个低档位是否是用户显式选择的结果（而非机制缺失造成的被动降级） */
+  user_selected?: boolean
   /** 降级原因（人类可读，直接展示） */
   reasons: string[]
   downgrade_allowed: boolean
   /**
-   * 前端据此置灰：**本机真能做到**且不低于底线的档位。
+   * 前端据此置灰：**本机真能做到**的档位。
    *
-   * 注意它不等于"高于底线的档位" —— 后端会端到端探测每一档（真的起一个子进程
+   * 包含低于安全底线的 `none`/`job` —— 它们可以被显式选择，只是 `none` 需要
+   * 二次确认（见 `acknowledge_required`）。挡在墙外会让"关掉隔离"只能改代码。
+   *
+   * 注意它不等于"所有档位"：后端会端到端探测每一档（真的起一个子进程
    * 读回输出），做不到的不列出来。否则面板会把 `restricted` 也标成可选，
    * 用户选了却只落到 `low_il`（实测：非管理员下 `CreateProcessAsUserW` err=5）。
    */
   selectable: IsolationLevel[]
+  /**
+   * 选择这些档位时必须先二次确认。
+   *
+   * 只有 `none`（完全没有边界）在此列；`job` 仍有 Job Object 边界，不值得加门槛。
+   */
+  acknowledge_required?: IsolationLevel[]
   /**
    * 不可选档位的原因，按档位名索引。
    *
@@ -1251,13 +1268,22 @@ export async function getIsolationStatus(): Promise<IsolationStatus> {
  * 切换隔离档位。
  *
  * 只在引擎进程内生效，**不写配置文件** —— 所以重启即恢复原值，撤销是免费的。
- * 传低于底线的档位不会被拒绝，而是被抬到底线并在 `reasons` 里说明。
+ *
+ * 低于安全底线的档位有两种处理：
+ *   · `job` —— 直接生效（它仍有 Job Object 边界）；
+ *   · `none` —— 必须传 `acknowledgeBelowFloor=true`，否则被后端抬到底线并在
+ *     `reasons` 里说明。这是"用户自己关掉隔离"的显式声明，不是配置能做的事。
  */
 export async function setIsolationLevel(
   level: IsolationLevel,
   reason = '',
+  acknowledgeBelowFloor = false,
 ): Promise<IsolationStatus> {
-  const resp = await api.put('/v1/system/isolation', { level, reason })
+  const resp = await api.put('/v1/system/isolation', {
+    level,
+    reason,
+    acknowledge_below_floor: acknowledgeBelowFloor,
+  })
   return toIsolationStatus(resp.data)
 }
 

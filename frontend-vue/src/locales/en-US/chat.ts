@@ -455,4 +455,7 @@ export default {
   // ── Wrap-up 1: surfacing P1's completion verdict (same wording for live event & persisted trace) ──
   turn_incomplete_reasons: "Turn not completed (host evidence): {reasons}",
   turn_incomplete_more: "{n} more",
+  // ── s23: subagent result → comparison dock ──
+  view_subagent_in_dock: "View this subagent in the dock",
+  open_subagent_in_dock: "Open the dock and focus {run}",
 }
