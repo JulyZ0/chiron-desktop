@@ -1,7 +1,8 @@
 /**
  * 当前**项目**（记忆隔离维度，方案 02 §4 · C3）。
  *
- * 语义：L2 记忆按 `tenant + user + project` 隔离，**空串 = 未分组**（缺省，与既有行为一致）。
+ * 语义：L2 记忆按 `tenant + user + project` 隔离，**空串 = 全局** —— 该条目对所有项目
+ * 可见并会被自动带上；具名项目之间仍互不可见（缺省值即全局，与既有行为向后兼容）。
  *
  * 两处消费点：
  * - **记忆页**用它决定"看/改哪个项目的记忆"；
@@ -21,15 +22,15 @@ function readStored(): string {
   try {
     return (localStorage.getItem(STORAGE_KEY) || '').trim()
   } catch {
-    // 隐私模式 / SSR 等拿不到 localStorage：退回"未分组"，不影响功能
+    // 隐私模式 / SSR 等拿不到 localStorage：退回"全局"，不影响功能
     return ''
   }
 }
 
-/** 当前项目（空串 = 未分组）。 */
+/** 当前项目（空串 = 全局视图）。 */
 export const currentProject = ref<string>(readStored())
 
-/** 切换项目并持久化（空串 = 回到未分组）。 */
+/** 切换项目并持久化（空串 = 回到全局视图）。 */
 export function setProject(name: string): void {
   const next = (name || '').trim()
   currentProject.value = next
@@ -44,7 +45,7 @@ export function setProject(name: string): void {
 /**
  * 给 HTTP 请求用的 query 片段。
  *
- * 空项目 → **不带参数**（服务端把"没有 project"与"project=''"都当未分组）——
+ * 空项目 → **不带参数**（服务端把"没有 project"与"project=''"都当全局范围）——
  * 这样未使用项目的用户，请求与 C3 之前**逐字相同**。
  */
 export function projectParams(): Record<string, string> {

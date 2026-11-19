@@ -17,7 +17,7 @@ export default {
     all: 'All',
     agent: 'Agents',
     skill: 'Skills',
-    knowledge: 'Knowledge',
+    knowledge: 'Collection',
     mcp: 'MCP',
   },
 
@@ -60,6 +60,8 @@ export default {
     requires_approval: 'It still needs approval on the plugins page before it can run',
     requires_env: 'Required environment variables',
     requires_env_hint: 'Kept in memory for this session only — never written to local storage or disk.',
+    collection_documents: 'Collection contains {n} document(s)',
+    collection_hint: 'Each source below is fetched and imported into the knowledge base on install. No index is built automatically — trigger it from the knowledge base page.',
     no_description: 'No description provided',
   },
 

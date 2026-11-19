@@ -30,6 +30,7 @@ import {
   ThunderboltOutlined,
   DatabaseOutlined,
   CommentOutlined,
+  SwapOutlined,
 } from '@ant-design/icons-vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import ConflictCard from '../components/memory/ConflictCard.vue'
@@ -41,12 +42,14 @@ import {
   deleteMemory,
   clearMemory,
   searchMemory,
+  moveMemoryScope,
   startOrganize,
   getOrganizeStatus,
   listConflicts,
   listSummaries,
   MEMORY_SLOTS,
   type MemoryEntry,
+  type MemoryScope,
   type MemorySearchHit,
   type MemorySlot,
   type MemorySource,
@@ -148,17 +151,52 @@ const form = ref<{
   value: string
   confidence: number
   source: MemorySource
+  /** 写入范围：`global` = 所有项目通用；`project` = 当前项目 */
+  scope: MemoryScope
 }>({
   slot: 'fact',
   key: '',
   value: '',
   confidence: 50,
   source: 'user_confirmed',
+  scope: 'project',
 })
+
+/**
+ * 条目是否为全局。
+ *
+ * `scope` 缺失时按 `project` 是否为空串推断 —— 但**只认空串**：
+ * 两个字段都没有（旧后端）时按"项目条目"处理，宁可多给一个编辑入口，
+ * 也不要把整页记忆误锁成只读。
+ */
+function isGlobal(entry: MemoryEntry): boolean {
+  if (entry.scope) return entry.scope === 'global'
+  return entry.project === ''
+}
+
+/** 当前视图是否就是「全局」（项目名留空）。 */
+const isGlobalView = computed(() => !project.value)
+
+/**
+ * 项目视图里全局条目**只读**：改它会波及所有项目，入口收在全局视图。
+ *
+ * 不用 computed 按条目缓存 —— 只是个布尔推导，模板里直接调用更直观。
+ */
+function isReadOnly(entry: MemoryEntry): boolean {
+  return !isGlobalView.value && isGlobal(entry)
+}
 
 function openCreate(slot?: MemorySlot) {
   editing.value = null
-  form.value = { slot: slot ?? 'fact', key: '', value: '', confidence: 50, source: 'user_confirmed' }
+  form.value = {
+    slot: slot ?? 'fact',
+    key: '',
+    value: '',
+    confidence: 50,
+    source: 'user_confirmed',
+    // 新建默认落在当前视图：在项目里建的默认属于该项目，在全局视图建的默认全局
+    scope: isGlobalView.value ? 'global' : 'project',
+  }
   formVisible.value = true
 }
 
@@ -170,12 +208,13 @@ function openEdit(entry: MemoryEntry) {
     value: entry.value,
     confidence: entry.confidence,
     source: entry.source as MemorySource,
+    scope: isGlobal(entry) ? 'global' : 'project',
   }
   formVisible.value = true
 }
 
 async function handleSave() {
-  const { slot, key, value, confidence, source } = form.value
+  const { slot, key, value, confidence, source, scope } = form.value
   if (!key.trim() || !value.trim()) {
     message.warning(t('common.key_and_content_cannot_be_empty'))
     return
@@ -183,10 +222,16 @@ async function handleSave() {
   saving.value = true
   try {
     if (editing.value) {
+      // 编辑是"就地改内容"，范围由后端按当前 `?project=` 精确匹配 —— 不在这里换范围
+      // （换范围走 moveScope，语义不同：它要跨范围动作）。
       await updateMemory({ id: editing.value.id, key, value, confidence, source })
       message.success(t('memory.memory_updated'))
     } else {
-      const res = await upsertMemory({ slot, key, value, confidence, source })
+      // 新建时范围可覆盖当前视图：在项目里也能直接建一条"全局"记忆
+      const res = await upsertMemory(
+        { slot, key, value, confidence, source },
+        { project: scope === 'global' ? '' : project.value },
+      )
       if (res.duplicate_of) {
         message.warning(t('memory.similar_memory_key_detected_auto_merged_during_cleanup', { key: res.duplicate_of.key }))
       } else {
@@ -199,6 +244,30 @@ async function handleSave() {
     message.error(serverErrorMessage(e, t('errors.save_failed')))
   } finally {
     saving.value = false
+  }
+}
+
+/**
+ * 把一条**项目专属**记忆提升为全局记忆（`project` → 空）。
+ *
+ * 界面只给这一个方向：后端 `move_entry_scope` 要求 `from_project` 等于条目当前所属范围
+ * （那是权限边界），所以项目视图只能动本项目的条目，全局视图只能动全局条目。
+ * 而全局视图里没有"目标项目"的来源 —— 项目名是用户自由输入的，界面上此刻为空；
+ * 替用户猜一个项目等于把一条所有项目共用的记忆悄悄绑到其中一个上。
+ * 因此「全局 → 项目」不提供入口，需要时在目标项目的视图里新建即可。
+ */
+async function makeGlobal(entry: MemoryEntry) {
+  try {
+    await moveMemoryScope(entry.id, '')
+    message.success(t('memory.memory_scope_switched'))
+    await loadProfile()
+  } catch (e) {
+    // 409：目标范围已有同 (slot, key) 的条目，后端不会静默覆盖
+    if (errorStatus(e) === 409) {
+      message.error(t('memory.target_scope_already_has_a_memory_with_the_same_key'))
+    } else {
+      message.error(serverErrorMessage(e, t('errors.save_failed')))
+    }
   }
 }
 
@@ -290,8 +359,9 @@ async function runOrganize() {
 }
 
 // ── 项目（C3）──
-// 记忆按 `tenant + user + project` 隔离，**空 = 未分组**。切换项目必须**重新加载**：
-// 否则界面上留着上一个项目的条目，用户会以为它们还在（"隔离"看起来生效而其实串了）。
+// 记忆按 `tenant + user + project` 隔离：**空 = 全局**（所有项目通用），具名项目互不可见。
+// 切换项目必须**重新加载**：否则界面上留着上一个项目的条目，用户会以为它们还在
+// （"隔离"看起来生效而其实串了）。
 const project = currentProject
 
 /** ant 的 `@change` 给的是原生 Event（这里用的是 `:value` + `@change` 的原生语义） */
@@ -661,6 +731,12 @@ function pct(n: number): string {
                   <Tag color="purple">
                     {{ item.slot_label }}
                   </Tag>
+                  <Tag
+                    :color="isGlobal(item) ? 'gold' : 'geekblue'"
+                    data-test="entry-scope"
+                  >
+                    {{ isGlobal(item) ? $t('memory.scope_global') : $t('memory.scope_project') }}
+                  </Tag>
                   <span class="entry-key">{{ item.key }}</span>
                   <Tag :color="item.source === 'user_confirmed' ? 'green' : 'default'">
                     {{ item.source_label }}
@@ -681,7 +757,27 @@ function pct(n: number): string {
                         <CommentOutlined />
                       </template>
                     </Button>
+                    <!-- 换范围：只对**本项目专属**的条目开放。
+                         全局条目在项目视图里只读（后端按 `from_project` 精确匹配，
+                         从项目视图发请求会被 404 拒绝），而全局视图下又推不出"改成哪个项目"，
+                         所以两个方向里只有「项目 → 全局」有明确入口。 -->
+                    <Tooltip
+                      v-if="!isGlobalView && !isGlobal(item)"
+                      :title="$t('memory.move_to_global')"
+                    >
+                      <Button
+                        size="small"
+                        type="text"
+                        data-test="toggle-scope"
+                        @click="makeGlobal(item)"
+                      >
+                        <template #icon>
+                          <SwapOutlined />
+                        </template>
+                      </Button>
+                    </Tooltip>
                     <Button
+                      v-if="!isReadOnly(item)"
                       size="small"
                       type="text"
                       :title="$t('common.edit_2')"
@@ -691,7 +787,24 @@ function pct(n: number): string {
                         <EditOutlined />
                       </template>
                     </Button>
+                    <!-- 全局条目在项目视图里只读：给出原因，而不是留一个点了没反应的按钮 -->
+                    <Tooltip
+                      v-else
+                      :title="$t('memory.global_entries_are_read_only_in_project_view_switch_to_global_scope_to_edit')"
+                    >
+                      <Button
+                        size="small"
+                        type="text"
+                        disabled
+                        data-test="edit-disabled"
+                      >
+                        <template #icon>
+                          <EditOutlined />
+                        </template>
+                      </Button>
+                    </Tooltip>
                     <Popconfirm
+                      v-if="!isReadOnly(item)"
                       :title="$t('memory.delete_this_memory')"
                       :ok-text="$t('common.delete')"
                       :cancel-text="$t('common.cancel')"
@@ -844,6 +957,29 @@ function pct(n: number): string {
             {{ $t('agent.tool_write') }}
           </Select.Option>
         </Select>
+      </div>
+      <!-- 范围只对「新建」开放：编辑已有条目换范围走卡片上的切换按钮，
+           那条路径要跨范围动作、还可能撞上目标范围的同名 key（409）。 -->
+      <div
+        v-if="!editing"
+        class="form-row"
+      >
+        <label>{{ $t('common.scope') }}</label>
+        <Select
+          v-model:value="form.scope"
+          style="width: 100%"
+          data-test="form-scope"
+        >
+          <Select.Option value="global">
+            {{ $t('memory.scope_global') }}
+          </Select.Option>
+          <Select.Option value="project">
+            {{ $t('memory.scope_project') }}
+          </Select.Option>
+        </Select>
+        <div class="config-note">
+          {{ $t('memory.project_hint') }}
+        </div>
       </div>
     </Modal>
   </div>

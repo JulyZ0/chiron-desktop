@@ -41,6 +41,17 @@ import {
   type MenuAction,
 } from './media/menuModel'
 import { pasteBlockedReason } from './media/clipboard'
+import {
+  collectDroppedEntries,
+  dirKey,
+  dragHasFiles,
+  ensureDropFolders,
+  MAX_DROP_DEPTH,
+  planDrop,
+  runWithConcurrency,
+  type DroppedEntry,
+  type ExistingFolder,
+} from './media/dropUpload'
 import type { DeleteScopeDetail } from './media/dialogs'
 import type { PropertySource } from './media/properties'
 import {
@@ -537,6 +548,7 @@ const {
   uploadFileList,
   uploadingFiles,
   handleUploadRequest,
+  uploadOne,
   pauseAllUploads,
   retryFailedUploads,
   clearCompletedUploads,
@@ -1128,6 +1140,178 @@ async function uploadToKnowledgeBase() {
   if (fail > 0) message.error(tr('errors.n_files_failed_to_upload', { n: fail }))
 }
 
+// ── 拖拽上传（文件 + 文件夹） ──
+//
+// 三件事必须一起做对，否则用户看到的是"拖进去没反应"或"文件夹传了一半"：
+//   1. dragover 必须 preventDefault，否则浏览器把文件当链接打开（整页跳走）；
+//   2. 文件夹要递归展开（`collectDroppedEntries`），一次最多读 100 条的限制在那边处理；
+//   3. 目录结构要在媒体库里**建出来**（`ensureDropFolders`），否则文件全糊在当层。
+const dropActive = ref(false)
+const dropping = ref(false)
+const dropTotal = ref(0)
+const dropDone = ref(0)
+
+/** 拖拽计数：子元素上的 dragleave 会冒泡上来，不用计数器时遮罩会疯狂闪烁。 */
+let dragDepth = 0
+
+function onPageDragEnter(e: DragEvent) {
+  if (!dragHasFiles(e.dataTransfer)) return
+  dragDepth++
+  dropActive.value = true
+}
+
+function onPageDragOver(e: DragEvent) {
+  if (!dragHasFiles(e.dataTransfer)) return
+  // 不 preventDefault 浏览器就会"打开"这个文件：整个页面被替换成一张图片，
+  // 媒体页连同未保存的选择一起消失。这是拖拽上传最常见的实现事故。
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'
+}
+
+/**
+ * dragleave **不能**用 `dragHasFiles` 早退。
+ *
+ * 离开窗口时浏览器给的 `dataTransfer` 常常是 null（或 types 已被清空），一旦在这里
+ * 直接 return，计数器就停在大于 0 的位置，遮罩再也不会消失 —— 用户看到的是
+ * "拖走之后整页一直蒙着一层". 只要计数还没归零，任何 dragleave 都应该递减。
+ */
+function onPageDragLeave() {
+  if (dragDepth === 0) return
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) dropActive.value = false
+}
+
+/** 清空拖拽状态：计数归零、遮罩收起。 */
+function resetDropState() {
+  dragDepth = 0
+  dropActive.value = false
+}
+
+/**
+ * 拖出窗口后松手不会触发页面上的 `drop`，遮罩会一直挂着挡满视口。
+ *
+ * 这里挂在 window 上兜底，而不是给元素加 `@dragend`：从**页面外**拖文件进来时，
+ * 拖拽源根本不在本页，`dragend` 永远不会送到这棵组件树上。判断依据是
+ * `relatedTarget === null` —— 指针真正离开窗口时浏览器才会给 null，
+ * 在元素之间移动时它指向新的目标，不能据此清状态（否则遮罩一路闪）。
+ */
+function onWindowDragLeave(e: DragEvent) {
+  if (e.relatedTarget) return
+  resetDropState()
+}
+
+async function onPageDrop(e: DragEvent) {
+  if (!dragHasFiles(e.dataTransfer)) return
+  e.preventDefault()
+  resetDropState()
+  if (!e.dataTransfer) return
+  // 正在上传时再拖入不能静默丢弃：用户会以为"这次也传了"，而实际什么都没发生，
+  // 等上一批结束才发现少了一批文件。Batch 不排队（会让进度条语义混乱：
+  // 分母在跑的过程中变大），只明确告诉他等这批结束再拖。
+  if (dropping.value) {
+    message.warning(tr('media.drop_busy_please_wait'))
+    return
+  }
+  // ⚠ 必须在任何 await 之前把 DataTransfer 读掉：见 dropUpload.ts 的注释第 2 条。
+  const entries = await collectDroppedEntries(e.dataTransfer)
+  await uploadDroppedEntries(entries)
+}
+
+const DROP_CONCURRENCY = 3
+
+async function uploadDroppedEntries(entries: DroppedEntry[]) {
+  if (entries.length === 0) {
+    message.info(tr('media.drop_no_uploadable_files'))
+    return
+  }
+
+  // 落点在**开始时**就锁定：上传是长任务，用户完全可能在进度条走的过程中点进
+  // 另一个目录去看别的文件。中途再读 `currentParentId` / `breadcrumbs` 会让同一
+  // 批文件被劈成两半投到两个目录，而提示仍然是一条"已上传 N 个文件"。
+  const baseParentId = currentParentId.value
+  const baseDepth = breadcrumbs.value.length - 1
+
+  dropping.value = true
+  dropTotal.value = entries.length
+  dropDone.value = 0
+
+  try {
+    const { entries: kept, folders, droppedDeep } = planDrop(entries, baseDepth)
+    if (droppedDeep > 0) {
+      // 超深度的文件一个都传不了，必须**说出来**：静默丢弃会让人以为拖漏了。
+      message.warning(tr('media.drop_too_deep', { n: droppedDeep, max: MAX_DROP_DEPTH }))
+    }
+    if (kept.length === 0) return
+
+    const existingRes = await api.get('/v1/media/folders').catch(() => null)
+    const existing: ExistingFolder[] = existingRes?.data?.data || []
+
+    const created = await ensureDropFolders(
+      folders,
+      existing,
+      async (name, parentId) => {
+        const res = await api
+          .post('/v1/media/folders', { name, parent_id: parentId })
+          .catch(() => null)
+        const d = res?.data?.data
+        // 并发重名（另一个窗口刚建了同名目录）时后端返回 400，这里当作"已存在"
+        // 重新查一次，而不是直接判失败 —— 目录确实在那儿，文件照样能进去。
+        if (!d?.id) {
+          const fresh = await api.get('/v1/media/folders').catch(() => null)
+          const list: ExistingFolder[] = fresh?.data?.data || []
+          const hit = list.find(
+            (f) => (f.parent_id || '') === parentId && f.name === name,
+          )
+          return hit || null
+        }
+        return { id: d.id as string, name, parent_id: parentId }
+      },
+      baseParentId,
+    )
+
+    if (created.failed.length > 0) {
+      message.warning(
+        tr('media.drop_folders_failed', {
+          n: created.failed.length,
+          names: created.failed.slice(0, 3).join(' / '),
+        }),
+      )
+    }
+
+    // 目录失败的文件不再尝试：传上去也只会落在当层，比不传更让人困惑。
+    const uploadable = kept.filter(
+      (entry) => entry.dirs.length === 0 || created.ids.has(dirKey(entry.dirs)),
+    )
+    const skipped = kept.length - uploadable.length
+
+    const results = await runWithConcurrency(uploadable, DROP_CONCURRENCY, async (entry) => {
+      // 不用 `|| baseParentId` 兜底：目录失败的文件已在上面被 `uploadable` 过滤掉，
+      // 这里拿不到 id 说明规划与执行不一致 —— 与其静默投到当层，不如让这次失败可见。
+      const parentId = entry.dirs.length === 0
+        ? baseParentId
+        : (created.ids.get(dirKey(entry.dirs)) as string)
+      await uploadOne(entry.file, { parentId, notify: false, refresh: false })
+      dropDone.value++
+    })
+
+    const failed = results.filter((r) => !r.ok).length + skipped
+    const okCount = uploadable.length - results.filter((r) => !r.ok).length
+
+    if (okCount > 0) {
+      message.success(tr('media.drop_uploaded_n_files', { n: okCount }))
+    }
+    if (failed > 0) {
+      message.error(tr('errors.n_files_failed_to_upload', { n: failed }))
+    }
+  } finally {
+    dropping.value = false
+    dropTotal.value = 0
+    dropDone.value = 0
+    // 批量上传期间关掉了逐个刷新：最后统一拉一次，避免 N 次列表请求互相覆盖。
+    await fetchItems()
+  }
+}
+
 // S 修复：搜索/筛选变化时重置到第 1 页并防抖(300ms)，避免逐击键请求；分页变化单独触发
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 watch([searchQuery, typeFilter, tagFilter], () => {
@@ -1141,16 +1325,46 @@ onMounted(() => {
   fetchItems()
   window.addEventListener('keydown', onLightboxKey)
   window.addEventListener('keydown', handleKeyboardShortcut)
+  // dragleave 冒泡到 window 才算真正离开文档；元素级的 dragleave 在子节点之间
+  // 移动时也会触发，单靠它无法区分"离开窗口"与"换个元素"。
+  window.addEventListener('dragleave', onWindowDragLeave)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onLightboxKey)
   window.removeEventListener('keydown', handleKeyboardShortcut)
+  window.removeEventListener('dragleave', onWindowDragLeave)
 })
 </script>
 
 <template>
-  <div class="media-page">
+  <div
+    class="media-page"
+    @dragenter="onPageDragEnter"
+    @dragover="onPageDragOver"
+    @dragleave="onPageDragLeave"
+    @drop="onPageDrop"
+  >
+    <!-- 拖拽遮罩：整页可落，而不是只在那个 720px 的弹窗里能拖。
+         使用 pointer-events: none 让遮罩本身不吃掉 drop 事件（否则拖到遮罩上松手
+         会落空，表现为"拖了半天没反应"）。 -->
+    <div
+      v-if="dropActive || dropping"
+      class="drop-overlay"
+      aria-live="polite"
+    >
+      <div class="drop-overlay-card">
+        <CloudUploadOutlined class="drop-overlay-icon" />
+        <div class="drop-overlay-title">
+          {{ dropping
+            ? $t('media.drop_uploading_progress', { done: dropDone, total: dropTotal })
+            : $t('media.drop_release_to_upload_files_and_folders') }}
+        </div>
+        <div class="drop-overlay-hint">
+          {{ $t('media.drop_into_current_folder') }}
+        </div>
+      </div>
+    </div>
     <div class="media-toolbar">
       <div class="breadcrumb">
         <template
@@ -1801,7 +2015,9 @@ onUnmounted(() => {
             class="upload-item"
           >
             <div class="upload-item-header">
-              <span class="upload-filename">{{ fileId.split('-')[0] }}</span>
+              <!-- 名字从 state.name 取：key 现在编码了母目录/size/lastModified，
+                   再按分隔符反推会把整段前缀显示成文件名。 -->
+              <span class="upload-filename">{{ state.name || fileId }}</span>
               <span 
                 class="upload-status" 
                 :class="state.status"
@@ -2054,6 +2270,39 @@ onUnmounted(() => {
   .media-total { margin-inline-start: 0; }
 }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+/* 整页拖拽遮罩。
+   关键是 `pointer-events: none`：遮罩浮在整页之上，若它自己接收事件，
+   dragover/drop 就会落在遮罩而不是 .media-page 上，松手时事件冒泡到遮罩
+   内部却拿不到 DataTransfer，表现为"拖到遮罩上就没反应"。
+   `inset: 0` 配合 `position: fixed` 覆盖整个视口 —— 用户拖到工具栏或空白处
+   都算落点，而不是只有内容区那一小块。 */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal, 1000);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--bg-primary) 72%, transparent);
+  border: 2px dashed var(--primary);
+  border-radius: var(--radius-lg);
+}
+.drop-overlay-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 28px 36px;
+  border-radius: var(--radius-xl);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-lg);
+  text-align: center;
+}
+.drop-overlay-icon { font-size: 40px; color: var(--primary); }
+.drop-overlay-title { font-size: 16px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+.drop-overlay-hint { font-size: 12px; color: var(--text-tertiary); }
 
 /* 上传进度列表样式 */
 .upload-container { display: flex; flex-direction: column; gap: 12px; }

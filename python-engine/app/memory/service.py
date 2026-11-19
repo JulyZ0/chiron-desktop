@@ -300,9 +300,15 @@ class MemoryService:
 
     @staticmethod
     def _entry_dict(entry: Any) -> dict[str, Any]:
-        """MemoryEntry → API 契约（字段名与前端 MemoryEntry 类型一一对应）。"""
+        """MemoryEntry → API 契约（字段名与前端 MemoryEntry 类型一一对应）。
+
+        ``scope`` 是**由 project 推出的展示口径**，不落库：
+        ``global`` = 所有项目通用（project 空），``project`` = 某个项目专属。
+        前端据此把全局条目在项目视图里渲染成只读 —— 改它会波及所有项目。
+        """
         slot = _slot_value(entry.slot)
         source = _source_value(entry.source)
+        project = str(getattr(entry, "project", "") or "")
         return {
             "id": entry.id,
             "slot": slot,
@@ -318,6 +324,8 @@ class MemoryService:
             "status": entry.status,
             "created_at": _iso(entry.created_at),
             "updated_at": _iso(entry.updated_at),
+            "project": project,
+            "scope": "project" if project else "global",
         }
 
     async def list_entries(
@@ -330,7 +338,10 @@ class MemoryService:
     ) -> dict[str, Any]:
         """列出记忆条目，并按槽位给出计数（前端 tab 计数依赖 counts）。
 
-        C3：`project` 空串 = **未分组**；不同项目互不可见。
+        C3：`project` 空串 = **全局**（所有项目通用的条目）；具名项目下**并入全局条目**，
+        这样用户在项目里既看得到本项目专属的记忆，也看得到所有项目通用的偏好。
+        两类条目在返回里用 ``scope`` 区分（``global`` / ``project``），前端据此把全局
+        条目渲染成只读 —— 改它会波及所有项目，入口收在「全局」视图里。
         """
         store = self._require_store()
         items = await store.list(
@@ -339,6 +350,8 @@ class MemoryService:
             include_archived=include_archived,
             slot=slot,
             project=project,
+            # 全局视图（project 空）下这个开关没有意义：过滤条件本就是 project=''
+            include_global=bool(project),
         )
         counts: dict[str, int] = {s: 0 for s in SLOT_LABELS}
         for item in items:
@@ -569,6 +582,55 @@ class MemoryService:
         )
         return removed
 
+    async def move_entry_scope(
+        self,
+        tenant_id: int,
+        user_id: str,
+        entry_id: str,
+        from_project: str = "",
+        to_project: str = "",
+    ) -> Any | None:
+        """把一条记忆在「全局 ↔ 某个项目」之间切换（空串 = 全局）。
+
+        `from_project` 是**调用方当前所在的范围**，同时就是权限边界：只有在当前范围
+        里看得见的条目才允许迁移 —— 项目视图里动不了全局条目（它属于所有项目，
+        改动入口收在全局视图），与"项目视图里全局条目只读"是同一套口径。
+
+        返回 None 表示条目不存在、或不在调用方的当前范围。
+
+        目标范围已有同 (slot, key) 的条目时抛 ``ValueError``：静默覆盖会凭空丢掉一条
+        用户看得见的记忆，而"该留哪条"是置信度与来源的取舍，属于智能整理的职责，
+        不该在一次范围切换里替用户决定。
+        """
+        store = self._require_store()
+        entry = await store.get_any(tenant_id, user_id, entry_id)
+        if entry is None:
+            return None
+        current = str(getattr(entry, "project", "") or "")
+        if current != (from_project or ""):
+            return None
+        target = (to_project or "").strip()
+        if target == current:
+            return entry
+
+        slot = _slot_value(entry.slot)
+        if await store.get_by_key(
+            tenant_id, user_id, slot, entry.item_key, project=target
+        ):
+            raise ValueError(
+                f"target scope already has a memory with key '{entry.item_key}'"
+            )
+        try:
+            return await store.move_scope(tenant_id, user_id, entry_id, current, target)
+        except Exception as e:
+            # 并发下唯一约束可能在"查重"之后才被顶住：转成可读的业务错误。
+            # 其它异常（连接失败等）原样抛出 —— 别把基础设施问题说成用户输入有误。
+            if "unique" in type(e).__name__.lower():
+                raise ValueError(
+                    f"target scope already has a memory with key '{entry.item_key}'"
+                ) from None
+            raise
+
     async def forget_by_key(
         self,
         tenant_id: int,
@@ -610,7 +672,11 @@ class MemoryService:
         if not q:
             raise ValueError("query is required")
         store = self._require_store()
-        items = await store.list(tenant_id, user_id, slot=slot, project=project)
+        # 项目视图下并入全局条目：用户搜"编辑器偏好"时，所有项目通用的那条也该命中。
+        items = await store.list(
+            tenant_id, user_id, slot=slot, project=project,
+            include_global=bool(project),
+        )
 
         qvec = await self._embed(q)
         hits: list[tuple[Any, float, float]] = []
@@ -902,14 +968,16 @@ class MemoryService:
 
         L2 与 L3 都 fail-soft：记忆是增强项，不该因为它挂掉就阻断整轮对话。
 
-        C3：L2 按 `project` 隔离（空 = 未分组）；L3 是**会话级**摘要，不受 project 影响。
+        C3：L2 按 `project` 隔离（空 = 全局）；具名项目下**并入全局条目**——全局记忆
+        是"所有项目通用"的，项目里当然要注入。L3 是**会话级**摘要，不受 project 影响。
         """
         # ── L2 ──
         profile_items: list[Any] = []
         try:
             if self._store is not None:
                 profile_items = await self._store.list(
-                    tenant_id, user_id, project=project
+                    tenant_id, user_id, project=project,
+                    include_global=bool(project),
                 )
                 if slots:
                     # 按分类收窄：用户在对话里显式表达了「只带上偏好」这类意图

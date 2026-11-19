@@ -44,15 +44,21 @@ function gatewayEnv() {
   )
 }
 
-test('buildEngineEnv 把五个相对默认值的路径顶成 <dataDir> 下的绝对路径', () => {
+test('buildEngineEnv 把相对默认值的落盘路径顶成 <dataDir> 下的绝对路径', () => {
   const env = engineEnv()
-  // 名字必须是引擎真正读的那几个；改一个就等于没下发
+  // 名字必须是引擎真正读的那几个；改一个就等于没下发。
+  //
+  // SPEECH_LOCAL_MODEL_DIR 是本地语音转写的模型缓存（faster-whisper 的 download_root）：
+  // 它不在导入期写盘，所以漏了**不会**让引擎起不来 —— 表现是打包态首次用语音时
+  // 模型下不下来、语音永远转不出结果，而且没有任何报错。正因为它坏得这么安静，
+  // 才必须在这里钉住。
   for (const name of [
     'SKILL_STORE_PATH',
     'MEDIA_STORE_PATH',
     'KNOWLEDGE_LOCAL_PATH',
     'PLUGIN_DATA_DIR',
     'SANDBOX_ROOT',
+    'SPEECH_LOCAL_MODEL_DIR',
   ]) {
     assert.ok(env[name], `引擎缺 ${name}：它会退回相对 cwd 的默认值，在只读目录里 mkdir 失败`)
     assert.ok(path.isAbsolute(env[name]), `${name} 必须是绝对路径，实际：${env[name]}`)

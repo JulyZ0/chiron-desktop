@@ -119,14 +119,23 @@ class ProfileStore:
         include_archived: bool = False,
         slot: str | None = None,
         project: str = "",
+        include_global: bool = False,
     ) -> list[MemoryEntry]:
         """按 (tenant, user, project) 列出条目。
 
-        C3：`project` 空串 = **未分组**；不同项目互不可见（过滤而非排序）。
+        C3：`project` 空串 = **全局**（所有项目通用，不是"未分组"这一档独立项目）；
+        不同具名项目之间互不可见（过滤而非排序）。
+
+        ``include_global``：在具名项目下**并入全局条目**。只有展示与召回该这么做 ——
+        用户在一个项目里既要看到"所有项目通用的偏好"，也要看到"这个项目专属的"。
+        整理 / 淘汰 / 近重复检测**绝不能**带上它：那几条路径按项目记账，混进全局条目
+        会让 A 项目的一次整理把三个项目都在用的记忆当成本项目的重复项删掉。
+        默认 False 就是让这些路径维持精确匹配。
         """
+        scope_sql = "(project=$3 OR project='')" if include_global and project else "project=$3"
         sql = (
             f"SELECT {_COLUMNS} FROM user_memory_entries "
-            "WHERE tenant_id=$1 AND user_id=$2 AND project=$3"
+            f"WHERE tenant_id=$1 AND user_id=$2 AND {scope_sql}"
         )
         params: list[Any] = [tenant_id, user_id, project]
         if not include_archived:
@@ -187,6 +196,50 @@ class ProfileStore:
             "WHERE tenant_id=$1 AND user_id=$2 AND slot=$3 AND item_key=$4 AND project=$5"
         )
         row = await self._pool.fetchrow(sql, tenant_id, user_id, slot, item_key, project)
+        return _row_to_entry(row) if row else None
+
+    async def get_any(
+        self, tenant_id: int, user_id: str, entry_id: str
+    ) -> MemoryEntry | None:
+        """按 id 取一条，**不限定 project** —— 只给"范围迁移"用。
+
+        其它读写方法一律带 `project` 过滤，那是权限边界。迁移是唯一一个必须
+        先知道条目当前落在哪个范围的操作（否则无法判断调用方有没有资格动它），
+        所以单独开一个口子，并由 service 层校验"当前视图 == 条目所属范围"。
+        """
+        sql = (
+            f"SELECT {_COLUMNS} FROM user_memory_entries "
+            "WHERE tenant_id=$1 AND user_id=$2 AND id=$3"
+        )
+        row = await self._pool.fetchrow(sql, tenant_id, user_id, entry_id)
+        return _row_to_entry(row) if row else None
+
+    async def move_scope(
+        self,
+        tenant_id: int,
+        user_id: str,
+        entry_id: str,
+        from_project: str,
+        to_project: str,
+    ) -> MemoryEntry | None:
+        """把一条条目的范围从 `from_project` 改到 `to_project`（空 = 全局）。
+
+        条件里带 `from_project` 而不是只按 id：迁移也必须是**有条件的**写 ——
+        否则并发下两个人一个在迁移、一个在删除，晚到的迁移会把已删除的行复活成
+        "凭空多出来的一条"。返回 None 表示没有匹配行（期间被改过或删掉了）。
+
+        唯一约束 (tenant, user, project, slot, key) 可能被目标范围里的同名条目顶住 ——
+        那种情况下 SQL 会抛唯一冲突，由调用方先查重并给出可读的 409，而不是把
+        数据库错误原样抛给前端。
+        """
+        sql = (
+            "UPDATE user_memory_entries SET project=$5, updated_at=NOW() "
+            "WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND project=$4 "
+            f"RETURNING {_COLUMNS}"
+        )
+        row = await self._pool.fetchrow(
+            sql, tenant_id, user_id, entry_id, from_project, to_project
+        )
         return _row_to_entry(row) if row else None
 
     async def count(self, tenant_id: int, user_id: str, project: str = "") -> int:

@@ -26,6 +26,7 @@ vi.mock('../../api/memory', async (importOriginal) => {
     deleteMemory: vi.fn(),
     clearMemory: vi.fn(),
     searchMemory: vi.fn(),
+    moveMemoryScope: vi.fn(),
     startOrganize: vi.fn(),
     getOrganizeStatus: vi.fn(),
     listConflicts: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock('../../api/memory', async (importOriginal) => {
 
 import MemoryView from '../MemoryView.vue'
 import * as memoryApi from '../../api/memory'
+import { setProject } from '../../composables/useProject'
 import type { MemorySearchHit } from '../../api/memory'
 
 function makeEntry(overrides: Partial<MemorySearchHit> = {}): MemorySearchHit {
@@ -391,5 +393,94 @@ describe('MemoryView', () => {
     await flushPromises()
 
     expect(memoryApi.listMemory).toHaveBeenCalledWith(true)
+  })
+})
+
+describe('记忆范围（全局 / 项目）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    // 模块级单例：上一条用例可能把当前项目改成了 proj-a，这里必须显式归零
+    setProject('')
+    vi.mocked(memoryApi.listConflicts).mockResolvedValue({ conflicts: [], count: 0 })
+    vi.mocked(memoryApi.listSummaries).mockResolvedValue({ summaries: [], count: 0 })
+    vi.mocked(memoryApi.getOrganizeStatus).mockResolvedValue({
+      running: false,
+      started_at: null,
+      finished_at: null,
+      result: null,
+      error: null,
+    })
+  })
+
+  function mockList(entries: MemorySearchHit[]) {
+    vi.mocked(memoryApi.listMemory).mockResolvedValue({
+      entries,
+      counts: { identity: 0, preference: entries.length, decision: 0, fact: 0 },
+      total: entries.length,
+      slots: [],
+      organize: { running: false, started_at: null, finished_at: null, result: null, error: null },
+    })
+  }
+
+  it('全局视图里全局条目可编辑（只读只发生在项目视图）', async () => {
+    mockList([makeEntry({ scope: 'global', project: '' })])
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.find('[data-test="edit-disabled"]').exists()).toBe(false)
+    // 全局视图里没有"改为全局"的入口 —— 它已经是全局了
+    expect(wrapper.find('[data-test="toggle-scope"]').exists()).toBe(false)
+  })
+
+  it('项目视图里全局条目只读：编辑变成禁用态，并给出原因', async () => {
+    setProject('proj-a')
+    mockList([
+      makeEntry({ id: 'g', key: 'lang', scope: 'global', project: '' }),
+      makeEntry({ id: 'p', key: 'editor', scope: 'project', project: 'proj-a' }),
+    ])
+    const wrapper = mountView()
+    await flushPromises()
+
+    const disabled = wrapper.findAll('[data-test="edit-disabled"]')
+    expect(disabled.length, '全局条目应当渲染成禁用的编辑按钮').toBe(1)
+    // 条目自身的范围徽标把两类区分开
+    const scopes = wrapper.findAll('[data-test="entry-scope"]').map((n) => n.text())
+    expect(scopes).toContain('全局')
+    expect(scopes).toContain('项目')
+  })
+
+  it('项目视图里把项目专属记忆提升为全局', async () => {
+    setProject('proj-a')
+    mockList([makeEntry({ id: 'p', key: 'editor', scope: 'project', project: 'proj-a' })])
+    vi.mocked(memoryApi.moveMemoryScope).mockResolvedValue({
+      entry: makeEntry({ id: 'p', scope: 'global', project: '' }),
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    const btn = wrapper.find('[data-test="toggle-scope"]')
+    expect(btn.exists()).toBe(true)
+    await btn.trigger('click')
+    await flushPromises()
+
+    // 目标范围空串 = 全局；入口只对项目专属条目开放，所以不必再判断方向
+    expect(memoryApi.moveMemoryScope).toHaveBeenCalledWith('p', '')
+    expect(memoryApi.listMemory).toHaveBeenCalledTimes(2)
+  })
+
+  it('提升为全局撞上同名 key（409）时提示用户先处理', async () => {
+    setProject('proj-a')
+    mockList([makeEntry({ id: 'p', key: 'editor', scope: 'project', project: 'proj-a' })])
+    vi.mocked(memoryApi.moveMemoryScope).mockRejectedValue({
+      response: { status: 409, data: { error: 'target scope already has a memory with key' } },
+    })
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.find('[data-test="toggle-scope"]').trigger('click')
+    await flushPromises()
+
+    expect(document.body.textContent).toContain('目标范围已有同名记忆')
   })
 })

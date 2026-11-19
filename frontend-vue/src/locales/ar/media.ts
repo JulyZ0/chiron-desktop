@@ -37,6 +37,14 @@ export default {
   image_viewer: "عارض الصور",
   image_generation: "توليد الصور",
   drag_files_here_or_click_to_select: "اسحب الملفات إلى هنا، أو انقر للاختيار",
+  drop_release_to_upload_files_and_folders: "أفلت لرفع الملفات والمجلدات",
+  drop_uploading_progress: "جارٍ الرفع {done}/{total}",
+  drop_into_current_folder: "تُحفظ الملفات في المجلد الحالي، مع الحفاظ على بنية المجلدات",
+  drop_no_uploadable_files: "لا توجد ملفات قابلة للرفع (تم تجاهل ملفات النظام المخفية)",
+  drop_too_deep: "{n} ملفًا يتجاوز {max} مستويات من المجلدات وتم تجاهله",
+  drop_folders_failed: "تعذّر إنشاء {n} مجلدًا ({names})؛ لم تُرفع ملفاتها",
+  drop_uploaded_n_files: "تم رفع {n} ملفًا",
+  drop_busy_please_wait: "الدفعة السابقة قيد الرفع — أفلت مرة أخرى بعد انتهائها",
   drag_files_here_or_click_to_upload_to_start_managing_your_media_library: "اسحب الملفات إلى هنا أو انقر للرفع لبدء إدارة مكتبة الوسائط",
   file: "ملف",
   folder_name: "اسم المجلد",
@@ -46,7 +54,11 @@ export default {
   new_folder: "مجلد جديد",
   no_downloadable_files_in_the_selected_items: "لا توجد ملفات قابلة للتنزيل في العناصر المحددة",
   audio: "صوت",
-  voice_input_transcribed_locally_in_the_browser_audio_not_uploaded: "إدخال صوتي (يُنسخ محليًا في المتصفح، ولا يُرفع الصوت)",
+  // إدخال صوتي: التسجيل يتم محليًا والتحويل يجري على faster-whisper في محرّك
+  // الجهاز — لا يغادر الصوت هذا الجهاز. النص القديم قال "يُنسخ محليًا في المتصفح"،
+  // وهو وصف حقبة Web Speech API: التعرّف جرى فعليًا على خدمة Google ولم يعمل في
+  // نسخة سطح المكتب أصلًا.
+  voice_input_transcribed_locally_by_the_engine_audio_never_leaves_this_machine: "إدخال صوتي (يُحوَّل بواسطة محرّك الجهاز، ولا يغادر الصوت هذا الجهاز)",
   no_files_yet: "لا توجد ملفات بعد",
   this_run_did_not_write_any_files: "لم يكتب هذا التشغيل أي ملفات",
   multi_file_upload_supported_up_to_50mb_per_file: "يدعم رفع ملفات متعددة، حتى 50 ميجابايت لكل ملف",

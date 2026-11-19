@@ -381,6 +381,11 @@ func NewGatewayRouter(
 	registerProxyRoutes(mux, authMW, rlMW, kbRateMW, pythonClient)
 	// 桌面端云端片段推理（POST /v1/desktop/infer，用户 JWT + 限流，见 routes_desktop.go）
 	registerDesktopRoutes(mux, authMW, rlMW, pythonClient)
+	// 本地语音转写（POST /v1/audio/transcribe）：音频字节透传给引擎，
+	// 由本机 faster-whisper 解码 —— 桌面包里浏览器的 SpeechRecognition 依赖
+	// Google 在线服务，Electron 构建不含该密钥，必然失败（见 routes_audio.go）。
+	mux.Handle("POST /v1/audio/transcribe", authMW(rlMW(AudioTranscribeHandler(pythonClient))))
+	mux.Handle("GET /v1/audio/availability", authMW(rlMW(AudioAvailabilityHandler(pythonClient))))
 	// OpenAI 兼容对话（POST /v1/chat/completions）：用户 API Key 可直接接入任意
 	// OpenAI 客户端 —— 这是「设置 → API Keys」里那把 key 真正被「用起来」的入口。
 	registerOpenAICompatRoutes(mux, authMW, rlMW, pythonClient)

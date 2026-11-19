@@ -82,6 +82,18 @@ GATEWAY_IDENTITY_PARAMS = {"user_id": "test-user", "tenant_id": "test-tenant"}
 
 
 @_pytest.fixture(autouse=True)
+def _isolate_plugin_data_dir(tmp_path, monkeypatch):
+    """把 `PLUGIN_DATA_DIR` 指到临时目录。
+
+    `command_allowed` 现在还会读 `{PLUGIN_DATA_DIR}/command_allowlist.json`（后台可编辑
+    白名单，与 Go 网关共用同一份文件）。不隔离的话，开发机上真实存在的白名单会让
+    "未配置即 fail-closed"的断言随环境飘 —— 本机绿、CI 红，反之亦然。
+    """
+    monkeypatch.setenv("PLUGIN_DATA_DIR", str(tmp_path / "plugins"))
+    yield
+
+
+@_pytest.fixture(autouse=True)
 async def _integration_pg_pool(request):
     """``integration`` 用例直连 PostgreSQL：按应用启动流程把连接池建起来。
 

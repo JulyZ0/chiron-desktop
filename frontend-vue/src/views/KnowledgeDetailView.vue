@@ -312,6 +312,21 @@ async function toggleEnabled(next: boolean) {
   }
 }
 
+/**
+ * 媒体条目能否导入**本**知识库。
+ *
+ * 媒体库收一切文件（图片、视频、压缩包……），而知识库按 provider 只吃少数几种
+ * 原文（自托管只有 PDF，cloud 再加 Office），判定口径见 `kb_file_types.go`。
+ *
+ * 此前弹窗完全没有这层过滤：用户在媒体库里勾一张 PNG，`importFromMedia` 照样把它
+ * 完整下载、切分片传到 `/v1/uploads`，最后由网关 `finalizeKBDoc` 以 400
+ * 「知识库（selfhosted）不支持 .png 类型」拒绝 —— 一次 64MB 的白传，而且错误被
+ * 吞掉，界面只剩「N 个文件导入失败」。所以这一层是 **UX 前置**，不是安全边界。
+ */
+function isImportableMedia(item: MediaFileItem): boolean {
+  return !isMediaFolder(item) && isSupportedKbFile(kbProvider.value, item.name)
+}
+
 // 过滤后的媒体文件
 const filteredMediaFiles = computed(() => {
   if (!mediaSearchQuery.value.trim()) return mediaFiles.value
@@ -445,7 +460,10 @@ async function importFromMedia() {
 
   importingMedia.value = true
   let successCount = 0
-  let failCount = 0
+  // 失败要**带原因**：旧实现只有 `catch { failCount++ }`，界面最终只剩一句
+  // 「N 个文件导入失败」—— 是签名失效、取字节 404，还是网关类型校验 400，
+  // 用户完全无从判断，只能反复重试同一批注定失败的文件。
+  const failures: string[] = []
 
   // 从 pickedMedia 取条目（而不是当前目录列表）：选择可以跨文件夹，只查 mediaFiles
   // 会把其他目录里选中的文件漏掉，导入结果少得莫名其妙。
@@ -456,14 +474,30 @@ async function importFromMedia() {
     try {
       // 安全改造：/media/ 公开路径先解析为短时效签名 URL 再取字节（带归属校验）
       const signed = await resolveMediaUrl({ id: file.id, file_url: file.file_url })
-      const response = await fetch(absUrl(signed || file.file_url))
+      const sourceUrl = absUrl(signed || file.file_url)
+      if (!sourceUrl) throw new Error(t('knowledge.media_file_has_no_url'))
+
+      const response = await fetch(sourceUrl)
+      // ⚠ 必须查 `ok`：`fetch` 对 404/403 不抛错。旧实现直接 `blob()`，
+      // 于是网关的 JSON 错误页会被当成"文件内容"上传，得到一个内容完全
+      // 错误、却在列表里显示成功的知识文档 —— 比报错更糟。
+      if (!response.ok) {
+        throw new Error(t('knowledge.media_download_failed', {
+          status: response.status,
+          statusText: response.statusText || '',
+        }))
+      }
       const blob = await response.blob()
+      if (blob.size === 0) throw new Error(t('knowledge.media_file_is_empty'))
+
       const mediaFile = new File([blob], file.name, { type: file.mime_type || '' })
       const handle = await createChunkUpload(mediaFile, { purpose: 'kb_doc', parentId: kbId })
       await handle.done
       successCount++
-    } catch {
-      failCount++
+    } catch (error) {
+      // 优先用服务端原文（`detail` / `error`），否则用本条链路自己抛出的原因。
+      const reason = kbErrorText(error, '') || errorDetail(error, t('errors.upload_failed'))
+      failures.push(`${file.name}：${reason}`)
     }
   }
 
@@ -476,14 +510,25 @@ async function importFromMedia() {
     await loadKnowledgeBase()
     await loadDocuments()
   }
-  if (failCount > 0) {
-    message.error(t('errors.n_files_failed_to_import', { n: failCount }))
+  if (failures.length > 0) {
+    // 汇总一行 + 逐条原因（最多 3 条）：批量导入时逐个弹窗会刷屏，
+    // 但只报数量又等于什么都没说。
+    message.error(`${t('errors.n_files_failed_to_import', { n: failures.length })}：${failures.slice(0, 3).join('；')}`)
   }
 }
 
 function toggleMediaSelection(item: MediaFileItem) {
   const index = selectedMediaIds.value.indexOf(item.id)
   if (index === -1) {
+    // 不可导入的条目**根本不进选中集合**：勾上却注定在导入时被网关 400 拒掉，
+    // 比一开始就拦住更让人困惑（用户会以为"选中了就该能导入"）。
+    if (!isImportableMedia(item)) {
+      message.warning(t('knowledge.unsupported_file_type', {
+        name: item.name,
+        supported: kbAccept.value.replace(/,/g, ' '),
+      }))
+      return
+    }
     selectedMediaIds.value.push(item.id)
     pickedMedia.value[item.id] = item
   } else {
@@ -492,9 +537,9 @@ function toggleMediaSelection(item: MediaFileItem) {
   }
 }
 
-/** 全选当前目录的**文件**（文件夹不是可导入对象，不能进选中集合）。 */
+/** 全选当前目录里**可导入**的文件（文件夹与类型不符者都不进选中集合）。 */
 function selectAllMedia() {
-  const files = filteredMediaFiles.value.filter((f) => !isMediaFolder(f))
+  const files = filteredMediaFiles.value.filter(isImportableMedia)
   for (const f of files) pickedMedia.value[f.id] = f
   selectedMediaIds.value = files.map((f) => f.id)
 }
@@ -506,7 +551,7 @@ function deselectAllMedia() {
 
 /** 当前目录里还有没有可导入的文件（用来区分"目录是空的"和"只有文件夹"）。 */
 const hasSelectableMedia = computed(() =>
-  filteredMediaFiles.value.some((f) => !isMediaFolder(f)),
+  filteredMediaFiles.value.some(isImportableMedia),
 )
 
 /**
@@ -514,9 +559,12 @@ const hasSelectableMedia = computed(() =>
  *
  * 计数不能直接用 `filteredMediaFiles.length`：文件夹也在这份列表里，把它们算进
  * "共 N 项"会让「全选」后的选中数永远追不上总数，看着像功能坏了。
+ *
+ * 口径必须与 `selectAllMedia` 完全一致（都走 `isImportableMedia`）：否则「全选」
+ * 后的选中数与这里显示的"共 N 项"对不上，而用户唯一能做的推断就是"全选坏了"。
  */
 const selectableMediaCount = computed(
-  () => filteredMediaFiles.value.filter((f) => !isMediaFolder(f)).length,
+  () => filteredMediaFiles.value.filter(isImportableMedia).length,
 )
 
 /** 库上的索引错误原因（worker 写在 `error_message`，如"文档 X: 缺少原文对象"）。 */
@@ -958,7 +1006,7 @@ function formatSize(bytes: number): string {
           <div
             v-for="item in filteredMediaFiles"
             :key="item.id"
-            :class="['media-item', { selected: !isMediaFolder(item) && selectedMediaIds.includes(item.id) }]"
+            :class="['media-item', { selected: !isMediaFolder(item) && selectedMediaIds.includes(item.id), 'not-importable': !isMediaFolder(item) && !isImportableMedia(item) }]"
             :role="isMediaFolder(item) ? 'button' : 'checkbox'"
             :aria-checked="isMediaFolder(item) ? undefined : selectedMediaIds.includes(item.id)"
             tabindex="0"
@@ -1074,6 +1122,10 @@ function formatSize(bytes: number): string {
 .media-item:last-child { border-bottom: none; }
 .media-item:hover { background: var(--bg-hover, rgba(0,0,0,0.03)); }
 .media-item.selected { background: var(--primary-bg, #e6f7ff); }
+/* 类型不受本知识库支持：仍然列出来（用户得知道自己选的目录里有什么），
+   但明确标灰，避免"点了没反应"的错觉 —— 点击时会给出具体支持的扩展名。 */
+.media-item.not-importable { opacity: 0.55; }
+.media-item.not-importable .media-name { color: var(--text-tertiary); text-decoration: line-through; }
 .media-info { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
 .media-name { font-weight: var(--fw-medium); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary); }
 .media-meta { display: flex; gap: 12px; font-size: 12px; color: var(--text-tertiary); }

@@ -183,6 +183,46 @@ async def delete_profile(entry_id: str, request: Request) -> Any:
     return {"success": True, "deleted": entry_id}
 
 
+@router.post("/v1/memory/profile/{entry_id}/scope")
+async def move_profile_scope(entry_id: str, request: Request) -> Any:
+    """把一条记忆在「全局 ↔ 某个项目」之间切换（`to_project` 空 = 全局）。
+
+    为什么单独开端点而不是塞进 PUT /profile：PUT 的语义是"就地改内容"，它按
+    `?project=` 精确匹配 —— 在项目视图里，全局条目根本匹配不上（这是"全局条目只读"
+    的实现方式）。范围切换恰恰要**跨**范围动作，所以它显式声明"我当前在哪个范围"
+    （`?project=`）与"要挪到哪个范围"（body `to_project`）。
+
+    权限边界与 PUT 相同：只有在当前范围里看得见的条目才允许迁移。于是
+    项目视图里动不了全局条目，必须回到「全局」视图 —— 与前端只读渲染是同一套口径。
+    """
+    svc = get_service()
+    if svc is None:
+        return _unavailable()
+    tenant_id, user_id = _scope(request)
+    if not user_id:
+        return _bad_request("user_id is required")
+    body = await request.json()
+    try:
+        entry = await svc.move_entry_scope(
+            tenant_id,
+            user_id,
+            entry_id,
+            from_project=_project(request),
+            to_project=str(body.get("to_project") or ""),
+        )
+    except ValueError as e:
+        # 目标范围已有同 (slot, key) 的条目：不是 400 的参数错误，是 409 的状态冲突
+        return JSONResponse(
+            {"success": False, "error": str(e)}, status_code=409
+        )
+    if entry is None:
+        return JSONResponse(
+            {"success": False, "error": "entry not found in this scope"},
+            status_code=404,
+        )
+    return {"success": True, "entry": svc._entry_dict(entry)}
+
+
 @router.post("/v1/memory/profile/clear")
 async def clear_profile(request: Request) -> Any:
     """清空当前用户全部记忆（隐私出口）。要求 body {confirm: true} 防误触。"""

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
+import { createPinia } from 'pinia'
 
 /**
  * `PluginsView` 的冒烟网 + **`collectBindingUsage` 的接线**（2026-10-09）。
@@ -48,7 +49,9 @@ const router = createRouter({
 })
 
 function mountView() {
-  return mount(PluginsView, { global: { plugins: [router] } })
+  // `PluginsView` 的 setup 里调 `useAuthStore()`（「一键加白」按钮按 isAdmin 显示），
+  // 没有 pinia 会在 setup 阶段直接抛错 —— 这里装上，与 AgentsView / HomeView 测试一致。
+  return mount(PluginsView, { global: { plugins: [router, createPinia()] } })
 }
 
 describe('PluginsView（此前零测试）', () => {

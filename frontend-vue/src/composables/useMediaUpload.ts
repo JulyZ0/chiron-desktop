@@ -11,6 +11,14 @@ interface UploadState {
   progress: number
   status: 'uploading' | 'success' | 'error'
   error?: string
+  /**
+   * 展示用的文件名。
+   *
+   * 此前模板从 key 里 `split('-')[0]` 反推文件名 —— 文件名本身含 `-` 时会被截断，
+   * 而拖拽上传的 key 还带上了目录 id 前缀，反推就更不成立了。名字在这里存一份，
+   * key 就能自由编码（目录、大小、时间）。
+   */
+  name?: string
 }
 
 /**
@@ -40,6 +48,86 @@ export function useMediaUpload(opts: {
     return new Error(typeof err === 'string' ? err : String(err))
   }
 
+  /**
+   * 上传单个文件，并在 `uploadingFiles` 里维护进度。
+   *
+   * `notify` 默认为 true（上传弹窗里逐文件提示是合适的）；批量拖拽必须传 false
+   * —— 拖进来 200 个文件时会弹出 200 条 message，把界面糊死，而用户真正需要的是
+   * 最后那句汇总。进度仍然逐个记录，所以弹窗里看到的进度一样。
+   */
+  function uploadOne(
+    file: File,
+    extra: {
+      parentId?: string
+      notify?: boolean
+      /** 每完成一个文件就重拉列表。批量场景传 false，由调用方最后统一刷一次。 */
+      refresh?: boolean
+      onProgress?: (pct: number) => void
+    } = {},
+  ): Promise<void> {
+    const parentId = extra.parentId ?? opts.parentId.value
+    const notify = extra.notify !== false
+    const refresh = extra.refresh !== false
+    // key 里带母目录：同一个文件拖到不同目录是两次独立上传（也是两处不同的资产）。
+    const fileId = `${parentId || 'root'}:${file.name}:${file.size}:${file.lastModified}`
+    uploadingFiles.value.set(fileId, { progress: 0, status: 'uploading', name: file.name })
+
+    let lastError: unknown = null
+    const markError = (fallback: string) =>
+      uploadingFiles.value.set(fileId, {
+        progress: 0,
+        status: 'error',
+        name: file.name,
+        error: uploadErrorText(lastError, fallback),
+      })
+
+    return createChunkUpload(file, { purpose: 'media', parentId })
+      .then((handle) => {
+        handle.onProgress((p) => {
+          extra.onProgress?.(p)
+          const current = uploadingFiles.value.get(fileId)
+          if (current) uploadingFiles.value.set(fileId, { ...current, progress: p })
+        })
+        return handle.done
+          .then(() => {
+            uploadingFiles.value.set(fileId, {
+              progress: 100,
+              status: 'success',
+              name: file.name,
+            })
+            if (notify) message.success(tr('common.uploaded_name', { name: file.name }))
+            // 3秒后移除成功记录
+            setTimeout(() => uploadingFiles.value.delete(fileId), 3000)
+          })
+          .catch((err: unknown) => {
+            lastError = err
+            markError(tr('errors.unknown_error'))
+            if (notify) {
+              message.error(tr('errors.upload_failed_name_reason', {
+                name: file.name,
+                reason: uploadErrorText(err, tr('errors.unknown_error')),
+              }))
+            }
+            // 继续往外抛：调用方（拖拽批量上传）需要按文件统计失败数，
+            // 而不是去翻 Map 猜哪几个失败了。
+            throw err
+          })
+          .finally(() => { if (refresh) opts.onUploaded() })
+      })
+      .catch((err: unknown) => {
+        lastError = err
+        // 初始化阶段失败时状态仍是 uploading；done 阶段的失败已在上面的
+        // catch 里写成 error（带真实原因），这里不能覆盖成"初始化失败"。
+        if (uploadingFiles.value.get(fileId)?.status !== 'error') {
+          markError(tr('errors.initialization_failed'))
+          if (notify) {
+            message.error(tr('errors.upload_failed_name_init_failed', { name: file.name }))
+          }
+        }
+        throw err
+      })
+  }
+
   function handleUploadRequest(options: UploadRequestOptions) {
     const { file, onProgress, onSuccess, onError } = options
     // antd 的 file 允许多态（string/Blob，用于受控 fileList）；本视图只接真实上传文件
@@ -47,49 +135,9 @@ export function useMediaUpload(opts: {
       onError?.(new Error('unsupported upload payload'))
       return
     }
-    const fileId = `${file.name}-${file.size}-${file.lastModified}`
-
-    // 初始化上传状态
-    uploadingFiles.value.set(fileId, { progress: 0, status: 'uploading' })
-
-    // 全局分片上传（断点续传）
-    createChunkUpload(file, { purpose: 'media', parentId: opts.parentId.value })
-      .then((handle) => {
-        handle.onProgress((p) => {
-          onProgress?.({ percent: p })
-          // 更新详细进度
-          const current = uploadingFiles.value.get(fileId)
-          if (current) {
-            uploadingFiles.value.set(fileId, { ...current, progress: p })
-          }
-        })
-        handle.done
-          .then(() => {
-            onSuccess?.(null)
-            uploadingFiles.value.set(fileId, { progress: 100, status: 'success' })
-            message.success(tr('common.uploaded_name', { name: file.name }))
-            // 3秒后移除成功记录
-            setTimeout(() => uploadingFiles.value.delete(fileId), 3000)
-          })
-          .catch((err: unknown) => {
-            onError?.(toUploadError(err))
-            uploadingFiles.value.set(fileId, {
-              progress: 0,
-              status: 'error',
-              error: uploadErrorText(err, tr('errors.unknown_error')),
-            })
-            message.error(tr('errors.upload_failed_name_reason', { name: file.name, reason: uploadErrorText(err, tr('errors.unknown_error')) }))
-          })
-          .finally(() => { opts.onUploaded() })
-      })
-      .catch((err: unknown) => {
-        uploadingFiles.value.set(fileId, {
-          progress: 0,
-          status: 'error',
-          error: uploadErrorText(err, tr('errors.initialization_failed')),
-        })
-        message.error(tr('errors.upload_failed_name_init_failed', { name: file.name }))
-      })
+    uploadOne(file, { onProgress: (pct) => onProgress?.({ percent: pct }) })
+      .then(() => onSuccess?.(null))
+      .catch((err: unknown) => onError?.(toUploadError(err)))
   }
 
   // 暂停所有上传
@@ -175,6 +223,7 @@ export function useMediaUpload(opts: {
     uploadFileList,
     uploadingFiles,
     handleUploadRequest,
+    uploadOne,
     pauseAllUploads,
     retryFailedUploads,
     clearCompletedUploads,

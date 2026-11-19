@@ -14,9 +14,11 @@ import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import AttachToAgentDialog from '../components/common/AttachToAgentDialog.vue'
 import { bindingUsageOf, collectBindingUsage, type BindingUsage } from '../utils/kbUsage'
+import { getPluginAllowlist, updatePluginAllowlist } from '../api/admin'
 
 import { useI18n } from 'vue-i18n'
 import { serverErrorMessage, serverErrorDetail, errorDetail } from '../utils/apiError'
+import { useAuthStore } from '../stores/auth'
 
 import { errorMessageText, errorStatus } from '../utils/apiError'
 const { t } = useI18n()
@@ -76,7 +78,45 @@ const saving = ref(false)
 
 // 测试
 const testingName = ref('')
-const testResults = ref<Record<string, { ok: boolean; message: string }>>({})
+interface TestResult {
+  ok: boolean
+  message: string
+  /** 后端结构化返回：命令被放行名单挡下（code = plugin_command_not_allowed） */
+  command?: string
+  /** 该命令的放行来自部署 env（后台改不了，需改环境变量并重启） */
+  fromEnv?: boolean
+}
+const testResults = ref<Record<string, TestResult>>({})
+
+// 「一键加入白名单」：装完市场插件点测试连接被拒时，管理员可在原地加白，
+// 不必去改部署 env 再重启网关 + 引擎（见 internal/api/plugin_allowlist.go）。
+const authStore = useAuthStore()
+const allowlistingName = ref('')
+
+async function addToAllowlist(p: Plugin) {
+  const result = testResults.value[p.name]
+  const command = result?.command?.trim()
+  if (!command) return
+  if (result.fromEnv) {
+    message.warning(t('common.plugin_command_allowlist_env_locked'))
+    return
+  }
+  allowlistingName.value = p.name
+  try {
+    // 读当前**文件**部分再追加：后端 PUT 是整体替换，直接传 [command] 会
+    // 把管理员之前加白的其它命令一并删掉。
+    const current = await getPluginAllowlist()
+    const next = Array.from(new Set([...(current.file_commands || []), command]))
+    await updatePluginAllowlist(next)
+    message.success(t('common.plugin_command_added_to_allowlist', { command }))
+    // 立刻重试，让用户看到真实的连接结果（而不是只看到"已加入白名单"）
+    await testPlugin(p)
+  } catch (e) {
+    message.error(serverErrorMessage(e, t('errors.operation_failed')))
+  } finally {
+    allowlistingName.value = ''
+  }
+}
 
 onMounted(() => {
   loadPlugins()
@@ -273,7 +313,16 @@ async function testPlugin(p: Plugin) {
   try {
     const res = await api.post(`/v1/plugins/${encodeURIComponent(p.name)}/test`)
     const data = res.data?.data || {}
-    testResults.value = { ...testResults.value, [p.name]: { ok: !!data.ok, message: data.message || '' } }
+    testResults.value = {
+      ...testResults.value,
+      [p.name]: {
+        ok: !!data.ok,
+        message: data.message || '',
+        // 结构化信息只在命令被放行名单挡下时出现，供「加入白名单」按钮使用。
+        command: data.code === 'plugin_command_not_allowed' ? data.command : undefined,
+        fromEnv: data.code === 'plugin_command_not_allowed' ? !!data.from_env : undefined,
+      },
+    }
     if (data.ok) message.success(t('common.name_connection_ok', { name: p.name }))
     else message.error(t('errors.name_connection_failed', { name: p.name }))
   } catch (e) {
@@ -498,7 +547,25 @@ async function testPlugin(p: Plugin) {
               class="test-result"
               :class="{ ok: testResults[p.name].ok }"
             >
-              {{ testResults[p.name].ok ? '✅' : '❌' }} {{ testResults[p.name].message }}
+              <span>{{ testResults[p.name].ok ? '✅' : '❌' }} {{ testResults[p.name].message }}</span>
+              <!-- 命令被放行名单挡下时，管理员可就地加白（改 env 需重启两侧，不现实） -->
+              <template v-if="!testResults[p.name].ok && testResults[p.name].command">
+                <Button
+                  v-if="authStore.isAdmin"
+                  size="small"
+                  type="primary"
+                  class="allowlist-cta"
+                  :loading="allowlistingName === p.name"
+                  :title="$t('common.plugin_command_allowlist_hint')"
+                  @click="addToAllowlist(p)"
+                >
+                  {{ $t('common.add_to_plugin_allowlist') }}
+                </Button>
+                <span
+                  v-else
+                  class="allowlist-hint"
+                >{{ $t('common.plugin_command_allowlist_hint') }}</span>
+              </template>
             </div>
 
             <!-- 配置详情 -->
@@ -646,8 +713,10 @@ async function testPlugin(p: Plugin) {
 .card-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .mini-icon { font-size: var(--fs-xs); }
 .action-right { margin-inline-start: auto; display: flex; gap: 2px; }
-.test-result { font-size: 12px; padding: 6px 10px; border-radius: var(--radius-lg); background: var(--error-bg); color: var(--error); }
+.test-result { font-size: 12px; padding: 6px 10px; border-radius: var(--radius-lg); background: var(--error-bg); color: var(--error); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .test-result.ok { background: var(--success-bg); color: var(--success); }
+.allowlist-cta { margin-left: auto; }
+.allowlist-hint { margin-left: auto; font-size: var(--fs-xs); opacity: 0.8; }
 .plugin-detail { display: flex; flex-direction: column; gap: 8px; border-top: var(--hairline-width) solid var(--border-card); padding-top: 10px; }
 .detail-row { display: flex; flex-direction: column; gap: 4px; }
 .detail-label { font-size: var(--fs-xs); color: var(--text-tertiary); font-weight: var(--fw-medium); }

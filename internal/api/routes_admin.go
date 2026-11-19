@@ -141,4 +141,10 @@ func registerAdminRoutes(
 	mux.Handle("GET /v1/admin/settings", authMW(rlMW(platformReadMW(adminStrip))))
 	mux.Handle("PUT /v1/admin/settings", authMW(rlMW(platformWriteMW(adminStrip))))
 
+	// 插件命令白名单：可直接决定**宿主机能执行哪些命令**，属平台级安全边界。
+	// 读用 platformReadMW；写用 platformWriteMW —— 加白即时生效（无需重启网关/引擎），
+	// 放开一条命令等于放开一类二进制，与 queue/flush 同口径。
+	mux.Handle("GET /v1/admin/plugin-allowlist", authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.GetPluginAllowlist)))))
+	mux.Handle("PUT /v1/admin/plugin-allowlist", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.UpdatePluginAllowlist)))))
+
 }

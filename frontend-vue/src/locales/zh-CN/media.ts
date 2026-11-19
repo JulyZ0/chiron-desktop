@@ -37,6 +37,16 @@ export default {
   image_viewer: "图片查看器",
   image_generation: "图片生成",
   drag_files_here_or_click_to_select: "拖拽文件到此处，或点击选择",
+  // 媒体页整页拖拽：与上传弹窗里的那句区分开 —— 这里的落点是**当前所在目录**，
+  // 拖文件夹进来还会按目录结构自动建好子目录。
+  drop_release_to_upload_files_and_folders: "松开即可上传文件与文件夹",
+  drop_uploading_progress: "正在上传 {done}/{total}",
+  drop_into_current_folder: "文件会落在当前所在目录，文件夹结构会自动保留",
+  drop_no_uploadable_files: "没有可上传的文件（系统隐藏文件已跳过）",
+  drop_too_deep: "{n} 个文件层级超过 {max} 层，已跳过",
+  drop_folders_failed: "{n} 个目录创建失败（{names}），其中的文件未上传",
+  drop_uploaded_n_files: "已上传 {n} 个文件",
+  drop_busy_please_wait: "上一批还在上传，请等它结束再拖入",
   drag_files_here_or_click_to_upload_to_start_managing_your_media_library: "拖拽文件到此处或点击上传，开始管理你的媒体库",
   file: "文件",
   folder_name: "文件夹名称",
@@ -46,7 +56,10 @@ export default {
   new_folder: "新建文件夹",
   no_downloadable_files_in_the_selected_items: "选中的项目中没有可下载的文件",
   audio: "音频",
-  voice_input_transcribed_locally_in_the_browser_audio_not_uploaded: "语音输入（浏览器本地转写，不上传音频）",
+  // 语音输入：录音在本机，转写由**本机引擎的 faster-whisper** 完成，音频不出这台机器。
+  // 旧文案写的是"浏览器本地转写"，那是 Web Speech API 时代的说法 —— 实际识别发生在
+  // Google 在线服务，桌面包里根本走不通。
+  voice_input_transcribed_locally_by_the_engine_audio_never_leaves_this_machine: "语音输入（本机引擎转写，音频不出这台机器）",
   no_files_yet: "暂无文件",
   this_run_did_not_write_any_files: "这次运行没有写入任何文件",
   multi_file_upload_supported_up_to_50mb_per_file: "支持多文件上传，单文件不超过 50MB",

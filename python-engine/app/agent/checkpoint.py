@@ -415,6 +415,60 @@ async def claim(
         return False
 
 
+async def load_recent_task_meta(
+    *, tenant_id: int, session_id: str
+) -> dict[str, Any]:
+    """读**最近一条** run 快照里的 `task_meta`，**不限状态**。没有则返回空 dict。
+
+    与 :func:`load` 的唯一区别是放宽了状态过滤，因为这个入口服务的是**接管**
+    （super-agent），而接管的典型现场恰恰是"上一轮 run 已经正常 ``completed``、
+    用户随后走开"：此时活跃集合是空的，``load()`` 恒返回 ``None``，接管每一拍都
+    卡在"拿不到现场"上，连续 3 次后熔断 —— 这就是"super-agent 无法真正接管"
+    的根因。只放宽状态而不放宽"读什么"，正是为了让这条修复不引入 ``load()``
+    刻意挡住的那个风险。
+
+    **只读 `task_meta` 一格，绝不返回 `messages`**：
+
+    * 接管的对话上下文由 runtime 自己从 session_cache / PG durable history 重建
+      （见 ``AgentRuntime.run`` 的 ``elif task.session_id:`` 分支）；
+    * 借这一格只是为了拿到 `llm_config`（含 `tools_mode`）、`system_prompt`、
+      `workbench_context` —— 这些配置**只存在于提交请求里**，不存进快照就没有
+      第二个稳定来源。
+
+    ``load()`` 限制状态的理由是"不要从早已正常结束的陈旧快照里**续跑消息**"；
+    这里不返回消息，那条风险在定义上就不成立。
+
+    返回空 dict 表示"没有可用元信息"，调用方应据此失败，而不是用默认配置硬跑 ——
+    用错配置推进用户的活，比不推进坏得多。
+    """
+    if not session_id:
+        return {}
+    try:
+        pool = _pool()
+        if pool is None:
+            return {}
+        row = await pool.fetchrow(
+            """
+            SELECT checkpoint -> 'task_meta' AS task_meta
+              FROM agent_runs
+             WHERE session_id = $1 AND ($2 = 0 OR tenant_id = $2)
+               AND checkpoint IS NOT NULL
+             ORDER BY updated_at DESC
+             LIMIT 1
+            """,
+            session_id,
+            to_tenant_int(tenant_id),
+        )
+        if row is None or row["task_meta"] is None:
+            return {}
+        raw = row["task_meta"]
+        parsed = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recent task_meta load failed (session=%s): %s", session_id, exc)
+        return {}
+
+
 async def load_awaiting(
     *, tenant_id: int, session_id: str
 ) -> dict[str, Any] | None:

@@ -669,6 +669,81 @@ export async function uploadFile(file: File): Promise<{
   }
 }
 
+// ── 本地语音转写（POST /v1/audio/transcribe） ──
+//
+// 为什么不再用浏览器的 Web Speech API：`webkitSpeechRecognition` 的构造器在 Chromium
+// 里存在，但**识别后端是 Google 的在线语音服务**，Electron 官方构建不含该服务密钥 ——
+// 桌面包里 `start()` 看似成功，随后 `onerror` 报 `network` / `service-not-allowed`，
+// 用户看到的是"进入录音态然后失败"。
+//
+// 现在改成：渲染进程 `MediaRecorder` 录一段音频 → 经网关 `POST /v1/audio/transcribe`
+// → 引擎用本机 faster-whisper 离线转写。音频不出这台机器（云端模式下网关也只在
+// 本机部署时才有该引擎，见 internal/api/routes_audio.go）。
+
+/** 转写可用性（`GET /v1/audio/availability`，只查依赖与开关，不加载模型）。 */
+export interface AudioAvailability {
+  available: boolean
+  /** 不可用原因（面向用户的中文/后端原文），可用时为空串 */
+  reason: string
+  /** 将要使用的模型规格（如 `small`） */
+  model: string
+  /** 模型是否已加载进内存 */
+  loaded: boolean
+}
+
+/**
+ * 探测本机能否做本地语音转写。
+ *
+ * 失败**不抛**：这是"按钮该不该可点"的前置探测，探测本身失败（网关老版本没有该端点、
+ * 离线）与"本机不支持"在界面上应给出同样的结论 —— 按钮不可点，理由写清楚。
+ */
+export async function getAudioAvailability(): Promise<AudioAvailability> {
+  try {
+    const resp = await api.get('/v1/audio/availability')
+    const d = (resp.data ?? {}) as Partial<AudioAvailability>
+    return {
+      available: Boolean(d.available),
+      reason: typeof d.reason === 'string' ? d.reason : '',
+      model: typeof d.model === 'string' ? d.model : '',
+      loaded: Boolean(d.loaded),
+    }
+  } catch (error) {
+    return {
+      available: false,
+      reason: serverErrorDetail(error, ''),
+      model: '',
+      loaded: false,
+    }
+  }
+}
+
+/**
+ * 上传一段录音并取回转写文本。
+ *
+ * 超时单独放宽到 120s：首次调用要下载/加载模型（数百 MB、数秒到数十秒），加上 CPU
+ * 转写本身，默认的 30s 会在"第一次用语音"时**必然**超时 —— 而这个失败看起来像
+ * "语音坏了"，实际只是模型还没下完。
+ */
+export async function transcribeAudio(blob: Blob, language: string): Promise<{
+  text: string
+  language: string
+  duration: number
+}> {
+  const form = new FormData()
+  // 文件名只用于服务端的 MIME 推断；faster-whisper 走容器内解码，扩展名影响很小，
+  // 但给一个有意义的默认值便于引擎日志排查（**不含用户输入**）。
+  form.append('file', blob, 'voice-input.webm')
+  // 空串 = 让模型自动判定语种
+  form.append('language', language || '')
+  const resp = await api.post('/v1/audio/transcribe', form, { timeout: 120000 })
+  const d = (resp.data ?? {}) as { text?: unknown; language?: unknown; duration?: unknown }
+  return {
+    text: typeof d.text === 'string' ? d.text : '',
+    language: typeof d.language === 'string' ? d.language : '',
+    duration: Number(d.duration) || 0,
+  }
+}
+
 // SSE 连接
 //
 // 为什么是 fetch + ReadableStream 而不是 EventSource：**EventSource 不能设置请求头**，

@@ -528,6 +528,66 @@ def test_restore_does_not_clobber_caller_index(env: Env) -> None:
     assert env.index.read_bytes() == sentinel
 
 
+def test_restore_lands_inside_project_root_when_repo_is_monorepo(tmp_path: Path) -> None:
+    """项目根是仓库子目录时，回滚必须落在**项目根**。
+
+    实测缺陷：``diff-tree`` 默认输出**仓库根**口径（``packages/foo/src/a.txt``），
+    而 ``ls-files`` / ``ls-tree`` 是**项目根**口径（``src/a.txt``）。混用会让
+    ``restore()`` 拼出 ``packages/foo/packages/foo/src/a.txt``：内容落在了错误
+    位置，而 ``written`` 返回空、``ok=True`` —— 用户看到"回滚成功"却没改动
+    任何文件（实测样本）。
+    """
+    repo = _init(tmp_path / "repo")
+    proj = repo / "packages" / "foo"
+    (proj / "src").mkdir(parents=True)
+    (repo / "packages" / "bar").mkdir(parents=True)
+    (proj / "src" / "a.txt").write_bytes(b"orig\n")
+    (repo / "packages" / "bar" / "b.txt").write_bytes(b"bar\n")
+    _commit_all(repo)
+
+    state = tmp_path / "state"
+    state.mkdir()
+    index = state / "snap.idx"
+    store = state / "untracked"
+
+    target = gc.snapshot(proj, index_file=index, store_root=store)
+    (proj / "src" / "a.txt").write_bytes(b"MUTATED\n")
+
+    result = gc.restore(proj, target=target, store_root=store, index_file=index)
+
+    assert result.ok, result.failed
+    assert result.written == ("src/a.txt",)
+    assert (proj / "src" / "a.txt").read_bytes() == b"orig\n"
+    # 缺陷的指纹：项目根下多出一层同名目录
+    assert not (proj / "packages").exists()
+    # 兄弟包不该被波及
+    assert (repo / "packages" / "bar" / "b.txt").read_bytes() == b"bar\n"
+
+
+def test_staged_new_file_in_monorepo_subdir_is_included(tmp_path: Path) -> None:
+    """子目录里 ``git add`` 的新文件也要进快照。
+
+    ``diff --cached --name-only`` 不带 ``--relative`` 时返回仓库根口径
+    （``packages/foo/new.py``）；拿它去 ``git add`` 会因路径不对而失败，
+    或者把仓库根的路径当成项目根路径。
+    """
+    repo = _init(tmp_path / "repo")
+    proj = repo / "packages" / "foo"
+    proj.mkdir(parents=True)
+    (proj / "a.py").write_bytes(b"v1\n")
+    _commit_all(repo)
+
+    (proj / "new.py").write_bytes(b"staged\n")
+    assert _git(proj, "add", "new.py").returncode == 0
+
+    state = tmp_path / "state"
+    state.mkdir()
+    snap = gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
+
+    assert "new.py" in snap.tree_paths
+    assert "a.py" in snap.tree_paths
+
+
 # ---------------------------------------------------------------------------
 # commit / ref（P1 的接口，但纯函数可测）
 # ---------------------------------------------------------------------------

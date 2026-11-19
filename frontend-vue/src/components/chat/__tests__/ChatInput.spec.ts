@@ -5,6 +5,17 @@ import { createPinia, setActivePinia } from 'pinia'
 vi.mock('../../api', () => ({
   uploadFile: vi.fn(),
   listModels: vi.fn(async () => []),
+  // 语音输入依赖的这两个函数必须显式给出：不写的话 `onMounted` 里的探测与
+  // `finishRecording` 的转写都会拿到 `undefined` 去调用。眼下 jsdom 没有
+  // `navigator.mediaDevices`，`canRecordAudio` 提前为 false 把这两条路挡住了 ——
+  // 测试靠"环境恰好缺能力"通过，正是最脆的那种绿。
+  getAudioAvailability: vi.fn(async () => ({
+    available: false,
+    reason: 'test: no microphone in jsdom',
+    model: '',
+    loaded: false,
+  })),
+  transcribeAudio: vi.fn(async () => ({ text: '', language: '', duration: 0 })),
 }))
 
 import ChatInput from '../ChatInput.vue'

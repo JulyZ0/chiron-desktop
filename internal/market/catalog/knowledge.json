@@ -2,27 +2,29 @@
   {
     "kind": "knowledge",
     "id": "knowledge:blank",
-    "name": "空白知识库",
-    "description": "创建一个空知识库模板：装完即可上传自己的文档并构建索引。市场不复制他人的文档内容。",
+    "name": "空白文档合集",
+    "description": "创建一个空的知识库：装完即可上传自己的文档并构建索引。清单为空是合法形态 —— 只有条目自己声明的文档才会被导入。",
     "version": "0.1.0",
     "author": "chiron",
-    "tags": ["template"],
+    "tags": ["collection", "empty"],
     "payload": {
-      "description": "空白知识库（由市场模板创建）",
-      "visibility": "private"
+      "description": "空白文档合集（由市场条目创建）",
+      "visibility": "private",
+      "documents": []
     }
   },
   {
     "kind": "knowledge",
     "id": "knowledge:team-shared",
-    "name": "团队共享知识库",
-    "description": "创建一个可见性为「租户」的空知识库模板，装完后同租户成员都能检索其中的文档。",
+    "name": "团队共享文档合集",
+    "description": "创建一个可见性为「租户」的空知识库，装完后同租户成员都能检索其中的文档。清单为空是合法形态。",
     "version": "0.1.0",
     "author": "chiron",
-    "tags": ["template", "team"],
+    "tags": ["collection", "empty", "team"],
     "payload": {
-      "description": "团队共享知识库（由市场模板创建）",
-      "visibility": "tenant"
+      "description": "团队共享文档合集（由市场条目创建）",
+      "visibility": "tenant",
+      "documents": []
     }
   }
 ]

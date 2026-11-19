@@ -52,6 +52,12 @@ const LOCAL_DATA_SUBDIRS = {
   KNOWLEDGE_SELFHOSTED_ROOT: 'knowledge_index',
   PLUGIN_DATA_DIR: 'plugins',
   SANDBOX_ROOT: 'sandbox',
+  /**
+   * 本地语音转写的模型缓存（`SPEECH_LOCAL_MODEL_DIR` → faster-whisper 的
+   * `download_root`）。与上面几项同因：默认缓存落在用户 home 或相对 cwd，而打包态
+   * 的 cwd 是只读的 `resources/python-engine`，模型下不下来、也读不回来。
+   */
+  SPEECH_LOCAL_MODEL_DIR: 'models',
   /** 审计日志根：四处 `*_audit.py` 读 `Settings.log_dir`（env 名 `LOG_DIR`） */
   LOG_DIR: 'logs',
 }
@@ -857,6 +863,9 @@ function buildEngineEnv(info, options = {}) {
     'KNOWLEDGE_LOCAL_PATH',
     'PLUGIN_DATA_DIR',
     'SANDBOX_ROOT',
+    // 语音模型缓存（faster-whisper 的 download_root）。不给的话模型会下到
+    // 用户 home 或相对 cwd，而打包态 cwd 只读 —— 表现是"语音永远转不出来"。
+    'SPEECH_LOCAL_MODEL_DIR',
   ]) {
     if (dataPaths[name] && (options.env || {})[name] === undefined) env[name] = dataPaths[name]
   }

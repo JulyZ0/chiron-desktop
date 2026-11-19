@@ -329,7 +329,7 @@ class MCPClient:
         if not command_allowed(cmd[0]):
             raise ValueError(
                 f"STDIO transport: command not allowed: {cmd[0]} "
-                "(set PLUGIN_COMMAND_ALLOWLIST)"
+                "(add its basename to the plugin command allowlist in admin settings)"
             )
 
         # 构造 initialize + 实际请求两条消息

@@ -502,6 +502,26 @@ class Settings(BaseSettings):
     # CHAOS_ENABLED 开关）。详见 docs/deployment-multi-instance.md 的混沌工程一节。
     chaos_enabled: bool = False
 
+    # ── 本地语音转写（`POST /v1/audio/transcribe`，见 app/api/audio.py）──
+    # 对话页的语音输入走本机 faster-whisper 离线转写，而不是浏览器的
+    # `webkitSpeechRecognition` —— 后者的识别后端是 Google 在线服务，Electron 官方
+    # 构建不含该服务密钥，桌面包里必然失败（`onerror: network/service-not-allowed`）。
+    #
+    # 开关默认**开**：能力是否真的可用由依赖探测决定（未装 faster-whisper 时端点
+    # 如实返回 503 与原因）。默认关会让"装了依赖也用不了"，与这里的目的相反。
+    speech_local_enabled: bool = True
+    # 模型规格。`small` 在中文短句上的准确率与 CPU 耗时是当前折中最好的点；
+    # 用户机器很弱可降到 `base`（体积约 1/3），追求准确率可升到 `medium`。
+    speech_local_model: str = "small"
+    # 模型缓存目录。**打包态必须给绝对路径**：引擎源码目录在安装包里是只读的，
+    # 交给 faster-whisper 的默认缓存（相对 cwd 或用户 home 之外的猜测）会静默失败。
+    # 桌面壳把它指到 `<dataDir>/models`；空值 = 用 faster-whisper 自己的默认。
+    speech_local_model_dir: str = ""
+    # 推理设备与量化。CPU + int8 是唯一能保证"任何机器都跑得起来"的组合；
+    # 有 CUDA 的用户可自行改成 `cuda` / `float16`。
+    speech_local_device: str = "cpu"
+    speech_local_compute_type: str = "int8"
+
     # ── Go 网关内部配置下发端点（引擎启动时拉取后台「系统设置」中的 python 分类配置）──
     gateway_internal_url: str = "http://127.0.0.1:8080"
 

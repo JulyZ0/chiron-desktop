@@ -805,17 +805,100 @@ func (s skillMarketInstaller) Uninstall(ctx context.Context, item market.Item, r
 
 // ── 落点 4/4：knowledge → 代理 Python ──────────────────────
 
-// knowledgeMarketInstaller 用市场模板创建一个知识库
-// （`POST /v1/kb?user_id=&tenant_id=`，见 python-engine/app/api/knowledge.py）。
+// knowledgeMarketInstaller 安装一个**文档合集**：建知识库 + 把清单里的文档导进去
+// （`POST /v1/kb` 与 `POST /v1/kb/{id}/documents`，见 python-engine/app/api/knowledge.py）。
 //
-// **不复制任何文档内容**：市场只提供模板（名称/说明/可见性），内容由用户自己上传。
-// 这与"市场不搬运他人数据"的边界一致。
+// **只导入条目自己声明的文档**：市场不抓取、不复制安装者没有显式授权的第三方内容。
+// 清单为空是合法形态（「空白文档合集」），此时行为与旧模板完全一致 —— 建一个空库。
+//
+// **不自动建索引**：索引由用户在知识库页显式触发（`POST /v1/kb/{id}/build`）。
+// 建索引会消耗 provider 额度且耗时，装一个合集不该在用户没要求时就开始烧。
 type knowledgeMarketInstaller struct{ py *engine.PythonClient }
 
 // knowledgePayload 是市场 knowledge 条目的 payload 形状。
 type knowledgePayload struct {
 	Description string `json:"description"`
 	Visibility  string `json:"visibility"`
+	// Documents 是合集里的文档清单。省略或为空 = 空合集。
+	Documents []knowledgeDocument `json:"documents"`
+}
+
+// knowledgeDocument 是合集里的一份文档。
+//
+// **只有 `url` 一种来源**：知识库 provider 的白名单是 PDF / Office 二进制
+// （`app/knowledge/remote.py` 的 `_LOCAL_SUFFIXES` / `_CLOUD_SUFFIXES`），md/txt
+// 传上去会在上传阶段被 400 拒绝。所以"内联正文"在这个落点上没有归宿 —— 提供它
+// 只会让发布方写下一份注定装不上的条目。
+//
+// `url` 由引擎侧抓取并直接入库（`/v1/internal/market/kb-import`），不经网关搬运
+// 字节：合集文档是几十 MB 的 PDF，走网关要多做一次大字节编解码，还会让"多大算
+// 太大"的判断出现第二份。
+type knowledgeDocument struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+	// FileType 是可选的类型提示；name 自带扩展名时以 name 为准。
+	FileType string `json:"file_type"`
+}
+
+// maxCollectionDocuments 是单个合集允许声明的文档数上限。
+//
+// 上限存在的理由不是引擎扛不住，而是**安装是一个同步请求**：抓取 + 上传几百份
+// 文档会把 HTTP 请求拖到分钟级，前端只能看到一直转圈。超出上限的合集应当拆成
+// 多个条目，或由用户自己上传。
+const maxCollectionDocuments = 50
+
+// normalizeCollectionDocuments 校验并规整文档清单（**纯函数，无 I/O**）。
+//
+// 之所以在建库**之前**做：清单写错是发布方的错误，应该在产生任何副作用之前
+// 暴露。否则会留下一个"建好了但只有一半文档"的知识库，用户既看不出问题，
+// 卸载重装又会多出一个空库。
+func normalizeCollectionDocuments(in []knowledgeDocument) ([]knowledgeDocument, error) {
+	if len(in) > maxCollectionDocuments {
+		return nil, fmt.Errorf("too many documents in collection (%d > %d)",
+			len(in), maxCollectionDocuments)
+	}
+	out := make([]knowledgeDocument, 0, len(in))
+	for i, d := range in {
+		name := strings.TrimSpace(d.Name)
+		if name == "" {
+			return nil, fmt.Errorf("documents[%d]: name is required", i)
+		}
+		rawURL := strings.TrimSpace(d.URL)
+		if rawURL == "" {
+			return nil, fmt.Errorf("documents[%d] (%s): url is required", i, name)
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			// Python 侧 `_require_https` 才是权威；这里提前拦是为了让错误
+			// 指向"哪个文档的地址不合法"，而不是一句笼统的抓取失败。
+			return nil, fmt.Errorf("documents[%d] (%s): url must be an absolute https URL", i, name)
+		}
+		ft := strings.ToLower(strings.TrimSpace(d.FileType))
+		// name 带扩展名时以它为准（`file_type` 只作 content-type 提示），
+		// 因为引擎按 name 的扩展判断 provider 是否支持 —— 两处不一致时
+		// 让"看得见的文件名"赢，比让一个提示字段赢更好理解。
+		if !hasExtension(name) {
+			if ft == "" {
+				return nil, fmt.Errorf("documents[%d] (%s): name needs a file extension or file_type", i, name)
+			}
+			name += "." + ft
+		}
+		out = append(out, knowledgeDocument{
+			Name:     name,
+			URL:      rawURL,
+			FileType: ft,
+		})
+	}
+	return out, nil
+}
+
+// hasExtension 判断文件名是否带扩展名（`.md` / `.pdf` 之类）。
+//
+// 只认"点后至少一个字符"，且不看点在最前的情形（`.env` 这种 dotfile 按无扩展名处理）：
+// 市场合集里出现 dotfile 名字本身就是错的。
+func hasExtension(name string) bool {
+	i := strings.LastIndexByte(name, '.')
+	return i > 0 && i < len(name)-1
 }
 
 func (k knowledgeMarketInstaller) Install(ctx context.Context, item market.Item, _ map[string]string) (map[string]any, error) {
@@ -832,6 +915,10 @@ func (k knowledgeMarketInstaller) Install(ctx context.Context, item market.Item,
 		if err := json.Unmarshal(item.Payload, &p); err != nil {
 			return nil, fmt.Errorf("%w: invalid knowledge payload: %v", market.ErrBadRequest, err)
 		}
+	}
+	docs, err := normalizeCollectionDocuments(p.Documents)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", market.ErrBadRequest, err)
 	}
 	visibility := p.Visibility
 	if visibility == "" {
@@ -852,7 +939,90 @@ func (k knowledgeMarketInstaller) Install(ctx context.Context, item market.Item,
 	if kbID == "" {
 		return nil, fmt.Errorf("%w: engine returned no knowledge base id", errInstallUpstream)
 	}
-	return map[string]any{"kb_id": kbID, "name": item.Name, "market_id": item.ID}, nil
+
+	// 逐份导入。任何一份失败都**回滚刚建的库**：留着半成品库的话，安装记录不会
+	// 写入（Installer 返回错误即中止），用户重试就会再建一个 —— 空库越积越多，
+	// 而真正的失败原因早被刷过去了。
+	for _, doc := range docs {
+		if err := k.importDocument(ctx, claims, kbID, doc); err != nil {
+			k.rollback(ctx, claims, kbID, item.ID, err)
+			return nil, err
+		}
+	}
+
+	return map[string]any{
+		"kb_id":     kbID,
+		"name":      item.Name,
+		"market_id": item.ID,
+		// documents 记录**实际导入**的份数：卸载时无从复查，装上多少个字面上
+		// 就是多少个。空合集为 0。
+		"documents": len(docs),
+	}, nil
+}
+
+// kbImportResponse 是引擎 `/v1/internal/market/kb-import` 的响应体。
+//
+// 该端点恒回 200，失败以 `ok=false` + 稳定原因码表达 —— 所以错误分类在这里
+// 做，而不是靠 `classifyUpstream` 解析状态码。
+type kbImportResponse struct {
+	OK     bool   `json:"ok"`
+	Error  string `json:"error"`
+	Detail string `json:"detail"`
+	Bytes  int    `json:"bytes"`
+}
+
+// importDocument 让引擎抓取并直接入库一份合集文档。
+//
+// **字节不经网关**：走内部端点 `/v1/internal/market/kb-import`，由引擎出网抓取
+// （`fetch_url_safe`）后写入对象存储。网关只传 `url` 与知识库身份 —— 否则几十 MB
+// 的 PDF 要在两侧各做一遍 base64 编解码，而"多大算太大"也会出现第二份判断。
+func (k knowledgeMarketInstaller) importDocument(
+	ctx context.Context, claims *auth.Claims, kbID string, doc knowledgeDocument,
+) error {
+	body := map[string]any{
+		"kb_id":     kbID,
+		"user_id":   claims.UserID,
+		"name":      doc.Name,
+		"file_type": doc.FileType,
+		"url":       doc.URL,
+	}
+	var resp kbImportResponse
+	if err := k.py.PostJSON(ctx, "/v1/internal/market/kb-import", body, &resp); err != nil {
+		// 传输层失败（引擎不可达/超时）不是调用方的问题。
+		return fmt.Errorf("%w: import %q: %v", errInstallUpstream, doc.Name, err)
+	}
+	if resp.OK {
+		return nil
+	}
+
+	// 原因码分两类，对用户的含义不同：
+	//   - `source_*`：发布方给的地址抓不下来（不可达/超时/被 SSRF 策略拦/非 https），
+	//     安装者无从修正，归上游故障；
+	//   - `kb_*` / `unsupported_document` / `payload_too_large`：入库阶段被拒，
+	//     原因往往能指向"这份文档本身有问题"，但仍不是安装者能自己改的。
+	// 两类都回 502，差别只体现在 detail 里 —— 让用户看到是哪一份、为什么。
+	code := firstNonEmpty(resp.Error, "kb_upload_failed")
+	detail := strings.TrimSpace(resp.Detail)
+	if detail == "" {
+		detail = "engine rejected the document"
+	}
+	return fmt.Errorf("%w: import %q from %s: %s (%s)",
+		errInstallUpstream, doc.Name, doc.URL, code, detail)
+}
+
+// rollback 尽力删除刚建的知识库。
+//
+// 失败只记日志、不改变对外错误：用户需要看到的是**原始失败原因**（哪份文档、
+// 为什么），而不是"回滚也失败了"。留下的空库仍可在知识库页手动删掉。
+func (k knowledgeMarketInstaller) rollback(ctx context.Context, claims *auth.Claims, kbID, marketID string, cause error) {
+	if delErr := k.py.DeleteJSON(ctx,
+		withQuery("/v1/kb/"+url.PathEscape(kbID), identityQuery(claims)), nil); delErr != nil {
+		slog.Warn("market install: rollback knowledge base failed",
+			"kb_id", kbID, "market_id", marketID, "error", delErr, "cause", cause)
+		return
+	}
+	slog.Info("market install: rolled back knowledge base after failed document import",
+		"kb_id", kbID, "market_id", marketID)
 }
 
 func (k knowledgeMarketInstaller) Uninstall(ctx context.Context, item market.Item, ref map[string]any) error {

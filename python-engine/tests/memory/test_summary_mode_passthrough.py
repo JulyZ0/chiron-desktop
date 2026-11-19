@@ -25,7 +25,11 @@ class _FakeProfileStore:
     def __init__(self) -> None:
         self.touched: list[list[str]] = []
 
-    async def list(self, tenant_id: int, user_id: str, *, slot: str = "", project: str = "") -> list[Any]:
+    async def list(
+        self, tenant_id: int, user_id: str, *, slot: str = "", project: str = "",
+        include_global: bool = False,
+    ) -> list[Any]:
+        """没有条目，`include_global` 只为与真实 store 的签名保持一致。"""
         return []
 
     async def touch(self, ids: list[str]) -> None:

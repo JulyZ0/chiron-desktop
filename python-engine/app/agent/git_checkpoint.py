@@ -679,7 +679,12 @@ def _staged_added_paths(root: Path) -> list[str]:
     """
     if _run_git(root, "rev-parse", "--verify", "--quiet", "HEAD").returncode != 0:
         return []
-    proc = _run_git(root, "diff", "--cached", "--name-only", "-z", "--diff-filter=A", "HEAD")
+    # ``--relative`` 不能省：不带它时 ``diff --cached`` 输出的是**仓库根**口径
+    # （``packages/foo/new.txt``），而其余一切路径都是项目根口径（``new.txt``）。
+    # 混用会让恢复时去 ``cat-file <tree>:packages/foo/new.txt`` 取到错误对象。
+    proc = _run_git(
+        root, "diff", "--cached", "--name-only", "-z", "--relative", "--diff-filter=A", "HEAD"
+    )
     if proc.returncode != 0:
         return []
     return [p.replace(os.sep, "/") for p in _split_z(proc.stdout)]
@@ -767,7 +772,14 @@ def _tree_diff(root: Path, base: str, target: str) -> list[tuple[str, str]]:
     ``-z`` 下每项是 ``<status>\\0<path>\\0``（已实测）。``R``/``C`` 会多带一个路径，
     这里按状态长度跳过额外项 —— 不加 ``-M`` 时不会出现，但解析要稳。
     """
-    proc = _run_git(root, "diff-tree", "-r", "-z", "--no-commit-id", "--name-status", base, target)
+    # ``--relative`` 是这里的关键：``diff-tree`` 默认输出**仓库根**口径的路径
+    # （monorepo 子目录下是 ``packages/foo/src/a.txt``），而 ``_tree_entries`` /
+    # ``ls-files`` 都是项目根口径（``src/a.txt``）。不加它，`restore()` 会拿
+    # 仓库根路径去拼 ``root / path``，写进 ``packages/foo/packages/foo/src/a.txt``，
+    # 而 ``written`` 返回空、``ok=True`` —— 用户看到"回滚成功"却没改动任何文件（实测）。
+    proc = _run_git(
+        root, "diff-tree", "-r", "-z", "--no-commit-id", "--relative", "--name-status", base, target
+    )
     if proc.returncode != 0:
         raise GitError(
             "diff-tree failed: " + proc.stderr.decode("utf-8", errors="replace").strip()
@@ -904,8 +916,14 @@ def _read_blob(root: Path, tree: str, path: str) -> bytes:
       ``git status`` 立刻变脏。
     * ``git cat-file --filters`` 会应用 ``.gitattributes`` / ``core.autocrlf``，
       还原成工作区应有的字节，``git status`` 保持为空。
+
+    ``path`` 是**项目根**相对路径（``_tree_diff`` / ``_tree_entries`` 的口径）。
+    ``cat-file`` 默认按**仓库根**解析，所以必须写成 ``<tree>:./<path>`` ——
+    ``./`` 让它跟着 ``-C root`` 的工作目录走（实测：monorepo 子目录下
+    ``<tree>:src/a.txt`` 报 ``path does not exist``，``<tree>:./src/a.txt`` 正常）。
+    手工拼 ``rev-parse --show-prefix`` 也能对，但多一次子进程且要处理分隔符。
     """
-    proc = _run_git(root, "cat-file", "--filters", f"{tree}:{path}")
+    proc = _run_git(root, "cat-file", "--filters", f"{tree}:./{path}")
     if proc.returncode != 0:
         raise GitError(
             f"cat-file failed for {path}: "

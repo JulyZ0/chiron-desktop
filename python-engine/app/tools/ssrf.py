@@ -206,13 +206,6 @@ def _command_path_ok(command: str) -> bool:
 _ALLOWLIST_FILE_NAME = "command_allowlist.json"
 
 
-def _allowlist_file_path():
-    """白名单文件位置（每次调用时解析，保证后台改了 `PLUGIN_DATA_DIR` 也跟随）。"""
-    from app.plugins.store import plugin_data_dir
-
-    return plugin_data_dir() / _ALLOWLIST_FILE_NAME
-
-
 def plugin_allowlist_file_entries() -> frozenset[str]:
     """读**后台可编辑**的白名单（`{PLUGIN_DATA_DIR}/command_allowlist.json`）。
 

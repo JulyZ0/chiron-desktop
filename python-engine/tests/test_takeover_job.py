@@ -751,3 +751,232 @@ async def test_loop_tick_interval_floor(monkeypatch):
 
     await job.takeover_loop(FakeRedis(), should_stop=_should_stop)
     assert seen == [30]
+
+
+# ── _TokenTally / _default_runner：用量与"是否推进"的口径 ────────────
+#
+# 这一层曾整段失效且**不报错**：`_default_runner` 按 dict 读事件，而 `runtime.run`
+# 产出的是 `AgentEvent` 对象 ⇒ 每条事件都被 `isinstance(ev, dict)` 挡掉。表现是
+# token 恒为 0（当日预算闸门永不触发）与 `progressed` 恒为 False（每拍都记成"无事
+# 可做"）。下面三个用例之所以必要，是因为"读取方式错了"在类型上完全合法。
+
+
+class _Ev:
+    """`AgentEvent` 的最小替身：只带被消费的那几个字段。"""
+
+    def __init__(self, type, input_tokens=0, output_tokens=0, cached_tokens=0, model=""):  # noqa: ANN001
+        self.type = type
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cached_tokens = cached_tokens
+        self.model = model
+
+
+def test_token_tally_prefers_done_and_ignores_cached():
+    """`done` 是整轮累计的主来源；`cached` 是输入的子集，不能加进总数。
+
+    加进去的后果不是"多记一点"，而是让预算闸门比真实消耗更早熔断 —— 用户会
+    在还有额度时被停掉巡检，而且看不出原因。
+    """
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("usage", _Ev("usage", 10, 5, 3))
+    tally.observe("done", _Ev("done", 100, 40, 30))
+    assert tally.tokens() == 140  # 100 + 40，cached 30 不计
+    assert tally.totals() == (100, 40)
+
+
+def test_token_tally_falls_back_to_usage_without_done():
+    """`done` 缺失（被取消 / 流被截断）时用增量之和兜底，且不与 `done` 重复累加。"""
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("usage", _Ev("usage", 10, 5, 3))
+    tally.observe("usage", _Ev("usage", 7, 2, 0))
+    assert tally.tokens() == 24  # (10+7) + (5+2)
+
+    # 迟到的 `done` 一旦带了 token，就完全改用它 —— 兜底值不再参与。
+    tally.observe("done", _Ev("done", 1, 1, 0))
+    assert tally.tokens() == 2
+
+
+def test_token_tally_ignores_other_events():
+    """`text` / `tool_call` 等不带用量，读它们不能抛异常也不能算出数。"""
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("text", _Ev("text"))
+    tally.observe("tool_call", _Ev("tool_call"))
+    assert tally.tokens() == 0
+
+
+@pytest.mark.asyncio
+async def test_default_runner_consumes_agent_events(monkeypatch):
+    """端到端钉住 `_default_runner` 的消费口径：`AgentEvent` 对象 + 真推进才算 progressed。"""
+    from app.agent import checkpoint
+    from app.agent import runtime as runtime_mod
+    from app.memory import service as memory_service
+
+    async def _fake_meta(*, tenant_id, session_id):  # noqa: ANN001
+        return {
+            "llm_config": {"model": "m", "tools_mode": "auto"},
+            "system_prompt": "sp",
+        }
+
+    monkeypatch.setattr(checkpoint, "load_recent_task_meta", _fake_meta)
+
+    async def _fake_gateway():
+        return object()
+
+    import app.main as main_mod
+
+    monkeypatch.setattr(main_mod, "get_gateway", _fake_gateway)
+    monkeypatch.setattr(memory_service, "get_service", lambda: None)
+
+    class _FakeRuntime:
+        def __init__(self, **kw):  # noqa: ANN003
+            self.kw = kw
+
+        async def run(self, task):  # noqa: ANN001
+            yield _Ev("text")
+            yield _Ev("usage", 10, 5, 3)
+            yield _Ev("tool_call")
+            yield _Ev("done", 100, 40, 30)
+
+    monkeypatch.setattr(runtime_mod, "AgentRuntime", _FakeRuntime)
+
+    reported: list[dict] = []
+
+    async def _fake_report(**kw):  # noqa: ANN003
+        reported.append(kw)
+        return True
+
+    monkeypatch.setattr(job, "_report_usage", _fake_report)
+
+    out = await job._default_runner(_row())  # noqa: SLF001
+    assert out.ok is True
+    assert out.tokens == 140
+    assert out.progressed is True
+
+    # 用量必须上报给网关：`usage_events` 是计费页唯一的事实源，接管 run 不经过网关
+    # 的 SSE 消费段，不上报就等于这部分花费从未发生。
+    assert len(reported) == 1
+    assert reported[0]["session_id"] == "s1"
+    assert reported[0]["turn_id"], "turn_id 必须带（网关据此幂等）"
+    assert reported[0]["turn_id"].startswith("takeover_")
+
+
+@pytest.mark.asyncio
+async def test_default_runner_idle_run_is_not_progressed(monkeypatch):
+    """只有文本回复（含"无事可做"）= `ok=True` + `progressed=False`，要能区分开。"""
+    from app.agent import checkpoint
+    from app.agent import runtime as runtime_mod
+    from app.memory import service as memory_service
+
+    async def _fake_meta(*, tenant_id, session_id):  # noqa: ANN001
+        return {
+            "llm_config": {"model": "m", "tools_mode": "auto"},
+            "system_prompt": "sp",
+        }
+
+    monkeypatch.setattr(checkpoint, "load_recent_task_meta", _fake_meta)
+
+    async def _fake_gateway():
+        return object()
+
+    import app.main as main_mod
+
+    monkeypatch.setattr(main_mod, "get_gateway", _fake_gateway)
+    monkeypatch.setattr(memory_service, "get_service", lambda: None)
+
+    class _IdleRuntime:
+        def __init__(self, **kw):  # noqa: ANN003
+            pass
+
+        async def run(self, task):  # noqa: ANN001
+            yield _Ev("text")
+            yield _Ev("done", 8, 3, 0)
+
+    monkeypatch.setattr(runtime_mod, "AgentRuntime", _IdleRuntime)
+
+    reported: list[dict] = []
+
+    async def _fake_report(**kw):  # noqa: ANN003
+        reported.append(kw)
+        return True
+
+    monkeypatch.setattr(job, "_report_usage", _fake_report)
+
+    out = await job._default_runner(_row())  # noqa: SLF001
+    assert out.ok is True
+    assert out.progressed is False
+    assert out.tokens == 11
+    # "无事可做"也真的花了 token（读上下文、判断任务板），照样要记账。
+    assert len(reported) == 1
+
+
+# ── _TokenTally.entries()：按模型归因，但绝不改总额 ────────────────────
+
+
+def test_token_tally_entries_splits_by_model():
+    """按模型拆行，各行之和**恒等于**整轮入账量 —— 归因只改粒度，不改总额。"""
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("usage", _Ev("usage", 10, 5, 3, model="gpt-4o"))
+    tally.observe("usage", _Ev("usage", 90, 35, 27, model="gpt-4o-mini"))
+    tally.observe("done", _Ev("done", 100, 40, 30, model="gpt-4o"))
+
+    rows = tally.entries()
+    assert [r["model"] for r in rows] == ["gpt-4o", "gpt-4o-mini"]
+    assert sum(r["input_tokens"] for r in rows) == 100
+    assert sum(r["output_tokens"] for r in rows) == 40
+    assert sum(r["cached_tokens"] for r in rows) == 30
+
+
+def test_token_tally_entries_merges_gap_into_turn_model():
+    """`done` 有增量没覆盖到的差额时，并到归属模型那一行 —— 那部分用量确实发生了。
+
+    差额不处理就会"明细加起来对不上本轮记账"，而界面上不会有任何报错。
+    """
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("usage", _Ev("usage", 10, 5, 0, model="gpt-4o"))
+    # done 带了 100/40：其中 10/5 有归因，剩下 90/35 只知道属于本轮模型。
+    tally.observe("done", _Ev("done", 100, 40, 0, model="gpt-4o"))
+
+    rows = tally.entries()
+    assert len(rows) == 1
+    assert rows[0]["model"] == "gpt-4o"
+    assert rows[0]["input_tokens"] == 100
+    assert rows[0]["output_tokens"] == 40
+
+
+def test_token_tally_entries_without_usage_attributes_to_turn_model():
+    """没有任何 `usage` 增量时退回单行（老引擎 / 全零），模型名用归属模型。"""
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("done", _Ev("done", 7, 3, 0, model="claude-x"))
+
+    rows = tally.entries()
+    assert len(rows) == 1
+    assert rows[0]["model"] == "claude-x"
+    assert (rows[0]["input_tokens"], rows[0]["output_tokens"]) == (7, 3)
+
+
+def test_token_tally_entries_empty_when_nothing_spent():
+    """零用量不产生上报行 —— 网关不该收到一次空上报。"""
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("text", _Ev("text"))
+    assert tally.entries() == []
+
+
+def test_token_tally_entries_ignores_usage_model_for_turn_model():
+    """`usage` 的 model 不能当归属模型：那会让"本轮用的哪个模型"变成本轮**最后**一次调用。
+
+    摘要、子 Agent 外层调用都会把它带偏，于是差额被按错误的单价折算 —— 而差额
+    恰恰是"不知道属于哪个模型"的那部分，只能记在主模型名下。
+    """
+    tally = job._TokenTally()  # noqa: SLF001
+    tally.observe("usage", _Ev("usage", 1, 1, 0, model="cheap-summarizer"))
+    # done 比增量多 9/4：这 9/4 只知道属于本轮主模型。
+    tally.observe("done", _Ev("done", 10, 5, 0, model="gpt-4o"))
+
+    rows = {r["model"]: r for r in tally.entries()}
+    assert set(rows) == {"cheap-summarizer", "gpt-4o"}
+    assert rows["cheap-summarizer"]["input_tokens"] == 1
+    # 差额归到 gpt-4o（`done` 的 model），不是归到最后一个 `usage` 的模型。
+    assert rows["gpt-4o"]["input_tokens"] == 9
+    assert rows["gpt-4o"]["output_tokens"] == 4
+    assert sum(r["input_tokens"] for r in rows.values()) == 10

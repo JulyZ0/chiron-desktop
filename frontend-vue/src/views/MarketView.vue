@@ -302,6 +302,29 @@ function resetDetailEnv() {
   for (const key of Object.keys(detailEnv)) delete detailEnv[key]
 }
 
+/** 合集条目声明会导入的一份文档（`payload.documents[]`）。 */
+interface CollectionDocument {
+  name?: string
+  url?: string
+  file_type?: string
+}
+
+/**
+ * 详情抽屉要列的「合集包含的文档」。
+ *
+ * 只在**内容就在 payload 里**的条目上展示：外部条目的 payload 只是目录自称的
+ * 展示信息，真正安装取的是 manifest。拿目录里的清单来展示，会出现"看到要装 3 份、
+ * 实际装了 2 份"这种用户无法自证的不一致 —— 宁可不展示。
+ */
+const collectionDocuments = computed<CollectionDocument[]>(() => {
+  const it = detailItem.value
+  if (!it || it.kind !== 'knowledge' || it.manifest_url) return []
+  const payload = it.payload as { documents?: unknown } | undefined
+  const docs = payload?.documents
+  if (!Array.isArray(docs)) return []
+  return (docs as CollectionDocument[]).filter(d => !!d && (!!d.name || !!d.url))
+})
+
 async function openDetail(it: MarketItem) {
   detailItem.value = it
   detailOpen.value = true
@@ -748,7 +771,36 @@ function installFromDetail() {
           </div>
         </div>
 
-        <!-- 前提条件：只提示，不在这里替用户做别的动作 -->
+        <!-- 合集清单：装之前就让用户看到会导入哪些文档 -->
+        <div
+          v-if="collectionDocuments.length"
+          class="detail-section"
+        >
+          <span class="detail-label">
+            {{ $t('market.detail.collection_documents', { n: collectionDocuments.length }) }}
+          </span>
+          <ol class="collection-list">
+            <li
+              v-for="(doc, i) in collectionDocuments"
+              :key="`${i}-${doc.url}`"
+              class="collection-item"
+            >
+              <span class="collection-name">{{ doc.name || doc.url }}</span>
+              <a
+                v-if="doc.url"
+                class="collection-url"
+                :href="doc.url"
+                target="_blank"
+                rel="noopener noreferrer"
+              >{{ doc.url }}</a>
+            </li>
+          </ol>
+          <p class="collection-hint">
+            {{ $t('market.detail.collection_hint') }}
+          </p>
+        </div>
+
+
         <div
           v-if="detailItem.requires?.model || detailItem.requires?.approval"
           class="detail-section"
@@ -1002,6 +1054,33 @@ function installFromDetail() {
   word-break: break-word;
 }
 .detail-tag { margin-inline-end: 4px; }
+
+/* 合集文档清单：装之前要能看清"会导入哪几份"。 */
+.collection-list {
+  margin: 0;
+  padding-inline-start: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.collection-item {
+  font-size: 13px;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+.collection-name { display: block; }
+.collection-url {
+  display: block;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  word-break: break-all;
+}
+.collection-hint {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  line-height: 1.5;
+}
 
 .env-field {
   display: flex;

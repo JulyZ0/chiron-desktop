@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/engine"
@@ -81,6 +82,18 @@ func registerProxyRoutes(
 		// 若在此之前校验，看到的是前端随手传的字段而非真正生效的模型。
 		// 返回 false 表示已自行写出响应（如 403）、代理应中止。
 		guardBody func(w http.ResponseWriter, r *http.Request, body map[string]interface{}) bool
+		// forwardQuery 以**白名单**形式透传客户端 query（只在这几个键上生效）。
+		//
+		// 为什么必须有：转发路径由 `buildPath(r) + "?user_id=…&tenant_id=…"` 拼成，
+		// **r.URL.RawQuery 整个被丢弃**。而 C3 的记忆按项目隔离，引擎侧读的正是
+		// `?project=`（见 python-engine/app/api/memory.py 的 `_project`）——
+		// 到了网关这一跳就没了：记忆页选了项目，看到的仍是未分组，新写入的条目
+		// 也落回未分组，隔离"看起来做了、实际完全没生效"。
+		//
+		// 为什么不是整串透传：客户端自带 `?user_id=victim` 会与网关追加的身份并存，
+		// 谁先谁后取决于拼接顺序 —— 这正是 routes_proxy_escseg_test.go 钉住的 P0
+		// 越权回归。只按明确的键取值，身份永远来自 claims，伪造的同名参数进不来。
+		forwardQuery []string
 	}
 	newProxy := func(prefix string, opt proxyOpt) func(func(*http.Request) string) http.HandlerFunc {
 		return func(buildPath func(*http.Request) string) http.HandlerFunc {
@@ -95,7 +108,25 @@ func registerProxyRoutes(
 					return
 				}
 				// 多租户隔离：透传 tenant_id 给 Python 引擎（query 参数兼容，header 见 pythonClient.WithTenant）
-				proxiedPath := buildPath(r) + "?user_id=" + url.QueryEscape(claims.UserID) + "&tenant_id=" + url.QueryEscape(tenantStr(claims.TenantID))
+				//
+				// `forwardQuery` 里的键**先拼**、身份**后拼**：即便某个键在引擎侧与身份同名，
+				// 追加的身份也在后面 —— 但真正的保证是白名单里根本不包含 user_id/tenant_id
+				// （见 proxyOpt.forwardQuery 的注释）。键名同样走 QueryEscape，值里的
+				// `&` / `=` 不会撑开 query 结构。
+				proxiedPath := buildPath(r) + "?"
+				if len(opt.forwardQuery) > 0 {
+					q := r.URL.Query()
+					var parts []string
+					for _, key := range opt.forwardQuery {
+						for _, v := range q[key] {
+							parts = append(parts, url.QueryEscape(key)+"="+url.QueryEscape(v))
+						}
+					}
+					if len(parts) > 0 {
+						proxiedPath += strings.Join(parts, "&") + "&"
+					}
+				}
+				proxiedPath += "user_id=" + url.QueryEscape(claims.UserID) + "&tenant_id=" + url.QueryEscape(tenantStr(claims.TenantID))
 				var resp interface{}
 				var err error
 				switch r.Method {
@@ -229,11 +260,23 @@ func registerProxyRoutes(
 	mux.Handle("POST /v1/capabilities/search", authMW(rlMW(capP(pathFn("/v1/capabilities/search")))))
 
 	// Memory (用户长期记忆 L2 档案卡: 列表/CRUD/语义检索/智能整理, 代理 Python)
-	memP := newProxy("", proxyOpt{logTag: "memory"})
+	//
+	// forwardQuery 是 C3「记忆按项目隔离」的**唯一**通路：前端 `projectParams()`
+	// 把当前项目作为 `?project=` 挂在 URL 上，引擎侧 `_project()` 从 query 读它。
+	// newProxy 默认丢弃原始 query，不透传的话项目维度到网关就断——记忆页选了项目
+	// 仍显示未分组，新写入也落回未分组。
+	//
+	// 只放这三个键，身份（user_id/tenant_id）永远由网关追加：`archived` 是列表
+	// 是否含归档，`limit` 是摘要条数（引擎 clamp 到 1..200），都不影响归属判定。
+	memP := newProxy("", proxyOpt{logTag: "memory", forwardQuery: []string{"project", "archived", "limit"}})
+
 	mux.Handle("GET /v1/memory/profile", authMW(rlMW(memP(pathFn("/v1/memory/profile")))))
 	mux.Handle("POST /v1/memory/profile", authMW(rlMW(memP(pathFn("/v1/memory/profile")))))
 	mux.Handle("PUT /v1/memory/profile", authMW(rlMW(memP(pathFn("/v1/memory/profile")))))
 	mux.Handle("DELETE /v1/memory/profile/{id}", authMW(rlMW(memP(pathParam("/v1/memory/profile")))))
+	// 范围切换（全局 ↔ 某个项目）。刻意**不走** PUT：PUT 按 `?project=` 精确匹配，
+	// 项目视图里匹配不上全局条目（这正是"全局条目只读"的实现），而换范围要跨范围动作。
+	mux.Handle("POST /v1/memory/profile/{id}/scope", authMW(rlMW(memP(pathParamSuffix("/v1/memory/profile", "/scope")))))
 	mux.Handle("POST /v1/memory/profile/clear", authMW(rlMW(memP(pathFn("/v1/memory/profile/clear")))))
 	mux.Handle("POST /v1/memory/search", authMW(rlMW(memP(pathFn("/v1/memory/search")))))
 	mux.Handle("POST /v1/memory/organize", authMW(rlMW(memP(pathFn("/v1/memory/organize")))))

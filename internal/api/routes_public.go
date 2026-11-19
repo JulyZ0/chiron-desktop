@@ -67,6 +67,12 @@ func registerPublicEndpoints(
 	// 前端也就没有任何回滚点可渲染。归属由网关按 session_id 反查，请求体不作数。
 	mux.Handle("POST /v1/internal/checkpoints", rlMW(internalTokenMW(cfg, http.HandlerFunc(IngestProjectCheckpoint))))
 
+	// 用量上报（X-Internal-Token 保护）：引擎侧**自己起**的 run（接管巡检）不经过
+	// 网关的 SSE 消费段，用量因此进不了 `usage_events` —— 计费页对它永远是 0。
+	// 这条通道让引擎只上报事实（模型 / token），归属与金额由网关按会话行反查、
+	// 按 `model_prices` 换算（见 usage_events_internal.go）。
+	mux.Handle("POST /v1/internal/usage-events", rlMW(internalTokenMW(cfg, http.HandlerFunc(IngestUsageEvents))))
+
 	// Python 引擎数据库/Redis 统一访问端点（X-Internal-Token 保护）
 	mux.Handle("POST /v1/internal/db/query", rlMW(internalTokenMW(cfg, http.HandlerFunc(systemHandler.DBQuery))))
 	mux.Handle("POST /v1/internal/db/execute", rlMW(internalTokenMW(cfg, http.HandlerFunc(systemHandler.DBExecute))))

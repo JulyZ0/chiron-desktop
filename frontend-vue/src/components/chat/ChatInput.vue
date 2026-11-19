@@ -2,8 +2,10 @@
 import { ref, onMounted, onUnmounted, watch, computed, nextTick, h } from 'vue'
 import { Input, Button, Select, Tooltip, Popover } from 'ant-design-vue'
 import { SendOutlined, StopOutlined, PaperClipOutlined, CloseOutlined, BranchesOutlined, AudioOutlined, FolderOpenOutlined, SettingOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
-import api, { uploadFile, listModels } from '../../api'
+import api, { uploadFile, listModels, getAudioAvailability, transcribeAudio } from '../../api'
 import type { LlmModel } from '../../api'
+import { serverErrorDetail } from '../../utils/apiError'
+import { currentLocale } from '../../i18n'
 import type { ChatAttachment } from './chat-types'
 import type { ContextChip } from './contextChips'
 import MediaPickerDialog from './MediaPickerDialog.vue'
@@ -248,6 +250,22 @@ watch(
 
 onUnmounted(() => {
   if (elapsedTimer !== undefined) clearInterval(elapsedTimer)
+  // 语音输入：组件被卸载（切会话/切路由）时把麦克风还回去。
+  // 不停的话录音轨会一直占着设备，用户下次点录音可能拿到静音轨。
+  //
+  // `disposed` 必须先于 `stop()` 置位：`stop()` 触发的 `onstop` 是异步的，
+  // 若不在入口拦住，切换会话会顺带把这段录音上传一次（见 `finishRecording`）。
+  disposed = true
+  if (recordingInterval) clearInterval(recordingInterval)
+  recordingInterval = null
+  micBars.stop()
+  const active = recorder
+  recorder = null
+  recChunks = []
+  if (active && active.state !== 'inactive') {
+    try { active.stop() } catch { /* 已停止 */ }
+  }
+  stopRecStream()
 })
 
 // 会话切换/恢复时同步（父组件回传 llm_config.model；空 = 后端默认）
@@ -256,6 +274,9 @@ watch(() => props.model, (v) => { modelValue.value = v || '' }, { immediate: tru
 // 挂载自动聚焦 + 加载可用模型
 onMounted(async () => {
   textareaRef.value?.focus?.()
+  // 语音输入能力探测：只查引擎侧依赖与开关（不加载模型），据此决定按钮是否可点。
+  // 不 await：它不该挡住输入框聚焦与模型列表，探测结果到达后再更新按钮态。
+  void probeVoiceAvailability()
   try {
     modelsLoading.value = true
     models.value = await listModels()
@@ -894,60 +915,27 @@ function removeAttachment(id: string) {
   if (idx >= 0) pendingAttachments.value.splice(idx, 1)
 }
 
-// ── 语音输入（Speech-to-Text，纯前端） ──
+// ── 语音输入（本地离线转写） ──
 //
-// 用浏览器原生 Web Speech API 在**浏览器侧**完成识别，文字直接落进输入框：
-// 不生成音频文件、不经后端、不调用 Whisper。原实现是 MediaRecorder 录成 webm →
-// 上传 → 后端 speech_to_text 调 Whisper API，既有 API 费用又占后端资源；
-// 而多数场景用户要的只是"把说的话变成字"。
-/**
- * Web Speech API 的最小形状。
- *
- * 全部自声明、不引用 lib.dom 的 `SpeechRecognition*`：
- * 1. lib.dom **没有**识别器主接口（规范未进 lib），只有事件/结果接口；
- * 2. eslint 的 `no-undef` 走 `browser` globals 列表，里面没有 `SpeechRecognitionEvent`，
- *    引用它会被判未定义（tsc 侧却在 lib.dom 里找得到，两边覆盖不一致）。
- * 各浏览器还带 `webkit` 前缀，故构造器也在这里收口。
- */
-interface SpeechAlternative {
-  transcript: string
-}
-interface SpeechResult {
-  isFinal: boolean
-  length: number
-  [index: number]: SpeechAlternative
-}
-interface SpeechResultEvent {
-  /** 本轮发生变化的最小下标（interim 结果每次重发整段） */
-  resultIndex: number
-  results: { length: number; [index: number]: SpeechResult }
-}
-interface SpeechErrorEvent {
-  error: string
-  message?: string
-}
-interface SpeechRecognizer {
-  lang: string
-  continuous: boolean
-  interimResults: boolean
-  onresult: ((e: SpeechResultEvent) => void) | null
-  onerror: ((e: SpeechErrorEvent) => void) | null
-  onend: (() => void) | null
-  start(): void
-  stop(): void
-}
-type SpeechRecognitionCtor = new () => SpeechRecognizer
-
-const SpeechRec =
-  (window as unknown as {
-    SpeechRecognition?: SpeechRecognitionCtor
-    webkitSpeechRecognition?: SpeechRecognitionCtor
-  }).SpeechRecognition
-  || (window as unknown as { webkitSpeechRecognition?: SpeechRecognitionCtor })
-    .webkitSpeechRecognition
-const speechSupported = !!SpeechRec
+// 录音走 `MediaRecorder`，转写走引擎里的 `faster-whisper`
+//（`POST /v1/audio/transcribe`，见 python-engine/app/api/audio.py）。
+//
+// 为什么不用浏览器的 `webkitSpeechRecognition`：它在 Chromium 里构造器存在，但
+// **识别后端是 Google 的在线语音服务**，Electron 官方构建不含该服务密钥 ——
+// 桌面包里 `start()` 看似成功、随后 `onerror` 报 `network`，用户看到的是
+// "进入录音态然后失败"。旧注释里"浏览器本地识别、不上传音频"那句话因此是错的：
+// 音频实际上被发去了第三方在线服务。
+//
+// 现在的取舍是**换成把音频发到本机引擎**：不出这台机器、不产生第三方费用，
+// 代价是首用要下载模型（数百 MB）与一次几秒的转写等待。
+const canRecordAudio =
+  typeof navigator !== 'undefined'
+  && !!navigator.mediaDevices?.getUserMedia
+  && typeof window.MediaRecorder !== 'undefined'
 
 const recording = ref(false)
+/** 录音已停、正在等引擎返回文本。与 `recording` 分开：此时不该再点按钮。 */
+const transcribing = ref(false)
 const recordingTimer = ref(0)
 /** 6 频段电平柱：`--level` 由 rAF 直接写 DOM（不走响应式，60fps 不该触发 Composer 重渲染） */
 const barEls = ref<HTMLElement[]>([])
@@ -957,75 +945,184 @@ const micBars = useMicBars(levels => {
   }
 })
 let recordingInterval: ReturnType<typeof setInterval> | null = null
-let recognizer: SpeechRecognizer | null = null
-/** 本次会话已定稿的文本（interim 结果每次重发整段，需与它拼接） */
-let speechFinal = ''
-/** 开始转写前的输入框内容：识别结果追加在它之后 */
+/** 当前录音的媒体流。**与波形共用同一路** —— 各开一路会让部分驱动给录音静音轨。 */
+let recStream: MediaStream | null = null
+let recorder: MediaRecorder | null = null
+let recChunks: Blob[] = []
+/** 按下录音那一刻输入框的**原始**内容（用于判断录音期间用户有没有改过） */
+let speechBaseline = ''
+/**
+ * 组件已卸载。卸载时会把录音 `stop()` 掉，而 `onstop` 是**异步**回调 ——
+ * 不拦的话，切换会话/切路由会顺带把这段录音上传一遍（用户已经离开这一次录音，
+ * 却还为它多走一趟网络），再把文本写进一个已销毁组件的 ref。
+ */
+let disposed = false
+/** 转写结果要接在它之后（已把结尾空白归一成单个空格） */
 let speechPrefix = ''
+/**
+ * 本机能否转写。`null` = 尚未探测完 —— 此时**不禁用**按钮：
+ * 禁用态先闪一下再恢复，比"按钮灰着等一秒"更让人困惑。
+ */
+const voiceAvailable = ref<boolean | null>(null)
+/** 不可用原因（引擎/网关给的可读说明），用于按钮 title 与点击时的提示 */
+const voiceUnavailableReason = ref('')
 
-function startRecording() {
-  if (!speechSupported) {
-    notify.warning(tr('chat.current_browser_does_not_support_speech_to_text_please_use_chrome_edge_safari'))
+/** 录音按容器能力挑一个编码；都不支持（极旧内核）就让浏览器自己决定。 */
+function pickAudioMimeType(): string | undefined {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+  for (const type of candidates) {
+    try {
+      if (MediaRecorder.isTypeSupported?.(type)) return type
+    } catch { /* 探测本身失败：继续试下一个 */ }
+  }
+  return undefined
+}
+
+/**
+ * 交给引擎的语言码：界面语言的主语言部分（`zh-CN` → `zh`）。
+ *
+ * 不传空串而是尽量给提示，是因为**短句**（"好的"、"开会")在自动语种判定下很容易
+ * 被判成别的语言，然后转出一串无关文字。引擎侧接受空串 = 自动判定。
+ */
+function speechLanguage(): string {
+  const base = currentLocale().split('-')[0]?.toLowerCase() ?? ''
+  return base === 'zh' || base === 'en' || base === 'ar' ? base : ''
+}
+
+function stopRecStream() {
+  recStream?.getTracks().forEach(track => track.stop())
+  recStream = null
+}
+
+/** 挂载时探测一次"本机能不能转写"，据此决定按钮是否可点与提示文案。 */
+async function probeVoiceAvailability() {
+  if (!canRecordAudio) {
+    voiceAvailable.value = false
+    voiceUnavailableReason.value = tr('chat.this_environment_has_no_microphone_recording_support')
+    return
+  }
+  const a = await getAudioAvailability()
+  voiceAvailable.value = a.available
+  voiceUnavailableReason.value = a.reason
+}
+
+async function startRecording() {
+  if (recording.value || transcribing.value) return
+  if (!canRecordAudio) {
+    notify.warning(tr('chat.this_environment_has_no_microphone_recording_support'))
+    return
+  }
+  if (voiceAvailable.value === false) {
+    // 按钮在不可用时已置灰，这里只是兜底（探测之后能力又被关掉的情况）
+    notify.warning(voiceUnavailableReason.value || tr('chat.voice_input_is_unavailable_on_this_machine'))
     return
   }
   try {
-    recognizer = new SpeechRec()
-    recognizer.lang = 'zh-CN'
-    recognizer.continuous = true
-    recognizer.interimResults = true
-
-    speechFinal = ''
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    recStream = stream
+    recChunks = []
+    const mimeType = pickAudioMimeType()
+    recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
+    recorder.ondataavailable = (e: BlobEvent) => { if (e.data?.size) recChunks.push(e.data) }
+    recorder.onstop = () => { void finishRecording() }
+    // 记下"按下录音那一刻"的内容：录音期间用户仍可编辑，转写结果不该覆盖它
+    speechBaseline = input.value
     speechPrefix = input.value ? input.value.replace(/\s*$/, ' ') : ''
+    recorder.start()
 
-    recognizer.onresult = (e: SpeechResultEvent) => {
-      let interim = ''
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const r = e.results[i]
-        if (r.isFinal) speechFinal += r[0].transcript
-        else interim += r[0].transcript
-      }
-      // 定稿 + 临时结果实时上屏：用户随时能看到识别到哪了
-      input.value = speechPrefix + speechFinal + interim
-    }
-    recognizer.onerror = (e: SpeechErrorEvent) => {
-      // no-speech / aborted 属正常收尾（静音超时、用户停止），不当错误
-      if (e?.error === 'no-speech' || e?.error === 'aborted') return
-      notify.error(
-        e?.error === 'not-allowed'
-          ? tr('errors.microphone_permission_denied_please_allow_it_in_your_browser_settings_and_retry')
-          : `${tr('errors.speech_transcription_failed')}: ${e?.error || ''}`,
-      )
-      stopRecording()
-    }
-    // 浏览器可能自行结束（静音超时）；统一收尾，避免状态卡在"录音中"
-    recognizer.onend = () => { if (recording.value) stopRecording() }
-
-    recognizer.start()
     recording.value = true
     recordingTimer.value = 0
     recordingInterval = setInterval(() => { recordingTimer.value++ }, 1000)
-    // 波形是"锦上添花"：拿不到麦克风流就静默不画，识别照常
-    void micBars.start()
+    // 波形复用录音这一路流：各开一路会让两个消费者抢设备，部分驱动下录音轨静音
+    void micBars.start(stream)
     playUiSound('voice-enter')
-  } catch {
-    notify.error(tr('errors.unable_to_start_speech_transcription_please_check_microphone_permission'))
+  } catch (error) {
+    stopRecStream()
+    recorder = null
+    const name = (error as { name?: string } | null)?.name || ''
+    // NotAllowedError / SecurityError：用户拒了权限或非安全上下文
+    notify.error(
+      name === 'NotAllowedError' || name === 'SecurityError'
+        ? tr('errors.microphone_permission_denied_please_allow_it_in_your_browser_settings_and_retry')
+        : tr('errors.unable_to_start_speech_transcription_please_check_microphone_permission'),
+    )
+  }
+}
+
+/** 收尾：停表、停流、把已录到的数据交给引擎。 */
+async function finishRecording() {
+  recorder = null
+  const chunks = recChunks
+  recChunks = []
+  stopRecStream()
+
+  // 已卸载（切会话/切路由）：这段录音本来就没打算发出去，
+  // 别为一个用户已经离开的输入框多跑一趟网络，也别再写它的 ref。
+  if (disposed) return
+
+  const type = chunks[0]?.type || 'audio/webm'
+  const blob = new Blob(chunks, { type })
+  if (!blob.size) {
+    transcribing.value = false
+    return
+  }
+  try {
+    const { text } = await transcribeAudio(blob, speechLanguage())
+    if (text) {
+      // 录音期间用户可能还在打字：此时**追加**而不是覆盖。
+      // 用 `speechBaseline`（按下录音那一刻的原文）判断"用户改过没有" ——
+      // 按长度比会在"删掉几个字又重新输入"时误判成没改过，然后吞掉他写的内容。
+      const current = input.value
+      const untouched = current === speechBaseline || current === speechPrefix
+      input.value = untouched ? speechPrefix + text : `${current.replace(/\s*$/, ' ')}${text}`
+      historyCursor.value = null
+      saveDraft()
+      nextTick(() => textareaRef.value?.focus?.())
+    } else {
+      // 静音/没听清不是错误：明确说"没识别到"，而不是把空串悄悄吞掉
+      notify.info(tr('chat.no_speech_was_detected_please_speak_closer_to_the_microphone'))
+    }
+  } catch (error) {
+    const status = (error as { response?: { status?: number } } | null)?.response?.status
+    const detail = serverErrorDetail(error, '')
+    if (status === 503) {
+      // 本机缺 faster-whisper 或开关关了：把引擎给的可操作说明原样呈现，
+      // 并同步按钮态（否则用户会一直点一个必然失败的按钮）
+      voiceAvailable.value = false
+      voiceUnavailableReason.value = detail
+      notify.warning(detail || tr('chat.voice_input_is_unavailable_on_this_machine'))
+    } else if (status === 413) {
+      notify.warning(tr('chat.recording_is_too_long_please_shorten_it_and_try_again'))
+    } else {
+      notify.error(`${tr('errors.speech_transcription_failed')}${detail ? `: ${detail}` : ''}`)
+    }
+  } finally {
+    transcribing.value = false
   }
 }
 
 function stopRecording() {
-  const wasRecording = recording.value
-  if (recognizer) {
-    // 先置空再 stop：onend 会回调进来，置空可避免递归
-    const r = recognizer
-    recognizer = null
-    try { r.stop() } catch { /* 已停止 */ }
-  }
+  if (!recording.value) return
   recording.value = false
   micBars.stop()
-  if (wasRecording) playUiSound('voice-exit')
   if (recordingInterval) {
     clearInterval(recordingInterval)
     recordingInterval = null
+  }
+  playUiSound('voice-exit')
+  const active = recorder
+  if (active && active.state !== 'inactive') {
+    // 先亮"转写中"，再让 onstop 接管：中间不能有一段"按钮可点但什么都不会发生"
+    transcribing.value = true
+    try {
+      active.stop()
+    } catch {
+      transcribing.value = false
+      stopRecStream()
+      recorder = null
+    }
+  } else {
+    stopRecStream()
   }
 }
 
@@ -1417,10 +1514,15 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
             type="text"
             size="small"
             class="record-btn"
-            :class="{ recording: recording }"
+            :class="{ recording: recording, transcribing: transcribing }"
+            :disabled="voiceAvailable === false || transcribing"
             :title="recording
               ? $t('common.click_to_stop_voice_input')
-              : (speechSupported ? $t('media.voice_input_transcribed_locally_in_the_browser_audio_not_uploaded') : $t('chat.current_browser_does_not_support_speech_to_text'))"
+              : transcribing
+                ? $t('chat.transcribing_voice_input')
+                : (voiceAvailable === false
+                  ? (voiceUnavailableReason || $t('chat.voice_input_is_unavailable_on_this_machine'))
+                  : $t('media.voice_input_transcribed_locally_by_the_engine_audio_never_leaves_this_machine'))"
             @click="recording ? stopRecording() : startRecording()"
           >
             <template #icon>
@@ -1442,6 +1544,12 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
               v-if="recording"
               class="recording-timer"
             >{{ formatRecordingTime(recordingTimer) }}</span>
+            <!-- 转写中：录音已停、正在等引擎返回文本。给一个明确的进行态，
+                 否则用户会以为"按了没反应"然后再点一次。 -->
+            <span
+              v-if="transcribing"
+              class="recording-timer"
+            >{{ $t('chat.transcribing') }}</span>
           </Button>
           <!-- 模式 + 工具授权收进一个 popover：两者都是"偶发调整"的设置项，
                常驻会让底栏拥挤且与模型抢注意力；模型是高频切换项，仍留在底栏。
@@ -1839,6 +1947,10 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
 .record-btn { color: var(--text-tertiary); display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
 .record-btn:hover { color: var(--primary); }
 .record-btn.recording { color: var(--error); animation: pulse-rec var(--dur-pulse) ease-in-out infinite; }
+/* 转写中：录音已停、在等引擎返回。用中性色 + 无动画 —— 这不是"正在录音"，
+   红色脉冲会让人以为麦克风还开着。 */
+.record-btn.transcribing { color: var(--text-secondary); }
+.record-btn:disabled { color: var(--text-disabled, var(--text-tertiary)); opacity: 0.5; cursor: not-allowed; }
 @keyframes pulse-rec {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }

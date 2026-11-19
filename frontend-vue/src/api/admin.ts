@@ -569,3 +569,27 @@ export async function listAdminShares(): Promise<AdminShareItem[]> {
 export async function revokeAdminShare(shareId: string): Promise<void> {
   await api.delete(`/v1/admin/shares/${encodeURIComponent(shareId)}`)
 }
+
+// ── 插件命令白名单（后台可编辑） ──
+
+export interface PluginAllowlist {
+  /** 生效中的全部命令（env ∪ 后台文件） */
+  commands: string[]
+  /** 后台文件里的那部分（编辑框回填它） */
+  file_commands: string[]
+  /** 来自部署环境变量，页面只读 */
+  env_commands: string[]
+  /** 是否配置了任何来源 */
+  configured: boolean
+}
+
+export async function getPluginAllowlist(): Promise<PluginAllowlist> {
+  const { data } = await api.get('/v1/admin/plugin-allowlist')
+  return data?.data ?? { commands: [], file_commands: [], env_commands: [], configured: false }
+}
+
+/** 整体替换后台白名单文件（改动即时生效，网关与引擎共用同一份） */
+export async function updatePluginAllowlist(commands: string[]): Promise<PluginAllowlist> {
+  const { data } = await api.put('/v1/admin/plugin-allowlist', { commands })
+  return data?.data ?? { commands: [], file_commands: [], env_commands: [], configured: false }
+}

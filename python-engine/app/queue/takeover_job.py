@@ -419,6 +419,226 @@ def _audit(entry: dict[str, Any]) -> None:
 # ── 默认 runner ──────────────────────────────────────────────────────
 
 
+class _TokenTally:
+    """把一次 run 的事件流折成"这一拍花了多少 token"（只用于记账与预算闸门）。
+
+    **口径必须与 Go 侧 `usageTotals` 一致**，否则同一次 run 在两边算出两个数：
+
+    - ``done`` 携带**整轮累计**，是唯一的主来源；
+    - ``usage`` 携带**本次调用**的增量，只在 ``done`` 完全没带 token 时兜底
+      （引擎被取消、流被截断、旧版本没发终态都能走到这里）；
+    - 两者**互斥**：一旦 ``done`` 给了任何非零值，就完全信任它，绝不把增量再并一次。
+
+    为什么不用 ``total_tokens``：``AgentEvent`` 根本没有这个字段。它的用量是
+    ``input_tokens`` / ``output_tokens`` / ``cached_tokens`` 三个独立数，而且
+    ``cached`` 是 ``input`` 的**子集**（不是额外开销）—— 把它加进总数会比真实用量
+    偏高，直接让预算闸门提前熔断。
+    """
+
+    def __init__(self) -> None:
+        self.done_input = 0
+        self.done_output = 0
+        self.done_cached = 0
+        self.fallback_input = 0
+        self.fallback_output = 0
+        self.fallback_cached = 0
+        #: 按模型归集的**调用增量**：model -> [input, output, cached]。
+        #:
+        #: 单独一份是因为"这一拍花了多少"与"花在哪个模型上"是两个问题：前者喂
+        #: 预算闸门，后者喂计费明细（`usage_events` 一行一次调用）。合并成一个数
+        #: 就只能按"最后一个模型"定价，而主模型与 fallback 差几倍时成本会直接错几倍。
+        self._by_model: dict[str, list[int]] = {}
+        #: 整轮的"归属模型"：取**最后一个非空**且不是 `usage` 的 model。
+        #: 排除 `usage` 的理由与 Go 侧 `turnModel` 相同 —— 逐次调用的事件会把它
+        #: 带偏成"本轮最后一次调用用的模型"（摘要、子 Agent 都会）。
+        self._turn_model = ""
+
+    @staticmethod
+    def _int(value: Any) -> int:
+        try:
+            return max(int(value or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def observe(self, event_type: str, event: Any) -> None:
+        """并入一条事件。未知类型直接忽略（`text` / `tool_call` 等不带用量）。"""
+        model = str(getattr(event, "model", "") or "").strip()
+        if model and event_type != "usage":
+            self._turn_model = model
+        if event_type == "usage":
+            inp = self._int(getattr(event, "input_tokens", 0))
+            out = self._int(getattr(event, "output_tokens", 0))
+            cached = self._int(getattr(event, "cached_tokens", 0))
+            self.fallback_input += inp
+            self.fallback_output += out
+            self.fallback_cached += cached
+            if inp or out or cached:
+                slot = self._by_model.setdefault(model, [0, 0, 0])
+                slot[0] += inp
+                slot[1] += out
+                slot[2] += cached
+        elif event_type == "done":
+            self.done_input += self._int(getattr(event, "input_tokens", 0))
+            self.done_output += self._int(getattr(event, "output_tokens", 0))
+            self.done_cached += self._int(getattr(event, "cached_tokens", 0))
+
+    @property
+    def has_done(self) -> bool:
+        return bool(self.done_input or self.done_output or self.done_cached)
+
+    def totals(self) -> tuple[int, int]:
+        """返回 ``(输入, 输出)``。
+
+        ``cached`` **不参与**：它是输入里已经命中缓存的那部分，加进去就是重复计数。
+        """
+        if self.has_done:
+            return self.done_input, self.done_output
+        return self.fallback_input, self.fallback_output
+
+    def tokens(self) -> int:
+        """记账用的 token 总数（输入 + 输出）。"""
+        inp, out = self.totals()
+        return inp + out
+
+    def entries(self) -> list[dict[str, Any]]:
+        """折成**按模型**的用量行，供 `POST /v1/internal/usage-events` 上报。
+
+        口径与 Go 侧 `modelLedger.settle` **逐条对齐**，因为两边算的是同一笔账：
+
+        - 总额永远取自 :meth:`totals`（`done` 优先，缺失才用增量之和兜底）；
+        - 归因只改**粒度**、绝不改总额：各行之和恒等于总额；
+        - `done` 里有、增量没覆盖到的差额，并到归属模型那一行（那部分用量确实发生了，
+          只是没发 `usage`）；
+        - 差额为负说明两份数据打架，此时不信归因，退回单行保总额。
+
+        返回空列表表示"这一拍确实没花 token"，调用方据此跳过上报。
+        """
+        inp, out = self.totals()
+        cached = self.done_cached if self.has_done else self.fallback_cached
+        if not inp and not out and not cached and not self._by_model:
+            return []
+
+        def _single() -> list[dict[str, Any]]:
+            return [
+                {
+                    "model": self._turn_model,
+                    "input_tokens": inp,
+                    "output_tokens": out,
+                    "cached_tokens": cached,
+                }
+            ]
+
+        keys = sorted(self._by_model)
+        if not keys:
+            # 没有任何增量：归因退化为旧行为（整轮记在归属模型名下），总额不变。
+            return _single()
+
+        sum_in = sum(self._by_model[k][0] for k in keys)
+        sum_out = sum(self._by_model[k][1] for k in keys)
+        sum_cached = sum(self._by_model[k][2] for k in keys)
+        gap_in = inp - sum_in
+        gap_out = out - sum_out
+        gap_cached = cached - sum_cached
+        if gap_in < 0 or gap_out < 0 or gap_cached < 0:
+            # 增量多于整轮合计：两份数据打架，不信归因，只保总额。
+            return _single()
+
+        rows = [
+            {
+                "model": k,
+                "input_tokens": self._by_model[k][0],
+                "output_tokens": self._by_model[k][1],
+                "cached_tokens": self._by_model[k][2],
+            }
+            for k in keys
+        ]
+        if gap_in or gap_out or gap_cached:
+            merged = False
+            for row in rows:
+                if row["model"] == self._turn_model:
+                    row["input_tokens"] += gap_in
+                    row["output_tokens"] += gap_out
+                    row["cached_tokens"] += gap_cached
+                    merged = True
+                    break
+            if not merged:
+                rows.append(
+                    {
+                        "model": self._turn_model,
+                        "input_tokens": gap_in,
+                        "output_tokens": gap_out,
+                        "cached_tokens": gap_cached,
+                    }
+                )
+        return rows
+
+
+async def _report_usage(
+    *,
+    session_id: str,
+    turn_id: str,
+    entries: list[dict[str, Any]],
+    provider: str = "",
+) -> bool:
+    """把这一拍的用量上报给网关（``POST /v1/internal/usage-events``）。
+
+    **为什么必须上报**：`usage_events` 是计费页唯一的事实源，而它原本只有一处写入点 ——
+    网关消费引擎 SSE 的回合结算段。接管 run 由引擎**自己**起，事件流不回到网关，
+    于是这部分花费永远进不了表：用户每天都能看到巡检推进了会话，计费页却一直是 0。
+
+    **为什么由网关决定归属与金额**：本函数只报事实（模型 / token）。tenant/user 由
+    网关按 `session_id` 反查会话行，金额由网关按 `model_prices` 换算 —— 引擎侧既没有
+    价格表，也不该决定"这笔账算谁的"（请求体是可以伪造的）。
+
+    失败只告警：上报是回合的**旁路**，一个慢网关不该拖住接管的下一拍。
+    """
+    if not session_id or not turn_id or not entries:
+        return False
+    try:
+        from app.config import settings
+
+        addr = (settings.gateway_internal_url or "").strip()
+        token = settings.internal_token or ""
+    except Exception as exc:  # noqa: BLE001 — 配置不可读就不上报
+        logger.debug("usage report: settings unavailable: %s", exc)
+        return False
+    if not addr:
+        logger.debug("usage report skipped: no gateway address configured")
+        return False
+
+    payload = {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "provider": provider,
+        "entries": entries,
+    }
+    try:
+        import httpx
+
+        headers = {"X-Internal-Token": token} if token else {}
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                addr.rstrip("/") + "/v1/internal/usage-events",
+                json=payload,
+                headers=headers,
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "usage report rejected session=%s turn=%s: HTTP %s %s",
+                session_id,
+                turn_id,
+                resp.status_code,
+                resp.text[:200],
+            )
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001 — 见 docstring
+        logger.warning(
+            "usage report failed session=%s turn=%s: %s", session_id, turn_id, exc
+        )
+        return False
+
+
 async def _default_runner(row: dict[str, Any]) -> RunOutcome:
     """起一次**无人值守** run（`AgentRuntime(unattended=True)`）。
 
@@ -437,12 +657,20 @@ async def _default_runner(row: dict[str, Any]) -> RunOutcome:
 
     from app.agent import checkpoint
 
-    snap = await checkpoint.load(tenant_id=tenant_id, session_id=session_id)
-    if not snap:
-        return RunOutcome(ok=False, error="no checkpoint snapshot; nothing to take over")
-    meta = snap.get("task_meta")
-    if not isinstance(meta, dict) or not meta:
-        return RunOutcome(ok=False, error="snapshot has no task_meta; cannot rebuild run context")
+    # **不能用 `checkpoint.load()`**：它只认活跃状态（running/checkpointed/resuming），
+    # 而接管的典型现场恰恰是"上一轮 run 已正常 completed、用户随后走开" —— 活跃集合
+    # 是空的，`load()` 恒返回 `None`，于是每一拍都在第一道校验上失败，连续 3 次后熔断。
+    # 这就是"super-agent 无法真正接管"的根因。
+    #
+    # 接管只要 `task_meta` 那一格（llm_config / system_prompt / workbench_context），
+    # 对话上下文由 runtime 自己按 session_id 从 session_cache / PG 重建。所以这里读一个
+    # 放宽了状态过滤、且**只返回 task_meta** 的入口 —— 既不丢现场，也不会把陈旧快照的
+    # 消息当历史捡回来（那正是 `load()` 限制状态要防的事）。
+    meta = await checkpoint.load_recent_task_meta(
+        tenant_id=tenant_id, session_id=session_id
+    )
+    if not meta:
+        return RunOutcome(ok=False, error="no task_meta snapshot; cannot rebuild run context")
     llm_config = meta.get("llm_config")
     if not isinstance(llm_config, dict):
         return RunOutcome(ok=False, error="snapshot has no llm_config")
@@ -502,24 +730,30 @@ async def _default_runner(row: dict[str, Any]) -> RunOutcome:
         unattended=True,
     )
 
-    tokens = 0
+    tally = _TokenTally()
     progressed = False
     try:
+        # `runtime.run` 产出的是 `AgentEvent` **对象**，不是 dict —— 这里曾按
+        # `ev.get("type")` 读，于是每条事件都被 `isinstance(ev, dict)` 挡掉，
+        # token 恒为 0、`progressed` 恒为 False。后果不是"少记一笔账"：
+        # `tokens_used_today` 永远不涨 ⇒ 当日预算闸门（`should_melt` 的 budget 分支）
+        # 永不触发，用户设的日限额形同不存在。
         async for ev in runtime.run(task):
-            if not isinstance(ev, dict):
-                continue
-            if ev.get("type") == "usage":
-                usage = ev.get("usage") or {}
-                try:
-                    tokens += int(usage.get("total_tokens") or 0) or (
-                        int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0)
-                    )
-                except (TypeError, ValueError):
-                    pass
-            elif ev.get("type") == "message" and str(ev.get("role") or "") == "assistant":
+            ev_type = str(getattr(ev, "type", "") or "")
+            tally.observe(ev_type, ev)
+            # 推进的证据只有"真的动了手"：工具调用或任务板变更。纯文本回复
+            # （包括"无事可做"）不算 —— 那正是 `ok=True + progressed=False` 要表达的。
+            if ev_type in ("tool_call", "todo_updated"):
                 progressed = True
     except Exception as exc:  # noqa: BLE001 - 单次 run 失败不能打散循环
-        return RunOutcome(ok=False, tokens=tokens, error=str(exc)[:300])
+        # **异常路径也要上报**：run 半路炸掉时前面几次调用已经真的花了钱。漏报的
+        # 后果是"失败的巡检不记账"，而失败恰恰是最容易反复发生的那种。
+        await _report_usage(
+            session_id=session_id,
+            turn_id=task.id,
+            entries=tally.entries(),
+        )
+        return RunOutcome(ok=False, tokens=tally.tokens(), error=str(exc)[:300])
     finally:
         # 清理本轮的 unattended 标记：它挂在 contextvar 上，不清会让同一 task
         # 里的后续调用继承"无人值守"——那条路径不该存在，但清了更安全。
@@ -528,7 +762,16 @@ async def _default_runner(row: dict[str, Any]) -> RunOutcome:
         except Exception:  # noqa: BLE001
             pass
 
-    return RunOutcome(ok=True, tokens=tokens, progressed=progressed)
+    # 用量上报：`usage_events` 是计费页唯一的事实源，而它原本只有网关 SSE 消费段
+    # 一个写入点 —— 接管 run 由引擎自己起，事件流不回到网关，这部分花费会永远
+    # 不见。`task.id`（`takeover_<8hex>`）就是这次 run 的 turn_id，网关据此幂等。
+    await _report_usage(
+        session_id=session_id,
+        turn_id=task.id,
+        entries=tally.entries(),
+    )
+
+    return RunOutcome(ok=True, tokens=tally.tokens(), progressed=progressed)
 
 
 async def _record(pool: Any, *, row: dict[str, Any], decision: l0.Decision, outcome: RunOutcome | None, now: float) -> None:

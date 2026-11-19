@@ -195,6 +195,69 @@ describe('MarketView', () => {
     wrapper.unmount()
   })
 
+  it('★ 合集条目在详情里列出会导入的文档（装之前就能看清）', async () => {
+    const collection: MarketItem = {
+      kind: 'knowledge',
+      id: 'kb.collection',
+      name: '文档合集',
+      description: '一批文档',
+      source: 'builtin',
+      signed: false,
+      payload: {
+        documents: [
+          { name: 'a.pdf', url: 'https://example.com/a.pdf' },
+          { name: 'b.docx', url: 'https://example.com/b.docx' },
+        ],
+      },
+    }
+    marketMocks.listMarketCatalog.mockResolvedValue(
+      catalogOf({ items: [collection], total: 1 }),
+    )
+    marketMocks.getMarketItem.mockResolvedValue({ item: collection, warnings: [] })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.find('[data-testid="market-card"]').trigger('click')
+    await flushPromises()
+
+    // Drawer 渲染到 body 上，不能只看组件树
+    const drawer = document.body.textContent ?? ''
+    expect(drawer).toContain(tr('market.detail.collection_documents', { n: 2 }))
+    expect(drawer).toContain('a.pdf')
+    expect(drawer).toContain('https://example.com/b.docx')
+    // 必须同时说明"不会自动建索引"：否则用户会以为装完就能检索
+    expect(drawer).toContain(tr('market.detail.collection_hint'))
+
+    wrapper.unmount()
+  })
+
+  it('★ 外部条目不展示合集清单（payload 只是目录自称，装什么以 manifest 为准）', async () => {
+    const externalKb: MarketItem = {
+      ...externalItem,
+      kind: 'knowledge',
+      id: 'ext.kb',
+      payload: { documents: [{ name: 'claimed.pdf', url: 'https://example.com/claimed.pdf' }] },
+    }
+    marketMocks.listMarketCatalog.mockResolvedValue(
+      catalogOf({ items: [externalKb], total: 1 }),
+    )
+    marketMocks.getMarketItem.mockResolvedValue({ item: externalKb, warnings: [] })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.find('[data-testid="market-card"]').trigger('click')
+    await flushPromises()
+
+    // 展示目录自称的清单会造成"看到 3 份、实际装了 2 份"的不可自证不一致
+    const drawer = document.body.textContent ?? ''
+    expect(drawer).not.toContain('claimed.pdf')
+    expect(drawer).not.toContain(tr('market.detail.collection_documents', { n: 1 }))
+
+    wrapper.unmount()
+  })
+
   it('★ 切换源 Tab 会用新的 source 重新取数', async () => {
     const wrapper = mountView()
     await flushPromises()

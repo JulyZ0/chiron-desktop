@@ -34,11 +34,19 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["internal"])
 
-#: 单个文档的体积硬上限（1 MiB）。
+#: 市场目录与 manifest 的体积硬上限（1 MiB）。
 #:
 #: 市场目录与 manifest 都是**小 JSON**；1 MiB 远超正常需要，同时把"一个源
 #: 拖垮网关内存"的成本定死。调用方只能要得更小，不能要得更大。
 MAX_DOCUMENT_BYTES = 1_048_576
+
+#: 合集文档的体积上限（PDF / Office 原文，64 MiB）。
+#:
+#: 与 `MAX_DOCUMENT_BYTES` **分开**，因为两者服务的是不同东西：目录/manifest 是
+#: 小 JSON，1 MiB 足够；合集里的文档是用户要入库的原文，必须与知识库上传同口径
+#: （`knowledge.MAX_UPLOAD_BYTES`）。两个数字若不一致，就会出现"知识库页能传、
+#: 市场装不了"的割裂 —— 而那正是用户最难自己诊断的一类问题。
+MAX_COLLECTION_DOCUMENT_BYTES = 64 * 1024 * 1024
 
 #: 重定向跳数上限（与 `fetch_url_safe` 保持一致）。
 _MAX_REDIRECTS = 5
@@ -51,6 +59,36 @@ class MarketFetchRequest(BaseModel):
 
     url: str
     max_bytes: int = MAX_DOCUMENT_BYTES
+
+
+class MarketKbImportRequest(BaseModel):
+    """把一份合集文档导入知识库（抓取与入库都在引擎侧完成）。
+
+    **只有 `url` 一种来源**：知识库 provider 的白名单是 PDF / Office 二进制
+    （`app/knowledge/remote.py` 的 `_LOCAL_SUFFIXES` / `_CLOUD_SUFFIXES`），
+    md/txt 会在上传阶段被 400 拒绝。所以内联正文在这里没有归宿 —— 提供它只会
+    让发布方写下一份注定装不上的条目。
+    """
+
+    kb_id: str = ""
+    #: 目标知识库的属主。由网关从 claims 填，客户端无法自报（见中间件）。
+    user_id: str = ""
+    name: str = ""
+    file_type: str = ""
+    #: 远端地址（PDF / Office 原文）。
+    url: str = ""
+
+
+def _kb_error_code(status_code: int) -> str:
+    """把入库阶段的 HTTP 状态码译成稳定原因码（与抓取侧 `source_*` 区分开）。"""
+    return {
+        400: "unsupported_document",
+        403: "kb_forbidden",
+        404: "kb_not_found",
+        409: "provider_mismatch",
+        413: "payload_too_large",
+        503: "provider_unavailable",
+    }.get(status_code, "kb_upload_failed")
 
 
 def _classify(exc: Exception) -> str:
@@ -106,7 +144,9 @@ def _require_https(url: str) -> None:
     raise ValueError(f"blocked scheme: {parsed.scheme} (market sources must use https)")
 
 
-async def _fetch_document(url: str, max_bytes: int) -> tuple[bytes, str]:
+async def _fetch_document(
+    url: str, max_bytes: int, timeout: float | None = None
+) -> tuple[bytes, str]:
     """抓取一个市场文档，返回 `(原始字节, content-type)`。
 
     Raises:
@@ -120,11 +160,16 @@ async def _fetch_document(url: str, max_bytes: int) -> tuple[bytes, str]:
 
     _require_https(url)
 
+    # 超时按用途分开：目录/manifest 是几十 KB 的 JSON（默认 15 s 足够），
+    # 合集文档是几十 MB 的 PDF —— 用同一个超时会让大文件在慢网下必然失败，
+    # 而失败原因看起来像"源不可达"，用户无从判断其实只是超时。
+    effective_timeout = timeout if timeout and timeout > 0 else settings.http_timeout_default
+
     current = url
     for _ in range(_MAX_REDIRECTS + 1):
         # 逐跳复检：攻击者可用公开 URL 302 到内网，只在首跳校验形同无校验。
         assert_safe_url(current)
-        async with shared_client(timeout=settings.http_timeout_default) as client:
+        async with shared_client(timeout=effective_timeout) as client:
             async with client.stream("GET", current, follow_redirects=False) as resp:
                 if resp.status_code in _REDIRECT_STATUS:
                     location = resp.headers.get("location")
@@ -188,3 +233,72 @@ async def internal_market_fetch(body: MarketFetchRequest) -> dict[str, Any]:
         "content_type": content_type,
         "bytes": len(raw),
     }
+
+
+@router.post("/v1/internal/market/kb-import")
+async def internal_market_kb_import(body: MarketKbImportRequest) -> dict[str, Any]:
+    """把一份合集文档导入知识库：抓取（可选）→ 落对象存储 → 待索引。
+
+    为什么抓取放在这里，而不是"网关抓回来再 base64 传给知识库"：合集文档是
+    几十 MB 的 PDF，经网关搬运要多做一次大字节的编解码，还会让 Go 侧再养一份
+    "多大算太大"的判断 —— 与 `knowledge.MAX_UPLOAD_BYTES` 一旦不一致，就会出现
+    "知识库页能传、市场装不了"的割裂。出网口与入库口都在引擎，这两处判断只剩一处。
+
+    **不建索引**：本端点只落 `pending` 行，与知识库页上传同一语义。索引由用户在
+    知识库页显式触发（`POST /v1/kb/{id}/build`）。
+    """
+    kb_id = (body.kb_id or "").strip()
+    user_id = (body.user_id or "").strip()
+    name = (body.name or "").strip()
+    if not kb_id or not user_id or not name:
+        return {
+            "ok": False,
+            "error": "invalid_request",
+            "detail": "kb_id, user_id and name are required",
+        }
+
+    url = (body.url or "").strip()
+    if not url:
+        return {
+            "ok": False,
+            "error": "invalid_request",
+            "detail": "url is required",
+        }
+
+    from app.config import settings
+
+    try:
+        raw, _content_type = await _fetch_document(
+            url, MAX_COLLECTION_DOCUMENT_BYTES, timeout=settings.http_timeout_long
+        )
+    except Exception as exc:  # noqa: BLE001 — 失败原因分类后回给网关，不抛栈
+        code = _classify(exc)
+        level = logging.WARNING if code != "blocked_url" else logging.INFO
+        logger.log(level, "market kb-import fetch failed (%s): %s", code, str(exc)[:200])
+        return {"ok": False, "error": code, "detail": str(exc)[:300]}
+
+    from fastapi import HTTPException
+
+    from app.api.knowledge import upload_document
+
+    try:
+        doc = await upload_document(
+            kb_id=kb_id,
+            user_id=user_id,
+            name=name,
+            file_type=(body.file_type or "").strip(),
+            file_size_bytes=len(raw),
+            content=raw,
+        )
+    except HTTPException as exc:
+        # 引擎的拒绝往往可操作（"当前 provider 不支持该文件类型"），原样带回去；
+        # 只把状态码译成稳定原因码，让网关不必解析中文句子。
+        code = _kb_error_code(exc.status_code)
+        logger.warning("market kb-import rejected (%s): %s", code, str(exc.detail)[:200])
+        return {"ok": False, "error": code, "detail": str(exc.detail)[:300]}
+    except Exception as exc:  # noqa: BLE001 — 存储/DB 故障是上游问题，不是调用方错误
+        logger.error("market kb-import failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": "kb_upload_failed", "detail": str(exc)[:300]}
+
+    return {"ok": True, "document": doc, "bytes": len(raw)}
+

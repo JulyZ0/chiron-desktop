@@ -225,6 +225,15 @@ export default {
   no_questions_in_this_session_yet: "当前会话暂无提问",
   current_browser_does_not_support_speech_to_text: "当前浏览器不支持语音转写",
   current_browser_does_not_support_speech_to_text_please_use_chrome_edge_safari: "当前浏览器不支持语音转写，请使用 Chrome / Edge / Safari",
+  // ── 语音输入（MediaRecorder → 本机 faster-whisper 离线转写） ──
+  // 旧实现走 Web Speech API，识别后端是 Google 在线服务，桌面包里必然失败；
+  // 文案随之重写为"本机引擎转写"，不再声称"浏览器本地识别"。
+  voice_input_is_unavailable_on_this_machine: "本机语音转写不可用",
+  this_environment_has_no_microphone_recording_support: "当前环境不支持麦克风录音",
+  transcribing: "转写中…",
+  transcribing_voice_input: "正在转写语音输入…",
+  no_speech_was_detected_please_speak_closer_to_the_microphone: "没有识别到语音，请靠近麦克风再说一次",
+  recording_is_too_long_please_shorten_it_and_try_again: "录音过长，请缩短后重试",
   no_messages_available_to_export: "当前没有可导出的消息",
   chat: "对话",
   conversation_settings: "对话设置",

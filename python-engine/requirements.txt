@@ -61,3 +61,12 @@ opentelemetry-instrumentation-redis==0.65b0
 opentelemetry-instrumentation-httpx==0.65b0
 # Agent Tools & Workflow
 pydantic-ai==2.53.0
+# 本地语音转写（app/api/audio.py，对话页语音输入）。
+# 为什么必须在**这份清单**里：桌面端引擎 venv 的唯一依赖来源就是它
+#（frontend-vue/electron/runtime-install.cjs 直接 `uv pip install -r requirements.txt`），
+# 写进 pyproject 的 extra 在打包态不会被安装，表现是"代码在、端点 503、语音永远不可用"。
+# 版本固定在 1.2.x：1.2 起 ctranslate2 的 wheels 覆盖 win32-x64 的 cp312，
+# 与随包的 CPython 3.12 运行期一致；升到别的大版本前先确认该 wheel 仍然存在。
+# 它会带入 ctranslate2 / onnxruntime / tokenizers / huggingface-hub（约 100–200 MB），
+# 这是"完全离线转写"的固有代价 —— 模型文件本身在首次使用时才下载。
+faster-whisper==1.2.1

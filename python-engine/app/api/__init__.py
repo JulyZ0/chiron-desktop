@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from app.api.agents import router as agents_router
+from app.api.audio import router as audio_router
 from app.api.capabilities import router as capabilities_router
 from app.api.checkpoints import router as checkpoints_router
 from app.api.context import router as context_router
@@ -42,3 +43,5 @@ api_router.include_router(system_router)
 api_router.include_router(isolation_router)
 api_router.include_router(checkpoints_router)
 api_router.include_router(superagent_router)
+# 本地语音转写（POST /v1/audio/transcribe，见 app/api/audio.py）
+api_router.include_router(audio_router)

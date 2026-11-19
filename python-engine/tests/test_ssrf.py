@@ -117,6 +117,61 @@ class TestPluginCommandPathRule:
         assert command_allowed("npx") is False, "白名单未配置 = 禁止所有自定义插件命令"
 
 
+class TestPluginAllowlistFile:
+    """**后台可编辑**白名单（`{PLUGIN_DATA_DIR}/command_allowlist.json`）。
+
+    背景：装完市场插件、点「测试连接」却被告知命令未放行时，用户只能去改部署 env
+    并重启网关 + 引擎。现在后台把 basename 写进这个文件，网关（Go）与引擎（本模块）
+    读**同一份**（两侧共享 PLUGIN_DATA_DIR），改动即时生效。
+
+    口径必须与 Go `internal/api/plugin_allowlist.go` 一致：**env ∪ 文件**。
+    """
+
+    @staticmethod
+    def _write(tmp_path, payload):
+        from app.plugins.store import plugin_data_dir
+
+        path = plugin_data_dir() / "command_allowlist.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_file_alone_enables_command(self, tmp_path, monkeypatch):
+        """env 为空时，后台文件是**唯一**来源也必须生效（否则后台加白毫无用处）。"""
+        monkeypatch.delenv("PLUGIN_COMMAND_ALLOWLIST", raising=False)
+        self._write(tmp_path, {"commands": ["npx"]})
+
+        assert command_allowed("npx") is True, "后台加白后应放行"
+        assert command_allowed("/usr/local/bin/npx") is True, "绝对路径同样命中"
+        assert command_allowed("curl") is False, "不在名单里的命令仍须拒绝"
+
+    def test_env_and_file_are_merged(self, tmp_path, monkeypatch):
+        """并集：后台加白不会把 env 里已有的挤掉，反之亦然。"""
+        monkeypatch.setenv("PLUGIN_COMMAND_ALLOWLIST", "uvx")
+        self._write(tmp_path, {"commands": ["npx"]})
+
+        assert command_allowed("uvx") is True
+        assert command_allowed("npx") is True
+
+    @pytest.mark.parametrize("bad", ["../npx", "/usr/bin/npx", "C:\\tools\\npx", "", "  ", "np\nx"])
+    def test_path_like_entries_are_ignored(self, tmp_path, monkeypatch, bad):
+        """条目只接受**裸可执行名**：带分隔符的条目等于开一条任意路径放行通道。"""
+        monkeypatch.delenv("PLUGIN_COMMAND_ALLOWLIST", raising=False)
+        self._write(tmp_path, {"commands": [bad]})
+        assert command_allowed("npx") is False, f"{bad!r} 不该被当成有效条目"
+
+    def test_corrupt_file_fails_closed(self, tmp_path, monkeypatch):
+        """文件损坏**不能**变成放行：读失败只让这一来源失效，最终仍是拒绝。"""
+        from app.plugins.store import plugin_data_dir
+
+        monkeypatch.delenv("PLUGIN_COMMAND_ALLOWLIST", raising=False)
+        path = plugin_data_dir() / "command_allowlist.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+
+        assert command_allowed("npx") is False
+
+
 class TestSkillInstallValidation:
     @pytest.fixture(autouse=True)
     def _isolate_store(self, tmp_path, monkeypatch):

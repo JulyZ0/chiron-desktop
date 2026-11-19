@@ -219,6 +219,16 @@ export default {
   no_questions_in_this_session_yet: "No questions in this session yet",
   current_browser_does_not_support_speech_to_text: "Current browser does not support speech-to-text",
   current_browser_does_not_support_speech_to_text_please_use_chrome_edge_safari: "Current browser does not support speech-to-text; please use Chrome / Edge / Safari",
+  // Voice input (MediaRecorder → local faster-whisper on this machine).
+  // The old implementation used the Web Speech API, whose recognition backend is
+  // Google's online service — it always fails inside the desktop build, so the
+  // copy no longer claims "recognised locally in the browser".
+  voice_input_is_unavailable_on_this_machine: "Voice transcription is unavailable on this machine",
+  this_environment_has_no_microphone_recording_support: "This environment does not support microphone recording",
+  transcribing: "Transcribing…",
+  transcribing_voice_input: "Transcribing voice input…",
+  no_speech_was_detected_please_speak_closer_to_the_microphone: "No speech detected; please move closer to the microphone and try again",
+  recording_is_too_long_please_shorten_it_and_try_again: "Recording is too long; please shorten it and try again",
   no_messages_available_to_export: "No messages available to export",
   chat: "Chat",
   conversation_settings: "Conversation settings",

@@ -21,7 +21,7 @@ export default {
     all: '全部',
     agent: 'Agent',
     skill: '技能',
-    knowledge: '知识库',
+    knowledge: '文档合集',
     mcp: 'MCP',
   },
 
@@ -66,6 +66,8 @@ export default {
     requires_approval: '安装后仍需在插件页授权才能真正执行',
     requires_env: '需要填写的环境变量',
     requires_env_hint: '只保存在本次会话的内存中，不会写入本地存储或磁盘。',
+    collection_documents: '合集包含 {n} 份文档',
+    collection_hint: '安装时会从下列地址抓取原文导入知识库，不会自动构建索引 —— 索引请在知识库页自行触发。',
     no_description: '该条目未提供描述',
   },
 

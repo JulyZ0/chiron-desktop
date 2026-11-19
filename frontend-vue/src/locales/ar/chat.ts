@@ -224,6 +224,16 @@ export default {
   no_questions_in_this_session_yet: "لا توجد أسئلة في هذه الجلسة بعد",
   current_browser_does_not_support_speech_to_text: "المتصفح الحالي لا يدعم تحويل الكلام إلى نص",
   current_browser_does_not_support_speech_to_text_please_use_chrome_edge_safari: "المتصفح الحالي لا يدعم تحويل الكلام إلى نص؛ يرجى استخدام Chrome / Edge / Safari",
+  // إدخال صوتي (MediaRecorder ← faster-whisper محلي على هذا الجهاز).
+  // التطبيق القديم استخدم Web Speech API، وخلفية التعرّف فيه خدمة Google عبر
+  // الإنترنت — تفشل دائمًا داخل نسخة سطح المكتب، لذا لم يعد النص يدّعي
+  // "التعرّف محليًا في المتصفح".
+  voice_input_is_unavailable_on_this_machine: "تحويل الصوت إلى نص غير متاح على هذا الجهاز",
+  this_environment_has_no_microphone_recording_support: "هذه البيئة لا تدعم التسجيل من الميكروفون",
+  transcribing: "جارٍ التحويل…",
+  transcribing_voice_input: "جارٍ تحويل الإدخال الصوتي…",
+  no_speech_was_detected_please_speak_closer_to_the_microphone: "لم يُكتشف كلام؛ يرجى الاقتراب من الميكروفون والمحاولة مرة أخرى",
+  recording_is_too_long_please_shorten_it_and_try_again: "التسجيل طويل جدًا؛ يرجى تقصيره والمحاولة مرة أخرى",
   no_messages_available_to_export: "لا توجد رسائل متاحة للتصدير",
   chat: "محادثة",
   conversation_settings: "إعدادات المحادثة",

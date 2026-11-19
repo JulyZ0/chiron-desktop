@@ -365,8 +365,8 @@ class MCPClient:
                 )
         elif not command_allowed(server.command):
             raise PermissionError(
-                f"MCP server command {server.command!r} not allowed: "
-                "set PLUGIN_COMMAND_ALLOWLIST (comma-separated basenames) to enable"
+                f"MCP server command {server.command!r} not allowed: add its basename to the "
+                "plugin command allowlist in admin settings (takes effect immediately, no restart)"
             )
         # 无论 server 是否声明 env，子进程环境都必须以 sandboxed_env() 为基底。
         #

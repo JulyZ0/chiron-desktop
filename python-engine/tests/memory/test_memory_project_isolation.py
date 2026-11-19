@@ -49,15 +49,39 @@ async def test_same_key_in_two_projects_are_independent():
     assert _values(await svc.list_entries(1, "u", project="proj-b")) == ["English"]
 
 
-async def test_ungrouped_is_its_own_project():
-    """不传 project = 未分组，与任何具名项目都互不可见（不是"能看见全部"）。"""
+async def test_ungrouped_is_global_and_visible_in_every_project():
+    """不传 project = **全局**：所有具名项目都能看到它，但它不属于任何一个项目。
+
+    C3 修订（按产品决定）：早先 `project=''` 是独立的一档「未分组」，项目里看不见；
+    现在它是**全局**范围 —— "用户的通用偏好"本就该在每个项目里生效，否则老用户升级后
+    会以为记忆丢了。具名项目之间仍然互不可见（见上一条用例）。
+    """
     svc = _svc()
 
-    await svc.upsert(1, "u", slot="fact", key="k", value="未分组")
+    await svc.upsert(1, "u", slot="fact", key="k", value="全局")
     await svc.upsert(1, "u", slot="fact", key="k", value="A", project="proj-a")
 
-    assert _values(await svc.list_entries(1, "u")) == ["未分组"]
-    assert _values(await svc.list_entries(1, "u", project="proj-a")) == ["A"]
+    # 全局视图只看得到全局条目
+    assert _values(await svc.list_entries(1, "u")) == ["全局"]
+    # 项目视图 = 本项目专属 + 全局（同名 key 各自独立，是两条记忆）
+    assert _values(await svc.list_entries(1, "u", project="proj-a")) == ["A", "全局"]
+    # 另一个项目看不到 proj-a 的，但看得到全局的
+    assert _values(await svc.list_entries(1, "u", project="proj-b")) == ["全局"]
+
+
+async def test_entries_carry_scope_for_the_ui():
+    """条目带 `scope`：前端据此把项目视图里的全局条目渲染成只读。"""
+    svc = _svc()
+    await svc.upsert(1, "u", slot="fact", key="g", value="全局")
+    await svc.upsert(1, "u", slot="fact", key="p", value="项目", project="proj-a")
+
+    types = {
+        e["key"]: (e["scope"], e["project"])
+        for e in (await svc.list_entries(1, "u", project="proj-a"))["entries"]
+    }
+
+    assert types["g"] == ("global", "")
+    assert types["p"] == ("project", "proj-a")
 
 
 async def test_search_does_not_leak_across_projects():
@@ -253,3 +277,110 @@ async def test_http_clear_only_clears_that_project(monkeypatch):
 
     assert resp.status_code == 200 and resp.json()["deleted"] == 1
     assert (await svc.list_entries(1, "u", project="proj-b"))["total"] == 1
+
+
+# ── 范围迁移（全局 ↔ 项目） ─────────────────────────────────────────────
+
+
+async def test_move_project_entry_to_global():
+    """项目里的条目改成全局后：全局视图能看见，原项目视图仍能看见（并集）。"""
+    svc = _svc()
+    await svc.upsert(1, "u", slot="fact", key="k", value="A", project="proj-a")
+    entry = (await svc.list_entries(1, "u", project="proj-a"))["entries"][0]
+
+    moved = await svc.move_entry_scope(
+        1, "u", entry["id"], from_project="proj-a", to_project=""
+    )
+
+    assert moved is not None, "同范围内的条目应当迁移成功"
+    assert _values(await svc.list_entries(1, "u")) == ["A"]
+    # 项目视图下仍然看得到（项目专属 + 全局的并集），只是变成了只读的全局条目
+    data = await svc.list_entries(1, "u", project="proj-a")
+    assert _values(data) == ["A"]
+    assert data["entries"][0]["scope"] == "global"
+
+
+async def test_move_global_entry_to_project():
+    svc = _svc()
+    await svc.upsert(1, "u", slot="fact", key="k", value="G")
+    entry = (await svc.list_entries(1, "u"))["entries"][0]
+
+    await svc.move_entry_scope(1, "u", entry["id"], from_project="", to_project="proj-a")
+
+    assert _values(await svc.list_entries(1, "u")) == [], "全局视图里不该再看到它"
+    assert _values(await svc.list_entries(1, "u", project="proj-a")) == ["G"]
+    assert _values(await svc.list_entries(1, "u", project="proj-b")) == []
+
+
+async def test_move_refuses_when_not_in_current_scope():
+    """项目视图里动不了全局条目 —— `from_project` 就是权限边界。
+
+    这条与"项目视图里全局条目只读"是同一套口径：前端只是不渲染入口，
+    真正的拦截必须在服务端，否则绕过界面直接发请求就能改到所有项目共用的记忆。
+    """
+    svc = _svc()
+    await svc.upsert(1, "u", slot="fact", key="k", value="G")
+    entry = (await svc.list_entries(1, "u"))["entries"][0]
+
+    out = await svc.move_entry_scope(
+        1, "u", entry["id"], from_project="proj-a", to_project="proj-a"
+    )
+
+    assert out is None
+    assert _values(await svc.list_entries(1, "u")) == ["G"]
+
+
+async def test_move_rejects_when_target_has_same_key():
+    """目标范围已有同 (slot, key)：抛 ValueError（HTTP 层转 409），绝不静默覆盖。
+
+    覆盖会凭空丢掉一条用户看得见的记忆，而"该留哪条"属于智能整理的职责。
+    """
+    svc = _svc()
+    await svc.upsert(1, "u", slot="fact", key="k", value="G")
+    await svc.upsert(1, "u", slot="fact", key="k", value="A", project="proj-a")
+    global_entry = (await svc.list_entries(1, "u"))["entries"][0]
+
+    with pytest.raises(ValueError):
+        await svc.move_entry_scope(
+            1, "u", global_entry["id"], from_project="", to_project="proj-a"
+        )
+
+    assert _values(await svc.list_entries(1, "u", project="proj-a")) == ["A", "G"]
+
+
+async def test_move_to_same_scope_is_noop():
+    svc = _svc()
+    await svc.upsert(1, "u", slot="fact", key="k", value="A", project="proj-a")
+    entry = (await svc.list_entries(1, "u", project="proj-a"))["entries"][0]
+
+    out = await svc.move_entry_scope(
+        1, "u", entry["id"], from_project="proj-a", to_project="proj-a"
+    )
+
+    assert out is not None and out.item_key == "k"
+
+
+async def test_http_move_scope_reports_409_on_key_clash(monkeypatch):
+    svc = _svc()
+    _patch_api_service(monkeypatch, svc)
+    params = {"user_id": "u", "tenant_id": 1}
+    await svc.upsert(1, "u", slot="fact", key="k", value="G")
+    await svc.upsert(1, "u", slot="fact", key="k", value="A", project="proj-a")
+    global_entry = (await svc.list_entries(1, "u"))["entries"][0]
+
+    async with httpx.AsyncClient(
+        transport=ASGITransport(app=create_app()), base_url="http://t"
+    ) as client:
+        clash = await client.post(
+            f"/v1/memory/profile/{global_entry['id']}/scope",
+            json={"to_project": "proj-a"},
+            params=params,  # from_project 空 = 全局视图
+        )
+        gone = await client.post(
+            "/v1/memory/profile/not-a-real-id/scope",
+            json={"to_project": ""},
+            params={**params, "project": "proj-a"},
+        )
+
+    assert clash.status_code == 409
+    assert gone.status_code == 404

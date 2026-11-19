@@ -37,6 +37,14 @@ export default {
   image_viewer: "Image viewer",
   image_generation: "Image generation",
   drag_files_here_or_click_to_select: "Drag files here, or click to select",
+  drop_release_to_upload_files_and_folders: "Release to upload files and folders",
+  drop_uploading_progress: "Uploading {done}/{total}",
+  drop_into_current_folder: "Files land in the current folder; folder structure is preserved",
+  drop_no_uploadable_files: "Nothing to upload (hidden system files were skipped)",
+  drop_too_deep: "{n} files exceed {max} folder levels and were skipped",
+  drop_folders_failed: "Failed to create {n} folders ({names}); their files were not uploaded",
+  drop_uploaded_n_files: "Uploaded {n} files",
+  drop_busy_please_wait: "The previous batch is still uploading — drop again once it finishes",
   drag_files_here_or_click_to_upload_to_start_managing_your_media_library: "Drag files here or click to upload to start managing your media library",
   file: "File",
   folder_name: "Folder name",
@@ -46,7 +54,12 @@ export default {
   new_folder: "New folder",
   no_downloadable_files_in_the_selected_items: "No downloadable files in the selected items",
   audio: "Audio",
-  voice_input_transcribed_locally_in_the_browser_audio_not_uploaded: "Voice input (transcribed locally in the browser, audio not uploaded)",
+  // Voice input: recording happens locally and transcription runs on the local
+  // engine's faster-whisper — the audio never leaves this machine. The old copy
+  // said "transcribed locally in the browser", which described the Web Speech API
+  // era: recognition actually ran on Google's online service and never worked in
+  // the desktop build.
+  voice_input_transcribed_locally_by_the_engine_audio_never_leaves_this_machine: "Voice input (transcribed by the local engine, audio never leaves this machine)",
   no_files_yet: "No files yet",
   this_run_did_not_write_any_files: "This run did not write any files",
   multi_file_upload_supported_up_to_50mb_per_file: "Multi-file upload supported, up to 50MB per file",

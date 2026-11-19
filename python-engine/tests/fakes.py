@@ -129,13 +129,18 @@ class InMemoryProfileStore:
         return (tenant_id, user_id, project, slot, item_key)
 
     async def list(
-        self, tenant_id, user_id, include_archived=False, slot=None, project=""
+        self, tenant_id, user_id, include_archived=False, slot=None, project="",
+        include_global=False,
     ):
+        """列出条目。``include_global`` 与真实 store 同义：具名项目下并入全局条目。"""
         out = [
             e for e in self.by_key.values()
             if e.tenant_id == tenant_id
             and e.user_id == user_id
-            and _project_of(e) == project
+            and (
+                _project_of(e) == project
+                or (include_global and project and _project_of(e) == "")
+            )
             and (include_archived or e.status == "active")
             and (slot is None or e.slot == slot)
         ]
@@ -152,6 +157,35 @@ class InMemoryProfileStore:
         if e and e.tenant_id == tenant_id and e.user_id == user_id:
             return e if _project_of(e) == project else None
         return None
+
+    async def get_any(self, tenant_id, user_id, entry_id):
+        """不限 project 的按 id 取 —— 只给范围迁移用（见真实 store 同名方法）。"""
+        e = self.by_id.get(entry_id)
+        if e and e.tenant_id == tenant_id and e.user_id == user_id:
+            return e
+        return None
+
+    async def move_scope(self, tenant_id, user_id, entry_id, from_project, to_project):
+        """与真实 store 同义：有条件地换范围，唯一键冲突时抛 ValueError。"""
+        e = self.by_id.get(entry_id)
+        if e is None or e.tenant_id != tenant_id or e.user_id != user_id:
+            return None
+        if _project_of(e) != from_project:
+            return None
+        clash = self.by_key.get(
+            self._key(tenant_id, user_id, e.slot, e.item_key, to_project)
+        )
+        if clash is not None and clash is not e:
+            raise ValueError("duplicate key in target scope")
+        self.by_key.pop(
+            self._key(tenant_id, user_id, e.slot, e.item_key, _project_of(e)), None
+        )
+        e.project = to_project
+        e.updated_at = datetime.now(UTC)
+        self.by_key[
+            self._key(tenant_id, user_id, e.slot, e.item_key, to_project)
+        ] = e
+        return e
 
     async def list_evictable(self, tenant_id, user_id, project=""):
         """与真实 `ProfileStore.list_evictable` 同形：只给淘汰要的四个字段。"""
