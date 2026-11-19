@@ -689,9 +689,8 @@ func (c *PythonClient) RunSSE(ctx context.Context, path string, body any, extraH
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 1024*1024), 16*1024*1024)
 
-		// Use a ticker to periodically check context cancellation
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
+		// 取消由下方 select 的 ctx.Done() 分支处理；不需要额外的定时器 ——
+		// 每个活跃流一条 500ms ticker 只是纯唤醒，不会让读循环更早退出。
 		lineCh := make(chan string, 1)
 
 		// Background goroutine to read lines
@@ -732,8 +731,6 @@ func (c *PythonClient) RunSSE(ctx context.Context, path string, body any, extraH
 				case <-ctx.Done():
 					return
 				}
-			case <-ticker.C:
-				// Periodic check
 			}
 		}
 	}()
