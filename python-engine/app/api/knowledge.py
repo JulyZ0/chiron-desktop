@@ -199,14 +199,21 @@ def _require_kb_access(kb_row: Any, user_id: str, tenant_id: int, *, action: str
 
 
 async def _load_user_provider(user_id: str) -> str:
-    """取用户当前 provider；未选择时给出可操作的提示（400 而非 500）。"""
-    user_settings = await settings_store.load(user_id)
-    if user_settings is None or not user_settings.provider:
+    """取用户**实际生效**的 provider；内置服务可用时无需先选（默认自托管）。
+
+    未选择且没有内置服务时给出可操作的提示（400 而非 500）。
+    """
+    stored = await settings_store.load(user_id)
+    provider = settings_store.effective_provider_name(stored)
+    if not provider:
         raise HTTPException(
             status_code=400,
-            detail="请先在知识库设置中选择 provider（自托管 / PageIndex Cloud）",
+            detail=(
+                "知识库检索服务未就绪：内置服务未启动（KNOWLEDGE_SERVICE_URL 未配置），"
+                "且尚未选择 provider（自托管 / PageIndex Cloud）。请重启应用或到「知识库设置」选择"
+            ),
         )
-    return user_settings.provider
+    return provider
 
 
 async def _assert_provider_matches(*, user_id: str, kb_provider: str) -> None:
@@ -846,14 +853,24 @@ async def admin_list_knowledge_bases() -> dict[str, Any]:
 
 
 async def get_user_settings(user_id: str) -> dict[str, Any]:
-    """用户知识库设置（不回传 key 明文，只给"是否已配置"+指纹）。"""
+    """用户知识库设置（不回传 key 明文，只给"是否已配置"+指纹）。
+
+    ``provider`` 是**实际生效**的值（未选择时回落到内置自托管），``provider_selected``
+    区分"默认"与"已选定"，``service_url`` 让用户在报错时能直接对照自己连的是哪个地址。
+    """
     stored = await settings_store.load(user_id)
     system_health = registry.selfhosted_health()
+    effective = settings_store.effective_provider_name(stored)
+    service_url = settings_store.builtin_service_url()
     return {
-        "provider": stored.provider if stored else "",
+        "provider": effective,
+        "provider_selected": bool(stored and stored.provider),
+        "default_provider": settings_store.default_provider(),
         "status": stored.status if stored else STATUS_DISABLED,
         "error_message": stored.error_message if stored else "",
         "cloud_key_configured": bool(stored and stored.cloud_api_key),
+        "service_url": service_url,
+        "service_ready": system_health.ok,
         "providers": [
             {
                 "name": "selfhosted",

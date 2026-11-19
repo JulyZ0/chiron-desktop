@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 
 	"github.com/athenavi/chiron/config"
 	"github.com/athenavi/chiron/internal/db"
@@ -43,6 +44,38 @@ func internalTokenMW(cfg *config.Config, next http.HandlerFunc) http.HandlerFunc
 	}
 }
 
+// envFirstKeys 是**由启动器按运行时端口注入**的键（Electron local-stack / run.py 先起
+// 检索服务、拿到随机端口后才拼得出地址）。
+//
+// 后台「系统设置」里这些键留空只代表"没配"，不代表"要清空"：若把空串下发，引擎会用
+// `model_copy(update=...)` 把它当成显式值，于是明明起了内置 pageindex-service，
+// 引擎侧 `KNOWLEDGE_SERVICE_URL` 仍为空 ⇒ 知识库整页"服务不可用"。
+// 因此这些键的空值一律不下发，让引擎回落到环境变量。
+var envFirstKeys = map[string]struct{}{
+	"knowledge_service_url": {},
+	"internal_token":        {},
+	"jwt_secret":            {},
+	"gateway_internal_url":  {},
+	"sandbox_service_url":   {},
+}
+
+// pruneEnvFirstEmpty 去掉 envFirstKeys 里的空值（只处理空字符串，其它类型原样保留）。
+func pruneEnvFirstEmpty(in map[string]interface{}) map[string]interface{} {
+	if len(in) == 0 {
+		return in
+	}
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		if _, guarded := envFirstKeys[k]; guarded {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) == "" {
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // EngineConfig GET /v1/internal/engine-config
 // 供 Python AI 引擎启动时拉取「python」分类的后台配置（敏感键已由 APP_SECRET 解密）。
 // 仅接受带 X-Internal-Token 的内部调用，防止配置外泄。
@@ -59,6 +92,8 @@ func EngineConfig(cfg *config.Config) http.HandlerFunc {
 			InternalError(w, "failed to load engine config")
 			return
 		}
+		// 启动器注入的键不允许被"空值"覆盖（见 envFirstKeys 的说明）。
+		m = pruneEnvFirstEmpty(m)
 		// 服务提供商目录（权威源在网关侧）：引擎按目录注册 provider，
 		// 避免引擎内硬编码 provider 列表与服务端漂移。
 		m["llm_provider_catalog"] = llmProviderCatalogPayload()

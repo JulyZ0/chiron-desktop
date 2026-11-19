@@ -76,7 +76,8 @@ class RemoteProvider:
         if not base:
             # 前缀是给用户看的，括号里是给排查看的 —— 只留变量名时用户完全无从下手
             raise ProviderUnavailableError(
-                "知识库索引服务未就绪（KNOWLEDGE_SERVICE_URL 未配置），请重启应用让它自动安装"
+                "内置检索服务未启动（KNOWLEDGE_SERVICE_URL 未配置）：重启应用会自动拉起，"
+                "或手动运行 pageindex-service"
             )
         token = str(getattr(settings, "internal_token", "") or "")
         if not token:
@@ -89,9 +90,9 @@ class RemoteProvider:
             ) as client:
                 resp = await client.post(path, json=payload)
         except Exception as exc:  # noqa: BLE001 — 服务不可达 = provider 不可用，不是 500
-            raise ProviderUnavailableError(f"知识库服务不可达: {exc}") from exc
+            raise ProviderUnavailableError(f"检索服务不可达（{base}）：{exc}") from exc
         if resp.status_code == 401:
-            raise ProviderUnavailableError("知识库服务拒绝内部令牌（INTERNAL_TOKEN 不一致？）")
+            raise ProviderUnavailableError("检索服务拒绝内部令牌（INTERNAL_TOKEN 与引擎不一致）")
         if resp.status_code >= 400:
             detail = ""
             try:
@@ -126,17 +127,21 @@ class RemoteProvider:
         真正的连通性是"测试连接"（``api/knowledge.py`` 的 verify）才做的 —— 启动路径上
         对每个用户发一次网络请求会把"某用户 key 失效"变成服务启动延迟。
         """
-        if not self._base_url():
+        base = self._base_url()
+        if not base:
             # 这句话会原样显示在「知识库设置」的自托管卡片上，所以先说人话，
             # 括号里留变量名给排查用 —— 只给变量名时用户完全无从下手。
             return HealthResult(
                 False,
                 STATUS_DISABLED,
-                "知识库索引服务未就绪（KNOWLEDGE_SERVICE_URL 未配置），重启应用会自动安装",
+                "内置检索服务未启动（KNOWLEDGE_SERVICE_URL 未配置）：重启应用会自动拉起，"
+                "或手动运行 pageindex-service",
             )
         if not str(getattr(settings, "internal_token", "") or ""):
             return HealthResult(
-                False, STATUS_DISABLED, "内部凭据未就绪（INTERNAL_TOKEN 未配置），重启应用后重试"
+                False,
+                STATUS_DISABLED,
+                "内部凭据未就绪（INTERNAL_TOKEN 未配置），引擎与检索服务无法互信；请重启应用",
             )
         if self._mode == "cloud" and not self._api_key:
             return HealthResult(False, STATUS_DISABLED, "未配置 PageIndex Cloud API key")
@@ -151,17 +156,30 @@ class RemoteProvider:
             return HealthResult(
                 False,
                 STATUS_DISABLED,
-                "知识库索引服务未就绪（KNOWLEDGE_SERVICE_URL 未配置），重启应用会自动安装",
+                "内置检索服务未启动（KNOWLEDGE_SERVICE_URL 未配置）：重启应用会自动拉起，"
+                "或手动运行 pageindex-service",
             )
         try:
             async with httpx.AsyncClient(base_url=base, timeout=10.0) as client:
                 resp = await client.get("/healthz")
             body = dict(resp.json() or {})
-            if resp.status_code >= 400 or not body.get("ok"):
-                return HealthResult(False, STATUS_ERROR, str(body.get("detail") or resp.status_code))
+            if resp.status_code >= 400:
+                return HealthResult(
+                    False, STATUS_ERROR, f"检索服务健康检查失败（HTTP {resp.status_code}，{base}）"
+                )
+            if not body.get("ok"):
+                # 服务能连上、但自报不可用（例如索引模型未配置）：把它的原话透出去，
+                # 否则用户只知道"连不上"，而真相是"连上了但没配模型"。
+                status = str(body.get("status") or STATUS_ERROR)
+                detail = str(body.get("detail") or "").strip()
+                return HealthResult(
+                    False,
+                    status if status in (STATUS_DISABLED, STATUS_ERROR) else STATUS_ERROR,
+                    f"{detail or '检索服务自报不可用'}（{base}）",
+                )
             return HealthResult(True, STATUS_READY, "")
         except Exception as exc:  # noqa: BLE001
-            return HealthResult(False, STATUS_ERROR, f"知识库服务不可达: {exc}")
+            return HealthResult(False, STATUS_ERROR, f"检索服务不可达（{base}）：{exc}")
 
     def supports(self, filename: str) -> bool:
         suffix = filename[filename.rfind("."):].lower() if "." in filename else ""

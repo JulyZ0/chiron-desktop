@@ -21,6 +21,7 @@ from app.knowledge import crypto
 from app.knowledge.errors import KnowledgeError, ProviderUnavailableError
 from app.knowledge.providers.base import (
     PROVIDER_CLOUD,
+    PROVIDER_SELFHOSTED,
     STATUS_DISABLED,
     STATUS_ERROR,
     is_known_provider,
@@ -28,6 +29,38 @@ from app.knowledge.providers.base import (
 from app.tools.context import to_tenant_int
 
 logger = logging.getLogger(__name__)
+
+
+def builtin_service_url() -> str:
+    """内置检索服务（pageindex-service）的地址；未部署/未启动时为空串。
+
+    单独一个函数而不是各处 `getattr(settings, ...)`：判断"内置服务在不在"的口径
+    必须只有一处，否则默认 provider、健康状态与提示文案会各说各话。
+    """
+    return str(getattr(settings, "knowledge_service_url", "") or "").strip()
+
+
+def default_provider() -> str:
+    """没有显式选择时使用的 provider。
+
+    **内置服务可用即默认自托管**（需求：桌面/单机开箱即用）。没有内置服务时不猜 ——
+    返回空串，由调用方给出"请先选择 provider"的可操作提示。
+    """
+    return PROVIDER_SELFHOSTED if builtin_service_url() else ""
+
+
+def effective_provider_name(stored: "UserKnowledgeSettings | None") -> str:
+    """用户设置 → 实际生效的 provider 名（未选择时回落到 :func:`default_provider`）。"""
+    if stored is not None and stored.provider:
+        return stored.provider
+    return default_provider()
+
+
+async def effective_provider(user_id: str) -> str:
+    """读取用户设置并给出实际生效的 provider 名（不落库）。"""
+    if not user_id:
+        return ""
+    return effective_provider_name(await load(user_id))
 
 
 @dataclass(frozen=True)

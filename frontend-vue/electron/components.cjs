@@ -863,7 +863,11 @@ function packagedKnowledgeServiceDir() {
  * 返回 null 的含义与引擎一致：这台机器上没有可用的服务源码或解释器，**不猜**。
  */
 function resolveKnowledgeServiceLaunch(options = {}) {
-  const explicit = String(process.env.CHIRON_PAGEINDEX_PYTHON || '').trim()
+  // 开发态的解释器优先级：`CHIRON_PAGEINDEX_PYTHON`（专用环境）→ `CHIRON_PYTHON`
+  // （开发者已经把引擎依赖装进某个解释器，pageindex 通常也装在同一台机器的同一环境里
+  // 做联调）→ PATH 上的 `python`。打包态只认自己的 venv，绝不回退 —— 那份 venv 里
+  // 没有 pageindex 依赖，回退过去只会在 import 阶段炸，报错点离真因很远。
+  const explicit = String(process.env.CHIRON_PAGEINDEX_PYTHON || process.env.CHIRON_PYTHON || '').trim()
   const args = ['-m', 'uvicorn', 'app.search_api:app', '--host', '127.0.0.1']
 
   const packaged = packagedKnowledgeServiceDir()

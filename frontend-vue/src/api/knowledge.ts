@@ -96,9 +96,16 @@ export interface ProviderOption {
 
 export interface KnowledgeSettings {
   provider: ProviderName | ''
+  /** 是否**显式保存过** provider（false 且 provider 非空 = 走内置服务的默认值） */
+  provider_selected?: boolean
+  default_provider?: ProviderName | ''
   status: string
   error_message: string
   cloud_key_configured: boolean
+  /** 内置检索服务（pageindex-service）的实际地址，未部署时为空 */
+  service_url?: string
+  /** 内置服务的配置是否齐备（地址 + 内部令牌） */
+  service_ready?: boolean
   providers: ProviderOption[]
 }
 

@@ -35,6 +35,20 @@ const verifyResult = ref<{ ok: boolean; detail: string } | null>(null)
 const selfhosted = computed(() => settings.value?.providers.find(p => p.name === 'selfhosted'))
 const cloud = computed(() => settings.value?.providers.find(p => p.name === 'cloud'))
 const cloudConfigured = computed(() => settings.value?.cloud_key_configured ?? false)
+// 内置检索服务（pageindex-service）的实际地址：连不上时用户至少能对照自己连的是哪个端口
+const serviceUrl = computed(() => settings.value?.service_url || '')
+// 当前生效的 provider 不可用时的可读原因（后端已给出面向用户的话术）
+const providerProblem = computed(() => {
+  const active = settings.value?.provider
+  if (!active) return ''
+  const option = settings.value?.providers.find(p => p.name === active)
+  if (!option || option.available) return ''
+  return option.detail || ''
+})
+// 没有显式保存过选择、但内置服务可用 → 走的是默认自托管（"默认"与"已选定"要能区分）
+const usingDefaultProvider = computed(
+  () => Boolean(settings.value?.provider) && settings.value?.provider_selected === false,
+)
 
 async function load() {
   loading.value = true
@@ -111,6 +125,23 @@ onMounted(load)
         class="page-alert"
       />
 
+      <!-- 内置检索服务连不上：把后端给出的可读原因原样展示（含实际地址），
+           而不是让用户对着一句「操作失败」猜。 -->
+      <Alert
+        v-if="providerProblem"
+        type="warning"
+        show-icon
+        :message="providerProblem"
+        class="page-alert"
+      />
+      <Alert
+        v-else-if="usingDefaultProvider"
+        type="info"
+        show-icon
+        :message="t('knowledge.default_provider_hint')"
+        class="page-alert"
+      />
+
       <div class="provider-grid">
         <label class="provider-card" :class="{ 'is-active': provider === 'selfhosted' }" @click="provider = 'selfhosted'">
           <Radio :checked="provider === 'selfhosted'" />
@@ -122,6 +153,9 @@ onMounted(load)
               <Tag v-else color="default">{{ t('knowledge.not_configured') }}</Tag>
             </div>
             <p class="provider-desc">{{ t('knowledge.provider_selfhosted_desc') }}</p>
+            <p v-if="serviceUrl" class="provider-detail">
+              {{ t('knowledge.service_endpoint') }}：{{ serviceUrl }}
+            </p>
             <p v-if="selfhosted?.detail" class="provider-detail">{{ selfhosted.detail }}</p>
           </div>
         </label>

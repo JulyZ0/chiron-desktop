@@ -157,7 +157,17 @@ async def _workbench_binding(body: AgentDispatchRequest, gateway: Any) -> str:
                 if text:
                     if len(text) > 1500:
                         text = text[:1500] + "…"
-                    sections.append("## 知识库参考\n\n" + text)
+                    section = "## 知识库参考\n\n" + text
+                    # 引用（文件名 / 页码）一并给出：没有出处的答案在对话里无法核对。
+                    refs = [
+                        f"- {c.doc_name}"
+                        + (f" 第 {c.page} 页" if isinstance(c.page, int) and c.page > 0 else "")
+                        for c in (answer.citations or [])[:5]
+                        if c.doc_name or c.page
+                    ]
+                    if refs:
+                        section += "\n\n引用：\n" + "\n".join(refs)
+                    sections.append(section)
         except Exception as exc:  # pragma: no cover - 降级路径
             logger.warning("agent binding: knowledge query failed: %s", exc)
 

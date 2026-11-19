@@ -15,6 +15,9 @@ chiron 一键运行脚本
 """
 
 import argparse
+import base64
+import hashlib
+import hmac
 import os
 import platform
 import shutil
@@ -72,6 +75,26 @@ SERVICES = {
         "env": {},
         "optional": True,
     },
+    "pageindex-service": {
+        # 内置知识库检索服务（pageindex-service）：引擎经内网 HTTP 调它做「建索引 / 检索」。
+        #
+        # **必须有这一项**：此前 run.py 只起网关与引擎，`KNOWLEDGE_SERVICE_URL` 永远为空，
+        # 引擎侧 `RemoteProvider` 每次检索都报"服务未就绪"，知识库页面能建库、能上传，
+        # 一建索引就失败 —— 这就是开发态"连不上内置 pageindex"的直接原因。
+        #
+        # 独立解释器：`pageindex → litellm → openai<3` 与引擎的 `openai 3.x` 在同一个
+        # 环境里 pip 直接 ResolutionImpossible，所以用 `<仓库>/.venv-pageindex`
+        # （由 `run.py setup` 创建）。缺这个 venv 时该服务被跳过，不影响聊天/记忆。
+        "name": "PageIndex 检索服务",
+        "port": 8100,
+        "cmd": [""],  # 占位：真实命令在启动时由 ServiceManager._pageindex_cmd() 解析
+        "cwd": str(BASE_DIR / "pageindex-service"),
+        "env": {},
+        # 8100 被占时改挑空闲端口（引擎拿到的是**实际**端口）
+        "dynamic_port": True,
+        # 可选组件：起不来只提示，不让 `run.py start` 整体失败
+        "optional": True,
+    },
     "python-engine": {
         "name": "Python AI 引擎",
         "port": 8000,
@@ -100,6 +123,11 @@ SERVICES = {
 }
 
 DEFAULT_ENV = {}
+
+#: 本次运行实际使用的端口（与 `SERVICES[*]["port"]` 的"首选值"区分）。
+#: 检索服务的端口是**运行时决定**的（8100 被占就换号），而引擎要拿这个真实端口
+#: 拼 `KNOWLEDGE_SERVICE_URL` —— 所以它必须记录下来供后续服务读取。
+_RUNTIME_PORTS: dict = {}
 
 
 def load_env_file():
@@ -174,6 +202,103 @@ def is_port_open(port: int, host: str = "localhost", timeout: float = 1.0) -> bo
         return False
 
 
+def find_free_port() -> int:
+    """借一个当前空闲的端口号（listen 到 0 再 close，与 Electron 侧 pickFreePort 同口径）。
+
+    借号与真正 bind 之间仍有竞态，所以调用方要么重试、要么接受"极少数情况下失败"。
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+# ── 内置知识库检索服务（pageindex-service）────────────────────────────
+
+#: 独立解释器的位置：`pageindex → litellm → openai<3` 与引擎的 `openai 3.x`
+#: 无法共存于同一份环境（pip ResolutionImpossible），只能各用一份 venv。
+PAGEINDEX_VENV = BASE_DIR / ".venv-pageindex"
+
+
+def pageindex_python() -> str:
+    """检索服务该用哪个解释器；没有可用的就返回空串（调用方跳过该服务）。
+
+    顺序：显式 `CHIRON_PAGEINDEX_PYTHON` → 仓库内 `.venv-pageindex` → 空。
+    **不回退到当前解释器**：那份环境装了引擎的 `openai 3.x`，起 pageindex 必然
+    在 import 阶段炸，而报错点离"用错了 venv"很远。
+    """
+    explicit = (os.environ.get("CHIRON_PAGEINDEX_PYTHON") or "").strip()
+    if explicit:
+        return explicit
+    candidate = PAGEINDEX_VENV / ("Scripts/python.exe" if is_windows() else "bin/python")
+    return str(candidate) if candidate.exists() else ""
+
+
+def pageindex_cmd() -> list[str]:
+    """检索服务的启动命令（uvicorn，监听地址与端口由调用方补 --port）。"""
+    python = pageindex_python() or sys.executable
+    return [python, "-u", "-m", "uvicorn", "app.search_api:app", "--host", "127.0.0.1"]
+
+
+def _service_available(key: str, svc: dict) -> bool:
+    """该服务在这台机器上能不能起（可选服务据此决定"跳过"还是"启动"）。
+
+    `pageindex-service` 的 `SERVICES["cmd"]` 只是占位（真实解析依赖独立 venv），
+    所以它不能走 `shutil.which(cmd[0])` —— 那会把"已装好 venv"判成"未安装"。
+    """
+    if key == "pageindex-service":
+        return bool(pageindex_python())
+    return shutil.which(svc["cmd"][0]) is not None
+
+
+def derive_subsecret(app_secret: str, domain: str) -> str:
+    """HMAC-SHA256(APP_SECRET, domain) → base64url 无 padding。
+
+    **必须与 Go `config/config.go::deriveSubsecret`、引擎 `app/config.py`、
+    `frontend-vue/electron/local-stack.cjs` 逐字一致**：检索服务用 `INTERNAL_TOKEN`
+    校验引擎的内部调用，两边只要有一处算法不同，表现就是每一次检索都 401。
+    """
+    digest = hmac.new(app_secret.encode("utf-8"), domain.encode("utf-8"), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _resolve_pageindex_env() -> dict:
+    """检索服务需要的环境：内部令牌、索引/问答模型、原文与索引目录。
+
+    这些都是**服务侧必需**、而引擎侧各自有默认值的项。缺令牌 ⇒ 每次调用 401；
+    缺模型 ⇒ `/healthz` 回 `status=disabled`（引擎看到的就是"服务不可用"）；
+    目录与引擎不一致 ⇒ worker 读不到原文，索引永远停在 indexing。
+    """
+    env: dict = {}
+
+    app_secret = (os.environ.get("APP_SECRET") or DEFAULT_ENV.get("APP_SECRET") or "").strip()
+    internal_token = (os.environ.get("INTERNAL_TOKEN") or DEFAULT_ENV.get("INTERNAL_TOKEN") or "").strip()
+    if not internal_token and app_secret:
+        internal_token = derive_subsecret(app_secret, "chiron-internal")
+    if internal_token:
+        env["INTERNAL_TOKEN"] = internal_token
+
+    # 桌面/单机只有一份模型配置，没有理由让用户为索引单独再配一遍：
+    # 与 electron/local-stack.cjs 的 buildKnowledgeServiceEnv 同一套映射口径。
+    chat_model = os.environ.get("OPENAI_MODEL") or os.environ.get("LLM_MODEL") or DEFAULT_ENV.get("LLM_MODEL") or ""
+    if chat_model:
+        env.setdefault("KNOWLEDGE_SELFHOSTED_CHAT_MODEL", chat_model)
+        env.setdefault("KNOWLEDGE_SELFHOSTED_INDEX_MODEL", chat_model)
+    base_url = os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
+    if base_url:
+        env["KNOWLEDGE_SELFHOSTED_LLM_BASE_URL"] = base_url
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    if api_key:
+        env["KNOWLEDGE_SELFHOSTED_LLM_API_KEY"] = api_key
+
+    # 原文（引擎侧写）与索引产物（worker 侧写）必须是**同一对目录**：
+    # 引擎的 `KNOWLEDGE_LOCAL_PATH` 默认是相对 cwd 的 `data/knowledge`，
+    # 而服务侧默认是 `/srv/chiron/...`（容器口径）—— 在裸机上两者对不上，
+    # 于是 worker 读不到原文，文档永远停在 pending/indexing。
+    env["KNOWLEDGE_LOCAL_PATH"] = str(BASE_DIR / "python-engine" / "data" / "knowledge")
+    env["KNOWLEDGE_SELFHOSTED_ROOT"] = str(BASE_DIR / "data" / "knowledge_index")
+    return env
+
+
 def gateway_needs_rebuild(exe_path: Path) -> bool:
     """Go 网关源码（cmd/chiron + internal）是否比编译产物新。
 
@@ -217,6 +342,36 @@ def write_pid(service: str, pid: int):
 
 def remove_pid(service: str):
     pf = get_pid_file(service)
+    if pf.exists():
+        pf.unlink()
+
+
+def get_port_file(service: str) -> Path:
+    return PID_DIR / f"{service}.port"
+
+
+def read_port(service: str) -> int | None:
+    """读上次启动时记录的**实际**端口（`status` / 单独重启下游服务时要用）。
+
+    检索服务的端口是运行时挑的（8100 被占就换号），只靠 `SERVICES[*]["port"]`
+    会把"跑在 49321 上"的服务显示成"8100 未监听"。
+    """
+    pf = get_port_file(service)
+    if pf.exists():
+        try:
+            return int(pf.read_text().strip())
+        except ValueError:
+            return None
+    return None
+
+
+def write_port(service: str, port: int):
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    get_port_file(service).write_text(str(port))
+
+
+def remove_port(service: str):
+    pf = get_port_file(service)
     if pf.exists():
         pf.unlink()
 
@@ -389,6 +544,24 @@ class ServiceManager:
         # （例如 DEFAULT_ENV 的 JWT_SECRET="" 会覆盖 .env 的 JWT_SECRET，
         # 导致 python-engine 的 pydantic 校验拒绝启动）
         env.update({k: v for k, v in DEFAULT_ENV.items() if v})
+
+        if service_key == "pageindex-service":
+            # 检索服务本身用不到引擎那套变量，但需要内部令牌/模型/目录（见 _resolve_pageindex_env）
+            for key, value in _resolve_pageindex_env().items():
+                env.setdefault(key, value)
+            port = _RUNTIME_PORTS.get("pageindex-service")
+            if port:
+                env["PAGEINDEX_PORT"] = str(port)
+
+        if service_key == "python-engine":
+            # 引擎必须知道检索服务的**实际**地址：它在 spawn 时读一次就定了，
+            # 之后再改（换个引擎参数）不会生效。只在本机确实起了该服务时才下发，
+            # 否则引擎侧会显示"检索服务不可达"而不是"服务未部署"。
+            port = _RUNTIME_PORTS.get("pageindex-service") or read_port("pageindex-service")
+            explicit = os.environ.get("KNOWLEDGE_SERVICE_URL") or DEFAULT_ENV.get("KNOWLEDGE_SERVICE_URL")
+            if port and not explicit and is_port_open(port, "127.0.0.1"):
+                env["KNOWLEDGE_SERVICE_URL"] = f"http://127.0.0.1:{port}"
+
         if service_key in SERVICES:
             env.update(SERVICES[service_key].get("env", {}))
         return env
@@ -481,22 +654,85 @@ class ServiceManager:
                     capture_output=True
                 )
 
+        self._setup_pageindex()
+
         print(green("依赖安装完成"))
         return True
+
+    def _setup_pageindex(self):
+        """为内置检索服务准备**独立** venv（`pageindex → litellm → openai<3`）。
+
+        为什么不能装进当前解释器：引擎固定 `openai 3.x`，两者的依赖树在同一个环境里
+        pip 直接 ResolutionImpossible —— 装一边必然把另一边弄坏。失败**不算致命**：
+        检索是可选能力，缺它时建库/上传照常，只是建索引与检索不可用。
+        """
+        print("  检查知识库检索服务（pageindex-service）...")
+        if pageindex_python():
+            print(green("    已就绪"))
+            return
+        req_file = BASE_DIR / "pageindex-service" / "requirements.txt"
+        if not req_file.exists():
+            print(gray("    未找到 pageindex-service，跳过"))
+            return
+        try:
+            print(yellow("    创建独立环境 .venv-pageindex ..."))
+            created = subprocess.run(
+                [sys.executable, "-m", "venv", str(PAGEINDEX_VENV)],
+                capture_output=True, text=True,
+            )
+            if created.returncode != 0:
+                raise RuntimeError(created.stderr.strip()[:400] or "venv 创建失败")
+            python = pageindex_python()
+            installed = subprocess.run(
+                [python, "-m", "pip", "install", "-r", str(req_file), "-q"],
+                capture_output=True, text=True,
+            )
+            if installed.returncode != 0:
+                raise RuntimeError(installed.stderr.strip()[-400:] or "pip install 失败")
+            print(green("    已安装（python run.py start 会一并拉起它）"))
+        except Exception as exc:  # noqa: BLE001 — 可选组件，装不上只提示
+            print(yellow(f"    安装失败：{exc}"))
+            print(gray("    知识库的建索引/检索将不可用（建库与上传不受影响）。"))
+            print(gray("    可设置 CHIRON_PAGEINDEX_PYTHON 指向一个已装好依赖的解释器。"))
 
     def _start_service(self, key: str, background: bool = True):
         """启动单个服务"""
         svc = SERVICES[key]
         name = svc["name"]
-        port = svc["port"]
-        cmd = svc["cmd"]
         cwd = svc.get("cwd", str(BASE_DIR))
+
+        # 检索服务的命令是**运行时解析**的（要用独立的 venv 解释器），不能写死在 SERVICES 里。
+        if key == "pageindex-service":
+            if not pageindex_python():
+                print(f"  {name}: {gray('已跳过（缺少独立 venv：先跑 python run.py setup）')}")
+                return True
+            cmd = pageindex_cmd()
+        else:
+            cmd = svc["cmd"]
+
+        # 首选端口被占时换一个空闲端口。检索服务必须换（本机上 8100 常被别人占着），
+        # 而引擎要拿这个**实际**端口拼 URL —— 所以端口要记进 _RUNTIME_PORTS。
+        port = svc["port"]
+        if svc.get("dynamic_port") and is_port_open(port):
+            preferred = port
+            port = find_free_port()
+            print(f"  {name}: {yellow(f'端口 {preferred} 已被占用，改用 {port}')}")
+        _RUNTIME_PORTS[key] = port
+        write_port(key, port)
+
+        # uvicorn 的监听端口只能从命令行给（`PAGEINDEX_PORT` 只影响服务内部配置），
+        # 少了这一句它会退回 uvicorn 默认的 8000 —— 正好与引擎撞车。
+        if key == "pageindex-service":
+            cmd = [*cmd, "--port", str(port)]
+
         env = self._build_env(key)
+        if key == "pageindex-service":
+            env["PAGEINDEX_PORT"] = str(port)
 
         # 可选服务：二进制不存在时**跳过并视为成功**。
         # 可选服务是增强项（如 XERJ 检索），不是运行前提 —— 让它把 `start` 的整体
         # 退出码拖成失败，会让"没装就该跳过"变成"没装就起不来"。
-        if svc.get("optional") and shutil.which(cmd[0]) is None:
+        if svc.get("optional") and not _service_available(key, svc):
             print(f"  {name}: {gray('已跳过（未安装，可选）')}")
             return True
 
@@ -506,10 +742,10 @@ class ServiceManager:
             print(f"  {name}: {yellow('已在运行')} (PID {pid})")
             return True
 
-        # 检查端口占用
+        # 检查端口占用（换过号的端口是刚借到的，仍然有极小的竞态，所以照查）
         if is_port_open(port):
             print(f"  {name}: {yellow(f'端口 {port} 已被占用')}")
-            return False
+            return bool(svc.get("optional"))
 
         if not background:
             # 前台模式
@@ -621,6 +857,7 @@ class ServiceManager:
         else:
             print(f"  {name}: {green('已停止')}")
         remove_pid(key)
+        remove_port(key)
 
     def start(self, background: bool = True, services: list = None):
         """启动服务"""
@@ -642,8 +879,17 @@ class ServiceManager:
 
         results = {}
         for key in targets:
-            if key in SERVICES:
-                results[key] = self._start_service(key, background)
+            if key not in SERVICES:
+                continue
+            ok = self._start_service(key, background)
+            # 可选服务（检索 / 索引增强）失败不该让 `start` 整体退出码变红：
+            # 聊天、记忆、技能与建库上传都不依赖它，只有"建索引/检索"依赖。
+            if not ok and SERVICES[key].get("optional"):
+                print(
+                    f"  {SERVICES[key]['name']}: {yellow('未启动（可选组件，不影响其它功能）')}"
+                )
+                ok = True
+            results[key] = ok
 
         print()
 
@@ -676,13 +922,14 @@ class ServiceManager:
 
         for key, svc in SERVICES.items():
             name = svc["name"]
-            port = svc["port"]
+            port = read_port(key) or svc["port"]
             pid = read_pid(key)
 
             # 可选服务未安装：既不是"运行中"也不是"已停止"，报"未安装"才准确
             # —— 否则用户会以为它该跑却没跑起来，去翻一个根本不存在的日志。
-            if svc.get("optional") and shutil.which(svc["cmd"][0]) is None:
-                print(f"{name:<20} {gray('未安装'):<12} {'-':<10} {port:<8} {gray('可选')}")
+            if svc.get("optional") and not _service_available(key, svc):
+                hint = "可选（先跑 setup）" if key == "pageindex-service" else "可选"
+                print(f"{name:<20} {gray('未安装'):<12} {'-':<10} {port:<8} {gray(hint)}")
                 continue
 
             if pid and is_process_running(pid):
@@ -746,6 +993,9 @@ class ServiceManager:
         # 可选服务只在真正装了的时候才展示，避免给出一个点不开的地址
         if "xerj" in SERVICES and shutil.which(SERVICES["xerj"]["cmd"][0]):
             print(f"  XERJ 节点:    http://localhost:{SERVICES['xerj']['port']}  (只读检索)")
+        kb_port = _RUNTIME_PORTS.get("pageindex-service")
+        if kb_port and is_port_open(kb_port):
+            print(f"  PageIndex:    http://localhost:{kb_port}  (知识库检索，内置)")
         print()
         print(f"  日志目录:     {LOG_DIR}")
         print(f"  PID 目录:     {PID_DIR}")

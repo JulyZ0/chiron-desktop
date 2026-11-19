@@ -47,14 +47,28 @@ async def resolve_for_user(
         return None, None, HealthResult(False, STATUS_DISABLED, "缺少用户身份")
 
     user_settings = await settings_store.load(user_id)
+
+    # 没有显式设置时回落到**内置检索服务**（需求：本地模式默认 provider=PageIndex local）。
+    # 之前这里直接判 disabled ⇒ 用户没进过「知识库设置」时，建库 400、检索 503，
+    # 桌面端"内置 pageindex 连不上"的第一现场就是这一句。
+    provider_name = settings_store.effective_provider_name(user_settings)
+    if not provider_name:
+        detail = (
+            "尚未选择知识库 provider，且未检测到内置检索服务（KNOWLEDGE_SERVICE_URL 未配置）"
+            if user_settings is None
+            else "知识库 provider 为空，且未检测到内置检索服务（KNOWLEDGE_SERVICE_URL 未配置）"
+        )
+        return None, user_settings, HealthResult(False, STATUS_DISABLED, detail)
     if user_settings is None:
-        return None, None, HealthResult(False, STATUS_DISABLED, "尚未选择知识库 provider")
-    if not user_settings.provider:
-        return None, user_settings, HealthResult(False, STATUS_DISABLED, "知识库 provider 为空")
+        # 默认值**不落库**（"默认"与"已选定"必须可区分），但下游要用 settings 里的
+        # user_id/tenant_id/cloud_folder_id，所以这里给一个只读投影。
+        user_settings = settings_store.UserKnowledgeSettings(
+            user_id=user_id, tenant_id=0, provider=provider_name
+        )
 
     try:
         provider = build_provider(
-            user_settings.provider,
+            provider_name,
             cloud_api_key=user_settings.cloud_api_key,
             folder_id=folder_id,
             user_folder_id=user_settings.cloud_folder_id,

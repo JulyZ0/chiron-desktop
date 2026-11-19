@@ -804,7 +804,23 @@ def _load_gateway_config() -> dict[str, Any]:
 # 合并网关下发的配置：仅接受 Settings 已声明的字段，DB/env 之外不引入任意键。
 _db_overrides = _load_gateway_config()
 _allowed = set(Settings.model_fields.keys())
-_merged = {k: v for k, v in _db_overrides.items() if k in _allowed}
+
+# 这几个键是**部署时由启动器注入**的（Electron local-stack / run.py 拿到随机端口后
+# 才拼得出地址）。后台「系统设置」里留空不代表"要清空"，只代表"没配" —— 若让空串
+# 覆盖，桌面端明明起了内置检索服务，引擎也会报 `KNOWLEDGE_SERVICE_URL 未配置`，
+# 知识库整页不可用。空串一律视为未设置，回落到 env。
+_ENV_FIRST_KEYS = {
+    "knowledge_service_url",
+    "internal_token",
+    "jwt_secret",
+    "gateway_internal_url",
+    "sandbox_service_url",
+}
+_merged = {
+    k: v
+    for k, v in _db_overrides.items()
+    if k in _allowed and not (k in _ENV_FIRST_KEYS and isinstance(v, str) and not v.strip())
+}
 
 # provider 级覆盖（{provider}_base_url / {provider}_api_key）：Settings 不为每个
 # provider 逐个声明字段，故按后缀白名单单独收集到 provider_overrides，

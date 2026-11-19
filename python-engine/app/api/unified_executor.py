@@ -327,6 +327,7 @@ class UnifiedChatHandler:
                     kb_ids=ctx_kb_ids,
                     query=user_input,
                     tenant_id=tenant_id,
+                    user_id=str(user_id or ""),
                     trace_id=trace_id,
                 )
                 if kb_block:
@@ -582,6 +583,7 @@ class UnifiedChatHandler:
         query: str,
         tenant_id: int,
         trace_id: str,
+        user_id: str = "",
         top_k: int = 5,
         limit: int = 12,
     ) -> tuple[str, int]:
@@ -593,6 +595,12 @@ class UnifiedChatHandler:
 
         返回 (引用块, 命中数);任何失败 (DB 不可用 / kb 不存在 / 无命中) 都降级为
         空块 + 0,不阻断主任务执行 (与"不传 context 行为一致"的向后兼容原则一致)。
+
+        **身份必须传真实 user_id**：``kb_search`` 用工具上下文里的 user_id 做
+        ``kb_access_allowed`` 归属校验。此前这里把 ``user_id`` 写成 ``tenant_id``，
+        于是"自己的私有库"也判成越权、检索恒 0 命中（表现为"选了知识库但回答里没有
+        任何引用"）。缺省时退回空串，由 kb_access_allowed 判为无权，而不是误认成
+        某个用户的身份。
         """
         if not kb_ids:
             return "", 0
@@ -603,7 +611,7 @@ class UnifiedChatHandler:
             # kb_search 依赖工具上下文做归属校验 (与 TaskRouter._execute_single_task 同口径)
             set_tool_context(
                 session_id=f"task_{trace_id}" if trace_id else "chat_context_rag",
-                user_id=tenant_id,
+                user_id=user_id or "",
                 tenant_id=tenant_id,
             )
 
@@ -623,9 +631,16 @@ class UnifiedChatHandler:
                 answer = str(result.get("answer") or "").strip()
                 citations = [c for c in (result.get("citations") or []) if isinstance(c, dict)]
                 total_hits += len(citations) or (1 if answer else 0)
-                snippets = ([answer[:300]] if answer else []) + [
-                    str(c.get("snippet") or "").strip()[:300] for c in citations
-                ]
+                snippets: list[str] = [answer[:300]] if answer else []
+                for cite in citations[: top_k or 3]:
+                    # 引用带上文件名与页码：模型据此能给用户"出自哪份文档第几页"，
+                    # 而不是一句无从核对的话。
+                    label = str(cite.get("doc_name") or "").strip() or "文档"
+                    page = cite.get("page")
+                    if isinstance(page, int) and page > 0:
+                        label = f"{label} 第 {page} 页"
+                    text = str(cite.get("snippet") or "").strip()[:300]
+                    snippets.append(f"[{label}] {text}" if text else f"[{label}]")
                 snippets = [s for s in snippets if s]
                 if snippets:
                     groups.append(snippets)
