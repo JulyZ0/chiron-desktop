@@ -56,6 +56,10 @@ func main() {
 
 	// ── PostgreSQL ──
 	pgConnected := false
+	// drift 非 nil 表示 schema 与本次构建不一致：此时**不再**继续初始化业务组件，
+	// 改为只提供最小诊断 HTTP 服务（见 serveSchemaMismatchAndWait）。
+	// ALLOW_SCHEMA_DRIFT=true 时 verifySchemaVersion 恒返回 nil，语义与旧行为一致。
+	var drift *schemaMismatch
 	if len(cfg.PostgresReadDSNs) > 0 {
 		// Read replicas configured — use DatabaseRouter for read/write splitting
 		poolCfg := db.PoolConfig{
@@ -74,7 +78,7 @@ func main() {
 			pgConnected = true
 			defer router.Close()
 			// schema 版本校验（只读）：迁移由发布流程/DBA 执行，应用不再自行迁移
-			verifySchemaVersion(ctx, cfg)
+			drift = verifySchemaVersion(ctx, cfg)
 			slog.Info("database router enabled", "read_replicas", len(cfg.PostgresReadDSNs))
 		}
 	}
@@ -93,11 +97,19 @@ func main() {
 			slog.Warn("ensure default tenant failed", "error", err)
 		}
 		// schema 版本校验（只读）：迁移由发布流程/DBA 执行，应用不再自行迁移
-		verifySchemaVersion(ctx, cfg)
+		drift = verifySchemaVersion(ctx, cfg)
 	}
 
 	if !pgConnected {
 		slog.Error("FATAL: no PostgreSQL connection was established — refusing to start (check POSTGRES_DSN)")
+		return
+	}
+
+	// schema 漂移：业务路由一条都不能挂（PG/Redis/引擎的初始化都假定 schema 正确），
+	// 但也不能让端口消失 —— 否则前端只剩白屏，用户看不到 expected/actual 与修复命令。
+	// 这里只起一个**最小** HTTP 服务，日志仍保留 FATAL 语义（见 verifySchemaVersion）。
+	if drift != nil {
+		serveSchemaMismatchAndWait(cfg, *drift)
 		return
 	}
 
@@ -466,29 +478,36 @@ func applyDBSettingsAfterConnect(ctx context.Context, cfg *config.Config) {
 // 镜像里必然静默失败）。迁移由发布流程/DBA 用 requirements-migrate.txt 的环境执行；
 // 这里比对 migrations/versions 的 head 与数据库 alembic_version，不一致时默认拒绝启动，
 // ALLOW_SCHEMA_DRIFT=true 可放行（迁移超前/回滚等场景）。
-func verifySchemaVersion(ctx context.Context, cfg *config.Config) {
+//
+// 返回值非 nil 表示**必须拒绝启动**：调用方据此改起最小诊断服务，而不是让进程静默死掉
+// （见 schemaMismatch 的说明）。日志仍按 FATAL 语义写 —— 运维按日志告警的既有链路不变。
+func verifySchemaVersion(ctx context.Context, cfg *config.Config) *schemaMismatch {
 	expected, actual, match, err := db.CheckSchemaVersion(ctx)
 	if err != nil {
 		slog.Warn("schema version check unavailable", "error", err)
-		return
+		return nil
 	}
 	if match {
 		slog.Info("schema version verified", "migration", expected)
 		// revision 一致 ≠ 表都在：手工删表后 revision 仍匹配，缺失会推迟到运行时
 		// 才以 relation does not exist 暴露。补一道只读的存在性校验。
-		verifyRequiredTables(ctx, cfg)
+		if m := verifyRequiredTables(ctx, cfg, expected, actual); m != nil {
+			return m
+		}
 		warnOnTimezoneMismatch(ctx)
-		return
+		return nil
 	}
 	slog.Error("database schema does not match this build",
 		"expected_migration", expected, "database_migration", actual,
 		"hint", "run `alembic upgrade head` (see requirements-migrate.txt) before starting")
 	if cfg.AllowSchemaDrift {
 		slog.Warn("ALLOW_SCHEMA_DRIFT=true — continuing despite schema drift")
-		return
+		return nil
 	}
-	slog.Error("FATAL: refusing to start on mismatched schema; set ALLOW_SCHEMA_DRIFT=true to bypass")
-	os.Exit(1)
+	slog.Error("FATAL: refusing to start on mismatched schema; set ALLOW_SCHEMA_DRIFT=true to bypass "+
+		"(serving /healthz diagnostics only)",
+		"expected", expected, "actual", actual)
+	return &schemaMismatch{Expected: expected, Actual: actual, Reason: schemaMismatchRevision}
 }
 
 // warnOnTimezoneMismatch 只读比对数据库会话时区与宿主时区，不一致时告警（不阻断启动）。
@@ -517,25 +536,33 @@ func warnOnTimezoneMismatch(ctx context.Context) {
 // verifyRequiredTables 只读校验网关必需的表是否存在（清单见 db.RequiredTables）。
 //
 // 与 revision 校验互补：版本对上但表缺了（手工删表、迁移在别处被回滚过），这里能提前发现。
-func verifyRequiredTables(ctx context.Context, cfg *config.Config) {
+// expected/actual 只用于把漂移详情带进诊断响应（表缺时版本号本身是一致的）。
+func verifyRequiredTables(ctx context.Context, cfg *config.Config, expected, actual string) *schemaMismatch {
 	missing, err := db.CheckMissingTables(ctx)
 	if err != nil {
 		slog.Warn("required-table check unavailable", "error", err)
-		return
+		return nil
 	}
 	if len(missing) == 0 {
 		slog.Info("required tables verified", "count", len(db.RequiredTables))
-		return
+		return nil
 	}
 	slog.Error("database is missing required tables",
 		"missing", strings.Join(missing, ", "),
 		"hint", "run `alembic upgrade head` (see requirements-migrate.txt) before starting")
 	if cfg.AllowSchemaDrift {
 		slog.Warn("ALLOW_SCHEMA_DRIFT=true — continuing despite missing tables")
-		return
+		return nil
 	}
-	slog.Error("FATAL: refusing to start on missing tables; set ALLOW_SCHEMA_DRIFT=true to bypass")
-	os.Exit(1)
+	slog.Error("FATAL: refusing to start on missing tables; set ALLOW_SCHEMA_DRIFT=true to bypass "+
+		"(serving /healthz diagnostics only)",
+		"missing", strings.Join(missing, ", "))
+	return &schemaMismatch{
+		Expected: expected,
+		Actual:   actual,
+		Reason:   schemaMismatchMissingTables,
+		Missing:  missing,
+	}
 }
 
 func parseLogLevel(level string) slog.Level {
