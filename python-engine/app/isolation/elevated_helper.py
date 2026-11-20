@@ -462,6 +462,17 @@ def serve(parent_pid: int, *, key: bytes | None = None) -> int:
             proto.REASON_TOKEN_TARGET_UNAVAILABLE,
         )
 
+    # **helper 这条路径同样要启用启动特权**：提权令牌只是"持有"
+    # SeAssignPrimaryTokenPrivilege / SeIncreaseQuotaPrivilege，默认禁用。
+    # 这里先预热一次，失败会在"就绪"之前留下点名特权的 warning，而不是等到
+    # 第一条 `/v1/exec` 才回一个光秃秃的 err=5。
+    # （`launch_restricted` 每次执行前还会再启用一次 —— 令牌状态可能被策略刷新。）
+    from app.isolation import win_token
+
+    priv_ok, priv_reason = win_token.enable_launch_privileges()
+    if not priv_ok:
+        logger.warning("受限启动特权未能在助手启动时启用（执行时会再次尝试）: %s", priv_reason)
+
     try:
         proto.port_path().parent.mkdir(parents=True, exist_ok=True)
         proto.port_path().write_text(str(port), encoding="utf-8")

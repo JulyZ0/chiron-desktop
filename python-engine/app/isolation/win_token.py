@@ -84,6 +84,41 @@ TOKEN_ASSIGN_PRIMARY = 0x0001
 #: `OpenProcess` 的最小访问位：只要进程信息，不要内存/线程。
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
+#: `OpenProcessToken` 的访问位：读令牌信息 + 改令牌特权。
+TOKEN_QUERY = 0x0008
+TOKEN_ADJUST_PRIVILEGES = 0x0020
+
+#: `TOKEN_PRIVILEGES.Privileges[i].Attributes`：启用该特权。
+SE_PRIVILEGE_ENABLED = 0x0000_0002
+
+#: `AdjustTokenPrivileges` 的**特殊**成败语义：返回 TRUE 不等于生效。
+#:
+#: 官方文档原文：该 API 成功**且** `GetLastError()==ERROR_NOT_ALL_ASSIGNED`
+#: 表示"有一个或多个特权没能分配"。漏判这一点会把"没提权"误当"已启用"，
+#: 于是继续去调 `CreateProcessAsUserW`，拿到一个毫无指向性的 `err=5`。
+ERROR_NOT_ALL_ASSIGNED = 1300
+
+#: `CreateProcessAsUserW` 成功所需的两个进程令牌特权名（Win32 原名）。
+#:
+#: * `SeAssignPrimaryTokenPrivilege` —— 给新进程指定主令牌；
+#: * `SeIncreaseQuotaPrivilege` —— 新进程的配额（内存）调整。
+#:
+#: 提权令牌只是**持有**它们（present but disabled）：UAC 拆分后的管理员令牌
+#: 默认是禁用态。所以必须先用 `AdjustTokenPrivileges` 翻成启用态，否则
+#: 即使 `engine_elevated=true` 也会稳定 `err=5`。
+SE_ASSIGN_PRIMARY_TOKEN_NAME = "SeAssignPrimaryTokenPrivilege"
+SE_INCREASE_QUOTA_NAME = "SeIncreaseQuotaPrivilege"
+
+#: 调试用的第三项特权（**不默认启用**）。
+#:
+#: `SeTcbPrivilege`（"作为操作系统的一部分"）能让调用方绕过令牌指派检查，
+#: 看起来能"顺手治好" err=5，代价是把进程抬到可信计算基的信任级别。
+#: 只在排障时**手动**调用 `_enable_privilege(SE_TCB_NAME)`，绝不进默认清单。
+SE_TCB_NAME = "SeTcbPrivilege"
+
+#: 受限启动**默认**要启用的特权（顺序即启用顺序，便于日志比对）。
+LAUNCH_PRIVILEGES = (SE_ASSIGN_PRIMARY_TOKEN_NAME, SE_INCREASE_QUOTA_NAME)
+
 #: 降级理由的字面量（写进协议响应、日志与 `reasons`，因此必须稳定）。
 #:
 #: 含义：**拿不到调用方（目标用户）的令牌**，只能退回 helper 自身令牌。此时
@@ -143,6 +178,129 @@ def exec_unavailable_reason() -> str:
     return f"受限令牌执行层不可用（{detail or '未知原因'}）"
 
 
+# ── 启用进程令牌特权（`CreateProcessAsUserW` 的前置）─────────────────
+#
+# 这一节解决一个**只靠 is_admin() 看不出来**的失败：
+#
+#   实测（用户机器，engine_elevated=true，helper available=true）：
+#       GET /v1/system/isolation → unavailable_reasons.restricted =
+#           "受限令牌执行层不可用：CreateProcessAsUserW 失败 err=5（拒绝访问）"
+#
+# 提权令牌**持有** `SeAssignPrimaryTokenPrivilege` / `SeIncreaseQuotaPrivilege`，
+# 但它们默认是**禁用**态（UAC 拆分令牌即如此）。`CreateProcessAsUserW` 只认
+# "已启用"的特权，所以必须先 `AdjustTokenPrivileges`。缺这一步时 API 只回一个
+# 光秃秃的 `err=5`，无法与"缺桌面 DACL""安全软件拦截""没提权"区分开。
+
+#: 最近一次 `_enable_privilege` 的失败细节（特权名 → 中文原因）。
+#:
+#: 用模块级字典而不是让 `_enable_privilege` 返回元组：调用点要的是
+#: "这一项成功了吗"，而把 Win32 细节拼成字符串是另一件事 —— 分开之后
+#: 测试可以只 mock 布尔结果，仍然能拿到具体原因。
+_PRIVILEGE_ERRORS: dict[str, str] = {}
+
+
+def privilege_error(name: str) -> str:
+    """`_enable_privilege(name)` 最近一次的失败原因；成功或未调用过时为空串。"""
+    return _PRIVILEGE_ERRORS.get(name, "")
+
+
+def _enable_privilege(name: str) -> bool:
+    """在**当前进程令牌**上启用名为 `name` 的特权。成功返回 True。
+
+    三种失败分开记，因为处置方式完全不同：
+
+    * `OpenProcessToken` 失败 —— 连自己的令牌都打不开（极少见，多半是句柄耗尽）；
+    * `LookupPrivilegeValueW` 失败 —— 本机的安全策略里**没有**这个特权项；
+    * `AdjustTokenPrivileges` 返回 FALSE，或返回 TRUE 但 `last error==1300`
+      （`ERROR_NOT_ALL_ASSIGNED`） —— 令牌里没有这一项（未提权 / 被组策略移除）。
+      注意第二种：只看返回值会把"没分配"当成"已启用"继续往下走。
+
+    重复调用是幂等的：已经启用的特权再启用一次仍然成功。
+    """
+    _PRIVILEGE_ERRORS.pop(name, None)
+    if not win.IS_WINDOWS:
+        _PRIVILEGE_ERRORS[name] = f"启用 {name} 失败：非 Windows 平台"
+        return False
+    adv = _advapi()
+    k32 = _k32()
+    if adv is None or k32 is None:
+        _PRIVILEGE_ERRORS[name] = f"启用 {name} 失败：advapi32/kernel32 不可加载"
+        return False
+
+    token = wt.HANDLE()
+    if not k32.OpenProcessToken(
+        k32.GetCurrentProcess(),
+        TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+        ctypes.byref(token),
+    ):
+        err = ctypes.get_last_error()
+        _PRIVILEGE_ERRORS[name] = f"OpenProcessToken 失败 err={err}（无法调整 {name}）"
+        return False
+    try:
+        luid = _LUID()
+        if not adv.LookupPrivilegeValueW(None, name, ctypes.byref(luid)):
+            err = ctypes.get_last_error()
+            _PRIVILEGE_ERRORS[name] = (
+                f"LookupPrivilegeValueW({name}) 失败 err={err}：本机安全策略里没有该特权"
+            )
+            return False
+
+        state = _TOKEN_PRIVILEGES()
+        state.PrivilegeCount = 1
+        state.Privileges[0].Luid = luid
+        state.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED
+
+        if not adv.AdjustTokenPrivileges(token, False, ctypes.byref(state), 0, None, None):
+            err = ctypes.get_last_error()
+            _PRIVILEGE_ERRORS[name] = f"AdjustTokenPrivileges({name}) 返回失败 err={err}"
+            return False
+        # 返回 TRUE 也可能是**部分**失败：必须再读 last error（见常量说明）。
+        err = ctypes.get_last_error()
+        if err == ERROR_NOT_ALL_ASSIGNED:
+            _PRIVILEGE_ERRORS[name] = (
+                f"AdjustTokenPrivileges({name}) 未生效 err={err}"
+                "（当前进程令牌不含该特权：引擎/助手未提权，或被安全策略移除）"
+            )
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001 — 任何异常都按"没启用"处理（fail-closed）
+        _PRIVILEGE_ERRORS[name] = f"启用 {name} 异常: {type(exc).__name__}: {exc}"
+        return False
+    finally:
+        try:
+            k32.CloseHandle(token)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def enable_launch_privileges() -> tuple[bool, str]:
+    """启用 `CreateProcessAsUserW` 需要的两个特权。返回 `(ok, 原因)`。
+
+    逐条尝试、**不短路**：用户需要知道"两项里缺哪一项"。只报第一个失败会让人
+    修好一个再撞一次，而两次 `err=5` 长得一模一样。
+
+    成功时的日志是排障锚点（真机手工验证看这一行）：
+    ``已启用 SeAssignPrimaryTokenPrivilege/SeIncreaseQuotaPrivilege``。
+
+    失败时返回的字符串里包含**特权名与 API 名**，可以直接写进
+    `unavailable_reasons` / 审计流水 —— 用户据此能判断是"没提权"还是"策略移除"，
+    而不是对着一句"err=5（拒绝访问）"猜。
+    """
+    enabled: list[str] = []
+    failed: list[str] = []
+    for name in LAUNCH_PRIVILEGES:
+        if _enable_privilege(name):
+            enabled.append(name)
+        else:
+            failed.append(privilege_error(name) or f"{name} 启用失败（原因未给出）")
+    if not failed:
+        logger.info("已启用 %s", "/".join(enabled))
+        return True, ""
+    reason = "受限启动所需特权未能启用：" + "；".join(failed)
+    logger.warning("%s", reason)
+    return False, reason
+
+
 class _LUID(ctypes.Structure):
     _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
 
@@ -160,6 +318,25 @@ class _TOKEN_GROUPS(ctypes.Structure):  # noqa: N801 — 沿用 Windows SDK 原�
     _fields_ = [
         ("GroupCount", wt.DWORD),
         ("Groups", win._SID_AND_ATTRIBUTES * 1),  # noqa: SLF001 — 变长尾部，按 1 声明后手动索引
+    ]
+
+
+class _LUID_AND_ATTRIBUTES(ctypes.Structure):  # noqa: N801 — 沿用 Windows SDK 原名
+    """`TOKEN_PRIVILEGES` 的元素：一项特权 + 想把它设成什么状态。"""
+
+    _fields_ = [("Luid", _LUID), ("Attributes", wt.DWORD)]
+
+
+class _TOKEN_PRIVILEGES(ctypes.Structure):  # noqa: N801 — 沿用 Windows SDK 原名
+    """`AdjustTokenPrivileges` 的入参。
+
+    这里只声明 1 项：逐条启用而不是一次塞两项，是为了让"哪一项失败"能单独报出来 ——
+    一次塞两项时 `ERROR_NOT_ALL_ASSIGNED` 不告诉你是哪一项没分配。
+    """
+
+    _fields_ = [
+        ("PrivilegeCount", wt.DWORD),
+        ("Privileges", _LUID_AND_ATTRIBUTES * 1),
     ]
 
 
@@ -246,6 +423,23 @@ def _advapi() -> Any:
         wt.LPCWSTR,
         ctypes.POINTER(_STARTUPINFOW),
         ctypes.POINTER(_PROCESS_INFORMATION),
+    ]
+    # 启用启动特权用的两个入口。`LookupPrivilegeValueW` 把特权**名**翻成 LUID，
+    # 名字是本机的（"SeIncreaseQuotaPrivilege"），LUID 才是令牌里的键。
+    lib.LookupPrivilegeValueW.restype = wt.BOOL
+    lib.LookupPrivilegeValueW.argtypes = [
+        wt.LPCWSTR,  # lpSystemName：None = 本机
+        wt.LPCWSTR,  # lpName
+        ctypes.POINTER(_LUID),
+    ]
+    lib.AdjustTokenPrivileges.restype = wt.BOOL
+    lib.AdjustTokenPrivileges.argtypes = [
+        wt.HANDLE,
+        wt.BOOL,  # DisableAllPrivileges：False = 按 NewState 改
+        ctypes.POINTER(_TOKEN_PRIVILEGES),
+        wt.DWORD,  # BufferLength：0 + NULL = 不关心旧状态
+        ctypes.c_void_p,
+        ctypes.c_void_p,
     ]
     return lib
 
@@ -799,6 +993,10 @@ def grant_report(paths: list[str]) -> dict[str, Any]:
 
 __all__ = [
     "DESKTOP_NAME",
+    "LAUNCH_PRIVILEGES",
+    "SE_ASSIGN_PRIMARY_TOKEN_NAME",
+    "SE_INCREASE_QUOTA_NAME",
+    "SE_TCB_NAME",
     "SYNTHETIC_SID",
     "TOKEN_TARGET_UNAVAILABLE",
     "TargetToken",
@@ -806,10 +1004,12 @@ __all__ = [
     "create_restricted_token_from",
     "current_user_sid",
     "desktop_isolation_ready",
+    "enable_launch_privileges",
     "grant_path",
     "grant_report",
     "is_administrator_identity",
     "open_process_token",
+    "privilege_error",
     "probe",
     "process_creation_time",
     "process_identity",
