@@ -54,6 +54,9 @@ DATA_PLANE_POLICY = "data_plane_policy"
 GOAL_CONTEXT = "goal_context"
 #: 本轮召回的**记忆块**。
 MEMORY = "memory"
+#: 本轮**知识库检索结果**（`agent/knowledge_context`）。独立的 system 消息：
+#: 内容逐轮、逐库都不同，拼进稳定前缀会让前缀缓存整段失效。
+KNOWLEDGE = "knowledge"
 #: hook 通过 `additional_context` 提供的参考资料（`hooks/inject`）。
 HOOK_CONTEXT = "hook_context"
 #: 子 Agent 的主动汇报（`subagent/reporting`）。
@@ -79,6 +82,9 @@ INLINE_ORDER: tuple[str, ...] = (
 STANDALONE_ORDER: tuple[str, ...] = (
     GOAL_CONTEXT,
     MEMORY,
+    # 知识库资料紧跟在记忆之后：两者都是"本轮给模型的参考资料"，相邻摆放便于模型
+    # 一并当作资料而非指令看待。
+    KNOWLEDGE,
     HOOK_CONTEXT,
     REPORT,
     TOOL_CHANGE_NOTICE,
@@ -154,6 +160,7 @@ __all__ = [
     "HARNESS_SUFFIX",
     "HOOK_CONTEXT",
     "INLINE_ORDER",
+    "KNOWLEDGE",
     "MEMORY",
     "NARRATION_SUFFIX",
     "PLANNING_SUFFIX",

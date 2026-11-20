@@ -114,9 +114,17 @@ class DeleteBody(ContextBody):
     pageindex_doc_id: str
 
 
-def _adapter(body: ContextBody) -> tuple[Adapter, RequestContext]:
+async def _adapter(body: ContextBody) -> tuple[Adapter, RequestContext]:
+    """构造 Adapter 前先把模型解析出来（env → 网关 /models）。
+
+    **放在这里而不是构造期**：模型可能只在网关 PG 里配过（桌面单机），而检索服务
+    先于网关启动 —— 解析必须等到"真正要用模型"的时刻（见 app/models.py 的说明）。
+    """
+    from app import models as models_mod
+
+    resolved = await models_mod.resolve(config())
     ctx = body.to_ctx()
-    return Adapter(mode=ctx_mode(body), cfg=config()), ctx
+    return Adapter(mode=ctx_mode(body), cfg=config(), models=resolved), ctx
 
 
 def ctx_mode(body: ContextBody) -> str:
@@ -125,8 +133,16 @@ def ctx_mode(body: ContextBody) -> str:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    """健康检查**不要求内部 token**（供容器探针使用），但也不泄露任何业务信息。"""
-    health = Adapter(mode="selfhosted", cfg=config()).health()
+    """健康检查**不要求内部 token**（供容器探针使用），但也不泄露任何业务信息。
+
+    模型的解析结果就是这里的判据：只在 env 里找不到时向网关要 `/models` 的配置，
+    因此"管理员在 /models 配了模型"能立刻反映到 ready 上；真没有时会给出
+    **可操作**说明（去 /models 配置），而不是笼统的"未配置自托管模型"。
+    """
+    from app import models as models_mod
+
+    resolved = await models_mod.resolve(config())
+    health = Adapter(mode="selfhosted", cfg=config(), models=resolved).health(resolved)
     return {**health, "engine": sdk_version(), "service": "pageindex-search"}
 
 
@@ -171,8 +187,7 @@ async def answer(
     body: AnswerBody, x_internal_token: str | None = Header(default=None)
 ) -> dict[str, Any]:
     _require_internal_token(x_internal_token)
-    ctx = body.to_ctx()
-    adapter = Adapter(mode=ctx_mode(body), cfg=config())
+    adapter, ctx = await _adapter(body)
     if not body.question.strip():
         raise HTTPException(status_code=400, detail="question 不能为空")
     try:
@@ -196,8 +211,7 @@ async def prepare(
 ) -> dict[str, Any]:
     """确保索引位置存在（Cloud 建 folder / local 返回索引目录），供引擎回写 ``index_ref``。"""
     _require_internal_token(x_internal_token)
-    ctx = body.to_ctx()
-    adapter = Adapter(mode=ctx_mode(body), cfg=config())
+    adapter, ctx = await _adapter(body)
     try:
         if body.mode == "cloud":
             kb_folder, user_folder = await asyncio.to_thread(adapter.ensure_kb_folder, ctx)
@@ -227,7 +241,7 @@ async def supports(
 ) -> dict[str, Any]:
     """上传前的类型校验（引擎在落库前问一次，避免"传成功了却索引不了"）。"""
     _require_internal_token(x_internal_token)
-    adapter = Adapter(mode=ctx_mode(body), cfg=config())
+    adapter, _ctx = await _adapter(body)
     try:
         return {"supported": adapter.supports(filename)}
     except UnsupportedDocument as exc:  # pragma: no cover - supports 不抛

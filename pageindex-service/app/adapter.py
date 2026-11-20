@@ -138,11 +138,33 @@ class AnswerResult:
 class Adapter:
     """一个请求一个实例（无跨请求状态，便于服务化与水平扩展）。"""
 
-    def __init__(self, *, mode: str, cfg: Any) -> None:
+    def __init__(self, *, mode: str, cfg: Any, models: Any = None) -> None:
         self._mode = mode
         self._cfg = cfg
+        # 解析后的模型（env → 网关 /models，见 app/models.py）。None = 只看 cfg（老行为）。
+        self._models = models
 
     # ── 客户端 ──
+
+    def _selfhosted_models(self) -> tuple[str, str, dict[str, str]]:
+        """自托管索引/问答模型与 LLM 连接（**唯一的取值口径**）。
+
+        顺序：``models``（env → 网关 /models 解析结果）优先，回落到 ``cfg`` 的 env 直读值。
+        两个来源并存是有意的：前者覆盖"模型只在网关 PG 里配过"的桌面形态，后者保证
+        手工 export 了 ``KNOWLEDGE_SELFHOSTED_*`` 的部署行为**逐字不变**。
+        """
+        models = self._models
+        if models is not None and getattr(models, "ready", lambda: False)():
+            return (
+                models.index_model or models.chat_model,
+                models.chat_model,
+                models.llm_backend(),
+            )
+        return (
+            self._cfg.selfhosted_index_model,
+            self._cfg.selfhosted_chat_model,
+            self._cfg.llm_backend(),
+        )
 
     def _client(self, ctx: RequestContext) -> Any:
         if self._mode == "cloud":
@@ -159,6 +181,14 @@ class Adapter:
 
         from pageindex import PageIndexLocalClient
 
+        index_model, chat_model, cfg_backend = self._selfhosted_models()
+        if not index_model or not chat_model:
+            # 不把空模型名交给 SDK（它会在内部拼出一个 404 请求，报错点离原因很远）
+            from app.models import unavailable_detail
+
+            if self._models is not None:
+                raise PageIndexError(unavailable_detail(self._models))
+            raise PageIndexError("自托管索引/问答模型未配置（KNOWLEDGE_SELFHOSTED_*）")
         storage = self.storage_path(ctx)
         # search 服务以 **只读** 挂载索引卷（worker 才是写方）：在 :ro 上 mkdir 会抛 EROFS。
         # 目录由 worker 建；这里只在不存在时尝试创建，失败时给出可定位的错误，
@@ -172,10 +202,10 @@ class Adapter:
                     "（search 侧应为只读挂载，目录需由 pageindex-worker 先创建）"
                 ) from exc
         return PageIndexLocalClient(
-            index_model=self._cfg.selfhosted_index_model,
-            index_backend=ctx.llm or None,
-            chat_model=self._cfg.selfhosted_chat_model,
-            chat_backend=ctx.llm or None,
+            index_model=index_model,
+            index_backend=ctx.llm or cfg_backend or None,
+            chat_model=chat_model,
+            chat_backend=ctx.llm or cfg_backend or None,
             storage_path=storage,
             # 显式传（0.4.4 起默认 "full" = 加一轮 LLM expand）：不显式传就会跟着默认值漂移，
             # 而默认值本身在版本间会变，索引成本与耗时也跟着变。
@@ -297,18 +327,32 @@ class Adapter:
 
     # ── 健康 ──
 
-    def health(self) -> dict[str, Any]:
+    def health(self, models: Any = None) -> dict[str, Any]:
         try:
             import pageindex  # noqa: F401
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "status": "disabled", "detail": f"pageindex 未安装: {exc}"}
-        if not self._cfg.selfhosted_ready() and not self._cfg.cloud_ready():
-            return {
-                "ok": False,
-                "status": "disabled",
-                "detail": "未配置自托管模型，也未配置 Cloud 问答模型",
-            }
-        return {"ok": True, "status": "ready", "engine": sdk_version()}
+        models = self._models if models is None else models
+        # 自托管的可用性以**解析后的模型**为准（env → 网关 /models）：只看 env 的
+        # `selfhosted_ready()` 正是"管理员在 /models 配了模型、healthz 却说未配置"的根源。
+        selfhosted_ready = (
+            models.ready() if models is not None else self._cfg.selfhosted_ready()
+        )
+        if not selfhosted_ready and not self._cfg.cloud_ready():
+            if models is not None:
+                from app.models import unavailable_detail
+
+                detail = unavailable_detail(models)
+            else:
+                detail = "未配置自托管模型，也未配置 Cloud 问答模型"
+            return {"ok": False, "status": "disabled", "detail": detail}
+        payload: dict[str, Any] = {"ok": True, "status": "ready", "engine": sdk_version()}
+        if selfhosted_ready:
+            # 来源与模型名**不是秘密**，但要能一眼看出"模型是从哪来的"——
+            # 排障第一个问题永远是"它到底读到了哪份配置"。
+            payload["model_source"] = str(getattr(models, "source", "env") or "env")
+            payload["chat_model"] = str(getattr(models, "chat_model", "") or "")
+        return payload
 
 
 def _normalize(raw: Any) -> AnswerResult:

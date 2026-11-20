@@ -604,18 +604,31 @@ async function tryStartGoStack(options = {}) {
     const port =
       Number(options.gatewayPort) > 0 ? Number(options.gatewayPort) : await components.pickFreePort()
 
+    // APP_SECRET 提前取好：知识库模型的网关回查要用它派生的 INTERNAL_TOKEN
+    // （与网关 `deriveSubsecret` 同算法，见 local-stack.cjs）。
+    const appSecret = ensureAppSecret(dataDir)
     const started = await stack.startLocalStack({
       launcher: { command: launch.command, cwd: launch.cwd },
       dataDir,
       exe: gatewayExe,
       port,
-      appSecret: ensureAppSecret(dataDir),
+      appSecret,
       engine: engineLaunch || undefined,
       knowledge: knowledgeLaunch || undefined,
       // 桌面态的模型配置在 safeStorage 里（`secrets.bin`），`local-stack.cjs` 是纯
       // Node 模块读不到 —— 必须在这里解密后交下去。缺了它 pageindex-search 会自报
       // `status: "disabled"`，知识库建索引全部失败。
-      knowledgeSecrets: (await resolveKnowledgeSecrets()) || undefined,
+      // 两路来源（同源口径）：本地「设置 → 本地模型」（secrets.bin）＞网关 /models。
+      // 后者是管理员在 /models 配的那份，也是 pageindex `/healthz` 判就绪的唯一权威。
+      knowledgeSecrets:
+        (await resolveKnowledgeSecrets({
+          gatewayBaseUrl:
+            typeof stack.getStackState === 'function' ? stack.getStackState()?.gateway?.baseUrl || '' : '',
+          internalToken:
+            typeof stack.deriveSubsecret === 'function'
+              ? stack.deriveSubsecret(appSecret, 'chiron-internal')
+              : '',
+        })) || undefined,
       // 网关托管前端产物（resources/web）：分享链接必须有一个别人也能打开的宿主，
       // 否则链接只能是 file://，换台机器就是「找不到文件」。空串 = 不托管。
       webRoot: resolveWebRoot(),
@@ -723,7 +736,7 @@ async function prepareEngine(components, options) {
  * 返回 `null` 表示"没配过 / 读不到"，调用方据此退回环境变量那条老路径。
  * **绝不记录 apiKey**（契约 §8：provider key 不进日志）。
  */
-async function resolveKnowledgeSecrets() {
+async function resolveKnowledgeSecrets(options = {}) {
   const mod = loadOptionalModule('./secrets.cjs')
   if (!mod || typeof mod.readSecrets !== 'function') return null
   let secrets
@@ -733,7 +746,10 @@ async function resolveKnowledgeSecrets() {
     logMain('warn', `读取模型配置失败，知识库将退回环境变量: ${err?.message || err}`)
     return null
   }
-  if (!secrets || typeof secrets !== 'object') return null
+  if (!secrets || typeof secrets !== 'object') {
+    // 没有本地模型配置不等于"没有模型"：权威源在网关 PG（见下方 fetchGatewayKnowledgeModel）
+    return fetchGatewayKnowledgeModel(options.gatewayBaseUrl, options.internalToken)
+  }
 
   const providers = secrets.providers && typeof secrets.providers === 'object' ? secrets.providers : {}
   const pick = name => (providers[name] && typeof providers[name] === 'object' ? providers[name] : null)
@@ -748,11 +764,52 @@ async function resolveKnowledgeSecrets() {
   if (!entry) return null
 
   const model = String(entry.model || '').trim()
-  if (!model) return null
+  if (!model) return fetchGatewayKnowledgeModel(options.gatewayBaseUrl, options.internalToken)
   return {
     model,
     baseUrl: String(entry.baseUrl || '').trim(),
     apiKey: String(entry.apiKey || '').trim(),
+  }
+}
+
+/**
+ * 从网关取「这台机器上第一个可用 chat 模型」（权威源 = PG 的 llm_models）。
+ *
+ * **为什么需要这一路**：`secrets.bin` 里只有用户在「本地模型」页手工填的那一份；
+ * 管理员在 /models 配的模型（provider + key + base_url）根本不在那儿。只读 secrets.bin
+ * 的结果就是 pageindex 拿到空模型、`/healthz` 回 disabled —— 即"配了模型却说没配"。
+ *
+ * 与 `run.py::fetch_gateway_knowledge_model` 读的是**同一个端点**，因此两条启动路径
+ * （本机直跑 / 桌面）不会各自理解"哪个模型算可用"。
+ *
+ * 网关尚未就绪是**正常情况**（检索服务先于网关启动）：返回 null，由检索服务自己
+ * 在首次需要模型时回查（`pageindex-service/app/models.py`，带短负缓存）。
+ * 绝不抛：这一路失败只是"少一份配置"，不能让本地栈启动失败。
+ */
+async function fetchGatewayKnowledgeModel(baseUrl, internalToken = '') {
+  const base = String(baseUrl || process.env.CHIRON_GATEWAY_URL || process.env.GATEWAY_INTERNAL_URL || '')
+    .trim()
+    .replace(/\/+$/, '')
+  if (!base) return null
+  const token = String(internalToken || process.env.INTERNAL_TOKEN || '').trim()
+  if (!token) return null
+  try {
+    const resp = await runtime().fetch(`${base}/v1/internal/knowledge-model`, {
+      headers: { 'X-Internal-Token': token, Accept: 'application/json' },
+      signal: AbortSignal.timeout ? AbortSignal.timeout(3000) : undefined,
+    })
+    if (!resp.ok) return null
+    const body = await resp.json()
+    const payload = body && typeof body.data === 'object' && body.data ? body.data : body
+    if (!payload || !payload.available || !payload.chat_model) return null
+    return {
+      model: String(payload.chat_model || '').trim(),
+      baseUrl: String(payload.base_url || '').trim(),
+      apiKey: String(payload.api_key || '').trim(),
+    }
+  } catch (err) {
+    logMain('info', `网关模型配置不可用（检索服务会自行重试）：${err?.message || err}`)
+    return null
   }
 }
 

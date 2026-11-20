@@ -20,10 +20,11 @@ HEADERS = {"X-Internal-Token": TOKEN}
 class FakeAdapter:
     """替掉真实 SDK：只验证"服务怎么用它"，不验证 SDK 行为。"""
 
-    def __init__(self, *, mode: str, cfg) -> None:
+    def __init__(self, *, mode: str, cfg, models=None) -> None:
         self.mode = mode
+        self.models = models
 
-    def health(self):
+    def health(self, models=None):
         return {"ok": True, "status": "ready"}
 
     def storage_path(self, ctx):
@@ -65,6 +66,10 @@ def client(monkeypatch):
     monkeypatch.setenv("KNOWLEDGE_CLOUD_CHAT_MODEL", "openai/gpt-x")
     monkeypatch.setattr(search_api, "_cfg", None)
     monkeypatch.setattr(search_api, "Adapter", FakeAdapter)
+    # 模型解析带有（正/负）缓存：跨用例清一次，避免上一个用例的结论串到下一个
+    from app import models as models_mod
+
+    models_mod.reset_cache()
     return TestClient(search_api.app)
 
 

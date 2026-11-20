@@ -90,6 +90,18 @@ describe('知识库多选（P1-1：上限 5）', () => {
   const manyKb = (n: number): ContextChip[] =>
     Array.from({ length: n }, (_, i) => ({ type: 'kb', label: `kb-${i}`, value: `kb-${i}` }))
 
+  it('提交字段名就是引擎读的 kb_ids / kb_id（不是 knowledge_base_ids）', () => {
+    // 这条断言防的是"两端各用一个名字"的断点：引擎侧读的是
+    // python-engine/app/agent/workbench_context.py::context_ids(ctx, "kb") →
+    // `<name>_ids` / `<name>_id`。前端一旦改名（如 knowledge_base_ids），
+    // 网关照旧透传、引擎照旧解析，但解析结果恒为空 —— 表现就是"选了库却没有任何注入"。
+    const ctx = buildWorkbenchContext(manyKb(2)) as Record<string, unknown>
+    expect(Object.keys(ctx).sort()).toEqual(['kb_id', 'kb_ids'])
+    expect(ctx.kb_ids).toEqual(['kb-0', 'kb-1'])
+    expect(ctx).not.toHaveProperty('knowledge_base_ids')
+    expect(ctx).not.toHaveProperty('kbIds')
+  })
+
   it('多选提交：kb_ids 数组带上全部已选库（单值 kb_id 仍取首个）', () => {
     const ctx = buildWorkbenchContext(manyKb(3))
     expect(ctx).toEqual({ kb_id: 'kb-0', kb_ids: ['kb-0', 'kb-1', 'kb-2'] })

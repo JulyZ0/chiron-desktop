@@ -18,6 +18,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import json
 import os
 import platform
 import shutil
@@ -26,6 +27,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 # ── 配置 ──────────────────────────────────────────────────────
@@ -261,12 +263,54 @@ def derive_subsecret(app_secret: str, domain: str) -> str:
     return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
+def _gateway_base_url() -> str:
+    """本机网关的内部访问地址（给检索服务回查模型配置用）。"""
+    port = read_port("gateway") or SERVICES["gateway"]["port"]
+    return f"http://127.0.0.1:{port}"
+
+
+def fetch_gateway_knowledge_model(base_url: str, token: str, *, attempts: int = 8, delay: float = 0.5) -> dict:
+    """向网关取「这台机器上第一个可用 chat 模型」（`/v1/internal/knowledge-model`）。
+
+    为什么必须问网关而不是自己读 PG：模型与 provider key 的**权威组合**在网关
+    （`llm_models` + `llm_provider_keys` + 目录里的 provider 默认端点），本文件没有
+    解密能力也没有那份目录。自己拼一份的结果就是两边漂移 —— 而漂移的表现是
+    "管理员在 /models 配了模型，检索服务却说未配置"。
+
+    重试是必要的：网关刚 spawn 出来时端口可能还没监听，此刻直接判失败会让
+    pageindex 带着空模型起来，之后要等用户手动重启才恢复。
+    """
+    url = f"{base_url.rstrip('/')}/v1/internal/knowledge-model"
+    headers = {"X-Internal-Token": token, "Accept": "application/json"}
+    for i in range(max(1, attempts)):
+        try:
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                body = json.loads(resp.read().decode("utf-8") or "{}")
+            payload = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) else body
+            if isinstance(payload, dict) and payload.get("available") and payload.get("chat_model"):
+                return payload
+            # 网关回"库里没有可用模型"是**终态**：再重试也不会变，直接把原因带回去
+            if isinstance(payload, dict):
+                return {"available": False, "reason": str(payload.get("reason") or "")}
+        except Exception:  # noqa: BLE001 — 未就绪/连接被拒：等下一轮
+            pass
+        if i + 1 < attempts:
+            time.sleep(delay)
+    return {"available": False, "reason": "网关未就绪，无法读取 /models 的模型配置"}
+
+
 def _resolve_pageindex_env() -> dict:
     """检索服务需要的环境：内部令牌、索引/问答模型、原文与索引目录。
 
     这些都是**服务侧必需**、而引擎侧各自有默认值的项。缺令牌 ⇒ 每次调用 401；
     缺模型 ⇒ `/healthz` 回 `status=disabled`（引擎看到的就是"服务不可用"）；
     目录与引擎不一致 ⇒ worker 读不到原文，索引永远停在 indexing。
+
+    模型来源的优先级（见 docs 与 electron/local-stack.cjs 的同名实现）：
+      1. 显式 `KNOWLEDGE_SELFHOSTED_*`（管理员在「知识库」页钉死，最高）；
+      2. 网关 `llm_models`（= 管理员在 /models 配的，**权威源**）；
+      3. `LLM_MODEL` / `OPENAI_MODEL` 等启动环境（开发态便利，最低）。
     """
     env: dict = {}
 
@@ -277,16 +321,49 @@ def _resolve_pageindex_env() -> dict:
     if internal_token:
         env["INTERNAL_TOKEN"] = internal_token
 
-    # 桌面/单机只有一份模型配置，没有理由让用户为索引单独再配一遍：
-    # 与 electron/local-stack.cjs 的 buildKnowledgeServiceEnv 同一套映射口径。
-    chat_model = os.environ.get("OPENAI_MODEL") or os.environ.get("LLM_MODEL") or DEFAULT_ENV.get("LLM_MODEL") or ""
+    # 检索服务在 env 里找不到模型时会回查网关（惰性、带短负缓存）。地址必须给它：
+    # 少了它，Electron 那种"检索服务先于网关启动"的顺序永远读不到 /models 的配置。
+    gateway_base = _gateway_base_url()
+    env["GATEWAY_INTERNAL_URL"] = gateway_base
+
+    explicit_chat = (
+        os.environ.get("KNOWLEDGE_SELFHOSTED_CHAT_MODEL")
+        or DEFAULT_ENV.get("KNOWLEDGE_SELFHOSTED_CHAT_MODEL")
+        or ""
+    ).strip()
+    explicit_index = (
+        os.environ.get("KNOWLEDGE_SELFHOSTED_INDEX_MODEL")
+        or DEFAULT_ENV.get("KNOWLEDGE_SELFHOSTED_INDEX_MODEL")
+        or ""
+    ).strip()
+
+    chat_model = explicit_chat
+    index_model = explicit_index
+    base_url = ""
+    api_key = ""
+
+    if not (chat_model and index_model) and internal_token:
+        from_gateway = fetch_gateway_knowledge_model(gateway_base, internal_token)
+        if from_gateway.get("available"):
+            chat_model = chat_model or str(from_gateway.get("chat_model") or "")
+            index_model = index_model or str(from_gateway.get("index_model") or chat_model)
+            base_url = str(from_gateway.get("base_url") or "")
+            api_key = str(from_gateway.get("api_key") or "")
+        elif from_gateway.get("reason"):
+            print(yellow(f"  检索服务模型未解析：{from_gateway['reason']}"))
+            print(gray("    （检索服务会在网关就绪后自动重试；也可在「知识库」页显式覆盖）"))
+
+    # 最低优先：启动环境里的模型配置（开发态便利）。**不覆盖**上面两级已定的值。
+    chat_model = chat_model or (
+        os.environ.get("OPENAI_MODEL") or os.environ.get("LLM_MODEL") or DEFAULT_ENV.get("LLM_MODEL") or ""
+    )
     if chat_model:
-        env.setdefault("KNOWLEDGE_SELFHOSTED_CHAT_MODEL", chat_model)
-        env.setdefault("KNOWLEDGE_SELFHOSTED_INDEX_MODEL", chat_model)
-    base_url = os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
+        env["KNOWLEDGE_SELFHOSTED_CHAT_MODEL"] = chat_model
+        env["KNOWLEDGE_SELFHOSTED_INDEX_MODEL"] = index_model or chat_model
+    base_url = base_url or os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
     if base_url:
         env["KNOWLEDGE_SELFHOSTED_LLM_BASE_URL"] = base_url
-    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    api_key = api_key or os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
     if api_key:
         env["KNOWLEDGE_SELFHOSTED_LLM_API_KEY"] = api_key
 

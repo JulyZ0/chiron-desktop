@@ -26,6 +26,7 @@ from app.agent.prompt_sections import (
     GOAL_CONTEXT,
     HARNESS_SUFFIX,
     HOOK_CONTEXT,
+    KNOWLEDGE,
     MEMORY,
     NARRATION_SUFFIX,
     PLANNING_SUFFIX,
@@ -103,6 +104,9 @@ def build_system_sections(
         (task.workbench_context or {}).get("goal_enforce")
     )
     standalone[MEMORY] = task.memory_context
+    # 本轮知识库检索结果（用户 `@` 选中的库）。**空串 = 没选库**，与"选了但没命中"
+    # 严格区分 —— 后者注入的是一段"已检索、无命中"的说明（见 knowledge_context 的注释）。
+    standalone[KNOWLEDGE] = getattr(task, "knowledge_context", "") or ""
     # 批 G+ 批次 4：hook 的**上下文注入**。与记忆同样独立成消息，且只走**结构化字段**
     # （`additional_context`），不消费 stdout 正文 —— 见 `app/hooks/inject.py`。
     # 默认关 ⇒ 渲染返回空串 ⇒ 这里零行为变化。

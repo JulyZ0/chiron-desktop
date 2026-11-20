@@ -74,6 +74,15 @@ class AgentTask:
     #: 默认空串 ⇒ 没有待汇报条目时零行为变化；它**不进** checkpoint 快照
     #: （`_resume_task_meta` 不含它）—— 汇报是"这一轮取回一次的增量"，续跑应重新取。
     report_context: str = ""
+    #: 本轮**知识库检索结果**（`app/agent/knowledge_context.py::collect` 的产物）。
+    #:
+    #: 为什么必须有这个字段：对话实际走 `POST /v1/agent/submit → AgentRuntime.run()`，
+    #: 而这条路上过去没有任何地方读 `workbench_context.kb_ids` —— 用户在 `@` 里选了库、
+    #: 网关也透传了，模型却看不到任何资料（实测：回答里完全没有库内容）。
+    #: 与 `memory_context` 同款处置：**不拼进 `system_prompt`**（那是逐字稳定的前缀，
+    #: 拼进去会让整段前缀缓存失效），而是作为独立 system 消息插在记忆之后。
+    #: 空串 = 本轮没选库；非空但写着"没有命中" = 选了库但 0 命中（两者**不能混同**）。
+    knowledge_context: str = ""
     #: 本轮用户消息附带的**媒体库附件**（`{id,name,mime_type,url,is_image}`，由 Go 网关
     #: 从请求体透传）。引擎侧把它们变成模型可见内容：图片→`image_url` 块（尺寸/格式走
     #: `app.media.image_fit`、能力判定走 `app.agent.model_capabilities`）；docx/pdf→文本

@@ -951,6 +951,19 @@ function buildKnowledgeServiceEnv(info, options = {}) {
   const port = Number(options.port)
   if (isValidPort(port)) env.PAGEINDEX_PORT = String(port)
 
+  // **网关地址必须给检索服务**：它自己会在 env 里找不到模型时回查
+  // `GET /v1/internal/knowledge-model`（权威源 = PG 的 llm_models）。
+  //
+  // 为什么不是"启动器直接把模型 env 注入好就完事"：本进程的启动顺序是
+  // 「检索服务 → 引擎 → 网关」（引擎的 KNOWLEDGE_SERVICE_URL 只能在 spawn 时给全），
+  // 也就是**检索服务起来时网关还没起**。只靠启动期注入，用户首次启动必然拿到空模型
+  // （正是 /healthz 报"未配置自托管模型"的那条路径）。给了地址之后，检索服务在
+  // 首次真正需要模型时（healthz / 第一个检索请求）自己会拿到配置 —— 那时网关已经就绪。
+  const gatewayPort = Number(options.gatewayPort)
+  if (isValidPort(gatewayPort)) {
+    env.GATEWAY_INTERNAL_URL = `http://${DEFAULTS.DEFAULT_HOST}:${gatewayPort}`
+  }
+
   const dataPaths = localDataPaths(options.dataDir)
   for (const name of ['KNOWLEDGE_LOCAL_PATH', 'KNOWLEDGE_SELFHOSTED_ROOT']) {
     if (dataPaths[name] && (options.env || {})[name] === undefined) env[name] = dataPaths[name]
@@ -1524,7 +1537,13 @@ async function startLocalStack(options = {}) {
       ? options.knowledgePort || (await components.pickFreePort())
       : 0
     const knowledgeResult = options.knowledge
-      ? await startKnowledgeService(launcherResult.info, { ...options, port: knowledgePort })
+      ? await startKnowledgeService(launcherResult.info, {
+          ...options,
+          port: knowledgePort,
+          // 检索服务回查模型配置要用（见 buildKnowledgeServiceEnv 的说明）：
+          // 这一刻网关还没起，但地址已经定了（gatewayPort 在下面 startGateway 用同一值）。
+          gatewayPort,
+        })
       : { ok: false, reason: 'not-installed' }
     const engineResult = await startEngine(launcherResult.info, {
       ...options,
