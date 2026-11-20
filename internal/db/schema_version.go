@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/athenavi/chiron/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -34,18 +35,34 @@ var (
 	migrationQuotedRe   = regexp.MustCompile(`['"]([^'"]+)['"]`)
 )
 
-// MigrationsDir 返回迁移文件目录（可用 MIGRATIONS_DIR 覆盖；默认 migrations/versions）。
+// MigrationsDir 返回迁移文件目录（绝对路径）。
+//
+// 优先级：
+//  1. `MIGRATIONS_DIR`：显式指定，运维/测试的逃生口，压过一切推断；
+//  2. 资产根下 `migrations/versions`（见 config/resources.go 的优先级）。
+//
+// **不再是裸相对路径**：打包态进程 CWD 与安装目录无关，`migrations/versions`
+// 只会在"恰好从仓库根启动"时成立，实测表现为诊断页报
+// `read migrations dir migrations\versions: cannot find the path`。
+// 找不到时返回空串 —— 由 CheckSchemaVersion 给出"未找到 + 查过哪些地方"的错误，
+// 而不是拿空路径去 os.ReadDir 得到一个 `open : no such file`。
 func MigrationsDir() string {
-	if v := os.Getenv("MIGRATIONS_DIR"); v != "" {
+	if v := strings.TrimSpace(os.Getenv(config.MigrationsDirEnv)); v != "" {
 		return v
 	}
-	return filepath.Join("migrations", "versions")
+	return config.ResourcePath("migrations/versions")
 }
 
 // ParseMigrationHead 解析目录下所有迁移，返回期望的 head revision。
 // head 的判定：出现在 `revision` 中、且未被任何迁移的 `down_revision` 引用。
 // 零个/多个 head 都返回错误——迁移链分叉或目录为空属于部署问题，必须显式暴露。
 func ParseMigrationHead(dir string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		// 空目录名不是"读目录失败"，而是"这套资产根本没被找到"：两者 fix 完全不同
+		//（前者查权限/挂载，后者查安装包/CHIRON_RESOURCES_DIR），不能混成一句。
+		return "", fmt.Errorf("migration dir not resolved: %s not found (checked %s, <exe>/resources, <exe>, repository root); set %s",
+			"migrations/versions", config.ResourcesDirEnv, config.MigrationsDirEnv)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", fmt.Errorf("read migrations dir %s: %w", dir, err)

@@ -477,8 +477,17 @@ func NewGatewayRouter(
 	// 不配置时不注册任何东西，"GET /" 仍是 404 —— 行为与引入前完全一致。
 	// 必须放在所有 API 路由之后：ServeMux 按最具体的 pattern 匹配，不依赖注册顺序，
 	// 但把兜底放在最后读起来才不会被误认为"吞掉 API"。
+	//
+	// 未显式配置时用 resolver 探测（config.WebRoot）：打包态是 `<安装根>\resources\web`
+	// （Go 进程打不开 asar，只能读这份）、开发态是 `frontend-vue/dist`。以前这里空串
+	// 就等于"不托管"，而打包态又没人保证 `CHIRON_WEB_ROOT` 一定注入 —— 分享链接于是
+	// 静默退化成 `file://`。探测不到仍然是空串（不托管），不会让网关起不来。
 	if cfg != nil {
-		mountSPA(mux, cfg.WebRoot)
+		webRoot := strings.TrimSpace(cfg.WebRoot)
+		if webRoot == "" {
+			webRoot = config.WebRoot()
+		}
+		mountSPA(mux, webRoot)
 	}
 
 	// Wrap main mux with public middleware.
