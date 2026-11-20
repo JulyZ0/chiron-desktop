@@ -458,7 +458,7 @@ onMounted(load)
 .share-detail-mask {
   position: fixed;
   inset: 0;
-  background: rgb(0 0 0 / 35%);
+  background: var(--bg-overlay);
   display: flex;
   justify-content: flex-end;
   z-index: var(--z-drawer);

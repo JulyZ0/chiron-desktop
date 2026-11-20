@@ -1567,10 +1567,10 @@ function formatSize(bytes: number): string {
 .kb-stats-windows { display: flex; gap: 32px; flex-wrap: wrap; }
 .kb-stats-window-title { font-weight: var(--fw-semibold); margin-bottom: 8px; }
 .kb-stats-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
-.kb-stats-diagnosis { margin: 12px 0 0; padding-left: 18px; color: var(--text-secondary); font-size: 13px; }
+.kb-stats-diagnosis { margin: 12px 0 0; padding-inline-start: 18px; color: var(--text-secondary); font-size: 13px; }
 .kb-stats-failures { margin-top: 12px; }
 .kb-stats-failures-title { font-weight: var(--fw-semibold); margin-bottom: 6px; }
-.kb-stats-failures ul { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.kb-stats-failures ul { margin: 0; padding-inline-start: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
 .kb-stats-failure-msg { margin: 0 8px; color: var(--text-secondary); font-size: 13px; }
 .kb-stats-failure-count { color: var(--text-tertiary); font-size: 12px; }
 .kb-stats-empty { color: var(--text-secondary); font-size: 13px; margin: 0; }
