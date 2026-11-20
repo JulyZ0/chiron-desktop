@@ -171,7 +171,7 @@ _NO_RISK_SELF_REPORT_RE = re.compile(
 )
 
 
-def _summarize(text: str, limit: int = MAX_REASON_LOG_CHARS) -> str:
+def summarize_reason(text: str, limit: int = MAX_REASON_LOG_CHARS) -> str:
     """把评审理由压成单行摘要（**只**用于日志，绝不带代码原文）。"""
     one_line = " ".join((text or "").split())
     return one_line[:limit]
@@ -271,7 +271,7 @@ def parse_assessment(text: str) -> GuardianAssessment:
     if raw_outcome == "deny" and self_reported_no_risk:
         logger.warning(
             "guardian contradiction (deny but no risk reported) -> treated as allow: %s",
-            _summarize(rationale),
+            summarize_reason(rationale),
         )
         return GuardianAssessment("allow", risk, rationale, contradictory=True)
 
@@ -330,7 +330,7 @@ async def review_tool_call(
         assessment.risk_level,
         assessment.failed,
         assessment.contradictory,
-        _summarize(assessment.rationale),
+        summarize_reason(assessment.rationale),
     )
     return assessment
 

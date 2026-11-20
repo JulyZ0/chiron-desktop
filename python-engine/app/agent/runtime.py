@@ -4464,6 +4464,7 @@ class AgentRuntime:
         # 3. 评审没做成 / 解析失败 / 服务端要求人工 ⇒ fail-open 回退人工审批，绝不 deny。
         if verdict.action == "confirm":
             from app.agent.guardian import may_release as guardian_may_release
+            from app.agent.guardian import summarize_reason
 
             # **`ask` 模式必须跳过 guardian**。
             #
@@ -4500,7 +4501,7 @@ class AgentRuntime:
                     verdict.level,
                     level_is_declared,
                     assessment.risk_level,
-                    assessment.rationale,
+                    summarize_reason(assessment.rationale),
                 )
                 verdict = ToolVerdict(
                     "allow",
@@ -4517,7 +4518,7 @@ class AgentRuntime:
                     tool_name,
                     verdict.level,
                     assessment.risk_level,
-                    assessment.rationale,
+                    summarize_reason(assessment.rationale),
                 )
                 return {
                     "error": (
@@ -4539,7 +4540,7 @@ class AgentRuntime:
                     broker_requires_approval,
                     "none" if assessment is None else assessment.outcome,
                     bool(assessment is not None and assessment.failed),
-                    "n/a" if assessment is None else assessment.rationale[:120],
+                    "n/a" if assessment is None else summarize_reason(assessment.rationale, 120),
                 )
         if verdict.action == "confirm":
             if not allow_approval:
