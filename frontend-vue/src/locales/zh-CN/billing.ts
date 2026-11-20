@@ -82,6 +82,7 @@ export default {
   prices_import_skipped_row: "第 {row} 行：{reason}",
   prices_import_skipped_more: "另有 {n} 条跳过未显示。",
   price_sources_title: "价格源状态",
+  price_sources_empty: "还没有任何同步记录：价格同步可能未运行（MODEL_PRICE_SYNC=off，或引擎未启动）。",
   price_sources_summary: "共 {total} 个源：{ok} 正常 / {empty} 空结果 / {failed} 失败；最近一轮共拉到 {rows} 条",
   price_sources_stale: "所有源都超过 2 小时没有更新：同步循环可能已停止，或引擎未运行。",
   price_sources_meta: "{rows} 条 / {ms}ms",

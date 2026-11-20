@@ -82,6 +82,7 @@ export default {
   prices_import_skipped_row: "Row {row}: {reason}",
   prices_import_skipped_more: "{n} more skipped rows not shown.",
   price_sources_title: "Price source status",
+  price_sources_empty: "No sync record yet: price sync may not be running (MODEL_PRICE_SYNC=off, or the engine is stopped).",
   price_sources_summary: "{total} sources: {ok} ok / {empty} empty / {failed} failed; {rows} rows fetched in the last round",
   price_sources_stale: "No source has updated for over 2 hours: the sync loop may be stopped or the engine is not running.",
   price_sources_meta: "{rows} rows / {ms}ms",

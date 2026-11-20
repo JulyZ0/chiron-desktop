@@ -82,6 +82,7 @@ export default {
   prices_import_skipped_row: "الصف {row}: {reason}",
   prices_import_skipped_more: "{n} صفًا متخطى إضافيًا غير معروض.",
   price_sources_title: "حالة مصادر الأسعار",
+  price_sources_empty: "لا يوجد سجل مزامنة بعد: قد لا تكون مزامنة الأسعار تعمل (MODEL_PRICE_SYNC=off أو المحرك متوقف).",
   price_sources_summary: "{total} مصادر: {ok} سليم / {empty} فارغ / {failed} فاشل؛ جُلبت {rows} صفًا في الجولة الأخيرة",
   price_sources_stale: "لم يُحدَّث أي مصدر منذ أكثر من ساعتين: قد تكون حلقة المزامنة متوقفة أو المحرك لا يعمل.",
   price_sources_meta: "{rows} صفًا / {ms}ms",

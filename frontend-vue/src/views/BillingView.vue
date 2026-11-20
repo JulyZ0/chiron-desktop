@@ -660,7 +660,7 @@ async function loadPriceSources() {
              失败原因直接摊开（已脱敏、≤200 字符）—— 用户实测 pricetoken 超时时，
              这是他唯一能看到的证据。 -->
         <div
-          v-if="priceSources && priceSources.sources.length"
+          v-if="priceSources"
           class="price-sources"
         >
           <div class="price-sources-head">
@@ -681,7 +681,18 @@ async function loadPriceSources() {
           >
             {{ $t('billing.price_sources_stale') }}
           </p>
-          <ul class="price-sources-list">
+          <!-- 一条记录都没有：同步循环可能从未跑过（MODEL_PRICE_SYNC=off / 引擎未启动）。
+               这时不能显示"0 个源全部正常"，要让用户知道"没有证据"本身也是信息。 -->
+          <p
+            v-if="!priceSources.sources.length"
+            class="price-sources-stale"
+          >
+            {{ $t('billing.price_sources_empty') }}
+          </p>
+          <ul
+            v-else
+            class="price-sources-list"
+          >
             <li
               v-for="src in priceSources.sources"
               :key="src.source"
