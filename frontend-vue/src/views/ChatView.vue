@@ -1556,13 +1556,13 @@ const trajectoryToken = ref(0)
  * 三件事的取值方式接进去：当前会话 id、事件归属的 run 状态（写作用域优先）、
  * 「本轮主 SSE 是否开着」（开着就跳过，避免同一帧被两个连接各送一份）。
  *
- * 建连入口只有一处（composable 内的 `watch(activeSessionId)`），单写者由
+ * 建连入口只有一处（composable 内的 `watch(activeSessionId)`）：这里**刻意不取**
+ * `ensureSubagentStream`，视图层没有第二条建连路径。单写者由
  * `composables/__tests__/useSubagentStream.spec.ts` 钉住。
  */
 const {
   subagentLiveEvents,
   pushSubagentEvent,
-  ensureSubagentStream,
   disposeSubagentStream,
 } = useSubagentStream({
   sessionId: () => activeSessionId.value,
