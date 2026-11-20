@@ -114,6 +114,14 @@ func registerAdminRoutes(
 	// 运行时监控统一数据源（性能 / 队列 / 缓存）。平台读门禁：回的是全平台运行事实
 	// （别家租户的 run 计数、引擎队列深度），租户 admin 的 admin:read 不该看到。
 	mux.Handle("GET /v1/admin/monitor/overview", authMW(rlMW(platformReadMW(adminStrip))))
+	// P2：历史趋势（跨副本、跨重启的分钟聚合）—— 同样是平台级运行事实。
+	mux.Handle("GET /v1/admin/monitor/history", authMW(rlMW(platformReadMW(adminStrip))))
+
+	// P0-4：保留期配置（读）/ 手动触发一轮（写）。
+	// 读用 platformReadMW：回的是全平台的清理口径与回收量；
+	// 写用 platformWriteMW —— 真实清理会删 usage_events / 分享 / 检查点分片。
+	mux.Handle("GET /v1/admin/retention", authMW(rlMW(platformReadMW(adminStrip))))
+	mux.Handle("POST /v1/admin/retention/run", authMW(rlMW(platformWriteMW(adminStrip))))
 
 	// LLM 熔断读数 / 手动恢复。
 	// 读用 platformReadMW（回的是全局运行状态，租户 admin 不该看见别家的 provider 熔断）；

@@ -642,12 +642,15 @@ func MonitoringMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		monitor.IncRequests()
 		start := time.Now()
+		// 路由分类在**请求开始时**取定（r.URL.Path 之后不会被改写），供分钟聚合
+		// 按 route_class 分组；低基数，见 routeClassOf。
+		class := routeClassOf(r.URL.Path)
 		sw := &monitorStatusWriter{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
 			monitor.DecRequests()
 			d := time.Since(start)
 			monitor.RequestHistogram.Record(d)
-			monitor.RequestWindowStats.Record(d, sw.status)
+			monitor.RequestWindowStats.RecordClass(class, d, sw.status)
 		}()
 		// panic 的请求实际回给客户端的是 500（由外层 RecoverMiddleware 写出），
 		// 但此刻 sw 还没写过状态码。先把它记成 500 再放行 panic，
