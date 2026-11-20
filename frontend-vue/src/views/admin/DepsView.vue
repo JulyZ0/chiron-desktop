@@ -47,7 +47,7 @@
         <Tag :color="jobColor">
           {{ $t(`admin.deps_job_${job.status}`) }}
         </Tag>
-        <span class="job-target">{{ job.kind === 'install' ? 'pip install' : 'pip uninstall' }} {{ job.target }}</span>
+        <span class="job-target">{{ jobCommand }}</span>
       </div>
       <Progress
         :percent="job.progress"
@@ -64,6 +64,72 @@
         v-if="job.output"
         class="job-log"
       >{{ job.output }}</pre>
+    </Card>
+
+    <!-- 快照与回滚：装/卸包之前引擎会自动落一份，这里也能手动拍 -->
+    <Card
+      class="block"
+      size="small"
+      :title="$t('admin.deps_snapshot_title')"
+    >
+      <template #extra>
+        <Button
+          size="small"
+          type="primary"
+          :disabled="busy || restoring || snapshotCreating"
+          @click="openSnapshotModal"
+        >
+          {{ $t('admin.deps_snapshot_create') }}
+        </Button>
+      </template>
+      <p class="card-desc">
+        {{ $t('admin.deps_snapshot_desc', { retention: snapshotRetention }) }}
+      </p>
+      <Alert
+        v-if="snapshotError"
+        class="block-tight"
+        type="error"
+        show-icon
+        :message="snapshotError"
+      />
+      <Spin :spinning="snapshotLoading">
+        <Table
+          :columns="snapshotColumns"
+          :data-source="snapshots"
+          :pagination="{ pageSize: 5, showSizeChanger: false, hideOnSinglePage: true }"
+          :locale="{ emptyText: $t('admin.deps_snapshot_empty') }"
+          row-key="id"
+          size="small"
+        >
+          <template #bodyCell="{ column, record }">
+            <template v-if="column.dataIndex === 'created_at'">
+              <span class="pkg-version">{{ formatSnapshotTime((record as DepSnapshot).created_at) }}</span>
+            </template>
+            <template v-else-if="column.dataIndex === 'trigger'">
+              <span class="snapshot-trigger">{{ (record as DepSnapshot).trigger }}</span>
+              <div
+                v-if="(record as DepSnapshot).label"
+                class="snapshot-label"
+              >
+                {{ (record as DepSnapshot).label }}
+              </div>
+            </template>
+            <template v-else-if="column.dataIndex === 'package_count'">
+              <span class="pkg-version">{{ (record as DepSnapshot).package_count }}</span>
+            </template>
+            <template v-else-if="column.dataIndex === 'actions'">
+              <Button
+                size="small"
+                :loading="restoreTarget?.id === (record as DepSnapshot).id && (restorePreviewing || restoring)"
+                :disabled="busy || restoring || snapshotCreating"
+                @click="openRestore(record as DepSnapshot)"
+              >
+                {{ $t('admin.deps_restore') }}
+              </Button>
+            </template>
+          </template>
+        </Table>
+      </Spin>
     </Card>
 
     <!-- 已安装包 -->
@@ -242,27 +308,208 @@
         {{ $t('admin.deps_cmd_hint') }}
       </p>
     </Card>
+
+    <!-- 安装二次确认：装包会改动整台机器共享的运行环境，点一下就走太轻率 -->
+    <Modal
+      v-model:open="installModalOpen"
+      :title="$t('admin.deps_install_confirm_title')"
+      :ok-text="$t('admin.deps_install_confirm_ok')"
+      :cancel-text="$t('common.cancel')"
+      :confirm-loading="installSubmitting"
+      class="install-confirm"
+      @ok="confirmInstall"
+    >
+      <p class="modal-line">
+        {{ $t('admin.deps_install_confirm_spec') }}
+      </p>
+      <pre class="modal-spec">{{ pendingSpec }}</pre>
+      <Alert
+        class="block-tight"
+        type="warning"
+        show-icon
+        :message="$t('admin.deps_install_confirm_warning')"
+      />
+      <p class="modal-hint">
+        {{ $t('admin.deps_install_confirm_snapshot') }}
+      </p>
+    </Modal>
+
+    <!-- 手动创建快照 -->
+    <Modal
+      v-model:open="snapshotModalOpen"
+      :title="$t('admin.deps_snapshot_create_title')"
+      :ok-text="$t('admin.deps_snapshot_create')"
+      :cancel-text="$t('common.cancel')"
+      :confirm-loading="snapshotCreating"
+      class="snapshot-create"
+      @ok="submitSnapshot"
+    >
+      <p class="modal-line">
+        {{ $t('admin.deps_snapshot_label_desc') }}
+      </p>
+      <Input
+        v-model:value="snapshotLabel"
+        :placeholder="$t('admin.deps_snapshot_label_placeholder')"
+        :maxlength="120"
+        @press-enter="submitSnapshot"
+      />
+    </Modal>
+
+    <!-- 恢复前的差异确认：必须让用户看到"会卸载什么" -->
+    <Modal
+      v-model:open="restoreModalOpen"
+      :title="$t('admin.deps_restore_title', { id: restoreTarget?.id ?? '' })"
+      :ok-text="$t('admin.deps_restore_confirm')"
+      :cancel-text="$t('common.cancel')"
+      :ok-button-props="{ danger: true, disabled: !restoreDiff || restoreDiff.exceeds_limit }"
+      :confirm-loading="restoring"
+      class="restore-confirm"
+      @ok="confirmRestore"
+    >
+      <Spin :spinning="restorePreviewing">
+        <Alert
+          v-if="restoreError"
+          class="block-tight"
+          type="error"
+          show-icon
+          :message="restoreError"
+        />
+        <template v-if="restoreDiff">
+          <p class="modal-line">
+            {{ $t('admin.deps_restore_summary', {
+              install: restoreDiff.install_count,
+              uninstall: restoreDiff.uninstall_count,
+              changed: restoreDiff.changed.length,
+            }) }}
+          </p>
+          <Alert
+            v-if="restoreDiff.exceeds_limit"
+            class="block-tight"
+            type="error"
+            show-icon
+            :message="$t('admin.deps_restore_too_many', { limit: restoreDiff.limit, count: restoreDiff.install_count })"
+          />
+          <Alert
+            v-else-if="restoreDiff.total_changes === 0"
+            class="block-tight"
+            type="info"
+            show-icon
+            :message="$t('admin.deps_restore_noop')"
+          />
+          <Alert
+            v-else
+            class="block-tight"
+            type="warning"
+            show-icon
+            :message="$t('admin.deps_restore_warning')"
+          />
+
+          <div
+            v-if="restoreDiff.extra.length"
+            class="diff-block"
+          >
+            <div class="diff-title">
+              {{ $t('admin.deps_restore_extra', { count: restoreDiff.extra.length }) }}
+            </div>
+            <div class="diff-items">
+              <Tag
+                v-for="pkg in restoreDiff.extra.slice(0, 12)"
+                :key="`extra-${pkg.name}`"
+                color="error"
+              >
+                {{ pkg.name }} {{ pkg.version }}
+              </Tag>
+              <span
+                v-if="restoreDiff.extra.length > 12"
+                class="diff-more"
+              >{{ $t('admin.deps_snapshot_more', { count: restoreDiff.extra.length - 12 }) }}</span>
+            </div>
+          </div>
+          <div
+            v-if="restoreDiff.missing.length"
+            class="diff-block"
+          >
+            <div class="diff-title">
+              {{ $t('admin.deps_restore_missing', { count: restoreDiff.missing.length }) }}
+            </div>
+            <div class="diff-items">
+              <Tag
+                v-for="pkg in restoreDiff.missing.slice(0, 12)"
+                :key="`missing-${pkg.name}`"
+                color="processing"
+              >
+                {{ pkg.name }}=={{ pkg.version }}
+              </Tag>
+              <span
+                v-if="restoreDiff.missing.length > 12"
+                class="diff-more"
+              >{{ $t('admin.deps_snapshot_more', { count: restoreDiff.missing.length - 12 }) }}</span>
+            </div>
+          </div>
+          <div
+            v-if="restoreDiff.changed.length"
+            class="diff-block"
+          >
+            <div class="diff-title">
+              {{ $t('admin.deps_restore_changed', { count: restoreDiff.changed.length }) }}
+            </div>
+            <div class="diff-items">
+              <Tag
+                v-for="item in restoreDiff.changed.slice(0, 12)"
+                :key="`changed-${item.name}`"
+                color="warning"
+              >
+                {{ item.name }} {{ item.from }} → {{ item.to }}
+              </Tag>
+              <span
+                v-if="restoreDiff.changed.length > 12"
+                class="diff-more"
+              >{{ $t('admin.deps_snapshot_more', { count: restoreDiff.changed.length - 12 }) }}</span>
+            </div>
+          </div>
+        </template>
+      </Spin>
+    </Modal>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { Alert, Button, Card, Empty, Input, Popconfirm, Progress, Spin, Table, Tag, message } from 'ant-design-vue'
+import {
+  Alert,
+  Button,
+  Card,
+  Empty,
+  Input,
+  Modal,
+  Popconfirm,
+  Progress,
+  Spin,
+  Table,
+  Tag,
+  message,
+} from 'ant-design-vue'
 import { ReloadOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
 import {
+  createDepSnapshot,
   getDepJob,
   installDep,
   isNewerVersion,
   isTerminalJob,
+  listDepSnapshots,
   listDeps,
+  previewDepRestore,
+  restoreDepSnapshot,
   searchPypi,
   uninstallDep,
   validatePipSpec,
   type DepJob,
   type DepListResult,
   type DepPackage,
+  type DepRestoreDiff,
   type DepSearchResult,
+  type DepSnapshot,
   type PypiResult,
 } from '../../api/deps'
 import { serverErrorDetail } from '../../utils/apiError'
@@ -286,6 +533,28 @@ const job = ref<DepJob | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 let pollAttempts = 0
 
+// ── 快照 ──
+const snapshots = ref<DepSnapshot[]>([])
+const snapshotRetention = ref(20)
+const snapshotLoading = ref(false)
+const snapshotError = ref('')
+const snapshotCreating = ref(false)
+const snapshotLabel = ref('')
+const snapshotModalOpen = ref(false)
+
+// ── 恢复（两步：先 dry_run 看差异，再确认执行）──
+const restoreTarget = ref<DepSnapshot | null>(null)
+const restoreDiff = ref<DepRestoreDiff | null>(null)
+const restoreError = ref('')
+const restoreModalOpen = ref(false)
+const restorePreviewing = ref(false)
+const restoring = ref(false)
+
+// ── 安装二次确认 ──
+const pendingSpec = ref('')
+const installModalOpen = ref(false)
+const installSubmitting = ref(false)
+
 /** 一次安装任务的轮询上限：5 分钟（引擎侧安装超时也是 300s）。 */
 const MAX_POLL_ATTEMPTS = 250
 const POLL_INTERVAL_MS = 1200
@@ -297,7 +566,23 @@ const columns = computed(() => [
   { title: t('admin.deps_col_actions'), dataIndex: 'actions', key: 'actions', width: 120 },
 ])
 
+const snapshotColumns = computed(() => [
+  { title: t('admin.deps_snapshot_col_time'), dataIndex: 'created_at', key: 'created_at', width: 170 },
+  { title: t('admin.deps_snapshot_col_trigger'), dataIndex: 'trigger', key: 'trigger' },
+  { title: t('admin.deps_snapshot_col_count'), dataIndex: 'package_count', key: 'package_count', width: 100 },
+  { title: t('admin.deps_col_actions'), dataIndex: 'actions', key: 'actions', width: 110 },
+])
+
 const busy = computed(() => !!job.value && !isTerminalJob(job.value.status))
+
+/** 任务卡片的标题行：install/uninstall 显示命令，restore 显示回滚到哪份快照。 */
+const jobCommand = computed(() => {
+  const current = job.value
+  if (!current) return ''
+  if (current.kind === 'install') return `pip install ${current.target}`
+  if (current.kind === 'uninstall') return `pip uninstall ${current.target}`
+  return `${t('admin.deps_restore')} ${current.target}`
+})
 
 const specError = computed(() => validatePipSpec(manualSpec.value))
 
@@ -369,6 +654,97 @@ async function reload() {
   }
 }
 
+async function loadSnapshots() {
+  snapshotLoading.value = true
+  snapshotError.value = ''
+  try {
+    const result = await listDepSnapshots()
+    snapshots.value = result.snapshots
+    snapshotRetention.value = result.retention
+  } catch (err) {
+    snapshotError.value = serverErrorDetail(err, t('admin.deps_snapshot_load_failed'))
+  } finally {
+    snapshotLoading.value = false
+  }
+}
+
+/** 时间戳按本地时间展示：快照 id 是 UTC，用户看的是本地。 */
+function formatSnapshotTime(seconds: number): string {
+  if (!seconds) return ''
+  const date = new Date(seconds * 1000)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (value: number) => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+function openSnapshotModal() {
+  snapshotLabel.value = ''
+  snapshotModalOpen.value = true
+}
+
+async function submitSnapshot() {
+  snapshotCreating.value = true
+  try {
+    const created = await createDepSnapshot(snapshotLabel.value.trim())
+    snapshotModalOpen.value = false
+    message.success(t('admin.deps_snapshot_created', { count: created.package_count }))
+    await loadSnapshots()
+  } catch (err) {
+    message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
+  } finally {
+    snapshotCreating.value = false
+  }
+}
+
+/** 第一步：只算差异（dry_run），把"会卸载什么"摆在用户面前。 */
+async function openRestore(snapshot: DepSnapshot) {
+  restoreTarget.value = snapshot
+  restoreDiff.value = null
+  restoreError.value = ''
+  restoreModalOpen.value = true
+  restorePreviewing.value = true
+  try {
+    const preview = await previewDepRestore(snapshot.id)
+    restoreDiff.value = preview.diff
+  } catch (err) {
+    restoreError.value = serverErrorDetail(err, t('admin.deps_restore_preview_failed'))
+  } finally {
+    restorePreviewing.value = false
+  }
+}
+
+/** 第二步：确认后真的执行（后台任务 + 轮询，与安装同一套）。 */
+async function confirmRestore() {
+  const target = restoreTarget.value
+  if (!target || restorePreviewing.value) return
+  if (!restoreDiff.value || restoreDiff.value.exceeds_limit) return
+  if (restoreDiff.value.total_changes === 0) {
+    restoreModalOpen.value = false
+    message.info(t('admin.deps_restore_noop'))
+    return
+  }
+  restoring.value = true
+  try {
+    const result = await restoreDepSnapshot(target.id)
+    restoreModalOpen.value = false
+    if (result.job) {
+      stopPolling()
+      job.value = result.job
+      pollAttempts = 0
+      schedulePoll()
+    } else {
+      message.info(t('admin.deps_restore_noop'))
+      await reload()
+      await loadSnapshots()
+    }
+  } catch (err) {
+    message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
+  } finally {
+    restoring.value = false
+  }
+}
+
 async function doSearch() {
   const q = query.value.trim()
   if (!q) return
@@ -384,6 +760,29 @@ async function doSearch() {
   }
 }
 
+/**
+ * 安装前的二次确认。
+ *
+ * 装包会改动**整台机器共享**的运行环境（引擎自己的 venv），点一下就执行太轻率：
+ * 用户至少该看到"装的是什么规格"，并知道"装完要重启才生效"。
+ */
+function askInstall(spec: string) {
+  const invalid = validatePipSpec(spec)
+  if (invalid) {
+    message.error(t(`admin.deps_error_${invalid}`))
+    return
+  }
+  pendingSpec.value = spec.trim()
+  installModalOpen.value = true
+}
+
+function confirmInstall() {
+  const spec = pendingSpec.value
+  installModalOpen.value = false
+  if (!spec) return
+  void startInstall(spec)
+}
+
 /** 创建安装任务并开始轮询；`spec` 必须已通过校验（两处入口都先校验）。 */
 async function startInstall(spec: string) {
   const invalid = validatePipSpec(spec)
@@ -392,23 +791,26 @@ async function startInstall(spec: string) {
     return
   }
   stopPolling()
+  installSubmitting.value = true
   try {
     job.value = await installDep(spec.trim())
     pollAttempts = 0
     schedulePoll()
   } catch (err) {
     message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
+  } finally {
+    installSubmitting.value = false
   }
 }
 
 function installFromSearch(item: PypiResult) {
   // 用 `==` 钉住搜索结果里的版本：用户点的就是"这个版本"，不该被上游重新解析成别的。
-  void startInstall(`${item.name}==${item.version}`)
+  askInstall(`${item.name}==${item.version}`)
 }
 
 function submitManual() {
   if (specError.value) return
-  void startInstall(manualSpec.value)
+  askInstall(manualSpec.value)
 }
 
 function schedulePoll() {
@@ -434,8 +836,10 @@ async function pollJob() {
       } else {
         message.error(t('admin.deps_job_failed_msg', { target: updated.target }))
       }
-      // 装/卸成功后包清单必然变了；失败也可能装了一半，刷新一次更接近事实。
+      // 装/卸/恢复之后包清单必然变了；失败也可能装了一半，刷新一次更接近事实。
       await reload()
+      // 每次变更前引擎都会自动落一份快照，所以快照列表也变了。
+      await loadSnapshots()
       return
     }
   } catch {
@@ -459,6 +863,8 @@ async function uninstall(name: string) {
     await uninstallDep(name)
     message.success(t('admin.deps_uninstall_done', { name }))
     await reload()
+    // 卸载前也会自动拍快照
+    await loadSnapshots()
   } catch (err) {
     message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
   } finally {
@@ -466,7 +872,10 @@ async function uninstall(name: string) {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  void reload()
+  void loadSnapshots()
+})
 onUnmounted(stopPolling)
 </script>
 
@@ -515,6 +924,32 @@ onUnmounted(stopPolling)
 .filter-input { width: 220px; }
 .pkg-name { font-weight: var(--fw-medium); word-break: break-all; }
 .pkg-version { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+.snapshot-trigger {
+  font-size: 12px;
+  color: var(--text-secondary);
+  word-break: break-all;
+  font-variant-numeric: tabular-nums;
+}
+.snapshot-label { margin-top: 2px; font-size: 12px; color: var(--text-primary); word-break: break-word; }
+
+/* Modal 内容（差异摘要）：Modal 走 Teleport 到 body，所以这些类不能依赖父级作用域变量 */
+.modal-line { margin: 0 0 6px; font-size: 12px; color: var(--text-secondary); }
+.modal-spec {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  border: var(--hairline-width) solid var(--border);
+  background: var(--bg-subtle, transparent);
+  font-size: 12px;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+.modal-hint { margin: 8px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.diff-block { margin-top: 10px; }
+.diff-title { margin-bottom: 4px; font-size: 12px; font-weight: var(--fw-medium); }
+.diff-items { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.diff-more { font-size: 12px; color: var(--text-tertiary); }
 
 .search-row, .cmd-row { display: flex; gap: 8px; align-items: center; }
 .search-row { margin-bottom: 10px; }

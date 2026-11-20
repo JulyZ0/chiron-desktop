@@ -547,6 +547,14 @@ class Settings(BaseSettings):
     # 审计静默全丢（四处都 try/except 只告警）。桌面壳在 `buildEngineEnv` 里下发。
     log_dir: str = ""
 
+    # ── 持久数据目录 ──
+    # 需要跨重启保留的引擎侧文件（目前是 deps 快照 `deps-snapshots/*.json`，见
+    # `app/api/deps.py`）都落在它下面。默认空 = 以 cwd 为根的 `data/`（与 media/skills
+    # 的默认根同一个）。**打包态必须显式给绝对路径**：桌面壳把引擎装在
+    # `Program Files\Chiron\resources\python-engine`（只读），相对目录写不进去，
+    # 快照会静默失败。桌面壳与 Go 侧的 `CHIRON_DATA_DIR` 是同一个目录语义。
+    data_dir: str = ""
+
     # ── 实例标识（K8s 注入）──
     pod_name: str = ""
     instance_id: str = ""

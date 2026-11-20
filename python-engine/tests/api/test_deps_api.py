@@ -37,15 +37,18 @@ BASE = "/internal/deps"
 
 
 @pytest.fixture(autouse=True)
-def _reset_deps_state(monkeypatch):
-    """每个用例都从"没有任务、没有缓存"开始。
+def _reset_deps_state(monkeypatch, tmp_path):
+    """每个用例都从"没有任务、没有缓存、空快照目录"开始。
 
     模块级全局（``_jobs`` / ``_running_job_id`` / ``_pypi_cache``）不清会串味：
     上一个用例留下的 job 会让下一个用例的 install 直接被判 409。
+    ``data_dir`` 必须指到 tmp_path：install/uninstall 现在会先落一份快照，
+    不隔离就会往仓库的 ``data/`` 里写测试垃圾。
     """
     monkeypatch.setattr(deps_api, "_jobs", {})
     monkeypatch.setattr(deps_api, "_running_job_id", None)
     monkeypatch.setattr(deps_api, "_pypi_cache", {})
+    monkeypatch.setattr(settings, "data_dir", str(tmp_path))
     yield
 
 
@@ -532,8 +535,13 @@ async def test_install_runs_whitelisted_pip_command(monkeypatch) -> None:
     assert polled.status_code == 200
     assert polled.json()["status"] == "succeeded"
     assert polled.json()["progress"] == 100
-    # 白名单命令：install + 两个必需 flag + 规格，一次一个参数（不拼 shell）
-    assert seen == [["install", "--no-input", "--disable-pip-version-check", "requests==2.31.0"]]
+    # 白名单命令：install + 两个必需 flag + 规格，一次一个参数（不拼 shell）。
+    # 前面那次 `list` 是安装前的自动快照（见 `_snapshot_before_mutation`）。
+    assert [args for args in seen if args[0] != "list"] == [
+        ["install", "--no-input", "--disable-pip-version-check", "requests==2.31.0"]
+    ]
+    # 自动快照发生在任何安装动作之前：这是"装坏了能回去"的唯一保证
+    assert seen[0][:2] == ["list", "--format=json"]
 
 
 async def test_install_is_mutually_exclusive(monkeypatch) -> None:
@@ -614,7 +622,11 @@ async def test_uninstall_uses_yes_and_validates_name(monkeypatch) -> None:
 
     assert ok.status_code == 200
     assert ok.json()["ok"] is True
-    assert seen == [["uninstall", "--yes", "--no-input", "--disable-pip-version-check", "requests"]]
+    # 卸载前先 `list` 一份快照（自动快照），再执行白名单卸载命令
+    assert seen[0][:2] == ["list", "--format=json"]
+    assert [args for args in seen if args[0] != "list"] == [
+        ["uninstall", "--yes", "--no-input", "--disable-pip-version-check", "requests"]
+    ]
     for rejected in (bad_spec, bad_path, bad_flag):
         assert rejected.status_code == 400
 

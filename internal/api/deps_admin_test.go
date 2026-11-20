@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,8 +93,11 @@ func TestDepsRoutesRejectNonPlatformOwner(t *testing.T) {
 		{http.MethodGet, "/v1/admin/deps/list", ""},
 		{http.MethodGet, "/v1/admin/deps/search?q=requests", ""},
 		{http.MethodGet, "/v1/admin/deps/jobs/abc123", ""},
+		{http.MethodGet, "/v1/admin/deps/snapshots", ""},
 		{http.MethodPost, "/v1/admin/deps/install", `{"spec":"requests"}`},
 		{http.MethodPost, "/v1/admin/deps/uninstall", `{"name":"requests"}`},
+		{http.MethodPost, "/v1/admin/deps/snapshots", `{"label":"x"}`},
+		{http.MethodPost, "/v1/admin/deps/snapshots/20250101T000000000Z-abcdef/restore", `{"dry_run":true}`},
 	}
 	for _, c := range cases {
 		t.Run(c.method+" "+c.path, func(t *testing.T) {
@@ -406,5 +410,187 @@ func TestDepsJobIDRejectsPathTraversal(t *testing.T) {
 	}
 	if reqs, _, _ := rig.seen(); len(reqs) != 0 {
 		t.Fatalf("非法 job id 不该打到引擎：%v", reqs)
+	}
+}
+
+// ── 快照代理 ─────────────────────────────────────────────────────────────
+
+// 读快照列表：透传引擎响应，令牌由网关注入（与 list 同口径）。
+func TestDepsListSnapshotsForwardsInternalToken(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/internal/deps/snapshots" {
+			t.Errorf("上游请求错误：%s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"snapshots":[{"id":"20250101T000000000Z-abcdef","package_count":2,"trigger":"manual","label":""}],"count":1}`))
+	})
+
+	req := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/snapshots", nil), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 200，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "20250101T000000000Z-abcdef") {
+		t.Fatalf("快照列表未透传：%s", rec.Body.String())
+	}
+	reqs, tokens, _ := rig.seen()
+	if len(reqs) != 1 || tokens[0] != "engine-internal-token" {
+		t.Fatalf("上游请求/令牌不符合预期：%v %v", reqs, tokens)
+	}
+}
+
+// 手动创建快照：label 只由网关注入体，超长在入口拒绝（引擎不必被惊动）。
+func TestDepsCreateSnapshotValidatesLabel(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/internal/deps/snapshots" {
+			t.Errorf("上游请求错误：%s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"snapshot":{"id":"20250101T000000000Z-abcdef","package_count":0}}`))
+	})
+
+	tooLong, _ := json.Marshal(map[string]string{"label": strings.Repeat("a", maxDepsSnapshotLabelLen+1)})
+	req := withClaims(httptest.NewRequest(http.MethodPost, "/v1/admin/deps/snapshots", strings.NewReader(string(tooLong))), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("超长 label 应 400，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if reqs, _, _ := rig.seen(); len(reqs) != 0 {
+		t.Fatalf("被拒绝的请求不该打到引擎：%v", reqs)
+	}
+
+	req = withClaims(httptest.NewRequest(http.MethodPost, "/v1/admin/deps/snapshots", strings.NewReader(`{"label":" before-upgrade "}`)), ownerClaims())
+	rec = httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 200，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	_, _, bodies := rig.seen()
+	if strings.TrimSpace(bodies[0]) != `{"label":"before-upgrade"}` {
+		t.Fatalf("请求体应只含修剪后的 label，实际：%s", bodies[0])
+	}
+}
+
+// 快照 id 会拼进上游 URL 的路径段：非法形态必须在网关就拒绝（不产生上游请求）。
+func TestDepsRestoreSnapshotRejectsPathTraversal(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("非法 snapshot id 不该打到引擎：%s", r.URL.Path)
+	})
+	for _, id := range []string{
+		"..%2Flist",
+		"a%2Fb",
+		"20250101T000000000Z-abcdef.json",
+		"20250101T000000000Z",
+		"00000000000000000Z-abcdef",
+		strings.Repeat("a", 70),
+	} {
+		req := withClaims(httptest.NewRequest(
+			http.MethodPost, "/v1/admin/deps/snapshots/"+id+"/restore", strings.NewReader(`{"dry_run":false}`),
+		), ownerClaims())
+		rec := httptest.NewRecorder()
+		rig.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest && rec.Code != http.StatusNotFound {
+			t.Errorf("id=%q 应被拒绝，得到 %d", id, rec.Code)
+		}
+	}
+	if reqs, _, _ := rig.seen(); len(reqs) != 0 {
+		t.Fatalf("非法 id 不该打到引擎：%v", reqs)
+	}
+}
+
+// dry_run 只算差异：不占互斥闸，且请求体显式带上 true（引擎据此决定是否建任务）。
+func TestDepsRestoreSnapshotDryRun(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/internal/deps/snapshots/20250101T000000000Z-abcdef/restore" {
+			t.Errorf("上游路径错误：%s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"dry_run":true,"diff":{"install_count":1},"job":null}`))
+	})
+
+	req := withClaims(httptest.NewRequest(
+		http.MethodPost, "/v1/admin/deps/snapshots/20250101T000000000Z-abcdef/restore",
+		strings.NewReader(`{"dry_run":true}`),
+	), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 200，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "install_count") {
+		t.Fatalf("差异摘要未透传：%s", rec.Body.String())
+	}
+	_, _, bodies := rig.seen()
+	if strings.TrimSpace(bodies[0]) != `{"dry_run":true}` {
+		t.Fatalf("dry_run 未透传：%s", bodies[0])
+	}
+}
+
+// 真恢复与安装/卸载共用同一把进程内闸：一个在途时第二个直接 409，不打上游。
+func TestDepsRestoreSnapshotTakesBusyGate(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	// preview 为 1 时假引擎立刻返回（dry_run 预览不该被卡住）。rig 已经把请求体读走了，
+	// 所以这里靠一个显式开关区分两类请求，而不是去解析 body。
+	var preview int32
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if atomic.LoadInt32(&preview) == 1 {
+			_, _ = w.Write([]byte(`{"dry_run":true,"diff":{"install_count":1},"job":null}`))
+			return
+		}
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		_, _ = w.Write([]byte(`{"dry_run":false,"job":{"id":"job1","kind":"restore"},"diff":{}}`))
+	})
+
+	firstDone := make(chan int, 1)
+	go func() {
+		req := withClaims(httptest.NewRequest(
+			http.MethodPost, "/v1/admin/deps/snapshots/20250101T000000000Z-abcdef/restore",
+			strings.NewReader(`{"dry_run":false}`),
+		), ownerClaims())
+		rec := httptest.NewRecorder()
+		rig.mux.ServeHTTP(rec, req)
+		firstDone <- rec.Code
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("第一个恢复请求没有到达引擎")
+	}
+
+	second := withClaims(httptest.NewRequest(
+		http.MethodPost, "/v1/admin/deps/snapshots/20250101T000000000Z-abcdef/restore",
+		strings.NewReader(`{"dry_run":false}`),
+	), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, second)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("并发恢复应 409，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+
+	// dry_run 是只读预览，即便有变更任务在途也应当放行（不占闸）
+	atomic.StoreInt32(&preview, 1)
+	dry := withClaims(httptest.NewRequest(
+		http.MethodPost, "/v1/admin/deps/snapshots/20250101T000000000Z-abcdef/restore",
+		strings.NewReader(`{"dry_run":true}`),
+	), ownerClaims())
+	recDry := httptest.NewRecorder()
+	rig.mux.ServeHTTP(recDry, dry)
+	if recDry.Code != http.StatusOK {
+		t.Fatalf("dry_run 不该被互斥闸拦下，得到 %d：%s", recDry.Code, recDry.Body.String())
+	}
+	close(release)
+	if code := <-firstDone; code != http.StatusOK {
+		t.Fatalf("第一个请求应成功，得到 %d", code)
 	}
 }

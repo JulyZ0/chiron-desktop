@@ -2,13 +2,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 /**
- * `DepsView` 的三个会误导用户的点：
+ * `DepsView` 的五个会误导用户的点：
  *
- *  1. **命令行式安装必须先过前端校验**：非法规格（分号/`-r`/路径）要在按下按钮之前
- *     就显示原因并禁用按钮 —— 否则用户只会看到一次 400，且不知道哪里不对；
- *  2. **"可升级"徽标只在真的有更新时出现**：同一版本不能提示升级（否则用户会反复点）；
- *  3. **安装走后台任务 + 轮询**：终态到达后必须刷新包列表，否则界面停在"安装中"、
- *     而包其实已经装好了。
+ *  1. **安装必须二次确认**：点"安装"只是弹确认框（显示规格 + "会改运行环境 / 装完要重启"），
+ *     确认之后才发请求 —— 装包改的是整台机器共享的运行环境；
+ *  2. **命令行式安装必须先过前端校验**：非法规格（分号/`-r`/路径）要在按下按钮之前
+ *     就显示原因并禁用按钮；
+ *  3. **"可升级"徽标只在真的有更新时出现**：同一版本不能提示升级；
+ *  4. **安装走后台任务 + 轮询**：终态到达后必须刷新包列表；
+ *  5. **快照恢复先看差异再确认**：恢复会卸载"快照里没有的包"，必须先 dry_run 预览差异、
+ *     再二次确认，确认后走后台任务。
  */
 
 const apiMocks = vi.hoisted(() => ({
@@ -17,6 +20,10 @@ const apiMocks = vi.hoisted(() => ({
   installDep: vi.fn(),
   uninstallDep: vi.fn(),
   getDepJob: vi.fn(),
+  listDepSnapshots: vi.fn(),
+  createDepSnapshot: vi.fn(),
+  previewDepRestore: vi.fn(),
+  restoreDepSnapshot: vi.fn(),
 }))
 
 vi.mock('../../../api/deps', async importOriginal => {
@@ -28,6 +35,7 @@ vi.mock('../../../api/deps', async importOriginal => {
     isNewerVersion: actual.isNewerVersion,
     isTerminalJob: actual.isTerminalJob,
     MAX_SPEC_LEN: actual.MAX_SPEC_LEN,
+    MAX_RESTORE_INSTALLS: actual.MAX_RESTORE_INSTALLS,
     PIP_SPEC_RE: actual.PIP_SPEC_RE,
     PACKAGE_NAME_RE: actual.PACKAGE_NAME_RE,
     listDeps: apiMocks.listDeps,
@@ -35,6 +43,10 @@ vi.mock('../../../api/deps', async importOriginal => {
     installDep: apiMocks.installDep,
     uninstallDep: apiMocks.uninstallDep,
     getDepJob: apiMocks.getDepJob,
+    listDepSnapshots: apiMocks.listDepSnapshots,
+    createDepSnapshot: apiMocks.createDepSnapshot,
+    previewDepRestore: apiMocks.previewDepRestore,
+    restoreDepSnapshot: apiMocks.restoreDepSnapshot,
   }
 })
 
@@ -69,8 +81,50 @@ const PACKAGES = {
   count: 2,
 }
 
+const SNAPSHOTS = {
+  snapshots: [
+    {
+      id: '20250101T000000000Z-abcdef',
+      created_at: 1735689600,
+      trigger: 'install:requests==2.32.0',
+      label: 'before upgrade',
+      package_count: 2,
+    },
+  ],
+  count: 1,
+  retention: 20,
+}
+
+const RESTORE_DIFF = {
+  missing: [{ name: 'pillow', version: '10.0.0' }],
+  extra: [{ name: 'legacy-pkg', version: '0.1' }],
+  changed: [{ name: 'requests', from: '2.32.0', to: '2.31.0' }],
+  unchanged: 1,
+  install_count: 2,
+  uninstall_count: 1,
+  total_changes: 3,
+  limit: 50,
+  exceeds_limit: false,
+}
+
 function mountView() {
-  return mount(DepsView)
+  // Modal 走 Teleport 到 body：不 attach 就查不到弹窗内容。
+  return mount(DepsView, { attachTo: document.body })
+}
+
+/** 弹窗里的主按钮（确认）。antd 的 footer 在 body 里，不在 wrapper 里。 */
+function modalOkButton(): HTMLButtonElement {
+  const buttons = Array.from(
+    document.body.querySelectorAll<HTMLButtonElement>('.ant-modal-footer .ant-btn-primary'),
+  )
+  const hit = buttons.at(-1)
+  if (!hit) throw new Error('弹窗里没有确认按钮')
+  return hit
+}
+
+function modalText(): string {
+  const modals = Array.from(document.body.querySelectorAll<HTMLElement>('.ant-modal'))
+  return modals.map(node => node.textContent ?? '').join('\n')
 }
 
 function cmdInput(wrapper: ReturnType<typeof mountView>) {
@@ -90,8 +144,17 @@ function installButton(wrapper: ReturnType<typeof mountView>) {
 describe('DepsView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    document.body.innerHTML = ''
     apiMocks.listDeps.mockResolvedValue(PACKAGES)
     apiMocks.searchPypi.mockResolvedValue({ query: '', results: [], count: 0, found: false })
+    apiMocks.listDepSnapshots.mockResolvedValue(SNAPSHOTS)
+    apiMocks.createDepSnapshot.mockResolvedValue(SNAPSHOTS.snapshots[0])
+    apiMocks.previewDepRestore.mockResolvedValue({
+      dry_run: true,
+      snapshot: SNAPSHOTS.snapshots[0],
+      diff: RESTORE_DIFF,
+      job: null,
+    })
     apiMocks.installDep.mockResolvedValue({
       id: 'job1',
       kind: 'install',
@@ -135,11 +198,14 @@ describe('DepsView', () => {
     expect(wrapper.find('.cmd-error').exists()).toBe(true)
     expect(installButton(wrapper).attributes('disabled')).toBeDefined()
     await installButton(wrapper).trigger('click')
+    await flushPromises()
     expect(apiMocks.installDep).not.toHaveBeenCalled()
+    // 非法输入连确认框都不该弹
+    expect(document.body.querySelector('.ant-modal')).toBeNull()
     wrapper.unmount()
   })
 
-  it('合法规格：创建任务 → 轮询到终态 → 刷新包清单', async () => {
+  it('合法规格：先弹确认框（显示规格与风险），确认后才创建任务 → 轮询 → 刷新', async () => {
     const wrapper = mountView()
     await flushPromises()
     expect(apiMocks.listDeps).toHaveBeenCalledTimes(1)
@@ -149,6 +215,16 @@ describe('DepsView', () => {
     await installButton(wrapper).trigger('click')
     await flushPromises()
 
+    // 点"安装"只是打开确认框：规格、风险、自动快照三件事都必须写出来
+    expect(apiMocks.installDep).not.toHaveBeenCalled()
+    const text = modalText()
+    expect(text).toContain('requests==2.31.0')
+    expect(text).toContain('运行环境')
+    expect(text).toContain('重启')
+    expect(text).toContain('快照')
+
+    modalOkButton().click()
+    await flushPromises()
     expect(apiMocks.installDep).toHaveBeenCalledWith('requests==2.31.0')
 
     // 轮询间隔 1200ms（见组件内 POLL_INTERVAL_MS）
@@ -189,6 +265,101 @@ describe('DepsView', () => {
     // fastapi：PyPI 版本更高 ⇒ 可升级
     expect(rows[1]!.text()).toContain('可升级')
     expect(rows[1]!.find('button').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('快照列表可见，手动创建会带上标签并刷新列表', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(apiMocks.listDepSnapshots).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).toContain('install:requests==2.32.0')
+    expect(wrapper.text()).toContain('before upgrade')
+
+    const createButton = wrapper.findAll('button').find(b => b.text().replace(/\s/g, '').includes('创建快照'))
+    expect(createButton).toBeTruthy()
+    await createButton!.trigger('click')
+    await flushPromises()
+
+    const labelInput = document.body.querySelector<HTMLInputElement>('.snapshot-create input')
+    expect(labelInput).toBeTruthy()
+    labelInput!.value = '手动拍的'
+    labelInput!.dispatchEvent(new Event('input'))
+    await flushPromises()
+
+    modalOkButton().click()
+    await flushPromises()
+
+    expect(apiMocks.createDepSnapshot).toHaveBeenCalledWith('手动拍的')
+    expect(apiMocks.listDepSnapshots).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
+  it('恢复快照：先 dry_run 预览差异并二次确认，确认后才真的恢复', async () => {
+    apiMocks.restoreDepSnapshot.mockResolvedValue({
+      dry_run: false,
+      snapshot: SNAPSHOTS.snapshots[0],
+      diff: RESTORE_DIFF,
+      job: {
+        id: 'restore1',
+        kind: 'restore',
+        target: SNAPSHOTS.snapshots[0]!.id,
+        status: 'running',
+        message: '',
+        progress: 20,
+        output: '',
+        created_at: 0,
+      },
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const restoreButton = wrapper.findAll('button').find(b => b.text().replace(/\s/g, '') === '恢复')
+    expect(restoreButton).toBeTruthy()
+    await restoreButton!.trigger('click')
+    await flushPromises()
+
+    // 第一步：只算差异，绝不执行
+    expect(apiMocks.previewDepRestore).toHaveBeenCalledWith('20250101T000000000Z-abcdef')
+    expect(apiMocks.restoreDepSnapshot).not.toHaveBeenCalled()
+
+    const text = modalText()
+    // 差异摘要必须让用户看到"会卸载什么、会装什么、哪些会改版本"
+    expect(text).toContain('legacy-pkg')
+    expect(text).toContain('pillow')
+    expect(text).toContain('2.32.0')
+    expect(text).toContain('2.31.0')
+
+    modalOkButton().click()
+    await flushPromises()
+    expect(apiMocks.restoreDepSnapshot).toHaveBeenCalledWith('20250101T000000000Z-abcdef')
+
+    // 恢复也是后台任务：轮询到终态后刷新包清单与快照列表
+    await new Promise(resolve => setTimeout(resolve, 1500))
+    await flushPromises()
+    expect(apiMocks.getDepJob).toHaveBeenCalled()
+    expect(apiMocks.listDeps).toHaveBeenCalledTimes(2)
+    wrapper.unmount()
+  })
+
+  it('差异超过单次上限：确认按钮禁用（引擎也会 400，但界面先挡住）', async () => {
+    apiMocks.previewDepRestore.mockResolvedValue({
+      dry_run: true,
+      snapshot: SNAPSHOTS.snapshots[0],
+      diff: { ...RESTORE_DIFF, install_count: 51, exceeds_limit: true, limit: 50, total_changes: 52 },
+      job: null,
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const restoreButton = wrapper.findAll('button').find(b => b.text().replace(/\s/g, '') === '恢复')
+    await restoreButton!.trigger('click')
+    await flushPromises()
+
+    expect(modalText()).toContain('50')
+    expect(modalOkButton().disabled).toBe(true)
     wrapper.unmount()
   })
 })
