@@ -98,7 +98,7 @@ func TestDiagnosticsSummaryDBUnavailableStillAnswersEveryRow(t *testing.T) {
 	}
 }
 
-func TestSchemaItemBranches(t *testing.T) {
+func TestDiagnosticsSchemaItemBranches(t *testing.T) {
 	cases := []struct {
 		name     string
 		expected string
@@ -132,7 +132,7 @@ func TestSchemaItemBranches(t *testing.T) {
 	}
 }
 
-func TestTablesItemNeverClaimsOKWithoutEngineEvidence(t *testing.T) {
+func TestDiagnosticsTablesItemNeverClaimsOKWithoutEngineEvidence(t *testing.T) {
 	// 引擎不可达：看不见表，**不能**说"表都在"。
 	got := tablesItem(engineTablesResult{}, errors.New("dial tcp: connection refused"))
 	if got.Status != diagStateUnknown {
@@ -170,7 +170,7 @@ func TestTablesItemNeverClaimsOKWithoutEngineEvidence(t *testing.T) {
 	}
 }
 
-func TestKnowledgeItemBranches(t *testing.T) {
+func TestDiagnosticsKnowledgeItemBranches(t *testing.T) {
 	// 引擎不可达：**不是 500**，而是 unknown + "服务未启动"。
 	down := knowledgeItem(engineKnowledgeState{}, errors.New("dial tcp: refused"))
 	if down.Status != diagStateUnknown {
@@ -230,7 +230,7 @@ func TestKnowledgeItemBranches(t *testing.T) {
 	}
 }
 
-func TestCheckpointsItemSeparatesNeverOKFromOccasionalFailure(t *testing.T) {
+func TestDiagnosticsCheckpointsItemSeparatesNeverOKFromOccasionalFailure(t *testing.T) {
 	const okAt = "2026-11-20 10:00"
 
 	healthy := checkpointsItem(checkpointStats{Failed24h: 0, LastOKText: okAt, Tenant: "租户 1"}, nil)
@@ -272,7 +272,7 @@ func TestCheckpointsItemSeparatesNeverOKFromOccasionalFailure(t *testing.T) {
 	}
 }
 
-func TestDepsItemTreatsTimeoutAsWarnNotFailure(t *testing.T) {
+func TestDiagnosticsDepsItemTreatsTimeoutAsWarnNotFailure(t *testing.T) {
 	if got := depsItem(nil); got.Status != diagStateOK || got.Fix != "" {
 		t.Errorf("可达应为 ok 且无 fix，得到 %q / %q", got.Status, got.Fix)
 	}
@@ -290,7 +290,7 @@ func TestDepsItemTreatsTimeoutAsWarnNotFailure(t *testing.T) {
 	}
 }
 
-func TestBuildDiagSummaryWorstStatusWins(t *testing.T) {
+func TestDiagnosticsBuildSummaryWorstStatusWins(t *testing.T) {
 	checks := []DiagSummaryCheck{
 		{Key: "a", Status: diagStateOK},
 		{Key: "b", Status: diagStateUnknown},
