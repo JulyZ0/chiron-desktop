@@ -60,7 +60,11 @@ def _audit_dir() -> Path:
         return AUDIT_DIR
     from app.config import settings
 
-    return Path(getattr(settings, "log_dir", "") or "logs")
+    from app.paths import log_dir
+
+    return log_dir(
+        getattr(settings, "log_dir", ""), getattr(settings, "data_dir", "")
+    )
 
 
 def _summarize_command(command: str) -> str:

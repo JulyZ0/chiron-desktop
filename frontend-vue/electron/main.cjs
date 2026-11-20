@@ -705,16 +705,18 @@ function resolveGatewayExe() {
  * 404"。所以 electron-builder.yml 里额外把 `dist/` 复制到 `resources/web`
  * （extraResources），这里按那个路径找；开发态回落到源码目录的 `dist/`。
  *
+ * 实现**只有一份**（`local-stack.cjs::resolveWebRoot`）：网关 spawn 环境的
+ * `CHIRON_WEB_ROOT` 用同一个函数算，两处各拼一份路径就会静默漂移
+ * （改了一处、另一处仍指向旧位置）。
  * 找不到就返回空串：网关不托管，本地栈照常启动（分享链接退化为不可对外）。
  */
 function resolveWebRoot() {
-  const candidates = []
-  if (process.resourcesPath) candidates.push(path.join(process.resourcesPath, 'web'))
-  candidates.push(path.join(__dirname, '..', 'dist'))
-  for (const candidate of candidates) {
-    if (fs.existsSync(path.join(candidate, 'index.html'))) return candidate
-  }
-  return ''
+  const stack = loadOptionalModule('./local-stack.cjs')
+  if (!stack || typeof stack.resolveWebRoot !== 'function') return ''
+  return stack.resolveWebRoot({
+    resourcesDir: process.resourcesPath,
+    devDist: path.join(__dirname, '..', 'dist'),
+  })
 }
 
 /**

@@ -17,9 +17,13 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/athenavi/chiron/internal/db"
 )
 
-const migrationsDir = "../../migrations/versions"
+// migrationsDir 走与生产同一条解析（config/resources.go）：以前写死
+// `../../migrations/versions`，把"测试恰好从 internal/api 运行"当成了前提。
+var migrationsDir = db.MigrationsDir()
 
 var (
 	migRevisionRe = regexp.MustCompile(`(?m)^revision:\s*str\s*=\s*"([^"]+)"`)

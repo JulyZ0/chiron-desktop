@@ -18,11 +18,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/athenavi/chiron/config"
 	"github.com/athenavi/chiron/internal/db"
 	"github.com/athenavi/chiron/internal/engine"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // withoutDB 把全局连接池摘掉，确保被测路径走"看不见库"的分支。
@@ -473,5 +476,57 @@ func TestDiagnosticsSummarySurfacesMissingTablesFromEngine(t *testing.T) {
 	}
 	if !contains(know.Detail, "dial tcp") {
 		t.Errorf("detail 应保留引擎给的失败原因，得到 %q", know.Detail)
+	}
+}
+
+// TestDiagnosticsSchemaUnknownWhenMigrationsDirMissing 钉住打包态的实测故障：
+// 进程 CWD ≠ 安装目录时，裸相对路径 `migrations\versions` 根本不存在。
+//
+// 判定要求是 **unknown（200）而不是 500**，且 detail 必须给出**解析到的绝对路径**
+// 与"找过哪些地方"—— 只报 `read migrations dir migrations\versions` 时，运维
+// 连迁移该放哪都不知道。这里用真实的 db.CheckSchemaVersion 走一遍解析失败分支
+//（连接池是个从不连接的惰性 pool：解析在查询之前就失败了）。
+func TestDiagnosticsSchemaUnknownWhenMigrationsDirMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-migrations-here")
+	t.Setenv("MIGRATIONS_DIR", missing)
+	t.Setenv(config.ResourcesDirEnv, "")
+
+	prev := db.Pool
+	pool, err := pgxpool.New(context.Background(),
+		"postgresql://chiron:chiron@127.0.0.1:1/chiron?connect_timeout=1&pool_max_conns=1")
+	if err != nil {
+		t.Fatalf("构造惰性连接池失败: %v", err)
+	}
+	db.Pool = pool
+	t.Cleanup(func() {
+		db.Pool = prev
+		pool.Close()
+	})
+
+	h := &AdminHandler{}
+	rec := httptest.NewRecorder()
+	h.GetDiagnosticsSummary(rec, httptest.NewRequest(http.MethodGet, "/v1/admin/diagnostics/summary", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("迁移目录缺失是业务结果，必须是 200（不是 500），得到 %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Success bool `json:"success"`
+		Data    DiagSummaryResponse
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+	schema := summaryByKey(t, body.Data.Checks, "schema")
+	if schema.Status != diagStateUnknown {
+		t.Fatalf("解析不到迁移目录应为 unknown，得到 %q / %q", schema.Status, schema.Detail)
+	}
+	if !contains(schema.Detail, missing) {
+		t.Errorf("detail 必须展示解析到的绝对目录 %q，得到 %q", missing, schema.Detail)
+	}
+	for _, hint := range []string{"MIGRATIONS_DIR", "CHIRON_RESOURCES_DIR"} {
+		if !contains(schema.Fix, hint) {
+			t.Errorf("fix 应给出可执行的逃生口 %q，得到 %q", hint, schema.Fix)
+		}
 	}
 }

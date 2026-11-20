@@ -35,6 +35,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/athenavi/chiron/config"
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
 )
@@ -104,6 +105,19 @@ func (h *AdminHandler) checkSchema(ctx context.Context) DiagSummaryCheck {
 	return schemaItem(expected, actual, match, err)
 }
 
+// migrationsDirDisplay 返回迁移目录的**绝对**展示串（解析不到时说清找过哪里）。
+//
+// 以前这一格是裸相对路径 `migrations\versions`，打包态报错时用户根本不知道
+// 进程把它解析到了哪个盘符下 —— 更别说 CWD ≠ 安装目录时它压根不存在。
+// 展示 absolute path 才能让"迁移就在安装包里"这件事一眼可见。
+func migrationsDirDisplay() string {
+	if dir := db.MigrationsDir(); dir != "" {
+		return dir
+	}
+	return "<未找到；已查 " + strings.Join(config.ResourceRoots(), ", ") + ">" +
+		"（可用 MIGRATIONS_DIR 或 CHIRON_RESOURCES_DIR 指定）"
+}
+
 // schemaItem 把 CheckSchemaVersion 的四个返回值翻译成一行的结论。
 //
 // 错误分两类：
@@ -123,8 +137,8 @@ func schemaItem(expected, actual string, match bool, err error) DiagSummaryCheck
 		item.Fix = "检查 POSTGRES_DSN 与数据库可达性；库没起来时所有依赖库的检查都会是未知。"
 		return item
 	case err != nil && expected == "":
-		item.Detail = "无法解析迁移 head：" + truncErr(err, 200)
-		item.Fix = "确认 MIGRATIONS_DIR 指向 migrations/versions，且迁移链只有一个 head（不要分叉）。"
+		item.Detail = "无法解析迁移 head（目录：" + migrationsDirDisplay() + "）：" + truncErr(err, 200)
+		item.Fix = "确认 MIGRATIONS_DIR 指向 migrations/versions，或 CHIRON_RESOURCES_DIR 指向安装包的 resources 目录，且迁移链只有一个 head（不要分叉）。"
 		return item
 	case err != nil:
 		item.Detail = fmt.Sprintf("读取 alembic_version 失败（期望 head %s）：%s", expected, truncErr(err, 200))

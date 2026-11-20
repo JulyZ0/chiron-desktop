@@ -549,7 +549,8 @@ class Settings(BaseSettings):
 
     # ── 审计落盘目录 ──
     # exec / approval / hooks / plugin 四份审计日志（`*_audit.py` 的 `_audit_dir()`）都读它，
-    # 默认空 = 相对 cwd 的 `logs/`。**打包态必须显式给绝对路径**：引擎源码与 cwd 都在
+    # 默认空 = 由 `app/paths.py::log_dir` 派生**绝对**路径（`<data_dir>/logs`，再兜底
+    # `<CWD>/logs`）。**打包态必须给绝对路径**：引擎源码与 cwd 都在
     # `Program Files\Chiron\resources\python-engine`（只读），相对目录会让 mkdir 失败、
     # 审计静默全丢（四处都 try/except 只告警）。桌面壳在 `buildEngineEnv` 里下发。
     log_dir: str = ""

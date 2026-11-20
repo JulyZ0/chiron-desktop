@@ -46,6 +46,10 @@ func main() {
 
 	slog.Info("starting chiron gateway", "version", "0.1.260825.01", "port", cfg.Port)
 
+	// 资产路径必须在第一行日志里就是**绝对**的：打包态的 CWD 与安装目录无关，
+	// 诊断页里"migrations 找不到"的根因往往就是这行没打出来、没人知道它去了哪。
+	logResourceLayout()
+
 	// lifecycleCtx 受 OS signal 控制，用于所有后台协程优雅关闭。
 	lifecycleCtx, lifecycleStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer lifecycleStop()
@@ -479,6 +483,31 @@ func applyDBSettingsAfterConnect(ctx context.Context, cfg *config.Config) {
 	})
 }
 
+// logResourceLayout 打印本次启动**实际解析到**的资产路径（全部绝对）。
+//
+// 三件事刻意放在同一行：resources 根、migrations 目录、web 根。它们是打包态最容易
+// "看起来装了、实际找不到"的三项，而各自曾经用不同的相对路径口径（exe 旁 / CWD /
+// 仓库根）。一行绝对路径就能让排障从"猜它去哪了"变成"对着日志核对"。
+// uv 只在存在时打：开发机没准备随包 uv 是正常形态，报空会制造噪音。
+func logResourceLayout() {
+	roots := config.ResourceRoots()
+	migrationsDir := db.MigrationsDir()
+	webRoot := config.WebRoot()
+	if root := config.ResourcesRoot(); root != "" {
+		slog.Info("resource layout",
+			"resources_root", root,
+			"migrations_dir", migrationsDir,
+			"web_root", webRoot,
+			"uv", config.UVBin())
+		return
+	}
+	// 一个候选根都不存在：打包残缺或 CHIRON_RESOURCES_DIR 指错。不阻断启动
+	//（缺 web 只是不托管 SPA），但必须显式告警并列出找过的位置。
+	slog.Warn("resource root not resolved; bundled assets (migrations/web/uv) may be missing",
+		"searched", strings.Join(roots, string(os.PathListSeparator)),
+		"migrations_dir", migrationsDir)
+}
+
 // verifySchemaVersion 只读校验数据库 schema 与代码期望的迁移 head 是否一致。
 //
 // 应用不再自行迁移（旧实现会 shell 出 python -m alembic 并写 .env，在无 python 的应用
@@ -491,7 +520,13 @@ func applyDBSettingsAfterConnect(ctx context.Context, cfg *config.Config) {
 func verifySchemaVersion(ctx context.Context, cfg *config.Config) *schemaMismatch {
 	expected, actual, match, err := db.CheckSchemaVersion(ctx)
 	if err != nil {
-		slog.Warn("schema version check unavailable", "error", err)
+		// 迁移目录解析失败时不阻断启动（DB 也许还没就绪，且这是"看不见"而非"不一致"），
+		// 但日志里必须带上解析到的**绝对**目录：否则这条 warn 只会告诉运维"检查不可用"，
+		// 而他连该去哪个目录放 migrations 都不知道。
+		slog.Warn("schema version check unavailable",
+			"error", err,
+			"migrations_dir", db.MigrationsDir(),
+			"resources_root", config.ResourcesRoot())
 		return nil
 	}
 	if match {

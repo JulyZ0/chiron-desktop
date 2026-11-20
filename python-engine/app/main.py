@@ -299,6 +299,34 @@ def _start_observability() -> None:
     logger.info("Chiron Python AI Engine v3.0 — Enterprise Edition")
     logger.info("=" * 60)
 
+    _log_resource_layout()
+
+
+def _log_resource_layout() -> None:
+    """启动 banner：把本次启动**实际解析到**的资产/数据路径按绝对路径打出来。
+
+    打包态引擎的 CWD 是只读的 ``resources/python-engine``，而资产在它的父目录
+    （``resources/migrations``、``resources/web``、``resources/uv``）。以前 banner
+    里没有任何路径，排查"迁移/前端产物去哪了"只能靠猜；相对路径写进日志又会被
+    误读成"相对于当前目录"。这里统一走 ``app/paths.py``（与 Go 侧
+    ``config/resources.go`` 同优先级），找不到就明说 ``<not found>`` 而不是沉默。
+    """
+    from app import paths
+
+    root = paths.resource_root()
+    migrations = paths.migrations_dir()
+    web = paths.web_root()
+    logger.info(
+        "Resource root: %s", root or "<not found — set CHIRON_RESOURCES_DIR>"
+    )
+    logger.info("Migrations dir: %s", migrations or "<not found>")
+    logger.info("Web root: %s", web or "<none>")
+    logger.info(
+        "Data dir: %s | Log dir: %s",
+        paths.data_dir(settings.data_dir),
+        paths.log_dir(settings.log_dir, settings.data_dir),
+    )
+
 
 def _verify_deployment_preconditions() -> None:
     """部署前置校验：多副本安全前置（沙箱根 + 媒体后端），从 `lifespan` 抽出。

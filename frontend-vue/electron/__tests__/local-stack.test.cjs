@@ -15,6 +15,9 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 const stack = require('../local-stack.cjs')
 const components = require('../components.cjs')
@@ -175,6 +178,47 @@ test('buildGatewayEnv 没有 webRoot 时不写 CHIRON_WEB_ROOT（网关不托管
     { appSecret: VALID_SECRET, port: 9100, env: {} },
   )
   assert.equal(env.CHIRON_WEB_ROOT, undefined)
+})
+
+test('resolveWebRoot：打包态取 <resources>/web，开发态取传入的 dist，找不到返回空串', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-webroot-'))
+  try {
+    const resourcesDir = path.join(base, 'resources')
+    fs.mkdirSync(path.join(resourcesDir, 'web'), { recursive: true })
+    fs.writeFileSync(path.join(resourcesDir, 'web', 'index.html'), '<html></html>')
+
+    // 打包态：<resources>/web 优先于开发态 dist。
+    const devDist = path.join(base, 'dist')
+    fs.mkdirSync(devDist, { recursive: true })
+    fs.writeFileSync(path.join(devDist, 'index.html'), '<html></html>')
+    assert.equal(stack.resolveWebRoot({ resourcesDir, devDist }), path.join(resourcesDir, 'web'))
+
+    // 目录存在但没有 index.html ⇒ 不算找到（"托管成功但永远 404"就是这个坑）。
+    fs.rmSync(path.join(resourcesDir, 'web', 'index.html'))
+    assert.equal(stack.resolveWebRoot({ resourcesDir, devDist }), devDist)
+    fs.rmSync(path.join(devDist, 'index.html'))
+    assert.equal(stack.resolveWebRoot({ resourcesDir, devDist }), '')
+    // 什么都没传（纯 Node 环境没有 process.resourcesPath）也要安全返回空串。
+    assert.equal(stack.resolveWebRoot({}), '')
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('buildGatewayEnv 未给 webRoot 时从 resourcesDir 探测，而不是各自拼路径', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-gwenv-'))
+  try {
+    fs.mkdirSync(path.join(base, 'web'), { recursive: true })
+    fs.writeFileSync(path.join(base, 'web', 'index.html'), '<html></html>')
+
+    const env = stack.buildGatewayEnv(
+      { pgDsn: 'postgresql://x', redisAddr: '' },
+      { appSecret: VALID_SECRET, port: 9100, env: {}, resourcesDir: base },
+    )
+    assert.equal(env.CHIRON_WEB_ROOT, path.join(base, 'web'))
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true })
+  }
 })
 
 test('buildGatewayEnv 强制关闭注册：本地模式没有任何"新账号"可注册', () => {
