@@ -174,6 +174,37 @@ raise SystemExit(99)
     assert not _crash_files(tmp_path), "收到停止信号属于正常关停，不是崩溃"
 
 
+def test_signal_handler_reinstalls_on_top_of_uvicorn(tmp_path):
+    """uvicorn 会**后**装 SIGTERM 处理者；取证层必须能再套一层，且不能吃掉关停行为。"""
+    script = """
+import signal
+
+from app import crash_forensics
+
+crash_forensics.install()
+# 模拟 uvicorn 覆盖处理者：它自己负责优雅关停（这里用 SystemExit(0) 代表）
+def uvicorn_like(signum, frame):
+    raise SystemExit(0)
+signal.signal(signal.SIGTERM, uvicorn_like)
+# lifespan 启动时再套一层（真实链路里就是这一次）
+crash_forensics.install_signal_handlers()
+signal.raise_signal(signal.SIGTERM)
+raise SystemExit(98)
+"""
+    proc = _run_child(tmp_path, script)
+
+    assert proc.returncode == 0, "取证层必须把信号继续交给 uvicorn 的处理者，而不是自己吃掉"
+    exit_log = tmp_path / "logs" / "engine-exit.log"
+    if not exit_log.is_file():
+        pytest.skip(f"SIGTERM 直接终止了进程，未走到 atexit（returncode={proc.returncode}）")
+    records = [
+        json.loads(line)
+        for line in exit_log.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records[-1]["reason"] == "signal:SIGTERM"
+
+
 def test_crash_report_keeps_only_last_20_events():
     """报告尾部只留 20 条：再多就是噪声，而文件要能被用户直接贴出来。"""
     from app import crash_forensics

@@ -102,11 +102,12 @@ _REDACT_HINTS = ("secret", "token", "password", "passwd", "apikey", "api_key", "
 # ── 模块状态 ──
 
 _installed = False
-_signals_installed = False
 _start_monotonic = time.monotonic()
 _crash_dir: Path | None = None
 _faulthandler_file: Any = None
 _lock = threading.Lock()
+#: 我们装过的信号处理者（按信号编号）：用来判断"当前最外层的还是不是我们"。
+_signal_handlers: dict[int, Any] = {}
 
 #: 最近事件环形缓冲（多线程 emit，报告在异常路径上读）。
 _events: deque[dict[str, str]] = deque(maxlen=EVENT_BUFFER)
@@ -464,13 +465,11 @@ def install_signal_handlers() -> None:
     变成"没有优雅关停"，PG 连接、队列排空全部被跳过 —— 那正是这个模块要取证的事故
     的另一种成因。因此：先记 reason，再调 `prev`。
 
-    为什么单独一个函数、并且允许重复调用：`uvicorn.run()` 在 `Server.run()` 里
+    为什么单独一个函数、并且**允许重复调用**：`uvicorn.run()` 在 `Server.run()` 里
     **后**装处理者，会盖掉 `main()` 阶段装的这一份。所以 lifespan 启动时（此时 uvicorn
-    的处理者已在位）要再调一次，把我们的记录层套在它外面。
+    的处理者已在位）要再调一次，把我们的记录层套在它外面。判据不是"装过没有"，而是
+    "当前最外层的处理者是不是我们"：是就跳过，不是就再套一层并链到新前驱。
     """
-    global _signals_installed
-    if _signals_installed:
-        return
     try:
         import signal
     except Exception:  # pragma: no cover
@@ -483,6 +482,9 @@ def install_signal_handlers() -> None:
         try:
             prev = signal.getsignal(sig)
         except Exception:  # pragma: no cover
+            continue
+        if prev is _signal_handlers.get(int(sig)):
+            # 已经是我们的（且之后没人再覆盖过）：重复调用到此为止
             continue
 
         def handler(signum: int, frame: Any, _prev: Any = prev, _name: str = name) -> None:
@@ -502,9 +504,9 @@ def install_signal_handlers() -> None:
 
         try:
             signal.signal(sig, handler)
+            _signal_handlers[int(sig)] = handler
         except Exception:  # pragma: no cover — 非主线程 / 平台不支持
             continue
-    _signals_installed = True
 
 
 def _install_faulthandler() -> None:
