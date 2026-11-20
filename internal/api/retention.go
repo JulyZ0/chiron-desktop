@@ -292,8 +292,8 @@ type checkpointGcStats struct {
 	Error         string `json:"error,omitempty"`
 }
 
-// checkpointGcRoots 读本平台已绑定的项目根（与 CheckpointGcHandler 同口径，上限 200）。
-func checkpointGcRoots(ctx context.Context) []string {
+// retentionGcRoots 读本平台已绑定的项目根（与 CheckpointGcHandler 同口径，上限 200）。
+func retentionGcRoots(ctx context.Context) []string {
 	roots := make([]string, 0, 8)
 	if db.Pool == nil {
 		return roots
@@ -328,7 +328,7 @@ func runCheckpointRetention(ctx context.Context, python *engine.PythonClient, da
 		stats.Error = "python engine 未配置"
 		return stats
 	}
-	roots := checkpointGcRoots(ctx)
+	roots := retentionGcRoots(ctx)
 	stats.Roots = len(roots)
 	payload := map[string]interface{}{
 		"roots":          roots,
@@ -433,7 +433,7 @@ func runCheckpointRetentionDryRun(ctx context.Context, python *engine.PythonClie
 		stats.Error = "python engine 未配置"
 		return stats
 	}
-	roots := checkpointGcRoots(ctx)
+	roots := retentionGcRoots(ctx)
 	stats.Roots = len(roots)
 	payload := map[string]interface{}{
 		"roots":          roots,
