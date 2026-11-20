@@ -461,7 +461,7 @@ onMounted(load)
   background: rgb(0 0 0 / 35%);
   display: flex;
   justify-content: flex-end;
-  z-index: 1000;
+  z-index: var(--z-drawer);
 }
 .share-detail {
   width: min(360px, 92vw);

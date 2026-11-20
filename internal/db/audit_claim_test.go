@@ -146,10 +146,15 @@ func callsInFunc(t *testing.T, path, funcName string) map[string]bool {
 func TestAuditClaimLoopIsWired(t *testing.T) {
 	// 认领细节在 claimOnce（每轮一次），claimLoop 只负责周期性调用它。
 	claim := callsInFunc(t, "audit.go", "claimOnce")
-	for _, want := range []string{"XPendingExt", "XClaim", "XAck", "handleMessage"} {
+	// ACK 走 ackAndRecord（XAck + 消费速率采样）；这里断言认领路径确实调它，
+	// 再单独断言 ackAndRecord 内部做了 XAck —— 两段合起来才是"认领后会 ACK"。
+	for _, want := range []string{"XPendingExt", "XClaim", "ackAndRecord", "handleMessage"} {
 		if !claim[want] {
 			t.Errorf("claimOnce 缺少 %s：崩溃遗留的 pending 消息无法恢复", want)
 		}
+	}
+	if ack := callsInFunc(t, "audit.go", "ackAndRecord"); !ack["XAck"] {
+		t.Error("ackAndRecord 没有调用 XAck：消费速率采样存在但消息不会被确认")
 	}
 
 	loop := callsInFunc(t, "audit.go", "claimLoop")
