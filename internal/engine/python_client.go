@@ -255,26 +255,98 @@ const pythonDialTimeout = 3 * time.Second
 // 前端"思考中"最长空等数分钟才收到 "Service temporarily unavailable"。
 const pythonResponseHeaderTimeout = 10 * time.Second
 
+// requestOptions 是**单次请求**的调用策略（不影响客户端全局配置）。
+type requestOptions struct {
+	// timeout > 0 时覆盖本次请求的整体超时（同步客户端 Timeout）；Transport 复用，
+	// 因此连接池不受影响。
+	timeout time.Duration
+	// retry=false 时**不重试**（只发一次）。用于"重试会放大伤害"的调用：
+	// 例如 pip list —— 上游 5xx 通常是 pip 本身慢/失败，重试 4 次等于把一堵墙
+	// 撞成 4 堵，还让用户多等 3 个退避周期。
+	retry bool
+	// cooldown=false 时**不更新地址熔断状态**。用于只读探针（后台依赖管理页的
+	// list/snapshots）：探针失败不足以证明"这个引擎实例不能服务对话"，而
+	// markFailure 会把这个地址冷却 5s，连聊天一起拖下水 —— 一次后台刷新不该
+	// 影响正在进行的对话。
+	cooldown bool
+}
+
+// RequestOption 是单次请求策略的可选项（见 GetJSON/PostJSON 的 opts 参数）。
+type RequestOption func(*requestOptions)
+
+// WithRequestTimeout 覆盖**本次**请求的整体超时。
+//
+// 为什么按调用粒度而不是全局：pip list / uninstall 这类管理端点天然比普通 API 慢
+// （冷启动要扫 site-packages，卸载要等子进程），但全局把 `PYTHON_ENGINE_TIMEOUT` 调大
+// 只会让所有端点的失败反馈一起变慢。
+func WithRequestTimeout(d time.Duration) RequestOption {
+	return func(o *requestOptions) {
+		if d > 0 {
+			o.timeout = d
+		}
+	}
+}
+
+// WithoutRetry 禁用本次请求的重试（只发一次）。
+func WithoutRetry() RequestOption {
+	return func(o *requestOptions) { o.retry = false }
+}
+
+// WithoutCooldown 让本次请求不更新地址熔断状态（见 requestOptions.cooldown）。
+func WithoutCooldown() RequestOption {
+	return func(o *requestOptions) { o.cooldown = false }
+}
+
+func newRequestOptions(opts ...RequestOption) requestOptions {
+	o := requestOptions{retry: true, cooldown: true}
+	for _, f := range opts {
+		if f != nil {
+			f(&o)
+		}
+	}
+	return o
+}
+
+// SyncTimeout 返回同步客户端当前的**整体超时**（`PYTHON_ENGINE_TIMEOUT`）。
+// 调用方据此算出"至少不能比它更短"的单次预算，避免把配置放宽的超时又按短值覆盖回去。
+func (c *PythonClient) SyncTimeout() time.Duration {
+	if c == nil || c.client == nil {
+		return defaultSyncTimeout
+	}
+	return c.client.Timeout
+}
+
+// maxUpstreamErrBody 是 429/5xx 响应体在错误串里的截断长度：
+// 够放下引擎的 `{"detail": ...}`，又不会把一整份堆栈塞进日志与响应。
+const maxUpstreamErrBody = 4 << 10
+
 // do 统一请求出口：记录成功/失败并更新熔断状态，支持重试
 // do 统一请求出口（同步 JSON/管理端点）：走 client（允许慢响应头）。
-func (c *PythonClient) do(req *http.Request) (*http.Response, error) {
-	return c.doWith(c.client, req)
+func (c *PythonClient) do(req *http.Request, opts ...RequestOption) (*http.Response, error) {
+	return c.doWith(c.client, req, opts...)
 }
 
 // doStream 流式（SSE）端点请求出口：走 streamClient（短响应头超时），
 // 引擎假死/容器挂起时快速失败，避免前端"思考中"空等数十秒。
-func (c *PythonClient) doStream(req *http.Request) (*http.Response, error) {
-	return c.doWith(c.streamClient, req)
+func (c *PythonClient) doStream(req *http.Request, opts ...RequestOption) (*http.Response, error) {
+	return c.doWith(c.streamClient, req, opts...)
 }
 
 // doWith 记录成功/失败并更新熔断状态，支持重试。
 // httpClient 由上层 do/doStream 按端点语义选择。
-func (c *PythonClient) doWith(httpClient *http.Client, req *http.Request) (*http.Response, error) {
+func (c *PythonClient) doWith(httpClient *http.Client, req *http.Request, opts ...RequestOption) (*http.Response, error) {
 	// 注入trace context到HTTP头
 	propagator := propagation.TraceContext{}
 	propagator.Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 
+	o := newRequestOptions(opts...)
+	if o.timeout > 0 {
+		// 只换整体超时，Transport 复用（连接池/空闲连接不变）。
+		httpClient = &http.Client{Timeout: o.timeout, Transport: httpClient.Transport}
+	}
+
 	addr := req.URL.Scheme + "://" + req.URL.Host
+	method, path := req.Method, req.URL.Path
 	var lastErr error
 
 	// 缓存请求体，用于重试时重新创建 body
@@ -288,10 +360,23 @@ func (c *PythonClient) doWith(httpClient *http.Client, req *http.Request) (*http
 		}
 	}
 
-	for attempt := 0; attempt <= defaultRetryConfig.MaxRetries; attempt++ {
+	attempts := defaultRetryConfig.MaxRetries + 1
+	if !o.retry {
+		attempts = 1
+	}
+
+	// 5xx/429 的最后一个响应体：重试耗尽后要把它交出去（否则调用方只拿到
+	// "server error 502"，引擎到底说了什么全丢）。
+	var lastStatus int
+	var lastBody string
+
+	for attempt := 0; attempt < attempts; attempt++ {
 		// 检查上下文取消
 		if err := req.Context().Err(); err != nil {
-			return nil, fmt.Errorf("request cancelled before attempt %d: %w", attempt+1, err)
+			return nil, &TransportError{
+				Method: method, Path: path,
+				Err: fmt.Errorf("request cancelled before attempt %d: %w", attempt+1, err),
+			}
 		}
 
 		if attempt > 0 {
@@ -312,7 +397,7 @@ func (c *PythonClient) doWith(httpClient *http.Client, req *http.Request) (*http
 
 			select {
 			case <-req.Context().Done():
-				return nil, req.Context().Err()
+				return nil, &TransportError{Method: method, Path: path, Err: req.Context().Err()}
 			case <-time.After(backoff):
 			}
 		}
@@ -326,12 +411,21 @@ func (c *PythonClient) doWith(httpClient *http.Client, req *http.Request) (*http
 		if err == nil {
 			// 检查是否是可重试的错误状态码
 			if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+				// 读一份带截断的体再关：错误串里必须带上引擎自己给的原因
+				// （如 FastAPI 的 {"detail": "pip list timed out"}）。
+				b, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrBody))
 				resp.Body.Close()
+				lastStatus = resp.StatusCode
+				lastBody = string(b)
 				lastErr = fmt.Errorf("server error %d", resp.StatusCode)
-				c.markFailure(addr)
+				if o.cooldown {
+					c.markFailure(addr)
+				}
 				continue
 			}
-			c.markSuccess(addr)
+			if o.cooldown {
+				c.markSuccess(addr)
+			}
 			return resp, nil
 		}
 
@@ -340,12 +434,16 @@ func (c *PythonClient) doWith(httpClient *http.Client, req *http.Request) (*http
 		// 数十秒（曾致前端"思考中"空等 50s+ 才收到错误提示）。此类故障交给熔断冷却
 		// （markFailure + pickAddress 跳过该地址）兜底：后续请求自动避开/冷却结束后再试，
 		// 当前请求立即失败，让上层（HandleSubmit）第一时间通知用户。
-		c.markFailure(addr)
-		return nil, fmt.Errorf("call python engine: %w", err)
+		if o.cooldown {
+			c.markFailure(addr)
+		}
+		return nil, &TransportError{Method: method, Path: path, Err: err}
 	}
 
-	return nil, fmt.Errorf("request failed after %d retries: %w",
-		defaultRetryConfig.MaxRetries+1, lastErr)
+	if lastStatus != 0 {
+		return nil, &UpstreamError{Method: method, Path: path, Status: lastStatus, Body: lastBody}
+	}
+	return nil, fmt.Errorf("request failed after %d retries: %w", attempts, lastErr)
 }
 
 // PythonEvent is a single SSE event from the Python engine.
@@ -432,47 +530,49 @@ func (c *PythonClient) IsConnected() bool {
 }
 
 // GetJSON performs a GET request and decodes JSON into out.
-func (c *PythonClient) GetJSON(ctx context.Context, path string, out any) error {
+//
+// opts 见 RequestOption：调用方按端点语义覆盖超时/重试/熔断副作用。
+func (c *PythonClient) GetJSON(ctx context.Context, path string, out any, opts ...RequestOption) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.pickAddress()+path, nil)
 	if err != nil {
 		return err
 	}
 	c.injectInternalToken(req)
-	resp, err := c.do(req)
+	resp, err := c.do(req, opts...)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("python GET %s returned %d: %s", path, resp.StatusCode, string(b))
+		return &UpstreamError{Method: http.MethodGet, Path: path, Status: resp.StatusCode, Body: string(b)}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 // GetText 取纯文本响应（如 Prometheus `/metrics`）。JSON 方法解不了文本端点，
 // 而进程内存（process_memory_rss_bytes）只在 Prometheus 指标里暴露。
-func (c *PythonClient) GetText(ctx context.Context, path string) (string, error) {
+func (c *PythonClient) GetText(ctx context.Context, path string, opts ...RequestOption) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.pickAddress()+path, nil)
 	if err != nil {
 		return "", err
 	}
 	c.injectInternalToken(req)
-	resp, err := c.do(req)
+	resp, err := c.do(req, opts...)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("python GET %s returned %d: %s", path, resp.StatusCode, string(b))
+		return "", &UpstreamError{Method: http.MethodGet, Path: path, Status: resp.StatusCode, Body: string(b)}
 	}
 	b, err := io.ReadAll(resp.Body)
 	return string(b), err
 }
 
 // PostJSON performs a POST request with JSON body and decodes JSON into out.
-func (c *PythonClient) PostJSON(ctx context.Context, path string, in any, out any) error {
+func (c *PythonClient) PostJSON(ctx context.Context, path string, in any, out any, opts ...RequestOption) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -483,20 +583,20 @@ func (c *PythonClient) PostJSON(ctx context.Context, path string, in any, out an
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.injectInternalToken(req)
-	resp, err := c.do(req)
+	resp, err := c.do(req, opts...)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("python POST %s returned %d: %s", path, resp.StatusCode, string(b))
+		return &UpstreamError{Method: http.MethodPost, Path: path, Status: resp.StatusCode, Body: string(b)}
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
 // PatchJSON performs a PATCH request with JSON body and decodes JSON into out.
-func (c *PythonClient) PatchJSON(ctx context.Context, path string, in any, out any) error {
+func (c *PythonClient) PatchJSON(ctx context.Context, path string, in any, out any, opts ...RequestOption) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -507,14 +607,14 @@ func (c *PythonClient) PatchJSON(ctx context.Context, path string, in any, out a
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.injectInternalToken(req)
-	resp, err := c.do(req)
+	resp, err := c.do(req, opts...)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("python PATCH %s returned %d: %s", path, resp.StatusCode, string(b))
+		return &UpstreamError{Method: http.MethodPatch, Path: path, Status: resp.StatusCode, Body: string(b)}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
@@ -523,7 +623,7 @@ func (c *PythonClient) PatchJSON(ctx context.Context, path string, in any, out a
 }
 
 // PutJSON performs a PUT request with JSON body and decodes JSON into out.
-func (c *PythonClient) PutJSON(ctx context.Context, path string, in any, out any) error {
+func (c *PythonClient) PutJSON(ctx context.Context, path string, in any, out any, opts ...RequestOption) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -534,14 +634,14 @@ func (c *PythonClient) PutJSON(ctx context.Context, path string, in any, out any
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.injectInternalToken(req)
-	resp, err := c.do(req)
+	resp, err := c.do(req, opts...)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("python PUT %s returned %d: %s", path, resp.StatusCode, string(b))
+		return &UpstreamError{Method: http.MethodPut, Path: path, Status: resp.StatusCode, Body: string(b)}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
@@ -612,20 +712,20 @@ func (c *PythonClient) ForwardRequest(w http.ResponseWriter, r *http.Request, pa
 }
 
 // DeleteJSON performs a DELETE request and decodes JSON into out.
-func (c *PythonClient) DeleteJSON(ctx context.Context, path string, out any) error {
+func (c *PythonClient) DeleteJSON(ctx context.Context, path string, out any, opts ...RequestOption) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.pickAddress()+path, nil)
 	if err != nil {
 		return err
 	}
 	c.injectInternalToken(req)
-	resp, err := c.do(req)
+	resp, err := c.do(req, opts...)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("python DELETE %s returned %d: %s", path, resp.StatusCode, string(b))
+		return &UpstreamError{Method: http.MethodDelete, Path: path, Status: resp.StatusCode, Body: string(b)}
 	}
 	if out != nil {
 		return json.NewDecoder(resp.Body).Decode(out)
