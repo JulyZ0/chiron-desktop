@@ -39,7 +39,10 @@
         :message="$t('admin.diag_summary_unavailable')"
         :description="summaryError"
       />
-      <Spin v-else :spinning="summaryLoading">
+      <Spin
+        v-else
+        :spinning="summaryLoading"
+      >
         <div class="summary-grid">
           <div
             v-for="item in summaryChecks"
