@@ -75,7 +75,7 @@ import { HistoryOutlined, ExportOutlined, BulbOutlined, BulbFilled, MoreOutlined
 import { splitThinking, stripUserInputTag, formatClock, formatSize, countItemsAfter, mergeTurnStats } from '../components/chat/chat-types'
 import { mergeHistory, normalizeMeta } from '../components/chat/chat-history'
 import { describeApiError, errorStatus } from '../utils/apiError'
-import { buildWorkbenchContext, chipsFromWorkbenchContext, CONTEXT_QUERY_KEYS, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
+import { buildWorkbenchContext, chipsFromWorkbenchContext, CONTEXT_QUERY_KEYS, MAX_CONTEXT_KBS, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
 import { currentProject } from '../composables/useProject'
 import { buildPrefillText, setChatPrefill, takeChatPrefill } from '../components/chat/chatPrefill'
 import type { ChatItem, ChatSession, ChatAttachment, TurnStatsItem, TextItem } from '../components/chat/chat-types'
@@ -1124,6 +1124,12 @@ const MENTION_CHIP_LABEL = computed<Record<string, string>>(() => ({
 
 function onMentionAdd(p: { type: string; id: string; name: string }) {
   if (contextChips.value.some(c => c.type === p.type && c.value === p.id)) return
+  // 知识库多选有上限（≤5）：每个库都是一次分钟级推理式检索，选到第 6 个时
+  // 该**当场拦住并说明**，而不是默默截断 —— 用户会以为第 6 个也生效了。
+  if (p.type === 'kb' && contextChips.value.filter(c => c.type === 'kb').length >= MAX_CONTEXT_KBS) {
+    notify.warning(t('knowledge.max_knowledge_bases_n', { n: MAX_CONTEXT_KBS }))
+    return
+  }
   contextChips.value = [
     ...contextChips.value,
     {

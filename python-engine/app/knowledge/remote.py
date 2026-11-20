@@ -30,6 +30,7 @@ from app.knowledge.providers.base import (
     HealthResult,
     ProviderContext,
     SubmitResult,
+    citation_doc_key,
     citation_in_scope,
 )
 
@@ -217,6 +218,12 @@ class RemoteProvider:
                 page=item.get("page") if isinstance(item.get("page"), int) else None,
                 block_id=str(item.get("block_id") or ""),
                 snippet=str(item.get("snippet") or ""),
+                # 可定位坐标（P1-1）：doc_id 由文件名前缀反解，kb_id 来自本次请求的上下文。
+                # 有了这两个字段，前端才能把引用点成 `/knowledge/:kbId?doc=:docId`。
+                doc_id=citation_doc_key(
+                    str(item.get("doc_name") or ""), ctx.doc_ids
+                ),
+                kb_id=ctx.kb_id,
             )
             for item in (body.get("citations") or [])
             if isinstance(item, dict)

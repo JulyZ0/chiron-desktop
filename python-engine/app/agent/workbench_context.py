@@ -13,6 +13,12 @@ from typing import Any, TypeVar
 
 T = TypeVar("T")
 
+#: 一次对话最多注入的知识库数。与前端 ``components/chat/contextChips.ts`` 的
+#: ``MAX_CONTEXT_KBS`` **逐值对齐**：每个库都是一次分钟级 LLM 推理、一次独立索引读取，
+#: 多选上限就是首字节延迟的上限。前端负责不让用户选出第 6 个，后端负责
+#: 手写 URL（``?kb=a&kb=b&...``）时也守住底线。
+MAX_CONTEXT_KBS = 5
+
 
 def _as_str_list(raw: Any) -> list[str]:
     """把任意形态的字段收敛成去空、去重、保序的字符串列表。"""

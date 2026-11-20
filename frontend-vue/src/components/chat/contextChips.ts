@@ -13,6 +13,16 @@ import { t } from '../../i18n'
 
 export type ContextChipType = 'kb' | 'agent' | 'skill' | 'plugin' | 'memory'
 
+/**
+ * 一次对话最多带入的知识库数。
+ *
+ * 为什么要上限：每个库都是一次**分钟级**的推理式检索（PageIndex 的 chat 是 LLM 工具
+ * 循环），多选 10 个库等于把首字节等待放大 10 倍。上限 5 与引擎侧
+ * `python-engine/app/agent/workbench_context.py::MAX_CONTEXT_KBS` 逐值对齐 ——
+ * 前端拦人是体验，后端截断是底线（手写 URL 能绕过去）。
+ */
+export const MAX_CONTEXT_KBS = 5
+
 export interface ContextChip {
   type: ContextChipType
   label: string
@@ -77,7 +87,7 @@ function valuesOf(chips: readonly ContextChip[], type: ContextChipType): string[
 export function buildWorkbenchContext(chips: readonly ContextChip[]): Record<string, unknown> | undefined {
   const ctx: Record<string, unknown> = {}
 
-  const kbIds = valuesOf(chips, 'kb')
+  const kbIds = valuesOf(chips, 'kb').slice(0, MAX_CONTEXT_KBS)
   if (kbIds.length) {
     ctx.kb_id = kbIds[0]
     ctx.kb_ids = kbIds

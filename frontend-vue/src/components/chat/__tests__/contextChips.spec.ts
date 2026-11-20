@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {CONTEXT_QUERY_KEYS, buildWorkbenchContext, parseContextQuery, type ContextChip} from '../contextChips'
+import {CONTEXT_QUERY_KEYS, MAX_CONTEXT_KBS, buildWorkbenchContext, parseContextQuery, type ContextChip} from '../contextChips'
 
 const chips = (...pairs: [ContextChip['type'], string][]): ContextChip[] =>
   pairs.map(([type, value]) => ({ type, label: value, value }))
@@ -83,5 +83,38 @@ describe('buildWorkbenchContext（发给引擎的形态）', () => {
 
   it('memory 参数已纳入统一清空列表（新增 chip 类型不再漏清）', () => {
     expect(CONTEXT_QUERY_KEYS).toContain('memory')
+  })
+})
+
+describe('知识库多选（P1-1：上限 5）', () => {
+  const manyKb = (n: number): ContextChip[] =>
+    Array.from({ length: n }, (_, i) => ({ type: 'kb', label: `kb-${i}`, value: `kb-${i}` }))
+
+  it('多选提交：kb_ids 数组带上全部已选库（单值 kb_id 仍取首个）', () => {
+    const ctx = buildWorkbenchContext(manyKb(3))
+    expect(ctx).toEqual({ kb_id: 'kb-0', kb_ids: ['kb-0', 'kb-1', 'kb-2'] })
+  })
+
+  it('超过上限时截断到 5 个（与引擎 MAX_CONTEXT_KBS 对齐）', () => {
+    const ctx = buildWorkbenchContext(manyKb(8)) as { kb_ids: string[]; kb_id: string }
+    expect(MAX_CONTEXT_KBS).toBe(5)
+    expect(ctx.kb_ids).toEqual(['kb-0', 'kb-1', 'kb-2', 'kb-3', 'kb-4'])
+    expect(ctx.kb_id).toBe('kb-0')
+  })
+
+  it('URL 里手写 8 个 kb 参数也只在提交时带 5 个', () => {
+    const chips = parseContextQuery({ kb: manyKb(8).map(c => c.value) })
+    expect(chips).toHaveLength(8) // 解析全保留（用户可能想先看到自己传了什么）
+    const ctx = buildWorkbenchContext(chips) as { kb_ids: string[] }
+    expect(ctx.kb_ids).toHaveLength(MAX_CONTEXT_KBS)
+  })
+
+  it('上限只作用于知识库：agent/skill/plugin 不受影响', () => {
+    const ctx = buildWorkbenchContext([
+      ...manyKb(7),
+      ...Array.from({ length: 6 }, (_, i) => ({ type: 'skill' as const, label: '', value: `s-${i}` })),
+    ]) as { kb_ids: string[]; skill_names: string[] }
+    expect(ctx.kb_ids).toHaveLength(5)
+    expect(ctx.skill_names).toHaveLength(6)
   })
 })

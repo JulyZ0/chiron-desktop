@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, markRaw } from 'vue'
+import { ref, onMounted, onUnmounted, computed, markRaw, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Card, Button, Upload, Table, Spin, Empty, Tag, Space, Switch,
@@ -13,8 +13,11 @@ import {
 import { api, resolveMediaUrl } from '../api'
 import {
   buildKnowledgeBase as requestBuildIndex,
+  getKnowledgeIndexStatus,
   isKbBuilding,
   isKbTerminal,
+  reindexKnowledgeBase,
+  type KbIndexStatus,
 } from '../api/knowledge'
 import { errorDetail } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
@@ -58,6 +61,27 @@ function kbStatusColor(status?: string): string {
 
 function kbStatusLabel(status?: string): string {
   return t(`knowledge.status_${status || 'disabled'}`)
+}
+
+/**
+ * 文档级状态 → Tag 颜色/文案。
+ *
+ * 取值集合是 worker 实际写入的四个（见 `pageindex-service/app/store.py`）：
+ * pending / indexing / ready / error。旧模板判的 completed / processing 从未被写入，
+ * 于是"已就绪"的文档在界面上显示成"失败"。
+ */
+function docStatusColor(status?: string): string {
+  if (status === 'ready') return 'success'
+  if (status === 'indexing') return 'processing'
+  if (status === 'error') return 'error'
+  return 'default'
+}
+
+function docStatusLabel(status?: string): string {
+  if (status === 'indexing') return t('knowledge.status_indexing')
+  if (status === 'ready') return t('knowledge.status_ready')
+  if (status === 'error') return t('knowledge.status_error')
+  return t('common.pending')
 }
 
 /** GET /v1/kb/{id}（网关字段 + 引擎补充的统计字段） */
@@ -269,6 +293,16 @@ const kbId = route.params.id as string
 onMounted(async () => {
   await loadKnowledgeBase()
   await loadDocuments()
+  // 首屏先取一次进度：库里可能早就有一批 indexing 的文档（离开页面时提交的任务），
+  // 只有 active 时才起轮询 —— 空闲的库不拉接口。
+  const active = await loadIndexStatus()
+  if (active) startIndexPolling()
+  await focusTargetDocument()
+})
+
+onUnmounted(() => {
+  pollStopped = true
+  stopIndexPolling()
 })
 
 async function loadKnowledgeBase() {
@@ -572,6 +606,126 @@ function kbErrorMessage(): string {
   return kb.value?.error_message || ''
 }
 
+// ── 索引进度轮询（P1-1） ──
+//
+// 只读 `GET /v1/kb/{id}/status`：服务端按文档状态聚合好 `percent` / `active`，
+// 前端**不再自己数文档**（两边各算一遍，迟早出现"进度条 80%、列表 6/10"）。
+//
+// 每 3s 一次，且**仅在 `active`（仍有文档在索引）时继续**：
+//   - 空闲的库不该被持续拉接口（一个页面挂着不动也会一直打后端）；
+//   - 到了终态（ready / error）立刻停 —— 继续轮询一个已经失败的库只会让用户干等超时。
+const INDEX_POLL_INTERVAL_MS = 3000
+const indexStatus = ref<KbIndexStatus | null>(null)
+// 服务端不可达时也要能收敛：轮询失败 3 次即停（别无限重试）
+const INDEX_POLL_MAX_ERRORS = 3
+let pollTimer: ReturnType<typeof setTimeout> | null = null
+let pollErrors = 0
+let pollStopped = false
+
+async function loadIndexStatus(): Promise<boolean> {
+  try {
+    indexStatus.value = await getKnowledgeIndexStatus(kbId)
+    pollErrors = 0
+    return Boolean(indexStatus.value?.active)
+  } catch {
+    pollErrors += 1
+    if (pollErrors >= INDEX_POLL_MAX_ERRORS) pollStopped = true
+    return false
+  }
+}
+
+function stopIndexPolling() {
+  if (pollTimer) {
+    clearTimeout(pollTimer)
+    pollTimer = null
+  }
+}
+
+/** 启动轮询（已在跑则不重复起）。`active` 为 false 时自然停。 */
+function startIndexPolling() {
+  stopIndexPolling()
+  pollStopped = false
+  pollErrors = 0
+  const tick = async () => {
+    pollTimer = null
+    if (pollStopped) return
+    const active = await loadIndexStatus()
+    // 本轮刚结束：把文档列表与库状态一起刷新，界面不会停在"索引中"的旧快照
+    if (!active) {
+      if (indexStatus.value?.total !== undefined) {
+        await loadDocuments()
+        await loadKnowledgeBase()
+      }
+      return
+    }
+    pollTimer = setTimeout(tick, INDEX_POLL_INTERVAL_MS)
+  }
+  pollTimer = setTimeout(tick, INDEX_POLL_INTERVAL_MS)
+}
+
+/** 重建索引：`failed` = 只重试失败文档；`all` = 全库重建。 */
+async function reindex(scope: 'failed' | 'all') {
+  rebuilding.value = scope
+  try {
+    const res = await reindexKnowledgeBase(kbId, scope)
+    if (res.enqueued) {
+      message.success(t('knowledge.index_build_started'))
+    } else if (res.reason === 'no failed documents') {
+      message.info(t('knowledge.no_failed_documents'))
+    } else {
+      // 已在索引中：幂等返回，不是错误
+      message.info(t('knowledge.index_already_running'))
+    }
+    await loadIndexStatus()
+    startIndexPolling()
+  } catch (e) {
+    message.error(kbErrorText(e, t('errors.re_index_failed')))
+  } finally {
+    rebuilding.value = null
+  }
+}
+
+const rebuilding = ref<'failed' | 'all' | null>(null)
+
+/** 失败文档（进度接口给出，不再从库级 error_message 反解析）。 */
+const failedDocuments = computed(() => indexStatus.value?.failed_documents ?? [])
+
+/** 进度卡片是否显示：有可执行的索引信息就显示（active 或 有失败）。 */
+const showIndexCard = computed(() => {
+  const st = indexStatus.value
+  if (!st) return false
+  return st.active || st.failed > 0 || st.pending > 0
+})
+
+// ── `?doc=` 定位（引用可点回这里） ──
+//
+// 消息里的知识库引用链到 `/knowledge/:kbId?doc=:docId`。落点要"看得见"：
+// 高亮该行并滚动到它，而不是丢给用户一个 500 行的文档表自己找。
+const targetDocId = ref<string>(typeof route.query.doc === 'string' ? route.query.doc : '')
+const docTableRef = ref<HTMLElement | null>(null)
+
+async function focusTargetDocument() {
+  const docId = targetDocId.value
+  if (!docId) return
+  await nextTick()
+  const row = docTableRef.value?.querySelector<HTMLElement>(`tr[data-row-key="${CSS.escape(docId)}"]`)
+  if (!row) return
+  row.scrollIntoView({ block: 'center', behavior: 'smooth' })
+}
+
+/** 目标行的样式钩子（Ant Design Table 的 rowClassName）。 */
+function docRowClassName(record: KnowledgeDocument): string {
+  return record.id && record.id === targetDocId.value ? 'doc-row-target' : ''
+}
+
+/** 行内高亮的锚点目标（引用落点）：也供“清除定位”使用。 */
+function clearTargetDocument() {
+  targetDocId.value = ''
+  const q = { ...route.query }
+  delete q.doc
+  void router.replace({ path: route.path, query: q })
+}
+
 /**
  * 轮询到索引进入终态。
  *
@@ -640,6 +794,9 @@ async function buildKnowledgeBase() {
   } finally {
     building.value = false
     buildProgress.value = 0
+    // 投递后统一由状态接口驱动界面（比本地定时器可靠：跨页面、跨实例都一致）
+    await loadIndexStatus()
+    startIndexPolling()
   }
 }
 
@@ -713,6 +870,18 @@ function formatSize(bytes: number): string {
         >
           {{ $t('common.building') }}
         </Button>
+        <!-- 全库重建：换索引模型/升级 pageindex 后用（失败的少量文档走进度卡片里的"重试"） -->
+        <Button
+          :loading="rebuilding === 'all'"
+          :disabled="rebuilding !== null || kb?.enabled === false"
+          :title="kb?.enabled === false ? $t('knowledge.kb_disabled_hint') : $t('knowledge.reindex_all_hint')"
+          @click="reindex('all')"
+        >
+          <template #icon>
+            <ReloadOutlined />
+          </template>
+          {{ $t('knowledge.reindex_all') }}
+        </Button>
       </Space>
     </div>
 
@@ -777,16 +946,49 @@ function formatSize(bytes: number): string {
           </p>
         </Card>
 
-        <!-- 构建进度 -->
+        <!-- 索引进度（服务端聚合，每 3s 轮询；仅在仍有文档在索引时轮询） -->
         <Card
-          v-if="building"
+          v-if="showIndexCard"
           :title="$t('common.build_progress')"
           style="margin-top: 16px"
         >
           <Progress
-            :percent="buildProgress"
-            status="active"
+            :percent="indexStatus?.percent ?? 0"
+            :status="indexStatus?.status === 'error' ? 'exception' : indexStatus?.active ? 'active' : 'success'"
           />
+          <div class="index-summary">
+            <span>{{ $t('knowledge.index_progress_n_of_m', { done: indexStatus?.indexed ?? 0, total: indexStatus?.total ?? 0 }) }}</span>
+            <span v-if="(indexStatus?.indexing ?? 0) > 0">{{ $t('knowledge.status_indexing') }} {{ indexStatus?.indexing }}</span>
+            <span v-if="(indexStatus?.pending ?? 0) > 0">{{ $t('common.pending') }} {{ indexStatus?.pending }}</span>
+            <span v-if="(indexStatus?.failed ?? 0) > 0" class="index-failed-count">{{ $t('errors.failed') }} {{ indexStatus?.failed }}</span>
+          </div>
+          <!-- 失败原因逐条列出：只给"异常"两个字，用户没法判断是重试还是换文件 -->
+          <div
+            v-if="failedDocuments.length"
+            class="index-failures"
+          >
+            <div class="index-failures-title">{{ $t('knowledge.index_failed_documents') }}</div>
+            <ul>
+              <li
+                v-for="doc in failedDocuments"
+                :key="doc.id"
+              >
+                <strong>{{ doc.name }}</strong>
+                <span v-if="doc.error_message">：{{ doc.error_message }}</span>
+              </li>
+            </ul>
+            <Button
+              size="small"
+              :loading="rebuilding === 'failed'"
+              :disabled="rebuilding !== null"
+              @click="reindex('failed')"
+            >
+              <template #icon>
+                <ReloadOutlined />
+              </template>
+              {{ $t('knowledge.retry_failed_documents') }}
+            </Button>
+          </div>
         </Card>
 
         <!-- 文档列表 -->
@@ -866,14 +1068,32 @@ function formatSize(bytes: number): string {
             :description="$t('knowledge.no_documents_yet')"
             :hint="$t('knowledge.upload_documents_or_pick_from_the_media_library_they_become_searchable_after_indexing')"
           />
-          <Table
+          <div
             v-else
-            :columns="docColumns"
-            :data-source="filteredDocs"
-            :pagination="false"
-            :row-selection="{ selectedRowKeys: selectedDocIds, onChange: (keys: any[]) => (selectedDocIds = keys) }"
-            row-key="id"
+            ref="docTableRef"
           >
+            <!-- 引用落点提示：从消息里的引用跳过来时，告诉用户"高亮的是哪一篇" -->
+            <div
+              v-if="targetDocId"
+              class="doc-target-hint"
+            >
+              <span>{{ $t('knowledge.located_referenced_document') }}</span>
+              <Button
+                type="link"
+                size="small"
+                @click="clearTargetDocument"
+              >
+                {{ $t('knowledge.clear_located_document') }}
+              </Button>
+            </div>
+            <Table
+              :columns="docColumns"
+              :data-source="filteredDocs"
+              :pagination="false"
+              :row-selection="{ selectedRowKeys: selectedDocIds, onChange: (keys: any[]) => (selectedDocIds = keys) }"
+              :row-class-name="docRowClassName"
+              row-key="id"
+            >
             <template #bodyCell="{ column, text, record }">
               <template v-if="column.dataIndex === 'name'">
                 <a
@@ -889,8 +1109,11 @@ function formatSize(bytes: number): string {
                 {{ formatSize(text) }}
               </template>
               <template v-else-if="column.dataIndex === 'status'">
-                <Tag :color="text === 'completed' ? 'success' : text === 'processing' ? 'processing' : text === 'error' ? 'error' : 'default'">
-                  {{ text === 'pending' ? $t('common.pending') : text === 'processing' ? $t('common.processing') : text === 'completed' ? $t('common.completed') : $t('errors.failed') }}
+                <!-- 文档状态取值来自 worker：pending / indexing / ready / error。
+                     旧模板判的是 completed / processing —— 两个从未被写入过的值，
+                     于是每篇文档都显示成"失败"。 -->
+                <Tag :color="docStatusColor(text)">
+                  {{ docStatusLabel(text) }}
                 </Tag>
               </template>
               <template v-else-if="column.dataIndex === 'created_at'">
@@ -926,7 +1149,8 @@ function formatSize(bytes: number): string {
                 </Space>
               </template>
             </template>
-          </Table>
+            </Table>
+          </div>
         </Card>
       </div>
     </Spin>
@@ -1103,6 +1327,18 @@ function formatSize(bytes: number): string {
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .doc-name-link:hover { text-decoration: underline; }
+
+/* ── 索引进度卡片 ── */
+.index-summary { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; font-size: 13px; color: var(--text-secondary); }
+.index-failed-count { color: var(--error); }
+.index-failures { margin-top: 12px; padding-top: 12px; border-top: var(--hairline-width) solid var(--border-card); }
+.index-failures-title { font-size: 13px; font-weight: var(--fw-medium); color: var(--text-primary); margin-bottom: 6px; }
+.index-failures ul { margin: 0 0 10px; padding-inline-start: 18px; font-size: 13px; color: var(--text-secondary); }
+.index-failures li { margin: 2px 0; word-break: break-word; }
+
+/* ── 引用落点高亮（/knowledge/:kbId?doc=:docId） ── */
+.doc-target-hint { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; color: var(--text-secondary); }
+:deep(tr.doc-row-target > td) { background: var(--primary-bg); }
 
 .media-search-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
 .media-actions { display: flex; align-items: center; gap: 8px; white-space: nowrap; }

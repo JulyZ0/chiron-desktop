@@ -36,7 +36,7 @@ from app.knowledge.providers.base import (
     STATUS_ERROR,
     is_known_provider,
 )
-from app.knowledge.service import answer_question, kb_enabled
+from app.knowledge.service import answer_question, index_status, kb_enabled
 from app.tools.context import to_tenant_int
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,17 @@ class DocumentUpload(BaseModel):
 class BuildBody(BaseModel):
     #: 重建索引。增量模式会跳过已 ready 的文档 —— 升级 pageindex 后必须走它。
     force: bool = False
+
+
+#: 重建范围。``failed`` = 只重试失败的文档（默认，"修一下"是绝大多数场景）；
+#: ``all`` = 全库重建（换索引模型/升级 pageindex 后用）。
+REINDEX_SCOPE_FAILED = "failed"
+REINDEX_SCOPE_ALL = "all"
+REINDEX_SCOPES: tuple[str, ...] = (REINDEX_SCOPE_FAILED, REINDEX_SCOPE_ALL)
+
+
+class ReindexBody(BaseModel):
+    scope: str = REINDEX_SCOPE_FAILED
 
 
 class KBQuery(BaseModel):
@@ -754,6 +765,208 @@ async def build_knowledge_base(
     }
 
 
+#: 重建请求的并发闸门：同一知识库同时只允许一个重建请求在途。
+#: 60s 足够覆盖"检查—改状态—投递"这三步；真正的长任务串行由 worker 的库级锁负责
+#: （见 pageindex-service/app/index_worker.py 的 KB_LOCK_TTL），这里只防手抖连点。
+REINDEX_LOCK_TTL_SECONDS = 60
+
+
+async def _acquire_reindex_lock(kb_id: str) -> tuple[bool, Any]:
+    """抢"同一库只允许一个重建请求"的短锁。
+
+    返回 ``(acquired, redis)``：Redis 不可用时 **fail-open**（``True, None``）——
+    和 ``desktop_infer`` 的幂等占位同一取舍：一个可选的防抖闸门不应因缓存故障
+    把重建功能整个关掉；真正的串行由 worker 的库级锁兜住。
+    """
+    from app.redis_client import get_redis
+    from app.redis_keys import rkey
+
+    try:
+        redis = await get_redis()
+    except Exception as exc:  # noqa: BLE001 — 缓存故障不阻断重建
+        logger.warning("reindex lock: redis unavailable (fail-open) kb=%s: %s", kb_id, exc)
+        return True, None
+    if redis is None:
+        return True, None
+    try:
+        got = await redis.set(
+            rkey(f"engine:kb:reindex:{kb_id}"), "1", nx=True, ex=REINDEX_LOCK_TTL_SECONDS
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reindex lock: claim failed (fail-open) kb=%s: %s", kb_id, exc)
+        return True, None
+    return bool(got), redis
+
+
+async def _release_reindex_lock(kb_id: str, redis: Any) -> None:
+    if redis is None:
+        return
+    from app.redis_keys import rkey
+
+    try:
+        await redis.delete(rkey(f"engine:kb:reindex:{kb_id}"))
+    except Exception:  # noqa: BLE001 — 释放失败由 TTL 兜底
+        logger.debug("reindex lock: release failed kb=%s", kb_id, exc_info=True)
+
+
+async def get_index_status(
+    kb_id: str, user_id: str, tenant_id: int = 0
+) -> dict[str, Any]:
+    """索引进度：库级状态 + 逐文档状态（前端据此画进度条 / 失败原因）。
+
+    **聚合在 service 层**（``index_status``）：pageindex-service 是**无状态**检索服务，
+    没有"某库的 job 进度"端点可透传（它只有 /healthz 与 /metrics 的全局队列深度），
+    真实进度只存在于数据库的文档状态里。
+
+    读权限与 ``list_documents`` 同一道 gate：能看文档列表的人才能看进度。
+    """
+    pool = get_pool()
+    kb = await pool.fetchrow(
+        "SELECT id, user_id, visibility, tenant_id FROM knowledge_bases WHERE id = $1", kb_id
+    )
+    if kb is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    _require_kb_access(kb, user_id, tenant_id, action="view")
+
+    try:
+        return await index_status(kb_id=kb_id)
+    except KnowledgeError as exc:  # 读行期间库被删：与 GET /{kb_id} 同口径
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+async def reindex_knowledge_base(
+    kb_id: str,
+    user_id: str,
+    tenant_id: int = 0,
+    scope: str = REINDEX_SCOPE_FAILED,
+) -> dict[str, Any]:
+    """重新提交索引：``failed`` = 只重试失败文档，``all`` = 全库重建。
+
+    ## 幂等
+
+    * 库正在 ``indexing`` → **不重复投递**，直接回当前状态（重复投递等于双倍 LLM 费用，
+      而用户看到的只是"多点了一次"）；
+    * ``scope=failed`` 但库里没有失败文档 → 不投递，回 ``reason``；
+    * 同一库并发两个重建请求 → 后到的拿不到短锁，回 409（"限制并发 1"）。
+
+    ## 为什么投递成功后立刻把库状态写成 indexing
+
+    worker 取件前 ``status`` 还是 ``error``，前端"仅在有 indexing 时轮询"的规则会让
+    进度条一动不动。这里主动写 ``indexing`` 是**事实**（任务已提交、正在执行），
+    失败回滚见下面的 ``except`` 分支。
+    """
+    if scope not in REINDEX_SCOPES:
+        raise HTTPException(status_code=400, detail=f"scope must be one of {REINDEX_SCOPES}")
+
+    pool = get_pool()
+    kb = await pool.fetchrow(
+        """SELECT id, user_id, provider, status, enabled, document_count
+             FROM knowledge_bases WHERE id = $1""",
+        kb_id,
+    )
+    if kb is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    if kb["user_id"] != user_id:
+        raise HTTPException(
+            status_code=403, detail="not authorized to reindex this knowledge base"
+        )
+    if not kb_enabled(kb):
+        raise HTTPException(
+            status_code=409,
+            detail="knowledge base is disabled; enable it before reindexing",
+        )
+    if (kb["document_count"] or 0) == 0:
+        raise HTTPException(
+            status_code=400, detail="cannot reindex knowledge base with no documents"
+        )
+    await _assert_provider_matches(user_id=str(user_id), kb_provider=str(kb["provider"]))
+    await _resolve_provider_or_error(user_id=str(user_id))
+
+    previous_status = str(kb["status"] or "")
+    if previous_status == kb_status.STATUS_INDEXING:
+        return {
+            "status": kb_status.STATUS_INDEXING,
+            "enqueued": False,
+            "reason": "already indexing",
+            "scope": scope,
+            "count": 0,
+            "task_id": "",
+        }
+
+    counts = await pool.fetchrow(
+        """SELECT COUNT(*) FILTER (WHERE status = 'error') AS failed,
+                  COUNT(*) FILTER (WHERE status <> 'ready') AS not_ready
+             FROM knowledge_documents WHERE knowledge_base_id = $1""",
+        kb_id,
+    )
+    failed_count = int((counts or {}).get("failed", 0) or 0)
+    not_ready = int((counts or {}).get("not_ready", 0) or 0)
+    if scope == REINDEX_SCOPE_FAILED and failed_count == 0 and not_ready == 0:
+        return {
+            "status": previous_status or kb_status.STATUS_READY,
+            "enqueued": False,
+            "reason": "no failed documents",
+            "scope": scope,
+            "count": 0,
+            "task_id": "",
+        }
+
+    acquired, redis = await _acquire_reindex_lock(kb_id)
+    if not acquired:
+        raise HTTPException(
+            status_code=409,
+            detail="a reindex request for this knowledge base is already in flight",
+        )
+    try:
+        if scope == REINDEX_SCOPE_FAILED:
+            # 失败文档回到 pending：worker 的增量模式本来也会取 status<>'ready'，
+            # 但显式重置能让进度条立刻显示"0/N 已重跑"，而不是停在旧的 error 计数上。
+            await pool.execute(
+                """UPDATE knowledge_documents
+                      SET status = 'pending', error_message = NULL, updated_at = NOW()
+                    WHERE knowledge_base_id = $1 AND status = 'error'""",
+                kb_id,
+            )
+        await pool.execute(
+            """UPDATE knowledge_bases
+                  SET status = $2, error_message = NULL, updated_at = NOW()
+                WHERE id = $1""",
+            kb_id,
+            kb_status.STATUS_INDEXING,
+        )
+        try:
+            task_id = await _enqueue_kb_index(
+                kb_id=kb_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                force=scope == REINDEX_SCOPE_ALL,
+            )
+        except Exception as exc:  # noqa: BLE001 — 投递失败必须回滚状态，否则界面永远"索引中"
+            await pool.execute(
+                """UPDATE knowledge_bases SET status = $2, updated_at = NOW() WHERE id = $1""",
+                kb_id,
+                previous_status or kb_status.STATUS_ERROR,
+            )
+            logger.error("reindex: enqueue failed kb=%s: %s", kb_id, exc)
+            raise HTTPException(status_code=503, detail=f"索引任务投递失败: {exc}") from exc
+    finally:
+        await _release_reindex_lock(kb_id, redis)
+
+    logger.info(
+        "reindex enqueued kb=%s scope=%s task=%s failed=%d", kb_id, scope, task_id, failed_count
+    )
+    return {
+        "status": kb_status.STATUS_INDEXING,
+        "enqueued": True,
+        "scope": scope,
+        # 本次实际会重跑的文档数（all = 全部，failed = 失败数 + 未就绪数）
+        "count": (kb["document_count"] or 0) if scope == REINDEX_SCOPE_ALL else max(failed_count, 0),
+        "not_ready": not_ready,
+        "task_id": task_id,
+        "provider": kb["provider"],
+    }
+
+
 async def query_knowledge_base(
     *, kb_id: str, user_id: str, query: str, tenant_id: int = 0, top_k: int = 5
 ) -> dict[str, Any]:
@@ -790,6 +1003,9 @@ async def query_knowledge_base(
                 "page": c.page,
                 "block_id": c.block_id,
                 "snippet": c.snippet,
+                # 可定位坐标（P1-1）：前端据此生成 /knowledge/:kbId?doc=:docId
+                "doc_id": c.doc_id,
+                "kb_id": c.kb_id or kb_id,
             }
             for c in result.citations
         ],
@@ -1162,6 +1378,39 @@ async def query_kb(
         query=body.query,
         top_k=body.top_k,
         tenant_id=tenant_id,
+    )
+
+
+@router.get("/{kb_id}/status")
+async def get_kb_status(
+    kb_id: str,
+    request: Request,
+    user_id: str = Query("", alias="user_id"),
+    tenant_id: int = Query(0, alias="tenant_id"),
+) -> dict[str, Any]:
+    """索引进度（只读）。与 `PUT /{kb_id}/status`（用户开关）**同路径不同方法**：
+    前者读索引状态、后者写启用开关，语义本就正交（见文件头与 0006 迁移）。"""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="user_id required")
+    return await get_index_status(kb_id, user_id, tenant_id=tenant_id)
+
+
+@router.post("/{kb_id}/reindex")
+async def reindex_kb(
+    kb_id: str,
+    request: Request,
+    body: ReindexBody | None = None,
+    user_id: str = Query("", alias="user_id"),
+    tenant_id: int = Query(0, alias="tenant_id"),
+) -> dict[str, Any]:
+    """重新提交索引（失败文档 / 全库），幂等且同库并发 1。"""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="user_id required")
+    return await reindex_knowledge_base(
+        kb_id=kb_id,
+        user_id=user_id,
+        tenant_id=tenant_id,
+        scope=(body.scope if body else REINDEX_SCOPE_FAILED),
     )
 
 
