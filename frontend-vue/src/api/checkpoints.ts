@@ -1,5 +1,5 @@
 /**
- * 还原点（检查点）的数据面：时间线 + 回滚。
+ * 还原点（检查点）的数据面：时间线 + 预览 + 回滚 + 回收。
  *
  * **为什么要读 Chiron 自己的表，而不是 git log**：这些点由引擎在每次回合边界
  * 自动创建，含义是「agent 动手之前/之后的世界长什么样」。`git log` 里看不到
@@ -7,9 +7,10 @@
  * 草稿），而回滚恰恰需要它们 —— 清单存在 `checkpoint_untracked` 里（见
  * `internal/api/project_checkpoints.go`）。
  *
- * **为什么回滚没有「预览差异」接口**：网关侧的 `restore` 会先算出计划再落地，
- * 但它不返回计划。要看差异用户应该切到「改动」页签 —— 那是当前工作区 vs HEAD，
- * 与「当前 vs 某个还原点」口径不同，不能混着展示。
+ * **预览与回滚是两条端点**：预览（`POST /v1/checkpoints/{id}/diff`）**只读**，
+ * 在引擎侧用临时索引/临时 CAS 算差异，工作区一个字节都不动。它回答的问题与
+ * 「改动」页签不同：那边是「当前工作区 vs HEAD」，这边是「当前 vs 某个还原点」，
+ * 两者口径不同，不能混着展示。
  */
 import { api } from './index'
 
@@ -18,6 +19,74 @@ export type CheckpointKind = 'pre_turn' | 'post_turn' | string
 
 /** `ok` = 完整写出；其它值说明这次快照本身就没写全，不能拿来回滚。 */
 export type CheckpointState = 'ok' | string
+
+/**
+ * 规模统计：时间线头部显示「当前快照多大 / 近 30 天平均多大」。
+ *
+ * `sample_count === 0` 时平均值没有意义（会显示 0），前端据此显示"暂无数据"。
+ */
+export interface CheckpointStats {
+  /** 统计窗口内的成功检查点数 */
+  sample_count: number
+  avg_file_count: number
+  avg_byte_size: number
+  window_days: number
+  /** 当前工作区快照（仅预览响应里有） */
+  current_files?: number
+  current_bytes?: number
+  /** 未跟踪 CAS 的规模 */
+  store_files?: number
+  store_bytes?: number
+}
+
+/**
+ * 回滚差异预览。**全部是"会做什么"，不是"做了什么"** —— 这条端点绝不动文件。
+ */
+export interface CheckpointDiffPreview {
+  /** 内容会被改回快照版本 */
+  restored: string[]
+  /** 快照里有、工作区没有，回滚会新建 */
+  added: string[]
+  /** 当前有、目标没有。**默认不删**（与 `allow_delete: false` 同口径） */
+  removed: string[]
+  /** 本会出现在 `removed`、但命中保护名单（密钥/噪声）而永不删除 */
+  protected_removed: string[]
+  /** 目标里是 gitlink 等无法恢复的内容 */
+  unsupported: string[]
+  /**
+   * `true` = 这个点的未跟踪清单读不到，预览**只覆盖 git 跟踪的文件**。
+   * 必须显示：否则"预览里没有差异"会被理解成"回滚不会动任何东西"。
+   */
+  untracked_omitted: boolean
+  stats: CheckpointStats
+}
+
+/** 回收结果（`dry_run` 时 `deleted`/`freed_bytes` 是计划值）。 */
+export interface CheckpointGcResult {
+  scanned: number
+  referenced: number
+  deleted: number
+  freed_bytes: number
+  dry_run: boolean
+  expired: number
+  orphan: number
+  kept_young: number
+  store_files: number
+  store_bytes: number
+  refs: number
+  commits: number
+  tree_paths: number
+  dangling_refs: string[]
+  planned: string[]
+  retention_days: number
+  stats: CheckpointStats
+}
+
+/** 时间线 + 规模统计。两者一起返回，省一次往返。 */
+export interface CheckpointListResult {
+  checkpoints: ProjectCheckpoint[]
+  stats: CheckpointStats | null
+}
 
 export interface ProjectCheckpoint {
   id: string
@@ -99,6 +168,23 @@ function normalizeCheckpoint(raw: unknown): ProjectCheckpoint | null {
   }
 }
 
+function normalizeStats(raw: unknown): CheckpointStats | null {
+  if (!raw || typeof raw !== 'object') return null
+  const s = raw as Record<string, unknown>
+  // 全部字段都可能缺失（老网关没有 stats）；缺了就按 0 处理，但不返回 null ——
+  // 返回 null 会让界面以为"没有统计数据"，而真相只是这个字段还没上线。
+  return {
+    sample_count: num(s.sample_count),
+    avg_file_count: num(s.avg_file_count),
+    avg_byte_size: num(s.avg_byte_size),
+    window_days: num(s.window_days) || 30,
+    current_files: num(s.current_files),
+    current_bytes: num(s.current_bytes),
+    store_files: num(s.store_files),
+    store_bytes: num(s.store_bytes),
+  }
+}
+
 /**
  * 读项目的时间线。`sessionId` 非空时只看这一个会话的点。
  *
@@ -107,16 +193,86 @@ function normalizeCheckpoint(raw: unknown): ProjectCheckpoint | null {
 export async function listProjectCheckpoints(
   projectId: string,
   sessionId?: string,
-): Promise<ProjectCheckpoint[]> {
+): Promise<CheckpointListResult> {
   const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
   const { data } = await api.get(
     `/v1/session-map/projects/${encodeURIComponent(projectId)}/checkpoints${query}`,
   )
   const payload = data?.data ?? {}
   const list: unknown[] = Array.isArray(payload.checkpoints) ? payload.checkpoints : []
-  return list
-    .map(normalizeCheckpoint)
-    .filter((c): c is ProjectCheckpoint => c !== null)
+  return {
+    checkpoints: list
+      .map(normalizeCheckpoint)
+      .filter((c): c is ProjectCheckpoint => c !== null),
+    stats: normalizeStats(payload.stats),
+  }
+}
+
+/**
+ * 预览"回到这个还原点"会动哪些文件。**只读**：引擎用临时索引/临时 CAS 取快照。
+ *
+ * 失败（点不存在 / 不是你的 / 工作区已移走）会抛错，由调用方就地显示 ——
+ * 预览失败不该静默变成"没有差异"。
+ */
+export async function previewCheckpointDiff(
+  checkpointId: string,
+): Promise<CheckpointDiffPreview> {
+  const { data } = await api.post(
+    `/v1/checkpoints/${encodeURIComponent(checkpointId)}/diff`,
+    {},
+  )
+  const p = data?.data ?? {}
+  return {
+    restored: strList(p.restored),
+    added: strList(p.added),
+    removed: strList(p.removed),
+    protected_removed: strList(p.protected_removed),
+    unsupported: strList(p.unsupported),
+    // 缺省按 true 处理：看不到这个字段时**不能**声称"未跟踪部分也预览到了"。
+    untracked_omitted: p.untracked_omitted === undefined ? true : !!p.untracked_omitted,
+    stats: normalizeStats(p.stats) ?? {
+      sample_count: 0, avg_file_count: 0, avg_byte_size: 0, window_days: 30,
+    },
+  }
+}
+
+/**
+ * 回收未跟踪 CAS 里"没人引用且已过保留期"的分片（平台 owner）。
+ *
+ * `dryRun` 默认 **true**：先看计划再决定。网关侧同样把缺省的 `dry_run` 当 true。
+ */
+export async function runCheckpointGc(options: {
+  retentionDays?: number
+  dryRun?: boolean
+  workspaceId?: string
+} = {}): Promise<CheckpointGcResult> {
+  const body: Record<string, unknown> = {}
+  if (options.retentionDays !== undefined) body.retention_days = options.retentionDays
+  if (options.dryRun !== undefined) body.dry_run = options.dryRun
+  if (options.workspaceId) body.workspace_id = options.workspaceId
+  const { data } = await api.post('/v1/admin/checkpoints/gc', body)
+  const p = data?.data ?? {}
+  return {
+    scanned: num(p.scanned),
+    referenced: num(p.referenced),
+    deleted: num(p.deleted),
+    freed_bytes: num(p.freed_bytes),
+    dry_run: p.dry_run === undefined ? true : !!p.dry_run,
+    expired: num(p.expired),
+    orphan: num(p.orphan),
+    kept_young: num(p.kept_young),
+    store_files: num(p.store_files),
+    store_bytes: num(p.store_bytes),
+    refs: num(p.refs),
+    commits: num(p.commits),
+    tree_paths: num(p.tree_paths),
+    dangling_refs: strList(p.dangling_refs),
+    planned: strList(p.planned),
+    retention_days: num(p.retention_days) || 30,
+    stats: normalizeStats(p.stats) ?? {
+      sample_count: 0, avg_file_count: 0, avg_byte_size: 0, window_days: 30,
+    },
+  }
 }
 
 /**

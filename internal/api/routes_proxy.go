@@ -313,4 +313,9 @@ func registerProxyRoutes(
 	// 所以归属校验必须发生在网关（见 checkpoint_restore.go 文件头），handler 自己
 	// 查一次 `(id, tenant, user)` 再转发。
 	mux.Handle("POST /v1/checkpoints/{cid}/restore", authMW(rlMW(http.HandlerFunc(CheckpointRestoreHandler(pythonClient)))))
+
+	// 还原点差异预览：**只读**，回答"回滚会动哪些文件"。归属校验与回滚同一判据
+	// （见 checkpoint_diff.go 文件头）—— 引擎拿到 root 就会去读工作区，
+	// 少了这道校验，猜到的 id 就能让引擎去快照别人的目录。
+	mux.Handle("POST /v1/checkpoints/{cid}/diff", authMW(rlMW(http.HandlerFunc(CheckpointDiffHandler(pythonClient)))))
 }

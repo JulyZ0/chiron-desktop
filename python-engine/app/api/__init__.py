@@ -11,6 +11,7 @@ from app.api.deps import router as deps_router
 from app.api.desktop_infer import router as desktop_infer_router
 from app.api.interactions import router as interactions_router
 from app.api.internal_diagnostics import router as internal_diagnostics_router
+from app.api.internal_checkpoints import router as internal_checkpoints_router
 from app.api.internal_knowledge import router as internal_knowledge_router
 from app.api.internal_market import router as internal_market_router
 from app.api.internal_subagent import router as internal_subagent_router
@@ -34,6 +35,8 @@ api_router.include_router(internal_market_router)
 api_router.include_router(internal_knowledge_router)
 # 后台「自诊断」：必需表存在性（只读 information_schema，清单与启动自检同源）
 api_router.include_router(internal_diagnostics_router)
+# 检查点维护：回滚差异预览（只读）与未跟踪 CAS 回收（P1-3，内部 token 鉴权）
+api_router.include_router(internal_checkpoints_router)
 api_router.include_router(interactions_router)
 api_router.include_router(skills_router)
 api_router.include_router(knowledge_router)
