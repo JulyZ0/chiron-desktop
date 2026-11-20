@@ -1435,12 +1435,44 @@ function notifyEngineExit(info = {}) {
  */
 let supervisorGaveUpNotified = false
 
+/**
+ * 把崩溃取证文件的位置与最后一行错误推给渲染层。
+ *
+ * 为什么走 IPC 而不是只弹窗：弹窗是一次性的，用户点掉就没了；而"崩溃日志在哪"是
+ * 用户反馈时**唯一**能被带出来的证据（真机退出码 1073807364 时引擎一个字节都没写）。
+ * 页面可以把它显示在错误条上并提供"复制路径"。
+ */
+function forwardEngineCrash(crashLog) {
+  const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+  if (!win || !crashLog || !crashLog.path) return
+  try {
+    win.webContents.send(shared.ENGINE_CRASH_CHANNEL, {
+      path: String(crashLog.path),
+      lastLine: String(crashLog.lastLine || ''),
+      at: String(crashLog.at || ''),
+    })
+  } catch (err) {
+    logMain('warn', `engine crash log forward failed: ${err?.message || err}`)
+  }
+}
+
 function notifySupervisorGiveUp(role, info = {}) {
   const label = role === 'gateway' ? '本地网关' : role === 'engine' ? '本地 AI 引擎' : String(role)
   const tail = String(info.stderrTail || '').trim().split('\n').slice(-8).join('\n')
+  // 引擎侧取证文件（local-stack.cjs 在放弃时挂上来的）：stderr 可能是空的，
+  // 这份文件是唯一的现场。没有它时保持原文案，不编造占位内容。
+  const crashLog = info.crashLog || null
+  const crashText = crashLog
+    ? `崩溃日志：${crashLog.path}` +
+      (crashLog.lastLine ? `\n最后一行：${crashLog.lastLine}` : '')
+    : ''
+  forwardEngineCrash(crashLog)
   logMain(
     'error',
-    `本地组件 ${role} 连续崩溃已达上限，停止自愈（code=${info.code} signal=${info.signal || ''}）` +
+    `本地组件 ${role} 连续崩溃已达上限，停止自愈（code=${info.code} signal=${info.signal || ''}` +
+      (info.reason ? ` reason=${info.reason}` : '') +
+      '）' +
+      (crashLog ? `\n${crashText}` : '') +
       (tail ? `\n${tail}` : ''),
   )
   if (supervisorGaveUpNotified) return
@@ -1454,8 +1486,10 @@ function notifySupervisorGiveUp(role, info = {}) {
       title: `${label}反复崩溃，已停止自动重启`,
       message: '本地后端无法自行恢复，功能会持续不可用',
       detail:
-        `${label}在短时间内连续崩溃，已经自动重启到上限（3 次）仍不稳定，` +
-        '为避免反复重建拖垮机器，已停止自动重启。\n\n' +
+        `${label}在短时间内连续崩溃（连续 3 次，或 10 分钟内累计 3 次），` +
+        '自动重启已停止：' +
+        '为避免反复重建拖垮机器，不再继续尝试。\n\n' +
+        (crashText ? `${crashText}\n\n` : '') +
         (tail ? `最近的输出（尾部）：\n${tail}\n\n` : '') +
         '重启应用会重新尝试一次完整的启动。若反复出现，请连同这条信息一起反馈。',
       buttons: ['重启应用', '稍后手动重启'],

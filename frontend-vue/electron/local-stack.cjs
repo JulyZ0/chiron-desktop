@@ -1546,6 +1546,139 @@ function watchGatewayExit(gatewayRecord, supervisor) {
 }
 
 /**
+ * 崩溃日志发现：把 Python 侧写下的现场文件交给上层。
+ *
+ * 引擎自己落两份文件（见 `python-engine/app/crash_forensics.py`）：
+ *   - `engine-crash-<ts>.log`：Python 层异常的结构化报告（退出类型/活跃 run/最近事件）；
+ *   - `engine-faulthandler.log`：`faulthandler` 的原生崩溃 dump（栈溢出、段错误），
+ *     也就是 Electron 只看到「退出码 1073807364」时**唯一**可能有栈的地方。
+ * 两份都取最新且非空的那一个：硬崩只有 faulthandler 有内容，软崩只有 ts 文件有内容。
+ */
+const ENGINE_CRASH_LOG_PATTERN = /^engine-crash-.*\.log$/
+const ENGINE_FAULTHANDLER_LOG = 'engine-faulthandler.log'
+/** 只读文件尾部：崩溃报告可能带长 traceback，没必要整份读进内存 */
+const CRASH_LOG_TAIL_BYTES = 16 * 1024
+
+/**
+ * `faulthandler` dump 的特征串。
+ *
+ * 这个文件**每次启动都会存在**（写入一行 boot 头），所以"文件在"不等于"崩过"：
+ * 只认真的 dump（`Fatal Python error` / Windows 的 `Windows fatal exception`）。
+ * 少了这道过滤，任何一次"引擎被外力杀掉"都会把一行 boot 头当成"最后一行错误"报给用户。
+ */
+const FAULTHANDLER_FATAL_MARKERS = [
+  'Fatal Python error',
+  'Windows fatal exception',
+  'Current thread 0x',
+]
+
+/** 报告尾标记对排障没有信息量，取"最后一行错误"时跳过它 */
+const CRASH_REPORT_END_MARK = '=== end ==='
+
+function readLastNonEmptyLine(file) {
+  let fd = null
+  try {
+    const size = fs.statSync(file).size
+    const start = Math.max(0, size - CRASH_LOG_TAIL_BYTES)
+    fd = fs.openSync(file, 'r')
+    const buf = Buffer.alloc(size - start)
+    fs.readSync(fd, buf, 0, buf.length, start)
+    const lines = buf
+      .toString('utf8')
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      if (lines[i] !== CRASH_REPORT_END_MARK) return lines[i].slice(0, 300)
+    }
+    return ''
+  } catch {
+    return ''
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd)
+      } catch {
+        /* 关闭失败不影响已读到的内容 */
+      }
+    }
+  }
+}
+
+/** `faulthandler.log` 里是否真有 dump（而不只是启动时写的那行 boot 头）。 */
+function hasFaulthandlerDump(file) {
+  let text = ''
+  try {
+    const size = fs.statSync(file).size
+    const start = Math.max(0, size - CRASH_LOG_TAIL_BYTES)
+    const fd = fs.openSync(file, 'r')
+    try {
+      const buf = Buffer.alloc(size - start)
+      fs.readSync(fd, buf, 0, buf.length, start)
+      text = buf.toString('utf8')
+    } finally {
+      fs.closeSync(fd)
+    }
+  } catch {
+    return false
+  }
+  return FAULTHANDLER_FATAL_MARKERS.some(marker => text.includes(marker))
+}
+
+/**
+ * 在 `logDir` 里找最近的崩溃日志。
+ *
+ * @returns {{path: string, lastLine: string, at: string, size: number}|null}
+ *   目录不存在、没有候选、候选全是空文件时返回 null（"没有证据"与"证据是空"必须分开）。
+ */
+function engineCrashLogInfo(logDir) {
+  const dir = String(logDir || '').trim()
+  if (!dir) return null
+  let entries = []
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return null
+  }
+  let best = null
+  for (const entry of entries) {
+    if (!entry.isFile()) continue
+    const isFaulthandler = entry.name === ENGINE_FAULTHANDLER_LOG
+    if (!isFaulthandler && !ENGINE_CRASH_LOG_PATTERN.test(entry.name)) continue
+    const full = path.join(dir, entry.name)
+    let stat
+    try {
+      stat = fs.statSync(full)
+    } catch {
+      continue
+    }
+    if (!stat.size) continue
+    // boot 头不是证据（见 FAULTHANDLER_FATAL_MARKERS 的说明）
+    if (isFaulthandler && !hasFaulthandlerDump(full)) continue
+    if (!best || stat.mtimeMs >= best.mtimeMs) {
+      best = { path: full, size: stat.size, mtimeMs: stat.mtimeMs }
+    }
+  }
+  if (!best) return null
+  return {
+    path: best.path,
+    lastLine: readLastNonEmptyLine(best.path),
+    at: new Date(best.mtimeMs).toISOString(),
+    size: best.size,
+  }
+}
+
+/** 引擎日志目录：与 `buildEngineEnv` 下发的 `LOG_DIR` 同一来源（测试可注入 env 覆盖）。 */
+function engineLogDir() {
+  const ctx = state.restartCtx
+  if (!ctx) return ''
+  const envLog = ctx.options && ctx.options.env && ctx.options.env.LOG_DIR
+  if (envLog) return String(envLog)
+  const paths = localDataPaths(ctx.options ? ctx.options.dataDir : '')
+  return paths.LOG_DIR || ''
+}
+
+/**
  * 装上崩溃自愈。
  *
  * 为什么必须有：网关与引擎都是长驻进程，而此前任何一方在运行中退出都**没有任何恢复**
@@ -1566,7 +1699,13 @@ function installSupervisor(options = {}) {
     restart: role => restartProcess(role),
     onGiveUp: (role, info) => {
       // 放弃时必须让用户知道：这是"再也起不来了"，不是一次会自动好的抖动。
-      if (typeof onGiveUp === 'function') onGiveUp(role, info)
+      // 引擎崩溃还要把取证文件一起交上去：`info.stderrTail` 只覆盖"进程输出"，
+      // 而真机上引擎往往一个字节都没来得及写（退出码 1073807364 就是这种）。
+      const crashLog = role === 'engine' ? engineCrashLogInfo(engineLogDir()) : null
+      if (crashLog) {
+        log(`engine crash log: ${crashLog.path} | last: ${crashLog.lastLine || '(empty)'}`)
+      }
+      if (typeof onGiveUp === 'function') onGiveUp(role, crashLog ? { ...info, crashLog } : info)
       log(`supervisor gave up on ${role}`)
     },
     log: msg => log(msg),
@@ -1861,6 +2000,12 @@ module.exports = {
    * 重挂 exit 监听），所以手动重启与自动恢复的行为不会各说一套。
    */
   restartProcess,
+  /**
+   * 最近的引擎崩溃取证文件（路径 + 最后一行错误）。
+   *
+   * 导出给主进程与用例：真机上"引擎无声退出"时，用户手里唯一能贴出来的证据就是它。
+   */
+  engineCrashLogInfo,
   _setDeps,
   _setLog,
   _resetDeps,
