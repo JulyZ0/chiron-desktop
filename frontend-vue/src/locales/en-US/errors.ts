@@ -305,4 +305,22 @@ export default {
   // rate-limit wording "Server busy" — "too many requests" vs "a local component
   // hasn't come up". The concrete cause comes from error.response.data.detail.
   local_service_not_ready: "The local service isn't ready yet, so this action can't be completed right now. Try again in a moment; if it keeps failing, restart the app.",
+  // Schema drift (/schema-mismatch): the gateway is up but its migrations don't match
+  // the database. The wording must let the user fix it themselves, so the versions and
+  // the command get their own lines instead of being folded into one sentence.
+  schema_mismatch_badge: "Database schema mismatch",
+  schema_mismatch_title: "The database schema needs migrating",
+  schema_mismatch_desc: "The gateway is running, but the database migration version does not match this build, so business endpoints are unavailable. Run the migration command below, then click Retry.",
+  schema_mismatch_expected: "Expected by this build",
+  schema_mismatch_actual: "Current in database",
+  schema_mismatch_actual_empty: "(no migration has ever run)",
+  schema_mismatch_missing_tables: "Missing tables",
+  schema_mismatch_fix_label: "Run this in the deployment directory:",
+  schema_mismatch_copy: "Copy command",
+  schema_mismatch_copied: "Fix command copied",
+  schema_mismatch_copy_failed: "Copy failed — select the command and copy it manually",
+  schema_mismatch_retry: "Retry",
+  schema_mismatch_reload: "Reload page",
+  schema_mismatch_still_mismatched: "Still out of sync: make sure the command finished and it targeted the same database.",
+  schema_mismatch_gateway_unreachable: "Cannot reach the gateway right now: it may be restarting. Try again in a moment.",
 }

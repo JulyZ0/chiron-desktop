@@ -1,6 +1,7 @@
 import { createRouter, createWebHashHistory, createWebHistory } from 'vue-router'
 import { authGuard } from './guard'
 import { setupRouteProgress } from './progress'
+import { setupSchemaMismatchWatch } from './schemaMismatch'
 
 import { t } from '../i18n'
 const routes = [
@@ -261,6 +262,16 @@ const routes = [
       { path: 'database', redirect: { path: '/admin/datastores', query: { tab: 'database' } } },
     ],
   },
+  // schema 漂移诊断页。网关在「代码期望的迁移 head ≠ 数据库 alembic_version」时只
+  // 提供 /healthz，业务路由全 503（见 cmd/chiron/schema_mismatch.go）；跳转由
+  // setupSchemaMismatchWatch 非阻塞地触发。`public` 是必须的：此刻没有可用的鉴权
+  // 接口，守卫若等 initToken 建立会话，用户会卡在转圈上而看不到这条诊断。
+  {
+    path: '/schema-mismatch',
+    name: 'SchemaMismatch',
+    component: () => import('../views/SchemaMismatchView.vue'),
+    meta: { public: true },
+  },
   // 404 兜底：避免未知地址白屏
   {
     path: '/:pathMatch(.*)*',
@@ -288,6 +299,10 @@ router.beforeEach(authGuard)
 
 // 路由进度条
 setupRouteProgress(router)
+
+// schema 漂移跳转（非阻塞）：启动探一次 + 每次导航后节流探测，只在
+// status=schema_mismatch 时把人送到 /schema-mismatch（见 src/router/schemaMismatch.ts）
+setupSchemaMismatchWatch(router)
 
 // 路由预加载：页面空闲时预加载常用路由
 // 使用 RequestIdleCallback 避免阻塞主线程
