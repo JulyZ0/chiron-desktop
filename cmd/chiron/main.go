@@ -281,6 +281,10 @@ func main() {
 	// 会话地图：周期对账（删掉指向已删会话的节点）—— 事件驱动的失效兜不住"别的实例删的会话"
 	api.StartSessionMapReconciler(lifecycleCtx)
 
+	// 检查点未跟踪 CAS 的周期回收（默认 24h，CHIRON_CHECKPOINT_GC_INTERVAL_HOURS 可关）。
+	// 与"手工 GC 端点"共用引擎侧同一套判据（引用集合来自 PG、读不到就中止）。
+	api.StartCheckpointGcScheduler(lifecycleCtx, pythonClient)
+
 	// P1-1: 启动数据库连接池自动调优（每5分钟检查一次）
 	if db.GlobalDBManager != nil {
 		db.GlobalDBManager.SetTuneInterval(5 * time.Minute)

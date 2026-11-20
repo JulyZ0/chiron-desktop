@@ -145,11 +145,12 @@ def attempt_checkpoint(
     返回 ``None`` 只剩两种情况：参数不成立（空 ``session_id``），或不是"建点失败"
     而是压根没有可报的东西 —— 这些都不该在时间线上留一行。
 
-    **"项目根嵌在父仓库里"也走失败分支**：``snapshot()`` 会先用
-    ``git rev-parse --show-toplevel`` 校验仓库顶层就是 ``root``，不相等直接抛
-    ``GitError``（否则会静默快照**父仓库**的内容，见 ``git_checkpoint`` 的说明）。
-    这条失败同样落成 ``state='failed'`` 的记录，"未启用版本控制的项目"因此得到
-    明确的失败记录，而不是一条看起来成功、实际什么都没保护的空快照。
+    **monorepo 子目录项目现在受支持**：``snapshot()`` 会用
+    ``git rev-parse --show-prefix`` 定出项目根在父仓库里的前缀，把独立索引裁到前缀内，
+    因此快照只含项目根子树（父仓库其它文件不会被卷进来，见 ``git_checkpoint``
+    的 ``RepoLayout``）。仍然走失败分支的只有"根本不在仓库里"与"拿不到前缀"
+    这两类 —— 判定都落在 ``state='failed'`` 的记录里，"未启用版本控制的项目"
+    因此得到明确的失败记录，而不是一条看起来成功、实际什么都没保护的空快照。
     """
     if not session_id:
         logger.warning("checkpoint skipped: empty session_id")

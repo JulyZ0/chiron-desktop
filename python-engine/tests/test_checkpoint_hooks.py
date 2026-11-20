@@ -128,8 +128,8 @@ async def test_failed_record_is_reported_with_reason(monkeypatch) -> None:
     _CAPTURED.clear()
 
     reason = (
-        "project root is inside another git repository: /tmp/outer/inner "
-        "(repository top-level: /tmp/outer)"
+        "not a git repository: /tmp/plain (not a git repository)；"
+        "检查点需要版本控制，请先在该目录执行 git init。"
     )
     rec = cs.CheckpointRecord(
         seq=7,
