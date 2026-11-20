@@ -489,6 +489,11 @@ def _session_hint(status: int | None) -> str:
         )
     if status == 403:
         return "来源不是 loopback：必须用 127.0.0.1 访问，别用机器名/局域网 IP（internal/api/auth_local_session.go）"
+    if status == 405:
+        return (
+            "该网关没有注册 POST /v1/auth/session（LOCAL_BOOTSTRAP 未开）——"
+            "常见于连到了源码态 `python run.py start` 的开发栈，而不是桌面本地栈"
+        )
     if status == 500:
         return "服务端 500：看引擎/网关日志与数据库是否可迁移（owner 账号由 ensureLocalOwner 幂等建）"
     return "检查网关日志 logs/main.log 与 /v1/auth/session 的注册开关（LOCAL_BOOTSTRAP）"
@@ -776,7 +781,7 @@ def judge_shares(result: HttpResult) -> tuple[Check, str]:
             status=PASS if token else FAIL,
             detail=detail,
             hint="" if token else "列表项缺 share_id，前端取不到可打开的链接（internal/api/share.go::List）",
-            evidence={"count": len(items), "sample_share_id": token},
+            evidence={"count": len(items), "sample_share_id_prefix": token[:8]},
         ),
         token,
     )
@@ -1017,7 +1022,7 @@ def render_text(report: dict[str, Any]) -> str:
         f"汇总：PASS={counts.get(PASS, 0)}  FAIL={counts.get(FAIL, 0)}  "
         f"SKIP={counts.get(SKIP, 0)}  INFO={counts.get(INFO, 0)}"
     )
-    failed = [f"{c['id']}（{c['title']}）" for c in report["checks"] if c["status"] == FAIL]
+    failed = [f"{c['id']} {c['title']}" for c in report["checks"] if c["status"] == FAIL]
     if failed:
         lines.append("FAIL 项：" + "、".join(failed))
     lines.append("结论：" + _verdict(report))

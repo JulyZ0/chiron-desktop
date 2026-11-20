@@ -411,6 +411,19 @@ class DiagnosticsJudgementTests(unittest.TestCase):
         self.assertEqual(vab.judge_diagnostics(http(500, text="{}")).status, vab.INFO)
 
 
+class SessionJudgementTests(unittest.TestCase):
+    def test_405_points_at_local_bootstrap(self) -> None:
+        # 真机见过：连到源码态 `python run.py start` 的开发栈，POST 该端点回 405
+        check = vab.judge_session(http(405, text="Method Not Allowed"))
+        self.assertEqual(check.status, vab.FAIL)
+        self.assertIn("LOCAL_BOOTSTRAP", check.hint)
+
+    def test_masked_token_is_not_a_session(self) -> None:
+        check = vab.judge_session(ok({"token": "********", "user": {}}))
+        self.assertEqual(check.status, vab.FAIL)
+        self.assertIn("sanitize_response.go", check.hint)
+
+
 class ReportTests(unittest.TestCase):
     def test_only_fail_drives_exit_code(self) -> None:
         checks = [
