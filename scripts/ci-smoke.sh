@@ -6,13 +6,19 @@
 #
 #   1. go       ：build + 单测（排除需要真机 DB/Redis 的 live/diag 用例）
 #                 + vendor 一致性（仅当仓库真的带 vendor/modules.txt）
-#   2. engine   ：pytest 单测（`-m "not live and not integration"`；
-#                 忽略 `test_chiron_client_sdk*.py` —— 它们要求 `clients/python/`
-#                 里的客户端包，本仓不含，收集阶段就会报 ModuleNotFoundError）
+#   2. engine   ：pytest 单测（`-m "not live and not integration and not network"`，
+#                 与 ci.yml 的稳定子集同口径；忽略 `test_chiron_client_sdk*.py` ——
+#                 它们要求 `clients/python/` 里的客户端包，本仓不含，收集阶段就会
+#                 报 ModuleNotFoundError）
 #   3. frontend ：electron 打包静态冒烟 + UI 契约 + vue-tsc + vitest + vite build
 #
 # 另加 schema 校验：`migrations/versions` 必须**只有一个 head**（分叉会让
 # `internal/db` 的 ParseMigrationHead 报错、网关拒绝启动）。
+#
+# 每个环节的结论（pass / fail / skip + 提交号 + 时间）落到
+# `.artifacts/ci-smoke/<slug>.result`（**不**提交），供
+# `scripts/check-release-ready.sh` 判断发布就绪 —— 那是**同一台机器、同一个
+# 工作树**上的证据链：门禁跑的是哪个提交，发布前就核对哪个提交。
 #
 # 用法：
 #   bash scripts/ci-smoke.sh          # 全量
@@ -21,9 +27,15 @@
 #                                     # 追加 P0-2 真机集成测试带（docker compose，数分钟）；
 #                                     # 默认**不跑**；缺 docker / 守护进程未启动时按 skipped 处理
 #                                     # （run.sh 以 77 退出，不算失败）
+#   bash scripts/ci-smoke.sh --release
+#                                     # 发布就绪组合 = **全量** + 末尾追加
+#                                     # `scripts/check-release-ready.sh`（迁移单 head /
+#                                     # 工作树干净 / go·python·frontend 三门禁证据齐全
+#                                     # 且对应当前提交）。与 --fast 互斥。
 #
 # 环境变量：
 #   CHIRON_SMOKE_SKIP=go,python,frontend,integration  跳过指定环节（局部调试用）
+#   CHIRON_SMOKE_ARTIFACTS=<dir>                     结论落盘目录（默认 .artifacts/ci-smoke）
 #
 # 前置：go / node / python 在 PATH 上；全量前端需要 `frontend-vue/node_modules`
 # （先 `pnpm install --frozen-lockfile`）；--integration 需要 docker compose。
@@ -35,24 +47,64 @@ cd "$ROOT" || exit 1
 
 FAST=0
 INTEGRATION=0
+RELEASE=0
 for arg in "$@"; do
   case "$arg" in
     --fast) FAST=1 ;;
     --integration) INTEGRATION=1 ;;
+    --release) RELEASE=1 ;;
     -h | --help)
-      sed -n '2,32p' "$0"
+      awk 'NR > 1 && /^set -/{exit} NR > 1' "$0"
       exit 0
       ;;
     *)
-      echo "未知参数：$arg（可用：--fast --integration）" >&2
+      echo "未知参数：$arg（可用：--fast --integration --release）" >&2
       exit 2
       ;;
   esac
 done
 
+# 发布门禁必须跑完整的门禁：跳过前端全量再"发布就绪"是自相矛盾的组合，
+# 与其在 check-release-ready.sh 里报缺证据，不如在这里直接拒绝。
+if [ "$RELEASE" = "1" ] && [ "$FAST" = "1" ]; then
+  echo "--release 与 --fast 互斥：发布门禁不接受跳过前端全量" >&2
+  exit 2
+fi
+
 SKIP="${CHIRON_SMOKE_SKIP:-}"
 skipped() {
   case ",$SKIP," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
+
+# ── 结论落盘 ──────────────────────────────────────────────────────────────
+# key=value 而不是 JSON：这条路径要被 check-release-ready.sh 在最小环境里读回来，
+# 而那一侧只有 bash/awk。字段含义：
+#   status   pass / fail / skip
+#   exit     原始退出码（skip 可能是 2 = 环境不具备，也可能是 0 = 显式跳过）
+#   commit   跑门禁时的 HEAD —— 与发布时的 HEAD 不一致即证据作废
+#   dirty    跑门禁时工作树是否已脏（0/1，供人判断，不作为门禁判据）
+OUT="${CHIRON_SMOKE_ARTIFACTS:-$ROOT/.artifacts/ci-smoke}"
+mkdir -p "$OUT" 2>/dev/null || true
+rm -f "$OUT"/*.result 2>/dev/null || true
+COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+DIRTY=0
+if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+  DIRTY=1
+fi
+
+record_result() {
+  # record_result <slug> <status> <exit> <seconds>
+  local slug="$1" status="$2" rc="$3" secs="$4" file
+  file="$OUT/$slug.result"
+  {
+    echo "stage=$slug"
+    echo "status=$status"
+    echo "exit=$rc"
+    echo "duration_s=$secs"
+    echo "commit=$COMMIT"
+    echo "dirty=$DIRTY"
+    echo "finished_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$file" 2>/dev/null || true
 }
 
 PASS=0
@@ -61,33 +113,40 @@ SKIPPED=0
 FAILED_NAMES=""
 
 stage() {
-  # stage <名字> <函数>；返回 2 表示"环境不具备，跳过"（不算失败）
-  local name="$1"
-  local fn="$2"
-  local start rc
+  # stage <slug> <名字> <函数>；函数返回 2 表示"环境不具备，跳过"（不算失败）
+  local slug="$1"
+  local name="$2"
+  local fn="$3"
+  local start rc secs
   start=$(date +%s)
   echo ""
   echo "── $name"
   "$fn"
   rc=$?
+  secs=$(( $(date +%s) - start ))
   if [ "$rc" -eq 0 ]; then
-    echo "   ✔ $name（$(( $(date +%s) - start ))s）"
+    echo "   ✔ $name（${secs}s）"
     PASS=$((PASS + 1))
+    record_result "$slug" pass 0 "$secs"
   elif [ "$rc" -eq 2 ]; then
     echo "   ↷ $name：环境不具备，跳过"
     SKIPPED=$((SKIPPED + 1))
+    record_result "$slug" skip "$rc" "$secs"
   else
     echo "   ✘ $name"
     FAIL=$((FAIL + 1))
     FAILED_NAMES="$FAILED_NAMES $name"
+    record_result "$slug" fail "$rc" "$secs"
   fi
 }
 
 skip_stage() {
+  # skip_stage <slug> <名字> <原因>
   echo ""
-  echo "── $1"
-  echo "   ↷ 跳过：$2"
+  echo "── $2"
+  echo "   ↷ 跳过：$3"
   SKIPPED=$((SKIPPED + 1))
+  record_result "$1" skip 0 0
 }
 
 # ── 1. Go 网关 ────────────────────────────────────────────────────────────
@@ -109,36 +168,12 @@ stage_vendor() {
 }
 
 # ── 2. 迁移单 head ────────────────────────────────────────────────────────
-# 不依赖 alembic（本地未必装了 requirements-migrate.txt）：直接解析
-# revision / down_revision。判据与 internal/db 的 ParseMigrationHead 同构。
+# 不依赖 alembic（本地未必装了 requirements-migrate.txt）：解析脚本只读
+# revision / down_revision，判据与 internal/db 的 ParseMigrationHead 同构。
+# 发布门禁（check-release-ready.sh）用的是**同一个**脚本，不是同一段复制 ——
+# 两份正则各自漂移时，本地绿与发布红会打架。
 stage_schema() {
-  python - <<'PY'
-import pathlib
-import re
-import sys
-
-versions = pathlib.Path("migrations/versions")
-revs = {}
-parents = set()
-for f in sorted(versions.glob("*.py")):
-    text = f.read_text(encoding="utf-8")
-    m = re.search(r"^revision\s*(?::[^=\n]+)?=\s*[\"']([^\"']+)[\"']", text, re.M)
-    if not m:
-        print(f"   ✘ {f.name}: 找不到 revision 声明", file=sys.stderr)
-        sys.exit(1)
-    revs[m.group(1)] = f.name
-    d = re.search(r"^down_revision\s*(?::[^=\n]+)?=\s*(.+)$", text, re.M)
-    if d:
-        # down_revision 可能是 None / "abc" / ("a", "b")
-        for ref in re.finditer(r"[\"']([^\"']+)[\"']", d.group(1)):
-            parents.add(ref.group(1))
-
-heads = sorted(set(revs) - parents)
-print(f"   revisions={len(revs)} heads={heads}")
-if len(heads) != 1:
-    print("   ✘ 迁移链必须只有 1 个 head（分叉会让网关拒绝启动）", file=sys.stderr)
-    sys.exit(1)
-PY
+  python scripts/check_migration_head.py
 }
 
 # ── 3. Python 引擎 ────────────────────────────────────────────────────────
@@ -149,6 +184,12 @@ PY
 # 与"代码有问题"是两回事）。Windows 冷启动即全量只会训练人忽略红。
 # 因此：CI 或 `CHIRON_SMOKE_PY_FULL=1` 走全量；否则跑**稳定子集的冒烟**
 # （api + 引擎装配 + 模式 + 工具守卫 —— 覆盖最核心的契约面，秒级完成）。
+#
+# marker 一律带 `not network`（`test_sandbox_service_multiprocess.py` 那类要真起
+# 监听端口）—— 与 ci.yml 的 Pytest 步骤同口径。此前这里只写了 `not live and not
+# integration`，于是 ci-smoke 在 CI/发布机上比 ci.yml 多跑一个"多进程沙箱服务"用例：
+# PR 门禁把它排除、发布门禁却带着它，两边结论天然可能不一致。它由 ci.yml 的
+# real-stack integration job 覆盖（`-m "integration or live or network"`）。
 stage_python() {
   if ! python -c "import pytest" >/dev/null 2>&1; then
     echo "   ↷ python 环境缺 pytest：先 pip install -r python-engine/requirements-dev.txt"
@@ -179,7 +220,8 @@ stage_python() {
     JWT_SECRET="${JWT_SECRET:-ci-python-jwt-secret-0123456789abcdef}" \
       APP_SECRET="${APP_SECRET:-ci-python-app-secret-0123456789abcdef}" \
       TEMP="$tmp" TMP="$tmp" \
-      python -m pytest $targets -q -m "not live and not integration" \
+      python -m pytest $targets -q \
+      -m "not live and not integration and not network" \
       --ignore-glob="tests/test_chiron_client_sdk*.py"
   )
 }
@@ -226,42 +268,57 @@ stage_integration() {
   return "$rc"
 }
 
-echo "ci-smoke：root=$ROOT fast=$FAST integration=$INTEGRATION"
+# ── 6. 发布就绪自检（--release）───────────────────────────────────────────
+# 判据全在 scripts/check-release-ready.sh（迁移单 head / 工作树干净 / 三门禁证据
+# 齐全且对应当前提交）。这里只做串联，顺序不能反：**先跑门禁、再看证据** ——
+# 反了就是拿上一次运行的残留结论给这一次签字。
+stage_release_ready() {
+  bash scripts/check-release-ready.sh
+}
+
+DIRTY_NOTE=""
+if [ "$DIRTY" = "1" ]; then DIRTY_NOTE="，工作树已脏"; fi
+echo "ci-smoke：root=$ROOT fast=$FAST integration=$INTEGRATION release=$RELEASE"
+echo "         结论落盘：${OUT#"$ROOT"/}（commit ${COMMIT:0:12}${DIRTY_NOTE}）"
 
 if skipped go; then
-  skip_stage "go（build + 单测）" "CHIRON_SMOKE_SKIP 指定"
+  skip_stage go "go（build + 单测）" "CHIRON_SMOKE_SKIP 指定"
 else
-  stage "go（build + 单测，排除 live/diag）" stage_go
-  stage "go vendor 一致性" stage_vendor
+  stage go "go（build + 单测，排除 live/diag）" stage_go
+  stage go-vendor "go vendor 一致性" stage_vendor
 fi
 
-stage "schema（迁移单 head）" stage_schema
+stage schema "schema（迁移单 head）" stage_schema
 
 if skipped python; then
-  skip_stage "engine（pytest 单测）" "CHIRON_SMOKE_SKIP 指定"
+  skip_stage python "engine（pytest 单测）" "CHIRON_SMOKE_SKIP 指定"
 else
-  stage "engine（pytest 单测）" stage_python
+  stage python "engine（pytest 单测）" stage_python
 fi
 
 if skipped frontend; then
-  skip_stage "frontend" "CHIRON_SMOKE_SKIP 指定"
+  skip_stage frontend "frontend" "CHIRON_SMOKE_SKIP 指定"
 else
-  stage "frontend 打包静态冒烟" stage_frontend_static
+  stage frontend-static "frontend 打包静态冒烟" stage_frontend_static
   if [ "$FAST" = "1" ]; then
-    skip_stage "frontend 全量（check:ui / vue-tsc / vitest / vite build）" "--fast"
+    skip_stage frontend-full "frontend 全量（check:ui / vue-tsc / vitest / vite build）" "--fast"
   else
-    stage "frontend 全量（check:ui / vue-tsc / vitest / vite build）" stage_frontend_full
+    stage frontend-full "frontend 全量（check:ui / vue-tsc / vitest / vite build）" stage_frontend_full
   fi
 fi
 
 if [ "$INTEGRATION" = "1" ]; then
   if skipped integration; then
-    skip_stage "integration（真机 compose 链路）" "CHIRON_SMOKE_SKIP 指定"
+    skip_stage integration "integration（真机 compose 链路）" "CHIRON_SMOKE_SKIP 指定"
   else
-    stage "integration（真机 compose 链路）" stage_integration
+    stage integration "integration（真机 compose 链路）" stage_integration
   fi
 else
-  skip_stage "integration（真机 compose 链路）" "默认跳过；加 --integration 开启"
+  skip_stage integration "integration（真机 compose 链路）" "默认跳过；加 --integration 开启"
+fi
+
+if [ "$RELEASE" = "1" ]; then
+  stage release-ready "release-ready（发布就绪自检）" stage_release_ready
 fi
 
 echo ""

@@ -82,6 +82,13 @@ smoke:
 smoke-fast:
 	bash scripts/ci-smoke.sh --fast
 
+# ── 发布门禁（P2-12）──
+# `release-ready` 只读证据：它核对工作树干净、迁移单 head、以及
+# `.artifacts/ci-smoke/` 里 go/python/frontend-full 三门禁的结论**对应当前 HEAD**。
+# 证据由 `smoke`（全量）写入 —— 想一次到位用 `bash scripts/ci-smoke.sh --release`。
+release-ready:
+	bash scripts/check-release-ready.sh
+
 # ── 集成测试带（P0-2）──
 # `integration` 需要 docker compose：起 PG/Redis/网关/引擎/pageindex/假 LLM，
 # 跑 submit → usage → checkpoint/回滚 → 匿名分享 → @知识库 → deps → 隔离档。
@@ -106,6 +113,6 @@ docker-run:
 
 .PHONY: all build run clean test lint fmt dev dev-up dev-up-scale dev-down \
 	docs-check check-go check check-py check-web check-all smoke smoke-fast \
-	integration integration-static \
+	release-ready integration integration-static \
 	docker-build docker-run
 
