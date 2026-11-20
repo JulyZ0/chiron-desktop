@@ -42,7 +42,7 @@ MAX_CITATIONS = 5
 
 @dataclass
 class KnowledgeInjection:
-    """一次注入的结果（同时供 prompt 与日志使用）。"""
+    """一次注入的结果（同时供 prompt、日志与**前端事件**使用）。"""
 
     #: 要注入的文本；空串 = 本轮没有选中知识库（与"选了但无命中"**严格区分**）
     block: str = ""
@@ -51,6 +51,15 @@ class KnowledgeInjection:
     citations: list[dict[str, Any]] = field(default_factory=list)
     #: `[(kb_id, 原因)]`：检索失败（不可用/越权/服务故障）的库
     failures: list[tuple[str, str]] = field(default_factory=list)
+    #: 失败的结构化形态 `[{kb_id, category, message}]`（前端据此给动作，见 metrics 的分类）
+    failure_details: list[dict[str, str]] = field(default_factory=list)
+    #: 检索过的库数（前端徽标要显示"检索了 N 个库"）
+    queried: int = 0
+
+    @property
+    def zero_hit(self) -> bool:
+        """检索过、但一条都没命中（≠ 没检索，也 ≠ 检索报错）。"""
+        return bool(self.queried) and self.hits == 0 and not self.failures
 
     def summary(self) -> str:
         """一行日志用摘要（不含正文，避免把用户文档内容写进日志）。"""
@@ -58,6 +67,24 @@ class KnowledgeInjection:
             f"kb_ids={len(self.kb_ids)} hits={self.hits} "
             f"citations={len(self.citations)} failures={len(self.failures)}"
         )
+
+    def as_event(self) -> dict[str, Any]:
+        """回合流里的**结构化事件**（`AgentEvent(type="knowledge_retrieval")` 的 payload）。
+
+        P1-6 的落点：用户要能回答"为什么没检索到"。前端拿到的必须是数字与分类，
+        而不是一段需要前端自己解析的中文 —— 文案会变，字段不会。
+        这里**不含 query 原文**：事件会进 SSE、进日志、可能进会话存储。
+        """
+        return {
+            "kb_ids": list(self.kb_ids),
+            "queried": int(self.queried or len(self.kb_ids)),
+            # `queries` 是"发起了几次检索"，与 `queried`（几个库）区分：前端要显示
+            # "检索了 3 个库 / 命中 0 条"，两个数都得有。
+            "hits": int(self.hits),
+            "citations": len(self.citations),
+            "zero_hit": self.zero_hit,
+            "errors": list(self.failure_details),
+        }
 
 
 #: 检索器签名：`(kb_id, query, user_id, tenant_id) -> {answer, citations}`，
@@ -166,17 +193,24 @@ async def collect(
     tenant_id: int = 0,
     retriever: Retriever | None = None,
     max_kbs: int = MAX_CONTEXT_KBS,
+    weights: dict[str, float] | None = None,
 ) -> KnowledgeInjection:
     """逐库检索并渲染成注入文本。
 
     * 单库失败**不拖垮**其余库（多选场景下不该因为一个坏 id 全盘降级）；
     * 上限与前端 `MAX_CONTEXT_KBS` 逐值对齐（手写 URL 也能绕过前端，底线在后端）；
-    * 失败与无命中的区别被**显式写进文本**，并且都记日志。
+    * 失败与无命中的区别被**显式写进文本**，并且都记日志；
+    * **权重**（P1-6）：`weights` 非空时按权重降序检索/注入 —— 超出上限被截断时，
+      丢掉的是权重最低的库，而不是"数组里排在后面的库"。检索本身是逐库进行的，
+      顺序不改变单库结果，但决定了预算紧时谁先被保住。
     """
     ids: list[str] = []
     for kb in kb_ids or []:
         if isinstance(kb, str) and kb.strip() and kb.strip() not in ids:
             ids.append(kb.strip())
+    if weights:
+        # `sorted` 是稳定排序：权重相同保持提交顺序（老前端不传权重 ⇒ 顺序逐值不变）
+        ids.sort(key=lambda kb: -float(weights.get(kb, 1.0) or 0.0))
     ids = ids[: max(0, max_kbs)]
     if not ids or not str(query or "").strip():
         return KnowledgeInjection()
@@ -184,12 +218,18 @@ async def collect(
     fetch = retriever or _default_retriever
     answers: dict[str, dict[str, Any]] = {}
     failures: list[tuple[str, str]] = []
+    failure_details: list[dict[str, str]] = []
     for kb_id in ids:
         try:
             result = await fetch(kb_id, query, user_id, tenant_id)
         except Exception as exc:  # noqa: BLE001 — 单库失败只记录，不中断其余库
             reason = str(exc) or exc.__class__.__name__
             failures.append((kb_id, reason[:200]))
+            # 分类 + 截断消息（与 Redis 计数同一份口径，见 app/knowledge/metrics.py）：
+            # 前端按 `category` 给动作，不解析这段中文。
+            from app.knowledge.metrics import describe_failure
+
+            failure_details.append({"kb_id": kb_id, **describe_failure(exc)})
             logger.warning("kb context retrieve failed (kb_id=%s): %s", kb_id, reason)
             continue
         answers[kb_id] = result if isinstance(result, dict) else {}
@@ -199,7 +239,13 @@ async def collect(
         for cite in item.get("citations") or []:
             if isinstance(cite, dict):
                 citations.append(cite)
-    hits = sum(1 for item in answers.values() if str(item.get("answer") or "").strip())
+    # 命中 = 有答案**或**有引用。只有引用没答案也算命中：推理式检索偶尔只回引用，
+    # 按"必须非空 answer"算会让命中率虚低，徽标上显示"0 命中"而库里其实命中过。
+    hits = sum(
+        1
+        for item in answers.values()
+        if str(item.get("answer") or "").strip() or item.get("citations")
+    )
     block = _render_block(ids, answers, failures)
     injection = KnowledgeInjection(
         block=block,
@@ -207,8 +253,10 @@ async def collect(
         hits=hits,
         citations=citations,
         failures=failures,
+        failure_details=failure_details,
+        queried=len(ids),
     )
-    if hits == 0 and not failures:
+    if injection.zero_hit:
         # 选了库、检索成功、但确实没有命中：这不是异常，但**必须**在日志里留痕
         # （用户反馈"库里明明有文档"时，第一个要看的就是这条）。
         logger.info("kb context retrieved with zero hits: %s", injection.summary())

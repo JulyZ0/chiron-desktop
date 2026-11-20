@@ -55,6 +55,14 @@ export interface KnowledgeBase {
   total_size_bytes: number
   credits_consumed: number
   error_message: string
+  /**
+   * 逐库模型覆盖（P1-6）：空串 = 沿用网关「模型服务」里的默认模型。
+   *
+   * 存的是 `knowledge_bases.config` 里的显式值，**不含默认值副本** ——
+   * 所以管理员在 /models 改了默认模型，所有没覆盖过的库立刻跟着变。
+   */
+  index_model?: string
+  chat_model?: string
   created_at: string
   updated_at: string
 }
@@ -153,10 +161,64 @@ export async function getKnowledgeBase(id: string): Promise<KnowledgeBase> {
 
 export async function updateKnowledgeBase(
   id: string,
-  body: { name?: string; description?: string; visibility?: KbVisibility },
+  body: {
+    name?: string
+    description?: string
+    visibility?: KbVisibility
+    /** 逐库模型覆盖（P1-6）：空串 = 清除覆盖、回落到默认（**不是**"保存空模型"） */
+    index_model?: string
+    chat_model?: string
+  },
 ): Promise<unknown> {
   const resp = await api.put(`/v1/kb/${id}`, body)
   return unwrap<unknown>(resp)
+}
+
+// ── 检索观测（P1-6） ──
+
+/** 一个时间窗口内的检索计数（引擎按小时内桶聚合，见 app/knowledge/metrics.py）。 */
+export interface KbStatsWindow {
+  queries: number
+  /** 命中数（有答案或有引用的库数） */
+  hits: number
+  /** 检索过但 0 命中的次数 */
+  zero_hit: number
+  errors: number
+  avg_latency_ms: number
+  /** 零命中率：分母是**成功**的检索数（失败另计，不混进去） */
+  zero_hit_rate: number
+}
+
+export interface KbStatsFailure {
+  /** 稳定分类（disabled / not_found / provider_unavailable / service_error / timeout / unknown） */
+  category: string
+  /** 截断后的失败消息（不会包含用户问题原文） */
+  message: string
+  count: number
+}
+
+export interface KbStats {
+  kb_id: string
+  window_hours_24: KbStatsWindow
+  window_days_7: KbStatsWindow
+  recent_failures: KbStatsFailure[]
+  /** 引擎算好的可读结论（别在前端再解释一遍数字） */
+  diagnosis: string[]
+  /** false = Redis 不可读，数字全 0 **不代表**"没检索过" */
+  available: boolean
+  ttl_days?: number
+  mine?: { window_hours_24: KbStatsWindow; window_days_7: KbStatsWindow }
+}
+
+/**
+ * 检索观测摘要：回答"为什么没检索到"。
+ *
+ * 网关同时转 `/v1/kb/{id}/stats`（既有前缀）与 `/v1/knowledge/{id}/stats`（对外文档名），
+ * 这里用前者，与其余 kb 接口保持一致。
+ */
+export async function getKnowledgeStats(kbId: string): Promise<KbStats> {
+  const resp = await api.get(`/v1/kb/${kbId}/stats`)
+  return unwrap<KbStats>(resp)
 }
 
 export async function deleteKnowledgeBase(id: string): Promise<unknown> {

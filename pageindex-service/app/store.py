@@ -36,7 +36,7 @@ class Store:
 
     async def get_kb(self, kb_id: str) -> Any:
         return await self._pool.fetchrow(
-            """SELECT id, tenant_id, user_id, provider, index_ref, status, index_engine
+            """SELECT id, tenant_id, user_id, provider, index_ref, status, index_engine, config
                  FROM knowledge_bases WHERE id = $1""",
             kb_id,
         )

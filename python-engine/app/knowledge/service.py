@@ -147,26 +147,57 @@ async def answer_question(
 
     检索范围 = 该库中**已就绪**文档的 provider doc_id 集合：PageIndex 没有"整库"隐式范围，
     不传文档就等于让模型在空集上推理。
+
+    **这里是全链路唯一的检索执行点**（API 问答、`kb_search` 工具、对话注入都走它），
+    因此检索观测也挂在这里：计数与失败原因只有一处写入方，才不会出现"页面上有数字、
+    实际一半检索没记上"的口径分裂（见 ``app/knowledge/metrics.py``）。
     """
-    pool = await _pool()
-    kb = await _load_kb(pool, kb_id)
-    _require_enabled(kb)
+    from app.knowledge import metrics
 
-    provider, _settings, health = await registry.resolve_for_user(
-        user_id, folder_id=str(kb["index_ref"] or "")
-    )
-    if provider is None or not health.ok:
-        raise ProviderUnavailableError(health.detail or "provider 不可用")
+    started = metrics.RetrievalTimer()
+    try:
+        pool = await _pool()
+        kb = await _load_kb(pool, kb_id)
+        _require_enabled(kb)
 
-    rows = await pool.fetch(
-        """SELECT pageindex_doc_id FROM knowledge_documents
-            WHERE knowledge_base_id = $1 AND status = 'ready'
-              AND pageindex_doc_id IS NOT NULL""",
-        kb_id,
+        provider, _settings, health = await registry.resolve_for_user(
+            user_id, folder_id=str(kb["index_ref"] or "")
+        )
+        if provider is None or not health.ok:
+            raise ProviderUnavailableError(health.detail or "provider 不可用")
+
+        rows = await pool.fetch(
+            """SELECT pageindex_doc_id FROM knowledge_documents
+                WHERE knowledge_base_id = $1 AND status = 'ready'
+                  AND pageindex_doc_id IS NOT NULL""",
+            kb_id,
+        )
+        doc_ids = tuple(str(row["pageindex_doc_id"]) for row in rows if row["pageindex_doc_id"])
+        ctx = _context(kb, doc_ids)
+        result = await provider.answer(ctx, question=question)
+    except Exception as exc:
+        # 失败**先记账再抛**：只记成功的实现会让"服务一直 500"在统计里显示成
+        # "queries=0"——那正好被解读成"根本没检索"，把排查带向完全错误的方向。
+        await metrics.record_retrieval(
+            kb_id=kb_id,
+            user_id=str(user_id or ""),
+            latency_ms=started.elapsed_ms,
+            error=exc,
+        )
+        raise
+
+    citations = list(result.citations or [])
+    answer = str(result.answer or "").strip()
+    await metrics.record_retrieval(
+        kb_id=kb_id,
+        user_id=str(user_id or ""),
+        # `hits` 是**命中条数**而不是"有/无命中"：用户问"检索了几条"时，答案就是这个数。
+        hits=len(citations),
+        # 零命中 = 既没有答案也没有引用。只有引用没有答案同样是"检索到东西了"
+        # （推理式检索偶尔只回引用），算作零命中会让命中率虚低。
+        zero_hit=not citations and not answer,
+        latency_ms=started.elapsed_ms,
     )
-    doc_ids = tuple(str(row["pageindex_doc_id"]) for row in rows if row["pageindex_doc_id"])
-    ctx = _context(kb, doc_ids)
-    result = await provider.answer(ctx, question=question)
     return result, provider.name
 
 

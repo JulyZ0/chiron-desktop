@@ -247,6 +247,14 @@ func registerProxyRoutes(
 	// 索引进度（只读）：聚合在引擎侧按文档状态算（pageindex-service 无 job 端点可透传）。
 	// 与上面的 PUT 同路径不同方法，语义正交（读索引状态 vs 写启用开关）。
 	mux.Handle("GET /v1/kb/{id}/status", authMW(kbRateMW(kbP(pathParamSuffix("/v1/kb", "/status")))))
+	// 检索观测（P1-6）：近 24h / 7d 计数与失败原因 Top5，回答"为什么没检索到"。
+	// 两条路径都转（引擎侧两条都注册）：`/v1/knowledge/{id}/stats` 是对外文档里的名字，
+	// `/v1/kb/{id}/stats` 是本项目既有前缀。少了任一条，前端就会拿到 404 ——
+	// 而 404 与"这项功能没做"在界面上长得一模一样。
+	mux.Handle("GET /v1/kb/{id}/stats", authMW(kbRateMW(kbP(pathParamSuffix("/v1/kb", "/stats")))))
+	mux.Handle("GET /v1/knowledge/{id}/stats", authMW(kbRateMW(kbP(func(r *http.Request) string {
+		return "/v1/knowledge/" + escSeg(r.PathValue("id")) + "/stats"
+	}))))
 	// 重新提交索引（失败文档 / 全库重建）。幂等与"同库并发 1"都在引擎侧实现，
 	// 网关只做鉴权与转发 —— 两处各判一次就会出现"网关放行、引擎拒绝"。
 	mux.Handle("POST /v1/kb/{id}/reindex", authMW(kbRateMW(kbP(pathParamSuffix("/v1/kb", "/reindex")))))

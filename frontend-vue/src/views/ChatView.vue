@@ -2520,6 +2520,36 @@ function onSSEMessage(raw: unknown, sid: string) {
         id: `steer:${Date.now()}`,
       })
     }
+  } else if (type === 'knowledge_retrieval') {
+    // 知识库检索事件（P1-6）：引擎在注入上下文的同时发一条结构化结果。
+    //
+    // 只落一个**徽标**（不是思考/正文）：用户要的是"这次到底检索了没有、命中几条、
+    // 哪个库出错了"。把它做成 notice 会挤占正文区域，做成气泡又会被当成 Assistant
+    // 说的话。`zero_hit` 与 `errors` 是两件事，模板按优先级分别显示提示。
+    //
+    // 历史不回放：这是**实时过程事件**，刷新后仅剩正文（与 todo_updated 同款处置）。
+    let kbEvent: Record<string, unknown> = {}
+    try { kbEvent = JSON.parse(String(d.content ?? evt.content ?? '{}')) } catch { kbEvent = {} }
+    if (kbEvent && typeof kbEvent === 'object') {
+      const kbIds = Array.isArray(kbEvent.kb_ids) ? kbEvent.kb_ids.map(v => String(v)) : []
+      const errors = Array.isArray(kbEvent.errors)
+        ? (kbEvent.errors as Array<Record<string, unknown>>).map(e => ({
+          kbId: String(e?.kb_id ?? ''),
+          category: String(e?.category ?? 'unknown'),
+          message: String(e?.message ?? ''),
+        }))
+        : []
+      items.value.push({
+        kind: 'knowledge',
+        kbIds,
+        queried: Number(kbEvent.queried ?? kbIds.length) || 0,
+        hits: Number(kbEvent.hits ?? 0) || 0,
+        citations: Number(kbEvent.citations ?? 0) || 0,
+        zeroHit: kbEvent.zero_hit === true,
+        errors,
+        id: `kb:${Date.now()}`,
+      })
+    }
   } else if (type === 'compaction') {
     // 引擎的自动压缩事件（runtime.py 的 _compact_with_notice）：把"上下文悄悄变短"
     // 变成用户可见的状态栏提示（问题 4）。

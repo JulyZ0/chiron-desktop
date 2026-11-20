@@ -76,6 +76,10 @@ class KnowledgeBaseUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     visibility: str | None = None
+    #: 逐库模型覆盖（P1-6）。``None`` = 不改；空串 = 清除覆盖、回落到网关注入的默认。
+    #: 存进 ``knowledge_bases.config``（见 ``settings_store.save_kb_models``）。
+    index_model: str | None = None
+    chat_model: str | None = None
 
 
 class KBEnabledUpdate(BaseModel):
@@ -142,6 +146,9 @@ def _row_enabled(data: dict[str, Any]) -> bool:
 
 def _serialize_kb(row: Any) -> dict[str, Any]:
     data = dict(row)
+    # 逐库模型覆盖：显式列在顶层（而不是藏在 config 里），前端设置面板直接绑定。
+    # 缺省为空串 = 沿用网关注入的默认模型（**不抄默认值**，否则管理员改默认后旧库不生效）。
+    models = settings_store.kb_model_overrides(data.get("config"))
     return {
         "id": data["id"],
         "name": data["name"],
@@ -157,6 +164,8 @@ def _serialize_kb(row: Any) -> dict[str, Any]:
         "total_size_bytes": data.get("total_size_bytes", 0),
         "credits_consumed": data.get("credits_consumed", 0),
         "error_message": data.get("error_message") or "",
+        "index_model": models.get("index_model", ""),
+        "chat_model": models.get("chat_model", ""),
         "config": _maybe_json(data.get("config")),
         "created_at": _iso(data.get("created_at")),
         "updated_at": _iso(data.get("updated_at")),
@@ -351,8 +360,15 @@ async def update_knowledge_base(
     name: str | None = None,
     description: str | None = None,
     visibility: str | None = None,
+    index_model: str | None = None,
+    chat_model: str | None = None,
 ) -> dict[str, Any]:
-    """更新知识库（仅 owner）。provider 不可改 —— 换 provider 等于换索引，必须重建。"""
+    """更新知识库（仅 owner）。provider 不可改 —— 换 provider 等于换索引，必须重建。
+
+    模型覆盖（``index_model`` / ``chat_model``）与其它字段**分开落库**：它们存进
+    ``config`` jsonb（见 ``settings_store.save_kb_models``），所以只改模型时不该报
+    "no fields to update"。校验失败抛 400，而不是存一个非法模型名进去等索引时炸。
+    """
     pool = get_pool()
     existing = await pool.fetchrow(
         "SELECT id, user_id FROM knowledge_bases WHERE id = $1", kb_id
@@ -362,6 +378,19 @@ async def update_knowledge_base(
     if existing["user_id"] != user_id:
         raise HTTPException(
             status_code=403, detail="not authorized to update this knowledge base"
+        )
+
+    models_changed = index_model is not None or chat_model is not None
+    if models_changed:
+        try:
+            models = await settings_store.save_kb_models(
+                kb_id=kb_id, index_model=index_model, chat_model=chat_model
+            )
+        except KnowledgeError as exc:  # 非法模型名 / 空值以外的东西
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        models = settings_store.kb_model_overrides(
+            await pool.fetchval("SELECT config FROM knowledge_bases WHERE id = $1", kb_id)
         )
 
     updates: list[str] = []
@@ -383,14 +412,27 @@ async def update_knowledge_base(
         updates.append(f"visibility = ${len(params)}")
 
     if not updates:
-        raise HTTPException(status_code=400, detail="no fields to update")
+        if not models_changed:
+            raise HTTPException(status_code=400, detail="no fields to update")
+        # 只改了模型：config 已由 save_kb_models 落库，这里直接回结果
+        return {
+            "id": kb_id,
+            "updated": True,
+            "index_model": models.get("index_model", ""),
+            "chat_model": models.get("chat_model", ""),
+        }
 
     params.append(kb_id)
     await pool.execute(
         f"UPDATE knowledge_bases SET {', '.join(updates)}, updated_at = NOW() WHERE id = ${len(params)}",
         *params,
     )
-    return {"id": kb_id, "updated": True}
+    return {
+        "id": kb_id,
+        "updated": True,
+        "index_model": models.get("index_model", ""),
+        "chat_model": models.get("chat_model", ""),
+    }
 
 
 async def set_knowledge_base_enabled(
@@ -832,6 +874,30 @@ async def get_index_status(
         return await index_status(kb_id=kb_id)
     except KnowledgeError as exc:  # 读行期间库被删：与 GET /{kb_id} 同口径
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+async def get_knowledge_stats(
+    kb_id: str, user_id: str, tenant_id: int = 0
+) -> dict[str, Any]:
+    """检索观测摘要（P1-6）：回答"为什么没检索到"。
+
+    近 24h / 7d 的计数来自 Redis 小时内桶（见 ``app/knowledge/metrics.py``），
+    **只对能看这个库的人开放**：统计里有"谁在用这个库"的痕迹（``mine`` 段），
+    权限判定与 ``get_index_status`` 用同一道 gate。
+
+    读不到 Redis 时返回 ``available=false`` + 全 0 —— 这是"观测暂不可读"，
+    不是"没检索过"，两者在界面上必须能分开（否则用户会被引导去删库重建）。
+    """
+    from app.knowledge import metrics
+
+    pool = get_pool()
+    kb = await pool.fetchrow(
+        "SELECT id, user_id, visibility, tenant_id FROM knowledge_bases WHERE id = $1", kb_id
+    )
+    if kb is None:
+        raise HTTPException(status_code=404, detail="knowledge base not found")
+    _require_kb_access(kb, user_id, tenant_id, action="view")
+    return await metrics.summary(kb_id=kb_id, user_id=user_id)
 
 
 async def reindex_knowledge_base(
@@ -1277,6 +1343,8 @@ async def update_kb(
         name=body.name,
         description=body.description,
         visibility=body.visibility,
+        index_model=body.index_model,
+        chat_model=body.chat_model,
     )
 
 
@@ -1393,6 +1461,32 @@ async def get_kb_status(
     if not user_id:
         raise HTTPException(status_code=401, detail="user_id required")
     return await get_index_status(kb_id, user_id, tenant_id=tenant_id)
+
+
+@router.get("/{kb_id}/stats")
+async def get_kb_stats(
+    kb_id: str,
+    request: Request,
+    user_id: str = Query("", alias="user_id"),
+    tenant_id: int = Query(0, alias="tenant_id"),
+) -> dict[str, Any]:
+    """检索观测摘要（近 24h / 7d + 失败原因 Top5）。
+
+    同时挂在 ``/v1/kb/{id}/stats`` 与 ``/v1/knowledge/{id}/stats``：后者是对外文档里
+    的名字（P1-6 的需求原文），前者是本服务既有前缀。两条打到同一个 handler，
+    不各写一份实现 —— 两处各写一份时，字段迟早会漂。
+    """
+    if not user_id:
+        raise HTTPException(status_code=401, detail="user_id required")
+    return await get_knowledge_stats(kb_id, user_id, tenant_id=tenant_id)
+
+
+#: 对外路径别名（`GET /v1/knowledge/{kb_id}/stats`）。只注册这一个端点：
+#: 其余的 kb CRUD 前缀仍是 `/v1/kb`，别名不该变成第二套 API。
+public_router = APIRouter(prefix="/v1/knowledge", tags=["knowledge"])
+public_router.add_api_route(
+    "/{kb_id}/stats", get_kb_stats, methods=["GET"], name="get_knowledge_stats_public"
+)
 
 
 @router.post("/{kb_id}/reindex")

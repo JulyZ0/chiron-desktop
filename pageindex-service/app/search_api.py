@@ -90,6 +90,11 @@ class ContextBody(BaseModel):
     user_folder_id: str = ""          # 用户 folder（cloud）
     api_key: str = ""                 # 用户级 Cloud key（明文只在内存里）
     llm: dict[str, Any] = Field(default_factory=dict)
+    #: 逐库模型覆盖（P1-6）：`{index_model?, chat_model?}`，来自引擎侧
+    #: `knowledge_bases.config`。空 = 按 env → 网关 /models 的顺序解析（原有行为）。
+    #: 只覆盖**显式配过的键**，不做"半覆盖就整体替换" —— 用户只改问答模型时，
+    #: 索引模型仍来自默认，否则一次设置会把索引也换掉（重新索引 = 白花钱）。
+    models: dict[str, str] = Field(default_factory=dict)
 
     def to_ctx(self) -> RequestContext:
         if self.mode not in ("selfhosted", "cloud"):
@@ -123,6 +128,7 @@ async def _adapter(body: ContextBody) -> tuple[Adapter, RequestContext]:
     from app import models as models_mod
 
     resolved = await models_mod.resolve(config())
+    resolved = models_mod.apply_overrides(resolved, body.models)
     ctx = body.to_ctx()
     return Adapter(mode=ctx_mode(body), cfg=config(), models=resolved), ctx
 

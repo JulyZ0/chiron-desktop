@@ -41,6 +41,23 @@ KB_LOCK_TTL = 3600  # 索引长任务的上限（单库串行；到期自动释�
 # ── 单库索引（可单独测试，不依赖 Redis）────────────────────────────────────
 
 
+def _kb_model_overrides(kb: Any) -> dict[str, str]:
+    """从库行里取显式模型覆盖（``config`` 可能是 dict 或 JSON 字符串，随驱动而异）。"""
+    raw = kb["config"] if "config" in kb.keys() else None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = None
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        key: str(raw.get(key) or "").strip()
+        for key in ("index_model", "chat_model")
+        if str(raw.get(key) or "").strip()
+    }
+
+
 async def handle_kb_index(
     *,
     cfg: Config,
@@ -83,6 +100,11 @@ async def handle_kb_index(
     from app import models as models_mod
 
     resolved = await models_mod.resolve(cfg)
+    # 逐库模型覆盖（P1-6）：索引模型存在 `knowledge_bases.config` 里（引擎侧
+    # `settings_store.save_kb_models` 写入）。**必须在这里应用**：worker 与 search
+    # 服务是两套进程，只在 search 侧覆盖会让"问答用新模型、索引还是旧模型"，
+    # 表现为查得到但与新索引对不上。
+    resolved = models_mod.apply_overrides(resolved, _kb_model_overrides(kb))
     if mode == "selfhosted" and not resolved.ready():
         detail = models_mod.unavailable_detail(resolved)
         await store.set_kb_status(kb_id, "error", detail)

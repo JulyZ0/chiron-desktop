@@ -161,6 +161,29 @@ export interface NoticeItem extends ChatItemBase {
   content: string
 }
 
+/**
+ * 一次知识库检索的结构化结果（P1-6）：`AgentEvent(type="knowledge_retrieval")`。
+ *
+ * 为什么单独一种 item 而不是塞进 `notice`：徽标要能回答三个不同的问题
+ * （检索了几个库 / 命中几条 / 有没有报错），而 `notice` 只有一句话。
+ * 数据来自引擎的**结构化字段**，不是从前端解析文案。
+ */
+export interface KnowledgeRetrievalItem extends ChatItemBase {
+  kind: 'knowledge'
+  /** 本轮检索涉及的知识库 id */
+  kbIds: string[]
+  /** 检索了几**个库**（与命中数区分） */
+  queried: number
+  /** 命中数（有答案或有引用的库数） */
+  hits: number
+  /** 引用条数 */
+  citations: number
+  /** 检索过、但一条都没命中（≠ 没检索、≠ 报错） */
+  zeroHit: boolean
+  /** 失败的库 `[{kb_id, category, message}]` —— category 是稳定枚举，文案会变 */
+  errors: Array<{ kbId: string; category: string; message: string }>
+}
+
 /** 一条用量事件的增量。注意 `usage` 是**每次 LLM 调用**一条（C3），不是每轮一条。 */
 export interface TurnStatsDelta {
   inputTokens: number
@@ -206,7 +229,7 @@ export function mergeTurnStats(
   return id
 }
 
-export type ChatItem = TextItem | ReasoningItem | ToolCallItem | ToolResultItem | TurnStatsItem | DateDividerItem | NoticeItem
+export type ChatItem = TextItem | ReasoningItem | ToolCallItem | ToolResultItem | TurnStatsItem | DateDividerItem | NoticeItem | KnowledgeRetrievalItem
 
 /**
  * assistant 消息上内联的 tool_call（OpenAI 形状）。

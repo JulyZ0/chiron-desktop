@@ -16,6 +16,7 @@ from app.api.internal_knowledge import router as internal_knowledge_router
 from app.api.internal_market import router as internal_market_router
 from app.api.internal_subagent import router as internal_subagent_router
 from app.api.isolation import router as isolation_router
+from app.api.knowledge import public_router as knowledge_public_router
 from app.api.knowledge import router as knowledge_router
 from app.api.memory import router as memory_router
 from app.api.openai_compat import router as openai_compat_router
@@ -40,6 +41,8 @@ api_router.include_router(internal_checkpoints_router)
 api_router.include_router(interactions_router)
 api_router.include_router(skills_router)
 api_router.include_router(knowledge_router)
+# 对外路径别名（`GET /v1/knowledge/{kb_id}/stats`，见 app/api/knowledge.py）
+api_router.include_router(knowledge_public_router)
 api_router.include_router(plugins_router)
 api_router.include_router(chat_router)
 api_router.include_router(capabilities_router)

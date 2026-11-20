@@ -221,3 +221,36 @@ def unavailable_detail(models: ResolvedModels) -> str:
     if models.reason:
         return f"{base}；当前原因：{models.reason}"
     return base
+
+
+# ── 逐库模型覆盖（P1-6） ──
+
+
+def apply_overrides(models: "ResolvedModels", overrides: dict[str, str] | None) -> "ResolvedModels":
+    """把知识库显式配置的 ``index_model`` / ``chat_model`` 覆盖到解析结果上。
+
+    只覆盖**出现且非空**的键：用户只改问答模型时，索引模型保持默认 —— 否则一次设置会
+    把索引也一起换掉，而换索引模型意味着整个库必须重建（真实费用）。
+
+    覆盖后 ``source`` 记成 ``kb``：排障时第一个问题仍是"它到底用了哪份配置"，
+    ``env`` / ``gateway`` 会把人带去看错地方。
+
+    LLM 连接（``base_url`` / ``api_key``）**不跟着覆盖**：它们是服务端的连接配置，
+    与"用哪个模型名"是两件事；只给模型名时仍用默认连接（与网关目录里的同名模型
+    指向同一端点，这是自托管部署的前提）。
+    """
+    data = {k: str(v or "").strip() for k, v in (overrides or {}).items() if str(v or "").strip()}
+    if not data:
+        return models
+    index_model = data.get("index_model") or models.index_model
+    chat_model = data.get("chat_model") or models.chat_model
+    if index_model == models.index_model and chat_model == models.chat_model:
+        return models
+    return ResolvedModels(
+        chat_model=chat_model,
+        index_model=index_model,
+        base_url=models.base_url,
+        api_key=models.api_key,
+        source="kb",
+        reason="",
+    )

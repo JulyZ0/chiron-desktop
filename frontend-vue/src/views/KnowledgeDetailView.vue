@@ -14,10 +14,14 @@ import { api, resolveMediaUrl } from '../api'
 import {
   buildKnowledgeBase as requestBuildIndex,
   getKnowledgeIndexStatus,
+  getKnowledgeStats,
   isKbBuilding,
   isKbTerminal,
   reindexKnowledgeBase,
+  updateKnowledgeBase,
   type KbIndexStatus,
+  type KbStats,
+  type KnowledgeBase,
 } from '../api/knowledge'
 import { errorDetail } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
@@ -85,21 +89,6 @@ function docStatusLabel(status?: string): string {
 }
 
 /** GET /v1/kb/{id}（网关字段 + 引擎补充的统计字段） */
-interface KnowledgeBase {
-  id?: string
-  name?: string
-  description?: string
-  status?: string
-  /** 用户开关（与 `status` 正交）；旧后端不返回时按启用处理。 */
-  enabled?: boolean
-  provider?: string
-  visibility?: string
-  document_count?: number
-  total_size_bytes?: number
-  credits_consumed?: number
-  /** 索引失败原因（worker 写入；成功时为空串）。 */
-  error_message?: string
-}
 
 /** GET /v1/kb/{id}/documents 的 documents[] */
 interface KnowledgeDocument {
@@ -290,6 +279,56 @@ const pickedMedia = ref<Record<string, MediaFileItem>>({})
 
 const kbId = route.params.id as string
 
+// ── 逐库模型覆盖（P1-6） ──
+// 空串 = 沿用网关注入的默认模型。保存时**原样提交**空串（= 清除覆盖），
+// 而不是省略字段 —— 省略意味着"不改"，那样用户永远没法把覆盖清回默认。
+const indexModel = ref('')
+const chatModel = ref('')
+const savingModels = ref(false)
+
+async function saveModels() {
+  savingModels.value = true
+  try {
+    await updateKnowledgeBase(kbId, {
+      index_model: indexModel.value.trim(),
+      chat_model: chatModel.value.trim(),
+    })
+    message.success(t('knowledge.models_saved'))
+    // 索引模型变了必须重建索引才生效：不提示的话用户会以为"保存了就变了"，
+    // 然后拿着旧索引去问新模型，得到一堆答不上来的结果。
+    await loadKnowledgeBase()
+  } catch (err) {
+    message.error(kbErrorText(err, t('knowledge.models_save_failed')))
+  } finally {
+    savingModels.value = false
+  }
+}
+
+// ── 检索观测（P1-6） ──
+const stats = ref<KbStats | null>(null)
+const statsLoading = ref(false)
+
+async function loadStats() {
+  statsLoading.value = true
+  try {
+    const raw = await getKnowledgeStats(kbId)
+    // 形状校验（不是防御式编程洁癖）：网关包了一层 `{data:...}`，而测试/代理链路
+    // 也可能给出空对象。缺窗口字段时若照常渲染，`window_hours_24.queries` 会在
+    // 渲染期抛错，把**整页**（含文档列表）一起打白 —— 统计是附加信息，不该有这种权力。
+    stats.value = raw && raw.window_hours_24 && raw.window_days_7 ? raw : null
+  } catch {
+    // 统计读不到不该阻塞页面：给 null，模板显示"暂不可读"而不是一片空白
+    stats.value = null
+  } finally {
+    statsLoading.value = false
+  }
+}
+
+/** 百分比展示：引擎给的是 0..1 的小数，界面按整数百分比显示。 */
+function pct(value?: number): string {
+  return `${Math.round((Number(value) || 0) * 100)}%`
+}
+
 onMounted(async () => {
   await loadKnowledgeBase()
   await loadDocuments()
@@ -297,6 +336,7 @@ onMounted(async () => {
   // 只有 active 时才起轮询 —— 空闲的库不拉接口。
   const active = await loadIndexStatus()
   if (active) startIndexPolling()
+  void loadStats()
   await focusTargetDocument()
 })
 
@@ -309,6 +349,10 @@ async function loadKnowledgeBase() {
   try {
     const res = await api.get(`/v1/kb/${kbId}`)
     kb.value = res.data?.data || res.data
+    // 回填模型覆盖：留空 = 跟随默认（见 api/knowledge.ts 的 KnowledgeBase.index_model）
+    const loaded = kb.value as KnowledgeBase | null
+    indexModel.value = loaded?.index_model || ''
+    chatModel.value = loaded?.chat_model || ''
   } catch {
     message.error(t('errors.failed_to_load_knowledge_base'))
     router.push('/knowledge')
@@ -993,6 +1037,134 @@ function formatSize(bytes: number): string {
           </div>
         </Card>
 
+        <!-- 检索质量（P1-6）：回答"为什么没检索到"。
+             数字来自引擎的 Redis 计数（近 24h / 7d），失败原因只有分类与截断消息，
+             不含用户问题原文。`available=false` 时必须显式说明"读不到"，
+             否则全 0 会被读成"根本没检索过"。 -->
+        <Card
+          :title="$t('knowledge.stats_title')"
+          style="margin-top: 16px"
+        >
+          <template #extra>
+            <Button
+              size="small"
+              :loading="statsLoading"
+              @click="loadStats"
+            >
+              <template #icon>
+                <ReloadOutlined />
+              </template>
+              {{ $t('knowledge.stats_refresh') }}
+            </Button>
+          </template>
+          <Spin :spinning="statsLoading">
+            <div
+              v-if="stats && stats.available === false"
+              class="kb-stats-unavailable"
+            >
+              {{ $t('knowledge.stats_unavailable') }}
+            </div>
+            <div
+              v-else-if="stats"
+              class="kb-stats"
+              data-testid="kb-stats"
+            >
+              <div class="kb-stats-windows">
+                <div class="kb-stats-window">
+                  <div class="kb-stats-window-title">{{ $t('knowledge.stats_24h') }}</div>
+                  <div class="kb-stats-grid">
+                    <span>{{ $t('knowledge.stats_queries') }}</span><strong data-testid="kb-stats-queries-24h">{{ stats.window_hours_24.queries }}</strong>
+                    <span>{{ $t('knowledge.stats_hits') }}</span><strong>{{ stats.window_hours_24.hits }}</strong>
+                    <span>{{ $t('knowledge.stats_zero_hit') }}</span><strong>{{ stats.window_hours_24.zero_hit }}</strong>
+                    <span>{{ $t('knowledge.stats_errors') }}</span><strong>{{ stats.window_hours_24.errors }}</strong>
+                    <span>{{ $t('knowledge.stats_avg_latency') }}</span><strong>{{ stats.window_hours_24.avg_latency_ms }} ms</strong>
+                  </div>
+                </div>
+                <div class="kb-stats-window">
+                  <div class="kb-stats-window-title">{{ $t('knowledge.stats_7d') }}</div>
+                  <div class="kb-stats-grid">
+                    <span>{{ $t('knowledge.stats_queries') }}</span><strong>{{ stats.window_days_7.queries }}</strong>
+                    <span>{{ $t('knowledge.stats_hits') }}</span><strong>{{ stats.window_days_7.hits }}</strong>
+                    <span>{{ $t('knowledge.stats_zero_hit') }}</span><strong>{{ stats.window_days_7.zero_hit }}（{{ pct(stats.window_days_7.zero_hit_rate) }}）</strong>
+                    <span>{{ $t('knowledge.stats_errors') }}</span><strong>{{ stats.window_days_7.errors }}</strong>
+                    <span>{{ $t('knowledge.stats_avg_latency') }}</span><strong>{{ stats.window_days_7.avg_latency_ms }} ms</strong>
+                  </div>
+                </div>
+              </div>
+              <!-- 引擎已经算好的可读结论：前端不再解释一遍数字（两处解释必然漂移） -->
+              <ul class="kb-stats-diagnosis">
+                <li
+                  v-for="(hint, i) in stats.diagnosis"
+                  :key="i"
+                >
+                  {{ hint }}
+                </li>
+              </ul>
+              <div class="kb-stats-failures">
+                <div class="kb-stats-failures-title">{{ $t('knowledge.stats_recent_failures') }}</div>
+                <p
+                  v-if="!stats.recent_failures.length"
+                  class="kb-stats-empty"
+                >
+                  {{ $t('knowledge.stats_no_failures') }}
+                </p>
+                <ul v-else>
+                  <li
+                    v-for="(f, i) in stats.recent_failures"
+                    :key="i"
+                  >
+                    <Tag>{{ f.category }}</Tag>
+                    <span class="kb-stats-failure-msg">{{ f.message }}</span>
+                    <span class="kb-stats-failure-count">×{{ f.count }}</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </Spin>
+        </Card>
+
+        <!-- 逐库模型覆盖（P1-6）：留空 = 沿用网关默认。 -->
+        <Card
+          :title="$t('knowledge.model_settings_title')"
+          style="margin-top: 16px"
+        >
+          <p class="kb-model-hint">
+            {{ $t('knowledge.model_settings_hint') }}
+          </p>
+          <div class="kb-model-form">
+            <div class="kb-model-field">
+              <span class="label">{{ $t('knowledge.index_model') }}</span>
+              <Input
+                v-model:value="indexModel"
+                :placeholder="$t('knowledge.index_model_placeholder')"
+                allow-clear
+              />
+            </div>
+            <div class="kb-model-field">
+              <span class="label">{{ $t('knowledge.chat_model') }}</span>
+              <Input
+                v-model:value="chatModel"
+                :placeholder="$t('knowledge.chat_model_placeholder')"
+                allow-clear
+              />
+            </div>
+            <Button
+              type="primary"
+              :loading="savingModels"
+              data-testid="kb-save-models"
+              @click="saveModels"
+            >
+              {{ $t('common.save') }}
+            </Button>
+          </div>
+          <p
+            v-if="indexModel"
+            class="kb-model-warn"
+          >
+            {{ $t('knowledge.models_need_reindex') }}
+          </p>
+        </Card>
+
         <!-- 文档列表 -->
         <Card
           :title="$t('knowledge.document_management')"
@@ -1391,4 +1563,20 @@ function formatSize(bytes: number): string {
 @media (prefers-reduced-motion: reduce) {
   .media-item { transition: none; }
 }
+
+.kb-stats-windows { display: flex; gap: 32px; flex-wrap: wrap; }
+.kb-stats-window-title { font-weight: var(--fw-semibold); margin-bottom: 8px; }
+.kb-stats-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 13px; }
+.kb-stats-diagnosis { margin: 12px 0 0; padding-left: 18px; color: var(--text-secondary); font-size: 13px; }
+.kb-stats-failures { margin-top: 12px; }
+.kb-stats-failures-title { font-weight: var(--fw-semibold); margin-bottom: 6px; }
+.kb-stats-failures ul { margin: 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.kb-stats-failure-msg { margin: 0 8px; color: var(--text-secondary); font-size: 13px; }
+.kb-stats-failure-count { color: var(--text-tertiary); font-size: 12px; }
+.kb-stats-empty { color: var(--text-secondary); font-size: 13px; margin: 0; }
+.kb-stats-unavailable { color: var(--warning, var(--text-secondary)); font-size: 13px; }
+.kb-model-hint { color: var(--text-secondary); font-size: 13px; margin: 0 0 12px; }
+.kb-model-form { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
+.kb-model-field { display: flex; flex-direction: column; gap: 4px; min-width: 220px; }
+.kb-model-warn { color: var(--warning, var(--text-secondary)); font-size: 12px; margin: 8px 0 0; }
 </style>

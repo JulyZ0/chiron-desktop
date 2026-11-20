@@ -107,6 +107,10 @@ class RemoteProvider:
             raise ProviderFailedError(f"知识库服务返回非 JSON: {exc}") from exc
 
     def _ctx_payload(self, ctx: ProviderContext) -> dict[str, Any]:
+        # 逐库模型覆盖（P1-6）：只有显式配置过的键才会出现，空 dict 时服务侧
+        # 完全按自己的解析顺序（env → 网关 /models）走，行为与引入本项之前逐字相同。
+        from app.knowledge.settings_store import kb_model_overrides
+
         return {
             "mode": self._mode,
             "kb_id": ctx.kb_id,
@@ -118,6 +122,8 @@ class RemoteProvider:
             "api_key": self._api_key,
             # 自托管的 LLM 连接在**索引服务侧**配置（索引组件凭据独立轮换），这里不传
             "llm": {},
+            # 模型覆盖随请求走：问答在服务侧执行，引擎不持有模型实例
+            "models": kb_model_overrides(ctx.config),
         }
 
     # ── 协议实现 ──

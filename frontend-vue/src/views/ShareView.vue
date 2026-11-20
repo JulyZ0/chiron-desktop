@@ -71,6 +71,10 @@ function renderMarkdown(src: string): string {
  * `[thinking]` 块**保留**，拆到 reasoning 里由模板折叠展示 —— 公开页不该裸露标签，
  * 但也不该把"这次回答想了什么"整个丢掉。顺序与 ChatView 一致。
  */
+// 分享页是**只读降级**渲染：只出正文（+ 折叠的思考），不出任何运行时徽标。
+// 知识库检索事件（`knowledge_retrieval`）是实时过程事件、不落库，所以这里天然没有；
+// 即便将来把过程事件一并存下来，也不该在公开页展示 —— "检索了 3 个库 / 某库 403"
+// 泄露的是库的存在性与权限边界，而看分享页的人没有库权限。
 const messages = computed(() =>
   (share.value?.messages ?? []).map(m => {
     const { reasoning, body } = splitThinking(
