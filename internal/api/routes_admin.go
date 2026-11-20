@@ -104,6 +104,9 @@ func registerAdminRoutes(
 	// **立刻 410**，是改变对外可见性的写操作，与 queue/flush 同口径。
 	mux.Handle("GET /v1/admin/shares", authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.ListShares)))))
 	mux.Handle("DELETE /v1/admin/shares/{id}", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.RevokeShare)))))
+	// 批量撤销：一次处置同一批泄露链接时不必发 N 次请求（每次都要过一遍权限与限流），
+	// 也只需一条汇总审计。上限 200 见 adminShareBulkMax。
+	mux.Handle("DELETE /v1/admin/shares", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.RevokeShares)))))
 
 	// Cache admin routes
 	mux.Handle("GET /v1/admin/cache/stats", authMW(rlMW(platformReadMW(adminStrip))))

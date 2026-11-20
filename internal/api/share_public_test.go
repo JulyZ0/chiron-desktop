@@ -32,6 +32,12 @@ type shareRowData struct {
 	createdAt  time.Time
 	revokedAt  *time.Time
 	expiresAt  *time.Time
+	// passwordHash 空串 = 未设密码（SQL 侧由 COALESCE 把 NULL 压成 ''）。
+	passwordHash string
+	// maxViews nil = 不限次。
+	maxViews *int
+	// views 是访问统计子查询的返回值（已成功打开的次数）。
+	views int64
 	// err 非空时 Scan 直接返回它（模拟行不存在 / 连接失败）
 	err error
 }
@@ -48,6 +54,9 @@ func (d shareRowData) row() pgx.Row {
 		*dest[4].(*time.Time) = d.createdAt
 		*dest[5].(**time.Time) = d.revokedAt
 		*dest[6].(**time.Time) = d.expiresAt
+		*dest[7].(*string) = d.passwordHash
+		*dest[8].(**int) = d.maxViews
+		*dest[9].(*int64) = d.views
 		return nil
 	}}
 }
@@ -96,6 +105,14 @@ func (r *shareFakeRows) Scan(dest ...any) error {
 			*p, _ = row[i].(string)
 		case *time.Time:
 			*p, _ = row[i].(time.Time)
+		// 后台分享列表的聚合列：count(*) 是 bigint（int64），array_length 是 int。
+		case *int64:
+			*p, _ = row[i].(int64)
+		case *int:
+			*p, _ = row[i].(int)
+		// last_viewed_at 可为 NULL（从未被访问）。
+		case **time.Time:
+			*p, _ = row[i].(*time.Time)
 		default:
 			return errors.New("shareFakeRows: unsupported dest type")
 		}
@@ -107,6 +124,8 @@ type fakeShareStore struct {
 	row      pgx.Row
 	rows     pgx.Rows
 	queryErr error
+	// rowSets 按调用顺序消费，用于"一次请求里查多次"的端点（后台列表：列表 + 趋势）。
+	rowSets []pgx.Rows
 }
 
 func (s *fakeShareStore) QueryRow(context.Context, string, ...interface{}) pgx.Row { return s.row }
@@ -114,6 +133,11 @@ func (s *fakeShareStore) QueryRow(context.Context, string, ...interface{}) pgx.R
 func (s *fakeShareStore) Query(context.Context, string, ...interface{}) (pgx.Rows, error) {
 	if s.queryErr != nil {
 		return nil, s.queryErr
+	}
+	if len(s.rowSets) > 0 {
+		next := s.rowSets[0]
+		s.rowSets = s.rowSets[1:]
+		return next, nil
 	}
 	if s.rows == nil {
 		return &shareFakeRows{}, nil
@@ -191,7 +215,7 @@ func TestSharePublicGet_RevokedIs410WithRevokedCode(t *testing.T) {
 func TestSharePublicGet_ExpiredIs410WithExpiredCode(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 	cases := map[string]*time.Time{
-		"超过有效期":      &past,
+		"超过有效期":         &past,
 		"expires_at 为空": nil,
 	}
 	for name, expiresAt := range cases {

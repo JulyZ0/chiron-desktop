@@ -20,7 +20,7 @@ func TestSharePublicURL_UsesPublicBaseURL(t *testing.T) {
 	cfg := &config.Config{PublicBaseURL: "https://chat.example.com/"}
 
 	got := sharePublicURL(cfg, r, "tok123")
-	want := "https://chat.example.com/share/tok123"
+	want := "https://chat.example.com/s/tok123"
 	if got != want {
 		t.Fatalf("sharePublicURL: want %q, got %q", want, got)
 	}
@@ -32,7 +32,7 @@ func TestSharePublicURL_FallsBackToRequestHost(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8790/v1/conversations/x/share", nil)
 
 	got := sharePublicURL(nil, r, "tok123")
-	want := "http://127.0.0.1:8790/share/tok123"
+	want := "http://127.0.0.1:8790/s/tok123"
 	if got != want {
 		t.Fatalf("sharePublicURL: want %q, got %q", want, got)
 	}
@@ -40,7 +40,7 @@ func TestSharePublicURL_FallsBackToRequestHost(t *testing.T) {
 
 func TestSharePublicURL_TLSScheme(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "https://chat.example.com/v1/shares", nil)
-	if got := sharePublicURL(nil, r, "t"); got != "https://chat.example.com/share/t" {
+	if got := sharePublicURL(nil, r, "t"); got != "https://chat.example.com/s/t" {
 		t.Fatalf("TLS 请求应产 https 链接, got %q", got)
 	}
 }
@@ -54,7 +54,7 @@ func TestSharePublicURL_TrustedProxyForwardedHeaders(t *testing.T) {
 	cfg := &config.Config{TrustedProxyCIDRs: []string{"127.0.0.0/8"}}
 
 	got := sharePublicURL(cfg, r, "tok")
-	want := "https://chat.example.com/share/tok"
+	want := "https://chat.example.com/s/tok"
 	if got != want {
 		t.Fatalf("可信代理头未被采信: want %q, got %q", want, got)
 	}
@@ -69,17 +69,34 @@ func TestSharePublicURL_IgnoresForwardedFromUntrustedPeer(t *testing.T) {
 	cfg := &config.Config{TrustedProxyCIDRs: []string{"127.0.0.0/8"}}
 
 	got := sharePublicURL(cfg, r, "tok")
-	want := "http://10.0.0.5:8080/share/tok"
+	want := "http://10.0.0.5:8080/s/tok"
 	if got != want {
 		t.Fatalf("不可信来源的头被采信了: want %q, got %q", want, got)
 	}
 }
 
-// 空 token 不给链接（前端据此提示"请先配置对外地址"，而不是拿到一条 /share/ 的废链）。
+// 空 token 不给链接（前端据此提示"请先配置对外地址"，而不是拿到一条 `/s/` 的废链）。
 func TestSharePublicURL_EmptyTokenIsEmpty(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8790/v1/shares", nil)
 	if got := sharePublicURL(nil, r, "  "); got != "" {
 		t.Fatalf("空 token 应返回空串, got %q", got)
+	}
+}
+
+// 前缀统一：对外产出一律 `/s/<token>`，不再产出旧形态 `/share/<token>`。
+//
+// 旧路由只作为前端**读侧**兼容别名存在（已发出的链接不能 404），但对外再产出旧形态
+// 等于让新旧两套规格同时流通 —— 统计、缓存与运营文案都要同时兼容两条路径。
+func TestSharePublicURL_UsesShortPathPrefixOnly(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8790/v1/shares", nil)
+	cfg := &config.Config{PublicBaseURL: "https://chat.example.com"}
+
+	got := sharePublicURL(cfg, r, "tok123")
+	if !strings.HasPrefix(got, "https://chat.example.com/s/") {
+		t.Fatalf("分享链接必须以 /s/ 为前缀, got %q", got)
+	}
+	if strings.Contains(got, "/share/") {
+		t.Fatalf("不应再产出旧的 /share/ 形态, got %q", got)
 	}
 }
 

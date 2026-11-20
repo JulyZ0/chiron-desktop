@@ -375,6 +375,23 @@ export default {
   share_untitled: "(محادثة بلا عنوان)",
   share_load_failed: "تعذّر تحميل المشاركات",
   share_revoke_failed: "تعذّر إبطال المشاركة",
+  // ── P1-8 عمليات المشاركة: إحصاءات الزيارات / الإبطال الجماعي ──
+  share_col_views_24h: "الزيارات (24 ساعة)",
+  share_col_views_total: "إجمالي الزيارات",
+  share_col_last_viewed: "آخر زيارة",
+  share_detail: "التفاصيل",
+  share_detail_title: "تفاصيل المشاركة",
+  share_detail_close: "إغلاق",
+  share_never_viewed: "لم تُزر مطلقًا",
+  share_trend_7d: "الزيارات في آخر 7 أيام",
+  share_bulk_selected: "المحدد: {n}",
+  share_bulk_revoke: "إبطال المحدد",
+  share_bulk_confirm_text: "أتبطل هذه المشاركات ({n})؟ ستتوقف الروابط فورًا.",
+  share_bulk_confirm_ok: "تأكيد الإبطال",
+  share_bulk_cancel: "إلغاء",
+  share_bulk_done: "تم إبطال {n} مشاركة",
+  share_bulk_partial: "تعذّر إبطال {n} (مبطلة مسبقًا أو في مستأجر آخر)",
+  share_bulk_failed: "فشل إبطال المشاركات المحددة",
   // ── صفحة الخدمة: من يستطيع الوصول إلى هذا الجهاز ──
   service: {
     page_title: "الخدمة",

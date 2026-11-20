@@ -22,6 +22,17 @@ const loading = ref(true)
 const error = ref('')
 /** 失败是否值得重试：网络/超时/5xx 值得，404/410 不值得（重试一百次也还是失效）。 */
 const canRetry = ref(false)
+/**
+ * 需要访问密码（后端 401 + `share_password_required`）。
+ *
+ * 单独一个状态而不是塞进 `error`：这不是失败终态，而是一个**等待输入**的中间态 ——
+ * 用错误页展示它，访客会以为链接坏了，然后关掉页面。
+ */
+const passwordRequired = ref(false)
+/** 已提交过的密码（重试时复用，避免访客再输一遍）。 */
+const password = ref('')
+const passwordError = ref('')
+const passwordSubmitting = ref(false)
 
 /**
  * 请求硬超时（与 `getPublicShare` 内部的 axios timeout 同一量级）。
@@ -125,21 +136,34 @@ async function loadShare() {
   loading.value = true
   error.value = ''
   canRetry.value = false
+  passwordError.value = ''
   share.value = null
 
   try {
     if (!id) throw new Error('share: missing token')
-    const data = await withDeadline(getPublicShare(id), SHARE_DEADLINE_MS)
+    // 有密码才带第二个参数：无密码的首次加载保持原来的调用形态（也避免发一个空头）。
+    const request = password.value ? getPublicShare(id, password.value) : getPublicShare(id)
+    const data = await withDeadline(request, SHARE_DEADLINE_MS)
     // 空 body / 非 JSON（网关兜底吐了 HTML）也按失败处理：静默渲染空白同样是"没终态"。
     if (!data || !Array.isArray(data.messages)) throw new Error('share: malformed payload')
-    if (seq === loadSeq) share.value = data
+    if (seq === loadSeq) {
+      share.value = data
+      passwordRequired.value = false
+    }
   } catch (e) {
     if (seq !== loadSeq) return
     const status = errorStatus(e)
     const code = errorCode(e)
-    if (code === 'share_revoked') {
+    if (code === 'share_password_required') {
+      // 需要密码（含密码错误）：停在"等待输入"态，不把访客赶到错误页。
+      passwordRequired.value = true
+      if (password.value) passwordError.value = t('errors.share_password_wrong')
+    } else if (code === 'share_revoked') {
       // 被创建者主动撤销：与"过了有效期"是两件事，文案必须分开
       error.value = t('common.this_share_was_deleted_by_its_creator')
+    } else if (code === 'share_view_limit') {
+      // 达到创建者设定的访问次数上限：与"过期"分开说，否则访客以为链接太老
+      error.value = t('errors.share_view_limit_reached')
     } else if (status === 410 || status === 404) {
       // 410 share_expired 与 404 都可以用"不存在或已失效"覆盖（不误导成"被删除"）
       error.value = t('errors.share_does_not_exist_or_has_expired')
@@ -150,6 +174,24 @@ async function loadShare() {
   } finally {
     // 只有"最新一次加载"才有权收口，避免旧请求把新一轮的 loading 提前关掉
     if (seq === loadSeq) loading.value = false
+  }
+}
+
+/** 提交访问密码：立刻进入加载态，失败（密码错）时回到表单并提示。 */
+async function submitPassword() {
+  if (passwordSubmitting.value) return
+  const value = password.value.trim()
+  if (!value) {
+    passwordError.value = t('errors.share_password_empty')
+    return
+  }
+  // 用 trim 后的值提交，避免手机输入法带出的尾随空格被当成密码的一部分
+  password.value = value
+  passwordSubmitting.value = true
+  try {
+    await loadShare()
+  } finally {
+    passwordSubmitting.value = false
   }
 }
 
@@ -180,6 +222,47 @@ function formatDate(iso: string): string {
         variant="detail"
         :rows="4"
       />
+      <!-- 需要访问密码：表单态而不是错误态（链接是好的，只差一个口令） -->
+      <form
+        v-else-if="passwordRequired"
+        class="share-password"
+        @submit.prevent="submitPassword"
+      >
+        <h2 class="share-password-title">
+          {{ $t('errors.share_password_required_title') }}
+        </h2>
+        <p class="share-password-hint">
+          {{ $t('errors.share_password_required_hint') }}
+        </p>
+        <label
+          class="share-password-field"
+          for="share-password-input"
+        >
+          <input
+            id="share-password-input"
+            v-model="password"
+            class="share-password-input"
+            type="password"
+            autocomplete="off"
+            :placeholder="$t('errors.share_password_placeholder')"
+            :aria-invalid="passwordError ? 'true' : 'false'"
+          >
+        </label>
+        <p
+          v-if="passwordError"
+          class="share-password-error"
+          role="alert"
+        >
+          {{ passwordError }}
+        </p>
+        <button
+          type="submit"
+          class="share-password-submit"
+          :disabled="passwordSubmitting"
+        >
+          {{ $t('errors.share_password_submit') }}
+        </button>
+      </form>
       <div
         v-else-if="error"
         class="share-error"
@@ -264,6 +347,26 @@ function formatDate(iso: string): string {
 .share-meta { font-size: 12px; color: var(--text-tertiary); }
 .share-thread { display: flex; flex-direction: column; gap: 18px; }
 .share-error { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+/* 密码表单：与内容同宽上限，居中；输入框 16px 防止 iOS 聚焦时放大页面 */
+.share-password { max-width: 360px; margin: 48px auto 0; display: flex; flex-direction: column; gap: 10px; }
+.share-password-title { margin: 0; font-size: 18px; line-height: 26px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+.share-password-hint { margin: 0; font-size: 13px; line-height: 20px; color: var(--text-secondary); }
+.share-password-field { display: block; }
+.share-password-input {
+  width: 100%; box-sizing: border-box; min-height: 40px; padding: 8px 12px;
+  font-family: inherit; font-size: 16px; color: var(--text-primary);
+  background: var(--bg-card); border: var(--hairline-width) solid var(--border);
+  border-radius: var(--radius-md);
+}
+.share-password-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; border-color: var(--primary); }
+.share-password-error { margin: 0; font-size: 13px; color: var(--danger, #d4380d); }
+.share-password-submit {
+  min-height: 40px; padding: 8px 18px; cursor: pointer;
+  font-family: inherit; font-size: 14px; font-weight: var(--fw-semibold); color: var(--on-solid);
+  background: var(--primary); border: none; border-radius: var(--radius-md);
+}
+.share-password-submit:disabled { opacity: 0.6; cursor: default; }
+.share-password-submit:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .share-retry {
   min-height: 36px; padding: 8px 18px; cursor: pointer;
   font-family: inherit; font-size: 14px; color: var(--text-primary);

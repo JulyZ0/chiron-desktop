@@ -76,6 +76,17 @@ const (
 	// ——撤销是"创建者关了它"，求创建者重发；过期是"链接太老"，也要求重发但不必怀疑
 	// 被谁动了手脚。合并成一个码时分享页只能猜，实测文案会把过期链接说成"已被删除"。
 	CodeShareExpired = "share_expired"
+	// CodeSharePasswordRequired 表示这条分享设置了访问密码（401）。
+	//
+	// 与 `auth_required` **必须分开**：两者都是 401，但访客能做的事相反 ——
+	// `auth_required` 是"去登录"，而分享页是匿名页面，登录解决不了问题；正确动作是
+	// 在页面上输入创建者给的密码。合并成一个码时前端只能把访客弹到登录页。
+	CodeSharePasswordRequired = "share_password_required"
+	// CodeShareViewLimit 表示分享达到创建者设定的访问次数上限（410）。
+	//
+	// 与 `share_expired` 分开：上限是"已经被看过 N 次"，求创建者重发时对方需要知道
+	// 该调高限额，而不是单纯"再发一条"。
+	CodeShareViewLimit = "share_view_limit"
 )
 
 // knownMessageCodes 已知文案 → 错误码（键为小写原文）。
