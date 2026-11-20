@@ -63,6 +63,70 @@ export interface DepUninstallResult {
   output: string
 }
 
+// ── 快照与回滚（P0-3）────────────────────────────────────────────────────
+//
+// 快照是"装坏了能回去"的唯一保证：引擎在每次 install/uninstall/restore **动手之前**
+// 自动落一份 `pip list` 结果，用户也可以手动创建。恢复前必须先看差异（dry_run），
+// 再二次确认 —— 恢复会卸载"快照里没有的包"，那可能是别人刚装上的。
+
+export interface DepSnapshot {
+  /** 引擎生成的文件名（去扩展）：`<UTC 时间戳到毫秒>Z-<6 位随机>` */
+  id: string
+  /** Unix 秒（与 job 的时间戳同一口径） */
+  created_at: number
+  created_at_iso?: string
+  /** 触发动作：`manual` / `install:<spec>` / `uninstall:<name>` / `restore:<id>` */
+  trigger: string
+  label: string
+  package_count: number
+  python?: string
+}
+
+export interface DepSnapshotListResult {
+  snapshots: DepSnapshot[]
+  count: number
+  /** 引擎保留的最大份数（超出会清理更旧的） */
+  retention: number
+  /** 快照目录（排障用；用户不该从这里改文件） */
+  directory?: string
+}
+
+/** 版本变化项：`from` 是当前版本，`to` 是快照里的版本。 */
+export interface DepVersionChange {
+  name: string
+  from: string
+  to: string
+}
+
+export interface DepRestoreDiff {
+  /** 快照里有、现在没有 → 按快照版本装回 */
+  missing: DepPackage[]
+  /** 现在有、快照里没有 → 卸载 */
+  extra: DepPackage[]
+  /** 两边都有但版本不同 → 装成快照里的版本 */
+  changed: DepVersionChange[]
+  unchanged: number
+  /** missing + changed（这就是"一次最多 50 个"的计量口径） */
+  install_count: number
+  uninstall_count: number
+  total_changes: number
+  limit: number
+  exceeds_limit: boolean
+}
+
+export interface DepRestoreResult {
+  dry_run: boolean
+  snapshot: DepSnapshot
+  diff: DepRestoreDiff
+  /** dry_run 或"环境已一致"时为 null */
+  job?: DepJob | null
+  /** true = 当前环境已与快照一致，没有可执行的动作 */
+  noop?: boolean
+}
+
+/** 与引擎 `MAX_RESTORE_INSTALLS` 一致：超过就必须拆解，而不是"一键回滚"。 */
+export const MAX_RESTORE_INSTALLS = 50
+
 // ── 校验（纯函数，vitest 直接覆盖）──────────────────────────────────────
 
 /**
@@ -156,6 +220,44 @@ export async function getDepJob(id: string): Promise<DepJob> {
 /** 任务是否已结束（用于停止轮询）。 */
 export function isTerminalJob(status: DepJobStatus | string): boolean {
   return status === 'succeeded' || status === 'failed'
+}
+
+// ── 快照 ────────────────────────────────────────────────────────────────
+
+/** 快照列表（最新在前）。失败时抛错 —— 空列表会被误读成"从没拍过快照"。 */
+export async function listDepSnapshots(): Promise<DepSnapshotListResult> {
+  const resp = await api.get('/v1/admin/deps/snapshots')
+  const data = unwrap<DepSnapshotListResult>(resp.data)
+  return {
+    snapshots: Array.isArray(data?.snapshots) ? data.snapshots : [],
+    count: typeof data?.count === 'number' ? data.count : 0,
+    retention: typeof data?.retention === 'number' ? data.retention : 20,
+    directory: data?.directory,
+  }
+}
+
+/** 手动创建一份快照；`label` 只用于展示（引擎会压成单行并限长）。 */
+export async function createDepSnapshot(label = ''): Promise<DepSnapshot> {
+  const resp = await api.post('/v1/admin/deps/snapshots', { label })
+  const data = unwrap<{ snapshot?: DepSnapshot }>(resp.data)
+  if (!data?.snapshot) throw new Error('snapshot missing in response')
+  return data.snapshot
+}
+
+/**
+ * 预览"回到该快照"要动什么（引擎 dry_run）。
+ *
+ * 必须先看这个再确认：恢复会**卸载快照里没有的包**，而用户往往记不清这一点。
+ */
+export async function previewDepRestore(id: string): Promise<DepRestoreResult> {
+  const resp = await api.post(`/v1/admin/deps/snapshots/${encodeURIComponent(id)}/restore`, { dry_run: true })
+  return unwrap<DepRestoreResult>(resp.data)
+}
+
+/** 真正执行恢复；返回的 job 需要轮询（与 install 同一套轮询）。 */
+export async function restoreDepSnapshot(id: string): Promise<DepRestoreResult> {
+  const resp = await api.post(`/v1/admin/deps/snapshots/${encodeURIComponent(id)}/restore`, { dry_run: false })
+  return unwrap<DepRestoreResult>(resp.data)
 }
 
 /**

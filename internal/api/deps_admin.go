@@ -47,11 +47,18 @@ var (
 	depsNameRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`)
 	// 任务 id 由引擎生成（12 位 hex）；这里只做形态约束，防止路径拼接穿越。
 	depsJobIDRe = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
+	// 快照 id 由引擎生成：`<UTC 时间戳到毫秒>Z-<6 位小写随机>`（见引擎的
+	// `SNAPSHOT_ID_RE`）。**刻意不含 `.` 与 `/`** —— id 会被拼进上游 URL 的路径段，
+	// 放过点号就等于放过 `..`。前后两份正则必须一起改。
+	depsSnapshotIDRe = regexp.MustCompile(`^[0-9]{8}T[0-9]{9}Z-[a-z0-9]{6}$`)
 )
 
 const (
 	maxDepsSpecLen = 128
 	maxDepsNameLen = 128
+	// 与引擎 `MAX_SNAPSHOT_LABEL_LEN` 一致：标签只用于展示，超长直接拒绝而不是截断
+	// （截断会让用户以为标签被正确保存）。
+	maxDepsSnapshotLabelLen = 120
 )
 
 // DepsHandler 代理依赖管理端点。
@@ -285,11 +292,120 @@ func (h *DepsHandler) Job(w http.ResponseWriter, r *http.Request) {
 	OK(w, resp)
 }
 
+// ListSnapshots GET /v1/admin/deps/snapshots
+//
+// 快照清单（最新在前）。读操作用平台级读门禁：清单本身不含包内容，但"何时有人动过
+// 运行环境"属于运维信息，与已安装包列表同口径。
+func (h *DepsHandler) ListSnapshots(w http.ResponseWriter, r *http.Request) {
+	if !h.requireEngine(w) {
+		return
+	}
+	var resp map[string]interface{}
+	if err := h.pythonClient.GetJSON(r.Context(), "/internal/deps/snapshots", &resp); err != nil {
+		depsEngineFailure(w, err)
+		return
+	}
+	OK(w, resp)
+}
+
+// CreateSnapshot POST /v1/admin/deps/snapshots {"label": "before upgrade"}
+//
+// 手动建快照是**写**操作（会在数据目录落文件），因此走平台级写门禁并记审计：
+// "谁在什么时候给运行环境拍了快照"与"谁装了包"同样需要可回溯。
+func (h *DepsHandler) CreateSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !h.requireEngine(w) {
+		return
+	}
+	var body struct {
+		Label string `json:"label"`
+	}
+	// 空 body 是合法的（标签可选）：Decoder 遇到 EOF 时保持零值。
+	if r.ContentLength > 0 {
+		if err := DecodeJSON(w, r, &body); err != nil {
+			BadRequest(w, ErrInvalidReq)
+			return
+		}
+	}
+	label := strings.TrimSpace(body.Label)
+	if len(label) > maxDepsSnapshotLabelLen {
+		BadRequest(w, "label is too long (max 120 characters)")
+		return
+	}
+
+	var resp map[string]interface{}
+	err := h.pythonClient.PostJSON(
+		r.Context(), "/internal/deps/snapshots", map[string]string{"label": label}, &resp,
+	)
+	if err != nil {
+		auditDeps(r, "deps.snapshot", "pip:snapshot", "snapshot failed: "+err.Error(), false)
+		depsEngineFailure(w, err)
+		return
+	}
+	auditDeps(r, "deps.snapshot", "pip:snapshot", "snapshot created", true)
+	OK(w, resp)
+}
+
+// RestoreSnapshot POST /v1/admin/deps/snapshots/{id}/restore {"dry_run": true}
+//
+// `dry_run=true` 只算差异（前端二次确认弹窗的数据来源），不占用互斥闸；
+// `dry_run=false` 真的建恢复任务 —— 那是**改变运行环境**的操作，必须过互斥闸并记审计。
+// 引擎侧还有一道全站单任务闸（跨进程有效），两把闸的分工见文件头注释。
+func (h *DepsHandler) RestoreSnapshot(w http.ResponseWriter, r *http.Request) {
+	if !h.requireEngine(w) {
+		return
+	}
+	id := r.PathValue("id")
+	if !depsSnapshotIDRe.MatchString(id) {
+		BadRequest(w, "invalid snapshot id")
+		return
+	}
+
+	var body struct {
+		DryRun bool `json:"dry_run"`
+	}
+	if r.ContentLength > 0 {
+		if err := DecodeJSON(w, r, &body); err != nil {
+			BadRequest(w, ErrInvalidReq)
+			return
+		}
+	}
+
+	if !body.DryRun {
+		if !atomic.CompareAndSwapInt32(&h.busy, 0, 1) {
+			JSON(w, http.StatusConflict, APIResponse{
+				Success: false,
+				Error:   "another dependency task is already running",
+			})
+			return
+		}
+		defer atomic.StoreInt32(&h.busy, 0)
+	}
+
+	var resp map[string]interface{}
+	err := h.pythonClient.PostJSON(
+		r.Context(),
+		"/internal/deps/snapshots/"+escSeg(id)+"/restore",
+		map[string]bool{"dry_run": body.DryRun},
+		&resp,
+	)
+	if err != nil {
+		if !body.DryRun {
+			auditDeps(r, "deps.restore", "pip:snapshot:"+id, "restore rejected or failed: "+err.Error(), false)
+		}
+		depsEngineFailure(w, err)
+		return
+	}
+	if !body.DryRun {
+		auditDeps(r, "deps.restore", "pip:snapshot:"+id, "restore job queued", true)
+	}
+	OK(w, resp)
+}
+
 // registerDepsRoutes 注册依赖管理路由（全部为管理员端点）。
 //
-// 读（list/search/jobs）用平台级读门禁，写（install/uninstall）用平台级写门禁：
-// 已安装清单与 PyPI 查询只暴露"这台机器装了什么"，但列表里可能含内部工具包名，
-// 与 `/v1/admin/performance` 同口径收紧到平台 owner。
+// 读（list/search/jobs/snapshots）用平台级读门禁，写（install/uninstall/创建快照/
+// 恢复快照）用平台级写门禁：已安装清单与 PyPI 查询只暴露"这台机器装了什么"，但列表里
+// 可能含内部工具包名，与 `/v1/admin/performance` 同口径收紧到平台 owner。
 func registerDepsRoutes(
 	mux *http.ServeMux,
 	authMW, rlMW routeMiddleware,
@@ -302,6 +418,12 @@ func registerDepsRoutes(
 	mux.Handle("GET /v1/admin/deps/list", authMW(rlMW(readMW(http.HandlerFunc(h.List)))))
 	mux.Handle("GET /v1/admin/deps/search", authMW(rlMW(readMW(http.HandlerFunc(h.Search)))))
 	mux.Handle("GET /v1/admin/deps/jobs/{id}", authMW(rlMW(readMW(http.HandlerFunc(h.Job)))))
+	mux.Handle("GET /v1/admin/deps/snapshots", authMW(rlMW(readMW(http.HandlerFunc(h.ListSnapshots)))))
 	mux.Handle("POST /v1/admin/deps/install", authMW(rlMW(writeMW(http.HandlerFunc(h.Install)))))
 	mux.Handle("POST /v1/admin/deps/uninstall", authMW(rlMW(writeMW(http.HandlerFunc(h.Uninstall)))))
+	mux.Handle("POST /v1/admin/deps/snapshots", authMW(rlMW(writeMW(http.HandlerFunc(h.CreateSnapshot)))))
+	mux.Handle(
+		"POST /v1/admin/deps/snapshots/{id}/restore",
+		authMW(rlMW(writeMW(http.HandlerFunc(h.RestoreSnapshot)))),
+	)
 }
