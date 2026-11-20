@@ -62,6 +62,24 @@ def _emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def error_payload(exc: BaseException) -> dict[str, Any]:
+    """把异常打成 ``launcher-error`` 事件。
+
+    ``code`` 只在异常自带分类时出现（目前是 :class:`app.migration.MigrationError`
+    的 ``migration_tool_missing`` / ``db_unreachable`` / ``migration_failed``）。
+    Electron 侧把它当作 ``reason`` 传给错误页，用户才看得到"该装什么/该查什么"，
+    而不是一句原始 traceback。字段名 ``error`` 保持不变（既有解析方按它取消息）。
+    """
+    payload: dict[str, Any] = {"event": ERROR_EVENT, "error": f"{type(exc).__name__}: {exc}"}
+    code = getattr(exc, "code", "")
+    if isinstance(code, str) and code:
+        payload["code"] = code
+    log_path = getattr(exc, "log_path", "")
+    if isinstance(log_path, str) and log_path:
+        payload["log"] = log_path
+    return payload
+
+
 # 组件子命令。``serve`` 是默认值，保持 ``-m app.launcher --data-dir X`` 老用法不变。
 COMPONENT_ACTIONS = ("status", "install", "remove")
 
@@ -192,7 +210,18 @@ def build_ready_payload(
 
 
 async def bootstrap(settings: Settings) -> tuple[PostgresServer, RedisServer, dict[str, Any]]:
-    """起 PG（含迁移）与 Redis，返回就绪载荷。任一步失败直接抛出。"""
+    """起 PG（含迁移）与 Redis，返回就绪载荷。任一步失败直接抛出。
+
+    **迁移是启动流程里的显式一步**（不再是"外部步骤，跑完再说"）：PG 起来后立刻
+    ``alembic upgrade head``，用配置的解释器起子进程、超时 300s、完整输出写
+    ``<data-dir>/logs/migration.log``。失败抛 :class:`app.migration.MigrationError`
+    （``code`` 区分 工具缺失 / DB 不可达 / 迁移报错），由 ``main`` 打成
+    ``launcher-error`` 事件交给 Electron，最终显示在错误页上。
+
+    失败时必须把**已起来的进程停掉**：PG 是经 ``pg_ctl`` 起的独立进程，不在本进程的
+    子进程树里，引导器一退出就成孤儿 —— 下次 ``initdb`` 撞上残留 postmaster，
+    用户看到的是"迁移失败"之后又冒出"端口被占用"，两个故障互相掩盖。
+    """
     settings.ensure_dirs()
     started = time.perf_counter()
 
@@ -200,14 +229,22 @@ async def bootstrap(settings: Settings) -> tuple[PostgresServer, RedisServer, di
     redis = RedisServer(settings)
     migration: dict[str, Any] | None = None
 
-    if settings.pg_enabled:
-        # pg_ctl / embedded 包都是阻塞调用，扔到线程里免得卡住事件循环
-        await asyncio.to_thread(pg.start)
-        if settings.run_migrations:
-            migration = await asyncio.to_thread(pg.migrate, pg.dsn)
+    try:
+        if settings.pg_enabled:
+            # pg_ctl / embedded 包都是阻塞调用，扔到线程里免得卡住事件循环
+            await asyncio.to_thread(pg.start)
+            if settings.run_migrations:
+                migration = await asyncio.to_thread(pg.migrate, pg.dsn)
 
-    if settings.redis_enabled:
-        await redis.start()
+        if settings.redis_enabled:
+            await redis.start()
+    except BaseException:
+        # 顺序与正常退出相反：先 Redis，再 PG。失败不掩盖原始异常。
+        with contextlib.suppress(Exception):
+            await redis.stop()
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(pg.stop)
+        raise
 
     payload = build_ready_payload(
         settings, pg, redis, (time.perf_counter() - started) * 1000, migration=migration
@@ -304,7 +341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 0
     except Exception as exc:  # noqa: BLE001 —— 顶层兜底：把原因打成事件，再以非零退出
-        _emit({"event": ERROR_EVENT, "error": f"{type(exc).__name__}: {exc}"})
+        _emit(error_payload(exc))
         return 1
 
 

@@ -43,6 +43,11 @@ from typing import Any
 from urllib.parse import quote
 
 from app.config import Settings
+from app.migration import (
+    CODE_MIGRATION_FAILED,
+    MigrationError,
+    run_alembic_upgrade,
+)
 
 # PyPI 包名（import 名是 embedded_postgres）
 _EMBEDDED_MODULE = "embedded_postgres"
@@ -483,8 +488,10 @@ def _dotenv_noop() -> Iterator[None]:
     为什么必须这么做：仓库根 ``migrations/env.py`` 在模块顶层调用
     ``load_dotenv(..., override=True)`` 读仓库的 ``.env``。若那份 ``.env`` 里有
     ``DATABASE_DSN``，它会**覆盖**我们刚设好的本地实例 DSN —— 迁移就会打到开发库上。
-    这里让 load_dotenv 变成空操作，配合 ``DATABASE_DSN`` 环境变量，迁移只可能落在
-    我们自己的实例里（事后还会用 ``alembic_version`` 复核一次）。
+
+    **现状**：迁移已改为子进程（``app/migration.py``），同一件事由子进程的启动引导
+    （``_ALEMBIC_BOOTSTRAP``）在 alembic 导入前完成。这里保留这个上下文管理器只因为
+    ``scripts/verify_p0.py`` 等外部自检仍在进程内跑 alembic；生产路径不再经过它。
     """
     try:
         import dotenv
@@ -1147,63 +1154,30 @@ class PostgresServer:
 
     # ------------------------------------------------------------------ 迁移
     def migrate(self, dsn: str | None = None) -> dict[str, Any]:
-        """跑仓库根 ``migrations/`` 的 ``alembic upgrade head``，返回真实结果。"""
+        """跑仓库根 ``migrations/`` 的 ``alembic upgrade head``，返回真实结果。
+
+        实现是**子进程**（``app.migration.run_alembic_upgrade``）：超时 300s、完整输出
+        写 ``<data-dir>/logs/migration.log``、失败按 工具缺失 / DB 不可达 / 迁移报错
+        分类（``MigrationError.code``）。进程内 import alembic 的旧实现会在依赖缺失时
+        直接崩掉引导器，且卡在迁移锁上时没有任何中途退出点。
+        """
         target = dsn or self._dsn
         if not target:
-            raise RuntimeError("迁移前必须先 start()（没有 DSN）")
-        migrations_dir = self.settings.migrations_dir
-        if not migrations_dir.is_dir():
-            raise RuntimeError(f"找不到迁移目录：{migrations_dir}")
+            raise MigrationError(CODE_MIGRATION_FAILED, "迁移前必须先 start()（没有 DSN）")
 
-        # SQLAlchemy 2.1 起 `postgresql://` 默认走 psycopg(v3)；本地环境装的是
-        # psycopg2-binary（与 run_sql 同源）。显式指定驱动，避免 alembic 报
-        # `ModuleNotFoundError: No module named 'psycopg'`。
-        alembic_target = target
-        if alembic_target.startswith("postgresql://"):
-            alembic_target = "postgresql+psycopg2://" + alembic_target[len("postgresql://") :]
+        result = run_alembic_upgrade(self.settings, target)
 
-        cfg = self._alembic_config(alembic_target, migrations_dir)
-        previous = os.environ.get("DATABASE_DSN")
-        os.environ["DATABASE_DSN"] = alembic_target
-        started = time.perf_counter()
-        try:
-            from alembic import command
-
-            with _dotenv_noop():
-                command.upgrade(cfg, "head")
-        finally:
-            if previous is None:
-                os.environ.pop("DATABASE_DSN", None)
-            else:
-                os.environ["DATABASE_DSN"] = previous
-        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-
+        # 迁移"成功"之后必须复核：``.env`` / 连接串被改写时 alembic 可能打到**别的库**，
+        # 那种情况下退出码是 0、本地实例里却仍然没有 alembic_version。
         revision = self.current_revision(target)
         if not revision:
-            raise RuntimeError(
-                "迁移后读不到 alembic_version —— 迁移很可能落到了别的库（检查 DATABASE_DSN 是否被 .env 覆盖）"
+            raise MigrationError(
+                CODE_MIGRATION_FAILED,
+                "迁移后读不到 alembic_version —— 迁移很可能落到了别的库"
+                "（检查是否有 .env 覆盖了 DATABASE_DSN）",
+                log_path=str(result.get("log") or ""),
             )
-        return {
-            "ok": True,
-            "revision": revision,
-            "elapsed_ms": elapsed_ms,
-            "migrations_dir": str(migrations_dir),
-        }
-
-    def _alembic_config(self, dsn: str, migrations_dir: Path) -> Any:
-        """优先用程序化 Config（无 alembic.ini 时不会重配 logging），失败则读仓库 alembic.ini。"""
-        from alembic.config import Config as AlembicConfig
-
-        script_location = str(migrations_dir).replace("%", "%%")
-
-        def _apply(cfg: Any) -> Any:
-            cfg.set_main_option("script_location", script_location)
-            cfg.set_main_option("sqlalchemy.url", dsn.replace("%", "%%"))
-            return cfg
-
-        with contextlib.suppress(Exception):
-            return _apply(AlembicConfig())
-        return _apply(AlembicConfig(str(self.settings.alembic_ini)))
+        return {**result, "revision": revision}
 
     def current_revision(self, dsn: str | None = None) -> str | None:
         target = dsn or self._dsn

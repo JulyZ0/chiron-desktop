@@ -480,7 +480,13 @@ function startLauncher(options = {}) {
         const parsed = parseLauncherLine(line)
         if (!parsed) return
         if (parsed.event === LAUNCHER_ERROR_EVENT) {
-          finish(makeLauncherError(`引导器内部错误：${parsed.error}`, record))
+          const err = makeLauncherError(`引导器内部错误：${parsed.error}`, record)
+          // 迁移失败分类（desktop-local/app/migration.py 的 MigrationError.code）：
+          // 原样带上，`main.cjs` 会把它当 localBackend.reason 写进错误页的 code，
+          // 用户据此看到"该装 alembic / 该查数据库 / 该看迁移日志"。
+          if (parsed.code) err.reason = String(parsed.code)
+          if (parsed.log) err.logPath = String(parsed.log)
+          finish(err)
           return
         }
         record.info = parsed

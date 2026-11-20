@@ -14,6 +14,7 @@
 ``CHIRON_LOCAL_REDIS_URL``       给了就走真实 Redis/Valkey，否则用 fakeredis
 ``POSTGRES_DSN``                 给了就复用外部 PG（不自己起进程），优先级最高
 ``CHIRON_LOCAL_RUN_MIGRATIONS``  启动时是否跑 ``alembic upgrade head``
+``CHIRON_LOCAL_PYTHON``          跑迁移用的解释器（默认：``CHIRON_PYTHON`` → 当前解释器）
 ``CHIRON_LOCAL_AUTH_ENABLED``    是否校验设备 token（Bearer）；默认关闭
 ===============================  ============================================================
 """
@@ -74,6 +75,10 @@ class Settings(BaseSettings):
     pg_enabled: bool = True
     redis_enabled: bool = True
     run_migrations: bool = True
+    # 跑 ``alembic upgrade head`` 用的解释器。空 = 按 ``python_executable`` 的兜底链推导。
+    # 单独配一个的理由：引导器自己可能是被 Electron 打包的 python 启动的，而**装没装
+    # alembic** 取决于那份运行时的依赖清单；显式配置让"用哪个 python 迁移"可排查可覆盖。
+    python: str = ""
     postgres_dsn: str | None = Field(
         default=None,
         validation_alias=AliasChoices("POSTGRES_DSN", f"{ENV_PREFIX}POSTGRES_DSN"),
@@ -153,6 +158,21 @@ class Settings(BaseSettings):
     @property
     def alembic_ini(self) -> Path:
         return REPO_ROOT / "alembic.ini"
+
+    @property
+    def python_executable(self) -> str:
+        """跑迁移的解释器：``CHIRON_LOCAL_PYTHON`` → ``CHIRON_PYTHON`` → 当前解释器。
+
+        ``CHIRON_PYTHON`` 是组件管理（``app/components/manager.py``）已经在用的口径，
+        这里复用同一名字：用户已经为组件指定过解释器时，不该再要求他配第二个。
+        """
+        explicit = (self.python or "").strip()
+        if explicit:
+            return explicit
+        shared = (os.environ.get("CHIRON_PYTHON") or "").strip()
+        if shared:
+            return shared
+        return sys.executable or "python"
 
     def ensure_dirs(self) -> None:
         """建好本进程需要写的目录（只写 data-dir 之下）。"""
