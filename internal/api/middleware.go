@@ -328,7 +328,10 @@ func CORSMiddleware() func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Credentials", "true")
 			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-API-Key")
+			// X-Share-Password：公开分享页的访问密码（见 share_access.go）。分享页与网关
+			// 通常同源，但把前端产物托管在别的域名时这个自定义头会触发预检 —— 不放行
+			// 就等于那条部署形态下"带密码的分享永远打不开"。
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-API-Key,X-Share-Password")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 
 			if r.Method == http.MethodOptions {

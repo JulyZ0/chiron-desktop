@@ -194,3 +194,88 @@ describe('分享落地页的加载终态', () => {
     expect(errorText(wrapper)).toContain('加载失败')
   })
 })
+
+/**
+ * ── P1-8 访问保护：密码 ──
+ *
+ * 401 + `share_password_required` 是**等待输入**的中间态，不是失败终态：
+ * 链接是好的，只差一个口令。把它当错误页处理会让访客以为链接坏了并关掉页面。
+ */
+describe('分享落地页的密码保护', () => {
+  it('需要密码时渲染表单而不是错误页', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockRejectedValue(httpError(401, 'share_password_required'))
+
+    const wrapper = await mountAt('/s/locked')
+
+    expect(isLoading(wrapper)).toBe(false)
+    expect(wrapper.find('.share-password').exists()).toBe(true)
+    // 不能显示成"分享不存在或已失效"，也不给无意义的重试按钮
+    expect(wrapper.find('.empty-state').exists()).toBe(false)
+    expect(wrapper.find('.share-retry').exists()).toBe(false)
+    // 首次加载不带密码
+    expect(shareApi.getPublicShare).toHaveBeenCalledWith('locked')
+  })
+
+  it('提交密码后带密码重新请求，成功则渲染内容', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockRejectedValueOnce(httpError(401, 'share_password_required'))
+    shareApi.getPublicShare.mockResolvedValueOnce({
+      id: 'locked', title: '受保护的会话', created_at: '2026-11-18T10:00:00Z',
+      messages: [{ role: 'user', content: '机密内容', created_at: '2026-11-18T10:00:00Z' }],
+    })
+
+    const wrapper = await mountAt('/s/locked')
+    expect(wrapper.find('.share-password').exists()).toBe(true)
+
+    await wrapper.find('.share-password-input').setValue('s3cret')
+    await wrapper.find('.share-password').trigger('submit')
+    await flushPromises()
+
+    expect(shareApi.getPublicShare).toHaveBeenLastCalledWith('locked', 's3cret')
+    expect(wrapper.find('.share-password').exists()).toBe(false)
+    expect(wrapper.text()).toContain('受保护的会话')
+    expect(wrapper.text()).toContain('机密内容')
+  })
+
+  it('密码错误：留在表单并提示，不把访客赶到错误页', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockRejectedValue(httpError(401, 'share_password_required'))
+
+    const wrapper = await mountAt('/s/locked')
+    await wrapper.find('.share-password-input').setValue('wrong')
+    await wrapper.find('.share-password').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.find('.share-password').exists()).toBe(true)
+    expect(wrapper.find('.share-password-error').text()).toContain('密码不正确')
+    expect(wrapper.find('.empty-state').exists()).toBe(false)
+  })
+
+  it('空白密码不发请求（先给出必填提示）', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockRejectedValue(httpError(401, 'share_password_required'))
+
+    const wrapper = await mountAt('/s/locked')
+    const before = shareApi.getPublicShare.mock.calls.length
+
+    await wrapper.find('.share-password-input').setValue('   ')
+    await wrapper.find('.share-password').trigger('submit')
+    await flushPromises()
+
+    expect(shareApi.getPublicShare.mock.calls.length).toBe(before)
+    expect(wrapper.find('.share-password-error').text()).toContain('请输入访问密码')
+  })
+
+  it('410 达到访问上限：文案与"过期/被删除"区分开', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockRejectedValue(httpError(410, 'share_view_limit'))
+
+    const wrapper = await mountAt('/s/limited')
+
+    expect(isLoading(wrapper)).toBe(false)
+    expect(errorText(wrapper)).toContain('访问次数上限')
+    expect(errorText(wrapper)).not.toContain('删除')
+    expect(wrapper.find('.share-retry').exists()).toBe(false)
+  })
+})

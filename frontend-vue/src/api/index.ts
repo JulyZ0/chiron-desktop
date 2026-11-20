@@ -396,11 +396,29 @@ export async function getToolCallOutput(
 export interface ShareInfo {
   share_id: string
   created_at?: string
+  /** 本次创建是否设了访问密码（幂等返回旧链接时为服务端已存的状态） */
+  has_password?: boolean
+  /** 访问次数上限；null / 缺省 = 不限次 */
+  max_views?: number | null
 }
 
-/** 创建分享（body 为选中的消息 id；已有活跃分享时幂等返回） */
-export async function createShare(sessionId: string, messageIds: string[]): Promise<ShareInfo> {
-  const { data } = await api.post(`/v1/conversations/${encodeURIComponent(sessionId)}/share`, { message_ids: messageIds })
+/**
+ * 创建分享（body 为选中的消息 id；已有活跃分享时幂等返回）。
+ *
+ * 可选保护参数：
+ * - `password`：访问密码（4-72 字节，服务端只存 bcrypt 摘要）；
+ * - `maxViews`：访问次数上限（达到后链接返回 410）。
+ * 都不传时是原来的行为（任何人都能打开、30 天有效）。
+ */
+export async function createShare(
+  sessionId: string,
+  messageIds: string[],
+  protection?: { password?: string; maxViews?: number },
+): Promise<ShareInfo> {
+  const body: Record<string, unknown> = { message_ids: messageIds }
+  if (protection?.password) body.password = protection.password
+  if (typeof protection?.maxViews === 'number') body.max_views = protection.maxViews
+  const { data } = await api.post(`/v1/conversations/${encodeURIComponent(sessionId)}/share`, body)
   return data?.data
 }
 
@@ -441,8 +459,9 @@ export interface PublicShare {
 export const PUBLIC_SHARE_TIMEOUT_MS = 10_000
 
 /**
- * 公开分享读取（无鉴权；已撤销返回 410、已过期返回 410+`share_expired`）。
- * 走 /v1/share/{id} 与 SPA /share/:id 路由分离（S 修复 路径冲突）。
+ * 公开分享读取（无鉴权；已撤销返回 410、已过期返回 410+`share_expired`、
+ * 达到访问上限返回 410+`share_view_limit`、需要密码返回 401+`share_password_required`）。
+ * 走 /v1/share/{id} 与 SPA /s/:token 路由分离（S 修复 路径冲突）。
  *
  * 两个刻意的请求选项：
  * - `timeout`：匿名首屏不能等满全局 30s（见 PUBLIC_SHARE_TIMEOUT_MS）。
@@ -454,10 +473,14 @@ export const PUBLIC_SHARE_TIMEOUT_MS = 10_000
  * 非 JSON / 空 body 一律**抛错**：`data?.data` 为空时若静默返回 undefined，调用方会
  * 渲染出一页既不是骨架也不是错误提示的空白（曾经就是"看着在加载"的来源之一）。
  */
-export async function getPublicShare(shareId: string): Promise<PublicShare> {
+export async function getPublicShare(shareId: string, password?: string): Promise<PublicShare> {
+  // 密码走请求头而不是查询串：URL 会进访问日志 / Referer / 浏览器历史，
+  // 而一条链接的密码往往被多次访问复用，泄露一次等于长期泄露。
+  const headers = password ? { 'X-Share-Password': password } : undefined
   const { data } = await api.get(`/v1/share/${encodeURIComponent(shareId)}`, {
     timeout: PUBLIC_SHARE_TIMEOUT_MS,
     __silent: true,
+    headers,
   })
   const payload = data?.data
   if (!payload || typeof payload !== 'object') {

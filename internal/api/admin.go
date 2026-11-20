@@ -34,6 +34,9 @@ type AdminHandler struct {
 	rateLimiter   *DistributedRateLimiter
 	appSecret     string
 	settingsStore *settings.Store
+	// shares 是「分享管理」端点的数据来源（默认 nil → db.GlobalDBManager）。
+	// 抽成接口只为单测：批量撤销的"部分失败"分支无法用真库覆盖。
+	shares shareQueryStore
 }
 
 func NewAdminHandler(cfg *config.Config, a *auth.Authenticator, store *storage.AtomicStore, redis *db.AtomicRedis, pythonClient *engine.PythonClient) *AdminHandler {

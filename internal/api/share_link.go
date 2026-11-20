@@ -20,9 +20,14 @@ import (
 	"github.com/athenavi/chiron/config"
 )
 
-// sharePathPrefix 是 SPA 里公开分享页的路由（frontend-vue 的 `/share/:id`）。
+// sharePathPrefix 是 SPA 里公开分享页的路由前缀。
+//
+// 统一为 `/s/`（短链形态，与前端 `utils/shareLink.ts` 的 SHARE_PATH_PREFIX 一致）。
+// 前端同时保留 `/share/:id` 作为**兼容别名** —— 链接发出去就收不回来，旧链接必须
+// 继续能打开，但那只是读侧兜底，不再是对外产出的形态。
+//
 // 与 `GET /v1/share/{id}`（JSON 接口）刻意分开：前者是给人打开的页面，后者是数据。
-const sharePathPrefix = "/share/"
+const sharePathPrefix = "/s/"
 
 // publicBaseURL 返回网关的对外基址（不带结尾 "/"）；无法确定时返回空串。
 func publicBaseURL(cfg *config.Config, r *http.Request) string {

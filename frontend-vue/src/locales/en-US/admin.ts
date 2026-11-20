@@ -375,6 +375,23 @@ export default {
   share_untitled: "(untitled conversation)",
   share_load_failed: "Failed to load shares",
   share_revoke_failed: "Failed to revoke the share",
+  // ── P1-8 share ops: view stats / bulk revoke ──
+  share_col_views_24h: "Views (24h)",
+  share_col_views_total: "Views (total)",
+  share_col_last_viewed: "Last viewed",
+  share_detail: "Details",
+  share_detail_title: "Share details",
+  share_detail_close: "Close",
+  share_never_viewed: "Never viewed",
+  share_trend_7d: "Views in the last 7 days",
+  share_bulk_selected: "{n} selected",
+  share_bulk_revoke: "Revoke selected",
+  share_bulk_confirm_text: "Revoke these {n} shares? The links stop working immediately.",
+  share_bulk_confirm_ok: "Revoke",
+  share_bulk_cancel: "Cancel",
+  share_bulk_done: "Revoked {n} shares",
+  share_bulk_partial: "{n} could not be revoked (already revoked or in another tenant)",
+  share_bulk_failed: "Failed to revoke the selected shares",
   // ── Service page: who can reach this machine ──
   service: {
     page_title: "Service",

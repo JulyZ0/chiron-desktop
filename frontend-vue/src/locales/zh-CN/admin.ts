@@ -371,6 +371,23 @@ export default {
   share_untitled: "（无标题会话）",
   share_load_failed: "读取分享列表失败",
   share_revoke_failed: "撤销分享失败",
+  // ── P1-8 分享运营：访问统计 / 批量撤销 ──
+  share_col_views_24h: "24 小时访问",
+  share_col_views_total: "累计访问",
+  share_col_last_viewed: "最近访问",
+  share_detail: "详情",
+  share_detail_title: "分享详情",
+  share_detail_close: "关闭",
+  share_never_viewed: "从未被访问",
+  share_trend_7d: "最近 7 天访问",
+  share_bulk_selected: "已选 {n} 条",
+  share_bulk_revoke: "批量撤销",
+  share_bulk_confirm_text: "确认撤销这 {n} 条分享？撤销后链接立即失效。",
+  share_bulk_confirm_ok: "确认撤销",
+  share_bulk_cancel: "取消",
+  share_bulk_done: "已撤销 {n} 条分享",
+  share_bulk_partial: "有 {n} 条未能撤销（已撤销或不在本租户）",
+  share_bulk_failed: "批量撤销失败",
   // ── 「服务」页：这台机器对谁可见 ──
   // 两句必须说清的话：① 监听地址改了要重启网关；② 只绑回环时其它设备连不上。
   service: {

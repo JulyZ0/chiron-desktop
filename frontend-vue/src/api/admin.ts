@@ -962,6 +962,12 @@ export async function getOnboardingFunnel(): Promise<OnboardingFunnel> {
 
 // ── 分享管理（租户内跨用户） ──
 
+export interface AdminShareDay {
+  /** YYYY-MM-DD（UTC，服务端铺满最近 7 天，缺的日期为 0） */
+  date: string
+  count: number
+}
+
 export interface AdminShareItem {
   share_id: string
   session_id: string
@@ -973,6 +979,14 @@ export interface AdminShareItem {
   expires_at: string
   /** 服务端产出的绝对分享地址（桌面端 file:// 下 origin 拼出来的是坏链） */
   url?: string
+  /** 最近 24 小时成功打开次数（404/410/密码错误不计） */
+  views_24h?: number
+  /** 累计成功打开次数 */
+  views_total?: number
+  /** 最近一次成功打开时间；从未被访问为 null */
+  last_viewed_at?: string | null
+  /** 最近 7 天按天访问数（固定长度，缺日补 0），用于迷你趋势图 */
+  daily?: AdminShareDay[]
 }
 
 /** 列出本租户内全部**有效**分享（已撤销 / 已过期的不会返回） */
@@ -984,6 +998,26 @@ export async function listAdminShares(): Promise<AdminShareItem[]> {
 /** 按分享 id 直接撤销（不必知道会话 id）；公开链接随即 410 */
 export async function revokeAdminShare(shareId: string): Promise<void> {
   await api.delete(`/v1/admin/shares/${encodeURIComponent(shareId)}`)
+}
+
+/** 批量撤销的结果：**部分失败是常态**（已被本人撤销 / 不属于本租户）。 */
+export interface AdminShareBulkResult {
+  requested: number
+  revoked: number
+  revoked_ids: string[]
+  failed: { id: string; reason: string }[]
+}
+
+/**
+ * 批量撤销（一次请求，服务端只写一条汇总审计）。
+ *
+ * 上限 200 条由服务端把关；这里不预裁，让超限的 400 文案统一由后端给出。
+ */
+export async function revokeAdminShares(shareIds: string[]): Promise<AdminShareBulkResult> {
+  const { data } = await api.delete('/v1/admin/shares', {
+    params: { ids: shareIds.join(',') },
+  })
+  return data?.data ?? { requested: 0, revoked: 0, revoked_ids: [], failed: [] }
 }
 
 // ── 插件命令白名单（后台可编辑） ──

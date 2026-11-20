@@ -31,11 +31,13 @@ if (!window.matchMedia) {
 const apiMocks = vi.hoisted(() => ({
   listAdminShares: vi.fn(),
   revokeAdminShare: vi.fn(),
+  revokeAdminShares: vi.fn(),
 }))
 
 vi.mock('@/api/admin', () => ({
   listAdminShares: apiMocks.listAdminShares,
   revokeAdminShare: apiMocks.revokeAdminShare,
+  revokeAdminShares: apiMocks.revokeAdminShares,
 }))
 
 import SharesView from '../SharesView.vue'
@@ -57,6 +59,23 @@ const SHARE_KEYS = [
   'admin.share_untitled',
   'admin.share_load_failed',
   'admin.share_revoke_failed',
+  // P1-8 分享运营：统计列 / 批量撤销 / 详情
+  'admin.share_col_views_24h',
+  'admin.share_col_views_total',
+  'admin.share_col_last_viewed',
+  'admin.share_detail',
+  'admin.share_detail_title',
+  'admin.share_detail_close',
+  'admin.share_never_viewed',
+  'admin.share_trend_7d',
+  'admin.share_bulk_selected',
+  'admin.share_bulk_revoke',
+  'admin.share_bulk_confirm_text',
+  'admin.share_bulk_confirm_ok',
+  'admin.share_bulk_cancel',
+  'admin.share_bulk_done',
+  'admin.share_bulk_partial',
+  'admin.share_bulk_failed',
 ]
 
 const LANGUAGES = ['zh-CN', 'en-US', 'ar'] as const
@@ -72,6 +91,18 @@ function share(overrides: Record<string, unknown> = {}) {
     message_count: 12,
     created_at: '2026-11-01T10:00:00Z',
     expires_at: '2026-12-01T10:00:00Z',
+    views_24h: 4,
+    views_total: 27,
+    last_viewed_at: '2026-11-20T08:00:00Z',
+    daily: [
+      { date: '2026-11-14', count: 0 },
+      { date: '2026-11-15', count: 2 },
+      { date: '2026-11-16', count: 0 },
+      { date: '2026-11-17', count: 5 },
+      { date: '2026-11-18', count: 1 },
+      { date: '2026-11-19', count: 3 },
+      { date: '2026-11-20', count: 4 },
+    ],
     ...overrides,
   }
 }
@@ -132,6 +163,109 @@ describe('SharesView 的三语适配', () => {
     await flushPromises()
 
     expect(wrapper.text()).not.toContain('admin.share_')
+
+    wrapper.unmount()
+  })
+})
+
+/**
+ * ── P1-8 分享运营：统计列 / 批量撤销 / 详情 ──
+ *
+ * 三条都守"运营能不能真的做处置"：
+ *  - 统计列要显示服务端聚合值（不是前端自己数）；
+ *  - 批量撤销必须经过一次就地二次确认（撤销会让已发出的链接立刻 410）；
+ *  - 详情面板的趋势图必须是**固定 7 个点**（服务端缺日补 0，前端按长度画）。
+ */
+describe('SharesView 的分享运营能力', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    apiMocks.listAdminShares.mockResolvedValue([share()])
+    apiMocks.revokeAdminShares.mockResolvedValue({
+      requested: 1,
+      revoked: 1,
+      revoked_ids: ['shr_abc123'],
+      failed: [],
+    })
+    setLocale('zh-CN', { persist: false })
+  })
+
+  afterEach(() => {
+    setLocale('zh-CN', { persist: false })
+  })
+
+  it('展示 24h / 累计 / 最近访问三列', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('24 小时访问')
+    expect(text).toContain('累计访问')
+    expect(text).toContain('最近访问')
+    // 行内数值来自服务端聚合
+    expect(text).toContain('27')
+
+    wrapper.unmount()
+  })
+
+  it('批量撤销必须二次确认，确认后按 id 批量提交', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    // 选中第一行（antd 的行选择复选框）
+    const box = wrapper.find('tbody .ant-checkbox-input')
+    expect(box.exists()).toBe(true)
+    await box.setValue(true)
+    await flushPromises()
+
+    // 第一次点击只是展开确认，不发请求
+    const ask = wrapper.find('.share-bulk-ask')
+    expect(ask.exists()).toBe(true)
+    await ask.trigger('click')
+    await flushPromises()
+    expect(apiMocks.revokeAdminShares).not.toHaveBeenCalled()
+    expect(wrapper.find('.share-bulk-confirm-text').text()).toContain('1')
+
+    await wrapper.find('.share-bulk-confirm').trigger('click')
+    await flushPromises()
+
+    expect(apiMocks.revokeAdminShares).toHaveBeenCalledWith(['shr_abc123'])
+    // 撤销成功的行从本地列表移除
+    expect(wrapper.text()).not.toContain('shr_abc123')
+
+    wrapper.unmount()
+  })
+
+  it('取消二次确认不会发请求', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.find('tbody .ant-checkbox-input').setValue(true)
+    await flushPromises()
+    await wrapper.find('.share-bulk-ask').trigger('click')
+    await flushPromises()
+    await wrapper.find('.share-bulk-cancel').trigger('click')
+    await flushPromises()
+
+    expect(apiMocks.revokeAdminShares).not.toHaveBeenCalled()
+    expect(wrapper.find('.share-bulk-confirm').exists()).toBe(false)
+
+    wrapper.unmount()
+  })
+
+  it('详情面板展示趋势图（7 个点的 polyline，不引图表库）', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    await wrapper.find('.share-detail-btn').trigger('click')
+    await flushPromises()
+
+    const panel = wrapper.find('.share-detail')
+    expect(panel.exists()).toBe(true)
+    const line = panel.find('.share-spark-line')
+    expect(line.exists()).toBe(true)
+    // 7 天固定 7 个坐标点
+    expect((line.attributes('points') ?? '').trim().split(/\s+/).length).toBe(7)
+    expect(panel.text()).toContain('27')
 
     wrapper.unmount()
   })
