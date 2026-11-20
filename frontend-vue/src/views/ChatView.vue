@@ -35,7 +35,6 @@ import type { SubagentEvent } from '../api/subagent'
 import MessageList from '../components/chat/MessageList.vue'
 import MessageItem from '../components/chat/MessageItem.vue'
 import ChatEmptyHero from '../components/chat/ChatEmptyHero.vue'
-import { addToOutbox, bumpRetryCount, clearOutbox, readOutbox, removeFromOutbox, type OutboxEntry } from '../components/chat/failedOutbox'
 import ChatInput from '../components/chat/ChatInput.vue'
 import WorkbenchPanel from '../components/workbench/WorkbenchPanel.vue'
 import { toggleWorkbench, workbenchOpen } from '../components/workbench/useWorkbench'
@@ -56,6 +55,8 @@ import { useSessionMeta } from '../composables/useSessionMeta'
 import { usePanelCollapse } from '../composables/usePanelCollapse'
 import { useSessionActivity } from '../composables/useSessionActivity'
 import { useSubagentStream } from '../composables/useSubagentStream'
+import { useComposerBridge } from '../composables/useComposerBridge'
+import { useSessionSwitch, projectHistory, HISTORY_PAGE_SIZE } from '../composables/useSessionSwitch'
 import { useMessageFailure } from '../composables/useMessageFailure'
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
 import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
@@ -73,11 +74,10 @@ import InteractionBadge from '../components/chat/InteractionBadge.vue'
 import CallChainTimeline from '../components/CallChainTimeline.vue'
 import { HistoryOutlined, ExportOutlined, BulbOutlined, BulbFilled, MoreOutlined, FontSizeOutlined, SearchOutlined, PartitionOutlined, RobotOutlined, DatabaseOutlined, SwapOutlined } from '@ant-design/icons-vue'
 import { splitThinking, stripUserInputTag, formatClock, formatSize, countItemsAfter, mergeTurnStats } from '../components/chat/chat-types'
-import { mergeHistory, normalizeMeta } from '../components/chat/chat-history'
-import { describeApiError, errorStatus } from '../utils/apiError'
-import { buildWorkbenchContext, chipsFromWorkbenchContext, CONTEXT_QUERY_KEYS, MAX_CONTEXT_KBS, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
+import { normalizeMeta } from '../components/chat/chat-history'
+import { describeApiError } from '../utils/apiError'
+import { buildWorkbenchContext, chipsFromWorkbenchContext, CONTEXT_QUERY_KEYS, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
 import { currentProject } from '../composables/useProject'
-import { buildPrefillText, setChatPrefill, takeChatPrefill } from '../components/chat/chatPrefill'
 import type { ChatItem, ChatSession, ChatAttachment, TurnStatsItem, TextItem } from '../components/chat/chat-types'
 
 import { useI18n } from 'vue-i18n'
@@ -227,13 +227,6 @@ function onToolbarMenu(info: { key: string | number }) {
   else if (info.key === 'swap_layout') toggleLayout()
 }
 
-// 消息区「引用到输入框」：把选中文本交给输入框（ChatInput 暴露 insertText）
-const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
-
-function onQuoteText(text: string) {
-  chatInputRef.value?.insertText(text)
-}
-
 // ── 会话内检索（正文与思考；工具输出不进结果）────────────────────────────
 // 实现见 `composables/useTranscriptSearch.ts`。`items` 与 `trajectoryFocus` 在本文件里
 // 都声明得更晚，所以两个依赖必须是**惰性**的（getter 与回调），不能传值。
@@ -345,6 +338,31 @@ listModels()
 const sessions = ref<ChatSession[]>([])
 const activeSessionId = ref('')
 
+// 输入区的装配胶水（引用投递 / 附件通道 / `@` 提及 / 失败暂存队列）
+// 实现见 `composables/useComposerBridge.ts`。`chatInputRef` 仍是模板 `ref=` 绑定的那个
+// 名字；会话 id、账号、激活芯片、发送路径都晚于这里声明，故一律以惰性 getter 传入。
+const {
+  chatInputRef,
+  onQuoteText,
+  onWorkbenchReference,
+  onMentionAdd,
+  applyChatPrefill,
+  outbox,
+  outboxPreview,
+  retrieveOutbox,
+  retryOutbox,
+  discardOutbox,
+  queueFailedSend,
+} = useComposerBridge({
+  sessionId: () => activeSessionId.value,
+  userId: () => authStore.user?.id,
+  contextChips: () => contextChips.value,
+  setContextChips: (chips) => { contextChips.value = chips },
+  persistRuntime: (patch) => persistRuntime(patch),
+  sendMessage: (text, attachments) => sendMessage(text, attachments),
+})
+
+
 /**
  * 当前会话所属的项目（session-map project id），`@` 引用项目文件要用。
  *
@@ -367,16 +385,6 @@ const activeProjectId = computed(() => activeProject.value?.id || '')
  */
 const activeProjectError = ref('')
 
-/**
- * 工作台里点「加入对话」：走的是输入框**同一条附件通道**。
- *
- * 不在 ChatView 里另读一次文件再 push 附件，是因为那样就有两处构造 `data:` URL
- * 的逻辑（编码方式、id 去重、二进制处理各一份），而它们一旦漂移，模型收到的
- * 内容就取决于用户是"@ 选的"还是"面板点的"。
- */
-function onWorkbenchReference(payload: { path: string; name: string }) {
-  void chatInputRef.value?.attachProjectFile?.(payload.path, payload.name)
-}
 /**
  * 重新解析"当前会话属于哪个项目"。
  *
@@ -432,34 +440,8 @@ watch(activeSessionId, () => { void refreshActiveProject() })
 const todoPanel = useTodoPanel()
 const todoBoard = computed(() => todoPanel.boardOf(activeSessionId.value))
 
-/** 发送失败、已暂存到本地的消息（见 components/chat/failedOutbox.ts）。
- *  按会话隔离：切会话就重新读 —— 否则会把 A 会话的失败消息挂到 B 会话的重发按钮上。 */
-const outbox = ref<OutboxEntry[]>([])
-function refreshOutbox() {
-  outbox.value = activeSessionId.value ? readOutbox(activeSessionId.value, authStore.user?.id) : []
-}
-watch(activeSessionId, refreshOutbox, { immediate: true })
-
-/** 横幅预览用的降维视图：输入区只关心"哪条、长什么样、几个附件"，
- *  不该接触 outbox 的存储格式（failedOutbox.ts 属于持久化细节）。
- *  摘要按**单行**收敛：换行会把条目撑高，列表里三行放不下。 */
-const outboxPreview = computed(() => outbox.value.map(e => ({
-  id: e.id,
-  preview: e.content.replace(/\s+/g, ' ').trim().slice(0, 200),
-  attachmentCount: e.attachments?.length ?? 0,
-})))
-
-/** 把一条暂存消息取回输入框重新编辑：从队列里删掉它，内容（含附件）交回 Composer。
- *  队列随之少一条 —— 留在队列里再取回一次会变成两条相同的草稿。 */
-function retrieveOutbox(id: string) {
-  const sid = activeSessionId.value
-  if (!sid) return
-  const entry = outbox.value.find(e => e.id === id)
-  if (!entry) return
-  removeFromOutbox(sid, authStore.user?.id, id)
-  refreshOutbox()
-  chatInputRef.value?.restoreDraft?.(entry.content, entry.attachments)
-}
+/** 失败暂存队列（按会话隔离、横幅预览、取回编辑）：见 `composables/useComposerBridge.ts`，
+ *  已在上方解构。它只与输入框交互，不参与消息流投影。 */
 const activeSession = computed(() => sessions.value.find(s => s.id === activeSessionId.value) || null)
 /**
  * ── 多会话运行：运行时状态**按会话**存 ──
@@ -1113,33 +1095,9 @@ function persistRuntime(patch: Record<string, unknown>) {
 }
 
 /**
- * `@` 提及选中的资源 → 加进"激活引用"的 chips，并**同步到单一事实源**（`runtime.context`）。
- *
- * 与 URL chips 走同一条链路：chips 只是 UI 呈现，`runtime.context` 才是提交时真正生效的东西
- * —— 只改 chips 不写 runtime，刷新后引用就会从界面上消失（这正是我们修过的那类问题）。
+ * `@` 提及的落地（去重 / 知识库上限 / 写 `runtime.context`）：见
+ * `composables/useComposerBridge.ts` 的 `onMentionAdd`，已在上方解构。
  */
-const MENTION_CHIP_LABEL = computed<Record<string, string>>(() => ({
-  kb: t('knowledge.knowledge_base'), agent: 'Agent', skill: t('agent.skill'), plugin: t('common.plugin'),
-}))
-
-function onMentionAdd(p: { type: string; id: string; name: string }) {
-  if (contextChips.value.some(c => c.type === p.type && c.value === p.id)) return
-  // 知识库多选有上限（≤5）：每个库都是一次分钟级推理式检索，选到第 6 个时
-  // 该**当场拦住并说明**，而不是默默截断 —— 用户会以为第 6 个也生效了。
-  if (p.type === 'kb' && contextChips.value.filter(c => c.type === 'kb').length >= MAX_CONTEXT_KBS) {
-    notify.warning(t('knowledge.max_knowledge_bases_n', { n: MAX_CONTEXT_KBS }))
-    return
-  }
-  contextChips.value = [
-    ...contextChips.value,
-    {
-      type: p.type as ContextChip['type'],
-      label: `${MENTION_CHIP_LABEL.value[p.type] || p.type} ${p.name}`,
-      value: p.id,
-    },
-  ]
-  persistRuntime({ context: buildWorkbenchContext(contextChips.value) })
-}
 
 /** 模型切换：更新 llmModel ref + 写入运行时状态（会话级持久） */
 function onModelChange(m: string) {
@@ -1226,23 +1184,6 @@ async function applyRouteQuery() {
   }
   await initContextChips(q)
   void applyChatPrefill()
-}
-
-/**
- * 「在对话中继续」的落地端：Agent 会话 / 工作流结果经 sessionStorage 投递到这里，
- * 插入输入框（不自动发送）—— 用户可以先修改再发。
- */
-async function applyChatPrefill() {
-  const prefill = takeChatPrefill()
-  if (!prefill) return
-  const text = buildPrefillText(prefill)
-  await nextTick()
-  if (chatInputRef.value?.insertText) {
-    chatInputRef.value.insertText(text)
-  } else {
-    // 输入框还没挂载（首帧）：把投递放回去，别让用户的那一次点击被静默吞掉
-    setChatPrefill(prefill)
-  }
 }
 
 async function initContextChips(q: Record<string, unknown>) {
@@ -2060,7 +2001,8 @@ async function switchSession(id: string) {
     unifiedSessionId.value = ''
   }
   if (id === activeSessionId.value) return
-  const mySeq = ++switchSeq.value
+  // 竞态守卫 + 分页状态复位（见 composables/useSessionSwitch.ts）
+  const mySeq = beginSwitch()
   // 多会话运行：切换会话**只换视图** —— 不再清空 items、也不再无条件置 loading。
   // 后台会话继续跑，它的 items/loading 留在自己的 run state 里；
   // 切回来时读到的就是它自己的（可能正在增长的）列表。
@@ -2079,22 +2021,15 @@ async function switchSession(id: string) {
   if (!currentRun.value.loading) activeSSE = null
   // 模式（对话模式 + 工具授权模式）不在此同步：它们是前端全局实时状态，
   // 切换会话既不改变它们，也不从会话状态读回（见 buildLlmConfig 的说明）。
-  hasMore.value = false; earliestCursor.value = ''; earliestToolCursor.value = ''
-  loadingEarlier.value = false
-  earlierLoadFailed.value = false
-  toolCallsPartial.value = false
-  initialLoading.value = true
   try {
     const res = await api.get(`/v1/conversations/${id}?limit=${HISTORY_PAGE_SIZE}`)
-    if (mySeq !== switchSeq.value) return
+    if (isStale(mySeq)) return
     const data = res.data?.data || res.data
     if (data?.messages) {
       // 该会话正在生成（或流里已累积过内容）时，**不要用拉回的历史覆盖它** ——
       // 否则"切走再切回"的瞬间会把这段时间里增长的内容冲掉。
-      const run = currentRun.value
-      if (!run.loading && run.items.length === 0) {
-        items.value = mergeHistory(data.messages, data.tool_calls || [])
-      }
+      const projected = projectHistory(currentRun.value, data.messages, data.tool_calls)
+      if (projected) items.value = projected
       // 刷新后恢复任务清单：`todo_updated` 是实时事件、不会重放，不从这里补一次，
       // 用户一刷新就看不到自己在跑的长任务（而模型那边仍有清单，因为它读的是 tool 消息）。
       //
@@ -2106,10 +2041,7 @@ async function switchSession(id: string) {
         // 再喂给 applyEvent 会按原始条目形状重新解析一遍，把 dependsOn/owner 丢掉。
         todoPanel.setBoard(id, restored, 0)
       }
-      earliestCursor.value = data.cursor || ''
-      hasMore.value = !!data.has_more
-      earliestToolCursor.value = data.tool_cursor || ''
-      toolCallsPartial.value = !!data.tool_calls_partial
+      applyPageMeta(data)
     }
     // 会话级运行时状态（model / provider / 已激活上下文）：Redis 热 + unified_sessions.runtime
     // 持久，切回会话时回填。**模式不在其中** —— 对话模式与工具授权模式是前端全局实时状态，
@@ -2146,9 +2078,9 @@ async function switchSession(id: string) {
       contextChips.value = merged
     }
   } catch { /* fallback */ } finally {
-    if (mySeq === switchSeq.value) {
+    if (!isStale(mySeq)) {
       loading.value = false
-      initialLoading.value = false
+      endSwitch(mySeq)
       // 会话加载完成后自动滚到底部：**走单写者**（契约 §1.1；此处原先直接写 DOM）
       await nextTick()
       messageListRef.value?.scrollToBottom()
@@ -2156,97 +2088,30 @@ async function switchSession(id: string) {
   }
 }
 
-// 性能优化：cursor 分页，触顶加载更早的消息（首屏只加载最新 HISTORY_PAGE_SIZE 条）
-const HISTORY_PAGE_SIZE = 50
-const hasMore = ref(false)
-const earliestCursor = ref('')
-// 工具调用**自己的**游标：与消息游标分开推进。两张表 created_at 分布不同，
-// 共用一个游标会漏取夹在两条消息之间的工具调用。
-const earliestToolCursor = ref('')
-const toolCallsPartial = ref(false)
-const loadingEarlier = ref(false)
-const earlierLoadFailed = ref(false)
-const initialLoading = ref(false)
-const switchSeq = ref(0)
-
-// 工具查询失败只提示一次：状态在每次翻页时都会重算，直接在赋值处 notify 会
-// 变成"每滚一屏弹一次"。这里只对 false→true 的翻转做提示。
-watch(toolCallsPartial, (now, before) => {
-  if (now && !before) notify.warning(t('chat.tool_calls_partial_warning'))
+// ── 会话切换的历史回放 / 分页 ──
+// 实现见 `composables/useSessionSwitch.ts`：分页游标、竞态守卫（`beginSwitch` / `isStale`）、
+// 触顶翻页、`stream_gap` 后的整段重拉都在那里。`switchSession` 仍在本文件（它还要管审批卡、
+// 流句柄、模型回填），只把"历史怎么回放"这一段交出去。
+const {
+  initialLoading,
+  hasMore,
+  loadingEarlier,
+  earlierLoadFailed,
+  beginSwitch,
+  isStale,
+  endSwitch,
+  applyPageMeta,
+  loadEarlier,
+  scheduleGapResync,
+  flushGapResync,
+} = useSessionSwitch({
+  sessionId: () => activeSessionId.value,
+  items: () => items.value,
+  setItems: (next) => { items.value = next },
+  runOf: (sid: string) => runOf(sid),
+  isActiveSession: (sid) => sid === activeSessionId.value,
+  scrollToBottom: () => messageListRef.value?.scrollToBottom(),
 })
-
-
-/** 可重试的错误：网络抖动、超时、服务端 5xx。它们不代表"历史到此为止"。 */
-function isRetriableLoadError(error: unknown): boolean {
-  const status = errorStatus(error)
-  if (status === undefined) return true // 网络错误 / 超时：没有状态码
-  return status >= 500 || status === 408 || status === 429
-}
-
-async function loadEarlier() {
-  if (loadingEarlier.value || !hasMore.value || !activeSessionId.value) return
-  // cursor 为空却 hasMore 为真 = 状态自相矛盾：再请求也拿不到"更早"的锚点。
-  // 早退会让人以为"到底了"而实际没有，所以显式结束并留痕，不留死锁。
-  if (!earliestCursor.value) {
-    console.warn('[chat] hasMore=true but cursor is empty; ending pagination', {
-      sessionId: activeSessionId.value,
-    })
-    hasMore.value = false
-    return
-  }
-
-  // 竞态守卫：慢响应期间用户可能已经切走。没有这一行，会话 A 的历史会被拼进
-  // 会话 B 的列表里 —— 刷新才消失，无从解释。
-  const mySeq = switchSeq.value
-  const mySession = activeSessionId.value
-  loadingEarlier.value = true
-  earlierLoadFailed.value = false
-  try {
-    // 两个游标各自带上：消息与工具调用是两张表，游标必须独立推进。
-    // 只发一个会让另一张表要么重复取、要么漏取（夹在两条消息之间的工具调用最容易漏）。
-    let url = `/v1/conversations/${encodeURIComponent(mySession)}?limit=${HISTORY_PAGE_SIZE}&before=${encodeURIComponent(earliestCursor.value)}`
-    if (earliestToolCursor.value) {
-      url += `&tool_before=${encodeURIComponent(earliestToolCursor.value)}`
-    }
-    const res = await api.get(url)
-    if (mySeq !== switchSeq.value || mySession !== activeSessionId.value) return
-    const data = res.data?.data || res.data
-    // 工具查询失败时服务端会带 tool_calls_partial：列表不完整，但消息仍可用。
-    // 标记它，让界面能提示"部分工具记录未加载"，而不是让人以为工具根本没执行过。
-    toolCallsPartial.value = !!data?.tool_calls_partial
-    if (data?.messages?.length) {
-      const earlier = mergeHistory(data.messages, data.tool_calls || [])
-      // 合并前按 id 去重：游标是 created_at|id 复合值，服务端与前端对时区/精度的
-      // 处理一旦有差异就会返回重叠页，同一条目会被渲染两次（像是执行了两次工具）。
-      const seen = new Set(items.value.map(i => i.id))
-      const fresh = earlier.filter(i => !seen.has(i.id))
-      // 头部插入后由 MessageList 按锚点还原视口（单写者），此处不碰 DOM
-      if (fresh.length) items.value = [...fresh, ...items.value]
-      earliestCursor.value = data.cursor || ''
-      hasMore.value = !!data.has_more
-      earliestToolCursor.value = data.tool_cursor || ''
-      if (hasMore.value && !earliestCursor.value) {
-        console.warn('[chat] server says has_more but sent no cursor; stopping', { sessionId: mySession })
-        hasMore.value = false
-      }
-    } else {
-      hasMore.value = false
-    }
-  } catch (error) {
-    if (mySeq !== switchSeq.value || mySession !== activeSessionId.value) return
-    // 区分"真的没有更多"与"这次没取到"：把 5xx/超时一律当成到底，会让一次网络抖动
-    // 永久关闭分页（hasMore=false 之后再也不会重试），用户看到的历史凭空少了一截。
-    if (isRetriableLoadError(error)) {
-      earlierLoadFailed.value = true
-      hasMore.value = true // 保留可重试资格
-      console.warn('[chat] load earlier failed (retriable)', { sessionId: mySession, error })
-    } else {
-      hasMore.value = false
-    }
-  } finally {
-    if (mySeq === switchSeq.value) loadingEarlier.value = false
-  }
-}
 
 async function deleteSession(id: string) {
   try { await api.delete(`/v1/conversations/${id}`) } catch { /* 保留本地删除 */ }
@@ -2391,45 +2256,8 @@ function goalCompletionNotice(raw: string): string {
   }
 }
 
-/** 收到 `stream_gap` 后待补拉的会话（本轮还在流式输出时不能立刻覆盖，见下）。 */
-const gapPendingResync = new Set<string>()
-
-/** 重拉某会话的历史并替换该会话的条目。事实源是消息列表，不是事件流。 */
-async function resyncSessionHistory(sid: string) {
-  try {
-    const res = await api.get(`/v1/conversations/${sid}?limit=${HISTORY_PAGE_SIZE}`)
-    const data = res.data?.data || res.data
-    if (!data?.messages) return
-    const run = runOf(sid)
-    // 拉取期间该会话可能又开跑了新一轮：那时历史是旧的，覆盖会把新内容冲掉
-    if (run.loading) return
-    run.items = mergeHistory(data.messages, data.tool_calls || [])
-    if (sid === activeSessionId.value) {
-      await nextTick()
-      messageListRef.value?.scrollToBottom()
-    }
-  } catch {
-    // 拉不到就保持现状（不用半截数据覆盖）：缺口会随下一次正常加载补齐
-  }
-}
-
-/**
- * 服务端说"断线期间的推送补不齐"（会话流被 MaxLen 裁到最近 200 条、或流已过 TTL 整条消失）。
- *
- * 这不是错误，不该弹窗 —— 此刻事实源是消息列表，重拉即恢复。**必须重拉**：不拉的话界面就
- * 停在断线前那一刻，用户回来时以为任务还在跑，或者以为它根本没跑过。
- */
-function scheduleGapResync(sid: string) {
-  if (!sid) return
-  if (runOf(sid).loading) {
-    // 本轮还在流式输出：立刻用历史覆盖会把这段累积冲掉（与 switchSession 同款判断）。
-    // 记下来，等本轮 `done` 收尾后再补 —— 那时实时与历史都已定稿。
-    gapPendingResync.add(sid)
-    return
-  }
-  void resyncSessionHistory(sid)
-}
-
+/** `stream_gap` 后的补拉（含"本轮在跑就先记账"）：见 `composables/useSessionSwitch.ts`，
+ *  已在上方解构。断线补不齐时事实源是消息列表，重拉即恢复。 */
 function onSSEMessage(raw: unknown, sid: string) {
   // SSE 载荷来自服务端 JSON（createSSEConnection 的 onMessage 契约即 unknown）：
   // 在边界一次性窄化成 Record，后续各事件分支只做字段级取值，不把 unknown 透出去。
@@ -2628,7 +2456,7 @@ function onSSEMessage(raw: unknown, sid: string) {
     // 本轮收尾 ⇒ 之前被"正在跑"挡下的那次唤醒现在可以补发了（见 wakeFromInbox）
     flushPendingInboxWake()
     // 断线期间补不齐的那一段：本轮已定稿，重拉历史补齐（见 scheduleGapResync）
-    if (gapPendingResync.delete(sid)) void resyncSessionHistory(sid)
+    flushGapResync(sid)
   } else if (type === 'approval') {
     const callId = String(d.id ?? d.tool_call_id ?? Date.now())
     pendingApprovals.value.push({
@@ -2890,32 +2718,13 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
     notify.error(t('errors.send_failed') + reason)
     // 落盘暂存：这条消息**没有**被服务端接收（POST 失败），刷新后 transcript 里不会有它。
     // 不回填输入框而是入队，是为了不打断"继续写草稿"的动作。
-    outbox.value = addToOutbox(sessionId, authStore.user?.id, { content: text, attachments })
+    queueFailedSend(sessionId, text, attachments)
     return false
   }
 }
 
-/** 重发暂存队列：逐条走正常发送路径，成功一条就从本地删一条；
- *  失败的只累加 retryCount（它本来就在队列里，不该再入队一次）。 */
-async function retryOutbox() {
-  const sid = activeSessionId.value
-  if (!sid) return
-  const uid = authStore.user?.id
-  for (const entry of readOutbox(sid, uid)) {
-    const ok = await sendMessage(entry.content, entry.attachments)
-    if (ok) removeFromOutbox(sid, uid, entry.id)
-    else bumpRetryCount(sid, uid, entry.id)
-  }
-  refreshOutbox()
-}
-
-/** 丢弃本会话全部暂存消息（用户明确放弃这几次发送）。 */
-function discardOutbox() {
-  const sid = activeSessionId.value
-  if (!sid) return
-  clearOutbox(sid, authStore.user?.id)
-  refreshOutbox()
-}
+/** 重发 / 丢弃暂存队列：见 `composables/useComposerBridge.ts`（已在上方解构）。
+ *  重发逐条走**正常发送路径**，成功一条就从本地删一条；失败的只累加 retryCount。 */
 
 // ── 失败消息标记 / 手动修复 ──
 // 实现见 `composables/useMessageFailure.ts`（已在文件上方解构）。这三个函数只写那条
