@@ -102,6 +102,19 @@ const GATEWAY_TIMEOUT_MS = 90_000
 const GATEWAY_HEALTH_PATH = '/health'
 const GATEWAY_READY_PATH = '/ready'
 
+/**
+ * schema 漂移诊断路径（`cmd/chiron/schema_mismatch.go`）。
+ *
+ * 网关在"数据库迁移版本 ≠ 本构建期望的 head"时**不退出**，只挂这条最小服务：
+ * `/healthz` 回 200 + `{status:"schema_mismatch", expected, actual, fix}`，其余路径 503。
+ *
+ * 为什么就绪探测必须多问一条：漂移态下 `/health` 与 `/ready` 都是 503，只看它们的
+ * 唯一结果是**等满 90s 超时**再报"网关未就绪"，然后落到通用错误页 —— 而真正的原因
+ * （迁移没跑）就在 `/healthz` 里。提前发现它，主窗口照常打开，前端会自己跳到
+ * `/schema-mismatch` 把 expected/actual 与修复命令摆给用户看。
+ */
+const GATEWAY_SCHEMA_PATH = '/healthz'
+
 /** APP_SECRET 的最短长度要求（`config/config.go` 强制 32+） */
 const APP_SECRET_MIN_LENGTH = 32
 
@@ -702,6 +715,25 @@ async function spawnGatewayOnce(info, options = {}) {
     if (record.exited) {
       throw gatewayError(`网关启动后立即退出（退出码 ${record.exitCode}）`, record)
     }
+    // 漂移优先于"就绪"：漂移态下 `/health`、`/ready` 都是 503，先问 `/healthz` 才能
+    // 在 1s 内拿到真因，而不是等满 90s 再报一句"未就绪"。
+    const schemaMismatch = await probeSchemaMismatchInfo(record.baseUrl)
+    if (schemaMismatch) {
+      log(
+        `网关 schema 漂移：expected=${schemaMismatch.expected} actual=${schemaMismatch.actual}` +
+          `（由前端 /schema-mismatch 页展示修复命令）`,
+      )
+      return {
+        child,
+        record,
+        baseUrl: record.baseUrl,
+        port,
+        // 依赖状态未知：业务路径此刻全是 503，报 up 就是撒谎
+        ready: { postgres: 'unknown', redis: 'unknown', schemaMismatch: true },
+        schemaMismatch,
+        stderrTail: record.stderrTail,
+      }
+    }
     if (await probeHttp(record.baseUrl, GATEWAY_HEALTH_PATH)) {
       // `/health` 只证明进程活着（不查依赖）；`/ready` 才证明 PG/Redis 都通了。
       // 本地模式的"可用"必须以 `/ready` 为准，否则会把"启动了但连不上库"报成成功。
@@ -726,6 +758,31 @@ function gatewayError(message, record) {
   err.stderrTail = record ? record.stderrTail : ''
   err.stdoutTail = record ? record.stdoutTail : ''
   return err
+}
+
+/**
+ * 问一次 `/healthz`：网关是不是处在 schema 漂移态。不是就返回 null。
+ *
+ * 只认 `status === 'schema_mismatch'`：正常网关这条路径是 404（它注册的是 `/health`
+ * 与 `/ready`），把 404/超时/解析失败当成漂移会让每一次启动都跳到诊断页。
+ */
+async function probeSchemaMismatchInfo(baseUrl) {
+  try {
+    const res = await fetch(`${baseUrl}${GATEWAY_SCHEMA_PATH}`, { method: 'GET' })
+    if (!res.ok) return null
+    const body = await res.json()
+    if (!body || body.status !== 'schema_mismatch') return null
+    return {
+      expected: String(body.expected || ''),
+      actual: String(body.actual || ''),
+      reason: String(body.reason || ''),
+      missing: Array.isArray(body.missing_tables) ? body.missing_tables.map(String) : [],
+      fix: String(body.fix || 'run alembic upgrade head'),
+    }
+  } catch {
+    // 还没开始监听 / 非 JSON：都只是"没漂移"，不能据此下结论
+    return null
+  }
 }
 
 async function probeHttp(baseUrl, pathname) {
@@ -1641,6 +1698,10 @@ async function startLocalStack(options = {}) {
       baseUrl: gatewayResult.baseUrl,
       port: gatewayResult.port,
       ready: gatewayResult.ready,
+      // 非空表示"网关起着但 schema 漂移"：前端会据此跳到 /schema-mismatch。
+      // 这里**不抛**：抛出去只会变成"本地后端未就绪"的通用错误页，用户看不到
+      // expected/actual 与修复命令，等于把可诊断的失败又变回白屏。
+      schemaMismatch: gatewayResult.schemaMismatch || null,
       launcher: launcherResult.info,
       engine: { ok: true, address: engineResult.address, port: engineResult.port },
     }
@@ -1705,6 +1766,8 @@ module.exports = {
   LAUNCHER_ERROR_EVENT,
   GATEWAY_HEALTH_PATH,
   GATEWAY_READY_PATH,
+  GATEWAY_SCHEMA_PATH,
+  probeSchemaMismatchInfo,
   ENGINE_HEALTH_PATH,
   KNOWLEDGE_SERVICE_HEALTH_PATH,
   KNOWLEDGE_SERVICE_TIMEOUT_MS,
