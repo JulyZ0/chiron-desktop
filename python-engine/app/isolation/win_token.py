@@ -34,7 +34,9 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 import logging
+import os
 import subprocess
+from dataclasses import dataclass
 from typing import Any
 
 from app.isolation import win as _win_mod
@@ -67,6 +69,28 @@ TOKEN_LOGON_SID = 28
 
 #: `TokenUser`（`TOKEN_INFORMATION_CLASS`）
 TOKEN_USER = 1
+
+#: `TokenElevation`（`TOKEN_INFORMATION_CLASS`）
+TOKEN_ELEVATION = 20
+
+#: 打开令牌所需的最小访问位集合。
+#:
+#: `TOKEN_DUPLICATE` 是 `CreateRestrictedToken` 对源令牌的硬要求；
+#: `TOKEN_QUERY` 用于读 `TokenUser` / `TokenLogonSid` / `TokenElevation`；
+#: `TOKEN_ASSIGN_PRIMARY` 用于随后把派生出的令牌塞进 `CreateProcessAsUserW`。
+TOKEN_DUPLICATE = 0x0002
+TOKEN_ASSIGN_PRIMARY = 0x0001
+
+#: `OpenProcess` 的最小访问位：只要进程信息，不要内存/线程。
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+#: 降级理由的字面量（写进协议响应、日志与 `reasons`，因此必须稳定）。
+#:
+#: 含义：**拿不到调用方（目标用户）的令牌**，只能退回 helper 自身令牌。此时
+#: 限制性 SID 仍然生效（写访问依旧被 restricting SIDs 约束），但**用户身份**
+#: 是 helper 的身份（通常是管理员）—— 这比"目标用户 + 限制性 SID"弱，
+#: 所以必须逐次记录，而不是默默发生。
+TOKEN_TARGET_UNAVAILABLE = "token_target_unavailable"
 
 #: `ConvertSidToStringSidW` 返回值的释放方式
 _LOCAL_FREE = None
@@ -121,6 +145,15 @@ def exec_unavailable_reason() -> str:
 
 class _LUID(ctypes.Structure):
     _fields_ = [("LowPart", wt.DWORD), ("HighPart", wt.LONG)]
+
+
+class _FILETIME(ctypes.Structure):  # noqa: N801 — 沿用 Windows SDK 原名
+    """`GetProcessTimes` 的输出。只用来识别 pid 复用，不参与任何安全判定。"""
+
+    _fields_ = [("dwLowDateTime", wt.DWORD), ("dwHighDateTime", wt.DWORD)]
+
+    def as_int(self) -> int:
+        return (int(self.dwHighDateTime) << 32) | int(self.dwLowDateTime)
 
 
 class _TOKEN_GROUPS(ctypes.Structure):  # noqa: N801 — 沿用 Windows SDK 原名，便于对照文档
@@ -237,6 +270,17 @@ def _k32() -> Any:
     # 用户看到的是"助手启用成功但档位仍不可用"，日志里只有一句"父进程已退出"。
     lib.OpenProcess.restype = wt.HANDLE
     lib.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    # 进程创建时间：用于识别 **pid 复用**。helper 以"父进程 pid"作为调用方身份，
+    # 而 pid 在父进程退出后会被系统回收再分配 —— 不校验创建时间，就可能在
+    # 引擎死后把"恰好拿到同一个 pid 的另一个进程"当成调用方。
+    lib.GetProcessTimes.restype = wt.BOOL
+    lib.GetProcessTimes.argtypes = [
+        wt.HANDLE,
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+    ]
     return lib
 
 
@@ -267,6 +311,153 @@ def _sid_to_string(sid_ptr: int) -> str:
         k32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
 
 
+def token_user_sid(handle: Any) -> str:
+    """任意令牌句柄的**用户 SID**（字符串形式），取不到返回空串。
+
+    从 `current_user_sid` 抽出来，因为这里需要读的是**别人的**令牌：helper 要以
+    调用方（引擎）的令牌造受限令牌，判定"现在的子进程到底是谁"也要读子进程令牌。
+    """
+    adv = _advapi()
+    if adv is None or not handle:
+        return ""
+    try:
+        need = wt.DWORD(0)
+        adv.GetTokenInformation(handle, TOKEN_USER, None, 0, ctypes.byref(need))
+        if need.value == 0:
+            return ""
+        buf = ctypes.create_string_buffer(need.value)
+        if not adv.GetTokenInformation(handle, TOKEN_USER, buf, need.value, ctypes.byref(need)):
+            return ""
+        # TOKEN_USER 就是一个 SID_AND_ATTRIBUTES，Sid 在偏移 0
+        sid_ptr = ctypes.cast(buf, ctypes.POINTER(win._SID_AND_ATTRIBUTES)).contents.Sid  # noqa: SLF001
+        return _sid_to_string(int(sid_ptr or 0))
+    except Exception:  # noqa: BLE001 — 读不到就是"身份未知"，由调用方按不可用处理
+        logger.debug("token_user_sid failed", exc_info=True)
+        return ""
+
+
+def token_elevated(handle: Any) -> bool:
+    """令牌是否处于**提权**状态（`TokenElevation`）。"""
+    adv = _advapi()
+    if adv is None or not handle:
+        return False
+    try:
+        value = wt.DWORD()
+        size = wt.DWORD()
+        if not adv.GetTokenInformation(
+            handle,
+            TOKEN_ELEVATION,
+            ctypes.byref(value),
+            ctypes.sizeof(value),
+            ctypes.byref(size),
+        ):
+            return False
+        return bool(value.value)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def is_administrator_identity(user_sid: str, elevated: bool = False) -> bool:
+    """这条"身份"是不是管理员。
+
+    ## 为什么要一个单独的名字
+
+    P0-1 的不变量就是"**受限进程的 token 用户不得是管理员**"。把判定写成函数
+    而不是散落在调用方里，是为了让它同时被运行时（日志/降级记录）与测试
+    （结构断言）使用 —— 两边各写一份，迟早会有一边被改松。
+
+    判定取两条**任一**成立：
+
+    * `elevated` 为真 —— 令牌本身已提权（UAC 已同意），这就是 High IL 的管理员；
+    * SID 的 RID 为 `500` —— 内置 Administrator 账户，即使未提权也不该作为
+      沙箱子进程的身份（它与普通管理员账户的 SID 形状不同，是唯一可靠标识）。
+
+    刻意**不**用"是否在 `BUILTIN\\Administrators` 组里"：UAC 下的普通用户令牌
+    也带这个组（deny-only），用它判定会把所有管理员账户的普通会话误报成
+    "以管理员运行"，而这个函数恰恰要用来区分这两种情况。
+    """
+    if elevated:
+        return True
+    return user_sid.endswith("-500")
+
+
+def process_identity(pid: int) -> tuple[str, bool]:
+    """进程的 (用户 SID, 是否提权)。打不开返回 `("", False)`。
+
+    用 pid 而不是进程句柄：调用点有两种（helper 查调用方、启动后回查子进程），
+    而 `PROCESS_INFORMATION` 里本来就有 pid；统一走 pid 少一条句柄生命周期。
+    """
+    k32 = _k32()
+    if k32 is None or pid <= 0:
+        return "", False
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        logger.debug("process_identity: OpenProcess(%s) 失败 err=%s", pid, ctypes.get_last_error())
+        return "", False
+    try:
+        token = wt.HANDLE()
+        if not k32.OpenProcessToken(handle, win.TOKEN_QUERY, ctypes.byref(token)):
+            return "", False
+        try:
+            return token_user_sid(token), token_elevated(token)
+        finally:
+            k32.CloseHandle(token)
+    finally:
+        k32.CloseHandle(handle)
+
+
+def process_creation_time(pid: int) -> int | None:
+    """进程创建时间（FILETIME 的 64 位整数）。取不到返回 `None`。"""
+    k32 = _k32()
+    if k32 is None or pid <= 0:
+        return None
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        created, exited, kernel, user = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
+        if not k32.GetProcessTimes(
+            handle,
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        return created.as_int()
+    finally:
+        k32.CloseHandle(handle)
+
+
+def open_process_token(pid: int, access: int | None = None) -> tuple[Any, str]:
+    """打开**另一个进程**的主令牌。返回 `(handle, 错误)`。
+
+    这是"以调用方身份降权"的第一步：helper 是提权进程，能打开调用方（Medium IL）
+    的令牌，随后用 `CreateRestrictedToken` 派生出**同一用户**的受限令牌。
+
+    访问位默认按 `CreateRestrictedToken` 的要求给足：少 `TOKEN_DUPLICATE` 会
+    稳定 `ERROR_ACCESS_DENIED(5)`，而错误信息完全不提是哪个位缺。
+    """
+    k32 = _k32()
+    if k32 is None:
+        return None, "kernel32 不可用"
+    if pid <= 0:
+        return None, "pid 无效"
+    wanted = (
+        win.TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY if access is None else access
+    )
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None, f"OpenProcess(pid={pid}) 失败 err={ctypes.get_last_error()}"
+    try:
+        token = wt.HANDLE()
+        if not k32.OpenProcessToken(handle, wanted, ctypes.byref(token)):
+            return None, f"OpenProcessToken(pid={pid}) 失败 err={ctypes.get_last_error()}"
+        return token, ""
+    finally:
+        k32.CloseHandle(handle)
+
+
 def current_user_sid() -> str:
     """当前进程令牌的**用户 SID**（字符串形式），取不到返回空串。
 
@@ -295,16 +486,7 @@ def current_user_sid() -> str:
         logger.debug("current_user_sid: OpenProcessToken failed err=%s", ctypes.get_last_error())
         return ""
     try:
-        need = wt.DWORD(0)
-        adv.GetTokenInformation(own, TOKEN_USER, None, 0, ctypes.byref(need))
-        if need.value == 0:
-            return ""
-        buf = ctypes.create_string_buffer(need.value)
-        if not adv.GetTokenInformation(own, TOKEN_USER, buf, need.value, ctypes.byref(need)):
-            return ""
-        # TOKEN_USER 就是一个 SID_AND_ATTRIBUTES，Sid 在偏移 0
-        sid_ptr = ctypes.cast(buf, ctypes.POINTER(win._SID_AND_ATTRIBUTES)).contents.Sid  # noqa: SLF001
-        return _sid_to_string(int(sid_ptr or 0))
+        return token_user_sid(own)
     finally:
         k32.CloseHandle(own)
 
@@ -340,25 +522,31 @@ def _logon_sid(token: Any) -> tuple[bytes | None, str]:
     return ctypes.string_at(sid_ptr, length), text
 
 
-def create_restricted_token() -> tuple[Any, str] | None:
-    """造受限令牌。成功返回 `(token_handle, synthetic_sid)`，失败返回 `None`。
+def create_restricted_token_from(source: Any | None = None) -> tuple[Any, str] | None:
+    """基于**任一**令牌造受限令牌。成功返回 `(token_handle, synthetic_sid)`。
 
-    调用方负责 `CloseHandle(token)`。失败即"机制不可用"，由 `resolve_level`
-    判为 `below_floor` —— 绝不静默退回无隔离执行。
+    `source=None` 等价于旧行为：拿**本进程**的令牌派生。传句柄则是 P0-1 的关键 ——
+    helper 用**调用方（引擎）的令牌**派生受限令牌，于是子进程运行在调用方的
+    用户/完整性级别下（而非 helper 的提权令牌），限制性 SID 只额外约束写访问。
+
+    调用方负责 `CloseHandle(token)`；`source` 由调用方持有与关闭。
     """
     adv, k32 = _advapi(), _k32()
     if adv is None or k32 is None or not win.IS_WINDOWS:
         return None
 
-    own = wt.HANDLE()
-    if not k32.OpenProcessToken(
-        k32.GetCurrentProcess(), win.TOKEN_QUERY | win.TOKEN_DUPLICATE, ctypes.byref(own)
-    ):
-        logger.debug("OpenProcessToken failed err=%s", ctypes.get_last_error())
-        return None
+    own: Any = None
+    if source is None:
+        own = wt.HANDLE()
+        if not k32.OpenProcessToken(
+            k32.GetCurrentProcess(), win.TOKEN_QUERY | win.TOKEN_DUPLICATE, ctypes.byref(own)
+        ):
+            logger.debug("OpenProcessToken failed err=%s", ctypes.get_last_error())
+            return None
+        source = own
 
     try:
-        logon_bytes, logon_text = _logon_sid(own)
+        logon_bytes, logon_text = _logon_sid(source)
         everyone = _well_known_sid(WIN_WORLD_SID)
         synthetic = _well_known_sid(WIN_NULL_SID)
         if not everyone or not synthetic:
@@ -385,7 +573,7 @@ def create_restricted_token() -> tuple[Any, str] | None:
 
         new = wt.HANDLE()
         ok = adv.CreateRestrictedToken(
-            own,
+            source,
             WRITE_RESTRICTED | DISABLE_MAX_PRIVILEGE,
             0,
             None,
@@ -404,7 +592,123 @@ def create_restricted_token() -> tuple[Any, str] | None:
         logger.warning("create_restricted_token unexpected error", exc_info=True)
         return None
     finally:
-        k32.CloseHandle(own)
+        if own is not None and own:
+            k32.CloseHandle(own)
+
+
+def create_restricted_token() -> tuple[Any, str] | None:
+    """本进程令牌的受限版本（历史入口，语义不变）。
+
+    调用方负责 `CloseHandle(token)`。失败即"机制不可用"，由 `resolve_level`
+    判为 `below_floor` —— 绝不静默退回无隔离执行。
+    """
+    return create_restricted_token_from(None)
+
+
+@dataclass(frozen=True)
+class TargetToken:
+    """一次受限令牌的"身份来源"描述。
+
+    这是 P0-1 不变量在数据上的落点：`source` 说明令牌派生自谁的令牌
+    （`"caller"` = 调用方用户，`"self"` = 本进程/helper 自身），`reason` 说明
+    为什么退回了较弱的那条路。
+    """
+
+    token: Any = None
+    user_sid: str = ""
+    elevated: bool = False
+    source: str = "self"
+    reason: str = ""
+    detail: str = ""
+
+
+def _self_target(reason: str = "", detail: str = "", token: Any = None) -> TargetToken:
+    """退回"本进程令牌"的结果（含降级理由）。"""
+    sid, elevated = ("", False)
+    if token:
+        # 拿不到 SID 不影响可用性，只是报告里少一个字段
+        sid, elevated = token_user_sid(token), token_elevated(token)
+    return TargetToken(
+        token=token,
+        user_sid=sid,
+        elevated=elevated,
+        source="self",
+        reason=reason,
+        detail=detail,
+    )
+
+
+def restricted_token_for_caller(
+    pid: int | None, *, expect_creation_time: int | None = None
+) -> TargetToken:
+    """为**调用方**（`pid`）造受限令牌；拿不到就退回本进程令牌并记录理由。
+
+    ## 为什么这件事必须做（P0-1）
+
+    受限令牌的 restricting SIDs **只在评估写访问时**参与检查（`WRITE_RESTRICTED`）。
+    如果受限令牌派生自 helper 自己的**提权**令牌，子进程虽然写不了大部分地方，
+    但读遍全盘、且"用户"仍是管理员 —— 隔离强度取决于"没有可用的提权路径"，
+    这不该是设计前提。派生自调用方令牌之后，子进程的**用户身份**与调用方一致
+    （通常是 Medium IL 的普通用户），这才是"降权"的本义。
+
+    ## 为什么 pid 不能由请求方随意指定
+
+    本函数只认**helper 启动时记录的父进程 pid**（见 `elevated_helper`），
+    请求体里的 pid 仅用于交叉校验。否则攻击者控制引擎后可以让 helper
+    打开任意进程的令牌 —— 那等于给引擎一个"以任意用户身份起进程"的能力，
+    比原来的问题更糟。
+
+    ## 降级
+
+    目标令牌不可得（进程已退出 / 跨账户被拒 / pid 复用）时**不抛异常、也不拒绝
+    执行**：退回本进程令牌，`reason=token_target_unavailable`，由调用方写进日志
+    与状态。执行仍然会走到"受限令牌 + 独立桌面"，只是身份没有降到调用方。
+    """
+    if pid is None or pid <= 0 or int(pid) == os.getpid():
+        made = create_restricted_token_from(None)
+        if made is None:
+            return TargetToken(detail="无法基于本进程令牌创建受限令牌")
+        return _self_target(token=made[0])
+
+    handle, detail = open_process_token(int(pid))
+    if handle is None:
+        logger.warning(
+            "无法打开调用方令牌（pid=%s）：%s —— 退回本进程令牌（%s）",
+            pid,
+            detail,
+            TOKEN_TARGET_UNAVAILABLE,
+        )
+        made = create_restricted_token_from(None)
+        return _self_target(TOKEN_TARGET_UNAVAILABLE, detail, made[0] if made else None)
+
+    try:
+        if expect_creation_time is not None:
+            actual = process_creation_time(int(pid))
+            if actual is None or actual != expect_creation_time:
+                detail = f"调用方 pid={pid} 的创建时间不匹配（可能已被复用）"
+                logger.warning("%s —— 退回本进程令牌（%s）", detail, TOKEN_TARGET_UNAVAILABLE)
+                made = create_restricted_token_from(None)
+                return _self_target(TOKEN_TARGET_UNAVAILABLE, detail, made[0] if made else None)
+
+        sid, elevated = token_user_sid(handle), token_elevated(handle)
+        made = create_restricted_token_from(handle)
+        if made is None:
+            detail = f"无法基于调用方令牌创建受限令牌（pid={pid}）"
+            logger.warning("%s —— 退回本进程令牌（%s）", detail, TOKEN_TARGET_UNAVAILABLE)
+            fallback = create_restricted_token_from(None)
+            return _self_target(TOKEN_TARGET_UNAVAILABLE, detail, fallback[0] if fallback else None)
+        return TargetToken(
+            token=made[0],
+            user_sid=sid,
+            elevated=elevated,
+            source="caller",
+            reason="",
+            detail="",
+        )
+    finally:
+        k32 = _k32()
+        if k32 is not None:
+            k32.CloseHandle(handle)
 
 
 def probe() -> bool:
@@ -496,10 +800,21 @@ def grant_report(paths: list[str]) -> dict[str, Any]:
 __all__ = [
     "DESKTOP_NAME",
     "SYNTHETIC_SID",
+    "TOKEN_TARGET_UNAVAILABLE",
+    "TargetToken",
     "create_restricted_token",
+    "create_restricted_token_from",
+    "current_user_sid",
     "desktop_isolation_ready",
     "grant_path",
     "grant_report",
+    "is_administrator_identity",
+    "open_process_token",
     "probe",
+    "process_creation_time",
+    "process_identity",
+    "restricted_token_for_caller",
     "revoke_path",
+    "token_elevated",
+    "token_user_sid",
 ]

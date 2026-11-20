@@ -18,6 +18,11 @@ Medium IL。所以只提权这一个瘦进程。
    `win_launch.launch_restricted` —— 目标进程带受限令牌 + 独立桌面，权限比
    引擎自身更低。即使引擎被完全攻破，攻击者拿到的也只是"受限执行"通道，
    强度不降。这是整个设计成立的前提，改动前请先想清楚。
+1b. **子进程的身份是调用方，不是本助手。** 受限令牌派生自**调用方令牌**
+   （`CallerIdentity`，启动时按 `--parent-pid` 记录，带创建时间防 pid 复用），
+   而不是本助手的提权令牌。否则限制性 SID 只约束写访问，子进程读遍全盘且
+   身份仍是管理员 —— 那不是"降权"。拿不到调用方令牌时**允许**降级，
+   但必须带 `degrade_reason=token_target_unavailable`。
 2. **只监听环回。** 绝不 `0.0.0.0`。它提供的是提权能力。
 3. **每个请求都要 HMAC 签名。** 密钥由引擎写入 `%LOCALAPPDATA%`，不走命令行
    （命令行对同机任意进程可见）。签名失败立刻断开且不记录内容 —— 那可能是探测。
@@ -62,6 +67,67 @@ MAX_OUTPUT_BYTES = 1_000_000
 
 #: 父进程存活检查间隔（秒）。父进程退出后最多这么久 helper 就消失。
 _PARENT_POLL_SECONDS = 2.0
+
+
+class CallerIdentity:
+    """helper **启动时**记录的调用方（引擎）身份。
+
+    ## 为什么身份在启动时定，而不是每个请求带
+
+    请求体里的 `caller_pid` 只是**交叉校验**。若让请求决定身份，攻破引擎的一方
+    就能让提权 helper 打开任意进程的令牌并以其身份起进程 —— 那是把引擎的
+    攻击面放大成"以任意用户身份执行"，比原来的问题（子进程继承 helper 的
+    管理员身份）更糟。
+
+    启动时的 `--parent-pid` 由引擎在 `spawn_elevated` 里给定，且 helper 会用
+    `creation_time` 防 pid 复用：父进程退出后 pid 会被系统回收，不校验创建时间
+    就可能把"恰好拿到同一个 pid 的另一个进程"当成调用方。
+    """
+
+    __slots__ = ("creation_time", "elevated", "pid", "user_sid")
+
+    def __init__(self, pid: int, user_sid: str, elevated: bool, creation_time: int | None) -> None:
+        self.pid = pid
+        self.user_sid = user_sid
+        self.elevated = elevated
+        self.creation_time = creation_time
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"pid": self.pid, "user_sid": self.user_sid, "elevated": self.elevated}
+
+
+#: 当前记录的调用方身份。`None` = 未知（helper 以 `--parent-pid=0` 启动，
+#: 或父进程令牌读不到）⇒ 受限进程只能退回 helper 自身令牌，并记录
+#: `token_target_unavailable`。
+_caller: CallerIdentity | None = None
+
+
+def set_caller(identity: CallerIdentity | None) -> None:
+    """设置/清除调用方身份（`serve()` 与测试使用）。"""
+    global _caller
+    _caller = identity
+
+
+def caller_identity() -> CallerIdentity | None:
+    return _caller
+
+
+def resolve_caller(pid: int) -> CallerIdentity | None:
+    """按 pid 读调用方身份。读不到返回 `None`（调用方会据此降级并记录理由）。"""
+    if pid <= 0:
+        return None
+    from app.isolation import win_token
+
+    user_sid, elevated = win_token.process_identity(int(pid))
+    if not user_sid:
+        logger.warning("无法读取调用方 pid=%s 的令牌身份，受限进程将退回本助手令牌", pid)
+        return None
+    return CallerIdentity(
+        pid=int(pid),
+        user_sid=user_sid,
+        elevated=elevated,
+        creation_time=win_token.process_creation_time(int(pid)),
+    )
 
 
 def _parent_alive(pid: int) -> bool:
@@ -162,6 +228,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         from app.isolation import elevated_protocol as proto
 
+        identity = _caller
         self._reply(
             HTTPStatus.OK,
             {
@@ -170,6 +237,9 @@ class _Handler(BaseHTTPRequestHandler):
                 # 让引擎侧能把"helper 在跑但没权限"与"helper 在跑且有权限"分开，
                 # 这是排查 err=5 的第一手信息。
                 "elevated": _is_elevated(),
+                # 调用方身份：引擎可据此确认"助手记录的调用方就是我自己"。
+                # 为空表示未记录 ⇒ 该助手只能用自身令牌起进程（降权不可用）。
+                "caller": identity.as_dict() if identity is not None else None,
             },
         )
 
@@ -249,8 +319,23 @@ def _handle_exec(request: dict[str, Any]) -> dict[str, Any]:
 
     校验的严格程度与"这是提权进程"相称：这里放过的每一个宽松点，都是提权身份
     可以被滥用的一条路径。
+
+    ## P0-1：子进程的身份是**调用方**，不是 helper
+
+    受限令牌派生自 `_caller` 记录的（引擎）令牌，于是子进程运行在调用方的
+    用户/完整性级别下；限制性 SID 只额外约束写访问。若 `_caller` 未知，
+    `launch_restricted` 会退回本助手令牌并在响应里给出
+    `degrade_reason=token_target_unavailable` —— 执行继续（限制性 SID 仍生效），
+    但调用方能看见"这次没有降权"。
+
+    请求里的 `caller_pid` **不参与身份决定**，只与记录值交叉校验。
     """
+    from app.isolation import elevated_protocol as proto
     from app.isolation import win_launch
+
+    version = request.get("protocol")
+    if version is not None and not proto.compatible(version):
+        raise _BadRequestError(proto.incompatible_reason(version))
 
     argv = request.get("argv")
     if not isinstance(argv, list) or not argv:
@@ -291,12 +376,33 @@ def _handle_exec(request: dict[str, Any]) -> dict[str, Any]:
         raise _BadRequestError("max_output 必须是正整数")
     max_output = min(max_output, MAX_OUTPUT_BYTES)
 
+    # 身份只来自启动时记录的调用方（见 `CallerIdentity`）。
+    identity = _caller
+    requested_pid = request.get("caller_pid")
+    if identity is not None and isinstance(requested_pid, int) and requested_pid != identity.pid:
+        # 不一致不改身份，只留痕：多进程引擎（子进程转发请求）会触发它，
+        # 但**不能**因此放宽成"按请求里的 pid 取令牌"。
+        logger.info(
+            "请求声明的 caller_pid=%s 与记录的调用方 pid=%s 不一致；身份仍按记录值",
+            requested_pid,
+            identity.pid,
+        )
+    if identity is None and requested_pid:
+        logger.warning(
+            "未记录调用方身份（本助手不是由引擎以 --parent-pid 启动）；"
+            "本次请求的 caller_pid=%s 不被采信，受限进程将退回本助手令牌（%s）",
+            requested_pid,
+            proto.REASON_TOKEN_TARGET_UNAVAILABLE,
+        )
+
     result = win_launch.launch_restricted(
         argv,
         cwd=cwd,
         env=env,
         timeout=timeout,
         max_output=max_output,
+        target_pid=identity.pid if identity is not None else None,
+        expect_creation_time=identity.creation_time if identity is not None else None,
     )
     return {
         "started": result.started,
@@ -304,6 +410,13 @@ def _handle_exec(request: dict[str, Any]) -> dict[str, Any]:
         "exit_code": result.exit_code,
         "stdout": result.stdout,
         "stderr": result.stderr,
+        # P0-1 的观测口。旧引擎不认识这些字段（只读上面几个），因此可安全新增。
+        "protocol": proto.PROTOCOL_VERSION,
+        "token_target": result.token_target,
+        "token_user_sid": result.token_user_sid,
+        "token_elevated": result.token_elevated,
+        "degrade_reason": result.degrade_reason,
+        "caller_user_sid": identity.user_sid if identity is not None else "",
     }
 
 
@@ -329,6 +442,25 @@ def serve(parent_pid: int, *, key: bytes | None = None) -> int:
     # 注入给 `/v1/shutdown`：它需要从请求线程里触发 `serve_forever()` 退出。
     _Handler.server_instance = server
     port = int(server.server_address[1])
+
+    # **P0-1 的身份锚点**：在任何请求进来之前记录调用方（引擎）身份。
+    # 之后每条 `/v1/exec` 都用它派生受限令牌，于是子进程以调用方用户运行。
+    set_caller(resolve_caller(parent_pid))
+    identity = _caller
+    if identity is not None:
+        logger.info(
+            "调用方身份已记录: pid=%s sid=%s elevated=%s —— 受限进程将以该身份运行",
+            identity.pid,
+            identity.user_sid,
+            identity.elevated,
+        )
+    else:
+        logger.warning(
+            "未能记录调用方身份（parent_pid=%s）；受限进程将退回本助手令牌，"
+            "每次执行都会带 degrade_reason=%s",
+            parent_pid,
+            proto.REASON_TOKEN_TARGET_UNAVAILABLE,
+        )
 
     try:
         proto.port_path().parent.mkdir(parents=True, exist_ok=True)

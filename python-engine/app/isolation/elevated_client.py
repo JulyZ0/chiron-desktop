@@ -30,7 +30,7 @@ import sys
 import threading
 
 from app.isolation import elevated_protocol as proto
-from app.isolation import win
+from app.isolation import win, win_token
 from app.isolation.win_launch import LaunchResult
 
 logger = logging.getLogger(__name__)
@@ -43,13 +43,26 @@ _ready: bool | None = None
 _ready_reason = ""
 _lock = threading.Lock()
 
+#: 最近一次 ping 得到的 helper 协议版本（`None` = 还没探测到）。
+#:
+#: 用它区分"v2 helper（能按调用方身份降权）"与"v1 helper（只能用自身令牌）"。
+#: 后者仍然可用（限制性 SID 生效），但必须把 `token_target_unavailable`
+#: 记进 `degrade_reason` —— 否则用户会以为降权已经生效。
+_helper_protocol: int | None = None
+
+
+def helper_protocol() -> int | None:
+    """最近一次探测到的 helper 协议版本；未探测到返回 `None`。"""
+    return _helper_protocol
+
 
 def reset_probe() -> None:
     """清缓存，供档位切换后重新探测（与 `win_launch.reset_probe` 同语义）。"""
-    global _ready, _ready_reason
+    global _ready, _ready_reason, _helper_protocol
     with _lock:
         _ready = None
         _ready_reason = ""
+        _helper_protocol = None
 
 
 # ── 共享密钥 ─────────────────────────────────────────────
@@ -84,7 +97,11 @@ def _read_port() -> int:
 
 
 def _ping(port: int, key: bytes, timeout: float) -> tuple[bool, bool, str]:
-    """探测 helper。返回 `(ok, elevated, detail)`。"""
+    """探测 helper。返回 `(ok, elevated, detail)`。
+
+    成功时把对端协议版本记进 `_helper_protocol`（见 `helper_protocol()`）。
+    """
+    global _helper_protocol
     conn = http.client.HTTPConnection(proto.LOOPBACK, port, timeout=timeout)
     try:
         conn.request(
@@ -97,11 +114,17 @@ def _ping(port: int, key: bytes, timeout: float) -> tuple[bool, bool, str]:
         if resp.status != 200:
             return False, False, f"ping HTTP {resp.status}"
         data = json.loads(body)
-        if int(data.get("protocol", -1)) != proto.PROTOCOL_VERSION:
-            # 版本不一致要拒绝：半懂不懂地解析"起进程"指令比重启 helper 危险。
-            return False, False, (
-                f"helper 协议版本 {data.get('protocol')} 与引擎 {proto.PROTOCOL_VERSION} 不一致"
-            )
+        version = data.get("protocol")
+        if not proto.compatible(version):
+            # 版本不可用要拒绝：半懂不懂地解析"起进程"指令比重启 helper 危险。
+            # 原因必须可行动（用户只需要重启助手），见 `incompatible_reason`。
+            return False, False, proto.incompatible_reason(version)
+        _helper_protocol = int(version)
+        note = proto.degrade_note(version)
+        if note:
+            # 可通话但能力受限（v1 helper 无法按调用方身份降权）。不拒绝，
+            # 但必须留痕 —— 这条日志是"为什么子进程还是管理员"的唯一线索。
+            logger.warning("%s", note)
         return True, bool(data.get("elevated")), ""
     except (OSError, ValueError) as exc:
         return False, False, f"{type(exc).__name__}: {exc}"
@@ -230,6 +253,33 @@ def stop(timeout: float = 10.0) -> tuple[bool, str]:
 # ── 执行 ─────────────────────────────────────────────────
 
 
+def exec_payload(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+    max_output: int,
+) -> dict[str, object]:
+    """`/v1/exec` 的请求体（协议 v2）。
+
+    `caller_pid` 是**引擎自己**的 pid：helper 用它交叉校验"请求者就是我启动时
+    记录的父进程"。身份**不**由它决定 —— helper 只认启动时记录的父进程，
+    否则攻破引擎的一方就能让提权 helper 打开任意进程的令牌。
+
+    多出来的两个字段对 v1 helper 无害：它的 `_handle_exec` 只读自己认识的键。
+    """
+    return {
+        "protocol": proto.PROTOCOL_VERSION,
+        "caller_pid": os.getpid(),
+        "argv": list(argv),
+        "cwd": cwd,
+        "env": dict(env),
+        "timeout": float(timeout),
+        "max_output": int(max_output),
+    }
+
+
 def helper_exec(
     argv: list[str],
     *,
@@ -242,22 +292,21 @@ def helper_exec(
 
     失败一律返回 `spawn_error` 非空的 `LaunchResult` —— 调用方据此**拒绝执行**，
     绝不退回无隔离路径。
+
+    成功时把 helper 报告的身份字段一并带回（`token_target` / `token_user_sid` /
+    `token_elevated` / `degrade_reason`）。**旧 helper（v1）不报这些字段**：
+    此时引擎自己补一条 `degrade_reason=token_target_unavailable` ——
+    它只能用自身（可能已提权）的令牌起进程，用户必须知道这一点。
     """
     key, _warn = ensure_key()
     if not key:
-        return LaunchResult(None, "", "", "无法建立 helper 共享密钥")
+        return LaunchResult(None, "", "", "无法建立 helper 共享密钥", degrade_reason=proto.REASON_TOKEN_TARGET_UNAVAILABLE)
     port = _read_port()
     if not port:
-        return LaunchResult(None, "", "", "提权 helper 未启动")
+        return LaunchResult(None, "", "", "提权 helper 未启动", degrade_reason=proto.REASON_TOKEN_TARGET_UNAVAILABLE)
 
     payload = json.dumps(
-        {
-            "argv": list(argv),
-            "cwd": cwd,
-            "env": dict(env),
-            "timeout": float(timeout),
-            "max_output": int(max_output),
-        },
+        exec_payload(argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
@@ -290,11 +339,44 @@ def helper_exec(
     finally:
         conn.close()
 
+    degrade = str(data.get("degrade_reason") or "")
+    if not degrade and (not data.get("token_target") or proto.degrade_note(_helper_protocol)):
+        # 两路证据任一成立就判降级：
+        #   * 响应里根本没有 `token_target` ⇒ 对端是 v1 helper（不认识这些字段），
+        #     它只能用**自己**的令牌派生受限令牌；
+        #   * 探测到的协议版本低于当前版本 ⇒ 同上。
+        # 只留一条都会漏：`_helper_protocol` 可能还没被 ping 填上（首次调用就直连执行）。
+        degrade = proto.REASON_TOKEN_TARGET_UNAVAILABLE
+    if degrade:
+        logger.warning(
+            "受限进程未能降到调用方身份：%s（helper 协议 %s，target=%s，子进程 sid=%s）",
+            degrade,
+            _helper_protocol,
+            data.get("token_target") or "未知",
+            data.get("token_user_sid") or "未知",
+        )
+    else:
+        # 引擎侧的最后一道核对：helper 声称"按调用方降权"时，子进程的 SID 必须
+        # 就是引擎自己的。不一致说明身份没落到调用方（配置/令牌来源出错）。
+        worker_sid = str(data.get("token_user_sid") or "")
+        own_sid = win_token.current_user_sid()
+        if worker_sid and own_sid and worker_sid != own_sid:
+            logger.warning(
+                "受限进程的身份与调用方不一致：子进程 sid=%s，引擎 sid=%s（target=%s）",
+                worker_sid,
+                own_sid,
+                data.get("token_target"),
+            )
+
     return LaunchResult(
         exit_code=data.get("exit_code"),
         stdout=data.get("stdout") or "",
         stderr=data.get("stderr") or "",
         spawn_error=data.get("spawn_error") or "",
+        token_target=str(data.get("token_target") or ""),
+        token_user_sid=str(data.get("token_user_sid") or ""),
+        token_elevated=bool(data.get("token_elevated")),
+        degrade_reason=degrade,
     )
 
 
@@ -420,8 +502,10 @@ def wait_ready(timeout: float = 20.0) -> tuple[bool, str]:
 __all__ = [
     "available",
     "ensure_key",
+    "exec_payload",
     "helper_argv",
     "helper_exec",
+    "helper_protocol",
     "reset_probe",
     "spawn_elevated",
     "stop",
