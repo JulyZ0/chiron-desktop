@@ -191,7 +191,32 @@ func (l *modelLedger) settle(total usageTotals, fallbackModel string) []modelUsa
 
 	out := make([]modelUsage, 0, len(keys)+1)
 	for _, k := range keys {
-		out = append(out, modelUsage{Model: k, usageTotals: l.entries[k]})
+		entry := l.entries[k]
+		// 空键（事件没带 model）在 fallback 已知时并到 fallback 名下。
+		//
+		// 为什么必须在这里做：`usage` 事件可能**先于**任何带 model 的事件到达
+		// （典型：第一次调用就是本轮唯一一次调用），此刻 `turnModel` 还是空的，
+		// 记账方只能把名字记成空串。空名字 ⇒ `usage_events.model` 为 NULL ⇒
+		// `model_prices` 查不到 ⇒ `cost_cents` 恒 NULL ⇒ 页面"有 token、花费 0"。
+		// 归因可以粗，但不能让价格键消失。
+		label := k
+		if label == "" && fallback != "" {
+			label = fallback
+		}
+		merged := false
+		for i := range out {
+			if out[i].Model == label {
+				out[i].input += entry.input
+				out[i].output += entry.output
+				out[i].cached += entry.cached
+				merged = true
+				break
+			}
+		}
+		if merged {
+			continue
+		}
+		out = append(out, modelUsage{Model: label, usageTotals: entry})
 	}
 	if gap.input > 0 || gap.output > 0 || gap.cached > 0 {
 		merged := false

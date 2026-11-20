@@ -21,6 +21,8 @@ export default {
   usage_col_cost: "花费（credits）",
   usage_unknown_bucket: "未知",
   usage_breakdown_empty: "该时间段内还没有用量明细",
+  usage_count_basis: "调用次数按记账行统计（一行 = 某个模型在一轮里的调用；同模型同轮合并），本区间 {rows} 行、共 {tokens} tokens。",
+  usage_legacy_no_tokens: "有 {n} 条记录发生在升级前，当时未采集 token 明细（调用次数仍真实）。这些历史行不回填。",
   usage_breakdown_hint: "明细从本次版本开始记录，此前的历史回合无法回填。",
   usage_breakdown_truncated: "仅显示花费最高的 {shown} 项（共 {total} 项）；上方合计仍是全部花费。",
 

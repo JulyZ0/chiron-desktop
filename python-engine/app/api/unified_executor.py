@@ -390,6 +390,13 @@ class UnifiedChatHandler:
                 "duration_ms": result.get("total_duration_ms"),
                 "subtasks": result.get("subtasks", []),
             }
+            # 用量（agent 模式由 `_execute_via_agent` 带回；auto 模式的路由不统计时为
+            # `None`）。**顶层与 metadata 各放一份**：网关两处都认（见
+            # internal/api/unified_usage.go），这样老/新网关都能记账，不会因为
+            # "字段挪了个位置"就静默丢账。
+            usage_block = result.get("usage")
+            if isinstance(usage_block, dict):
+                meta["usage"] = usage_block
             # 多值用 kb_ids 呈现；同时保留单值的首个，避免既有前端
             # （metadata.kb_id 驱动的知识库引用标签）失效。
             if ctx_kb_ids:
@@ -449,6 +456,8 @@ class UnifiedChatHandler:
                 "session_id": session_id,
                 "trace_id": trace_id,
                 "output": final_output,
+                # 顶层 usage：网关据此写 `usage_events`（引擎不记账）。
+                "usage": usage_block if isinstance(usage_block, dict) else None,
                 "metadata": {
                     **meta,
                     "subtasks_completed": result.get("output", {}).get(
@@ -484,6 +493,9 @@ class UnifiedChatHandler:
                 "error": str(e),
                 "session_id": session_id,
                 "trace_id": trace_id,
+                # 失败回合也可能已经消耗了 token（见 `_execute_via_agent` 的异常附件）。
+                # 没有就是 None —— 不编一个 0 出来冒充"已知无用量"。
+                "usage": getattr(e, "usage", None),
             }
 
     async def _execute_via_agent(
@@ -570,9 +582,19 @@ class UnifiedChatHandler:
         agent_result = await agent.run(task=task_input, tenant_id=tenant_id)
         if not agent_result.success:
             # Fail loud: Agent 执行失败必须向上抛出,由 submit_task 返回 success=False
-            raise RuntimeError(
+            #
+            # 但**用量不能跟着丢**：失败前那几次 LLM 调用是真实花掉的。把用量挂在
+            # 异常上带到回包里，网关照样记账（与 takeover 的"异常路径也要上报"同口径）。
+            err = RuntimeError(
                 f"Agent execution failed: {agent_result.error or 'unknown error'}"
             )
+            err.usage = {  # type: ignore[attr-defined]
+                "model": model,
+                "input_tokens": int(agent_result.token_usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(agent_result.token_usage.get("output_tokens", 0) or 0),
+                "cached_tokens": int(agent_result.token_usage.get("cached_tokens", 0) or 0),
+            }
+            raise err
 
         return {
             "status": "completed",
@@ -581,6 +603,18 @@ class UnifiedChatHandler:
                 "tool_calls": agent_result.tool_calls,
             },
             "total_duration_ms": int(agent_result.duration * 1000),
+            # 用量随回包交给网关记账（`usage_events` 的唯一事实源在 Go 侧）。
+            # 引擎不记账：这里只报**事实**，价格与归属由网关决定（见 openai_compat 的
+            # 同一口径）。缺了它，统一任务模式的回合在计费页里**一行都没有** ——
+            # 与 SSE 链路"有行无 token"是两种不同形态的漏账，都表现为"用量看起来是 0"。
+            "usage": {
+                "model": model,
+                "input_tokens": int(agent_result.token_usage.get("input_tokens", 0) or 0),
+                "output_tokens": int(agent_result.token_usage.get("output_tokens", 0) or 0),
+                # SubAgent 的流式累计里没有单列缓存命中；显式写 0 而不是省略，
+                # 让网关侧"没有这个字段"与"确实是 0"不会混淆。
+                "cached_tokens": int(agent_result.token_usage.get("cached_tokens", 0) or 0),
+            },
         }
 
     async def _retrieve_kb_context(

@@ -409,7 +409,109 @@ type PythonEvent struct {
 	// 只用于展示。**故意不喂给 usageTotals**：子 Agent 的 token 只记进引擎侧的
 	// 任务线账（subagent_runs + run_lineage_ledger，由线账闸门约束），不进租户额度池。
 	// 接线前请看 internal/api/usage_accounting.go 的 withEvent 注释。
+	//
+	// 注意：主对话事件上也可能出现同名字段（OpenAI 形状的 `{prompt_tokens,
+	// completion_tokens}`），见 NormalizeUsage 的映射表。
 	Usage map[string]any `json:"usage,omitempty"`
+
+	// ── 兼容别名（OpenAI 形状）──
+	//
+	// 引擎自己发的是扁平的 `input_tokens / output_tokens / cached_tokens`，但
+	// **不是所有链路上的"引擎"都长这样**：
+	//
+	//   - 兼容层 / 第三方网关按 OpenAI 契约回 `prompt_tokens` / `completion_tokens`；
+	//   - 部分版本把 usage 收进独立的 `usage` 对象（流式最后一帧，`choices` 为空）；
+	//   - 缓存命中在 `prompt_tokens_details.cached_tokens`。
+	//
+	// 这些字段此前在网关**根本没有声明**，于是 `json.Unmarshal` 静默丢弃它们 ⇒
+	// `usage` / `done` 事件带上来的一切用量都变成 0 ⇒ `usage_events` 里"有 45 行
+	// 调用、token 全 0"、计费页永远显示 0。真相不是"统计坏了"，是**字段名没对上**。
+	// 映射集中在 PythonEvent.NormalizeUsage，RunSSE 处统一调用一次。
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+}
+
+// NormalizeUsage 把各路别名折叠进规范字段（input/output/cached）。
+//
+// 口径：
+//   - 扁平 `input_tokens` 优先（引擎自己的形状，最权威）；
+//   - 缺失时才用别名 `prompt_tokens` / `completion_tokens` 补；
+//   - `cached_tokens` 缺失时从 `usage.prompt_tokens_details.cached_tokens`
+//     或 `usage.cached_tokens` 取；
+//   - **只要任一字段被填上就不再覆盖**：多个来源同时存在时以先到的规范字段为准，
+//     避免同一帧里的两份数字互相打架。
+//
+// 幂等：重复调用结果不变（已经填好的字段不会被别名改写）。
+func (e *PythonEvent) NormalizeUsage() {
+	if e == nil {
+		return
+	}
+	if e.InputTokens == 0 {
+		if e.PromptTokens > 0 {
+			e.InputTokens = e.PromptTokens
+		} else if v := intFromAny(e.Usage["prompt_tokens"]); v > 0 {
+			e.InputTokens = v
+		} else if v := intFromAny(e.Usage["input_tokens"]); v > 0 {
+			e.InputTokens = v
+		}
+	}
+	if e.OutputTokens == 0 {
+		if e.CompletionTokens > 0 {
+			e.OutputTokens = e.CompletionTokens
+		} else if v := intFromAny(e.Usage["completion_tokens"]); v > 0 {
+			e.OutputTokens = v
+		} else if v := intFromAny(e.Usage["output_tokens"]); v > 0 {
+			e.OutputTokens = v
+		}
+	}
+	if e.CachedTokens == 0 {
+		if v := intFromAny(e.Usage["cached_tokens"]); v > 0 {
+			e.CachedTokens = v
+		} else if details, ok := e.Usage["prompt_tokens_details"].(map[string]any); ok {
+			if v := intFromAny(details["cached_tokens"]); v > 0 {
+				e.CachedTokens = v
+			}
+		}
+	}
+	if e.Model == "" {
+		// 有的兼容层把模型名挂在 usage 之外的同级字段里，有的整帧都没有；
+		// 这里只做"有就取"，取不到留给调用方按本轮归属模型兜底。
+		if m := stringFromAny(e.Usage["model"]); m != "" {
+			e.Model = m
+		}
+	}
+}
+
+// intFromAny / stringFromAny 是 JSON 泛型数字/字符串的窄化。
+//
+// `any` 里的数字经 encoding/json 一律是 float64，但经 YAML/测试替身可能是
+// int / string，逐类处理比断言更稳（断言失败会 panic 到 SSE 读循环里）。
+func intFromAny(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case float32:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case int32:
+		return int(n)
+	case string:
+		var parsed int
+		if _, err := fmt.Sscanf(n, "%d", &parsed); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func stringFromAny(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // IsConnected checks if any Python engine instance is reachable.
@@ -753,6 +855,10 @@ func (c *PythonClient) RunSSE(ctx context.Context, path string, body any, extraH
 					slog.Warn("python engine: unmarshal event", "error", err, "data", raw)
 					continue
 				}
+				// 字段名折叠的**唯一**入口：引擎发扁平 input/output/cached，兼容层
+				// 可能发 OpenAI 形状（prompt_tokens / usage 嵌套）。不折一次的话，
+				// 后者在网关这里就是 0，一路传到 usage_events 变成"有调用、无 token"。
+				event.NormalizeUsage()
 				select {
 				case events <- event:
 				case <-ctx.Done():

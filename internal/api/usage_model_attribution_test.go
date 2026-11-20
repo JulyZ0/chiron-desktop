@@ -242,3 +242,39 @@ func TestNonPositiveAmountHasNoCost(t *testing.T) {
 	}
 }
 
+// 事件没带 model（`usage` 先于任何带 model 的事件到达）时，必须以本轮归属模型补齐。
+//
+// 这是"有 token、花费全 0"的成因之一：空 model ⇒ 列 NULL ⇒ `model_prices` 查不到
+// ⇒ `cost_cents` 恒 NULL。归因可以粗（退化成整轮一个模型），但价格键不能消失。
+func TestModelLedgerLabelsUnknownModelWithFallback(t *testing.T) {
+	var ledger modelLedger
+	ledger.add("", 400, 40, 0)
+
+	rows := ledger.settle(usageTotals{input: 400, output: 40}, "gpt-4o")
+
+	if len(rows) != 1 {
+		t.Fatalf("应只有 1 行，得到 %+v", rows)
+	}
+	if rows[0].Model != "gpt-4o" {
+		t.Fatalf("空模型名必须用本轮归属模型补齐，得到 %q", rows[0].Model)
+	}
+	if rows[0].input != 400 || rows[0].output != 40 {
+		t.Fatalf("补齐模型名不能改 token，得到 %+v", rows[0])
+	}
+}
+
+// 空键与真实模型键同时存在时，两者合并到 fallback 那一行，不得重复计总额。
+func TestModelLedgerMergesUnknownBucketIntoFallback(t *testing.T) {
+	var ledger modelLedger
+	ledger.add("", 100, 10, 0)
+	ledger.add("gpt-4o", 300, 30, 0)
+
+	rows := ledger.settle(usageTotals{input: 400, output: 40}, "gpt-4o")
+
+	if len(rows) != 1 {
+		t.Fatalf("空键应并进 fallback 行，得到 %+v", rows)
+	}
+	if rows[0].input != 400 || rows[0].output != 40 {
+		t.Fatalf("合并后总额必须不变，得到 %+v", rows[0])
+	}
+}

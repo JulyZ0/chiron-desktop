@@ -116,6 +116,43 @@ async function mountView() {
   return wrapper
 }
 
+
+/**
+ * 非零 token 的显示：计费页"消耗全为 0"的用户可见形态。
+ *
+ * 后端修好之后（按天视图也会 SUM token），页面必须把这些数字**真的显示出来**：
+ *  - 按天视图也要有 input/output/cached 与记账行数，不能只有花费；
+ *  - 花费算不出来（无单价）时，token 仍然是自证"用量被记下来了"的唯一证据；
+ *  - 历史行缺 token 明细时给出标注，但不凭空补数。
+ */
+const DAY_USAGE_WITH_TOKENS = {
+  daily: [
+    { day: '2026-11-19', tx_count: 3, credits_spent: 0, credits_added: 0, input_tokens: 1200, output_tokens: 300, cached_tokens: 128, zero_token_events: 0 },
+  ],
+  total_spent: 0,
+  period_days: 90,
+  total_input: 1200,
+  total_output: 300,
+  total_cached: 128,
+  total_calls: 3,
+  zero_token_events: 0,
+  count_basis: 'usage_rows',
+}
+
+const DAY_USAGE_WITH_LEGACY_ROWS = {
+  daily: [
+    { day: '2026-08-01', tx_count: 10, credits_spent: 0, credits_added: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0, zero_token_events: 10 },
+  ],
+  total_spent: 0,
+  period_days: 90,
+  total_input: 0,
+  total_output: 0,
+  total_cached: 0,
+  total_calls: 10,
+  zero_token_events: 10,
+  count_basis: 'usage_rows',
+}
+
 describe('BillingView 用量分摊', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -199,5 +236,49 @@ describe('BillingView 用量分摊', () => {
 
     // truncated 缺省（老后端）不能误报"显示不全"
     expect(wrapper.text()).not.toContain('仅显示花费最高的')
+  })
+  it('按天视图显示真实 token 与记账行数（花费为 0 也不掩盖用量）', async () => {
+    const wrapper = await mountView()
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: DAY_USAGE_WITH_TOKENS } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    await chooseRadio(wrapper, '90d')
+    await flushPromises()
+
+    const text = wrapper.text()
+    // 1200 / 300 / 128：三个 token 维度都必须渲染出来
+    expect(text).toContain('1200')
+    expect(text).toContain('300')
+    expect(text).toContain('128')
+    // 花费为 0 是"算不出来"，不该让 token 也一起消失
+    expect(text).toContain('每日消耗趋势')
+    // 调用次数口径必须可见，否则用户无从解释"调用次数和我数的不一样"
+    expect(text).toContain('记账行')
+  })
+
+  it('存在无 token 明细的历史行时给出标注', async () => {
+    const wrapper = await mountView()
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: DAY_USAGE_WITH_LEGACY_ROWS } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    await chooseRadio(wrapper, '90d')
+    await flushPromises()
+
+    // 不回填，但要说清"这段时间没有 token 明细"
+    expect(wrapper.text()).toContain('升级前')
+  })
+
+  it('没有历史零 token 行时不显示该标注', async () => {
+    const wrapper = await mountView()
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: DAY_USAGE_WITH_TOKENS } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    await chooseRadio(wrapper, '90d')
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('升级前')
   })
 })

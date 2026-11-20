@@ -905,7 +905,18 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		// 真实模型。`done` 的整轮合计没有归属，故不进 ledger（那也正是它不能用来
 		// 算成本的原因）。`subagent.*` 与 `usage` 同口径排除在租户额度外，见 withEvent。
 		if evt.Type == usageEventType && !strings.HasPrefix(evt.Type, subagentEventPrefix) {
-			ledger.add(evt.Model, evt.InputTokens, evt.OutputTokens, evt.CachedTokens)
+			// 事件没带 model 时用本轮的归属模型兜底。
+			//
+			// 为什么必须兜底：`usage_events.model` 是**价格查询键**（`model_prices`
+			// 按模型名取单价）。留空 ⇒ 列写 NULL ⇒ 取不到单价 ⇒ `cost_cents` 恒
+			// NULL ⇒ 计费页的花费永远是 0，而 token 其实是有的 —— 这正是"有调用、
+			// 有 token、花费却全 0"的成因之一，且界面上没有任何线索指向"模型名丢了"。
+			// 归因可以粗（退化成整轮一个模型），但**不能没有**。
+			attrModel := strings.TrimSpace(evt.Model)
+			if attrModel == "" {
+				attrModel = turnModel
+			}
+			ledger.add(attrModel, evt.InputTokens, evt.OutputTokens, evt.CachedTokens)
 		}
 		// 模型名：`done` 携带整轮的终态模型，取最后一个非空值。
 		//

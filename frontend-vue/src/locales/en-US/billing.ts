@@ -21,6 +21,8 @@ export default {
   usage_col_cost: "Cost (credits)",
   usage_unknown_bucket: "Unknown",
   usage_breakdown_empty: "No usage breakdown for this period yet",
+  usage_count_basis: "Calls are counted per accounting row (one row = one model in one turn; same-model calls within a turn are merged). This period: {rows} rows, {tokens} tokens.",
+  usage_legacy_no_tokens: "{n} rows predate the token-detail upgrade, so they carry no token breakdown (the call counts are still real). Historical rows are never backfilled.",
   usage_breakdown_hint: "Breakdown is recorded from this release onward; earlier turns cannot be backfilled.",
   usage_breakdown_truncated: "Showing the top {shown} of {total} items only; the totals above still cover everything.",
 
