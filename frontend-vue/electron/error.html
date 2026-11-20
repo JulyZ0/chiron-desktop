@@ -98,7 +98,19 @@
       const url = params.get('url') || ''
       const retry = params.get('retry') || ''
 
+      // 启动期迁移失败的三类原因（desktop-local/app/migration.py 的分类码）。
+      // 只补一句"该怎么办"：原始报错（含 alembic 输出尾部）在 desc 里，别覆盖它。
+      const hints = {
+        migration_tool_missing:
+          '迁移工具缺失：打包的 python 里没有 alembic，或 CHIRON_LOCAL_PYTHON 指向了错误的解释器。',
+        db_unreachable:
+          '数据库不可达：PostgreSQL 没有起来或被别的进程占用，迁移因此连不上库。',
+        migration_failed:
+          '迁移执行失败：见下方输出尾部与 <数据目录>/logs/migration.log。',
+      }
+
       document.getElementById('detail').textContent = [
+        hints[code] || '',
         code && `错误码 ${code}`,
         desc,
         url,

@@ -315,4 +315,21 @@ export default {
   // 后者是"请求太多"，前者是"本地组件还没起来"，成因与处置完全不同。
   // 具体原因由 error.response.data.detail 带出（见 src/api/index.ts 拦截器）。
   local_service_not_ready: "本地服务还没准备好，暂时无法完成这个操作。稍等片刻再试；若一直失败，请重启应用。",
+  // schema 漂移（/schema-mismatch 页）：网关起来但数据库迁移版本与代码不符。
+  // 文案要能让人**自己动手修**，所以版本号与命令是单独的行，不要揉进一句话。
+  schema_mismatch_badge: "数据库结构不一致",
+  schema_mismatch_title: "数据库结构需要迁移",
+  schema_mismatch_desc: "网关已启动，但数据库的迁移版本与当前程序不符，所以业务接口暂时不可用。执行下面的迁移命令后点「重试」即可。",
+  schema_mismatch_expected: "程序期望版本",
+  schema_mismatch_actual: "数据库当前版本",
+  schema_mismatch_actual_empty: "（从未执行过迁移）",
+  schema_mismatch_missing_tables: "缺失的数据表",
+  schema_mismatch_fix_label: "在部署目录执行：",
+  schema_mismatch_copy: "复制命令",
+  schema_mismatch_copied: "修复命令已复制",
+  schema_mismatch_copy_failed: "复制失败，请手动选中命令复制",
+  schema_mismatch_retry: "重试",
+  schema_mismatch_reload: "重新加载页面",
+  schema_mismatch_still_mismatched: "迁移版本仍不一致：确认命令已执行完成，且连的是同一个数据库。",
+  schema_mismatch_gateway_unreachable: "暂时连不上网关：它可能正在重启，稍等片刻再点重试。",
 }

@@ -643,6 +643,16 @@ async function tryStartGoStack(options = {}) {
     )
     // PG、Redis、引擎都是强依赖，能走到这里说明三者都起来了（缺一个 startLocalStack 就会抛）
     logMain('info', `python-engine 就绪 ${started.engine?.address || '（接管既有实例）'}`)
+    // schema 漂移：网关活着但业务路径全 503。**不当作启动失败** —— 让窗口照常打开，
+    // 前端的路由跳转器会探 /healthz 并把人送到 /schema-mismatch，那里有 expected/actual
+    // 与修复命令。走失败路径只会得到一句"本地后端未就绪"，真因又丢掉。
+    if (started.schemaMismatch) {
+      logMain(
+        'warn',
+        `网关 schema 漂移：expected=${started.schemaMismatch.expected} ` +
+          `actual=${started.schemaMismatch.actual}（前端会跳到 /schema-mismatch）`,
+      )
+    }
     // 新一轮运行重新计一次提示额度：上一轮崩过不该让这一轮的崩溃从此无声
     engineExitNotified = false
     return {
@@ -655,6 +665,9 @@ async function tryStartGoStack(options = {}) {
       via: 'go-stack',
       reason: '',
       message: '',
+      // 透传漂移详情（见 local-stack.cjs 的 GATEWAY_SCHEMA_PATH）：窗口照常打开，
+      // 界面侧由前端跳转器接手；这里只留一份给日志与排障看。
+      schemaMismatch: started.schemaMismatch || null,
     }
   } catch (err) {
     const message = err?.message || String(err)

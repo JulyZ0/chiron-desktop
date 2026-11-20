@@ -1095,3 +1095,60 @@ test('界面里没配模型时不写这些键（退回环境变量那条老路�
   assert.equal(env.KNOWLEDGE_SELFHOSTED_INDEX_MODEL, undefined)
   assert.equal(env.KNOWLEDGE_SELFHOSTED_CHAT_MODEL, undefined)
 })
+
+// --------------------------------------------------- schema 漂移（起网关的就绪探测）
+//
+// 漂移态下网关的 `/health` 与 `/ready` 都是 503，只有 `/healthz` 回 200 + 详情。
+// 若就绪探测不问这一条，唯一结果是等满 90s 超时再报"网关未就绪"，用户看到的是通用
+// 错误页 —— 而真因（迁移没跑）就在 `/healthz` 里。这里钉住"只认 status"这条判定：
+// 正常网关这条路径是 404，把 404/非 JSON 当成漂移会把每次启动都变成诊断页。
+
+test('probeSchemaMismatchInfo 只认 status=schema_mismatch', async t => {
+  t.after(() => {
+    delete globalThis.fetch
+  })
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() {
+      return {
+        status: 'schema_mismatch',
+        expected: 'head_abc',
+        actual: 'old_xyz',
+        reason: 'revision',
+        missing_tables: ['users'],
+        fix: 'run alembic upgrade head',
+      }
+    },
+  })
+
+  const info = await stack.probeSchemaMismatchInfo('http://127.0.0.1:1')
+  assert.equal(info.expected, 'head_abc')
+  assert.equal(info.actual, 'old_xyz')
+  assert.deepEqual(info.missing, ['users'])
+  assert.equal(info.fix, 'run alembic upgrade head')
+})
+
+test('probeSchemaMismatchInfo：404 / 非漂移 JSON / 连接失败都返回 null', async t => {
+  t.after(() => {
+    delete globalThis.fetch
+  })
+
+  // 正常网关：/healthz 是 404
+  globalThis.fetch = async () => ({ ok: false, async json() { return {} } })
+  assert.equal(await stack.probeSchemaMismatchInfo('http://127.0.0.1:1'), null)
+
+  // 其它服务的 200（例如把别的 HTTP 服务配到了网关端口）
+  globalThis.fetch = async () => ({ ok: true, async json() { return { status: 'ok' } } })
+  assert.equal(await stack.probeSchemaMismatchInfo('http://127.0.0.1:1'), null)
+
+  // 网关还没开始监听
+  globalThis.fetch = async () => {
+    throw new Error('ECONNREFUSED')
+  }
+  assert.equal(await stack.probeSchemaMismatchInfo('http://127.0.0.1:1'), null)
+})
+
+test('schema 诊断路径与网关一致：/healthz（不是 /health）', () => {
+  assert.equal(stack.GATEWAY_SCHEMA_PATH, '/healthz')
+  assert.notEqual(stack.GATEWAY_SCHEMA_PATH, stack.GATEWAY_HEALTH_PATH)
+})

@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
 from app.config import Settings
 from app.launcher import (
     ERROR_EVENT,
@@ -135,6 +136,99 @@ def test_state_file_is_opt_in_and_round_trips(tmp_path: Path) -> None:
     _write_state_file(str(target), payload)
 
     assert json.loads(target.read_text(encoding="utf-8")) == payload
+
+
+# --------------------------------------------------------- 迁移失败 → launcher-error
+#
+# 迁移是启动流程里的一步，失败必须变成一条**可分类**的事件：Electron 拿它当
+# localBackend.reason 写进错误页的 code，用户才知道是"缺 alembic"还是"库连不上"。
+# 只打一句 traceback 等于把分类责任推给用户。
+
+
+def test_error_payload_carries_migration_code_and_log() -> None:
+    from app.launcher import error_payload
+    from app.migration import CODE_DB_UNREACHABLE, MigrationError
+
+    exc = MigrationError(
+        CODE_DB_UNREACHABLE,
+        "alembic upgrade head 失败（退出码 1）：connection refused",
+        returncode=1,
+        log_path="C:/data/logs/migration.log",
+    )
+    payload = error_payload(exc)
+
+    assert payload["event"] == ERROR_EVENT
+    assert payload["code"] == CODE_DB_UNREACHABLE
+    assert payload["log"] == "C:/data/logs/migration.log"
+    # 既有解析方按 `error` 取消息，字段名不能改
+    assert "connection refused" in payload["error"]
+
+
+def test_error_payload_without_code_omits_fields() -> None:
+    """普通异常（PG 起不来等）不该凭空多出 code/log 键。"""
+    from app.launcher import error_payload
+
+    payload = error_payload(RuntimeError("实例不接受 SQL 连接"))
+
+    assert payload["event"] == ERROR_EVENT
+    assert "code" not in payload
+    assert "log" not in payload
+    assert payload["error"].startswith("RuntimeError: 实例不接受 SQL 连接")
+
+
+def test_bootstrap_stops_pg_when_migration_fails(tmp_path: Path, monkeypatch: Any) -> None:
+    """迁移失败必须把已起来的 PG 停掉：pg_ctl 起的 postmaster 不在子进程树里，
+    引导器一退出就成孤儿，下次 initdb 会撞上它。"""
+    from app import launcher as launcher_module
+    from app.migration import CODE_MIGRATION_FAILED, MigrationError
+
+    stopped: list[str] = []
+
+    class _FakePg:
+        dsn = "postgresql://postgres:@127.0.0.1:50165/chiron"
+        backend = "embedded-pack"
+        port = 50165
+        safe_dsn = "postgresql://postgres:***@127.0.0.1:50165/chiron"
+
+        def __init__(self, settings: Any) -> None:
+            self.settings = settings
+
+        def start(self) -> str:
+            return self.dsn
+
+        def migrate(self, dsn: str | None = None) -> dict[str, Any]:
+            raise MigrationError(CODE_MIGRATION_FAILED, "迁移脚本报错", returncode=2)
+
+        def stop(self) -> None:
+            stopped.append("pg")
+
+    class _FakeRedis:
+        backend = "bundled"
+        port = 0
+        lua_supported = True
+
+        def __init__(self, settings: Any) -> None:
+            self.settings = settings
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            stopped.append("redis")
+
+    monkeypatch.setattr(launcher_module, "PostgresServer", _FakePg)
+    monkeypatch.setattr(launcher_module, "RedisServer", _FakeRedis)
+
+    settings = _settings(tmp_path, pg_enabled=True, redis_enabled=True, run_migrations=True)
+
+    async def scenario() -> None:
+        with pytest.raises(MigrationError) as excinfo:
+            await launcher_module.bootstrap(settings)
+        assert excinfo.value.code == CODE_MIGRATION_FAILED
+
+    asyncio.run(scenario())
+    # 顺序：先 Redis 再 PG（与正常收尾一致）
+    assert stopped == ["redis", "pg"]
 
 
 # ------------------------------------------------------------------ stdin EOF 看护
