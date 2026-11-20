@@ -65,9 +65,10 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 #: 状态文件的格式版本。与 `frontend-vue/electron/runtime-state.cjs::STATE_SCHEMA`
 #: 是同一个数：读不懂的版本一律拒绝，绝不"猜字段"。
@@ -982,7 +983,7 @@ def build_report(checks: list[Check], meta: dict[str, Any]) -> dict[str, Any]:
     """组装机器可读报告。**不含 token**（meta 由调用方保证只放端口/路径）。"""
     counts = summarize(checks)
     return {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "ok": exit_code(checks) == 0,
         "counts": counts,
         "meta": meta,
@@ -1016,8 +1017,26 @@ def render_text(report: dict[str, Any]) -> str:
         f"汇总：PASS={counts.get(PASS, 0)}  FAIL={counts.get(FAIL, 0)}  "
         f"SKIP={counts.get(SKIP, 0)}  INFO={counts.get(INFO, 0)}"
     )
-    lines.append("结论：" + ("通过（无 FAIL）" if report.get("ok") else "存在 FAIL，重建不可验收"))
+    failed = [f"{c['id']}（{c['title']}）" for c in report["checks"] if c["status"] == FAIL]
+    if failed:
+        lines.append("FAIL 项：" + "、".join(failed))
+    lines.append("结论：" + _verdict(report))
     return "\n".join(lines)
+
+
+def _verdict(report: dict[str, Any]) -> str:
+    """"失败"要分两种说：环境没起来 ≠ 这一版重建坏了。
+
+    混为一谈的后果是运维拿着"重建不可验收"去回滚一个其实没问题的版本，或者
+    反过来对着一个坏版本重试"是不是应用没启动"。
+    """
+    counts = report.get("counts") or {}
+    if counts.get(FAIL, 0) == 0:
+        return "通过（无 FAIL）"
+    kind = str((report.get("meta") or {}).get("fatal_kind") or "")
+    if kind in ("unreachable", "session", "state"):
+        return "环境不具备：先让桌面应用正常起来（不是重建缺陷，退出码 2）"
+    return "存在 FAIL，重建不可验收"
 
 
 # ── 编排（IO 全部走可注入的 transport）───────────────────────────────────
@@ -1234,7 +1253,7 @@ def main(
     except StateError as exc:
         report = build_report(
             [Check(id="0a", title="runtime-state 可读", status=FAIL, detail=str(exc), hint="启动桌面应用后重跑")],
-            {"runtime_state_path": state_path, "fatal": str(exc), "base_url": args.base_url or ""},
+            {"runtime_state_path": state_path, "fatal": str(exc), "fatal_kind": "state", "base_url": args.base_url or ""},
         )
         return emit(report, 2)
 

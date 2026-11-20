@@ -60,11 +60,15 @@ $env:PYTHONIOENCODING = 'utf-8'
 # Interpreter order: explicit override, then the Windows `py` launcher, then
 # `python`. Each candidate is probed by actually running it: on Windows
 # `python` is often the Store alias, which exists but cannot execute.
+#
+# The probe uses `-c "import sys"` (a non-empty argument on purpose): Windows
+# PowerShell drops empty-string arguments when invoking a native exe, so
+# `-c ""` reaches py.exe as a bare `-c` and fails with "Argument expected".
 $pyExe = $null
 $pyPrefix = @()
 if ($env:CHIRON_VERIFY_PYTHON) {
     $candidate = $env:CHIRON_VERIFY_PYTHON
-    & $candidate -c "" 2>$null
+    & $candidate -c "import sys" *> $null
     if ($LASTEXITCODE -eq 0) { $pyExe = $candidate }
 }
 if (-not $pyExe) {
@@ -72,14 +76,14 @@ if (-not $pyExe) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
         if (-not $cmd) { continue }
         if ($name -eq 'py') {
-            & $cmd.Source -3 -c "" 2>$null
+            & $cmd.Source -3 -c "import sys" *> $null
             if ($LASTEXITCODE -eq 0) {
                 $pyExe = $cmd.Source
                 $pyPrefix = @('-3')
                 break
             }
         } else {
-            & $cmd.Source -c "" 2>$null
+            & $cmd.Source -c "import sys" *> $null
             if ($LASTEXITCODE -eq 0) {
                 $pyExe = $cmd.Source
                 break
