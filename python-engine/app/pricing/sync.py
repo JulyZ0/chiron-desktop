@@ -379,7 +379,7 @@ async def _fetch_source(
             payload = resp.json()
     except Exception as exc:  # noqa: BLE001 — 外部数据源的任何问题都不该打断同步循环
         MODEL_PRICE_SYNC.labels(outcome="fetch_failed", source=name).inc()
-        logger.warning("model price fetch failed (%s): %s", name, str(exc)[:160])
+        logger.warning("model price fetch failed (%s): %s", name, sanitize_reason(exc, limit=160))
         _report(f"{type(exc).__name__}: {exc}")
         return None
     if not isinstance(payload, dict):
@@ -390,7 +390,7 @@ async def _fetch_source(
         parsed = parser(payload, provider=provider)
     except Exception as exc:  # noqa: BLE001 — 源改了结构 = 解析失败，按"这轮没数据"处理
         MODEL_PRICE_SYNC.labels(outcome="parse_failed", source=name).inc()
-        logger.warning("model price parse failed (%s): %s", name, str(exc)[:160])
+        logger.warning("model price parse failed (%s): %s", name, sanitize_reason(exc, limit=160))
         _report(f"parse: {type(exc).__name__}: {exc}")
         return None
     if not isinstance(parsed, dict):
