@@ -123,34 +123,24 @@ func (dbPriceStore) ResolveProviders(ctx context.Context, models []string) map[s
 		return out
 	}
 	rows, err := db.GlobalDBManager.FetchAll(ctx, `
-		SELECT model, min(provider) AS provider
-		  FROM (
-		      SELECT btrim(name)     AS model, btrim(provider) AS provider
-		        FROM llm_models
-		       WHERE name = ANY($1::text[])
-		         AND provider IS NOT NULL AND btrim(provider) <> ''
-		      UNION ALL
-		      SELECT btrim(id)       AS model, btrim(provider) AS provider
-		        FROM llm_models
-		       WHERE id = ANY($1::text[])
-		         AND provider IS NOT NULL AND btrim(provider) <> ''
-		  ) s
-		 GROUP BY model
-		HAVING count(DISTINCT provider) = 1`, models)
+		SELECT btrim(name)     AS model, btrim(provider) AS provider
+		  FROM llm_models
+		 WHERE name = ANY($1::text[])
+		   AND provider IS NOT NULL AND btrim(provider) <> ''
+		UNION ALL
+		SELECT btrim(id)       AS model, btrim(provider) AS provider
+		  FROM llm_models
+		 WHERE id = ANY($1::text[])
+		   AND provider IS NOT NULL AND btrim(provider) <> ''`, models)
 	if err != nil {
 		// 反查失败不是导入失败：provider 只是归属信息，留空后价格照样能查到
 		// （读侧不按 provider 过滤）。
 		slog.Warn("model price import: provider resolve failed", "models", len(models), "error", err)
 		return out
 	}
-	for _, row := range rows {
-		model := stringOf(row["model"])
-		provider := strings.TrimSpace(stringOf(row["provider"]))
-		if model != "" && provider != "" {
-			out[model] = provider
-		}
-	}
-	return out
+	// 歧义规则与历史回填**共用同一个纯函数**（见 billing_price_provider_map.go）：
+	// 同名模型对应多个厂商时两边都留空，不会出现"导入填了、回填又改成另一个"。
+	return collapseProviderMap(toModelProviderRows(rows))
 }
 
 // WithTx 在一个事务里执行 fn（任何错误都回滚）。
