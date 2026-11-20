@@ -84,12 +84,15 @@ func TestMonitorMigrationChainSingleHead(t *testing.T) {
 	if len(heads) != 1 {
 		t.Fatalf("迁移链有 %d 个 head（应为 1）: %v", len(heads), heads)
 	}
-	// 当前链头由 0005 占据；0003 必须在链上且只有一个父（0002）。
-	if heads[0] != "0005_share_ops" {
-		t.Fatalf("链头应为 0005_share_ops，实际 %q", heads[0])
+	// 当前链头由 0006 占据；0003/0006 必须在链上且各只有一个父。
+	if heads[0] != "0006_metrics_rollup_instance" {
+		t.Fatalf("链头应为 0006_metrics_rollup_instance，实际 %q", heads[0])
 	}
 	if migs["0003_metrics_rollup"].down != "0002_inapp_notifications" {
 		t.Fatalf("0003 的 down_revision 被改动了: %q", migs["0003_metrics_rollup"].down)
+	}
+	if migs["0006_metrics_rollup_instance"].down != "0005_share_ops" {
+		t.Fatalf("0006 必须接在 0005 之后，实际 %q", migs["0006_metrics_rollup_instance"].down)
 	}
 }
 
@@ -122,5 +125,33 @@ func TestMonitorMigrationRollupTableShape(t *testing.T) {
 	// revision 标识本身不能被改动 —— 后续迁移依赖它。
 	if !strings.Contains(body, `revision: str = "0003_metrics_rollup"`) {
 		t.Fatalf("0003 的 revision 标识被改动了")
+	}
+}
+
+// TestMonitorMigrationRollupInstanceColumn 钉住 0006：instance 列存在、默认空串
+// （存量行不必回填），且 downgrade 可重复执行。
+//
+// 少这一列时 rollup 写入会在运行期报 "column instance does not exist" ——
+// 表现为监控历史永远为空，而错误只出现在日志里。
+func TestMonitorMigrationRollupInstanceColumn(t *testing.T) {
+	migs := migrationFiles(t)
+	m, ok := migs["0006_metrics_rollup_instance"]
+	if !ok {
+		t.Fatalf("缺少 0006_metrics_rollup_instance 迁移")
+	}
+	body := m.body
+	for _, frag := range []string{
+		"ALTER TABLE public.metrics_rollup_minute",
+		"ADD COLUMN IF NOT EXISTS instance text NOT NULL DEFAULT ''",
+	} {
+		if !strings.Contains(body, frag) {
+			t.Fatalf("0006 upgrade 缺少 %q", frag)
+		}
+	}
+	if !strings.Contains(body, "DROP COLUMN IF EXISTS instance") {
+		t.Fatalf("0006 downgrade 必须可重复执行地删列")
+	}
+	if !strings.Contains(body, `revision: str = "0006_metrics_rollup_instance"`) {
+		t.Fatalf("0006 的 revision 标识被改动了")
 	}
 }
