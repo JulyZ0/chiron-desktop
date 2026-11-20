@@ -24,9 +24,13 @@ import { SafetyOutlined, ReloadOutlined, WarningOutlined } from '@ant-design/ico
 import { useI18n } from 'vue-i18n'
 import {
   clearIsolationLevel,
+  getIsolationHelper,
   getIsolationStatus,
   revokeIsolationArtifacts,
   setIsolationLevel,
+  startIsolationHelper,
+  stopIsolationHelper,
+  type IsolationHelperStatus,
   type IsolationLevel,
   type IsolationStatus,
 } from '../../api'
@@ -44,6 +48,16 @@ const status = ref<IsolationStatus | null>(null)
 const loadError = ref('')
 /** 待切换的档位（提交前先记下来，避免提交中状态抖回旧值） */
 const pendingLevel = ref<IsolationLevel | null>(null)
+/**
+ * 提权助手状态。
+ *
+ * `null` 有明确含义：**还没问到**（或问失败）。与 `{available: false}` 不同 ——
+ * 后者是"问了，答案是不可用"。混用会让某一帧闪出"助手不可用"的假象，
+ * 而这正好是本面板最容易被误读的一条信息。
+ */
+const helperStatus = ref<IsolationHelperStatus | null>(null)
+/** 启停助手进行中（UAC 弹窗期间可能停留数秒，必须给按钮加 loading） */
+const helperBusy = ref(false)
 
 /** 档位由弱到强，与后端 `_ORDER` 严格一致 */
 const ALL_LEVELS: IsolationLevel[] = ['none', 'job', 'low_il', 'restricted', 'appcontainer']
@@ -111,6 +125,7 @@ async function load() {
   loadError.value = ''
   try {
     status.value = await getIsolationStatus()
+    await loadHelper()
   } catch (err) {
     const status401 = (err as { response?: { status?: number } })?.response?.status === 401
     if (status401) {
@@ -118,6 +133,7 @@ async function load() {
       if (ready) {
         try {
           status.value = await getIsolationStatus()
+          await loadHelper()
           return
         } catch (retryErr) {
           loadError.value = serverErrorMessage(retryErr, t('settings.isolation_auth_pending'))
@@ -130,6 +146,24 @@ async function load() {
     loadError.value = serverErrorMessage(err, t('settings.isolation_load_failed'))
   } finally {
     loading.value = false
+  }
+}
+
+/**
+ * 拉取提权助手状态。
+ *
+ * **失败不许影响面板**：helper 只是 `restricted` 档的前置条件，它探测失败时面板
+ * 其余部分（当前档位、其它档位、撤销入口）全都有效。把整块面板打成"加载失败"，
+ * 等于让一个附加信息的故障掩盖掉主信息。
+ *
+ * 所以这里单独 try/catch，失败时把 `helperStatus` 留在 `null`（未知），
+ * 让界面说"查不到"而不是谎称"不可用"。
+ */
+async function loadHelper() {
+  try {
+    helperStatus.value = await getIsolationHelper()
+  } catch {
+    helperStatus.value = null
   }
 }
 
@@ -230,6 +264,103 @@ async function revokeArtifacts() {
     message.error(serverErrorMessage(err, t('settings.isolation_revoke_failed')))
   } finally {
     revoking.value = false
+  }
+}
+
+/**
+ * 「`restricted` 为什么是灰的」—— 这个档位不可选，是不是就缺这个助手？
+ *
+ * 判据是**两件事同时成立**：档位不在 `selectable` 里，且助手确实不可用。
+ * 只看助手状态不够 —— 引擎自己已提权时 `restricted` 走本地路径、根本不需要助手，
+ * 此时助手显示"未运行"是完全正常的，不该催用户去点 UAC。
+ */
+const restrictedNeedsHelper = computed(() => {
+  if (helperStatus.value?.engine_elevated) return false
+  if (isSelectable('restricted')) return false
+  return helperStatus.value !== null && !helperStatus.value.available
+})
+
+/** 助手是否已在运行（可用即视为运行中：探测成功就是它活着） */
+const helperRunning = computed(() => helperStatus.value?.available === true)
+
+/**
+ * 是否展示助手这一节。
+ *
+ * 平台不支持时整节隐藏：展示一个永远点不动的按钮，等于把"你的系统不行"
+ * 伪装成一个可以操作的问题。
+ */
+const showHelperSection = computed(() => helperStatus.value?.supported !== false)
+
+async function enableHelper() {
+  if (helperBusy.value) return
+  // 弹 UAC 之前先说清楚"你将要同意什么"。这一步不能省 —— 用户点这一下之后
+  // 出现的是系统级弹窗，那时候再解释已经晚了。
+  const confirmed = await new Promise<boolean>((resolve) => {
+    Modal.confirm({
+      title: t('settings.isolation_helper_title'),
+      content: t('settings.isolation_helper_confirm'),
+      okText: t('settings.isolation_helper_enable'),
+      cancelText: t('common.cancel'),
+      onOk: () => resolve(true),
+      onCancel: () => resolve(false),
+    })
+  })
+  if (!confirmed) return
+
+  helperBusy.value = true
+  try {
+    const result = await startIsolationHelper()
+    status.value = result
+    helperStatus.value = result.helper
+    if (result.ok) {
+      message.success(t('settings.isolation_helper_enabled'))
+    } else if (result.cancelled) {
+      // 用户主动拒绝 UAC：正常选择，用 info 而不是 error。
+      message.info(t('settings.isolation_helper_cancelled'))
+    } else {
+      message.error(t('settings.isolation_helper_enable_failed', { reason: result.reason }))
+    }
+  } catch (err) {
+    message.error(
+      serverErrorMessage(
+        err,
+        t('settings.isolation_helper_enable_failed', {
+          reason: t('settings.isolation_unavailable_unknown'),
+        }),
+      ),
+    )
+  } finally {
+    helperBusy.value = false
+  }
+}
+
+async function disableHelper() {
+  if (helperBusy.value) return
+  helperBusy.value = true
+  try {
+    const result = await stopIsolationHelper()
+    status.value = result
+    helperStatus.value = result.helper
+    if (result.ok) {
+      message.success(t('settings.isolation_helper_disabled'))
+    } else {
+      message.error(
+        t('settings.isolation_helper_disable_failed', {
+          reason: result.reason || t('settings.isolation_unavailable_unknown'),
+        }),
+      )
+    }
+  } catch (err) {
+    message.error(
+      serverErrorMessage(
+        err,
+        t('settings.isolation_helper_disable_failed', {
+          reason: t('settings.isolation_unavailable_unknown'),
+        }),
+      ),
+    )
+  } finally {
+    helperBusy.value = false
   }
 }
 
@@ -369,6 +500,66 @@ onMounted(load)
         </div>
       </div>
 
+      <!--
+        提权助手：`restricted` 档的前置条件。
+        只在"缺它会导致该档不可选"或"它已经在跑"时才显眼；引擎自己已提权时
+        这一档根本不需要助手，此时不该催用户去点一次 UAC。
+      -->
+      <div
+        v-if="showHelperSection"
+        class="iso-helper"
+      >
+        <div class="iso-helper-head">
+          <div class="iso-helper-title">
+            {{ $t('settings.isolation_helper_title') }}
+          </div>
+          <a-tag :color="helperRunning ? 'green' : 'default'">
+            {{
+              helperRunning
+                ? $t('settings.isolation_helper_running')
+                : $t('settings.isolation_helper_stopped')
+            }}
+          </a-tag>
+        </div>
+        <p class="iso-helper-body">
+          {{ $t('settings.isolation_helper_body') }}
+        </p>
+        <!-- 助手不可用且正是它挡住了 restricted：把因果讲明，别让用户对着灰按钮猜 -->
+        <a-alert
+          v-if="restrictedNeedsHelper"
+          type="warning"
+          show-icon
+          class="iso-alert"
+          :message="$t('settings.isolation_helper_blocked')"
+          :description="helperStatus?.detail || ''"
+        />
+        <div
+          v-if="helperStatus?.engine_elevated"
+          class="iso-helper-note"
+        >
+          {{ $t('settings.isolation_helper_engine_elevated') }}
+        </div>
+        <div class="iso-actions">
+          <a-button
+            v-if="!helperRunning"
+            type="primary"
+            :loading="helperBusy"
+            :disabled="helperBusy"
+            @click="enableHelper"
+          >
+            {{ $t('settings.isolation_helper_enable') }}
+          </a-button>
+          <a-button
+            v-else
+            :loading="helperBusy"
+            :disabled="helperBusy"
+            @click="disableHelper"
+          >
+            {{ $t('settings.isolation_helper_disable') }}
+          </a-button>
+        </div>
+      </div>
+
       <!-- 撤销：设置层 -->
       <div class="iso-actions">
         <a-button
@@ -462,6 +653,16 @@ onMounted(load)
 
 .iso-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
 .iso-action-hint { color: var(--text-secondary); font-size: 12px; }
+
+.iso-helper {
+  padding: 14px 0 16px;
+  margin-bottom: 4px;
+  border-top: var(--hairline-width) solid var(--border-card, var(--border));
+}
+.iso-helper-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.iso-helper-title { font-weight: var(--fw-semibold); color: var(--text-primary); }
+.iso-helper-body { margin: 0 0 10px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.iso-helper-note { margin-bottom: 10px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
 
 .iso-revoke {
   padding-top: 16px;

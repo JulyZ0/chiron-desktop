@@ -424,6 +424,31 @@ _appcontainer_ok: bool | None = None
 _labeled_workspaces: set[str] = set()
 
 
+def reset_probes() -> None:
+    """清掉**档位可用性**的探测缓存，让下一次 `status()` 重新实测。
+
+    为什么需要：本模块的 `_restricted_ok` 与 `win_launch` 的 `_smoke_ok` 是
+    **两份独立缓存**。用户点"启用受限令牌助手"之后，helper 起来了、
+    `win_launch` 那边也清过了，但这里的 `_restricted_ok` 仍是 `False` ——
+    于是 `selectable` 里依旧没有 `restricted`，界面上表现成
+    "UAC 授权成功了，档位却还是灰的"。
+
+    同样的道理适用于撤销授权（helper 停了要立刻变回不可选）。所以两个方向
+    都在改动后调一次，而不是只清一边。
+    """
+    global _job_ok, _low_il_ok, _restricted_ok, _appcontainer_ok
+    _job_ok = None
+    _low_il_ok = None
+    _restricted_ok = None
+    _appcontainer_ok = None
+    try:
+        from app.isolation import win_launch
+
+        win_launch.reset_probe()
+    except Exception as exc:  # noqa: BLE001 — 复位失败不该让状态查询整个失败
+        logger.warning("isolation probe cache reset failed: %s", exc)
+
+
 def _ensure_workspace_low_label(path: str) -> tuple[bool, str]:
     """确保工作区带 Low 完整性标签（幂等，结果缓存）。
 
@@ -991,6 +1016,7 @@ __all__ = [
     "parse_level",
     "record_level_change",
     "require_or_raise",
+    "reset_probes",
     "resolve_level",
     "revoke_all",
     "runtime_override",

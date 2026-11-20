@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 from typing import Any
@@ -221,3 +222,100 @@ async def revoke_isolation(request: Request) -> dict[str, Any]:
         reason="撤销磁盘产物",
     )
     return {"ok": True, **result}
+
+
+# ── 提权 helper（受限令牌的执行前置） ─────────────────────────────
+#
+# 为什么这必须是一个**用户显式触发**的端点：它弹一次 UAC，而用户同意的是
+# "提权执行通道"。引擎自己在启动时静默弹窗是不可接受的 —— 用户不知道自己在
+# 同意什么。所以这条路只能由设置页的按钮走到这里。
+#
+# 为什么不需要额外做"仅本地可调"限制：`_verify_gateway_key` 已经要求网关凭据，
+# 而网关本身只听本机回环（桌面端形态）。
+
+
+@router.get("/isolation/helper")
+async def get_helper(request: Request) -> dict[str, Any]:
+    """提权 helper 的当前状态。
+
+    单列一个端点而不是塞进 ``GET /isolation``：``status()`` 会被高频调用
+    （面板每次刷新、档位每次解析），而 helper 探测要发一次 HTTP ping，
+    混进去会让本来常数时间的状态查询多一跳网络。
+    """
+    _verify_gateway_key(request)
+    return await asyncio.to_thread(_helper_status_payload)
+
+
+def _helper_status_payload() -> dict[str, Any]:
+    from app.isolation import win_launch
+
+    return win_launch.helper_status()
+
+
+@router.post("/isolation/helper")
+async def start_helper(request: Request) -> dict[str, Any]:
+    """启动提权 helper（**会弹一次 UAC**），等它就绪后返回最新状态。
+
+    失败不抛 500：UAC 被取消是用户的正常选择，不是服务器错误。回
+    ``{ok: false, reason}`` 让前端能把"你取消了"与"起不来"分开说。
+
+    启动成功后必须清探测缓存 —— 否则 ``selectable`` 里依旧没有 ``restricted``，
+    用户会看到"授权成功了但档位还是灰的"。
+    """
+    _verify_gateway_key(request)
+
+    from app.isolation import win_launch
+
+    ok, reason, cancelled = await asyncio.to_thread(win_launch.helper_start)
+    if ok:
+        # 两份缓存（本包的 `_restricted_ok` 与 win_launch 的 `_smoke_ok`）一起清。
+        iso.reset_probes()
+
+    iso.record_level_change(
+        action="helper_start",
+        requested=iso.configured_level().value,
+        effective=iso.resolve_level().effective.value,
+        previous=None,
+        actor=_actor(request),
+        reason="" if ok else ("用户取消 UAC" if cancelled else f"失败：{reason}"),
+    )
+    return {
+        "ok": ok,
+        # `cancelled` 单独给一个字段而不是靠解析 `reason` 文本：前端要据此选
+        # 「你取消了授权」还是「启用失败」两种完全不同的提示，而 `reason` 是
+        # 人类可读字符串、措辞会随版本变化。
+        "cancelled": cancelled,
+        "reason": "" if ok else (reason or "提权助手启动失败"),
+        "helper": await asyncio.to_thread(_helper_status_payload),
+        **iso.status(),
+    }
+
+
+@router.delete("/isolation/helper")
+async def stop_helper(request: Request) -> dict[str, Any]:
+    """停用提权 helper（由它自己退出，引擎无权杀 High IL 进程）。
+
+    幂等：本来没在跑也返回 ``ok: true``。
+    """
+    _verify_gateway_key(request)
+
+    from app.isolation import win_launch
+
+    ok, reason = await asyncio.to_thread(win_launch.helper_stop)
+    iso.reset_probes()
+
+    iso.record_level_change(
+        action="helper_stop",
+        requested=iso.configured_level().value,
+        effective=iso.resolve_level().effective.value,
+        previous=None,
+        actor=_actor(request),
+        reason="" if ok else f"失败：{reason}",
+    )
+    return {
+        "ok": ok,
+        "reason": "" if ok else (reason or "提权助手未能退出"),
+        "helper": await asyncio.to_thread(_helper_status_payload),
+        **iso.status(),
+    }
+

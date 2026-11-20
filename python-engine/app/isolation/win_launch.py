@@ -427,12 +427,171 @@ def launch_restricted(
 ) -> LaunchResult:
     """以受限令牌 + 独立桌面启动 `argv`，等待其结束并取回输出。
 
+    ## 两条执行路径
+
+    1. **提权 helper**（优先）：`CreateProcessAsUserW` 需要 `SeIncreaseQuotaPrivilege`，
+       只有提权令牌才有。引擎自己不提权（它承载模型输出，爆炸半径最大），所以
+       正常路径是把请求交给那个瘦 helper 去做。
+    2. **本进程直接建**：仅当本进程恰好已提权（用户以管理员运行引擎）。
+
+    两条路径都失败时才返回 `spawn_error`。**绝不**退回无隔离执行 ——
+    `spawn_error` 非空就是"拒绝执行"。
+
     失败语义区分得很清楚：
     * `spawn_error` 非空 ⇒ 进程没起来（令牌/桌面/管道任一步失败）。调用方应据此
       **拒绝执行**，而不是退回无隔离路径 —— 那才是"沙箱不可用时拒绝启动"的兑现。
     * `exit_code` 非空 ⇒ 进程已结束，非 0 是子进程自己的事。
 
     超时后 `TerminateProcess` 直接终结，不等它优雅退出：受限进程可能卡在等输入上。
+    """
+    helper_result = _via_helper(argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output)
+    if helper_result is not None:
+        # helper 起来了，或者本进程也没提权（没有第二条路可走）——
+        # 两种情况都如实返回，让调用方按 fail-closed 处理。
+        if helper_result.started or not is_admin():
+            return helper_result
+        logger.warning(
+            "helper 执行失败（%s），本进程已提权，改走本地路径", helper_result.spawn_error
+        )
+
+    return _launch_restricted_local(
+        argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output
+    )
+
+
+def _via_helper(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+    max_output: int,
+) -> LaunchResult | None:
+    """交给提权 helper 执行。helper 不可用时返回 `None`（表示"这条路不适用"）。
+
+    这里把"不可用"与"执行失败"分开：前者该让调用方另寻路径（本进程提权），
+    后者是一次真实失败，不该被悄悄重试掉。
+    """
+    ok, reason = helper_available()
+    if not ok:
+        logger.debug("restricted 不走 helper: %s", reason)
+        return None
+    client = _helper_client()
+    if client is None:
+        return None
+    return client.helper_exec(
+        argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output
+    )
+
+
+def helper_available() -> tuple[bool, str]:
+    """提权 helper 是否可用于执行 `restricted`。返回 `(ok, 原因)`。"""
+    client = _helper_client()
+    if client is None:
+        return False, "helper 客户端不可用"
+    try:
+        return client.available()
+    except Exception as exc:  # noqa: BLE001 — 探测异常按"不可用"（fail-closed）
+        return False, f"helper 探测异常: {type(exc).__name__}: {exc}"
+
+
+def _helper_client() -> Any:
+    """延迟取得 helper 客户端。
+
+    `elevated_client` 顶层 `from app.isolation.win_launch import LaunchResult`，
+    在模块顶部导入会成环，所以只能在这里取。
+    """
+    try:
+        from app.isolation import elevated_client
+
+        return elevated_client
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("helper 客户端导入失败: %s", exc)
+        return None
+
+
+def helper_start(parent_pid: int | None = None) -> tuple[bool, str, bool]:
+    """以管理员权限启动提权 helper，等它就绪。返回 `(ok, 原因, 是否用户取消)`。
+
+    **只能由用户显式操作触发**（设置页按钮 → 引擎端点）。引擎启动时静默弹 UAC
+    是不可接受的：用户不知道自己在同意什么，而同意的是"提权执行通道"。
+
+    这里把"启动"与"等就绪"合成一步：调用方（前端）只关心"现在能不能用"。
+    UAC 同意后 helper 还要绑端口、写端口文件，中间有一段不可用窗口；若只返回
+    "UAC 已同意"，前端会立刻把档位点亮，而实际执行还在撞 `err=5`。
+
+    第三个返回值一路透传到界面，让"你取消了 UAC"与"真的起不来"分开呈现：
+    前者不需要排障，后者需要看 `reason`。
+    """
+    client = _helper_client()
+    if client is None:
+        return False, "helper 客户端不可用", False
+
+    ok, reason, cancelled = client.spawn_elevated(parent_pid)
+    if not ok:
+        return False, reason, cancelled
+
+    ready, wait_reason = client.wait_ready()
+    if not ready:
+        # UAC 同意了但它没起来：把原因如实带出去，别让用户以为"授权成功了"。
+        return False, f"helper 已启动但未就绪（{wait_reason or '未知原因'}）", False
+
+    # 就绪后必须清探测缓存：`_probe_restricted` 之前算出的"不可用"现在过期了。
+    # 漏了这一步，用户会看到"授权成功了但档位还是灰的"。
+    reset_probe()
+    return True, "", False
+
+
+def helper_stop() -> tuple[bool, str]:
+    """请求提权 helper 自行退出。返回 `(ok, 原因)`。
+
+    幂等：本来没在跑时返回 `(True, "")`。
+
+    **不能**用 `TerminateProcess`：引擎是 Medium IL，helper 是 High IL，
+    Medium 对 High 调 `PROCESS_TERMINATE` 会 err=5。所以只能请求它自己退
+    （见 `elevated_client.stop` 与 helper 的 `/v1/shutdown`）。
+    """
+    client = _helper_client()
+    if client is None:
+        return False, "helper 客户端不可用"
+    ok, reason = client.stop()
+    reset_probe()
+    return ok, reason
+
+
+def helper_status() -> dict[str, Any]:
+    """helper 的完整状态快照，供设置页展示。
+
+    字段刻意分开，因为它们的**处置方式不同**：
+
+    * `available` —— 现在能不能用（`restricted` 可不可选就看它）；
+    * `detail` —— 不能用的具体原因（缺端口文件 / 无响应 / 没提权）；
+    * `engine_elevated` —— 引擎自己是否提权。为真时 `restricted` 走本地路径，
+      不需要 helper；为假才需要这个助手，界面的说明要跟着变。
+    """
+    ok, reason = helper_available()
+    return {
+        "available": ok,
+        "detail": "" if ok else (reason or "提权助手不可用"),
+        "engine_elevated": is_admin(),
+        # helper 只在 Windows 上有意义；非 Windows 直接不可用（`helper_available`
+        # 已经这么判了），这里多给一个字段让前端不必自己判平台。
+        "supported": bool(win.IS_WINDOWS),
+    }
+
+
+def _launch_restricted_local(
+    argv: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+    max_output: int,
+) -> LaunchResult:
+    """在本进程内直接用 `CreateProcessAsUserW` 建进程。
+
+    需要 `SeIncreaseQuotaPrivilege`，因此只在引擎本身已提权时才可能成功。
+    非提权下稳定 `err=5` —— 这是本机实测结论，不是推断。
     """
     if not win.IS_WINDOWS:
         return LaunchResult(None, "", "", "not windows")
@@ -1123,11 +1282,31 @@ def open_restricted_session(
     """以受限令牌起一个**常驻**进程。成功返回 `(session, "")`。
 
     失败返回 `(None, 原因)` —— 调用方必须据此拒绝执行，不得退回无隔离路径。
+
+    ## 为什么它不能走提权 helper
+
+    helper 是**一次性**执行模型（收一条请求 → 起进程 → 读完两根管道 → 回结果），
+    而常驻会话要求 stdin 在进程存活期间可以增量写入 —— 两者不兼容。
+
+    这带来一个真实的限制：**引擎未提权时，`restricted` 档的 `shell_exec` 可用
+    （走 helper），但 `persistent_shell` / `run_code` 不可用**（它们要常驻会话）。
+    这个差异必须如实报出来，而不是让调用方撞上 `err=5` —— 那会把"设计限制"
+    伪装成"机制坏了"。所以这里在动手前先判一次，给出可操作的原因。
     """
     if not win.IS_WINDOWS:
         return None, "not windows"
     if not argv:
         return None, "empty argv"
+
+    if not is_admin():
+        helper_ok, _helper_reason = helper_available()
+        if helper_ok:
+            # helper 在跑说明 restricted 档整体是"可达"的，但这一条路只能一次性执行。
+            return None, (
+                "常驻受限会话需要在引擎进程内直接建进程（CreateProcessAsUserW 需要 "
+                "SeIncreaseQuotaPrivilege），而提权 helper 只提供一次性执行；"
+                "引擎当前未提权"
+            )
 
     made = win_token.create_restricted_token()
     if made is None:
@@ -1328,6 +1507,15 @@ def reset_probe() -> None:
     # AppContainer 的探测结果同样要清：重新探测的前提是"上次的结论不再可信"。
     _appcontainer_ok = None
     _appcontainer_error = ""
+    # helper 的探测缓存也必须清：它正是"用户刚点了启用助手"之后要让
+    # `restricted` 从不可选变成可选的那个开关。漏在这里，用户会看到
+    # "授权成功了但档位还是灰的"。
+    client = _helper_client()
+    if client is not None:
+        try:
+            client.reset_probe()
+        except Exception as exc:  # noqa: BLE001 — 复位失败不应让整个探测失效
+            logger.debug("reset helper probe failed: %s", exc)
 
 
 __all__ = [
@@ -1343,6 +1531,10 @@ __all__ = [
     "ensure_desktop",
     "exec_error",
     "exec_ready",
+    "helper_available",
+    "helper_start",
+    "helper_status",
+    "helper_stop",
     "is_admin",
     "launch_appcontainer",
     "launch_restricted",

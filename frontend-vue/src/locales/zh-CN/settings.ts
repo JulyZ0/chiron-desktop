@@ -219,6 +219,24 @@ export default {
   isolation_revoke_partial: "部分痕迹未能清除，请查看详情：{detail}",
   isolation_revoke_failed: "清除隔离痕迹失败。",
 
+  isolation_helper_title: "受限令牌执行助手",
+  isolation_helper_body:
+    "「受限令牌」档位需要以受限令牌创建进程，而这一步要求管理员权限。为了让主程序不必整体提权，这里只提权一个功能极小的助手进程：它唯一能做的是「用受限令牌起进程」，权限比主程序更低。助手随主程序退出而自动结束。",
+  isolation_helper_enable: "启用助手（需要管理员授权）",
+  isolation_helper_disable: "停用助手",
+  isolation_helper_running: "助手运行中",
+  isolation_helper_stopped: "助手未运行",
+  isolation_helper_blocked: "「受限令牌」档位因此不可选。启用助手后即可切换。",
+  isolation_helper_engine_elevated: "主程序已以管理员身份运行，本档位无需助手。",
+  isolation_helper_unsupported: "当前平台不支持提权助手，本档位不可用。",
+  isolation_helper_confirm:
+    "接下来会弹出系统授权窗口（UAC），请选择「是」。助手只获得「用受限令牌起进程」这一项能力，不会以管理员权限执行你的任何命令。",
+  isolation_helper_enabled: "助手已启用，「受限令牌」档位现在可选。",
+  isolation_helper_cancelled: "已取消授权：系统授权窗口未同意，助手没有启动。",
+  isolation_helper_enable_failed: "启用助手失败：{reason}",
+  isolation_helper_disabled: "助手已停用。",
+  isolation_helper_disable_failed: "停用助手失败：{reason}",
+
   isolation_load_failed: "读取隔离档位失败。",
   isolation_auth_pending: "本机会话尚未就绪，暂时读不到隔离档位。确认本地服务已启动后重试。",
   isolation_changed: "已切换到「{level}」。",

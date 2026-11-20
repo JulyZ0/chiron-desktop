@@ -105,10 +105,18 @@ def exec_unavailable_reason() -> str:
     if win_launch.exec_ready():
         return ""
     detail = win_launch.exec_error()
-    return (
-        f"受限令牌执行层不可用（{detail or '未知原因'}）；"
-        "需要以管理员身份运行引擎以获得 SeIncreaseQuotaPrivilege"
-    )
+
+    # 提示必须指向**正确的做法**。此前这里写"以管理员身份运行引擎"，那是把整个
+    # 引擎提权 —— 而引擎承载模型输出，正是最不该提权的进程。现在的正解是只提权
+    # 那个瘦 helper，所以文案跟着改，否则用户会按旧提示去做错事。
+    helper_ok, helper_reason = win_launch.helper_available()
+    if not helper_ok:
+        return (
+            f"受限令牌执行层不可用（{detail or '未知原因'}）；"
+            f"提权 helper 不可用（{helper_reason or '未启动'}）——"
+            "请在设置页启用「受限令牌执行助手」（会请求一次管理员授权）"
+        )
+    return f"受限令牌执行层不可用（{detail or '未知原因'}）"
 
 
 class _LUID(ctypes.Structure):

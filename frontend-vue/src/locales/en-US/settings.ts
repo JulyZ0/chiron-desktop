@@ -219,6 +219,28 @@ export default {
   isolation_revoke_partial: "Some artifacts could not be removed; see details: {detail}",
   isolation_revoke_failed: "Failed to remove isolation artifacts.",
 
+  isolation_helper_title: "Restricted-token execution helper",
+  isolation_helper_body:
+    "The \"restricted token\" tier needs processes created with a restricted token, and that step requires administrator rights. Rather than elevating the whole app, only a tiny helper process is elevated: its sole capability is \"start a process with a restricted token\", which is less privileged than the app itself. The helper exits automatically when the app exits.",
+  isolation_helper_enable: "Enable helper (requires administrator approval)",
+  isolation_helper_disable: "Disable helper",
+  isolation_helper_running: "Helper running",
+  isolation_helper_stopped: "Helper not running",
+  isolation_helper_blocked:
+    "The \"restricted token\" tier is therefore unavailable. Enable the helper to switch to it.",
+  isolation_helper_engine_elevated:
+    "The app is already running as administrator, so this tier needs no helper.",
+  isolation_helper_unsupported:
+    "This platform does not support the elevated helper, so this tier is unavailable.",
+  isolation_helper_confirm:
+    "A system authorization prompt (UAC) will appear next; choose \"Yes\". The helper gains exactly one capability — starting processes with a restricted token — and will not run your commands as administrator.",
+  isolation_helper_enabled: "Helper enabled; the \"restricted token\" tier is now available.",
+  isolation_helper_cancelled:
+    "Authorization cancelled: the system prompt was declined, so the helper did not start.",
+  isolation_helper_enable_failed: "Failed to enable the helper: {reason}",
+  isolation_helper_disabled: "Helper disabled.",
+  isolation_helper_disable_failed: "Failed to disable the helper: {reason}",
+
   isolation_load_failed: "Failed to read the isolation tier.",
   isolation_auth_pending:
     "The local session is not ready yet, so the isolation tier cannot be read. Make sure the local service is running, then retry.",
