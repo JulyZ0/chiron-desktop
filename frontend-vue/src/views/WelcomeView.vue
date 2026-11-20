@@ -26,6 +26,8 @@ import {
 import { useI18n } from 'vue-i18n'
 import type { LlmModel } from '../api'
 import { useAuthStore } from '../stores/auth'
+// 第一步之后常驻的自检面板（P1-9）：与首页抽屉 / 设置顶部共用同一个组件与单例数据源
+import SelfCheckPanel from '../components/health/SelfCheckPanel.vue'
 import {
   WELCOME_STEPS,
   invalidateWelcomeModelCache,
@@ -559,6 +561,15 @@ function openModels(): void {
           </div>
         </div>
       </section>
+
+      <!-- 系统自检（P1-9）：走完第一步后常驻显示（折叠）。
+           只在引导进行中出现 —— 完成态那一屏保持"只看结果"，且已完成的用户
+           再进来时不该有任何额外探测（见 WelcomeView.spec 的"不探测"用例）。 -->
+      <SelfCheckPanel
+        v-if="currentIndex >= 1"
+        class="welcome-selfcheck"
+        data-testid="welcome-selfcheck"
+      />
 
       <footer class="welcome-foot">
         <Button
