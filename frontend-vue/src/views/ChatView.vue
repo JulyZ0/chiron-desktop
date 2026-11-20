@@ -54,6 +54,7 @@ import { boardFromHistory } from '../components/chat/todoProjection'
 import TodoPanel from '../components/chat/TodoPanel.vue'
 import { useSessionMeta } from '../composables/useSessionMeta'
 import { usePanelCollapse } from '../composables/usePanelCollapse'
+import { useSubagentStream } from '../composables/useSubagentStream'
 import { useMessageFailure } from '../composables/useMessageFailure'
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
 import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
@@ -1609,21 +1610,28 @@ const mapStreamPreviews = computed<Record<string, string>>(() => {
 
 const trajectoryFocus = ref<number | null>(null)
 const trajectoryToken = ref(0)
-// 子 Agent 实时事件缓冲（有界）：SSE 里的 `subagent.*` 分流到这里，
-// 只供侧边栏观测面板消费，绝不混入主对话流（docs/subagent-design.md §4.2）。
-//
-// ⚠️ 按**会话**存（与 items / loading 同一套）：真实存储落在 SessionRunState 上，
-// 对外仍是 `subagentLiveEvents` 这个名字 —— 用可写 computed 代理到"当前会话"的切片，
-// 于是既有读写（push / length / 模板传参）一行都不用改。
-// 此前是模块级单值 ref，会让会话 A 的子 Agent 进度串到会话 B 的面板与角标。
-const subagentLiveEvents = computed<SubagentEvent[]>({
-  get: () => (writingRun.value ?? currentRun.value).subagentEvents,
-  set: (v) => {
-    ;(writingRun.value ?? currentRun.value).subagentEvents = v
-  },
+
+/**
+ * 子 Agent 实时流式通道（会话级常驻 SSE + 50ms 合批 + 按 run 分组缓冲）。
+ *
+ * 整块实现搬到了 `composables/useSubagentStream.ts`（P2-1 拆分），这里只负责把
+ * 三件事的取值方式接进去：当前会话 id、事件归属的 run 状态（写作用域优先）、
+ * 「本轮主 SSE 是否开着」（开着就跳过，避免同一帧被两个连接各送一份）。
+ *
+ * 建连入口只有一处（composable 内的 `watch(activeSessionId)`），单写者由
+ * `composables/__tests__/useSubagentStream.spec.ts` 钉住。
+ */
+const {
+  subagentLiveEvents,
+  pushSubagentEvent,
+  ensureSubagentStream,
+  disposeSubagentStream,
+} = useSubagentStream({
+  sessionId: () => activeSessionId.value,
+  resolveRun: () => writingRun.value ?? currentRun.value,
+  isTurnStreamOpen: () => activeSSE !== null,
 })
 
-const SUBAGENT_LIVE_MAX = 500
 /**
  * 子 Agent 卡片「重试」：把失败任务放回输入框，而不是替用户再派发一次。
  *
@@ -1635,89 +1643,6 @@ function onSubagentRetry(payload: { runId: string; text: string }) {
   if (!text) return
   chatInputRef.value?.setDraft?.(text)
 }
-/** 合批窗口：子 Agent 一轮工具调用会连发几十条事件，逐条写响应式数组会让面板
- *  （以及侧栏角标、会话状态点）每秒重算几十次 —— 这才是"响应式风暴"的来源。
- *  50ms 合批后最多 20 次/秒，肉眼无差别，重算次数降一个量级。 */
-const SUBAGENT_FLUSH_MS = 50
-
-/**
- * 待落盘的事件缓冲：**按 run 状态对象分组**，而不是一个全局数组。
- *
- * 分组是必须的：用户可能在 50ms 内切了会话，若把缓冲统一写进"当前会话"，A 会话的
- * 子 Agent 事件就会串到 B 会话的面板里（正是这个文件此前修过的那个 bug）。
- * 记下事件到达时属于哪个 run 状态，切会话也不会写错地方。
- */
-type RunStateLike = (typeof currentRun)['value']
-const subagentBuffer = new Map<RunStateLike, SubagentEvent[]>()
-let subagentFlushHandle: number | null = null
-
-function flushSubagentBuffer() {
-  subagentFlushHandle = null
-  if (!subagentBuffer.size) return
-  for (const [run, events] of subagentBuffer) {
-    if (!events.length) continue
-    // 一次性拼接 + 截断：整个批次只触发一次响应式更新
-    const merged = [...run.subagentEvents, ...events]
-    run.subagentEvents = merged.length > SUBAGENT_LIVE_MAX
-      ? merged.slice(merged.length - SUBAGENT_LIVE_MAX)
-      : merged
-  }
-  subagentBuffer.clear()
-}
-
-/** 把一条子 Agent 事件并入所属会话的实时缓冲（两个来源共用，见 ensureSubagentStream）。 */
-function pushSubagentEvent(raw: unknown) {
-  const event = raw as SubagentEvent
-  const type = typeof event?.type === 'string' ? event.type : ''
-  if (!type.startsWith('subagent.') || !event?.run_id) return
-  const run = writingRun.value ?? currentRun.value
-  const pending = subagentBuffer.get(run)
-  if (pending) pending.push(event)
-  else subagentBuffer.set(run, [event])
-  if (subagentFlushHandle === null) {
-    subagentFlushHandle = window.setTimeout(flushSubagentBuffer, SUBAGENT_FLUSH_MS)
-  }
-}
-
-// ── 会话级常驻 SSE：后台子 Agent 的实时通道 ──
-//
-// 一轮对话的 SSE（`activeSSE`）在 turn_done 就关闭了，而默认就是**后台派发**的子 Agent
-// （`run_in_background=true`）通常还在跑：它后续的进度与 `subagent.approval`（等你批准）
-// 没有任何通道到达前端 —— 表现就是"必须刷新页面才能看到子 Agent 的后续请求"
-// （刷新后靠面板的 3 秒轮询把历史补回来）。
-//
-// 这里为当前会话保持一条常驻连接：会话切换时重建、组件卸载时关闭。本轮 SSE 仍在时**跳过处理**
-// （同一条事件会被两个连接各送一份，交给 `activeSSE` 处理即可，避免面板里出现重复项）。
-let subagentSSE: SSEHandle | null = null
-let subagentSSESession = ''
-
-function closeSubagentStream() {
-  if (subagentSSE) {
-    subagentSSE.close()
-    subagentSSE = null
-  }
-  subagentSSESession = ''
-}
-
-function ensureSubagentStream() {
-  const sid = activeSessionId.value || ''
-  if (!sid) {
-    closeSubagentStream()
-    return
-  }
-  if (subagentSSE && subagentSSESession === sid) return
-  closeSubagentStream()
-  subagentSSESession = sid
-  subagentSSE = createSSEConnection(
-    sid,
-    (raw) => { if (!activeSSE) pushSubagentEvent(raw) },
-    // 连续重连失败（网络长时间不可用/会话已失效）：放弃这条，等下次会话切换或刷新重建
-    () => { closeSubagentStream() },
-    { autoReconnect: true },
-  )
-}
-
-watch(activeSessionId, () => { ensureSubagentStream() }, { immediate: true })
 
 function onTrajectoryFocus(index: number) {
   trajectoryFocus.value = index
@@ -1885,14 +1810,8 @@ onMounted(async () => {
 onUnmounted(() => {
   stopTurnTimer()
   if (activeSSE) { activeSSE.close(); activeSSE = null }
-  closeSubagentStream()
-  // 合批缓冲：卸载时先把没落盘的那批冲刷掉（否则最后几十条事件随组件一起消失），
-  // 再清掉定时器，避免回调在已卸载的组件上继续写状态。
-  if (subagentFlushHandle !== null) {
-    clearTimeout(subagentFlushHandle)
-    subagentFlushHandle = null
-    flushSubagentBuffer()
-  }
+  // 子 Agent 通道：关常驻连接 + 冲刷未落盘的合批缓冲（见 useSubagentStream.disposeSubagentStream）
+  disposeSubagentStream()
   if (unifiedDoneTimer) { clearTimeout(unifiedDoneTimer); unifiedDoneTimer = null }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null }
