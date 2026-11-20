@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import dayjs from 'dayjs'
-import { Card, Spin, Radio, Table, Button, InputNumber, Modal, message } from 'ant-design-vue'
+import { Card, Spin, Radio, Table, Button, InputNumber, Modal, Tag, message } from 'ant-design-vue'
 import { useRouter } from 'vue-router'
 import EmptyState from '../components/common/EmptyState.vue'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
@@ -115,6 +115,42 @@ interface PriceCoverage {
   prices_entry_url?: string
 }
 
+/**
+ * 价格源健康（GET /v1/admin/billing/price-sources）。
+ *
+ * 覆盖率只说明"缺多少价"，不说明"为什么缺"。这个端点补上后者：每个源最近一轮
+ * 同步的 成功/失败/条数/耗时/原因。实测 pricetoken 超时时，用户能在这里直接看到
+ * 失败原因，而不是"价格表空了"。
+ */
+interface PriceSourceStatus {
+  source: string
+  parser: string
+  provider: string
+  url_host: string
+  status: string
+  rows: number
+  duration_ms: number
+  /** 已脱敏且 ≤200 字符（后端截断），空串表示成功 */
+  error: string
+  checked_at: string
+  age_seconds: number
+  stale: boolean
+}
+
+interface PriceSourceReport {
+  sources: PriceSourceStatus[]
+  summary: {
+    total: number
+    ok: number
+    empty: number
+    failed: number
+    stale: boolean
+    stale_count: number
+    rows_total: number
+    last_run_at: string
+  }
+}
+
 /** 与后端 usageGroupByWhitelist 一一对应；写死成联合类型，参数拼错在编译期就红 */
 type UsageGroup = 'day' | 'model' | 'session'
 type UsageRange = '7d' | '30d' | '90d'
@@ -162,6 +198,27 @@ const loading = ref(true)
  * 会误导运营去补一堆其实已有价格的模型。
  */
 const coverage = ref<PriceCoverage | null>(null)
+
+/**
+ * 价格源状态（与覆盖率并列展示）。
+ *
+ * 同样只在拿得到数据时渲染：非 admin / 老后端（没有 0006 迁移）时整块消失，
+ * **不显示"所有源正常"** —— 那会把"读不到"说成"没问题"。
+ */
+const priceSources = ref<PriceSourceReport | null>(null)
+
+/** 源状态标签：ok/empty/failed 三态必须用不同颜色，empty 不是失败。 */
+function priceSourceLabel(status: string): string {
+  if (status === 'ok') return t('billing.price_sources_status_ok')
+  if (status === 'empty') return t('billing.price_sources_status_empty')
+  return t('billing.price_sources_status_failed')
+}
+
+function priceSourceColor(status: string): string {
+  if (status === 'ok') return 'green'
+  if (status === 'empty') return 'orange'
+  return 'red'
+}
 
 /** 覆盖率百分数（整数）；无模型可定价时不显示 0%，由文案说明 */
 const coveragePercent = computed(() => {
@@ -417,6 +474,22 @@ async function loadCoverage() {
   } catch {
     coverage.value = null
   }
+  // 源状态与覆盖率同一权限口径（平台读）；403/404/网络错误都只是隐藏这一块。
+  await loadPriceSources()
+}
+
+/**
+ * 加载价格源状态。失败静默隐藏 —— 它是覆盖率的**辅助说明**，不能让整页报错。
+ * 形状也校验一层：老后端回 `{}` 时若当成报告渲染，会显示"0 个源全部正常"。
+ */
+async function loadPriceSources() {
+  try {
+    const resp = await api.get('/v1/admin/billing/price-sources')
+    const data = resp.data?.data as PriceSourceReport | undefined
+    priceSources.value = data && Array.isArray(data.sources) && data.summary ? data : null
+  } catch {
+    priceSources.value = null
+  }
 }
 </script>
 
@@ -582,6 +655,59 @@ async function loadCoverage() {
             </Button>
           </li>
         </ul>
+
+        <!-- 价格源状态：回答"为什么价格表会空"。ok/empty/failed 三态分开显示，
+             失败原因直接摊开（已脱敏、≤200 字符）—— 用户实测 pricetoken 超时时，
+             这是他唯一能看到的证据。 -->
+        <div
+          v-if="priceSources && priceSources.sources.length"
+          class="price-sources"
+        >
+          <div class="price-sources-head">
+            <span class="price-sources-title">{{ $t('billing.price_sources_title') }}</span>
+            <span class="price-sources-summary">
+              {{ $t('billing.price_sources_summary', {
+                total: priceSources.summary.total,
+                ok: priceSources.summary.ok,
+                empty: priceSources.summary.empty,
+                failed: priceSources.summary.failed,
+                rows: priceSources.summary.rows_total,
+              }) }}
+            </span>
+          </div>
+          <p
+            v-if="priceSources.summary.stale"
+            class="price-sources-stale"
+          >
+            {{ $t('billing.price_sources_stale') }}
+          </p>
+          <ul class="price-sources-list">
+            <li
+              v-for="src in priceSources.sources"
+              :key="src.source"
+              class="price-source-item"
+            >
+              <Tag
+                :color="priceSourceColor(src.status)"
+                class="price-source-tag"
+              >
+                {{ priceSourceLabel(src.status) }}
+              </Tag>
+              <span class="price-source-name">{{ src.source }}</span>
+              <span class="price-source-meta">
+                {{ $t('billing.price_sources_meta', { rows: src.rows, ms: src.duration_ms }) }}
+              </span>
+              <span
+                v-if="src.stale"
+                class="price-source-stale"
+              >{{ $t('billing.price_sources_item_stale') }}</span>
+              <span
+                v-if="src.error"
+                class="price-source-error"
+              >{{ src.error }}</span>
+            </li>
+          </ul>
+        </div>
       </Card>
 
       <!-- 设置单价：预填 0，由人给出真实单价（后端不猜、不写死任何厂商价格） -->
@@ -756,6 +882,21 @@ async function loadCoverage() {
 .coverage-item-text { flex: 1; min-width: 160px; }
 .coverage-item-action { padding: 0 4px; height: auto; }
 .price-dialog-hint { margin: 0 0 12px; font-size: 12px; color: var(--text-tertiary); }
+
+/* 价格源状态：接在未定价列表之后，同一张卡片里回答"缺多少"与"为什么缺" */
+.price-sources { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--border-secondary, rgba(0, 0, 0, 0.08)); }
+.price-sources-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
+.price-sources-title { font-size: 12px; font-weight: var(--fw-semibold); color: var(--text-secondary); }
+.price-sources-summary { flex: 1; min-width: 200px; font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.price-sources-stale { margin: 6px 0 0; font-size: 12px; color: var(--colorWarning, var(--warning)); }
+.price-sources-list { margin: 6px 0 0; padding: 0; list-style: none; }
+.price-source-item { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 2px 0; font-size: 12px; }
+.price-source-tag { margin-inline-end: 0; }
+.price-source-name { color: var(--text-secondary); font-family: var(--font-mono, monospace); }
+.price-source-meta { color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.price-source-stale { color: var(--colorWarning, var(--warning)); }
+/* 失败原因：允许换行（可能是一整句异常），但最多两行，细节看日志 */
+.price-source-error { flex-basis: 100%; color: var(--colorError, #cf1322); word-break: break-word; }
 .price-dialog-form { display: flex; flex-direction: column; gap: 6px; }
 .price-dialog-field { width: 100%; }
 

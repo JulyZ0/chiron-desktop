@@ -571,3 +571,104 @@ describe('BillingView 手工设置单价', () => {
     wrapper.unmount()
   })
 })
+
+// ── 价格源状态（GET /v1/admin/billing/price-sources）────────────────
+
+/**
+ * 覆盖率只说"缺多少价"，不说"为什么缺"。实测 pricetoken 超时时，用户只能看到
+ * 价格表空了，没有任何地方指出是某个源失败。这里钉住那条可见性：
+ *  - 失败源必须显示状态与**脱敏后的原因**；
+ *  - `empty`（源活着但对不上模型名）不能显示成失败；
+ *  - 接口失败时整块隐藏，不能渲染成"所有源正常"。
+ */
+const PRICE_SOURCES_FAILED = {
+  sources: [
+    {
+      source: 'pricetoken',
+      parser: 'pricetoken',
+      provider: '',
+      url_host: 'pricetoken.ai',
+      status: 'failed',
+      rows: 0,
+      duration_ms: 812,
+      error: 'ReadTimeout: 请求超时',
+      checked_at: '2026-11-20T10:00:00Z',
+      age_seconds: 60,
+      stale: false,
+    },
+    {
+      source: 'llmrates',
+      parser: 'llmrates',
+      provider: '',
+      url_host: 'www.llmrates.ai',
+      status: 'empty',
+      rows: 0,
+      duration_ms: 90,
+      error: '',
+      checked_at: '2026-11-20T10:00:00Z',
+      age_seconds: 60,
+      stale: false,
+    },
+  ],
+  summary: {
+    total: 2, ok: 0, empty: 1, failed: 1, stale: false, stale_count: 0,
+    rows_total: 0, last_run_at: '2026-11-20T10:00:00Z',
+  },
+}
+
+describe('BillingView 价格源状态', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    stubApi()
+  })
+
+  it('在覆盖率卡片里显示每个源的状态与失败原因', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/admin/billing/price-coverage') {
+        return Promise.resolve({ data: { data: COVERAGE_UNPRICED } })
+      }
+      if (url === '/v1/admin/billing/price-sources') {
+        return Promise.resolve({ data: { data: PRICE_SOURCES_FAILED } })
+      }
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+
+    const wrapper = await mountAttached()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('价格源状态')
+    expect(text).toContain('pricetoken')
+    // 失败原因必须可见（否则"价格表为什么空"永远无从判断）
+    expect(text).toContain('ReadTimeout')
+    // 三态分开：llmrates 是空结果，不是失败
+    expect(text).toContain('空结果')
+    expect(text).toContain('失败')
+
+    wrapper.unmount()
+  })
+
+  it('源状态接口失败（非 admin / 老后端）时整块隐藏且不报错', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/admin/billing/price-coverage') {
+        return Promise.resolve({ data: { data: COVERAGE_UNPRICED } })
+      }
+      if (url === '/v1/admin/billing/price-sources') return Promise.reject(new Error('403'))
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+
+    const wrapper = await mountAttached()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).not.toContain('价格源状态')
+    // 覆盖率面板本身仍在
+    expect(text).toContain('价格覆盖率')
+
+    wrapper.unmount()
+  })
+})
