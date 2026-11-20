@@ -54,6 +54,8 @@ import { boardFromHistory } from '../components/chat/todoProjection'
 import TodoPanel from '../components/chat/TodoPanel.vue'
 import { useSessionMeta } from '../composables/useSessionMeta'
 import { usePanelCollapse } from '../composables/usePanelCollapse'
+import { useSessionActivity } from '../composables/useSessionActivity'
+import { useSubagentStream } from '../composables/useSubagentStream'
 import { useMessageFailure } from '../composables/useMessageFailure'
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
 import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
@@ -312,23 +314,6 @@ const splitTitle = computed(() => {
  * 取近似常量而非实时测量：多留一些比少留安全，且避免 ResizeObserver 的复杂度。
  */
 const floatingBottomInset = 160
-
-/**
- * 运行中的子 Agent 数（状态栏角标）。
- *
- * 直接数实时事件：遇到 `subagent.done` 就移除，否则记为运行中 ——
- * 不依赖面板是否打开、也不等侧栏轮询结果，所以"有子 Agent 在跑"永远看得出来。
- */
-const subagentActiveCount = computed(() => {
-  const active = new Set<string>()
-  for (const e of subagentLiveEvents.value) {
-    const id = (e as { run_id?: string }).run_id
-    if (!id) continue
-    if ((e as { type?: string }).type === 'subagent.done') active.delete(id)
-    else active.add(id)
-  }
-  return active.size
-})
 
 /** 当前模式的显示名 */
 const modeLabel = computed(() => modeOptions.find(o => o.value === mode.value)?.label || t('common.normal'))
@@ -1538,52 +1523,6 @@ const panelView = ref<'trajectory' | 'sessions' | 'agents' | 'stats'>('trajector
 const synapseMapOpen = ref(false)
 
 /**
- * 地图上标「运行中」的会话。
- *
- * 此前 ChatView 从不传 `runningIds`，于是地图里的 `.is-running` 与脉冲徽标是死代码。
- * 数据来源是子 Agent 的实时事件流：某会话出现 run 即标记为运行中，收到 `subagent.done`
- * 才清除 —— 多个 run 并发时会话始终保持标记（与"是否还有未终态的 run"同义）。
- */
-const runningSessionIds = computed<string[]>(() => {
-  const open = new Set<string>()
-  for (const raw of subagentLiveEvents.value) {
-    const e = raw as { session_id?: string; run_id?: string; type?: string }
-    const sid = e?.session_id
-    if (!sid || !e?.run_id) continue
-    if (e.type === 'subagent.done') open.delete(sid)
-    else open.add(sid)
-  }
-  return [...open]
-})
-
-/**
- * 侧栏会话行上心跳点用的**并集**：主回合在跑（`liveRunSessionIds`）或还有未终态的
- * 子 Agent run（`runningSessionIds`）都算"这个会话还在动"。
- *
- * 为什么必须取并集：两个信号各有盲区 —— 只跑主回合时 `subagentLiveEvents` 是空的；
- * 主回合结束但后台子 Agent 仍在跑时 `runtimes.loading` 已为 false。
- * 为什么必须声明在这里：`runningSessionIds` 依赖 `subagentLiveEvents`，
- * 放到文件前半段会触发 TDZ（同下方 watch 的注释）。
- */
-const sidebarRunningIds = computed(() => {
-  const set = new Set<string>(runningSessionIds.value)
-  for (const sid of liveRunSessionIds.value) set.add(sid)
-  return set
-})
-
-/**
- * 会话地图的实时状态。
- *
- * 旧实现靠 `postMessage` 把宿主的运行态与流式文本推给 iframe 里的画布，改造时
- * 那条通道随 iframe 一起被删掉 —— 于是地图只剩「运行中」脉冲点，看不到正在生成的
- * 文字。现在改为同进程单向 props：
- *   - `mapRunningSessionIds` 给卡片打「运行中」标记
- *   - `mapStreamPreviews` 给卡片提供正在输出的尾部文本
- * 不再有消息协议，也就没有"端口通配 '*'"、`origin === 'null'`、20 秒回执超时这一整类问题。
- */
-const mapRunningSessionIds = computed<string[]>(() => [...sidebarRunningIds.value])
-
-/**
  * 会话 id → 正在流式输出的尾部文本（卡片预览）。
  *
  * 只投影 `loading` 为真的会话：`streaming` 条目只在这期间存在，遍历全部会话纯属白算。
@@ -1609,21 +1548,52 @@ const mapStreamPreviews = computed<Record<string, string>>(() => {
 
 const trajectoryFocus = ref<number | null>(null)
 const trajectoryToken = ref(0)
-// 子 Agent 实时事件缓冲（有界）：SSE 里的 `subagent.*` 分流到这里，
-// 只供侧边栏观测面板消费，绝不混入主对话流（docs/subagent-design.md §4.2）。
-//
-// ⚠️ 按**会话**存（与 items / loading 同一套）：真实存储落在 SessionRunState 上，
-// 对外仍是 `subagentLiveEvents` 这个名字 —— 用可写 computed 代理到"当前会话"的切片，
-// 于是既有读写（push / length / 模板传参）一行都不用改。
-// 此前是模块级单值 ref，会让会话 A 的子 Agent 进度串到会话 B 的面板与角标。
-const subagentLiveEvents = computed<SubagentEvent[]>({
-  get: () => (writingRun.value ?? currentRun.value).subagentEvents,
-  set: (v) => {
-    ;(writingRun.value ?? currentRun.value).subagentEvents = v
-  },
+
+/**
+ * 子 Agent 实时流式通道（会话级常驻 SSE + 50ms 合批 + 按 run 分组缓冲）。
+ *
+ * 整块实现搬到了 `composables/useSubagentStream.ts`（P2-1 拆分），这里只负责把
+ * 三件事的取值方式接进去：当前会话 id、事件归属的 run 状态（写作用域优先）、
+ * 「本轮主 SSE 是否开着」（开着就跳过，避免同一帧被两个连接各送一份）。
+ *
+ * 建连入口只有一处（composable 内的 `watch(activeSessionId)`）：这里**刻意不取**
+ * `ensureSubagentStream`，视图层没有第二条建连路径。单写者由
+ * `composables/__tests__/useSubagentStream.spec.ts` 钉住。
+ */
+const {
+  subagentLiveEvents,
+  pushSubagentEvent,
+  disposeSubagentStream,
+} = useSubagentStream({
+  sessionId: () => activeSessionId.value,
+  resolveRun: () => writingRun.value ?? currentRun.value,
+  isTurnStreamOpen: () => activeSSE !== null,
 })
 
-const SUBAGENT_LIVE_MAX = 500
+/**
+ * 「这个会话还在动」的三份派生：状态栏角标、会话地图的运行中标记、侧栏心跳点。
+ *
+ * 规则搬到了 `composables/useSessionActivity.ts`（P2-1 第二刀）；这里只决定两个输入：
+ * 子 Agent 实时事件（会话级 SSE 推来的那一份）与主回合仍 `loading` 的会话集合。
+ * 取并集的理由在 composable 里 —— 两个信号各有盲区。
+ */
+const { subagentActiveCount, sidebarRunningIds } = useSessionActivity({
+  subagentLiveEvents: () => subagentLiveEvents.value,
+  liveRunSessionIds: () => liveRunSessionIds.value,
+})
+
+/**
+ * 会话地图的实时状态。
+ *
+ * 旧实现靠 `postMessage` 把宿主的运行态与流式文本推给 iframe 里的画布，改造时
+ * 那条通道随 iframe 一起被删掉 —— 于是地图只剩「运行中」脉冲点，看不到正在生成的
+ * 文字。现在改为同进程单向 props：
+ *   - `mapRunningSessionIds` 给卡片打「运行中」标记
+ *   - `mapStreamPreviews` 给卡片提供正在输出的尾部文本
+ * 不再有消息协议，也就没有"端口通配 '*'"、`origin === 'null'`、20 秒回执超时这一整类问题。
+ */
+const mapRunningSessionIds = computed<string[]>(() => [...sidebarRunningIds.value])
+
 /**
  * 子 Agent 卡片「重试」：把失败任务放回输入框，而不是替用户再派发一次。
  *
@@ -1635,89 +1605,6 @@ function onSubagentRetry(payload: { runId: string; text: string }) {
   if (!text) return
   chatInputRef.value?.setDraft?.(text)
 }
-/** 合批窗口：子 Agent 一轮工具调用会连发几十条事件，逐条写响应式数组会让面板
- *  （以及侧栏角标、会话状态点）每秒重算几十次 —— 这才是"响应式风暴"的来源。
- *  50ms 合批后最多 20 次/秒，肉眼无差别，重算次数降一个量级。 */
-const SUBAGENT_FLUSH_MS = 50
-
-/**
- * 待落盘的事件缓冲：**按 run 状态对象分组**，而不是一个全局数组。
- *
- * 分组是必须的：用户可能在 50ms 内切了会话，若把缓冲统一写进"当前会话"，A 会话的
- * 子 Agent 事件就会串到 B 会话的面板里（正是这个文件此前修过的那个 bug）。
- * 记下事件到达时属于哪个 run 状态，切会话也不会写错地方。
- */
-type RunStateLike = (typeof currentRun)['value']
-const subagentBuffer = new Map<RunStateLike, SubagentEvent[]>()
-let subagentFlushHandle: number | null = null
-
-function flushSubagentBuffer() {
-  subagentFlushHandle = null
-  if (!subagentBuffer.size) return
-  for (const [run, events] of subagentBuffer) {
-    if (!events.length) continue
-    // 一次性拼接 + 截断：整个批次只触发一次响应式更新
-    const merged = [...run.subagentEvents, ...events]
-    run.subagentEvents = merged.length > SUBAGENT_LIVE_MAX
-      ? merged.slice(merged.length - SUBAGENT_LIVE_MAX)
-      : merged
-  }
-  subagentBuffer.clear()
-}
-
-/** 把一条子 Agent 事件并入所属会话的实时缓冲（两个来源共用，见 ensureSubagentStream）。 */
-function pushSubagentEvent(raw: unknown) {
-  const event = raw as SubagentEvent
-  const type = typeof event?.type === 'string' ? event.type : ''
-  if (!type.startsWith('subagent.') || !event?.run_id) return
-  const run = writingRun.value ?? currentRun.value
-  const pending = subagentBuffer.get(run)
-  if (pending) pending.push(event)
-  else subagentBuffer.set(run, [event])
-  if (subagentFlushHandle === null) {
-    subagentFlushHandle = window.setTimeout(flushSubagentBuffer, SUBAGENT_FLUSH_MS)
-  }
-}
-
-// ── 会话级常驻 SSE：后台子 Agent 的实时通道 ──
-//
-// 一轮对话的 SSE（`activeSSE`）在 turn_done 就关闭了，而默认就是**后台派发**的子 Agent
-// （`run_in_background=true`）通常还在跑：它后续的进度与 `subagent.approval`（等你批准）
-// 没有任何通道到达前端 —— 表现就是"必须刷新页面才能看到子 Agent 的后续请求"
-// （刷新后靠面板的 3 秒轮询把历史补回来）。
-//
-// 这里为当前会话保持一条常驻连接：会话切换时重建、组件卸载时关闭。本轮 SSE 仍在时**跳过处理**
-// （同一条事件会被两个连接各送一份，交给 `activeSSE` 处理即可，避免面板里出现重复项）。
-let subagentSSE: SSEHandle | null = null
-let subagentSSESession = ''
-
-function closeSubagentStream() {
-  if (subagentSSE) {
-    subagentSSE.close()
-    subagentSSE = null
-  }
-  subagentSSESession = ''
-}
-
-function ensureSubagentStream() {
-  const sid = activeSessionId.value || ''
-  if (!sid) {
-    closeSubagentStream()
-    return
-  }
-  if (subagentSSE && subagentSSESession === sid) return
-  closeSubagentStream()
-  subagentSSESession = sid
-  subagentSSE = createSSEConnection(
-    sid,
-    (raw) => { if (!activeSSE) pushSubagentEvent(raw) },
-    // 连续重连失败（网络长时间不可用/会话已失效）：放弃这条，等下次会话切换或刷新重建
-    () => { closeSubagentStream() },
-    { autoReconnect: true },
-  )
-}
-
-watch(activeSessionId, () => { ensureSubagentStream() }, { immediate: true })
 
 function onTrajectoryFocus(index: number) {
   trajectoryFocus.value = index
@@ -1885,14 +1772,8 @@ onMounted(async () => {
 onUnmounted(() => {
   stopTurnTimer()
   if (activeSSE) { activeSSE.close(); activeSSE = null }
-  closeSubagentStream()
-  // 合批缓冲：卸载时先把没落盘的那批冲刷掉（否则最后几十条事件随组件一起消失），
-  // 再清掉定时器，避免回调在已卸载的组件上继续写状态。
-  if (subagentFlushHandle !== null) {
-    clearTimeout(subagentFlushHandle)
-    subagentFlushHandle = null
-    flushSubagentBuffer()
-  }
+  // 子 Agent 通道：关常驻连接 + 冲刷未落盘的合批缓冲（见 useSubagentStream.disposeSubagentStream）
+  disposeSubagentStream()
   if (unifiedDoneTimer) { clearTimeout(unifiedDoneTimer); unifiedDoneTimer = null }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null }
