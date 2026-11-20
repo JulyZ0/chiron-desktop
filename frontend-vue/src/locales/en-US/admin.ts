@@ -465,6 +465,9 @@ export default {
   deps_title: "Python dependencies",
   deps_desc: "Inspect, search, install and uninstall pip packages in the engine interpreter. Installing changes the runtime shared by the whole machine — review before running.",
   deps_python_version: "Python {version}",
+  deps_tool: "Package manager: {tool}",
+  deps_tool_metadata_hint:
+    "No pip/uv in this environment: installed packages are read-only here, install and uninstall are unavailable",
   deps_installed_title: "Installed packages",
   deps_installed_empty: "No installed packages were returned",
   deps_filter_placeholder: "Filter by package name",

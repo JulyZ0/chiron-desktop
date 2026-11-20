@@ -355,6 +355,37 @@ test('buildEngineEnv 不把已带 scheme 的 Redis 地址拼成两遍', () => {
 })
 
 /**
+ * ★ 随包资产根必须进引擎环境。
+ *
+ * 桌面运行时 venv 实测**没有 pip**（`python -m pip` → `No module named pip`），
+ * 依赖页的 `pip list` 因此整页 502。安装包随带的 uv 在
+ * `resources/uv/<platform>/uv.exe`，引擎只能靠 `CHIRON_RESOURCES_DIR` 找到它 ——
+ * 不注入就等于"有 uv 但用不上"，修复回落到"整页报错"。
+ */
+test('buildEngineEnv 注入 CHIRON_RESOURCES_DIR（否则引擎找不到随包 uv）', () => {
+  const env = stack.buildEngineEnv(
+    { pgDsn: 'postgresql://x' },
+    { appSecret: VALID_SECRET, port: 9100, env: {}, resourcesDir: 'C:\\Program Files\\Chiron\\resources' },
+  )
+
+  assert.equal(env.CHIRON_RESOURCES_DIR, 'C:\\Program Files\\Chiron\\resources')
+})
+
+test('buildEngineEnv 让显式 env 覆盖 CHIRON_RESOURCES_DIR（单测/运维钉值）', () => {
+  const env = stack.buildEngineEnv(
+    { pgDsn: 'postgresql://x' },
+    {
+      appSecret: VALID_SECRET,
+      port: 9100,
+      env: { CHIRON_RESOURCES_DIR: 'D:\\pinned\\resources' },
+      resourcesDir: 'C:\\Program Files\\Chiron\\resources',
+    },
+  )
+
+  assert.equal(env.CHIRON_RESOURCES_DIR, 'D:\\pinned\\resources')
+})
+
+/**
  * ★ 引擎功能开关必须真的进 spawn 的 env。
  *
  * 只把开关写进 `engine-env.json` 是不够的 —— 引擎读的是**进程环境变量**。

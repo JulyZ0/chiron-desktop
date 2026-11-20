@@ -22,6 +22,22 @@ export interface DepListResult {
   executable: string
   packages: DepPackage[]
   count: number
+  /**
+   * 这次用的是哪个包工具（页面显示"包管理器：uv"）。
+   *
+   * `metadata` = 该环境**既没有 pip 也没有 uv**，只能读标准库元数据：
+   * 列表可用，安装/卸载会 503。桌面运行时 venv 就是这种环境（实测
+   * `python -m pip` → `No module named pip`），旧实现直接整页 502。
+   */
+  tool?: 'uv' | 'pip' | 'metadata'
+  /** uv 的绝对路径（仅在 tool === 'uv' 时有值） */
+  tool_path?: string
+  /** 工具降级了（tool === 'metadata'） */
+  degraded?: boolean
+  /** 为什么落到这个工具（排查"为什么没有 pip/uv"的唯一线索） */
+  tool_reason?: string
+  /** 降级时的说明文案（服务端给出，可直接展示） */
+  note?: string
 }
 
 export interface PypiResult {

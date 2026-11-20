@@ -944,6 +944,19 @@ function buildEngineEnv(info, options = {}) {
   ]) {
     if (dataPaths[name] && (options.env || {})[name] === undefined) env[name] = dataPaths[name]
   }
+
+  // 引擎要找的**随包资产根**：打包态是 `<安装根>/resources`（`process.resourcesPath`），
+  // 依赖管理页要用的 uv 就在 `resources/uv/<platform>/uv.exe`。
+  //
+  // 为什么必须注入：桌面运行时 venv 实测**没有 pip**（`python -m pip` →
+  // `No module named pip`），而 `pip list` 因此以 1 退出、依赖页整页 502
+  // `pip list exited with code 1`。uv 是那种环境里唯一能装包的工具，但引擎
+  // 猜不到安装目录（venv 在 userData 下、uv 在 Program Files 下），只能由壳层给。
+  // 开发态（`process.resourcesPath` 不存在）不写这一项：引擎会退回 PATH 上的 uv。
+  const resourcesDir = String(options.resourcesDir || process.resourcesPath || '').trim()
+  if (resourcesDir && (options.env || {}).CHIRON_RESOURCES_DIR === undefined) {
+    env.CHIRON_RESOURCES_DIR = resourcesDir
+  }
   // 审计目录走 Settings 的 `log_dir` 字段（`LOG_DIR`）。显式给绝对路径，是因为
   // `Settings` 里 `extra="ignore"`、四个 `*_audit.py` 又都写死 `getattr(settings,"log_dir","")
   // or "logs"` —— 不改字段名就只能改四个模块，改字段名一处即可。

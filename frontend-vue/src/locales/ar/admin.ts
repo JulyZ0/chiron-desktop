@@ -465,6 +465,9 @@ export default {
   deps_title: "اعتماديّات Python",
   deps_desc: "اعرض وابحث وثبّت وأزل حزم pip في مفسّر المحرّك. التثبيت يغيّر بيئة التشغيل المشتركة على الجهاز بالكامل — راجع قبل التنفيذ.",
   deps_python_version: "Python {version}",
+  deps_tool: "مدير الحزم: {tool}",
+  deps_tool_metadata_hint:
+    "لا يوجد pip/uv في هذه البيئة: قراءة الحزم المثبّتة فقط، والتثبيت والإزالة غير متاحين",
   deps_installed_title: "الحزم المثبّتة",
   deps_installed_empty: "لم تُرجَع أي حزمة مثبّتة",
   deps_filter_placeholder: "تصفية باسم الحزمة",

@@ -7,8 +7,16 @@
    同一凭据）。引擎的 ``AuthMiddleware`` 已经会对非探针路径做这一层校验，这里再以
    FastAPI 依赖做一遍是**刻意的纵深防御** —— 中间件白名单/装配一旦被改动，端点自己
    仍然 fail-closed。
-2. **解释器固定**：只用 ``sys.executable -m pip``。绝不用 ``pip``（PATH 上的可能是
-   另一个 venv / 系统 Python），绝不读仓库的 ``.env``（那是密钥文件，与"装包"无关）。
+2. **解释器固定**：只用 ``sys.executable -m pip``（或 ``uv pip ... --python sys.executable``）。
+   绝不用 PATH 上的裸 ``pip``／``uv`` 指向的解释器（那可能是另一个 venv / 系统 Python），
+   绝不读仓库的 ``.env``（那是密钥文件，与"装包"无关）。
+2b. **包工具降级链**：``uv`` → ``python -m pip`` → ``importlib.metadata``（只读）。
+   桌面运行时 venv 里**可能没有 pip**（实测 ``python -m pip`` → ``No module named pip``，
+   于是依赖页整页 502 ``pip list exited with code 1``）。uv 由安装包随带
+   （``resources/uv/<platform>/uv.exe``），所以先找 uv：env ``CHIRON_UV_BIN`` →
+   ``<CHIRON_RESOURCES_DIR>/uv/<platform>/uv`` → PATH ``uv`` → 运行时目录附近的 uv。
+   两个都没有时 list/check 仍可用（读 ``importlib.metadata``），install/uninstall
+   明确 503 并给出可行动文案 —— 而不是把 "No module named pip" 包装成一个 502。
 3. **规格白名单**：只接受 ``name`` 或 ``name<op>version`` 形式的 PEP 508 子集
    （见 ``PIP_SPEC_RE``）。空格 / 分号 / ``-r`` / URL / 路径 / extras 一律拒绝 ——
    ``pip install -r .env`` 能把密钥文件当需求清单读出来，``pkg; rm -rf /`` 在
@@ -51,10 +59,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
+import platform as platform_module
 import re
+import shutil
 import sys
 import time
 import uuid
@@ -151,6 +162,36 @@ CONFLICT_CHECK_TIMEOUT_SECONDS = 30.0
 #: 返回给前端的冲突文本上限：pip check 的整段输出可能很长，结论行在最前面。
 MAX_CONFLICT_OUTPUT_CHARS = 4000
 
+# ── 包工具（uv / pip / metadata）─────────────────────────────────────────
+#: 三个工具标签。都会出现在响应里（``tool`` 字段），前端显示"包管理器：uv"。
+TOOL_UV = "uv"
+TOOL_PIP = "pip"
+TOOL_METADATA = "metadata"
+#: ``tool`` 字段的合法取值（前端/测试共用）。
+TOOL_KINDS = (TOOL_UV, TOOL_PIP, TOOL_METADATA)
+
+#: 既没有 uv 也没有 pip 时的**可行动**文案。安装/卸载返回 503 时原样带出。
+NO_MUTATION_TOOL_MESSAGE = (
+    "运行环境未包含 pip/uv，请安装 uv 或设置 CHIRON_UV_BIN"
+)
+#: 只读路径（列表 / 预检）在同样的环境下该说的话：能看，但不能改。
+READ_ONLY_TOOL_HINT = (
+    "当前只能用标准库元数据读取已安装包（无 pip/uv），安装与卸载不可用；"
+    "请安装 uv 或设置 CHIRON_UV_BIN"
+)
+
+#: 引擎找随包资产（uv / python-runtime / web）的根目录，由桌面壳注入。
+RESOURCES_DIR_ENV = "CHIRON_RESOURCES_DIR"
+#: 显式指定 uv 可执行文件（优先级最高，运维/测试的逃生口）。
+UV_BIN_ENV = "CHIRON_UV_BIN"
+
+#: uv 报"这个子命令不认识"时的形状 —— 老版本 uv 没有 ``pip check``，
+#: 那不是环境坏了，只是预检做不了（见 ``uv_check_unsupported``）。
+_UV_UNSUPPORTED_RE = re.compile(
+    r"unrecognized subcommand|unsupported subcommand|unexpected argument|no such command",
+    re.IGNORECASE,
+)
+
 #: 快照 id 白名单：``<UTC 时间戳到毫秒>Z-<6 位随机>``。
 #:
 #: id 会被拼进文件路径，所以这里**只认引擎自己生成的形态**（不接受任何 ``.`` / ``/``
@@ -221,32 +262,53 @@ def resolve_identity(request: Request) -> tuple[int, str]:
 
 @dataclass(frozen=True)
 class ConflictCheck:
-    """一次 ``pip check`` 的结论。
+    """一次 ``pip check`` / ``uv pip check`` 的结论。
 
-    ``ok=True`` 有两种含义：没有冲突，或**无法判定**（超时）。后者不该阻断变更 ——
-    把"pip check 很慢"当成"环境坏了"会让依赖管理在最需要它的时候锁死；调用方在
-    ``timed_out=True`` 时只会把这件事写进任务日志。
+    ``ok=True`` 有三种含义：没有冲突、**无法判定**（超时），或**做不了**（``skipped``：
+    无 pip/uv，或 uv 版本过旧没有 ``check`` 子命令）。后两种都不该阻断变更 ——
+    把"预检做不了"当成"环境坏了"会让依赖管理在最需要它的时候锁死；调用方在
+    ``timed_out`` / ``skipped`` 时只会把这件事写进任务日志。
     """
 
     ok: bool
     output: str
     timed_out: bool = False
+    #: 预检被跳过（无工具 / uv 不支持 check）；``note`` 说明原因。
+    skipped: bool = False
+    note: str = ""
+    #: 实际执行预检的工具（uv / pip / metadata）。
+    tool: str = ""
 
 
 async def check_dependency_conflicts() -> ConflictCheck:
-    """跑 ``pip check``（30s 超时），失败时返回**已脱敏**的冲突文本。
+    """跑一次依赖冲突预检（30s 超时），失败时返回**已脱敏**的冲突文本。
 
-    ``_run_pip`` 的逐行采集已经做过一次 URL userinfo 脱敏；这里再对拼好的整段做一次，
-    是为了覆盖"调用方直接塞进来的 PipResult"（测试替身、将来的其他执行器）——
+    ``_run_process`` 的逐行采集已经做过一次 URL userinfo 脱敏；这里再对拼好的整段做
+    一次，是为了覆盖"调用方直接塞进来的 PipResult"（测试替身、将来的其他执行器）——
     撞库风险为零，但"凭据出现在错误响应里"一次都不该发生。
     """
-    result = await _run_pip(["check"], timeout=CONFLICT_CHECK_TIMEOUT_SECONDS)
+    run = await _run_tool("check", timeout=CONFLICT_CHECK_TIMEOUT_SECONDS)
+    if not run.ran:
+        # 无 pip 也无 uv：读元数据看不到冲突，明确"跳过"而不是假装干净。
+        return ConflictCheck(ok=True, output="", skipped=True, note=run.skipped_reason, tool=run.tool.kind)
+    result = run.result
+    assert result is not None  # run.ran 为真时必然有结果
     if result.timed_out:
-        return ConflictCheck(ok=True, output="", timed_out=True)
+        return ConflictCheck(ok=True, output="", timed_out=True, tool=run.tool.kind)
     if result.ok:
-        return ConflictCheck(ok=True, output="")
+        return ConflictCheck(ok=True, output="", tool=run.tool.kind)
+    if run.tool.kind == TOOL_UV and uv_check_unsupported(result):
+        return ConflictCheck(
+            ok=True,
+            output="",
+            skipped=True,
+            note="uv pip check is unavailable in this uv build; dependency pre-check skipped",
+            tool=run.tool.kind,
+        )
     text = redact_output(result.output or "").strip()
-    return ConflictCheck(ok=False, output=text[-MAX_CONFLICT_OUTPUT_CHARS:])
+    return ConflictCheck(
+        ok=False, output=text[-MAX_CONFLICT_OUTPUT_CHARS:], tool=run.tool.kind
+    )
 
 
 def conflict_http_exception(check: ConflictCheck) -> HTTPException:
@@ -335,6 +397,215 @@ def build_pip_command(args: list[str]) -> list[str]:
     return [sys.executable, "-m", "pip", *args]
 
 
+# ── 包工具选择：uv → pip → metadata ──────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PackageTool:
+    """一次依赖动作实际使用的工具。
+
+    ``kind`` 是三个合法标签之一：
+
+    * ``uv``：``<uv> pip ... --python <sys.executable>`` —— 桌面安装包随带的那份，
+      运行时 venv 里没有 pip 时**唯一**能装包的工具；
+    * ``pip``：``<sys.executable> -m pip ...`` —— 仅在 ``pip`` 模块真的可导入时使用
+      （``importlib.util.find_spec("pip") is None`` 时直接跑它只会得到
+      ``No module named pip`` + exit 1，正是依赖页 502 的根因）；
+    * ``metadata``：都没有时的**只读**兜底（``importlib.metadata``）。
+
+    ``path`` 只对 uv 有意义（绝对路径）；``reason`` 说明为什么落到这个工具，
+    直接进响应体，让"为什么没有 pip"在页面上可见而不是只留在日志里。
+    """
+
+    kind: str
+    path: str = ""
+    reason: str = ""
+
+    @property
+    def can_mutate(self) -> bool:
+        """能否执行 install / uninstall（metadata 只能读）。"""
+        return self.kind in (TOOL_UV, TOOL_PIP)
+
+
+def uv_executable_name() -> str:
+    """uv 的文件名（Windows 带 ``.exe``，POSIX 不带）。"""
+    return "uv.exe" if os.name == "nt" else "uv"
+
+
+def uv_platform_key() -> str:
+    """随包资产的平台键，与 ``prepare_uv.py`` / ``runtime-install.cjs`` 同一约定
+    （``win32-x64`` / ``darwin-arm64`` / ``linux-x64``）。"""
+    platform = "win32" if sys.platform.startswith("win") else ("darwin" if sys.platform == "darwin" else "linux")
+    raw = (platform_module.machine() or "").lower()
+    if raw in ("amd64", "x86_64", "x64"):
+        arch = "x64"
+    elif raw in ("arm64", "aarch64"):
+        arch = "arm64"
+    elif raw in ("i386", "i686", "x86"):
+        arch = "x86"
+    else:
+        arch = raw or "x64"
+    return f"{platform}-{arch}"
+
+
+def resources_dir() -> Path | None:
+    """``CHIRON_RESOURCES_DIR``（桌面壳注入的 ``<安装根>/resources``）。"""
+    raw = (os.environ.get(RESOURCES_DIR_ENV) or "").strip()
+    if not raw:
+        return None
+    return Path(raw)
+
+
+def uv_candidates() -> list[tuple[str, Path]]:
+    """uv 候选路径，**按优先级**排列的 ``(来源, 路径)``。
+
+    顺序即语义：
+
+    1. ``CHIRON_UV_BIN``：显式指定，运维/测试的逃生口，压过一切推断；
+    2. ``<CHIRON_RESOURCES_DIR>/uv/<platform>/uv``：安装包随带的那份（打包态正解）；
+    3. PATH 上的 ``uv``／``uv.exe``：开发者机器、或者用户自己装了 uv；
+    4. 运行时目录附近的 uv（venv 同级的 ``Scripts``/``bin``、安装根下的
+       ``uv/<platform>``、旧版按需下载的 ``runtime/bin/uv``）——
+       桌面壳把 venv 建在 userData 下，从 ``sys.executable`` 往上找总能覆盖这些位置。
+    """
+    exe = uv_executable_name()
+    out: list[tuple[str, Path]] = []
+
+    explicit = (os.environ.get(UV_BIN_ENV) or "").strip()
+    if explicit:
+        out.append((f"env {UV_BIN_ENV}", Path(explicit)))
+
+    root = resources_dir()
+    if root is not None:
+        out.append((f"{RESOURCES_DIR_ENV}/uv", root / "uv" / uv_platform_key() / exe))
+        out.append((f"{RESOURCES_DIR_ENV}/uv", root / "uv" / exe))
+        # 平台键算错（或安装包用了别的键）时的兜底：枚举 `resources/uv/*/<exe>`。
+        # 只读目录列表，不执行任何东西；命中与否都不影响后面的候选。
+        try:
+            out.extend(
+                (f"{RESOURCES_DIR_ENV}/uv/*", child / exe)
+                for child in sorted((root / "uv").iterdir())
+                if child.is_dir()
+            )
+        except OSError:
+            pass
+
+    which = shutil.which("uv") or shutil.which(exe)
+    if which:
+        out.append(("PATH", Path(which)))
+
+    try:
+        interp = Path(sys.executable).resolve()
+    except OSError:  # pragma: no cover - resolve 失败极罕见
+        interp = Path(sys.executable)
+    # venv 布局：<root>/venv/Scripts/python.exe（Windows）或 <root>/venv/bin/python（POSIX）
+    for base in list(interp.parents)[:4]:
+        out.append(("runtime sibling", base / exe))
+        out.append(("runtime sibling", base / "Scripts" / exe))
+        out.append(("runtime sibling", base / "bin" / exe))
+        out.append(("runtime sibling", base / "uv" / uv_platform_key() / exe))
+        out.append(("runtime sibling", base / "uv" / exe))
+    return out
+
+
+def resolve_uv_bin() -> str:
+    """找到可用的 uv 绝对路径；没有则返回空串（不猜、不下载）。"""
+    for source, candidate in uv_candidates():
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:  # pragma: no cover - 权限/路径异常按"不可用"处理
+            logger.debug("uv candidate %s unreadable (%s)", candidate, source)
+    return ""
+
+
+def pip_module_available() -> bool:
+    """``pip`` 模块是否真的可导入（不是"能不能找到 pip 这个名字"）。
+
+    直接跑 ``sys.executable -m pip`` 而不先查这一步，在桌面运行时 venv 里得到的
+    永远是 ``No module named pip`` + exit 1 —— 依赖页整页 502，用户看不到任何可用信息。
+    """
+    try:
+        return importlib.util.find_spec("pip") is not None
+    except (ImportError, ValueError):  # pragma: no cover - 解释器自身残缺
+        return False
+
+
+def resolve_package_tool() -> PackageTool:
+    """选包工具：**uv 优先**，其次 pip（模块确实存在），最后 metadata（只读）。
+
+    每次调用都重新解析（不缓存）：用户可能刚把 uv 放进 ``CHIRON_UV_BIN``，
+    而缓存会让"改完环境变量还得重启引擎"变成一个新的坑。
+    """
+    uv = resolve_uv_bin()
+    if uv:
+        return PackageTool(TOOL_UV, path=uv, reason=f"found uv at {uv}")
+    missing_uv = f"uv not found (checked {UV_BIN_ENV}, {RESOURCES_DIR_ENV}, PATH, runtime dir)"
+    if pip_module_available():
+        return PackageTool(TOOL_PIP, reason=f"{missing_uv}; falling back to python -m pip")
+    return PackageTool(
+        TOOL_METADATA,
+        reason=f"{missing_uv}; python -m pip is unavailable (no pip module in this interpreter)",
+    )
+
+
+def build_uv_command(action: str, operands: list[str], uv_bin: str) -> list[str]:
+    """构造 ``<uv> pip <action> --python <sys.executable> ...``。
+
+    ``--python`` 是必须的：uv 在 venv **内部**被调用时会自作主张用 ``VIRTUAL_ENV``，
+    而引擎进程的 ``VIRTUAL_ENV`` 可能指向别的 venv（桌面壳同时管 core/engine 两套）。
+    传绝对解释器路径让"装到哪个环境"不再取决于环境变量的残留。
+    """
+    base = [uv_bin, "pip", action, "--python", sys.executable]
+    if action == "list":
+        return [*base, "--format", "json"]
+    return [*base, *operands]
+
+
+def build_pip_action_command(action: str, operands: list[str]) -> list[str]:
+    """把动作翻译成 pip 的参数（保留原有的两个必需 flag）。"""
+    if action == "list":
+        return ["list", "--format=json", "--disable-pip-version-check"]
+    if action == "install":
+        return ["install", "--no-input", "--disable-pip-version-check", *operands]
+    if action == "uninstall":
+        return ["uninstall", "--yes", "--no-input", "--disable-pip-version-check", *operands]
+    return [action, *operands]
+
+
+def uv_check_unsupported(result: PipResult) -> bool:
+    """老版本 uv 没有 ``pip check``：那不是环境坏了，是预检做不了。"""
+    if result.ok or result.timed_out:
+        return False
+    return _UV_UNSUPPORTED_RE.search(result.output or "") is not None
+
+
+def list_metadata_packages() -> list[dict[str, str]]:
+    """用 ``importlib.metadata`` 读已安装包（无 pip/uv 时的只读兜底）。
+
+    视角与 pip 略有差异（可编辑安装、多 ``site-packages``），但**能看**比
+    "整页 502" 有用得多；响应里的 ``tool: "metadata"`` 会把这件事说清楚。
+    """
+    from importlib import metadata as importlib_metadata
+
+    by_name: dict[str, dict[str, str]] = {}
+    try:
+        distributions = list(importlib_metadata.distributions())
+    except Exception as exc:  # noqa: BLE001 - 元数据目录损坏的形态无法穷举
+        logger.warning("importlib.metadata unavailable: %s: %s", type(exc).__name__, exc)
+        return []
+    for dist in distributions:
+        try:
+            name = str(dist.metadata["Name"] or "").strip()
+            version = str(dist.version or "").strip()
+        except Exception:  # noqa: BLE001 - 单个损坏的 dist-info 不该拖垮整个列表
+            continue
+        if not name or not version:
+            continue
+        by_name.setdefault(name.lower(), {"name": name, "version": version})
+    return [by_name[key] for key in sorted(by_name)][:MAX_PACKAGES]
+
+
 #: 传给 pip 子进程的环境变量白名单。
 #:
 #: 不继承完整 ``os.environ``：引擎环境里有 JWT_SECRET / INTERNAL_TOKEN / 各 provider
@@ -380,7 +651,13 @@ def redact_output(text: str) -> str:
 
 
 def _pip_env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k in _PIP_ENV_ALLOW or k.startswith("PIP_")}
+    # uv 与 pip 共用一个白名单：``UV_*`` 里的镜像源/缓存目录（用户自己配的）必须能生效，
+    # 否则 uv 会去默认 index 拉包 —— 在离线/内网机器上表现为"安装卡到超时"。
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k in _PIP_ENV_ALLOW or k.startswith("PIP_") or k.startswith("UV_")
+    }
     # 关掉交互与版本检查：后台任务没有 TTY，任何 prompt 都会把任务挂到超时；
     # 版本检查是一次额外的网络往返，对这个页面没有价值。
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
@@ -390,13 +667,14 @@ def _pip_env() -> dict[str, str]:
     return env
 
 
-async def _run_pip(
-    args: list[str],
+async def _run_process(
+    command: list[str],
     *,
     timeout: float,
     on_line: Callable[[str], None] | None = None,
+    label: str = "pip",
 ) -> PipResult:
-    """执行一次 pip 调用：不经过 shell、有超时、输出有上限。
+    """执行一次子进程：不经过 shell、有超时、输出有上限（pip / uv 共用）。
 
     ``on_line`` 用于把输出**边跑边**喂给任务日志（后台安装任务的进度来源）。
     超时后 kill 子进程并返回 ``timed_out=True`` —— 不抛异常，因为调用方需要把
@@ -404,18 +682,18 @@ async def _run_pip(
     """
     try:
         proc = await asyncio.create_subprocess_exec(
-            *build_pip_command(args),
+            *command,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=_pip_env(),
         )
     except OSError as exc:
-        return PipResult(ok=False, returncode=-1, output=f"failed to start pip: {exc}")
+        return PipResult(ok=False, returncode=-1, output=f"failed to start {label}: {exc}")
 
     stdout = proc.stdout
     if stdout is None:  # pragma: no cover - 由 PIPE 保证非 None
-        return PipResult(ok=False, returncode=-1, output="pip stdout is unavailable")
+        return PipResult(ok=False, returncode=-1, output=f"{label} stdout is unavailable")
 
     collected: list[str] = []
     collected_bytes = 0
@@ -458,6 +736,88 @@ async def _run_pip(
         output=output,
         timed_out=timed_out,
         truncated=truncated,
+    )
+
+
+async def _run_pip(
+    args: list[str],
+    *,
+    timeout: float,
+    on_line: Callable[[str], None] | None = None,
+) -> PipResult:
+    """执行一次 ``python -m pip <args>``（参数是 pip 的原始参数列表）。"""
+    return await _run_process(
+        build_pip_command(args), timeout=timeout, on_line=on_line, label="pip"
+    )
+
+
+async def _run_uv(
+    args: list[str],
+    *,
+    timeout: float,
+    on_line: Callable[[str], None] | None = None,
+) -> PipResult:
+    """执行一次 ``uv pip ...``（``args`` 已由 ``build_uv_command`` 构造完整）。"""
+    return await _run_process(args, timeout=timeout, on_line=on_line, label="uv")
+
+
+@dataclass(frozen=True)
+class ToolRun:
+    """一次依赖动作的执行结果 + 实际用了哪个工具。
+
+    ``result is None`` 表示**这个工具执行不了该动作**（metadata 只能读；或者
+    install/uninstall 时根本没有可变更的工具），具体原因在 ``skipped_reason``。
+    """
+
+    tool: PackageTool
+    result: PipResult | None = None
+    skipped_reason: str = ""
+
+    @property
+    def ran(self) -> bool:
+        return self.result is not None
+
+
+async def _run_tool(
+    action: str,
+    operands: list[str] | None = None,
+    *,
+    timeout: float,
+    on_line: Callable[[str], None] | None = None,
+) -> ToolRun:
+    """按选中的工具执行 ``list`` / ``install`` / ``uninstall`` / ``check``。
+
+    这是所有依赖动作的**唯一**执行入口：pip 与 uv 的参数形态差异只在这里出现，
+    调用方（端点、快照、恢复任务）不需要知道背后是哪一个。
+    """
+    tool = resolve_package_tool()
+    ops = list(operands or [])
+    if tool.kind == TOOL_UV:
+        return ToolRun(tool, await _run_uv(
+            build_uv_command(action, ops, tool.path), timeout=timeout, on_line=on_line
+        ))
+    if tool.kind == TOOL_PIP:
+        return ToolRun(tool, await _run_pip(
+            build_pip_action_command(action, ops), timeout=timeout, on_line=on_line
+        ))
+    reason = READ_ONLY_TOOL_HINT if action == "list" else NO_MUTATION_TOOL_MESSAGE
+    return ToolRun(tool, None, skipped_reason=reason)
+
+
+def tool_unavailable_exception(tool: PackageTool, action: str) -> HTTPException:
+    """没有可变更工具时的 503：文案必须可直接行动（装 uv / 设 CHIRON_UV_BIN）。"""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "error": NO_MUTATION_TOOL_MESSAGE,
+            "tool": tool.kind,
+            "action": action,
+            "reason": tool.reason,
+            "hint": (
+                "the desktop runtime venv may have been created without pip; "
+                "install uv (bundled at resources/uv/<platform>/uv) or point CHIRON_UV_BIN at it"
+            ),
+        },
     )
 
 
@@ -670,22 +1030,31 @@ async def _run_install_job(
     tenant_id: int = DEFAULT_TENANT_ID,
     user_id: str = "",
 ) -> None:
-    """后台安装任务的执行体：先自动快照、再调 pip、推进进度、落结果。"""
+    """后台安装任务的执行体：先自动快照、再调包工具、推进进度、落结果。"""
     global _running_job_id
 
     job.status = "running"
     job.progress = 5
     job.message = "creating pre-install snapshot"
     try:
-        # 快照必须在 pip install 之前：装完再拍就拍到了坏状态。
+        # 快照必须在 install 之前：装完再拍就拍到了坏状态。
         await _snapshot_before_mutation(job, f"install:{spec}", tenant_id=tenant_id, user_id=user_id)
         job.progress = 10
-        job.message = "running pip install"
-        result = await _run_pip(
-            ["install", "--no-input", "--disable-pip-version-check", spec],
+        run = await _run_tool(
+            "install",
+            [spec],
             timeout=INSTALL_TIMEOUT_SECONDS,
             on_line=lambda line: _append_job_output(job, line),
         )
+        if not run.ran:
+            # 端点已经拦过 503；这里是并发窗口里工具消失（uv 被删）的兜底。
+            job.status = "failed"
+            job.progress = 100
+            job.message = run.skipped_reason
+            return
+        job.message = f"running {run.tool.kind} install"
+        result = run.result
+        assert result is not None
         job.returncode = result.returncode
         if result.ok:
             job.status = "succeeded"
@@ -697,9 +1066,9 @@ async def _run_install_job(
             job.status = "failed"
             job.progress = 100
             job.message = (
-                f"pip install timed out after {int(INSTALL_TIMEOUT_SECONDS)}s"
+                f"{run.tool.kind} install timed out after {int(INSTALL_TIMEOUT_SECONDS)}s"
                 if result.timed_out
-                else f"pip install exited with code {result.returncode}"
+                else f"{run.tool.kind} install exited with code {result.returncode}"
             )
         if result.output and result.output not in job.output:
             # 采集可能因上限而只有尾部：确保结论行一定在。
@@ -1236,16 +1605,22 @@ def compute_restore_diff(
 
 
 async def _current_packages() -> list[dict[str, str]]:
-    """取当前解释器的包清单（与 ``/list`` 同一命令、同一解析），失败抛 ``PipListError``。"""
-    result = await _run_pip(
-        ["list", "--format=json", "--disable-pip-version-check"],
-        timeout=LIST_TIMEOUT_SECONDS,
-    )
+    """取当前解释器的包清单（与 ``/list`` 同一命令、同一解析），失败抛 ``PipListError``。
+
+    无 pip/uv 时退到 ``importlib.metadata``：快照的用途是"装坏了能回去"，而在那种
+    环境里**唯一**的变更手段是用户手动装 uv —— 此时连一份只读清单都拿不到，等于
+    功能全灭。``tool: "metadata"`` 已经在 ``/list`` 里说清楚了视角差异。
+    """
+    run = await _run_tool("list", timeout=LIST_TIMEOUT_SECONDS)
+    if not run.ran:
+        return list_metadata_packages()
+    result = run.result
+    assert result is not None  # run.ran 为真时必然有结果
     if not result.ok:
         reason = (
-            f"pip list timed out after {int(LIST_TIMEOUT_SECONDS)}s"
+            f"{run.tool.kind} list timed out after {int(LIST_TIMEOUT_SECONDS)}s"
             if result.timed_out
-            else f"pip list exited with code {result.returncode}"
+            else f"{run.tool.kind} list exited with code {result.returncode}"
         )
         raise PipListError(f"{reason}: {result.output[-500:]}")
     try:
@@ -1326,18 +1701,26 @@ async def _run_restore_job(
         if extras:
             job.progress = 20
             job.message = f"uninstalling {len(extras)} package(s)"
-            result = await _run_pip(
-                ["uninstall", "--yes", "--no-input", "--disable-pip-version-check", *extras],
+            run = await _run_tool(
+                "uninstall",
+                extras,
                 timeout=UNINSTALL_TIMEOUT_SECONDS,
                 on_line=lambda line: _append_job_output(job, line),
             )
+            if not run.ran:
+                job.status = "failed"
+                job.progress = 100
+                job.message = run.skipped_reason
+                return
+            result = run.result
+            assert result is not None
             if not result.ok:
                 job.status = "failed"
                 job.progress = 100
                 job.message = (
-                    f"pip uninstall timed out after {int(UNINSTALL_TIMEOUT_SECONDS)}s"
+                    f"{run.tool.kind} uninstall timed out after {int(UNINSTALL_TIMEOUT_SECONDS)}s"
                     if result.timed_out
-                    else f"pip uninstall exited with code {result.returncode}"
+                    else f"{run.tool.kind} uninstall exited with code {result.returncode}"
                 )
                 return
 
@@ -1346,18 +1729,26 @@ async def _run_restore_job(
         if pinned:
             job.progress = 50
             job.message = f"installing {len(pinned)} package(s)"
-            result = await _run_pip(
-                ["install", "--no-input", "--disable-pip-version-check", *pinned],
+            run = await _run_tool(
+                "install",
+                pinned,
                 timeout=RESTORE_INSTALL_TIMEOUT_SECONDS,
                 on_line=lambda line: _append_job_output(job, line),
             )
+            if not run.ran:
+                job.status = "failed"
+                job.progress = 100
+                job.message = run.skipped_reason
+                return
+            result = run.result
+            assert result is not None
             if not result.ok:
                 job.status = "failed"
                 job.progress = 100
                 job.message = (
-                    f"pip install timed out after {int(RESTORE_INSTALL_TIMEOUT_SECONDS)}s"
+                    f"{run.tool.kind} install timed out after {int(RESTORE_INSTALL_TIMEOUT_SECONDS)}s"
                     if result.timed_out
-                    else f"pip install exited with code {result.returncode}"
+                    else f"{run.tool.kind} install exited with code {result.returncode}"
                 )
                 return
 
@@ -1411,31 +1802,63 @@ class RestoreRequest(BaseModel):
 
 @router.get("/list", dependencies=[Depends(require_internal_token)])
 async def list_packages() -> dict[str, Any]:
-    """列出**当前引擎解释器**已安装的包。
+    """列出**当前引擎解释器**已安装的包（``tool`` 说明用哪个工具读出来的）。
 
-    不用 ``importlib.metadata`` 直接读：那个视角与 pip 的视角在可编辑安装 / 多
-    ``site-packages`` 时会分叉，而用户在这里做的是 pip 操作，应当看到 pip 认为的结果。
+    为什么先 uv 再 pip：桌面运行时 venv 里可能**没有 pip**（实测
+    ``python -m pip`` → ``No module named pip``），此时旧实现整页 502
+    ``pip list exited with code 1``；而安装包随带 uv，能正常读出同一份清单。
+    两者都没有时退到 ``importlib.metadata``（``tool: "metadata"``）——
+    可编辑安装 / 多 ``site-packages`` 的视角会与 pip 分叉，但这比"整页报错"有用。
     """
-    result = await _run_pip(
-        ["list", "--format=json", "--disable-pip-version-check"],
-        timeout=LIST_TIMEOUT_SECONDS,
-    )
+    run = await _run_tool("list", timeout=LIST_TIMEOUT_SECONDS)
+    if not run.ran:
+        packages = list_metadata_packages()
+        return {
+            "python": sys.version.split()[0],
+            "executable": sys.executable,
+            "packages": packages,
+            "count": len(packages),
+            "tool": run.tool.kind,
+            "tool_path": "",
+            "degraded": True,
+            "tool_reason": run.tool.reason,
+            "note": READ_ONLY_TOOL_HINT,
+        }
+
+    result = run.result
+    assert result is not None  # run.ran 为真时必然有结果
+    # 逐行采集已经脱敏过一次；这里再脱一次是纵深防御（测试替身 / 未来别的执行器
+    # 可能直接塞进未脱敏的 output，而"凭据进错误响应"一次都不该发生）。
+    tail = redact_output(result.output[-2000:])
     if not result.ok:
         reason = (
-            f"pip list timed out after {int(LIST_TIMEOUT_SECONDS)}s"
+            f"{run.tool.kind} list timed out after {int(LIST_TIMEOUT_SECONDS)}s"
             if result.timed_out
-            else f"pip list exited with code {result.returncode}"
+            else f"{run.tool.kind} list exited with code {result.returncode}"
         )
         raise HTTPException(
             status_code=502,
-            detail={"error": reason, "output": result.output[-2000:]},
+            detail={
+                "error": reason,
+                "output": tail,
+                # stderr 与 stdout 合流采集，``tail`` 就是 stderr 尾部（已脱敏）。
+                "stderr_tail": tail,
+                "tool": run.tool.kind,
+                "tool_path": run.tool.path,
+                "reason": run.tool.reason,
+            },
         )
     try:
         packages = parse_pip_list(result.output)
     except ValueError as exc:
         raise HTTPException(
             status_code=502,
-            detail={"error": str(exc), "output": result.output[-2000:]},
+            detail={
+                "error": str(exc),
+                "output": tail,
+                "stderr_tail": tail,
+                "tool": run.tool.kind,
+            },
         ) from exc
 
     return {
@@ -1443,6 +1866,10 @@ async def list_packages() -> dict[str, Any]:
         "executable": sys.executable,
         "packages": packages,
         "count": len(packages),
+        "tool": run.tool.kind,
+        "tool_path": run.tool.path,
+        "degraded": False,
+        "tool_reason": run.tool.reason,
     }
 
 
@@ -1503,6 +1930,12 @@ async def install_package(payload: InstallRequest, request: Request) -> dict[str
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 先看工具再排队：既无 pip 也无 uv 时，排进去的任务注定失败，用户还要等一轮
+    # 轮询才知道原因。这里直接 503 + 可行动文案（装 uv / 设 CHIRON_UV_BIN）。
+    tool = resolve_package_tool()
+    if not tool.can_mutate:
+        raise tool_unavailable_exception(tool, "install")
+
     if _running_job_id is not None:
         raise HTTPException(
             status_code=409,
@@ -1555,6 +1988,10 @@ async def uninstall_package(payload: UninstallRequest, request: Request) -> dict
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    tool = resolve_package_tool()
+    if not tool.can_mutate:
+        raise tool_unavailable_exception(tool, "uninstall")
+
     if _running_job_id is not None:
         raise HTTPException(
             status_code=409,
@@ -1573,29 +2010,34 @@ async def uninstall_package(payload: UninstallRequest, request: Request) -> dict
             await capture_snapshot(f"uninstall:{name}", tenant_id=tenant_id, user_id=user_id)
         except (PipListError, OSError) as exc:
             logger.warning("deps pre-uninstall snapshot failed: %s", exc)
-        result = await _run_pip(
-            ["uninstall", "--yes", "--no-input", "--disable-pip-version-check", name],
-            timeout=UNINSTALL_TIMEOUT_SECONDS,
+        run = await _run_tool(
+            "uninstall", [name], timeout=UNINSTALL_TIMEOUT_SECONDS
         )
+        if not run.ran:
+            raise tool_unavailable_exception(run.tool, "uninstall")
+        result = run.result
+        assert result is not None
     finally:
         if _running_job_id == marker:
             _running_job_id = None
 
     if not result.ok:
         reason = (
-            f"pip uninstall timed out after {int(UNINSTALL_TIMEOUT_SECONDS)}s"
+            f"{run.tool.kind} uninstall timed out after {int(UNINSTALL_TIMEOUT_SECONDS)}s"
             if result.timed_out
-            else f"pip uninstall exited with code {result.returncode}"
+            else f"{run.tool.kind} uninstall exited with code {result.returncode}"
         )
+        tail = redact_output(result.output[-2000:])
         raise HTTPException(
             status_code=502,
-            detail={"error": reason, "output": result.output[-2000:]},
+            detail={"error": reason, "output": tail, "stderr_tail": tail, "tool": run.tool.kind},
         )
     # 卸载同样是"环境已变"：进程里可能仍有已导入的模块，重启后才完全一致。
     return {
         "ok": True,
         "name": name,
         "output": result.output[-2000:],
+        "tool": run.tool.kind,
         "restart_required": True,
     }
 

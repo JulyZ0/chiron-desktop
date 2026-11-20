@@ -461,6 +461,8 @@ export default {
   deps_title: "Python 依赖管理",
   deps_desc: "查看、搜索、安装与卸载引擎解释器里的 pip 包。安装会改变整台机器共享的运行环境，请确认后再执行。",
   deps_python_version: "Python {version}",
+  deps_tool: "包管理器：{tool}",
+  deps_tool_metadata_hint: "当前环境没有 pip/uv，只能读取已安装包；安装与卸载不可用",
   deps_installed_title: "已安装的包",
   deps_installed_empty: "没有读取到已安装的包",
   deps_filter_placeholder: "按包名过滤",
