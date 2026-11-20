@@ -233,26 +233,30 @@ stage_frontend_static() {
 }
 
 stage_frontend_full() {
-  cd frontend-vue || exit 1
-  if [ ! -d node_modules ]; then
-    echo "   ✘ frontend-vue/node_modules 不存在：先 pnpm install --frozen-lockfile" >&2
-    return 1
-  fi
-  npm run check:ui || return 1
+  # 整段放进**子 shell**：它必须 cd 进 frontend-vue，而在函数里直接 cd 会把工作目录
+  # 泄漏给后续环节 —— 后面以前没有别的环节，所以这个泄漏一直没暴露；`--release` 的
+  # release-ready 会因此在 frontend-vue 里找脚本（No such file or directory）。
+  (
+    cd frontend-vue || exit 1
+    if [ ! -d node_modules ]; then
+      echo "   ✘ frontend-vue/node_modules 不存在：先 pnpm install --frozen-lockfile" >&2
+      exit 1
+    fi
+    npm run check:ui || exit 1
 
-  # 存量已知错误：src/api/index.ts 的 IsolationHelperResult 族（P2 跟踪）。
-  # 只过滤这一族；其余任何 `error TS` 都必须让门禁红，否则 --noEmit 形同虚设。
-  local out remaining
-  out="$(npx vue-tsc --noEmit -p tsconfig.app.json 2>&1 || true)"
-  printf '%s\n' "$out"
-  remaining="$(printf '%s\n' "$out" | grep 'error TS' | grep -v 'IsolationHelperResult' || true)"
-  if [ -n "$remaining" ]; then
-    echo "   ✘ vue-tsc 报出非 IsolationHelperResult 的类型错误" >&2
-    return 1
-  fi
+    # 存量已知错误：src/api/index.ts 的 IsolationHelperResult 族（P2 跟踪）。
+    # 只过滤这一族；其余任何 `error TS` 都必须让门禁红，否则 --noEmit 形同虚设。
+    out="$(npx vue-tsc --noEmit -p tsconfig.app.json 2>&1 || true)"
+    printf '%s\n' "$out"
+    remaining="$(printf '%s\n' "$out" | grep 'error TS' | grep -v 'IsolationHelperResult' || true)"
+    if [ -n "$remaining" ]; then
+      echo "   ✘ vue-tsc 报出非 IsolationHelperResult 的类型错误" >&2
+      exit 1
+    fi
 
-  npx vitest run src || return 1
-  npx vite build
+    npx vitest run src || exit 1
+    npx vite build
+  )
 }
 
 # ── 5. 真机集成测试带（opt-in）────────────────────────────────────────────
@@ -273,7 +277,8 @@ stage_integration() {
 # 齐全且对应当前提交）。这里只做串联，顺序不能反：**先跑门禁、再看证据** ——
 # 反了就是拿上一次运行的残留结论给这一次签字。
 stage_release_ready() {
-  bash scripts/check-release-ready.sh
+  # 绝对路径：即使将来某个环节又漏了 cd，这里也不会"找不到脚本"而假失败。
+  bash "$ROOT/scripts/check-release-ready.sh"
 }
 
 DIRTY_NOTE=""
