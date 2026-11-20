@@ -115,11 +115,12 @@ describe('KnowledgeView：近 24h 命中率', () => {
   const emptyWin = { queries: 0, hits: 0, zero_hit: 0, errors: 0, avg_latency_ms: 0, zero_hit_rate: 0 }
 
   function installStats(win: Record<string, number>, available = true) {
-    apiMocks.get.mockImplementation((url: string) => {
-      if (url === '/v1/kb') {
+    apiMocks.get.mockImplementation((url?: unknown) => {
+      const u = String(url ?? '')
+      if (u === '/v1/kb') {
         return Promise.resolve({ data: { data: { knowledge_bases: [KB] } } })
       }
-      if (url === '/v1/kb/kb-1/stats') {
+      if (u === '/v1/kb/kb-1/stats') {
         return Promise.resolve({
           data: { data: {
             kb_id: 'kb-1',

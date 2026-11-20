@@ -25,7 +25,7 @@ import type { ChatItem, ToolCallItem, ToolResultItem, TextItem, ChatAttachment }
 import { formatSize } from './chat-types'
 import { resolveMediaUrl } from '../../api'
 import { useRouter } from 'vue-router'
-import { buildKbCitationLink, kbCitationLabel, normalizeKbCitations } from '../../utils/kbCitation'
+import { buildKbCitationLink, kbCitationLabel, kbCitationViews, normalizeKbCitations, type KbCitationView } from '../../utils/kbCitation'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
@@ -269,22 +269,13 @@ const sourceChips = computed<SourceChip[]>(() => {
 // 这里渲染成可点条目 → `/knowledge/:kbId?doc=:docId`，由 KnowledgeDetailView 定位并
 // 高亮那一行。`to` 为空表示缺 kb_id（老会话 / PageIndex 改写过文件名）：仍然展示
 // "文档名 · 第 N 页"，只是不可点击 —— 悄悄丢掉这条信息比点不动更糟。
-interface KbCitationView {
-  key: string
-  label: string
-  to: string
-  snippet: string
-}
-
+//
+// 组装规则在 `utils/kbCitation.kbCitationViews`：分享页用同一个函数、传
+// `linkable: false` 得到纯文本形态（公开页没有库权限，链接只会跳到登录墙）。
 const kbCitations = computed<KbCitationView[]>(() => {
   if (props.item.kind !== 'text' || props.item.role !== 'assistant') return []
   const meta: Record<string, unknown> = props.item.metadata || {}
-  return normalizeKbCitations(meta.kb_citations).map((c, i) => ({
-    key: `${c.kb_id}-${c.doc_id}-${i}`,
-    label: kbCitationLabel(c),
-    to: buildKbCitationLink(c),
-    snippet: c.snippet,
-  }))
+  return kbCitationViews(meta.kb_citations)
 })
 
 function openKbCitation(to: string) {

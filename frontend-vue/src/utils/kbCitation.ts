@@ -93,3 +93,46 @@ export function kbCitationLabel(citation: Partial<KbCitation> | null | undefined
   const base = name || t('knowledge.document')
   return page ? t('knowledge.citation_doc_page', { doc: base, page }) : base
 }
+
+/** 渲染层用的引用条目：`to` 为空 = 不可点（调用方渲染成纯文本）。 */
+export interface KbCitationView {
+  key: string
+  label: string
+  to: string
+  snippet: string
+}
+
+/**
+ * 引用数组 → 渲染条目（`MessageItem` 与分享页共用，P1-8）。
+ *
+ * `linkable: false` 用于**分享页**：公开链接没有库权限，跳 `/knowledge/:kbId`
+ * 只会把访客送进一个 404/登录墙。此时 `to` 恒为空，调用方按纯文本渲染 ——
+ * 信息（文档名 · 页码）保留，点击能力去掉。这条规则必须**共用同一个函数**，
+ * 否则两条渲染路径迟早分叉成"对话里能点、分享页也能点"。
+ */
+export function kbCitationViews(
+  raw: unknown,
+  options: { linkable?: boolean } = {},
+): KbCitationView[] {
+  const linkable = options.linkable !== false
+  return normalizeKbCitations(raw).map((citation, index) => ({
+    key: `${citation.kb_id}-${citation.doc_id}-${index}`,
+    label: kbCitationLabel(citation),
+    to: linkable ? buildKbCitationLink(citation) : '',
+    snippet: citation.snippet,
+  }))
+}
+
+/**
+ * 站内知识库路由前缀。分享页要把这类链接降级为纯文本（见 `kbCitationViews`）。
+ *
+ * 只匹配**站内相对路径**：绝对外链（`https://…`）与 `#` 锚点不受影响，
+ * 否则分享页的正常外链也会被降级。
+ */
+const INTERNAL_KB_LINK_PREFIXES = ['/knowledge', '/chat', '/agents', '/kb/']
+
+export function isInternalAppLink(href: string): boolean {
+  const value = asString(href)
+  if (!value || !value.startsWith('/')) return false
+  return INTERNAL_KB_LINK_PREFIXES.some(prefix => value === prefix || value.startsWith(`${prefix}/`) || value.startsWith(`${prefix}?`))
+}
