@@ -649,6 +649,15 @@ func MonitoringMiddleware(next http.Handler) http.Handler {
 			monitor.RequestHistogram.Record(d)
 			monitor.RequestWindowStats.Record(d, sw.status)
 		}()
+		// panic 的请求实际回给客户端的是 500（由外层 RecoverMiddleware 写出），
+		// 但此刻 sw 还没写过状态码。先把它记成 500 再放行 panic，
+		// 否则错误率会漏掉最严重的那一类请求。
+		defer func() {
+			if rec := recover(); rec != nil {
+				sw.status = http.StatusInternalServerError
+				panic(rec)
+			}
+		}()
 		next.ServeHTTP(sw, r)
 	})
 }

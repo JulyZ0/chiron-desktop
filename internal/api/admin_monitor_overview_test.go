@@ -238,6 +238,44 @@ func TestMonitorOverviewRequestSamplingIsReal(t *testing.T) {
 	}
 }
 
+// TestMonitoringMiddlewareRecordsRealStatus：错误率要能反映真实状态码。
+//
+// 写成两条：正常 503 与 panic（客户端看到 500，但 handler 从未 WriteHeader）。
+// 后者不补记 500 的话，错误率会恰好漏掉最严重的一类请求。
+func TestMonitoringMiddlewareRecordsRealStatus(t *testing.T) {
+	withoutBackends(t)
+	before := monitor.RequestWindowStats.Snapshot(15 * time.Minute)
+
+	rec := httptest.NewRecorder()
+	MonitoringMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/boom", nil))
+
+	after := monitor.RequestWindowStats.Snapshot(15 * time.Minute)
+	if after.Samples != before.Samples+1 {
+		t.Fatalf("503 请求应新增 1 条样本，得到 %d → %d", before.Samples, after.Samples)
+	}
+	if after.ServerErrors != before.ServerErrors+1 {
+		t.Errorf("503 必须计入 server_errors，得到 %d → %d", before.ServerErrors, after.ServerErrors)
+	}
+
+	// panic：外层 RecoverMiddleware 会回 500，这里补记后再放行 panic。
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("panic 应继续向上抛出（由 RecoverMiddleware 收口）")
+			}
+		}()
+		MonitoringMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			panic("boom")
+		})).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/panic", nil))
+	}()
+	panicked := monitor.RequestWindowStats.Snapshot(15 * time.Minute)
+	if panicked.ServerErrors != after.ServerErrors+1 {
+		t.Errorf("panic 请求必须按 500 计入 server_errors，得到 %d → %d", after.ServerErrors, panicked.ServerErrors)
+	}
+}
+
 // TestMonitorOverviewRouteIsPlatformReadOnly 钉住门禁：
 //   1. 路由必须挂到外部 mux（否则前端 404，与"功能没做"长得一样）；
 //   2. 权限必须是**平台读**：租户 admin 持有 admin:read 也不能看全平台运行事实。
