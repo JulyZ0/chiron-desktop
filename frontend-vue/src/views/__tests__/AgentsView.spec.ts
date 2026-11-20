@@ -168,4 +168,52 @@ describe('AgentsView（此前零测试）', () => {
     expect(canManageOf(anonymous)({ id: 'a-4', user_id: 'u-someone' })).toBe(true)
     anonymous.unmount()
   })
+
+  /**
+   * 空状态的两种口径（2026-11-19）。
+   *
+   * 动因：市场装完 Agent 后 Agents 页显示"还没有 Agent"（空状态）。空状态模板用
+   * `agents.length === 0` 判定，只要列表里**有任何一条**（哪怕已停用）就不得命中它；
+   * "筛选后为空"是另一块文案，不该引导用户去市场重装。
+   *
+   * 两条用例分别钉：
+   * ① 列表里只有 disabled 项时，页面必须列出它（「全部」分组不过滤启用态）+ 标「已停用」；
+   * ② 有 Agent 但当前分组筛空时，显示"没有匹配"，且不显示"还没有 Agent"。
+   */
+  const EMPTY_NO_AGENT = '还没有 Agent'
+  const EMPTY_NO_MATCH = '没有匹配的 Agent'
+
+  it('★ 列表只有已停用的 Agent 时不显示空状态，且「全部」分组里可见', async () => {
+    apiMocks.listAgents.mockResolvedValue([
+      { id: 'a-off', name: '停用的归档助手', description: '历史遗留', enabled: false, visibility: 'private' },
+    ])
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('停用的归档助手')
+    expect(text).not.toContain(EMPTY_NO_AGENT)
+    expect(text).not.toContain(EMPTY_NO_MATCH)
+    expect(text).toContain('已停用')
+    wrapper.unmount()
+  })
+
+  it('★ 有 Agent 但筛选后为空时显示"筛选空状态"，而不是"无 Agent"', async () => {
+    apiMocks.listAgents.mockResolvedValue([
+      { id: 'a-other', name: '别人的助手', description: '团队共享', enabled: true, visibility: 'private', user_id: 'u-other' },
+    ])
+
+    const wrapper = mountView('u-me')
+    await flushPromises()
+
+    // 切到「我的」：唯一的 Agent 不属于当前用户 ⇒ 筛选结果为空
+    ;(wrapper.vm as unknown as { groupFilter: string }).groupFilter = 'mine'
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain(EMPTY_NO_MATCH)
+    expect(text).not.toContain(EMPTY_NO_AGENT)
+    wrapper.unmount()
+  })
 })

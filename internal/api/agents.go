@@ -61,6 +61,9 @@ type Agent struct {
 	Visibility string    `json:"visibility,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// TenantID 只用于「列表返回的行是否真属于本次请求的租户」这一道 Go 侧复核，
+	// 不进 JSON：租户是请求上下文的事实，不是资源属性，透出只会诱发前端自行比较。
+	TenantID int16 `json:"-"`
 }
 
 // AgentSession 是一次 Agent 运行的持久化记录。
@@ -152,8 +155,8 @@ func (h *AgentHandler) seedPresetAgents() {
 			continue
 		}
 		if _, err := db.GlobalDBManager.Exec(ctx,
-			`INSERT INTO agents (id, tenant_id, user_id, name, description, system_prompt, tools, llm_config, max_turns, timeout_seconds, enabled)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true)`,
+			`INSERT INTO agents (id, tenant_id, user_id, name, description, system_prompt, tools, llm_config, max_turns, timeout_seconds, enabled, visibility, kind, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, 'private', 'chat', NOW(), NOW())`,
 			agentID, ownerTenantID, ownerUserID, p.Name, p.Description, p.Prompt,
 			string(toolsJSON), string(llmJSON), p.Turns, 120); err != nil {
 			slog.Warn("seed preset agent", "name", p.Name, "error", err)
@@ -187,8 +190,14 @@ func (h *AgentHandler) List(w http.ResponseWriter, r *http.Request) {
 		var a Agent
 		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.SystemPrompt, &a.Tools, &a.LLMConfig,
 			&a.MaxTurns, &a.TimeoutSeconds, &a.Enabled, &a.KbID, &a.Skills, &a.Plugins,
-			&a.UserID, &a.Visibility, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			&a.UserID, &a.Visibility, &a.CreatedAt, &a.UpdatedAt, &a.TenantID); err != nil {
 			slog.Warn("scan agent", "error", err)
+			continue
+		}
+		// SQL 已按同一口径过滤；这里是第二道保险（后置复核而不是只靠 SQL）：
+		// 一旦有人放松 WHERE（历史上一度只按 user_id 过滤），别人的私有 Agent
+		// 会被这条复核挡回去，而不是直接出现在列表里。
+		if !agentRowVisible(claims.TenantID, claims.UserID, &a) {
 			continue
 		}
 		agents = append(agents, a)
@@ -204,17 +213,43 @@ func (h *AgentHandler) List(w http.ResponseWriter, r *http.Request) {
 // （见 migrations/versions/0001_authoritative_baseline.py 的 agents DDL），缺省值一律
 // '[]'::json / '{}'::json。json 与 jsonb 之间两个方向都没有隐式转换，COALESCE 统一类型
 // 时会直接报 "could not convert type jsonb to json"。编译期和单测都看不出来。
+//
+// **时间戳必须 COALESCE**：`agents.created_at / updated_at` 在 DDL 里是
+// `timestamp without time zone` 且**没有默认值**（见 0001 baseline 的 agents DDL），
+// 而此前的三条写入路径（市场安装、POST /v1/agents、预置播种）都省略了这两列 ⇒ 落库为 NULL。
+// 把 NULL 扫进 `time.Time` 会报 "cannot scan NULL into *time.Time"，List 的处理是
+// `continue` —— 每一行都被静默丢掉，页面于是显示"还没有 Agent"（市场装完也一样）。
+// 读取侧因此无条件兜底（同时兼容已经写坏的 NULL 行），写入侧另行显式写 NOW()。
 const agentListQuery = `
 SELECT id::text, name, COALESCE(description,''), COALESCE(system_prompt,''),
        COALESCE(tools,'[]'::json), COALESCE(llm_config,'{}'::json),
        max_turns, timeout_seconds, enabled, COALESCE(kb_id,''),
        COALESCE(skills,'[]'::json), COALESCE(plugins,'[]'::json),
-       user_id::text, COALESCE(visibility,'private'), created_at, updated_at
+       user_id::text, COALESCE(visibility,'private'),
+       COALESCE(created_at, updated_at, TIMESTAMP '1970-01-01') AS created_at,
+       COALESCE(updated_at, created_at, TIMESTAMP '1970-01-01') AS updated_at,
+       tenant_id
   FROM agents
  WHERE tenant_id = $1
    AND (user_id = $2 OR visibility = 'tenant')
    AND (kind IS NULL OR kind = 'chat')  -- 子 Agent Profile（kind='subagent'）不进入对话 Agent 列表
- ORDER BY created_at DESC`
+ ORDER BY COALESCE(created_at, TIMESTAMP '1970-01-01') DESC, id`
+
+// agentRowVisible 是列表可见性口径的 Go 侧形态（C1-5：公开的归团队、私有的归个人）。
+//
+// 与 agentListQuery / agentGetQuery 的 WHERE 同构：**同租户** + （本人创建 或 团队共享）。
+// visibility 为空（历史行 visibility 为 NULL）按 private 处理 —— 只有属主能看到。
+// 抽成函数是为了让"两个租户各自的行互不可见"能被单测直接断言，而不是只能对
+// SQL 字符串做 contains 检查。
+func agentRowVisible(tenantID int16, userID string, a *Agent) bool {
+	if a == nil || a.TenantID != tenantID {
+		return false
+	}
+	if a.UserID != "" && a.UserID == userID {
+		return true
+	}
+	return a.Visibility == "tenant"
+}
 
 // Create 新建一个 Agent（绑定当前租户）。
 func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -251,8 +286,11 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, err = db.GlobalDBManager.Exec(r.Context(),
-		`INSERT INTO agents (id, tenant_id, user_id, name, description, system_prompt, tools, llm_config, max_turns, timeout_seconds, enabled, kb_id, skills, plugins)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+		// created_at / updated_at 必须显式写：DDL 里这两列没有默认值，省略即 NULL，
+		// 而 List/Get 把 NULL 扫进 time.Time 会报错 —— 表现是"建了但列表里没有"。
+		// visibility / kind 同样显式写，避免依赖"库里将来会不会有默认值"。
+		`INSERT INTO agents (id, tenant_id, user_id, name, description, system_prompt, tools, llm_config, max_turns, timeout_seconds, enabled, kb_id, skills, plugins, visibility, kind, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'private', 'chat', NOW(), NOW())`,
 		id, claims.TenantID, claims.UserID, body.Name, body.Description, body.SystemPrompt,
 		string(toolsJSON), string(llmJSON), body.MaxTurns, body.TimeoutSeconds, body.Enabled,
 		body.KbID, jsonOrEmptyArray(body.Skills), jsonOrEmptyArray(body.Plugins))
@@ -607,25 +645,33 @@ func (h *AgentHandler) queryAgent(ctx context.Context, tenantID int16, userID, a
 	return loadAgent(ctx, tenantID, userID, agentID)
 }
 
+// agentGetQuery 按 id 取一条 Agent（含租户归属与 tenant 共享可见性校验）。
+//
+// 与 agentListQuery 同一口径、同样的时间戳兜底：DDL 里 created_at / updated_at 可空，
+// 历史行是 NULL，直接扫进 time.Time 会让详情 404（"装了/建了却点不开"）。
+const agentGetQuery = `
+SELECT id::text, name, COALESCE(description,''), COALESCE(system_prompt,''),
+       COALESCE(tools,'[]'::json), COALESCE(llm_config,'{}'::json),
+       max_turns, timeout_seconds, enabled, COALESCE(kb_id,''),
+       COALESCE(skills,'[]'::json), COALESCE(plugins,'[]'::json),
+       COALESCE(created_at, updated_at, TIMESTAMP '1970-01-01') AS created_at,
+       COALESCE(updated_at, created_at, TIMESTAMP '1970-01-01') AS updated_at
+  FROM agents WHERE tenant_id = $1 AND id = $2 AND (user_id = $3 OR (visibility = 'tenant' AND tenant_id = $1))
+   AND (kind IS NULL OR kind = 'chat')  -- 子 Agent Profile 不可作为对话 Agent 运行`
+
 // loadAgent 是 queryAgent 的包级形态：网关的 /v1/agent/submit 需要在
 // "只带 agent_id、没带 agent 配置"时补全（见 gateway_router.go 的 submitHandlerFunc），
 // 而那里只有 db、拿不到 AgentHandler 实例。共用同一查询才能保证
 // 工作台页与直达 API 走同一套可见性规则，而不是两套。
 func loadAgent(ctx context.Context, tenantID int16, userID, agentID string) (*Agent, error) {
 	var a Agent
-	err := db.GlobalDBManager.QueryRow(ctx,
-		// 列类型必须对齐：tools / llm_config / skills / plugins **全部是 json 列**，
-		// 缺省值要用 '[]'::json / '{}'::json；写成 ::jsonb 会在运行时报
-		// "could not convert type jsonb to json" ——
-		// 编译期、go vet 和单元测试都发现不了，只有真连库跑这条 SQL 才暴露。
-		`SELECT id::text, name, COALESCE(description,''), COALESCE(system_prompt,''), COALESCE(tools,'[]'::json), COALESCE(llm_config,'{}'::json), max_turns, timeout_seconds, enabled, COALESCE(kb_id,''), COALESCE(skills,'[]'::json), COALESCE(plugins,'[]'::json), created_at, updated_at
-		 FROM agents WHERE tenant_id = $1 AND id = $2 AND (user_id = $3 OR (visibility = 'tenant' AND tenant_id = $1))
-		   AND (kind IS NULL OR kind = 'chat')  -- 子 Agent Profile 不可作为对话 Agent 运行`, tenantID, agentID, userID).
+	err := db.GlobalDBManager.QueryRow(ctx, agentGetQuery, tenantID, agentID, userID).
 		Scan(&a.ID, &a.Name, &a.Description, &a.SystemPrompt, &a.Tools, &a.LLMConfig,
 			&a.MaxTurns, &a.TimeoutSeconds, &a.Enabled, &a.KbID, &a.Skills, &a.Plugins, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
+	a.TenantID = tenantID
 	return &a, nil
 }
 
