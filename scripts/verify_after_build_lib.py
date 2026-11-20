@@ -195,7 +195,8 @@ def load_runtime_state(path: str) -> dict[str, Any]:
             raw = fh.read()
     except FileNotFoundError as exc:
         raise StateError(
-            f"状态文件不存在：{path} —— 桌面应用还没启动过（或以别的账户运行）"
+            f"状态文件不存在：{path} —— 桌面应用当前没在运行"
+            "（正常退出会删掉该文件），或从未在本账户下启动过"
         ) from exc
     except OSError as exc:
         raise StateError(f"读不了状态文件 {path}：{exc}") from exc
