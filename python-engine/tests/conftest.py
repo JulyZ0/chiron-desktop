@@ -38,9 +38,25 @@ tests/test_runtime.py、tests/test_context.py、tests/test_prompt_engine.py。
 # 没被发现的原因之一。
 #
 # 需要覆盖该头的测试（例如断言 401）在请求上显式传 `headers=` 即可。
+import importlib.util as _importlib_util
 import os as _os
 
 import pytest as _pytest  # noqa: E402 — 紧接上方的 fixture 说明
+
+# ── 可选 SDK 缺失时不要在**收集阶段**整轮中断 ──────────────────────────────
+#
+# `test_chiron_client_sdk*.py` import 的 `chiron_client` 在本仓的 `clients/python/`
+# （**不在** python-engine 的依赖里）。干净检出 / 只装引擎依赖的机器上它不存在，
+# 两个文件会在收集阶段抛 ModuleNotFoundError —— pytest 的处置是
+# `Interrupted: 2 errors during collection`：**一条用例都不跑**，
+# 连"稳定子集"都拿不到（这与"某条用例失败"是完全不同的形态）。
+#
+# 判据用 `find_spec` 而不是 try/except import：后者会把模块内部的真实 import 错误
+# （依赖装了但代码坏了）一起吞掉。包在，就让 pytest 正常收集并在导入时暴露真错；
+# 包不在，才排除这两个文件。
+if _importlib_util.find_spec("chiron_client") is None:
+    collect_ignore_glob = ["test_chiron_client_sdk*.py"]
+
 
 
 @_pytest.fixture(autouse=True)

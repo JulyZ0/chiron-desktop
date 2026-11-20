@@ -111,16 +111,19 @@ jobs:
         # 反过来，不纳入门禁的代码迟早会腐烂。
         run: mypy app/ acp_adapter/
       - name: Pytest
-        # 单测口径：
-        #   * `-m "not live and not integration"` —— integration 要完整栈（网关 HTTP / 真实 PG），
-        #     live 留给 integration job（那里有 Redis），见 pyproject 的 markers；
-        #   * `--ignore-glob=tests/test_chiron_client_sdk*.py` —— 它们 import `chiron_client`，
-        #     该包在 `clients/python/`，本仓不含 ⇒ 收集阶段就 ModuleNotFoundError
-        #     （整轮变成 "Interrupted: 2 errors during collection"，与用例失败不同）。
+        # 单测口径 = **稳定子集**（P2-13）：
+        #   * `-m "not live and not integration and not network"` —— 零外部依赖：
+        #     不连 Redis/PG、不发真实网络、不起监听端口的子进程。
+        #     live/integration 留给下面的 real-stack job（那里有 service 容器 + 真实网关）；
+        #     network 指"需要真实端口/网关"的用例（如 SDK 端到端、多进程沙箱服务），
+        #     它们在本 job 里既没有网关也没有端口保证，混进来只会随机红。
+        #   * `chiron_client` 缺失时由 tests/conftest.py 的 `collect_ignore_glob`
+        #     自动排除 `test_chiron_client_sdk*.py`（该包在 clients/python/，本仓不含）。
+        #     此前靠这里的 `--ignore-glob` 兜，但那只挡住 CI —— 本机仍会
+        #     `Interrupted: 2 errors during collection`，一条用例都跑不了。
         run: >-
           python -m pytest tests -q
-          -m "not live and not integration"
-          --ignore-glob="tests/test_chiron_client_sdk*.py"
+          -m "not live and not integration and not network"
 
   # ── 评测骨架（smoke 集）─────────────────────────────────────────────────
   #
@@ -196,8 +199,34 @@ jobs:
             echo "::error::vue-tsc 报出非 IsolationHelperResult 的类型错误"
             exit 1
           fi
-      - name: Unit tests
-        run: npx vitest run src
+      - name: Unit tests (fast subset)
+        # 快速档：只跑**被改动最频繁、且跑得快**的目录（api/composables/config/router/
+        # stores/utils，约 53 个 spec）。它的作用是让"明显打断"在 1~2 分钟内红，
+        # 而不是等全量 5 分钟。**它不能替代全量** —— components/ 与 views/ 的用例
+        # （102 个 spec）只有全量档才覆盖。
+        run: >-
+          npx vitest run
+          src/api src/composables src/config src/router src/stores src/utils
+          --reporter=dot
+      - name: Unit tests (full)
+        # 全量档：157 个 spec / 1600+ 用例。超时与并发口径见 frontend-vue/vitest.config.ts
+        # （testTimeout 15s / hookTimeout 20s / pool=forks / maxWorkers=50%）——
+        # 高负载下的 5s 超时抖动是**机器争用**，放宽等待上限是正解，不是把用例改绿。
+        # `--reporter=json --outputFile.json` 供失败时上传（见下一步），
+        # dot 保证日志可读，两者并存互不干扰。
+        run: >-
+          npx vitest run src
+          --reporter=dot --reporter=json --outputFile.json=vitest-report.json
+      - name: Upload vitest report
+        # 只在失败时上传：绿的时候没人看这份 JSON，存它只是浪费存储与带宽。
+        # `if-no-files-found: warn` —— 收集阶段就崩（配置写错）时报告文件不会生成，
+        # 此时不让"上传"这一步再叠一个红，掩盖真正的错误。
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitest-report
+          path: frontend-vue/vitest-report.json
+          if-no-files-found: warn
       # 打包静态冒烟：读 electron-builder.yml / main.cjs / web_static.go / router，
       # 断言「分享页可被网关托管、知识库与依赖页路由可达」。不需要 electron 本体。
       - name: Packaging smoke (static)
@@ -479,7 +508,10 @@ jobs:
         # `live` = 只需真实依赖(本 job 有 Redis)、不需 PG 的用例（如 KeyRing 的 Lua 脚本
         # test_key_ring_live.py）；它们被单测 job 的 `-m "not integration"` 收集时，因无
         # REDIS_URL 会即时 skip、不发起连接，所以放这里连同 integration 一起跑最省。
-        run: python -m pytest -q -m "integration or live"
+        # `network` = 需要真实端口/网关的用例（SDK 端到端、多进程沙箱服务）。单测 job
+        # 已用稳定子集把它们排除（那里没有网关、端口也不保证），**必须**在这里收回来跑，
+        # 否则它们会从"偶发红"变成"从不跑"—— 后者更糟，因为没人会察觉。
+        run: python -m pytest -q -m "integration or live or network"
 
       - name: Cross-instance drill (two gateway processes)
         # **两个真实网关进程** + Redis：跨实例扇出、实时不重复、断线重连补发不重复。

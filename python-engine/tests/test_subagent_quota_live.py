@@ -22,6 +22,11 @@ import pytest
 
 from app.subagent import quota
 
+# 模块级 `live`：本文件全部用例都要**真 Redis**（Lua / PEXPIRE / ZREMRANGEBYSCORE
+# 的语义只有真服务能判）。没有 Redis 时必须能从稳定子集里整片排除，
+# 而不是留在里面靠 fixture 逐条 skip —— 后者会让"跳过"与"通过"混在同一个计数里。
+pytestmark = pytest.mark.live
+
 _REDIS_URL = (
     os.getenv("CHIRON_TEST_REDIS_URL") or os.getenv("REDIS_URL") or "redis://127.0.0.1:6379/0"
 )

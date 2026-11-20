@@ -156,3 +156,8 @@ Thumbs.db
 /frontend-vue/assets/gateway/
 # 构建脚本的临时探针目录（本地排查用）
 /.probe/
+
+# 测试稳定性巡检产物（scripts/test-stability.sh / CI 的 vitest 报告）。
+# 每轮 JSON 与 summary.md 只对本机排查有意义，不入库。
+/.artifacts/
+/frontend-vue/vitest-report.json
