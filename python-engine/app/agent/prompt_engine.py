@@ -21,7 +21,12 @@ from pathlib import Path
 from typing import Any
 
 from app.agent.runtime import AgentTask
-from app.agent.workbench_context import context_ids, merge_by_quota, selected_memory_slots
+from app.agent.workbench_context import (
+    MAX_CONTEXT_KBS,
+    context_ids,
+    merge_by_quota,
+    selected_memory_slots,
+)
 from app.memory.manager import MemoryManager
 from app.skill.store import SkillStore
 
@@ -354,6 +359,8 @@ class PromptEngine:
         # kb_ids 是多值形态，kb_id 保留为单值兼容。tenant_id 只是历史约定下的兜底，
         # 它并不等于某个知识库。
         kb_ids = context_ids(task.workbench_context, "kb") or [str(task.tenant_id or "default")]
+        # 上限与对话链路同一个常量（详见 workbench_context.MAX_CONTEXT_KBS 的注释）
+        kb_ids = kb_ids[:MAX_CONTEXT_KBS]
 
         # 逐库检索再按轮询配额合并：多选的意图是"这几个库都要用"，混排后截断会让
         # 高分库占满名额（而且不同库的 embedding/索引不同，分数本就不可比）。

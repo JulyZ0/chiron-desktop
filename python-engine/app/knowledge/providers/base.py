@@ -65,6 +65,21 @@ def citation_in_scope(doc_name: str, doc_ids: Iterable[str]) -> bool:
     return parsed in {doc_prefix(d) for d in doc_ids if d}
 
 
+def citation_doc_key(doc_name: str, doc_ids: Iterable[str]) -> str:
+    """从引用文件名反解出 Chiron 侧的文档 id（``doc_name`` → ``knowledge_documents.id``）。
+
+    反向映射与 ``citation_in_scope`` 用同一套前缀规则，因此"能通过越界校验"的引用
+    一定能解出 id（除非 PageIndex 改写了文件名，那时由调用方留空降级）。
+    """
+    parsed = citation_doc_id(doc_name)
+    if not parsed:
+        return ""
+    for doc_id in doc_ids:
+        if doc_id and doc_prefix(doc_id) == parsed:
+            return str(doc_id)
+    return ""
+
+
 @dataclass(frozen=True)
 class ProviderContext:
     """一次 provider 调用的上下文。
@@ -98,12 +113,21 @@ class SubmitResult:
 
 @dataclass(frozen=True)
 class Citation:
-    """引用：PageIndex 的两级粒度（local 页级 / Cloud 块级）。"""
+    """引用：PageIndex 的两级粒度（local 页级 / Cloud 块级）。
+
+    ``doc_id`` / ``kb_id`` 是**可定位**所需的两个坐标（P1-1）：用户点引用要能回到
+    "哪个库的哪篇文档的第几页"。PageIndex 只返回文件名（``doc_name``），而文件名里带
+    了我们上传时写入的文档 id 前缀（``<doc_id去连字符>-<随机>_<原名>``，见 ``doc_prefix``），
+    所以文档 id 可以**从 doc_name 反解**，不需要额外查询；解不出时留空（前端降级为
+    只显示文档名，不影响正文）。
+    """
 
     doc_name: str = ""
     page: int | None = None
     block_id: str = ""
     snippet: str = ""
+    doc_id: str = ""
+    kb_id: str = ""
 
 
 @dataclass(frozen=True)

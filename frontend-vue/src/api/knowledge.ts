@@ -78,6 +78,13 @@ export interface Citation {
   page: number | null
   block_id: string
   snippet: string
+  /**
+   * 可定位坐标（P1-1）：文档 id 由引擎从文件名前缀反解，缺省时为空串
+   * （PageIndex 改写过文件名的情况），此时引用只展示文档名与页码。
+   */
+  doc_id?: string
+  /** 该引用所属知识库；多库对话时用于把引用点回正确的库。 */
+  kb_id?: string
 }
 
 export interface KnowledgeAnswer {
@@ -220,6 +227,75 @@ export async function buildKnowledgeBase(
 export async function queryKnowledgeBase(kbId: string, query: string): Promise<KnowledgeAnswer> {
   const resp = await api.post(`/v1/kb/${kbId}/query`, { query })
   return unwrap<KnowledgeAnswer>(resp)
+}
+
+// ── 索引进度与重建（P1-1） ──
+
+/** 单篇文档的索引进度条目（GET /v1/kb/{id}/status 的 documents[]）。 */
+export interface KbIndexDocument {
+  id: string
+  name: string
+  status: 'pending' | 'indexing' | 'ready' | 'error'
+  page_count: number
+  error_message: string
+  file_size_bytes: number
+}
+
+/**
+ * 库级索引进度。
+ *
+ * 由引擎按**文档状态聚合**（pageindex-service 没有 per-job 端点可透传，见
+ * `python-engine/app/knowledge/progress.py`）。因此 `percent` / `active` 都是服务端
+ * 算好的权威值 —— 前端**不要**再自己数文档，否则两边口径一漂就出现"进度条 80%、
+ * 列表 6/10"。
+ */
+export interface KbIndexStatus {
+  kb_id: string
+  status: KbStatus
+  /** 完成百分比：`ready + error` / 总数（失败也算处理完，否则进度永远停在半路）。 */
+  percent: number
+  /** 是否仍在索引 —— 前端据此决定要不要继续轮询。 */
+  active: boolean
+  total: number
+  indexed: number
+  failed: number
+  pending: number
+  indexing: number
+  error_message: string
+  documents: KbIndexDocument[]
+  failed_documents: KbIndexDocument[]
+}
+
+/** 重建范围：只重试失败文档 / 全库重建。 */
+export type KbReindexScope = 'failed' | 'all'
+
+export interface KbReindexResult {
+  status: string
+  enqueued: boolean
+  scope: KbReindexScope
+  /** 已在索引中 / 没有失败文档时为 false 并给出 reason（幂等，不算失败）。 */
+  reason?: string
+  count: number
+  task_id: string
+}
+
+/** 索引进度（只读）。 */
+export async function getKnowledgeIndexStatus(kbId: string): Promise<KbIndexStatus> {
+  const resp = await api.get(`/v1/kb/${kbId}/status`)
+  return unwrap<KbIndexStatus>(resp)
+}
+
+/**
+ * 重新提交索引：`failed`（默认）只重试失败文档，`all` 全库重建。
+ *
+ * 幂等：库正在索引时后端直接回当前状态（`enqueued: false`），不会重复花 LLM 费用。
+ */
+export async function reindexKnowledgeBase(
+  kbId: string,
+  scope: KbReindexScope = 'failed',
+): Promise<KbReindexResult> {
+  const resp = await api.post(`/v1/kb/${kbId}/reindex`, { scope })
+  return unwrap<KbReindexResult>(resp)
 }
 
 // ── 用户级设置 ──

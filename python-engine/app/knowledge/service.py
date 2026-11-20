@@ -176,3 +176,43 @@ def serialize_answer(result: AnswerResult) -> dict[str, Any]:
         "answer": result.answer,
         "citations": [asdict(c) for c in result.citations],
     }
+
+
+#: 状态端点返回的文档列 —— 只取进度需要的几列，不把 metadata / storage_key 带出去。
+_STATUS_DOC_COLUMNS = (
+    "id, name, status, page_count, error_message, file_size_bytes, updated_at"
+)
+
+
+async def index_status(*, kb_id: str) -> dict[str, Any]:
+    """库级索引进度（按文档状态聚合，**没有** pageindex-service 的 job 端点可透传）。
+
+    为什么在 service 而不是 API：队列 worker（``kb_index``）、状态端点、以及将来的
+    巡检都要读同一份口径。聚合逻辑本身在 ``app/knowledge/progress.py``（纯函数），
+    这里只负责取行。
+
+    权限校验不在这里 —— service 不知道 HTTP 语义（403/404 的取舍见 API 层注释）。
+    调用方必须**先**做 ``kb_access_allowed``，否则这个函数会把任意库的文档状态吐给
+    任何知道 id 的人。
+    """
+    from app.knowledge.progress import aggregate
+
+    pool = await _pool()
+    kb = await pool.fetchrow(
+        "SELECT id, status, error_message FROM knowledge_bases WHERE id = $1", kb_id
+    )
+    if kb is None:
+        raise KnowledgeError(f"knowledge base not found: {kb_id}")
+    rows = await pool.fetch(
+        f"""SELECT {_STATUS_DOC_COLUMNS}
+             FROM knowledge_documents
+            WHERE knowledge_base_id = $1
+            ORDER BY created_at""",
+        kb_id,
+    )
+    return aggregate(
+        kb_id=kb_id,
+        kb_status=str(kb["status"] or ""),
+        kb_error=str(kb["error_message"] or ""),
+        documents=list(rows),
+    )

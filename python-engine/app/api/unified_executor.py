@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any
 
 from app.agent.workbench_context import (
+    MAX_CONTEXT_KBS,
     context_ids,
     merge_by_quota,
 )
@@ -321,9 +322,10 @@ class UnifiedChatHandler:
         try:
             # 会话上下文注入: context.kb_id / kb_ids → 执行前 RAG 检索,片段拼接到 user_input 前
             kb_hits = 0
+            kb_citations: list[dict[str, Any]] = []
             effective_input = user_input
             if ctx_kb_ids:
-                kb_block, kb_hits = await self._retrieve_kb_context(
+                kb_block, kb_hits, kb_citations = await self._retrieve_kb_context(
                     kb_ids=ctx_kb_ids,
                     query=user_input,
                     tenant_id=tenant_id,
@@ -394,6 +396,10 @@ class UnifiedChatHandler:
                 meta["kb_hits"] = kb_hits
                 meta["kb_id"] = ctx_kb_ids[0]
                 meta["kb_ids"] = ctx_kb_ids
+                # 可点击的引用条目（P1-1）：kb_id/doc_id/doc_name/page 齐备时前端能把
+                # 每条引用点回 `/knowledge/:kbId?doc=:docId`；缺 id 的条目仍可读。
+                if kb_citations:
+                    meta["kb_citations"] = kb_citations
             if mode == "agent":
                 meta["agent_name"] = (ctx_agent or {}).get(
                     "name"
@@ -586,24 +592,36 @@ class UnifiedChatHandler:
         user_id: str = "",
         top_k: int = 5,
         limit: int = 12,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, list[dict[str, Any]]]:
         """基于 context.kb_id / kb_ids 做 RAG 检索 (复用 knowledge:kb_search 的 kb_search 工具)
 
-        多选知识库时逐库检索，再按**轮询配额**合并（workbench_context.merge_by_quota）：
-        保证每个库都有代表，而不是让高分库占满名额 —— 不同知识库的 embedding 与索引
-        不同，分数本就不可比。limit 是合并后的硬上限，保护多选时的首字节延迟。
+        多选知识库时逐库检索，再按**轮询配额**合并（workbench_context.merge_by_quota），
+        **结果按 kb 分组去重后**再拼成注入块：
 
-        返回 (引用块, 命中数);任何失败 (DB 不可用 / kb 不存在 / 无命中) 都降级为
-        空块 + 0,不阻断主任务执行 (与"不传 context 行为一致"的向后兼容原则一致)。
+        * 分组：不同库的 embedding/索引不同，分数不可比，混在一起模型也说不清
+          "这句话出自哪个库"。注入块按库分节（``### 库名``），引用标签形如
+          ``[库名 · 文件名 第 3 页]``；
+        * 去重：同一份文档常被导入多个库（个人库 + 团队库），两库检索会返回**同一段文字**，
+          不去重时它会在提示词里出现两遍，白占预算、还会让模型重复引用；
+        * ``limit`` 是合并后的硬上限（保护多选时的首字节延迟）。
+
+        返回 ``(引用块, 命中数, 引用列表)``；引用列表供上层写进 assistant metadata
+        （``kb_citations``），前端据此渲染可点击的引用条目（``/knowledge/:kbId?doc=:docId``）。
+        任何失败 (DB 不可用 / kb 不存在 / 无命中) 都降级为 ``("", 0, [])``，不阻断主任务。
 
         **身份必须传真实 user_id**：``kb_search`` 用工具上下文里的 user_id 做
         ``kb_access_allowed`` 归属校验。此前这里把 ``user_id`` 写成 ``tenant_id``，
         于是"自己的私有库"也判成越权、检索恒 0 命中（表现为"选了知识库但回答里没有
         任何引用"）。缺省时退回空串，由 kb_access_allowed 判为无权，而不是误认成
         某个用户的身份。
+
+        **上限 5 个库**（与前端 ``contextChips.MAX_CONTEXT_KBS`` 对齐）：每个库都是一次
+        分钟级的 LLM 推理，库数不设上限等于让一次对话的首字节等待变成库数的倍数。
         """
-        if not kb_ids:
-            return "", 0
+        # 去重保序 + 截断到上限（后端也做一遍：URL 里手写 20 个 kb 参数不该拖垮整轮对话）
+        ordered = [k for k in dict.fromkeys(kb_ids or []) if k][:MAX_CONTEXT_KBS]
+        if not ordered:
+            return "", 0, []
         try:
             from app.tools.context import set_tool_context
             from app.tools.kb import kb_search
@@ -615,10 +633,32 @@ class UnifiedChatHandler:
                 tenant_id=tenant_id,
             )
 
-            groups: list[list[str]] = []
+            kb_names = await self._kb_display_names(ordered)
+            # 每个库一组（组内保序），元素是"待注入的一行"; merge_by_quota 只认列表，
+            # 因此分组信息挂在元素本身，渲染时再按 kb 聚合。
+            groups: list[list[dict[str, Any]]] = []
+            citations_out: list[dict[str, Any]] = []
             total_hits = 0
-            for kb_id in kb_ids:
-                result = await kb_search(kb_id=kb_id, query=query, top_k=top_k)
+            seen: set[str] = set()
+
+            def _remember(key: str) -> bool:
+                """跨库去重：True 表示首次出现（该注入），False 表示重复。"""
+                if key in seen:
+                    return False
+                seen.add(key)
+                return True
+
+            for kb_id in ordered:
+                kb_name = kb_names.get(kb_id) or ""
+                try:
+                    result = await kb_search(kb_id=kb_id, query=query, top_k=top_k)
+                except Exception as exc:  # noqa: BLE001 — 单库异常不得拖垮其余库
+                    # kb_search 自己只吞 KnowledgeError；DB 抖动等仍会抛。多选场景下
+                    # 让一个坏库把整轮 RAG 打空，比"少一个库的引用"糟得多。
+                    logger.warning(
+                        "KB context retrieval errored (kb_id=%s): %s", kb_id, exc
+                    )
+                    continue
                 if not isinstance(result, dict) or "error" in result:
                     # 单个库失败不拖垮其余库：多选场景下不该因为一个坏 id 全盘降级
                     error = result.get("error") if isinstance(result, dict) else result
@@ -631,30 +671,101 @@ class UnifiedChatHandler:
                 answer = str(result.get("answer") or "").strip()
                 citations = [c for c in (result.get("citations") or []) if isinstance(c, dict)]
                 total_hits += len(citations) or (1 if answer else 0)
-                snippets: list[str] = [answer[:300]] if answer else []
+                group: list[dict[str, Any]] = []
+                # 答案也要去重：同一份文档在多个库里导过时，两个库的答案往往一字不差
+                if answer and _remember(f"answer:{answer[:200]}"):
+                    group.append(
+                        {"kb_id": kb_id, "kb_name": kb_name, "text": answer[:300]}
+                    )
                 for cite in citations[: top_k or 3]:
-                    # 引用带上文件名与页码：模型据此能给用户"出自哪份文档第几页"，
-                    # 而不是一句无从核对的话。
-                    label = str(cite.get("doc_name") or "").strip() or "文档"
+                    doc_name = str(cite.get("doc_name") or "").strip() or "文档"
                     page = cite.get("page")
-                    if isinstance(page, int) and page > 0:
-                        label = f"{label} 第 {page} 页"
+                    page_no = page if isinstance(page, int) and page > 0 else None
                     text = str(cite.get("snippet") or "").strip()[:300]
-                    snippets.append(f"[{label}] {text}" if text else f"[{label}]")
-                snippets = [s for s in snippets if s]
-                if snippets:
-                    groups.append(snippets)
+                    doc_id = str(cite.get("doc_id") or "")
+                    # 去重键优先用稳定坐标（文档 + 页 + 块），缺失时退回文本内容
+                    key = (
+                        f"cite:{doc_id or doc_name}:{page_no or ''}:{cite.get('block_id') or ''}"
+                        if (doc_id or doc_name)
+                        else f"text:{text[:160]}"
+                    )
+                    if not _remember(key):
+                        continue
+                    prefix = f"{kb_name} · " if kb_name else ""
+                    label = f"{prefix}{doc_name}"
+                    if page_no:
+                        label = f"{label} 第 {page_no} 页"
+                    group.append(
+                        {
+                            "kb_id": kb_id,
+                            "kb_name": kb_name,
+                            "text": f"[{label}] {text}" if text else f"[{label}]",
+                            "citation": {
+                                "kb_id": kb_id,
+                                "kb_name": kb_name,
+                                "doc_id": doc_id,
+                                "doc_name": doc_name,
+                                "page": page_no,
+                                "block_id": str(cite.get("block_id") or ""),
+                                "snippet": text,
+                            },
+                        }
+                    )
+                group = [item for item in group if item.get("text")]
+                if group:
+                    groups.append(group)
 
             merged = merge_by_quota(groups, limit)
             if not merged:
-                return "", 0
+                return "", 0, []
 
-            block = "【知识库引用】\n" + "\n".join(f"- {s}" for s in merged)
-            return block, total_hits
+            # 按 kb 分组渲染：轮询配额保证"每个库都有代表"，分组只是呈现方式
+            sections: list[tuple[str, list[str]]] = []
+            for item in merged:
+                kb_id = str(item.get("kb_id") or "")
+                title = str(item.get("kb_name") or kb_id)
+                for name, lines in sections:
+                    if name == title:
+                        lines.append(str(item.get("text") or ""))
+                        break
+                else:
+                    sections.append((title, [str(item.get("text") or "")]))
+
+            lines: list[str] = []
+            for title, items in sections:
+                # 单库且已有名字时也分节：模型据此能回答"分别出自哪些库"
+                lines.append(f"### {title}")
+                lines.extend(f"- {text}" for text in items)
+            block = "【知识库引用】\n" + "\n".join(lines)
+
+            for item in merged:
+                cite = item.get("citation")
+                if isinstance(cite, dict):
+                    citations_out.append(cite)
+            return block, total_hits, citations_out
 
         except Exception as e:  # noqa: BLE001 — 检索失败不阻断主任务
             logger.warning("KB context retrieval failed (kb_ids=%s): %s", kb_ids, e)
-            return "", 0
+            return "", 0, []
+
+    async def _kb_display_names(self, kb_ids: list[str]) -> dict[str, str]:
+        """批量取库名（注入块与引用标签用）。
+
+        取不到就返回空表：库名是**展示**信息，缺了用 id 顶替即可，绝不能因此让
+        检索本身失败。用 ``id::text = ANY($1)`` 而不是 uuid 数组：调用方传进来的是
+        从 URL/context 来的字符串，让 PG 做类型转换比在 Python 侧校验更省事。
+        """
+        if not kb_ids:
+            return {}
+        try:
+            rows = await get_pool().fetch(
+                "SELECT id::text AS id, name FROM knowledge_bases WHERE id::text = ANY($1)",
+                list(kb_ids),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("KB display names unavailable: %s", exc)
+            return {}
+        return {str(row["id"]): str(row["name"] or "") for row in rows}
 
     def _extract_output(self, result: dict[str, Any]) -> str:
         """从执行结果中提取最终输出"""

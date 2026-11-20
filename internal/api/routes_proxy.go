@@ -223,6 +223,12 @@ func registerProxyRoutes(
 	// 不自己碰库：属主校验、enabled 列写入都在引擎侧一处实现，网关只做鉴权与转发，
 	// 免得两处各判一次属主、口径漂移时就出现"网关放行、引擎拒绝"或反之。
 	mux.Handle("PUT /v1/kb/{id}/status", authMW(kbRateMW(kbP(pathParamSuffix("/v1/kb", "/status")))))
+	// 索引进度（只读）：聚合在引擎侧按文档状态算（pageindex-service 无 job 端点可透传）。
+	// 与上面的 PUT 同路径不同方法，语义正交（读索引状态 vs 写启用开关）。
+	mux.Handle("GET /v1/kb/{id}/status", authMW(kbRateMW(kbP(pathParamSuffix("/v1/kb", "/status")))))
+	// 重新提交索引（失败文档 / 全库重建）。幂等与"同库并发 1"都在引擎侧实现，
+	// 网关只做鉴权与转发 —— 两处各判一次就会出现"网关放行、引擎拒绝"。
+	mux.Handle("POST /v1/kb/{id}/reindex", authMW(kbRateMW(kbP(pathParamSuffix("/v1/kb", "/reindex")))))
 	mux.Handle("DELETE /v1/kb/{id}/documents", authMW(kbRateMW(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if pythonClient == nil {
 			InternalError(w, "python engine not available")

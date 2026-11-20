@@ -120,4 +120,17 @@ export default {
   kb_disabled_hint: "已停用：不参与检索、不能构建索引；索引仍保留，重新启用即可用",
   index_build_started: "索引任务已提交，正在后台执行",
   index_still_running: "索引仍在后台执行，可稍后刷新查看状态",
+  // ── 索引进度 / 重建（P1-1） ──
+  citation_doc_page: "{doc} · 第 {page} 页",
+  index_progress_n_of_m: "{done}/{total} 篇已完成索引",
+  index_failed_documents: "索引失败的文档",
+  retry_failed_documents: "重试失败文档",
+  reindex_all: "重建全部索引",
+  reindex_all_hint: "重建整个库的索引（会重新消耗索引费用）",
+  no_failed_documents: "没有失败的文档需要重试",
+  index_already_running: "该知识库正在索引，请稍候",
+  located_referenced_document: "已定位到引用的文档",
+  clear_located_document: "取消定位",
+  // ── 对话多库选择 ──
+  max_knowledge_bases_n: "一次对话最多选择 {n} 个知识库",
 }

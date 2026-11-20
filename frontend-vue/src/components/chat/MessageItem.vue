@@ -25,6 +25,7 @@ import type { ChatItem, ToolCallItem, ToolResultItem, TextItem, ChatAttachment }
 import { formatSize } from './chat-types'
 import { resolveMediaUrl } from '../../api'
 import { useRouter } from 'vue-router'
+import { buildKbCitationLink, kbCitationLabel, normalizeKbCitations } from '../../utils/kbCitation'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
@@ -223,6 +224,34 @@ const sourceChips = computed<SourceChip[]>(() => {
   }
   return chips
 })
+
+// ── 知识库引用（可定位）──
+//
+// 引擎在 assistant metadata 里给 `kb_citations`（kb_id / doc_id / doc_name / page）。
+// 这里渲染成可点条目 → `/knowledge/:kbId?doc=:docId`，由 KnowledgeDetailView 定位并
+// 高亮那一行。`to` 为空表示缺 kb_id（老会话 / PageIndex 改写过文件名）：仍然展示
+// "文档名 · 第 N 页"，只是不可点击 —— 悄悄丢掉这条信息比点不动更糟。
+interface KbCitationView {
+  key: string
+  label: string
+  to: string
+  snippet: string
+}
+
+const kbCitations = computed<KbCitationView[]>(() => {
+  if (props.item.kind !== 'text' || props.item.role !== 'assistant') return []
+  const meta: Record<string, unknown> = props.item.metadata || {}
+  return normalizeKbCitations(meta.kb_citations).map((c, i) => ({
+    key: `${c.kb_id}-${c.doc_id}-${i}`,
+    label: kbCitationLabel(c),
+    to: buildKbCitationLink(c),
+    snippet: c.snippet,
+  }))
+})
+
+function openKbCitation(to: string) {
+  if (to) void router.push(to)
+}
 
 // ── 安全改造：附件签名 URL 解析 ──
 // 附件若为 /media/ 公开路径，渲染前异步解析为短时效签名 URL（12 分钟本地缓存）；
@@ -879,6 +908,31 @@ watch(
             {{ chip.label }}
           </a>
         </div>
+        <!-- 知识库引用条目（可定位）：点一条回到该库并高亮那篇文档 -->
+        <div
+          v-if="item.role === 'assistant' && kbCitations.length"
+          class="kb-citations"
+        >
+          <span class="kb-citations-title">{{ $t('knowledge.citations') }}</span>
+          <template
+            v-for="c in kbCitations"
+            :key="c.key"
+          >
+            <a
+              v-if="c.to"
+              class="kb-citation"
+              :href="c.to"
+              :title="c.snippet || c.label"
+              @click.prevent="openKbCitation(c.to)"
+            >{{ c.label }}</a>
+            <!-- 缺定位坐标：降级为纯文本（不可点，但信息不丢） -->
+            <span
+              v-else
+              class="kb-citation static"
+              :title="c.snippet || c.label"
+            >{{ c.label }}</span>
+          </template>
+        </div>
         <!-- 失败消息错误提示 -->
         <div
           v-if="(item as TextItem).error"
@@ -1385,6 +1439,29 @@ watch(
 
 /* ── 反向定位：来源工作台 chips（与 kb-hits 标签同设计语言：胶囊 + CSS 变量色）── */
 .source-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+/* ── P1-1 知识库引用条目：可点回原文档（/knowledge/:kbId?doc=:docId） ──
+   与 source-chips 同为胶囊语言，但独立一行并带标题：引用是"答案的依据"，
+   比"来源工作台"更需要一眼看见。 */
+.kb-citations { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.kb-citations-title { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.kb-citation {
+  display: inline-flex; align-items: center;
+  padding: 2px 10px; min-height: 24px;
+  font-size: var(--fs-xs); line-height: 1.6;
+  color: var(--text-secondary); background: var(--bg-code);
+  border: var(--hairline-width) solid var(--border-subtle);
+  border-radius: var(--sig-radius-button);
+  text-decoration: none; cursor: pointer;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
+}
+.kb-citation:hover { color: var(--primary); background: var(--primary-bg); border-color: var(--primary); }
+/* 无定位坐标：纯文本，不假装可点 */
+.kb-citation.static { cursor: default; }
+.kb-citation.static:hover { color: var(--text-secondary); background: var(--bg-code); border-color: var(--border-subtle); }
+@media (max-width: 768px) {
+  .kb-citation { min-height: 32px; padding: 4px 10px; }
+}
 /* 子 Agent 自动轮注入的消息标记（见 internal/api/agent_followup.go） */
 .followup-badge {
   display: inline-flex; align-items: center; gap: 4px;
