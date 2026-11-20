@@ -14,6 +14,17 @@ import aiohttp
 from app.gateway.budget import TokenBudget
 from app.gateway.cache import SemanticCache
 from app.gateway.circuit_breaker import CircuitBreaker
+from app.gateway.errors import (
+    is_deterministic_client_error,
+    is_model_unavailable,
+)
+from app.gateway.key_ring import note_last_error
+from app.gateway.model_compat import (
+    DIRECT_PROVIDER_BY_FAMILY,
+    model_family,
+    plan_allowlist,
+    provider_supports_model,
+)
 from app.gateway.provider import ChatMessage, ChatResponse, EmbeddingResponse, LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -316,8 +327,20 @@ class GatewayRouter:
             # 缓存正常路径仅存结果；预算扣减统一在 finally 处理（见下）
 
         except Exception as e:
-            self._breakers[provider.name].record_failure()
-            logger.error("Provider %s chat_stream failed: %s", provider.name, e)
+            # 确定性 4xx（模型不在套餐 / 不存在 / 参数非法）**不是 provider 故障**：
+            # 记进熔断器会让"一个模型名配错"演变成"整个 provider 不可用"，把诊断方向
+            # 从模型带到端点。这类错误只上报（note_last_error）以便下一次诊断能说出原因。
+            if is_deterministic_client_error(e):
+                logger.error(
+                    "Provider %s rejected model=%s deterministically (not counted as failure): %s",
+                    provider.name,
+                    model,
+                    str(e)[:300],
+                )
+            else:
+                self._breakers[provider.name].record_failure()
+                logger.error("Provider %s chat_stream failed: %s", provider.name, e)
+            note_last_error(provider.name, e)
             # 不要将原始异常文本当作 assistant 回复内容发送（会显示成
             # "Connection error." 之类的假回复）；发 error chunk，
             # 由上层 AgentRuntime 转成 error 事件（message 携带真实原因）。
@@ -326,7 +349,7 @@ class GatewayRouter:
                 finish_reason="error",
                 provider=provider.name,
                 model=model,
-                message=f"provider {provider.name} stream failed: {type(e).__name__}: {e}",
+                message=self._stream_error_message(model, provider.name, e),
             )
         finally:
             # S 修复：预算扣减放入 finally——正常/异常路径都会按实际用量扣除。
@@ -437,12 +460,21 @@ class GatewayRouter:
 
             return resp
         except Exception as e:
-            self._breakers[provider.name].record_failure()
-            logger.error("Provider %s chat failed: %s", provider.name, e)
+            if is_deterministic_client_error(e):
+                logger.error(
+                    "Provider %s rejected model=%s deterministically (not counted as failure): %s",
+                    provider.name,
+                    model,
+                    str(e)[:300],
+                )
+            else:
+                self._breakers[provider.name].record_failure()
+                logger.error("Provider %s chat failed: %s", provider.name, e)
+            note_last_error(provider.name, e)
             return ChatResponse(
                 content="",
                 finish_reason="error",
-                message=str(e)[:300],
+                message=self._stream_error_message(model, provider.name, e),
                 provider=provider.name,
                 model=model,
             )
@@ -668,20 +700,82 @@ class GatewayRouter:
         （密钥在管理后台，落 PG、镜像进 Redis），于是用户按提示去查环境变量，越查越偏。
         这里按**两种真不同的故障**分开说：
         表是空的 ⇒ 没有任何 provider 被注册（没配 key / 配的 key 还没同步进来）；
-        表非空却选不出来 ⇒ provider 都在，是端点/熔断/模型名匹配的问题。
+        表非空却选不出来 ⇒ provider 都在，是端点/熔断/**模型-供应商不兼容**的问题。
+
+        最后一种是最容易被误诊的（实测：子 Agent 全部 failed）：模型是 Anthropic 直连的
+        `claude-sonnet-4-…`，而唯一配了 key 的是订阅网关 OpenCode Go（套餐不含它）。
+        所以当**所有已注册 provider 都被兼容判定拒绝**时，必须把"模型需要哪个 provider"
+        直接写出来，而不是让用户去猜"是不是端点配错了"。
         """
-        configured = ",".join(sorted(self._providers.keys()))
+        configured = sorted(self._providers.keys())
         if not configured:
             return (
                 f"no LLM provider available for model={model}: 引擎当前没有注册任何提供商。"
                 "请在「管理后台 → API 密钥」为某个服务提供商添加密钥并保存（保存后自动生效，"
                 "无需重启）；用环境变量部署的则设置对应的 *_API_KEY 后重启服务。"
             )
+        compatible = [n for n in configured if self._provider_accepts(n, model)]
+        if not compatible:
+            family = model_family(model)
+            needed = DIRECT_PROVIDER_BY_FAMILY.get(family, "")
+            parts = [
+                f"no LLM provider available for model={model}: 已注册 provider="
+                f"{','.join(configured)}，但**没有一个支持这个模型**"
+            ]
+            detail = []
+            for name in configured:
+                allow = plan_allowlist(name, self._catalog.get(name))
+                if allow:
+                    detail.append(f"{name}（套餐仅含 {', '.join(allow[:6])}…）")
+            if detail:
+                parts.append("：" + "、".join(detail))
+            if needed:
+                parts.append(
+                    f"。该模型需要 provider={needed}（直连），当前未配置 —— "
+                    f"请在「管理后台 → API 密钥」为 {needed} 添加密钥，"
+                    "或在设置里改选套餐内的模型"
+                )
+            else:
+                parts.append("。请为该模型配置对应的 provider，或改选已配置 provider 支持的模型")
+            return "".join(parts)
         return (
             f"no LLM provider available for model={model}: 已注册 "
-            f"provider={configured}，但没有一个可用 —— 请检查该 provider 的端点（BASE_URL）"
+            f"provider={','.join(configured)}，但没有一个可用 —— 请检查该 provider 的端点（BASE_URL）"
             "与密钥是否有效，或稍后重试（熔断中）。"
         )
+
+    def _stream_error_message(
+        self, model: str, provider: str, exc: BaseException
+    ) -> str:
+        """把上游异常转成**可行动**的错误文案（模型不可用时点名该配什么）。"""
+        if is_model_unavailable(exc):
+            family = model_family(model)
+            needed = DIRECT_PROVIDER_BY_FAMILY.get(family, "")
+            allowed = plan_allowlist(provider, self._catalog.get(provider)) or []
+            parts = [
+                f"provider {provider} 不支持 model={model}（该模型不在其套餐/清单内）"
+            ]
+            if allowed:
+                parts.append(f"套餐内可用模型族：{', '.join(allowed[:8])}")
+            if needed:
+                parts.append(
+                    f"该模型需要 provider={needed}（直连），请配置它的密钥或改选套餐内模型"
+                )
+            parts.append(f"upstream: {str(exc)[:300]}")
+            return "；".join(parts)
+        return f"provider {provider} stream failed: {type(exc).__name__}: {str(exc)[:600]}"
+
+    def _provider_accepts(self, name: str, model: str) -> bool:
+        """该 provider 是否能接收这个模型（套餐白名单 + 显式禁用，见 model_compat）。"""
+        return provider_supports_model(name, self._catalog.get(name), model)
+
+    def _compatible_providers(self, model: str) -> list[LLMProvider]:
+        """所有**兼容**该模型的已注册 provider（不含熔断判定）。"""
+        return [
+            provider
+            for name, provider in self._providers.items()
+            if self._provider_accepts(name, model)
+        ]
 
     async def _select(
         self, model: str, hint: str = "", tenant_id: int = 0, embed: bool = False
@@ -690,32 +784,63 @@ class GatewayRouter:
 
         embed=True 时使用**独立**的熔断表：embed 与 chat 的可用性互不牵连
         （见 __init__ 里 _embed_breakers 的注释）。
+
+        **先判兼容、再判熔断**：租户路由 / provider_hint 都是"用户偏好"，不是"上游能力"。
+        偏好指向一个不支持该模型的 provider 时（实测：会话 provider=opencode-go 而模型
+        是 Anthropic 直连模型），必须让位给兼容的 provider，而不是把请求发过去换一个 400。
         """
         breakers = self._embed_breakers if embed else self._breakers
-        # 租户路由优先
+        # 租户路由优先（但必须兼容该模型）
         if tenant_id:
             tenant_provider = self._get_tenant_provider(model, tenant_id)
             if tenant_provider and tenant_provider in self._providers:
-                if breakers[tenant_provider].allow():
+                if not self._provider_accepts(tenant_provider, model):
+                    logger.warning(
+                        "Tenant route provider %s does not support model=%s; "
+                        "falling back to a compatible provider",
+                        tenant_provider,
+                        model,
+                    )
+                elif breakers[tenant_provider].allow():
                     return self._providers[tenant_provider]
-                logger.warning(
-                    "Tenant route provider %s circuit-open for tenant=%s model=%s, falling back",
-                    tenant_provider, tenant_id, model,
-                )
+                else:
+                    logger.warning(
+                        "Tenant route provider %s circuit-open for tenant=%s model=%s, falling back",
+                        tenant_provider,
+                        tenant_id,
+                        model,
+                    )
         if hint and hint in self._providers:
-            if breakers[hint].allow():
+            if not self._provider_accepts(hint, model):
+                # 显式 hint 也不该压过"模型能否被这个 provider 接收"这条硬约束。
+                logger.warning(
+                    "Hinted provider %s does not support model=%s; choosing a "
+                    "compatible provider instead",
+                    hint,
+                    model,
+                )
+            elif breakers[hint].allow():
                 return self._providers[hint]
-            logger.warning("Hinted provider %s is circuit-open, falling back", hint)
+            else:
+                logger.warning("Hinted provider %s is circuit-open, falling back", hint)
 
-        # 找到所有支持该 model 的 provider
+        # 找到所有支持该 model 的 provider（目录前缀 + 兼容判定）
         candidates = self._find_candidates(model)
         if not candidates:
             # 一个都匹配不到 ⇒ 很可能是"key 是引擎启动之后才配的"（打包桌面态必然如此：
             # 桌面壳先起引擎、再起网关回填 keyset）。补注册一次再选，别直接判死。
             if await self.refresh_providers(reason="route-miss"):
                 return await self._select(model, hint, tenant_id=tenant_id, embed=embed)
-            # 全部尝试
-            candidates = list(self._providers.values())
+            # 只取**兼容**的那些：退回"全部 provider"正是"claude 被发给 opencode-go"
+            # 那条错误路由的来源（见 app/gateway/model_compat.py 模块文档）。
+            candidates = self._compatible_providers(model)
+            if not candidates:
+                logger.error(
+                    "No registered provider accepts model=%s (providers=%s)",
+                    model,
+                    ",".join(sorted(self._providers.keys())),
+                )
+                return None
 
         # 过滤熔断
         available = [p for p in candidates if breakers[p.name].allow()]
@@ -739,7 +864,8 @@ class GatewayRouter:
         """按 model 匹配候选 provider。
 
         优先用服务提供商目录的 ``model_prefixes``（新增 provider 只需补目录）；
-        目录未命中或无目录时保留内建前缀规则，行为与旧版一致。
+        目录未命中或无目录时保留内建前缀规则。**所有**分支都要过兼容判定
+        （`_provider_accepts`）—— 否则订阅网关会抢走它套餐里没有的模型。
         """
         model_lower = model.lower()
         matched: list[LLMProvider] = []
@@ -751,27 +877,41 @@ class GatewayRouter:
                 str(prefix).lower() in model_lower
                 for prefix in prefixes
                 if str(prefix).strip()
-            ):
+            ) and self._provider_accepts(name, model):
                 matched.append(self._providers[name])
         if matched:
             return matched
 
-        if "claude" in model_lower and "anthropic" in self._providers:
-            return [self._providers["anthropic"]]
-        if "deepseek" in model_lower and "deepseek" in self._providers:
-            return [self._providers["deepseek"]]
+        def _pick(name: str) -> list[LLMProvider]:
+            if name in self._providers and self._provider_accepts(name, model):
+                return [self._providers[name]]
+            return []
+
+        if "claude" in model_lower:
+            picked = _pick("anthropic")
+            if picked:
+                return picked
+        if "deepseek" in model_lower:
+            picked = _pick("deepseek")
+            if picked:
+                return picked
         # gpt / o1 / o3 / embedding → openai
         if (
             "gpt" in model_lower
             or "o1" in model_lower
             or "o3" in model_lower
             or "embedding" in model_lower
-        ) and "openai" in self._providers:
-            return [self._providers["openai"]] if "openai" in self._providers else []
-        # 兜底: 优先用 openai（最通用）
+        ):
+            picked = _pick("openai")
+            if picked:
+                return picked
+        # 兜底: 优先用 openai（最通用，历史行为）；**不兼容时**退回全部兼容 provider。
+        # 旧版最后一行是"无条件返回全部 provider" —— 那正是订阅网关抢走它套餐外模型的入口。
         if "openai" in self._providers:
-            return [self._providers["openai"]]
-        return list(self._providers.values())
+            picked = _pick("openai")
+            if picked:
+                return picked
+        return self._compatible_providers(model)
 
     def _provider_cost(self, name: str) -> float:
         """provider 参考成本（$/1M tokens）：目录优先，其次内建默认。"""

@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
 from app.gateway.errors import is_quota_exhausted
-from app.gateway.key_ring import NoUsableKeyError
+from app.gateway.key_ring import NoUsableKeyError, note_last_error
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,9 @@ async def call_with_key_retry(
         try:
             result = await call(client)
         except Exception as exc:
+            # 先记原因再分类：`NoUsableKeyError` 之后会把它带出去（`last_error=...`），
+            # 否则用户只看到 cooling=1，真实原因（模型不在套餐 / 参数非法）被埋掉。
+            note_last_error(provider, exc)
             if first_error is None:
                 first_error = exc
             if not is_key_scoped_failure(exc):
