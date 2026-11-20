@@ -13,6 +13,16 @@ const routes = [
   // 本地模式没有账号密码这一步 —— 身份由网关按 OS 账户免口令下发
   // （见 internal/api/auth_local_session.go），故不再有这四条路由。
   {
+    // 首次运行引导（P1-10）：配置模型 → 连通性 → 可选能力 → 第一条消息。
+    // 与守卫的 `WELCOME_ENTRY_PATHS` 配合 —— 只有"/"与"/chat"会**自动**把人送来，
+    // 本页自身以及 /models、/knowledge 等目标页不会被反复拉回（否则一点「去配置」
+    // 就会被弹回引导，形成死循环）。requiresAuth：引导要按 userId 记进度，匿名没有身份。
+    path: '/welcome',
+    name: 'Welcome',
+    component: () => import('../views/WelcomeView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/chat',
     name: 'Chat',
     component: () => import('../views/ChatView.vue'),
