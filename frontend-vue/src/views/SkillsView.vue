@@ -132,12 +132,18 @@ const execTypes = computed(() => {
 })
 
 // ── 两栏工作台：左栏筛选 + 列表，右栏详情 ──
-/** 来源分组：内置（builtin/shared 只读层）/ 自定义（user/root 私有层）/ 团队（tenant 共享层） */
-type SkillGroup = 'all' | 'builtin' | 'custom' | 'team'
-const groupFilter = ref<SkillGroup>('all')
+/**
+ * 详情徽标用的**层**分组（`source` = 后端 scope）：内置（builtin/shared 只读层）/
+ * 自定义（user/root 私有层）/ 团队（tenant 共享层）。
+ *
+ * 它只用于"README 里那句 '来源: 团队共享'"，**不再是左侧筛选维度** ——
+ * 筛选维度换成了下面的 origin（市场/本地/生成）。两套维度并列会让人分不清主次，
+ * 所以这里刻意保留成纯展示函数，没有对应的 filter 状态。
+ */
+type SkillGroup = 'builtin' | 'custom' | 'team'
 const selectedSkillName = ref('')
 
-function sourceKey(s: Skill): Exclude<SkillGroup, 'all'> {
+function sourceKey(s: Skill): SkillGroup {
   const src = (s.source || '').toLowerCase()
   if (src === 'tenant') return 'team'
   if (src === 'shared' || src === 'builtin') return 'builtin'
