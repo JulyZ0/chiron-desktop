@@ -95,7 +95,6 @@ func TestMonitorMigrationChainSingleHead(t *testing.T) {
 	if migs["0006_price_backfill"].down != "0005_share_ops" {
 		t.Fatalf("0006_price_backfill 的 down_revision 应为 0005_share_ops，实际 %q", migs["0006_price_backfill"].down)
 	}
-	}
 	if migs["0003_metrics_rollup"].down != "0002_inapp_notifications" {
 		t.Fatalf("0003 的 down_revision 被改动了: %q", migs["0003_metrics_rollup"].down)
 	}
