@@ -107,6 +107,28 @@ func depsEngineDetail(body string) string {
 	return body
 }
 
+// depsEngineConflicts 取引擎 409 里的**冲突文本**（`detail.conflicts`）。
+//
+// 为什么单独取而不是塞进 error 文案：`pip check` 的输出是多行、带包名与版本约束，
+// 前端要按 `<pre>` 原样展示（并允许用户复制去修）。混进一句话的错误里会丢换行，
+// 也让人以为那是网关拼出来的结论。放 `params.conflicts` 与既有错误码参数同口径。
+func depsEngineConflicts(body string) string {
+	body = strings.TrimSpace(body)
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return ""
+	}
+	detail, ok := payload["detail"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	conflicts, ok := detail["conflicts"].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(conflicts)
+}
+
 // depsEngineFailure 把上游错误映射成合适的网关响应。
 //
 // 判据顺序（**必须先分类再取文案**）：
@@ -185,7 +207,14 @@ func depsUpstreamFailure(w http.ResponseWriter, err error, up *engine.UpstreamEr
 		if msg == "" {
 			msg = http.StatusText(up.Status)
 		}
-		JSON(w, up.Status, APIResponse{Success: false, Error: msg})
+		// 409 可能是"已有任务在跑"，也可能是"环境已依赖冲突"（引擎跑过 pip check）。
+		// 后者带着多行冲突文本，必须原样透传：前端要把它摆给用户去修，而不是只说
+		// "冲突了"。其余 409/400/404 没有 conflicts，params 留空不影响既有契约。
+		resp := APIResponse{Success: false, Error: msg}
+		if conflicts := depsEngineConflicts(body); conflicts != "" {
+			resp.Params = map[string]interface{}{"conflicts": conflicts}
+		}
+		JSON(w, up.Status, resp)
 	case http.StatusUnauthorized, http.StatusForbidden:
 		logAndRespond(w, err, http.StatusBadGateway,
 			"python engine rejected the gateway credentials ("+strconv.Itoa(up.Status)+

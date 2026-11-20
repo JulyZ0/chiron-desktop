@@ -45,7 +45,7 @@ export type DepJobStatus = 'queued' | 'running' | 'succeeded' | 'failed'
 
 export interface DepJob {
   id: string
-  kind: 'install' | 'uninstall'
+  kind: 'install' | 'uninstall' | 'restore'
   target: string
   status: DepJobStatus
   message: string
@@ -53,6 +53,11 @@ export interface DepJob {
   progress: number
   output: string
   returncode?: number | null
+  /**
+   * 变更已落到 site-packages、但引擎进程仍持有旧的已导入模块 ⇒ 必须重启才完全生效。
+   * 只有 succeeded 的任务才可能为 true（失败要走"恢复快照"，那是另一件事）。
+   */
+  restart_required?: boolean
   created_at: number
   finished_at?: number | null
 }
@@ -61,6 +66,8 @@ export interface DepUninstallResult {
   ok: boolean
   name: string
   output: string
+  /** 卸载同样是"环境已变"：引擎返回 true 时页面要挂重启横幅。 */
+  restart_required?: boolean
 }
 
 // ── 快照与回滚（P0-3）────────────────────────────────────────────────────
@@ -70,7 +77,7 @@ export interface DepUninstallResult {
 // 再二次确认 —— 恢复会卸载"快照里没有的包"，那可能是别人刚装上的。
 
 export interface DepSnapshot {
-  /** 引擎生成的文件名（去扩展）：`<UTC 时间戳到毫秒>Z-<6 位随机>` */
+  /** 引擎生成的 id：`<UTC 时间戳到毫秒>Z-<6 位随机>` */
   id: string
   /** Unix 秒（与 job 的时间戳同一口径） */
   created_at: number
@@ -80,13 +87,17 @@ export interface DepSnapshot {
   label: string
   package_count: number
   python?: string
+  /** 这份快照实际存在哪里：`pg` = 多副本可见；`file` = 只在本机（降级） */
+  storage?: 'pg' | 'file'
 }
 
 export interface DepSnapshotListResult {
   snapshots: DepSnapshot[]
   count: number
-  /** 引擎保留的最大份数（超出会清理更旧的） */
+  /** 引擎保留的最大份数（超出会清理更旧的，按租户计） */
   retention: number
+  /** 本次列表实际读的后端：`pg` = 多副本一致；`file` = PG 不可用时的降级 */
+  storage?: 'pg' | 'file'
   /** 快照目录（排障用；用户不该从这里改文件） */
   directory?: string
 }
@@ -222,6 +233,29 @@ export function isTerminalJob(status: DepJobStatus | string): boolean {
   return status === 'succeeded' || status === 'failed'
 }
 
+// ── 冲突（409 + pip check 文本）───────────────────────────────────────────
+//
+// 安装/恢复前引擎会跑 `pip check`。有冲突时返回 409，正文在 `detail.conflicts`
+// （网关转成 `params.conflicts`，见 internal/api/deps_admin.go）。这段文本是用户
+// 唯一的行动依据，必须原样拿到 —— 只显示"冲突了"等于没说。
+
+/**
+ * 取"环境依赖冲突"详情；不是冲突 409 时返回 null。
+ *
+ * 之所以要判 `status === 409`：同一个 409 还表示"已有依赖任务在跑"。两者对用户
+ * 的处置完全不同（修依赖 vs 等它跑完），不能被同一个界面混淆。区分依据是
+ * `params.conflicts` 是否存在 —— 那种 409 不带它。
+ */
+export function depConflictOf(error: unknown): { conflicts: string } | null {
+  const resp = (error as {
+    response?: { status?: number; data?: { params?: { conflicts?: unknown } } }
+  } | null | undefined)?.response
+  if (!resp || resp.status !== 409) return null
+  const conflicts = resp.data?.params?.conflicts
+  if (typeof conflicts !== 'string' || !conflicts.trim()) return null
+  return { conflicts: conflicts.trim() }
+}
+
 // ── 快照 ────────────────────────────────────────────────────────────────
 
 /** 快照列表（最新在前）。失败时抛错 —— 空列表会被误读成"从没拍过快照"。 */
@@ -232,6 +266,7 @@ export async function listDepSnapshots(): Promise<DepSnapshotListResult> {
     snapshots: Array.isArray(data?.snapshots) ? data.snapshots : [],
     count: typeof data?.count === 'number' ? data.count : 0,
     retention: typeof data?.retention === 'number' ? data.retention : 20,
+    storage: data?.storage === 'file' ? 'file' : 'pg',
     directory: data?.directory,
   }
 }

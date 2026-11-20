@@ -28,6 +28,47 @@
       :message="listError"
     />
 
+    <!--
+      依赖已变更 ⇒ 引擎必须重启才完全生效。
+      刻意做成**常驻横幅**而不是一闪而过的 message：toast 消失之后，界面看起来一切
+      正常，而实际跑的还是旧模块 —— 这正是这类页面最容易骗人的地方。
+    -->
+    <Alert
+      v-if="restartRequired"
+      class="block restart-banner"
+      type="warning"
+      show-icon
+      :message="$t('admin.deps_restart_banner')"
+    >
+      <template #description>
+        <p class="restart-desc">
+          {{ $t('admin.deps_restart_banner_desc') }}
+        </p>
+        <Button
+          size="small"
+          @click="acknowledgeRestart"
+        >
+          {{ $t('admin.deps_restart_banner_ack') }}
+        </Button>
+      </template>
+    </Alert>
+
+    <!--
+      依赖冲突（引擎的 `pip check` 结论）：这段文本是用户唯一的行动依据，原样展示，
+      不做摘要/省略。上层不提供摘要，是因为"哪个包要什么版本"正是需要被复制去改的。
+    -->
+    <Alert
+      v-if="conflictText"
+      class="block conflict-banner"
+      type="error"
+      show-icon
+      :message="$t('admin.deps_conflict_title')"
+    >
+      <template #description>
+        <pre class="conflict-log">{{ conflictText }}</pre>
+      </template>
+    </Alert>
+
     <div
       v-if="list"
       class="engine-meta"
@@ -85,6 +126,14 @@
       <p class="card-desc">
         {{ $t('admin.deps_snapshot_desc', { retention: snapshotRetention }) }}
       </p>
+      <!-- 存储后端是"这次实际用的"，不是配置：file 意味着这份历史只在本机可见 -->
+      <Alert
+        v-if="snapshotStorage === 'file'"
+        class="block-tight"
+        type="info"
+        show-icon
+        :message="$t('admin.deps_snapshot_storage_file')"
+      />
       <Alert
         v-if="snapshotError"
         class="block-tight"
@@ -493,6 +542,7 @@ import { ReloadOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
 import {
   createDepSnapshot,
+  depConflictOf,
   getDepJob,
   installDep,
   isNewerVersion,
@@ -536,11 +586,66 @@ let pollAttempts = 0
 // ── 快照 ──
 const snapshots = ref<DepSnapshot[]>([])
 const snapshotRetention = ref(20)
+/** 本次列表实际读的后端（file = PG 不可用的降级，历史只在本机可见）。 */
+const snapshotStorage = ref<'pg' | 'file'>('pg')
 const snapshotLoading = ref(false)
 const snapshotError = ref('')
 const snapshotCreating = ref(false)
 const snapshotLabel = ref('')
 const snapshotModalOpen = ref(false)
+
+// ── 依赖冲突（引擎 pip check 的 409）──
+const conflictText = ref('')
+
+// ── 重启提示 ──
+//
+// 用 sessionStorage 让横幅**跨路由/刷新**存活：装完包切到别的页面再回来，
+// "需要重启"这件事不应该消失。`acknowledgeRestart` 是用户显式确认已经重启；
+// 我们没有（也不新造）"重启引擎"的 HTTP 端点 —— 那是一个能杀掉正在跑的会话的
+// 危险操作，不该藏在管理页的一个按钮后面。
+const RESTART_FLAG_KEY = 'chiron:deps:restart-required'
+
+function readRestartFlag(): boolean {
+  try {
+    return sessionStorage.getItem(RESTART_FLAG_KEY) === '1'
+  } catch {
+    // 隐私模式 / 禁用存储：退化为"本次挂载内有效"，不因为读不到就报错。
+    return false
+  }
+}
+
+const restartRequired = ref(readRestartFlag())
+
+function markRestartRequired() {
+  restartRequired.value = true
+  try {
+    sessionStorage.setItem(RESTART_FLAG_KEY, '1')
+  } catch {
+    // 同上：存不下只是失去跨页持久，横幅仍然立即出现。
+  }
+}
+
+function acknowledgeRestart() {
+  restartRequired.value = false
+  try {
+    sessionStorage.removeItem(RESTART_FLAG_KEY)
+  } catch {
+    // ignore
+  }
+  void reload()
+  void loadSnapshots()
+}
+
+/**
+ * 把 409 里的冲突文本摆到页面顶部；返回 true 表示"已就地展示"。
+ * 调用方据此跳过 toast —— 同一件事说两遍，用户会以为是两个问题。
+ */
+function showConflict(error: unknown): boolean {
+  const conflict = depConflictOf(error)
+  if (!conflict) return false
+  conflictText.value = conflict.conflicts
+  return true
+}
 
 // ── 恢复（两步：先 dry_run 看差异，再确认执行）──
 const restoreTarget = ref<DepSnapshot | null>(null)
@@ -661,6 +766,7 @@ async function loadSnapshots() {
     const result = await listDepSnapshots()
     snapshots.value = result.snapshots
     snapshotRetention.value = result.retention
+    snapshotStorage.value = result.storage ?? 'pg'
   } catch (err) {
     snapshotError.value = serverErrorDetail(err, t('admin.deps_snapshot_load_failed'))
   } finally {
@@ -702,12 +808,16 @@ async function openRestore(snapshot: DepSnapshot) {
   restoreTarget.value = snapshot
   restoreDiff.value = null
   restoreError.value = ''
+  conflictText.value = ''
   restoreModalOpen.value = true
   restorePreviewing.value = true
   try {
     const preview = await previewDepRestore(snapshot.id)
     restoreDiff.value = preview.diff
   } catch (err) {
+    // dry_run 是只读的，正常不会因为冲突被拒；真被拒了就说明引擎/网关契约变了，
+    // 把冲突文本也摆出来，用户至少知道卡在哪。
+    showConflict(err)
     restoreError.value = serverErrorDetail(err, t('admin.deps_restore_preview_failed'))
   } finally {
     restorePreviewing.value = false
@@ -725,6 +835,7 @@ async function confirmRestore() {
     return
   }
   restoring.value = true
+  conflictText.value = ''
   try {
     const result = await restoreDepSnapshot(target.id)
     restoreModalOpen.value = false
@@ -739,7 +850,10 @@ async function confirmRestore() {
       await loadSnapshots()
     }
   } catch (err) {
-    message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
+    // 冲突 409：把 pip check 原文摆在顶部（恢复同样被前置检挡住）。
+    if (!showConflict(err)) {
+      message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
+    }
   } finally {
     restoring.value = false
   }
@@ -792,12 +906,16 @@ async function startInstall(spec: string) {
   }
   stopPolling()
   installSubmitting.value = true
+  conflictText.value = ''
   try {
     job.value = await installDep(spec.trim())
     pollAttempts = 0
     schedulePoll()
   } catch (err) {
-    message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
+    // 引擎在动手前跑过 pip check：冲突时是 409 + 冲突文本，不是"随便失败一次"。
+    if (!showConflict(err)) {
+      message.error(serverErrorDetail(err, t('admin.deps_action_failed')))
+    }
   } finally {
     installSubmitting.value = false
   }
@@ -833,6 +951,8 @@ async function pollJob() {
     if (isTerminalJob(updated.status)) {
       if (updated.status === 'succeeded') {
         message.success(t('admin.deps_job_succeeded_msg', { target: updated.target }))
+        // 引擎说"要重启"才提示：安装/恢复成功后才会有这个字段。
+        if (updated.restart_required) markRestartRequired()
       } else {
         message.error(t('admin.deps_job_failed_msg', { target: updated.target }))
       }
@@ -859,9 +979,11 @@ function stopPolling() {
 
 async function uninstall(name: string) {
   uninstalling.value = name
+  conflictText.value = ''
   try {
-    await uninstallDep(name)
+    const result = await uninstallDep(name)
     message.success(t('admin.deps_uninstall_done', { name }))
+    if (result.restart_required) markRestartRequired()
     await reload()
     // 卸载前也会自动拍快照
     await loadSnapshots()
@@ -885,6 +1007,21 @@ onUnmounted(stopPolling)
 .block { margin-bottom: 16px; }
 .block-tight { margin: 8px 0; }
 .card-desc { margin: 0 0 10px; font-size: 12px; color: var(--text-secondary); }
+
+/* 重启横幅 / 冲突文本：都属于"必须能被读完并照着做"的内容，不能省略换行 */
+.restart-desc { margin: 0 0 8px; font-size: 12px; }
+.conflict-log {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle, transparent);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 .engine-meta {
   display: flex;

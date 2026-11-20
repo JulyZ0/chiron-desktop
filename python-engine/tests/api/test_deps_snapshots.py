@@ -151,7 +151,12 @@ async def test_install_creates_snapshot_before_pip(monkeypatch, tmp_path) -> Non
             await asyncio.sleep(0.01)
 
     assert polled.json()["status"] == "succeeded"
-    assert calls[0][0] == "list", "快照必须在 pip install 之前采集"
+    # 自动快照发生在任何安装动作之前（`check` 是动手前的冲突前置检，不算变更动作）
+    lists = [args for args in calls if args[0] == "list"]
+    assert lists, "install 之前必须先 pip list 一份快照"
+    assert calls.index(lists[0]) < calls.index(
+        [args for args in calls if args[0] == "install"][0]
+    )
 
     async with _client() as client:
         listed = await client.get(f"{BASE}/snapshots")
@@ -159,6 +164,9 @@ async def test_install_creates_snapshot_before_pip(monkeypatch, tmp_path) -> Non
     assert len(snapshots) == 1
     assert snapshots[0]["trigger"] == "install:requests==2.31.0"
     assert snapshots[0]["package_count"] == len(CURRENT)
+    # PG 不可用（本用例没有连接池）⇒ 明确标记为文件后端
+    assert listed.json()["storage"] == "file"
+    assert snapshots[0]["storage"] == "file"
 
 
 async def test_list_is_newest_first_and_skips_broken_files(tmp_path) -> None:
@@ -431,3 +439,213 @@ async def test_restore_respects_single_task_gate(monkeypatch) -> None:
         resp = await client.post(f"{BASE}/snapshots/{snapshot['id']}/restore", json={"dry_run": False})
     assert resp.status_code == 409
     assert resp.json()["detail"]["job_id"] == "busy-job"
+
+
+# ── 存储后端：PG 优先 / 文件回退（多副本一致）────────────────────────────
+#
+# 这里的替身只实现快照用到的三个方法，形状与 asyncpg.Pool 一致（execute / fetch /
+# fetchrow）。目的是证明**引擎真的把 PG 当权威**，而不是"两条路径都能跑"。
+
+
+class _FakePool:
+    """记录 SQL 的最小 PG 替身（按 tenant 维度维护行）。"""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.rows: dict[str, dict[str, Any]] = {}
+        self.calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fail = fail
+
+    def _maybe_fail(self) -> None:
+        if self.fail:
+            raise RuntimeError("relation deps_snapshots does not exist")
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.calls.append((sql, args))
+        self._maybe_fail()
+        if "INSERT INTO" in sql:
+            sid, tenant, user, epoch, trigger, label, python, packages = args
+            self.rows[sid] = {
+                "id": sid,
+                "tenant_id": tenant,
+                "user_id": user,
+                "created_at": epoch,
+                "trigger": trigger,
+                "label": label,
+                "python": python,
+                "packages": json.loads(packages),
+            }
+            return "INSERT 0 1"
+        if "DELETE FROM" in sql:
+            tenant, keep = args
+            tenant_rows = sorted(
+                (row for row in self.rows.values() if row["tenant_id"] == tenant),
+                key=lambda row: row["created_at"],
+                reverse=True,
+            )
+            for stale in tenant_rows[keep:]:
+                self.rows.pop(stale["id"], None)
+            return "DELETE"
+        return "OK"
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.calls.append((sql, args))
+        self._maybe_fail()
+        tenant, limit = args
+        rows = [row for row in self.rows.values() if row["tenant_id"] == tenant]
+        rows.sort(key=lambda row: row["created_at"], reverse=True)
+        return [
+            {
+                **{k: v for k, v in row.items() if k != "packages"},
+                "package_count": len(row["packages"]),
+            }
+            for row in rows[:limit]
+        ]
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        self.calls.append((sql, args))
+        self._maybe_fail()
+        sid, tenant = args
+        row = self.rows.get(sid)
+        if row is None or row["tenant_id"] != tenant:
+            return None
+        return dict(row)
+
+
+async def _pip_packages_only(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+    """只回答 pip list；其它命令（install/check）都当成功。"""
+    if args[0] == "list":
+        return _pip_ok(CURRENT)
+    if args[0] == "check":
+        return deps_api.PipResult(ok=True, returncode=0, output="")
+    return deps_api.PipResult(ok=True, returncode=0, output="ok\n")
+
+
+async def test_snapshots_prefer_pg_and_do_not_touch_files(monkeypatch, tmp_path) -> None:
+    pool = _FakePool()
+    monkeypatch.setattr(deps_api, "get_pool", lambda: pool)
+    monkeypatch.setattr(deps_api, "_run_pip", _pip_packages_only)
+
+    async with _client() as client:
+        created = await client.post(f"{BASE}/snapshots", json={"label": "pg"})
+        listed = await client.get(f"{BASE}/snapshots")
+
+    body = created.json()
+    assert body["storage"] == "pg"
+    assert body["snapshot"]["storage"] == "pg"
+    assert listed.json()["storage"] == "pg"
+    assert listed.json()["directory"] == ""
+    assert [item["id"] for item in listed.json()["snapshots"]] == [body["snapshot"]["id"]]
+    assert listed.json()["snapshots"][0]["package_count"] == len(CURRENT)
+
+    # 权威在 PG 时不该再落一份文件：双写会让"哪份是权威"变成谜
+    root = tmp_path / deps_api.SNAPSHOT_DIRNAME
+    assert not root.is_dir() or not list(root.glob("*.json"))
+
+    # 保留策略按租户执行（tenant=1 是单租户默认值）
+    prunes = [call for call in pool.calls if "DELETE FROM" in call[0]]
+    assert prunes and prunes[0][1] == (1, MAX_SNAPSHOTS)
+
+
+async def test_pg_retention_is_per_tenant(monkeypatch, tmp_path) -> None:
+    pool = _FakePool()
+    monkeypatch.setattr(deps_api, "get_pool", lambda: pool)
+
+    for index in range(MAX_SNAPSHOTS + 3):
+        await deps_api.save_snapshot(
+            CURRENT, trigger="manual", tenant_id=1, label=f"#{index}", now=1_700_000_000 + index
+        )
+    for index in range(3):
+        await deps_api.save_snapshot(
+            CURRENT, trigger="manual", tenant_id=2, label=f"t2-{index}", now=1_700_000_000 + index
+        )
+
+    tenant_one = [row for row in pool.rows.values() if row["tenant_id"] == 1]
+    tenant_two = [row for row in pool.rows.values() if row["tenant_id"] == 2]
+    assert len(tenant_one) == MAX_SNAPSHOTS, "每个租户各自保留最近 20 份"
+    assert len(tenant_two) == 3, "裁剪一个租户不能删掉另一个租户的历史"
+
+
+async def test_restore_reads_snapshot_from_pg(monkeypatch, tmp_path) -> None:
+    pool = _FakePool()
+    monkeypatch.setattr(deps_api, "get_pool", lambda: pool)
+    doc = await deps_api.save_snapshot(
+        [{"name": "pillow", "version": "10.0.0"}], trigger="manual"
+    )
+    # 文件侧没有这份快照：能从 PG 读出来才说明走的是 PG
+    assert not (tmp_path / deps_api.SNAPSHOT_DIRNAME).exists()
+
+    monkeypatch.setattr(deps_api, "_run_pip", _pip_packages_only)
+
+    async with _client() as client:
+        resp = await client.post(f"{BASE}/snapshots/{doc['id']}/restore", json={"dry_run": True})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["snapshot"]["storage"] == "pg"
+    assert body["diff"]["missing"] == [{"name": "pillow", "version": "10.0.0"}]
+
+
+async def test_pg_unavailable_falls_back_to_file_and_marks_storage(monkeypatch, tmp_path) -> None:
+    pool = _FakePool(fail=True)
+    monkeypatch.setattr(deps_api, "get_pool", lambda: pool)
+    monkeypatch.setattr(deps_api, "_run_pip", _pip_packages_only)
+
+    async with _client() as client:
+        created = await client.post(f"{BASE}/snapshots", json={"label": "fallback"})
+        listed = await client.get(f"{BASE}/snapshots")
+
+    assert created.json()["storage"] == "file"
+    assert created.json()["snapshot"]["storage"] == "file"
+    assert listed.json()["storage"] == "file"
+    assert listed.json()["directory"]
+
+    snap_id = created.json()["snapshot"]["id"]
+    path = tmp_path / deps_api.SNAPSHOT_DIRNAME / f"{snap_id}.json"
+    assert path.is_file(), "PG 不可用时快照必须落到本地文件（降级而不是失败）"
+
+
+async def test_restore_conflict_blocks_execution_but_not_preview(monkeypatch) -> None:
+    async def fake_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        if args[0] == "list":
+            return _pip_ok(CURRENT)
+        if args[0] == "check":
+            return deps_api.PipResult(
+                ok=False,
+                returncode=1,
+                output="pkg 1.0 has requirement dep<2, but you have dep 3.0.\n",
+            )
+        raise AssertionError(f"冲突时不该执行 {args}")
+
+    monkeypatch.setattr(deps_api, "_run_pip", fake_run)
+    snapshot = deps_api.write_snapshot([{"name": "pillow", "version": "10.0.0"}], trigger="manual")
+
+    async with _client() as client:
+        preview = await client.post(f"{BASE}/snapshots/{snapshot['id']}/restore", json={"dry_run": True})
+        blocked = await client.post(f"{BASE}/snapshots/{snapshot['id']}/restore", json={})
+
+    # dry_run 只读：不被冲突阻断（否则用户连"要回滚到哪份快照"都看不到）
+    assert preview.status_code == 200
+    assert preview.json()["diff"]["missing"] == [{"name": "pillow", "version": "10.0.0"}]
+
+    assert blocked.status_code == 409
+    assert "dep<2" in blocked.json()["detail"]["conflicts"]
+    assert deps_api._jobs == {}
+    assert deps_api._running_job_id is None
+
+
+async def test_restore_success_sets_restart_required(monkeypatch) -> None:
+    monkeypatch.setattr(deps_api, "_run_pip", _pip_packages_only)
+    snapshot = deps_api.write_snapshot([{"name": "pillow", "version": "10.0.0"}], trigger="manual")
+
+    async with _client() as client:
+        resp = await client.post(f"{BASE}/snapshots/{snapshot['id']}/restore", json={})
+        assert resp.status_code == 200
+        job_id = resp.json()["job"]["id"]
+        for _ in range(100):
+            polled = await client.get(f"{BASE}/jobs/{job_id}")
+            if polled.json()["status"] in ("succeeded", "failed"):
+                break
+            await asyncio.sleep(0.01)
+
+    assert polled.json()["status"] == "succeeded"
+    assert polled.json()["restart_required"] is True

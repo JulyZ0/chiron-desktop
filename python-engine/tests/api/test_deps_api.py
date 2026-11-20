@@ -535,13 +535,18 @@ async def test_install_runs_whitelisted_pip_command(monkeypatch) -> None:
     assert polled.status_code == 200
     assert polled.json()["status"] == "succeeded"
     assert polled.json()["progress"] == 100
+    # 变更成功 ⇒ 进程里仍是旧模块，必须提示重启才生效
+    assert polled.json()["restart_required"] is True
     # 白名单命令：install + 两个必需 flag + 规格，一次一个参数（不拼 shell）。
-    # 前面那次 `list` 是安装前的自动快照（见 `_snapshot_before_mutation`）。
-    assert [args for args in seen if args[0] != "list"] == [
+    # `check` 是动手前的冲突前置检，`list` 是安装前的自动快照（见
+    # `_snapshot_before_mutation`）—— 两者都不带安装规格。
+    assert [args for args in seen if args[0] not in ("list", "check")] == [
         ["install", "--no-input", "--disable-pip-version-check", "requests==2.31.0"]
     ]
+    # 前置检必须发生在真正的安装之前
+    assert seen[0] == ["check"]
     # 自动快照发生在任何安装动作之前：这是"装坏了能回去"的唯一保证
-    assert seen[0][:2] == ["list", "--format=json"]
+    assert [args for args in seen if args[0] == "list"][0][:2] == ["list", "--format=json"]
 
 
 async def test_install_is_mutually_exclusive(monkeypatch) -> None:
@@ -549,6 +554,9 @@ async def test_install_is_mutually_exclusive(monkeypatch) -> None:
     release = asyncio.Event()
 
     async def slow_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        # `pip check` 是前置检，不参与"任务在跑"的模拟（它本身就是同步的）。
+        if args[0] == "check":
+            return deps_api.PipResult(ok=True, returncode=0, output="")
         started.set()
         await release.wait()
         return deps_api.PipResult(ok=True, returncode=0, output="")
@@ -577,6 +585,9 @@ async def test_install_is_mutually_exclusive(monkeypatch) -> None:
 
 async def test_install_failure_is_reported_on_job(monkeypatch) -> None:
     async def failing_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        # 前置检通过（环境本身没冲突），真正的 install 才失败。
+        if args[0] == "check":
+            return deps_api.PipResult(ok=True, returncode=0, output="")
         return deps_api.PipResult(ok=False, returncode=1, output="ERROR: No matching distribution\n")
 
     monkeypatch.setattr(deps_api, "_run_pip", failing_run)
@@ -622,6 +633,8 @@ async def test_uninstall_uses_yes_and_validates_name(monkeypatch) -> None:
 
     assert ok.status_code == 200
     assert ok.json()["ok"] is True
+    # 卸载同样是"环境已变"：必须告诉前端挂重启横幅
+    assert ok.json()["restart_required"] is True
     # 卸载前先 `list` 一份快照（自动快照），再执行白名单卸载命令
     assert seen[0][:2] == ["list", "--format=json"]
     assert [args for args in seen if args[0] != "list"] == [
@@ -641,6 +654,121 @@ async def test_uninstall_failure_returns_502(monkeypatch) -> None:
         resp = await client.post(f"{BASE}/uninstall", json={"name": "requests"})
     assert resp.status_code == 502
     assert "exited with code 1" in json.dumps(resp.json())
+
+
+# ── 变更前置检（pip check）──────────────────────────────────────────────
+
+
+async def test_install_blocks_on_dependency_conflicts(monkeypatch) -> None:
+    """环境已有冲突时，install 必须**同步**返回 409 + 冲突文本，而不是排队一个注定失败的任务。"""
+    ran: list[list[str]] = []
+
+    async def fake_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        ran.append(args)
+        assert args == ["check"], f"冲突时不该继续执行 {args}"
+        return deps_api.PipResult(
+            ok=False,
+            returncode=1,
+            output="requests 2.31.0 has requirement urllib3<2, but you have urllib3 2.0.7.\n",
+        )
+
+    monkeypatch.setattr(deps_api, "_run_pip", fake_run)
+
+    async with _client() as client:
+        resp = await client.post(f"{BASE}/install", json={"spec": "requests==2.31.0"})
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert "urllib3" in detail["conflicts"]
+    assert "pip check" in detail["hint"]
+    assert ran == [["check"]]
+    assert deps_api._jobs == {}
+    # 闸必须还回去，否则之后的每一次安装都会 409
+    assert deps_api._running_job_id is None
+
+
+async def test_conflict_text_is_redacted_and_gate_is_reusable(monkeypatch) -> None:
+    """冲突文本里的索引 URL 凭据必须脱敏；阻塞一次不代表永久阻塞。"""
+    state = {"conflict": True}
+
+    async def fake_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        if args[0] == "check":
+            if state["conflict"]:
+                return deps_api.PipResult(
+                    ok=False,
+                    returncode=1,
+                    output=(
+                        "Looking in indexes: https://user:sekret-token@pypi.example.com/simple\n"
+                        "pkg 1.0 has requirement dep<2, but you have dep 3.0.\n"
+                    ),
+                )
+            return deps_api.PipResult(ok=True, returncode=0, output="")
+        if args[0] == "list":
+            return deps_api.PipResult(
+                ok=True,
+                returncode=0,
+                output=json.dumps([{"name": "requests", "version": "2.31.0"}]),
+            )
+        return deps_api.PipResult(ok=True, returncode=0, output="")
+
+    monkeypatch.setattr(deps_api, "_run_pip", fake_run)
+
+    async with _client() as client:
+        blocked = await client.post(f"{BASE}/install", json={"spec": "requests==2.31.0"})
+        assert blocked.status_code == 409
+        conflicts = blocked.json()["detail"]["conflicts"]
+        assert "sekret-token" not in conflicts
+        assert "https://***@pypi.example.com/simple" in conflicts
+
+        # 冲突修好之后，同一端点必须能继续工作（闸没有被锁死）
+        state["conflict"] = False
+        again = await client.post(f"{BASE}/install", json={"spec": "requests==2.31.0"})
+        assert again.status_code == 200
+        job_id = again.json()["job"]["id"]
+        for _ in range(100):
+            polled = await client.get(f"{BASE}/jobs/{job_id}")
+            if polled.json()["status"] in ("succeeded", "failed"):
+                break
+            await asyncio.sleep(0.01)
+
+
+async def test_install_preflight_timeout_does_not_block(monkeypatch) -> None:
+    """``pip check`` 超时属于"无法判定"，不能当成"有冲突"把功能锁死。"""
+    seen: list[list[str]] = []
+
+    async def fake_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        seen.append(args)
+        if args[0] == "check":
+            # 超时：pip 被 kill，ok=False 但 timed_out=True
+            return deps_api.PipResult(ok=False, returncode=-9, output="", timed_out=True)
+        if args[0] == "list":
+            return deps_api.PipResult(
+                ok=True,
+                returncode=0,
+                output=json.dumps([{"name": "requests", "version": "2.31.0"}]),
+            )
+        return deps_api.PipResult(ok=True, returncode=0, output="")
+
+    monkeypatch.setattr(deps_api, "_run_pip", fake_run)
+
+    async with _client() as client:
+        resp = await client.post(f"{BASE}/install", json={"spec": "requests==2.31.0"})
+        assert resp.status_code == 200
+        job_id = resp.json()["job"]["id"]
+        for _ in range(100):
+            polled = await client.get(f"{BASE}/jobs/{job_id}")
+            if polled.json()["status"] in ("succeeded", "failed"):
+                break
+            await asyncio.sleep(0.01)
+
+    assert polled.json()["status"] == "succeeded"
+    assert ["install", "--no-input", "--disable-pip-version-check", "requests==2.31.0"] in seen
+
+
+def test_check_dependency_conflicts_reports_timeout_separately() -> None:
+    """纯函数口径：超时 ⇒ ok=True + timed_out=True（不携带冲突文本）。"""
+    check = deps_api.ConflictCheck(ok=True, output="", timed_out=True)
+    assert check.ok and check.timed_out
 
 
 # ── 输出脱敏 ─────────────────────────────────────────────────────────────

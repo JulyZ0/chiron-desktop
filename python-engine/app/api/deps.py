@@ -32,9 +32,18 @@
 - ``POST /internal/deps/snapshots/{id}/restore`` ``{"dry_run"}`` → 差异预览 / 恢复任务
 
 **快照与回滚**：install/uninstall/restore 在**改动 site-packages 之前**都会先自动落一份
-`pip list --format=json` 的结果到 ``<data_dir>/deps-snapshots/<id>.json``（只保留最近 20
-份）。恢复先算差异（多出的卸、缺失/改版本的按快照版本钉住装），再以后台任务执行 ——
-一次最多装 50 个包，超出直接拒绝。
+`pip list --format=json` 的结果（只保留最近 20 份，按租户计）。恢复先算差异（多出的卸、
+缺失/改版本的按快照版本钉住装），再以后台任务执行 —— 一次最多装 50 个包，超出直接拒绝。
+
+**快照存哪里（多副本一致）**：权威存储是 PG 的 ``deps_snapshots`` 表（迁移 0004），
+任一副本写入、所有副本可读。PG 不可用（未初始化 / 迁移未跑 / 连接失败）时**回退**本地
+文件 ``<data_dir>/deps-snapshots/<id>.json``，并在响应里用 ``storage: "file"`` 明示 ——
+"快照只在本机可见"与"多副本一致"是两件不同的事，不能让用户从成功响应里猜。
+
+**变更前置检**：install / restore（非 dry_run）在动手前跑一次 ``pip check``（30s 超时）。
+当前环境已有依赖冲突时直接 409 并附冲突文本（``redact_output`` 已脱敏 URL userinfo）——
+冲突没解决就继续装包，只会把"装坏了"变成"装坏了且不知道从哪儿坏起"。
+dry_run 是只读预览，不受冲突阻断（否则用户连"要回滚到哪份快照"都看不到）。
 """
 
 from __future__ import annotations
@@ -59,7 +68,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.config import settings
+from app.config import DEFAULT_TENANT_ID, settings
+from app.db import get_pool
 from app.http_client import shared_client
 
 logger = logging.getLogger(__name__)
@@ -127,6 +137,20 @@ MAX_SNAPSHOT_LABEL_LEN = 120
 #: 快照文件格式版本：将来字段变化时据此判断兼容（当前只写不用）。
 SNAPSHOT_SCHEMA_VERSION = 1
 
+# ── 快照存储后端（PG 优先，文件回退）────────────────────────────────────
+#: 快照的权威存储（迁移 0004）：多副本各写各的文件时，列表在副本之间会随机分叉。
+DEPS_SNAPSHOT_TABLE = "deps_snapshots"
+#: 这一次读写实际用了哪个后端；前端据 ``storage == "file"`` 提示"只在本机可见"。
+SNAPSHOT_STORAGE_PG = "pg"
+SNAPSHOT_STORAGE_FILE = "file"
+
+# ── 变更前置检（pip check）───────────────────────────────────────────────
+#: ``pip check`` 的超时。它只扫已安装元数据、不联网，30s 对任何真实环境都够；
+#: 超时按"无法判定"处理（不阻断变更），因为把慢当成"有冲突"会锁死整个功能。
+CONFLICT_CHECK_TIMEOUT_SECONDS = 30.0
+#: 返回给前端的冲突文本上限：pip check 的整段输出可能很长，结论行在最前面。
+MAX_CONFLICT_OUTPUT_CHARS = 4000
+
 #: 快照 id 白名单：``<UTC 时间戳到毫秒>Z-<6 位随机>``。
 #:
 #: id 会被拼进文件路径，所以这里**只认引擎自己生成的形态**（不接受任何 ``.`` / ``/``
@@ -156,6 +180,88 @@ def require_internal_token(request: Request) -> None:
     provided = request.headers.get("X-Internal-Token", "")
     if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="invalid internal token")
+
+
+# ── 身份（快照的租户/用户归属）────────────────────────────────────────────
+#
+# 依赖管理是**平台级**功能（装的是整台机器共享的解释器），所以 default 租户是常态。
+# 但快照的保留份数按租户计、表里也有 tenant_id —— 一旦部署方让网关透传身份
+# （``?tenant_id=&user_id=`` 或 ``X-Tenant-Id``/``X-User-Id``，见
+# ``app/middleware/auth.py``），归属就应当跟着走，而不是永远写死成 1。
+
+
+def resolve_identity(request: Request) -> tuple[int, str]:
+    """从已鉴权的请求里取 ``(tenant_id, user_id)``。
+
+    取值顺序与 ``app/middleware/auth.py`` 一致：中间件设置好的
+    ``request.state.tenant_id`` 优先（query 透传路径），其次网关注入的
+    ``X-Tenant-Id`` 头，最后是平台默认租户。三个都没配时不报错 ——
+    单机/桌面形态下"没有租户维度的依赖管理"本来就是正常状态。
+    """
+    tenant_raw: Any = getattr(request.state, "tenant_id", None)
+    if tenant_raw in (None, ""):
+        tenant_raw = request.headers.get("X-Tenant-Id", "")
+    try:
+        tenant_id = int(tenant_raw)
+    except (TypeError, ValueError):
+        tenant_id = 0
+    if tenant_id <= 0:
+        tenant_id = DEFAULT_TENANT_ID
+
+    user_id = str(
+        getattr(request.state, "user_id", None)
+        or request.headers.get("X-User-Id", "")
+        or request.query_params.get("user_id", "")
+    ).strip()
+    return tenant_id, user_id[:64]
+
+
+# ── 变更前置检（pip check）───────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ConflictCheck:
+    """一次 ``pip check`` 的结论。
+
+    ``ok=True`` 有两种含义：没有冲突，或**无法判定**（超时）。后者不该阻断变更 ——
+    把"pip check 很慢"当成"环境坏了"会让依赖管理在最需要它的时候锁死；调用方在
+    ``timed_out=True`` 时只会把这件事写进任务日志。
+    """
+
+    ok: bool
+    output: str
+    timed_out: bool = False
+
+
+async def check_dependency_conflicts() -> ConflictCheck:
+    """跑 ``pip check``（30s 超时），失败时返回**已脱敏**的冲突文本。
+
+    ``_run_pip`` 的逐行采集已经做过一次 URL userinfo 脱敏；这里再对拼好的整段做一次，
+    是为了覆盖"调用方直接塞进来的 PipResult"（测试替身、将来的其他执行器）——
+    撞库风险为零，但"凭据出现在错误响应里"一次都不该发生。
+    """
+    result = await _run_pip(["check"], timeout=CONFLICT_CHECK_TIMEOUT_SECONDS)
+    if result.timed_out:
+        return ConflictCheck(ok=True, output="", timed_out=True)
+    if result.ok:
+        return ConflictCheck(ok=True, output="")
+    text = redact_output(result.output or "").strip()
+    return ConflictCheck(ok=False, output=text[-MAX_CONFLICT_OUTPUT_CHARS:])
+
+
+def conflict_http_exception(check: ConflictCheck) -> HTTPException:
+    """把冲突结论转成 409（冲突文本放在 ``detail.conflicts``，前端原样展示）。"""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": (
+                "dependency conflicts detected: the current environment is already broken, "
+                "so installing or restoring on top of it is unsafe"
+            ),
+            "conflicts": check.output or "pip check exited with a non-zero status",
+            "hint": "run `pip check` with the engine interpreter and resolve the listed requirements first",
+        },
+    )
 
 
 # ── 输入校验（纯函数，便于单测）──────────────────────────────────────────
@@ -500,6 +606,10 @@ class DepJob:
     progress: int = 0
     output: str = ""
     returncode: int | None = None
+    #: 变更已落到 site-packages、但进程仍持有**旧的已导入模块** ⇒ 必须重启引擎才能
+    #: 完全生效。只在 succeeded 时置 True（失败可能装了一半，但"重启"不是那种情况的
+    #: 解决方案 —— 恢复快照才是，界面不该用一个提示把两件事混起来）。
+    restart_required: bool = False
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
 
@@ -513,6 +623,7 @@ class DepJob:
             "progress": self.progress,
             "output": self.output,
             "returncode": self.returncode,
+            "restart_required": self.restart_required,
             "created_at": self.created_at,
             "finished_at": self.finished_at,
         }
@@ -552,7 +663,13 @@ def _append_job_output(job: DepJob, text: str) -> None:
     job.output = combined
 
 
-async def _run_install_job(job: DepJob, spec: str) -> None:
+async def _run_install_job(
+    job: DepJob,
+    spec: str,
+    *,
+    tenant_id: int = DEFAULT_TENANT_ID,
+    user_id: str = "",
+) -> None:
     """后台安装任务的执行体：先自动快照、再调 pip、推进进度、落结果。"""
     global _running_job_id
 
@@ -561,7 +678,7 @@ async def _run_install_job(job: DepJob, spec: str) -> None:
     job.message = "creating pre-install snapshot"
     try:
         # 快照必须在 pip install 之前：装完再拍就拍到了坏状态。
-        await _snapshot_before_mutation(job, f"install:{spec}")
+        await _snapshot_before_mutation(job, f"install:{spec}", tenant_id=tenant_id, user_id=user_id)
         job.progress = 10
         job.message = "running pip install"
         result = await _run_pip(
@@ -574,6 +691,8 @@ async def _run_install_job(job: DepJob, spec: str) -> None:
             job.status = "succeeded"
             job.progress = 100
             job.message = "installed"
+            # site-packages 变了但进程里已导入的模块还是旧的 ⇒ 重启才完全生效。
+            job.restart_required = True
         else:
             job.status = "failed"
             job.progress = 100
@@ -672,21 +791,21 @@ def normalize_label(raw: str) -> str:
     return " ".join(text.split())[:MAX_SNAPSHOT_LABEL_LEN]
 
 
-def write_snapshot(
+def build_snapshot_doc(
     packages: list[dict[str, str]],
     *,
     trigger: str,
     label: str = "",
     now: float | None = None,
 ) -> dict[str, Any]:
-    """把一份包清单落成快照文件（原子写 + 保留最近 N 份），返回完整文档。
+    """组装一份快照文档（纯函数：不落盘、不入库）。
 
-    "原子"是指先写 ``.json.tmp`` 再 ``replace``：直接写目标文件的话，写一半被杀会留下
-    半截 JSON，而列表端点会把每一个坏文件都当成一次告警 —— 用户看到的是"快照都不见了"。
+    PG 与文件两个后端共用同一个文档形状 —— 否则"换后端"会悄悄改变列表页读到的字段，
+    而前端只会看到某些列为空。
     """
     current = time.time() if now is None else now
     sid = new_snapshot_id(current)
-    doc: dict[str, Any] = {
+    return {
         "schema": SNAPSHOT_SCHEMA_VERSION,
         "id": sid,
         "created_at": current,
@@ -698,6 +817,16 @@ def write_snapshot(
         "packages": packages,
         "package_count": len(packages),
     }
+
+
+def persist_snapshot_file(doc: dict[str, Any]) -> dict[str, Any]:
+    """把文档落成快照文件（原子写 + 保留最近 N 份），返回带 ``storage`` 的文档。
+
+    "原子"是指先写 ``.json.tmp`` 再 ``replace``：直接写目标文件的话，写一半被杀会留下
+    半截 JSON，而列表端点会把每一个坏文件都当成一次告警 —— 用户看到的是"快照都不见了"。
+    """
+    sid = str(doc["id"])
+    doc = {**doc, "storage": SNAPSHOT_STORAGE_FILE}
     root = snapshot_root()
     root.mkdir(parents=True, exist_ok=True)
     target = snapshot_path(sid)
@@ -706,6 +835,19 @@ def write_snapshot(
     tmp.replace(target)
     prune_snapshots()
     return doc
+
+
+def write_snapshot(
+    packages: list[dict[str, str]],
+    *,
+    trigger: str,
+    label: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    """把一份包清单落成快照文件（文件后端的唯一入口，也是回退路径）。"""
+    return persist_snapshot_file(
+        build_snapshot_doc(packages, trigger=trigger, label=label, now=now)
+    )
 
 
 def prune_snapshots(keep: int = MAX_SNAPSHOTS) -> list[str]:
@@ -782,6 +924,8 @@ def snapshot_meta(doc: dict[str, Any]) -> dict[str, Any]:
         "label": str(doc.get("label") or ""),
         "package_count": int(_as_float(doc.get("package_count"))),
         "python": str(doc.get("python") or ""),
+        # 存储后端随元数据一起回传：前端据此说明"这份历史是否跨副本可见"。
+        "storage": str(doc.get("storage") or SNAPSHOT_STORAGE_FILE),
     }
 
 
@@ -802,6 +946,247 @@ def list_snapshot_docs(limit: int = MAX_SNAPSHOTS) -> list[dict[str, Any]]:
         except (OSError, ValueError) as exc:
             logger.warning("deps snapshot unreadable: %s (%s)", path.name, exc)
     return docs
+
+
+# ── 快照存储：PG 优先，文件回退 ───────────────────────────────────────────
+#
+# 顺序是**硬约定**：能连上 PG 就以 PG 为准（多副本一致）；连不上 / 写失败 / 表不存在
+# 才回退文件，并把 ``storage`` 标成 ``file``。不在这里做"两处都写"：双写会让
+# "哪份是权威"变成谜，而回滚场景最不能容忍的就是"看见了 A 却回滚到 B"。
+
+_SNAPSHOT_INSERT_SQL = f"""
+    INSERT INTO {DEPS_SNAPSHOT_TABLE}
+            (id, tenant_id, user_id, created_at, "trigger", label, python, packages)
+    VALUES ($1, $2, $3, to_timestamp($4::double precision), $5, $6, $7, $8::jsonb)
+"""
+
+_SNAPSHOT_LIST_SQL = f"""
+    SELECT id,
+           tenant_id,
+           user_id,
+           EXTRACT(EPOCH FROM created_at) AS created_at,
+           "trigger",
+           label,
+           python,
+           jsonb_array_length(packages) AS package_count
+      FROM {DEPS_SNAPSHOT_TABLE}
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2
+"""
+
+_SNAPSHOT_SELECT_SQL = f"""
+    SELECT id,
+           tenant_id,
+           user_id,
+           EXTRACT(EPOCH FROM created_at) AS created_at,
+           "trigger",
+           label,
+           python,
+           packages
+      FROM {DEPS_SNAPSHOT_TABLE}
+     WHERE id = $1 AND tenant_id = $2
+"""
+
+_SNAPSHOT_PRUNE_SQL = f"""
+    DELETE FROM {DEPS_SNAPSHOT_TABLE}
+     WHERE tenant_id = $1
+       AND id NOT IN (
+           SELECT id FROM {DEPS_SNAPSHOT_TABLE}
+            WHERE tenant_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+       )
+"""
+
+
+def _pg_pool() -> Any | None:
+    """取数据库池；不可用时返回 ``None``（快照回退文件）。
+
+    刻意吞掉**所有**异常：池未初始化抛 ``RuntimeError``，部署方也可能改坏连接串。
+    快照是"环境坏了时的最后手段"，不该因为数据库抖动让整页不可用。
+    """
+    try:
+        return get_pool()
+    except Exception as exc:  # noqa: BLE001 - 任何形态都只意味着"用文件"
+        logger.debug("deps snapshots: database pool unavailable (%s); using files", exc)
+        return None
+
+
+def _row_value(row: Any, key: str, default: Any = None) -> Any:
+    """按列名取值（asyncpg.Record 与统一客户端的 _RowDict 都支持下标）。
+
+    两种行的 ``__getitem__`` 对未知列的行为不同（一个抛 KeyError、一个返回缺省），
+    统一成 ``.get`` 语义，避免"某个后端少一列就 500"。
+    """
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _decode_packages(raw: Any) -> list[dict[str, str]]:
+    """把 jsonb 列归一成 ``[{name, version}]``。
+
+    asyncpg 对 jsonb 返回 ``str``（不做解码），统一客户端的网关更是把值原样塞进
+    dict。缺 name/version 的条目直接丢弃 —— 它们无法变成任何 pip 参数。
+    """
+    data: Any = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(data, list):
+        return []
+    packages: list[dict[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        version = str(item.get("version") or "").strip()
+        if name and version:
+            packages.append({"name": name, "version": version})
+    return packages
+
+
+def _epoch_of(value: Any) -> float:
+    return _as_float(value)
+
+
+def _snapshot_meta_from_row(row: Any) -> dict[str, Any]:
+    created = _epoch_of(_row_value(row, "created_at"))
+    return {
+        "id": str(_row_value(row, "id", "")),
+        "created_at": created,
+        "created_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created)) if created else "",
+        "trigger": str(_row_value(row, "trigger", "")),
+        "label": str(_row_value(row, "label", "")),
+        "package_count": int(_epoch_of(_row_value(row, "package_count", 0))),
+        "python": str(_row_value(row, "python", "")),
+        "storage": SNAPSHOT_STORAGE_PG,
+    }
+
+
+def _snapshot_doc_from_row(row: Any) -> dict[str, Any]:
+    doc = _snapshot_meta_from_row(row)
+    packages = _decode_packages(_row_value(row, "packages", []))
+    doc.update(
+        {
+            "schema": SNAPSHOT_SCHEMA_VERSION,
+            "packages": packages,
+            "package_count": len(packages),
+            "tenant_id": int(_epoch_of(_row_value(row, "tenant_id", DEFAULT_TENANT_ID))),
+            "user_id": str(_row_value(row, "user_id", "") or ""),
+        }
+    )
+    return doc
+
+
+async def list_stored_snapshots(
+    limit: int = MAX_SNAPSHOTS,
+    tenant_id: int | None = None,
+) -> dict[str, Any]:
+    """列出快照（PG 优先，回退文件），返回 ``{snapshots, storage, directory}``。
+
+    ``storage`` 是**这次实际用到的后端**，不是配置：前端据此提示"当前快照只在本机
+    可见，重启/换副本后可能看不到"。PG 报错时回退文件是刻意的降级，不是静默兜底 ——
+    日志里总会留一条 warning。
+    """
+    tid = tenant_id or DEFAULT_TENANT_ID
+    pool = _pg_pool()
+    if pool is not None:
+        try:
+            rows = await pool.fetch(_SNAPSHOT_LIST_SQL, tid, limit)
+            return {
+                "snapshots": [_snapshot_meta_from_row(row) for row in rows],
+                "storage": SNAPSHOT_STORAGE_PG,
+                "directory": "",
+            }
+        except Exception as exc:  # noqa: BLE001 - 迁移未跑 / 连接失败都回退文件
+            logger.warning("deps snapshots: PostgreSQL list failed (%s); falling back to files", exc)
+
+    return {
+        "snapshots": list_snapshot_docs(limit),
+        "storage": SNAPSHOT_STORAGE_FILE,
+        "directory": str(snapshot_root()),
+    }
+
+
+async def load_snapshot_doc(
+    snapshot_id: str,
+    tenant_id: int | None = None,
+) -> dict[str, Any] | None:
+    """按 id 读一份快照：PG 命中即返回，否则回退文件；都不存在返回 ``None``。
+
+    id 非法抛 ``ValueError``（调用方转 400）。这里不把"PG 里没有"直接当成 404 ——
+    迁移之前拍的快照只在磁盘上，它们必须仍然可读、可恢复。
+    """
+    sid = (snapshot_id or "").strip()
+    if not SNAPSHOT_ID_RE.fullmatch(sid):
+        raise ValueError("invalid snapshot id")
+    tid = tenant_id or DEFAULT_TENANT_ID
+
+    pool = _pg_pool()
+    if pool is not None:
+        try:
+            row = await pool.fetchrow(_SNAPSHOT_SELECT_SQL, sid, tid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("deps snapshots: PostgreSQL read failed (%s); falling back to files", exc)
+            row = None
+        if row is not None:
+            return _snapshot_doc_from_row(row)
+
+    path = snapshot_path(sid)
+    if not path.is_file():
+        return None
+    doc = read_snapshot(sid)
+    doc["storage"] = SNAPSHOT_STORAGE_FILE
+    return doc
+
+
+async def save_snapshot(
+    packages: list[dict[str, str]],
+    *,
+    trigger: str,
+    label: str = "",
+    tenant_id: int | None = None,
+    user_id: str = "",
+    now: float | None = None,
+) -> dict[str, Any]:
+    """持久化一份快照：PG 优先，失败回退文件（返回带 ``storage`` 的文档）。
+
+    失败回退**不**抛异常：快照失败本身不阻断变更（见 ``_snapshot_before_mutation``），
+    但"回退到文件"必须留痕，否则多副本下用户会以为历史已经共享。
+    """
+    tid = tenant_id or DEFAULT_TENANT_ID
+    doc = build_snapshot_doc(packages, trigger=trigger, label=label, now=now)
+    doc.update({"tenant_id": tid, "user_id": user_id, "storage": SNAPSHOT_STORAGE_PG})
+
+    pool = _pg_pool()
+    if pool is not None:
+        try:
+            await pool.execute(
+                _SNAPSHOT_INSERT_SQL,
+                doc["id"],
+                tid,
+                user_id or None,
+                float(doc["created_at"]),
+                trigger,
+                label,
+                doc["python"],
+                json.dumps(packages, ensure_ascii=False),
+            )
+            # 保留策略按**租户**执行：清理别人的历史是另一回事。
+            await pool.execute(_SNAPSHOT_PRUNE_SQL, tid, MAX_SNAPSHOTS)
+            return doc
+        except Exception as exc:  # noqa: BLE001 - 迁移未跑 / 连接失败 / 唯一冲突
+            logger.warning(
+                "deps snapshots: PostgreSQL write failed (%s); falling back to files", exc
+            )
+
+    return persist_snapshot_file(doc)
 
 
 def compute_restore_diff(
@@ -869,17 +1254,36 @@ async def _current_packages() -> list[dict[str, str]]:
         raise PipListError(str(exc)) from exc
 
 
-async def capture_snapshot(trigger: str, label: str = "") -> dict[str, Any]:
-    """采集 + 落盘一份快照（手动创建与自动快照共用）。
+async def capture_snapshot(
+    trigger: str,
+    label: str = "",
+    *,
+    tenant_id: int | None = None,
+    user_id: str = "",
+) -> dict[str, Any]:
+    """采集 + 落库/落盘一份快照（手动创建与自动快照共用）。
 
     失败形态原样抛出（``PipListError`` / ``OSError``），由调用方决定是"转成 502"
-    还是"记一行告警后继续装包"。
+    还是"记一行告警后继续装包"。PG 写失败**不**抛 —— 它在 ``save_snapshot`` 内部回退文件。
     """
     packages = await _current_packages()
-    return write_snapshot(packages, trigger=trigger, label=normalize_label(label))
+    return await save_snapshot(
+        packages,
+        trigger=trigger,
+        label=normalize_label(label),
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
 
 
-async def _snapshot_before_mutation(job: DepJob, trigger: str, label: str = "") -> None:
+async def _snapshot_before_mutation(
+    job: DepJob,
+    trigger: str,
+    label: str = "",
+    *,
+    tenant_id: int | None = None,
+    user_id: str = "",
+) -> None:
     """变更前的自动快照：失败**不**阻断变更，只在任务日志里留一行。
 
     为什么不是 fail-closed：快照是对"装坏了"的补偿，而不是安全前置条件。让磁盘只读
@@ -887,14 +1291,22 @@ async def _snapshot_before_mutation(job: DepJob, trigger: str, label: str = "") 
     还有 pip 自己的 wheel 缓存与"重装回去"这条手工路径。
     """
     try:
-        await capture_snapshot(trigger, label)
-        _append_job_output(job, f"snapshot created before {trigger}\n")
+        doc = await capture_snapshot(trigger, label, tenant_id=tenant_id, user_id=user_id)
+        storage = doc.get("storage", SNAPSHOT_STORAGE_FILE)
+        _append_job_output(job, f"snapshot created before {trigger} (storage={storage})\n")
     except (PipListError, OSError) as exc:
         _append_job_output(job, f"pre-change snapshot failed (continuing): {exc}\n")
         logger.warning("deps pre-change snapshot failed: %s", exc)
 
 
-async def _run_restore_job(job: DepJob, snapshot: dict[str, Any], diff: dict[str, Any]) -> None:
+async def _run_restore_job(
+    job: DepJob,
+    snapshot: dict[str, Any],
+    diff: dict[str, Any],
+    *,
+    tenant_id: int = DEFAULT_TENANT_ID,
+    user_id: str = "",
+) -> None:
     """恢复任务的执行体：先卸多出的，再把缺失/改版本的按快照版本钉住装。"""
     global _running_job_id
 
@@ -902,7 +1314,13 @@ async def _run_restore_job(job: DepJob, snapshot: dict[str, Any], diff: dict[str
     job.progress = 5
     job.message = "creating pre-restore snapshot"
     try:
-        await _snapshot_before_mutation(job, f"restore:{snapshot['id']}", f"pre-restore {snapshot['id']}")
+        await _snapshot_before_mutation(
+            job,
+            f"restore:{snapshot['id']}",
+            f"pre-restore {snapshot['id']}",
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
 
         extras = [pkg["name"] for pkg in diff["extra"]]
         if extras:
@@ -946,6 +1364,7 @@ async def _run_restore_job(job: DepJob, snapshot: dict[str, Any], diff: dict[str
         job.status = "succeeded"
         job.progress = 100
         job.message = f"restored to snapshot {snapshot['id']}"
+        job.restart_required = True
         logger.info("deps restore job finished", extra={"job_id": job.id, "snapshot": snapshot["id"]})
     except asyncio.CancelledError:
         job.status = "failed"
@@ -1068,11 +1487,14 @@ async def search_packages(
 
 
 @router.post("/install", dependencies=[Depends(require_internal_token)])
-async def install_package(payload: InstallRequest) -> dict[str, Any]:
+async def install_package(payload: InstallRequest, request: Request) -> dict[str, Any]:
     """创建安装任务并立即返回 job（进度用 ``GET /jobs/{id}`` 轮询）。
 
     为什么异步：一次带编译的安装轻易超过 60s，网关的同步超时会先断开，用户只会看到
     "请求失败"而包其实装了一半。返回 job 之后，连接超时不再影响结果能否被读到。
+
+    动手前的 ``pip check`` 是**同步**的：冲突必须变成这次请求的 409，而不是一个
+    "排队了但注定失败"的后台任务。它只读已安装元数据，秒级完成。
     """
     global _running_job_id
 
@@ -1090,20 +1512,37 @@ async def install_package(payload: InstallRequest) -> dict[str, Any]:
             },
         )
 
-    _prune_jobs()
-    job = DepJob(id=uuid.uuid4().hex[:12], kind="install", target=spec, message="queued")
-    _jobs[job.id] = job
-    _running_job_id = job.id
-    task = asyncio.create_task(_run_install_job(job, spec))
-    _job_tasks.add(task)
-    task.add_done_callback(_job_tasks.discard)
+    # 先占闸再跑前置检：``pip check`` 是一个 await 窗口，不占闸的话两个并发安装会
+    # 双双通过检查、双双建任务（两道 `_running_job_id is None` 都在同一个空窗口里）。
+    tenant_id, user_id = resolve_identity(request)
+    marker = f"install-{uuid.uuid4().hex[:8]}"
+    _running_job_id = marker
+    try:
+        conflicts = await check_dependency_conflicts()
+        if not conflicts.ok:
+            raise conflict_http_exception(conflicts)
+
+        _prune_jobs()
+        job = DepJob(id=uuid.uuid4().hex[:12], kind="install", target=spec, message="queued")
+        _jobs[job.id] = job
+        _running_job_id = job.id
+        task = asyncio.create_task(
+            _run_install_job(job, spec, tenant_id=tenant_id, user_id=user_id)
+        )
+        _job_tasks.add(task)
+        task.add_done_callback(_job_tasks.discard)
+    except BaseException:
+        # 前置检失败 / 建任务失败：闸必须还回去，否则之后的每一次安装都会 409。
+        if _running_job_id == marker:
+            _running_job_id = None
+        raise
 
     logger.info("deps install job queued: %s", spec, extra={"job_id": job.id})
-    return {"job": job.to_dict()}
+    return {"job": job.to_dict(), "restart_required": False}
 
 
 @router.post("/uninstall", dependencies=[Depends(require_internal_token)])
-async def uninstall_package(payload: UninstallRequest) -> dict[str, Any]:
+async def uninstall_package(payload: UninstallRequest, request: Request) -> dict[str, Any]:
     """同步卸载（秒级，不需要任务表）；与安装共用"同一时刻只有一个变更任务"的闸。
 
     ``-y`` 与 ``--no-input`` 同时给：``--no-input`` 只是"不读 stdin"，卸载的确认
@@ -1125,12 +1564,13 @@ async def uninstall_package(payload: UninstallRequest) -> dict[str, Any]:
             },
         )
 
+    tenant_id, user_id = resolve_identity(request)
     marker = f"uninstall-{uuid.uuid4().hex[:8]}"
     _running_job_id = marker
     try:
         # 卸载前同样先快照（卸载没有任务表，所以快照失败只能记日志）。
         try:
-            await capture_snapshot(f"uninstall:{name}")
+            await capture_snapshot(f"uninstall:{name}", tenant_id=tenant_id, user_id=user_id)
         except (PipListError, OSError) as exc:
             logger.warning("deps pre-uninstall snapshot failed: %s", exc)
         result = await _run_pip(
@@ -1151,7 +1591,13 @@ async def uninstall_package(payload: UninstallRequest) -> dict[str, Any]:
             status_code=502,
             detail={"error": reason, "output": result.output[-2000:]},
         )
-    return {"ok": True, "name": name, "output": result.output[-2000:]}
+    # 卸载同样是"环境已变"：进程里可能仍有已导入的模块，重启后才完全一致。
+    return {
+        "ok": True,
+        "name": name,
+        "output": result.output[-2000:],
+        "restart_required": True,
+    }
 
 
 @router.get("/jobs/{job_id}", dependencies=[Depends(require_internal_token)])
@@ -1168,31 +1614,41 @@ async def get_job(job_id: str) -> dict[str, Any]:
 
 
 @router.get("/snapshots", dependencies=[Depends(require_internal_token)])
-async def list_snapshots() -> dict[str, Any]:
+async def list_snapshots(request: Request) -> dict[str, Any]:
     """快照列表（最新在前）。
 
     只回元数据（id / created_at / package_count / trigger / label）：几百个包名对列表页
     没有价值，却会让每次刷新都多传几十 KB。恢复时由后端自己读全文。
+
+    ``storage`` 是**这次实际用的后端**（pg / file）：文件后端下这份历史只在本机，
+    多副本部署时换一个副本就看不到 —— 必须让用户知道，而不是猜。
     """
-    snapshots = list_snapshot_docs()
+    tenant_id, _ = resolve_identity(request)
+    listed = await list_stored_snapshots(MAX_SNAPSHOTS, tenant_id)
+    snapshots = listed["snapshots"]
     return {
         "snapshots": snapshots,
         "count": len(snapshots),
         "retention": MAX_SNAPSHOTS,
-        "directory": str(snapshot_root()),
+        "storage": listed["storage"],
+        "directory": listed["directory"],
     }
 
 
 @router.post("/snapshots", dependencies=[Depends(require_internal_token)])
-async def create_snapshot(payload: SnapshotRequest | None = None) -> dict[str, Any]:
+async def create_snapshot(
+    request: Request,
+    payload: SnapshotRequest | None = None,
+) -> dict[str, Any]:
     """手动创建一份快照（trigger=manual）。
 
     同步执行：``pip list`` 是秒级操作，不像安装那样会撞网关超时；同步返回才能让前端
     立刻把新快照放进列表。
     """
     label = normalize_label(payload.label if payload is not None else "")
+    tenant_id, user_id = resolve_identity(request)
     try:
-        doc = await capture_snapshot("manual", label)
+        doc = await capture_snapshot("manual", label, tenant_id=tenant_id, user_id=user_id)
     except PipListError as exc:
         raise HTTPException(
             status_code=502,
@@ -1202,12 +1658,13 @@ async def create_snapshot(payload: SnapshotRequest | None = None) -> dict[str, A
         # 落盘失败（目录只读 / 磁盘满）：这是"服务器侧问题"，但原因必须让用户看见，
         # 否则"创建快照没反应"无从排查。
         raise HTTPException(status_code=500, detail=f"cannot write snapshot: {exc}") from exc
-    return {"snapshot": snapshot_meta(doc)}
+    return {"snapshot": snapshot_meta(doc), "storage": doc.get("storage", SNAPSHOT_STORAGE_FILE)}
 
 
 @router.post("/snapshots/{snapshot_id}/restore", dependencies=[Depends(require_internal_token)])
 async def restore_snapshot(
     snapshot_id: str,
+    request: Request,
     payload: RestoreRequest | None = None,
 ) -> dict[str, Any]:
     """把环境拉回某份快照。
@@ -1215,25 +1672,31 @@ async def restore_snapshot(
     ``dry_run=true``：只算差异并返回（前端的二次确认弹窗就靠这个）；
     ``dry_run=false``：建后台恢复任务并立即返回 job（批量重装必然超过网关同步超时）。
 
-    顺序即安全边界：id 白名单 → 文件存在 → 快照里的每个条目重新过规格白名单
-    （快照是磁盘文件，被改过一次就意味着任意 pip 参数）→ 读当前环境 → 算差异 →
-    上限校验 → 单任务闸 → 建任务。
+    顺序即安全边界：id 白名单 → 快照存在（PG 优先，回退文件）→ 快照里的每个条目重新
+    过规格白名单（快照是持久化数据，被改过一次就意味着任意 pip 参数）→ 读当前环境 →
+    算差异 → 上限校验 → 空转判定 → ``pip check`` 前置检 → 单任务闸 → 建任务。
+
+    ``dry_run`` 刻意**不跑**前置检也不被它阻断：预览是只读的，把"环境已有冲突"变成
+    "连差异都看不了"，用户就永远不知道该回滚到哪份快照。
     """
     global _running_job_id
 
     dry_run = bool(payload.dry_run) if payload is not None else False
+    tenant_id, user_id = resolve_identity(request)
 
+    # 先做**纯** id 校验（白名单 + realpath 双保险），再读内容：这样"非法 id"是 400，
+    # 而"文件/行内容坏了"才是 502 —— 两者对用户的处置完全不同。
     try:
-        path = snapshot_path(snapshot_id)
+        snapshot_path(snapshot_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail=f"snapshot {snapshot_id} not found")
 
     try:
-        snapshot = read_snapshot(snapshot_id)
+        snapshot = await load_snapshot_doc(snapshot_id, tenant_id)
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=f"snapshot is unreadable: {exc}") from exc
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"snapshot {snapshot_id} not found")
 
     for pkg in snapshot["packages"]:
         try:
@@ -1257,7 +1720,13 @@ async def restore_snapshot(
     meta = snapshot_meta(snapshot)
 
     if dry_run:
-        return {"dry_run": True, "snapshot": meta, "diff": diff, "job": None}
+        return {
+            "dry_run": True,
+            "snapshot": meta,
+            "diff": diff,
+            "job": None,
+            "restart_required": False,
+        }
 
     if diff["install_count"] > MAX_RESTORE_INSTALLS:
         raise HTTPException(
@@ -1273,8 +1742,17 @@ async def restore_snapshot(
 
     if diff["total_changes"] == 0:
         # 环境已经与快照一致：不建任务（否则前端要为一个空转任务轮询到底）。
-        return {"dry_run": False, "snapshot": meta, "diff": diff, "job": None, "noop": True}
+        return {
+            "dry_run": False,
+            "snapshot": meta,
+            "diff": diff,
+            "job": None,
+            "noop": True,
+            "restart_required": False,
+        }
 
+    # 真恢复会改 site-packages：当前环境已有冲突时先停下来（409 + 冲突文本）。
+    # 闸在前置检之前占住 —— 与 install 同一理由（``pip check`` 是 await 窗口）。
     if _running_job_id is not None:
         raise HTTPException(
             status_code=409,
@@ -1284,13 +1762,32 @@ async def restore_snapshot(
             },
         )
 
-    _prune_jobs()
-    job = DepJob(id=uuid.uuid4().hex[:12], kind="restore", target=snapshot_id, message="queued")
-    _jobs[job.id] = job
-    _running_job_id = job.id
-    task = asyncio.create_task(_run_restore_job(job, snapshot, diff))
-    _job_tasks.add(task)
-    task.add_done_callback(_job_tasks.discard)
+    marker = f"restore-{uuid.uuid4().hex[:8]}"
+    _running_job_id = marker
+    try:
+        conflicts = await check_dependency_conflicts()
+        if not conflicts.ok:
+            raise conflict_http_exception(conflicts)
+
+        _prune_jobs()
+        job = DepJob(id=uuid.uuid4().hex[:12], kind="restore", target=snapshot_id, message="queued")
+        _jobs[job.id] = job
+        _running_job_id = job.id
+        task = asyncio.create_task(
+            _run_restore_job(job, snapshot, diff, tenant_id=tenant_id, user_id=user_id)
+        )
+        _job_tasks.add(task)
+        task.add_done_callback(_job_tasks.discard)
+    except BaseException:
+        if _running_job_id == marker:
+            _running_job_id = None
+        raise
 
     logger.info("deps restore job queued: %s", snapshot_id, extra={"job_id": job.id})
-    return {"dry_run": False, "snapshot": meta, "diff": diff, "job": job.to_dict()}
+    return {
+        "dry_run": False,
+        "snapshot": meta,
+        "diff": diff,
+        "job": job.to_dict(),
+        "restart_required": False,
+    }
