@@ -160,6 +160,53 @@ async def consume_pending_reports(
     return items
 
 
+#: 失败原因写进 summary 时的上限（前端卡片两行 + 事件流一行，再多就是噪音）
+FAILURE_MAX_CHARS = 500
+
+
+def sanitize_failure(reason: str, *, limit: int = FAILURE_MAX_CHARS) -> str:
+    """把上游/运行期错误压成**可展示**的一行：脱敏 URL 与密钥、截断。
+
+    为什么失败原因要走脱敏：它来自上游响应体，可能带回显的请求信息（URL 里的 workspace /
+    token）或工具参数里的密钥；而这条文本会进 `subagent_runs.summary`（前端卡片、
+    父会话下一轮的 `<subagent-reports>` 注入）—— 那是**会扩散**的两个面。
+    """
+    text = " ".join(str(reason or "").split())
+    if not text:
+        return ""
+    import re
+
+    text = re.sub(r"https?://\S+", "[url]", text)
+    try:
+        from app.subagent.redact import redact_text
+
+        text, _ = redact_text(text)
+    except Exception:  # noqa: BLE001 - 脱敏层不可用得让错误仍然可见
+        pass
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+def failure_summary(
+    status: str, errors: list[str], *, limit: int = FAILURE_MAX_CHARS
+) -> str:
+    """失败/部分完成时**必须**给出一条可读摘要（"还没有摘要"是不可接受的终态）。
+
+    实测现场：子 Agent 全部 failed，卡片显示 `↑0 · ↓0` + "还没有摘要" —— 因为
+    `_summarise()` 拿到的是空输出，提取式摘要返回空串，而真实原因只存在于 `error`
+    列（前端卡片不读它）。把原因写进 summary 之后，同一处既能显示"为什么失败"，
+    也能随 `<subagent-reports>` 回到父会话（否则父模型只会看到一条空结论）。
+    """
+    if status not in ("failed", "partial"):
+        return ""
+    reason = " | ".join(e for e in (errors or []) if e).strip()
+    if not reason:
+        return "子 Agent 未产出有效结果（无错误详情）" if status == "failed" else ""
+    head = "失败原因" if status == "failed" else "部分完成，原因"
+    return sanitize_failure(f"{head}: {reason}", limit=limit)
+
+
 def format_reports(items: list[dict[str, Any]]) -> str:
     """把待汇报条目拼成一段**不可信数据**块（与 L2 的 `<subagent-result>` 同一约定）。
 

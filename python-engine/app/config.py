@@ -122,6 +122,13 @@ class Settings(BaseSettings):
     # 由网关 /v1/internal/engine-config 下发 llm_provider_catalog；为空则回落
     # app/providers/catalog.py 的兜底目录（网关不可达时的单机降级）。
     llm_provider_catalog: list[dict[str, Any]] = []
+    #: 订阅制 provider 的**套餐模型白名单**（`{provider: [前缀, ...]}`）。
+    #: 覆盖 `app/gateway/model_compat.py` 的内建默认（OpenCode Go 等订阅网关只覆盖
+    #: 一份模型清单）。配置成空列表 = 显式禁止该 provider 接收任何模型。
+    #: 例：`{"opencode-go": ["glm", "kimi", "qwen"]}`。
+    provider_model_allowlist: dict[str, Any] = {}
+    #: 显式禁用前缀（`{provider: [前缀, ...]}`），优先生效于白名单。
+    provider_model_deny: dict[str, Any] = {}
     # 网关「系统设置」python 分类里的 provider 级覆盖（{provider}_base_url /
     # {provider}_api_key）。Settings 不为每个 provider 声明字段，故集中收集于此。
     provider_overrides: dict[str, str] = {}

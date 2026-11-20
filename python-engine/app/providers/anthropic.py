@@ -292,8 +292,27 @@ class AnthropicProvider(LLMProvider):
                         getattr(final, "usage", None)
                     ),
                 )
-        except Exception:
-            await self._report_failure(key_item)
+        except Exception as exc:
+            # 只有**这把凭证自己**的错才上报（401/403/429）—— 与 `call_with_key_retry`
+            # 的 `is_key_scoped_failure` 同一口径。
+            #
+            # 此前这里是**无条件** `await self._report_failure(key_item)`，于是上游的
+            # 确定性 400（实测：`claude-sonnet-4-20250514 isn't included in OpenCode Go`）
+            # 会被算到密钥头上 → 唯一那把 key 进入 30s 冷却 → 下一次请求直接
+            # `NoUsableKeyError ... cooling=1`，真实原因被完全掩盖（子 Agent 全部 failed）。
+            from app.gateway.key_retry import is_key_scoped_failure
+            from app.gateway.key_ring import note_last_error
+
+            note_last_error(self.name, exc)
+            if is_key_scoped_failure(exc):
+                await self._report_failure(key_item)
+            else:
+                logger.warning(
+                    "provider %s stream failed with a non-credential error (%s); "
+                    "key NOT cooled",
+                    self.name,
+                    type(exc).__name__,
+                )
             raise
 
     async def chat(

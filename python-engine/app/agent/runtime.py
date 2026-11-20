@@ -2610,6 +2610,18 @@ class AgentRuntime:
             model = llm_config.get("model", settings.default_model)
             temperature = llm_config.get("temperature", settings.default_temperature)
 
+            # 把**本轮实际使用的模型与 provider** 放进工具上下文：子 Agent 委派必须继承它。
+            # 此前子 Agent 只拿 `spec.llm_config()`（通常为空）⇒ 退回 `default_model`，
+            # 与主 Agent 会话里选的模型/供应商不是一套，于是同一份配置在父子两处走了
+            # 不同的路由（实测：子 Agent 的 claude 被发给只配了 key 的 OpenCode Go → 400，
+            # 全部 failed；主 Agent 正常）。写在这里是"解析之后、调用之前"，即最终生效值。
+            from app.tools.context import set_tool_context as _set_llm_ctx
+
+            _set_llm_ctx(
+                llm_model=str(model or ""),
+                llm_provider=str((llm_config or {}).get("provider", "") or ""),
+            )
+
             # ── C4：压缩预算来自**模型窗口表**（不再是硬编码常量）──
             # `llm_models.context_window` 早已存在；查不到时回落 `MAX_CONTEXT_TOKENS`。
             # 窗口查询失败不阻断对话（它是"调参输入"，不是安全边界）。

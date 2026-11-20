@@ -80,7 +80,20 @@ const STATUS_COLOR: Record<string, string> = {
 
 const statusColor = computed(() => STATUS_COLOR[String(props.run.status)] || 'default')
 const name = computed(() => props.run.profile || props.run.run_id)
-const summary = computed(() => (props.run.summary || '').trim())
+/**
+ * 卡片摘要。
+ *
+ * **失败的 run 必须有可读摘要**：引擎会在失败时把上游原因写进 `summary`
+ * （`app/subagent/reporting.py::failure_summary`），但历史行 / 运行期缓存里可能只有
+ * `error`（Redis 缓存的 run 不带 summary）。此时回落到 `error`，而不是显示
+ * "还没有摘要" —— 用户要的是"为什么 failed"，不是一句"没有摘要"。
+ */
+const summary = computed(() => {
+  const text = (props.run.summary || '').trim()
+  if (text) return text
+  if (String(props.run.status) === 'failed') return (props.run.error || '').trim()
+  return ''
+})
 
 /** 已运行时长：只有活跃 run 且拿到 created_at 时才算（终态没有结束时间，宁可不显示） */
 const elapsedSec = computed(() => {

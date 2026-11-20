@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -58,19 +59,88 @@ class NoUsableKeyError(RuntimeError):
     此前的静默回退会构造出一句真·上游 401（掩码尾缀是占位 key 的 `aged`），前端按
     "上游说 key 无效"分类后引导用户去改一把**其实有效**的 key，而且每条失败消息都重弹一次。
     消息体里带固定标记 `no_usable_key` 与计数，前端按标记分类，不再靠状态码猜。
+
+    **必须携带最后一条上游原因**（`last_error`）：`cooling=1` 只说明"这把 key 刚被冷却"，
+    真正的原因在上一跳（例如 `400 … isn't included in OpenCode Go`）。不带它，
+    用户看到的就是 `no_usable_key … cooling=1` 这种与根因无关的诊断 —— 实测现场
+    子 Agent 全部 failed 时，两条错误里只有这条出现，反而把"模型不在套餐内"埋掉了。
     """
 
-    def __init__(self, provider: str, diag: dict[str, Any]) -> None:
+    def __init__(
+        self, provider: str, diag: dict[str, Any], last_error: str = ""
+    ) -> None:
         self.provider = provider
         self.configured = int(diag.get("configured") or 0)
         self.blocked = int(diag.get("blocked") or 0)
         self.cooling = int(diag.get("cooling") or 0)
         self.retry_after_seconds = float(diag.get("retry_after") or 0.0)
-        super().__init__(
+        #: 上一跳的真实原因（已脱敏截断）；空串 = 本次进程内没有观察到上游错误。
+        self.last_error = (last_error or last_error_of(provider) or "").strip()
+        message = (
             f"no_usable_key provider={provider} configured={self.configured} "
             f"blocked={self.blocked} cooling={self.cooling} "
             f"retry_after_seconds={self.retry_after_seconds:.0f}"
         )
+        if self.last_error:
+            message += f" last_error={self.last_error}"
+        super().__init__(message)
+
+
+#: provider → (单调时间, 最近一次上游错误摘要)。进程内即可满足"下一跳能说出真实原因"：
+#: 取 key 失败与上游报错发生在同一进程、相邻两次请求里；跨实例的权威诊断仍在日志。
+_LAST_ERRORS: dict[str, tuple[float, str]] = {}
+#: 只认这么近的原因 —— 十分钟前的 400 与现在的"没 key"未必相关，说错方向比不说更糟。
+LAST_ERROR_TTL_SECONDS = 600.0
+LAST_ERROR_MAX_CHARS = 300
+
+
+def _sanitize_reason(text: str) -> str:
+    """把上游错误压成一行、去掉 URL 与密钥、截断 —— 它会被写进用户可见的错误消息。"""
+    summary = " ".join(str(text or "").split())
+    # URL 里的 token / workspace id 属于内容面（OpenCode 的提示里就带 console 链接）
+    summary = re.sub(r"https?://\S+", "[url]", summary)
+    try:
+        from app.subagent.redact import redact_text
+
+        summary, _ = redact_text(summary)
+    except Exception:  # noqa: BLE001 - 脱敏层不可用不得阻断报错
+        pass
+    if len(summary) > LAST_ERROR_MAX_CHARS:
+        summary = summary[: LAST_ERROR_MAX_CHARS - 1] + "…"
+    return summary
+
+
+def note_last_error(provider: str, error: BaseException | str) -> None:
+    """记下该 provider 最近一次上游错误（供随后的 `NoUsableKeyError` 说明真实原因）。
+
+    打点失败绝不影响调用路径：这里只写一个进程内字典。
+    """
+    if not provider:
+        return
+    try:
+        text = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        _LAST_ERRORS[provider] = (time.monotonic(), _sanitize_reason(text))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def last_error_of(provider: str, *, now: float | None = None) -> str:
+    """取最近一次上游错误摘要（过期或未记录返回空串）。"""
+    item = _LAST_ERRORS.get(provider)
+    if item is None:
+        return ""
+    ts, text = item
+    if (now if now is not None else time.monotonic()) - ts > LAST_ERROR_TTL_SECONDS:
+        return ""
+    return text
+
+
+def clear_last_error(provider: str = "") -> None:
+    """测试/管理员重置用：清掉（指定 provider 的）最近上游错误。"""
+    if provider:
+        _LAST_ERRORS.pop(provider, None)
+    else:
+        _LAST_ERRORS.clear()
 
 
 def _key_id(provider: str, key: str) -> str:

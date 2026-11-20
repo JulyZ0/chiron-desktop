@@ -85,6 +85,95 @@ def is_quota_exhausted(exc: BaseException) -> bool:
     return any(marker in text for marker in _QUOTA_MARKERS)
 
 
+#: 「模型不在套餐 / 不存在」的文案标记（大小写不敏感）。
+#:
+#: **实测现场**（2026-11，子 Agent 全部 failed）：
+#: `400 claude-sonnet-4-20250514 isn't included in OpenCode Go. See the models it
+#: includes at https://opencode.ai/console/go.` —— 这条是**确定性**的配置错：
+#: 换 key、换时间、重试一万次都是同一个结果。把它当成"瞬时错误"处理的代价是
+#: 密钥被冷却（之后报 `no_usable_key`，真实原因被掩盖）+ 每个请求都白打一次上游。
+_NOT_INCLUDED_MARKERS: tuple[str, ...] = (
+    "isn't included in",
+    "is not included in",
+    "not included in",
+    "isn't available in",
+    "is not available in",
+    "not available in your plan",
+    "not available on your plan",
+    "isn't supported by this plan",
+)
+
+#: 「模型不存在 / 名字非法」的文案标记。
+_MODEL_NOT_FOUND_MARKERS: tuple[str, ...] = (
+    "model_not_found",
+    "model not found",
+    "no such model",
+    "unknown model",
+    "invalid model",
+    "unsupported model",
+    "model does not exist",
+    "model not supported",
+    "model is not supported",
+    "does not exist or you do not have access",
+)
+
+
+def status_of(exc: BaseException) -> int | None:
+    """从异常里取 HTTP 状态码（各家 SDK 字段名不同，逐级尝试）。
+
+    与 `app.gateway.key_retry._status_of` 同一口径，这里公开出来供错误分类复用
+    （两处各写一份判断会漂移）。
+    """
+    for attr in ("status_code", "http_status", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int):
+            return value
+    response = getattr(exc, "response", None)
+    code = getattr(response, "status_code", None)
+    if isinstance(code, int):
+        return code
+    return None
+
+
+def is_model_unavailable(exc: BaseException) -> bool:
+    """是否"这个模型在当前 provider 上根本不可用"（不在套餐内 / 不存在）。
+
+    这类错误**必须**与限流、鉴权、上游抖动分开：
+    * 换 key 无用（同一账号的套餐）；
+    * 重试无用（同一份配置）；
+    * 冷却密钥是有害的 —— 它会让下一次请求直接报 `no_usable_key`，把真实原因埋掉。
+
+    判定以文案为主、状态码为辅：OpenCode 用 400，OpenAI 用 404 `model_not_found`，
+    各家不统一；但只要文案命中"not included / model not found"就是确定性的。
+    """
+    status = status_of(exc)
+    if status is not None and status not in (400, 403, 404, 422):
+        # 403 也算进来：部分网关用 403 + "not available in your plan" 表达订阅范围。
+        return False
+    text = _flatten(exc).lower()
+    return any(m in text for m in _NOT_INCLUDED_MARKERS) or any(
+        m in text for m in _MODEL_NOT_FOUND_MARKERS
+    )
+
+
+#: 确定性 4xx：请求本身错了，换 key / 重试都不会变好（不冷却密钥、不重试、
+#: 也不该记成 provider 故障 —— 它不说明这个 provider 坏了）。
+#: 刻意**不含** 409（部分厂商用它表达冲突/重放，`key_retry` 里按可换 key 处理）。
+_DETERMINISTIC_STATUS: frozenset[int] = frozenset({400, 404, 405, 413, 422})
+
+
+def is_deterministic_client_error(exc: BaseException) -> bool:
+    """是否是"重试没有意义"的确定性客户端错误（400/404/405/413/422 或模型不可用）。
+
+    配额耗尽（402 / insufficient_quota）虽也不该重试，但它归 `is_quota_exhausted`
+    管（文案与处置不同），这里不重复归类。
+    """
+    if is_model_unavailable(exc):
+        return True
+    status = status_of(exc)
+    return status in _DETERMINISTIC_STATUS
+
+
 def _flatten(exc: BaseException) -> str:
     """把异常压成一段可搜索的文本（含嵌套错误体与 cause 链）。
 

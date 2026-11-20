@@ -303,6 +303,32 @@ def _parent_trace_context() -> tuple[str, str]:
         return "", ""
 
 
+def _parent_llm_config() -> dict[str, str]:
+    """父 run 本轮实际使用的 `{model, provider}`（取不到时为空 dict）。
+
+    来源是 `AgentRuntime.run` 在解析完 `llm_config` 后写进**工具上下文**的两个键
+    （`llm_model` / `llm_provider`），因此这里读到的是"真正发给上游的那个模型"，
+    而不是 Profile 里可能为空的配置。背景委派靠 contextvar 复制在 `create_task`
+    时拿到同一份值（见 `app/tools/context.py` 的 set/get 语义）。
+
+    任何异常都返回空 dict：继承是**增强**，取不到就退回既有行为（默认模型），
+    绝不能让"取模型"这一步把委派搞失败。
+    """
+    try:
+        from app.tools.context import get_tool_context
+
+        model = str(get_tool_context("llm_model", "") or "").strip()
+        provider = str(get_tool_context("llm_provider", "") or "").strip()
+        out: dict[str, str] = {}
+        if model:
+            out["model"] = model
+        if provider:
+            out["provider"] = provider
+        return out
+    except Exception:  # noqa: BLE001 - 继承失败退回默认模型
+        return {}
+
+
 async def _record_delegation_span(
     *,
     tenant_id: Any,
@@ -741,6 +767,22 @@ class SubAgentRunner:
         from app.agent.runtime import AgentRuntime, AgentTask
 
         system_prompt = (spec.system_prompt if spec else "") or expert_prompt
+        # 模型 / provider 的继承（P0 缺陷修复）：父 run 在工具上下文里写下"本轮实际使用的
+        # 模型与 provider"（runtime 解析完 llm_config 后写入），子 Agent 默认继承它们。
+        #
+        # 此前这里只有 `spec.llm_config()`（Profile 未配模型时为空）⇒ 子 Agent 用
+        # `settings.default_model` 且**没有 provider**，与主 Agent 会话选的模型/供应商脱钩：
+        # 实测子 Agent 的 `claude-sonnet-4-…` 被路由到唯一配了 key 的订阅网关 OpenCode Go
+        # （套餐不含它）→ 400，全部 failed，而主 Agent 一切正常。
+        # 优先级：Profile 显式配置 > 父 run 实际值（子 Agent 不该无条件换模型）。
+        inherited_llm = _parent_llm_config()
+        child_llm: dict[str, Any] = {
+            k: v for k, v in inherited_llm.items() if str(v or "").strip()
+        }
+        if spec:
+            child_llm |= {k: v for k, v in spec.llm_config().items() if str(v or "").strip()}
+        if mode:
+            child_llm["mode"] = mode
         child = AgentTask(
             id=f"sub_{run_id}",
             tenant_id=self._tenant_id,
@@ -748,7 +790,7 @@ class SubAgentRunner:
             session_id=f"sub:{self._parent_session_id}:{run_id}",
             content=task,
             system_prompt=system_prompt,
-            llm_config=(spec.llm_config() if spec else {}) | ({"mode": mode} if mode else {}),
+            llm_config=child_llm,
             max_turns=max(1, min(max_turns or (spec.max_turns if spec else 5), 10)),
             subagent_depth=child_depth,
         )
@@ -1225,6 +1267,22 @@ class SubAgentRunner:
             status = "failed"
             errors.append(f"{type(exc).__name__}: {exc}")
             logger.warning("subagent run %s failed: %s", run_id, exc)
+            # 事件 > 无语：这条异常此前只进 DB 的 error 列，屏幕上什么都没有 ——
+            # 用户只看到"failed + 还没有摘要"。发一条 notice（脱敏截断），
+            # 让失败原因在**事件流里当场**可见（终态的 summary 也带同一条，见下方）。
+            if sink is not None:
+                from app.subagent.reporting import sanitize_failure
+
+                reason = sanitize_failure(f"{type(exc).__name__}: {exc}")
+                if reason:
+                    sink.emit_progress(
+                        run_id=run_id,
+                        channel=EV_NOTICE,
+                        content=reason,
+                        parent_run_id=parent_run_id,
+                        depth=child_depth,
+                        profile=profile_name,
+                    )
         finally:
             # R2：先释放写槽。放在 finally 的**第一句**是为了让"任何**退出路径**都释放"
             # 成为结构上的必然（含取消、异常、正常收尾）。release 幂等。
@@ -1250,6 +1308,16 @@ class SubAgentRunner:
 
         # 5) L1 摘要 + 落库收尾
         summary = await self._summarise(task, raw_output)
+        # 失败/部分完成时**必须**有一条可读摘要（见 reporting.failure_summary）：
+        # 空输出 ⇒ 提取式摘要为空 ⇒ 前端卡片只剩"还没有摘要"，而真实原因躺在 error 列里
+        # （卡片不读）⇒ 用户完全不知道"为什么 failed"。上游错误在这里进 summary，
+        # 同时也会随 `<subagent-reports>` 回到父会话，不再是"一条空结论"。
+        if status in ("failed", "partial"):
+            from app.subagent.reporting import failure_summary
+
+            note = failure_summary(status, errors)
+            if note:
+                summary = f"{summary}\n\n{note}" if summary else note
         # R1：把**宿主**观测到的证据附在摘要之后。摘要会被送回父上下文 —— 父该看到可核实的事实，
         # 而不只是子 Agent 的自述。只读承诺被打破时会显式标违规（见 receipts 模块）。
         if _receipts_on:
