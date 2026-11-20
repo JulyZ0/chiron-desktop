@@ -417,6 +417,12 @@ func NewGatewayRouter(
 	// 用量分摊（计费页）：`usage_events` 是计费域删除后唯一还在写的用量事实源。
 	// 此前这条路由从未注册，前端每进一次计费页就 404 —— 页面只剩一句加载失败。
 	mux.Handle("GET /v1/billing/usage", authMW(rlMW(http.HandlerFunc(GetUsage))))
+	// 会话/模型/按天明细 CSV 导出（P1-7）：登录用户只能导出**本人**的行
+	// （handler 内部按 claims.UserID 过滤，不接受 user_id 参数）。
+	mux.Handle("GET /v1/billing/usage/export.csv", authMW(rlMW(http.HandlerFunc(ExportUsageCSV))))
+	// provider 归属回填（P1-7）：`dry_run` 缺省为 true，只有显式传 false 才写库。
+	// 只写 provider 列，不碰 token / cost_cents（见 billing_provider_backfill.go）。
+	mux.Handle("POST /v1/billing/backfill-provider", authMW(rlMW(http.HandlerFunc(BackfillUsageProvider))))
 	// 价格一览表：多源交叉验证后的参考价（**不参与计费**，见 billing_prices.go 注释）。
 	mux.Handle("GET /v1/billing/prices", authMW(rlMW(http.HandlerFunc(ListModelPrices))))
 	// dispatch 保留 Python 代理（agent 工具链内部调用，非页面主链路）
