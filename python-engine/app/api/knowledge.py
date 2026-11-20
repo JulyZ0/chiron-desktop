@@ -103,14 +103,22 @@ class BuildBody(BaseModel):
 
 
 #: 重建范围。``failed`` = 只重试失败的文档（默认，"修一下"是绝大多数场景）；
-#: ``all`` = 全库重建（换索引模型/升级 pageindex 后用）。
+#: ``all`` = 全库重建（换索引模型/升级 pageindex 后用）；
+#: ``doc`` = 只重试**某一篇**文档（进度卡片里那行"重试本文件"）。
 REINDEX_SCOPE_FAILED = "failed"
 REINDEX_SCOPE_ALL = "all"
-REINDEX_SCOPES: tuple[str, ...] = (REINDEX_SCOPE_FAILED, REINDEX_SCOPE_ALL)
+REINDEX_SCOPE_DOC = "doc"
+REINDEX_SCOPES: tuple[str, ...] = (
+    REINDEX_SCOPE_FAILED,
+    REINDEX_SCOPE_ALL,
+    REINDEX_SCOPE_DOC,
+)
 
 
 class ReindexBody(BaseModel):
     scope: str = REINDEX_SCOPE_FAILED
+    #: ``scope='doc'`` 时必填：只把这一篇重置为 pending 后投递**增量**任务。
+    doc_id: str = ""
 
 
 class KBQuery(BaseModel):
@@ -905,8 +913,15 @@ async def reindex_knowledge_base(
     user_id: str,
     tenant_id: int = 0,
     scope: str = REINDEX_SCOPE_FAILED,
+    doc_id: str = "",
 ) -> dict[str, Any]:
-    """重新提交索引：``failed`` = 只重试失败文档，``all`` = 全库重建。
+    """重新提交索引：``failed`` = 只重试失败文档，``all`` = 全库重建，
+    ``doc`` = 只重试 ``doc_id`` 那一篇。
+
+    **单文档重试不新建索引路径**：把这一篇重置成 ``pending``，再投递**增量**任务
+    （``force=False``）——worker 的增量模式本来就只取 ``status <> 'ready'`` 的文档，
+    所以重跑的自然就只有这一篇。这样既不动 pageindex 的索引实现，也不会因为
+    "单文件坏了"就重跑整库、把索引费用翻几倍。
 
     ## 幂等
 
@@ -923,6 +938,10 @@ async def reindex_knowledge_base(
     """
     if scope not in REINDEX_SCOPES:
         raise HTTPException(status_code=400, detail=f"scope must be one of {REINDEX_SCOPES}")
+    doc_id = (doc_id or "").strip()
+    if scope == REINDEX_SCOPE_DOC and not doc_id:
+        # 空 doc_id 会退化成"整库增量"——那与用户点的"重试本文件"不是一件事
+        raise HTTPException(status_code=400, detail="scope=doc requires doc_id")
 
     pool = get_pool()
     kb = await pool.fetchrow(
@@ -945,6 +964,19 @@ async def reindex_knowledge_base(
         raise HTTPException(
             status_code=400, detail="cannot reindex knowledge base with no documents"
         )
+    if scope == REINDEX_SCOPE_DOC:
+        # 必须先确认这篇属于**这个库**：只按 doc_id 更新的话，越权者能借任意库的
+        # 重建端点重置别人库里的文档（幂等更新看起来"成功"，实际是跨库写入）。
+        target = await pool.fetchrow(
+            """SELECT id FROM knowledge_documents
+                WHERE id = $1 AND knowledge_base_id = $2""",
+            doc_id,
+            kb_id,
+        )
+        if target is None:
+            raise HTTPException(
+                status_code=404, detail="document not found in this knowledge base"
+            )
     await _assert_provider_matches(user_id=str(user_id), kb_provider=str(kb["provider"]))
     await _resolve_provider_or_error(user_id=str(user_id))
 
@@ -993,6 +1025,17 @@ async def reindex_knowledge_base(
                     WHERE knowledge_base_id = $1 AND status = 'error'""",
                 kb_id,
             )
+        elif scope == REINDEX_SCOPE_DOC:
+            # 只重置这一篇（含已 ready 的：用户可能就是想让某个文件换个索引结果）。
+            # 同时清掉 pageindex_doc_id 之外的一切提示字段 —— 旧错误消息会跟着进度卡片
+            # 一起留在界面上，而它描述的已经是上一次尝试。
+            await pool.execute(
+                """UPDATE knowledge_documents
+                      SET status = 'pending', error_message = NULL, updated_at = NOW()
+                    WHERE id = $1 AND knowledge_base_id = $2""",
+                doc_id,
+                kb_id,
+            )
         await pool.execute(
             """UPDATE knowledge_bases
                   SET status = $2, error_message = NULL, updated_at = NOW()
@@ -1019,17 +1062,29 @@ async def reindex_knowledge_base(
         await _release_reindex_lock(kb_id, redis)
 
     logger.info(
-        "reindex enqueued kb=%s scope=%s task=%s failed=%d", kb_id, scope, task_id, failed_count
+        "reindex enqueued kb=%s scope=%s doc=%s task=%s failed=%d",
+        kb_id,
+        scope,
+        doc_id,
+        task_id,
+        failed_count,
     )
+    if scope == REINDEX_SCOPE_ALL:
+        count = int(kb["document_count"] or 0)
+    elif scope == REINDEX_SCOPE_DOC:
+        count = 1
+    else:
+        count = max(failed_count, 0)
     return {
         "status": kb_status.STATUS_INDEXING,
         "enqueued": True,
         "scope": scope,
-        # 本次实际会重跑的文档数（all = 全部，failed = 失败数 + 未就绪数）
-        "count": (kb["document_count"] or 0) if scope == REINDEX_SCOPE_ALL else max(failed_count, 0),
+        # 本次实际会重跑的文档数（all = 全部，failed = 失败数，doc = 1）
+        "count": count,
         "not_ready": not_ready,
         "task_id": task_id,
         "provider": kb["provider"],
+        **({"doc_id": doc_id} if scope == REINDEX_SCOPE_DOC else {}),
     }
 
 
@@ -1497,7 +1552,7 @@ async def reindex_kb(
     user_id: str = Query("", alias="user_id"),
     tenant_id: int = Query(0, alias="tenant_id"),
 ) -> dict[str, Any]:
-    """重新提交索引（失败文档 / 全库），幂等且同库并发 1。"""
+    """重新提交索引（失败文档 / 全部 / 单篇），幂等且同库并发 1。"""
     if not user_id:
         raise HTTPException(status_code=401, detail="user_id required")
     return await reindex_knowledge_base(
@@ -1505,6 +1560,7 @@ async def reindex_kb(
         user_id=user_id,
         tenant_id=tenant_id,
         scope=(body.scope if body else REINDEX_SCOPE_FAILED),
+        doc_id=(body.doc_id if body else ""),
     )
 
 

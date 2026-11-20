@@ -328,8 +328,13 @@ export interface KbIndexStatus {
   failed_documents: KbIndexDocument[]
 }
 
-/** 重建范围：只重试失败文档 / 全库重建。 */
-export type KbReindexScope = 'failed' | 'all'
+/**
+ * 重建范围：只重试失败文档 / 全库重建 / 只重试某一篇。
+ *
+ * `doc` 是进度卡片里"重试本文件"用的：后端只把这一篇重置为 pending 再投递**增量**
+ * 任务，其余已就绪的文档不会被重跑（不因为一篇坏文件就把整库索引费用翻倍）。
+ */
+export type KbReindexScope = 'failed' | 'all' | 'doc'
 
 export interface KbReindexResult {
   status: string
@@ -339,6 +344,8 @@ export interface KbReindexResult {
   reason?: string
   count: number
   task_id: string
+  /** `scope='doc'` 时回显被重试的文档 id（便于调用方在列表里高亮该行）。 */
+  doc_id?: string
 }
 
 /** 索引进度（只读）。 */
@@ -348,15 +355,19 @@ export async function getKnowledgeIndexStatus(kbId: string): Promise<KbIndexStat
 }
 
 /**
- * 重新提交索引：`failed`（默认）只重试失败文档，`all` 全库重建。
+ * 重新提交索引：`failed`（默认）只重试失败文档，`all` 全库重建，
+ * `doc` 只重试 `docId` 那一篇（必传，否则后端 400 —— 空 id 会退化成整库增量）。
  *
  * 幂等：库正在索引时后端直接回当前状态（`enqueued: false`），不会重复花 LLM 费用。
  */
 export async function reindexKnowledgeBase(
   kbId: string,
   scope: KbReindexScope = 'failed',
+  docId?: string,
 ): Promise<KbReindexResult> {
-  const resp = await api.post(`/v1/kb/${kbId}/reindex`, { scope })
+  const body: { scope: KbReindexScope; doc_id?: string } = { scope }
+  if (scope === 'doc' && docId) body.doc_id = docId
+  const resp = await api.post(`/v1/kb/${kbId}/reindex`, body)
   return unwrap<KbReindexResult>(resp)
 }
 
