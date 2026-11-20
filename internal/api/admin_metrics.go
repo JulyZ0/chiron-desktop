@@ -196,6 +196,9 @@ type streamGroups struct {
 	Pending   int64 // 已投递但未 ACK
 	Lag       int64 // 未投递积压
 	Consumers int
+	// LastDeliveredID 是**最慢消费者组**的 last-delivered-id（多组取最小），
+	// 供"最老未投递任务"换算等待时长使用。空串表示没读到。
+	LastDeliveredID string
 }
 
 // readStreamGroups 通过 XINFO GROUPS 汇总消费者组信息（不硬编码 group 名）。

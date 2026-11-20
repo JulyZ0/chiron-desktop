@@ -252,6 +252,177 @@ export async function getPerformance(): Promise<PerformanceStats> {
   return data.data
 }
 
+// ── 运行时监控（性能 / 队列 / 缓存统一数据源）──
+
+/**
+ * 一次取全三个面板。`window` 决定请求统计的时间窗（5m/15m/60m），
+ * 后端按同一窗口计算 samples / error_rate / P50/P95/P99。
+ */
+export async function getMonitorOverview(window: MonitorWindow = '15m'): Promise<MonitorOverview> {
+  const { data } = await api.get('/v1/admin/monitor/overview', { params: { window } })
+  return data.data
+}
+
+// ── 运行时监控（统一数据源）──
+//
+// 与 GET /v1/admin/monitor/overview 一一对应。所有"可能采不到"的数值都是
+// `number | null`：null 表示**未知**（PG/Redis/引擎不可达或没有样本），
+// 界面必须显示「—」，不能 `?? 0` —— 0 会被读成"确实是零"。
+
+export type MonitorWindow = '5m' | '15m' | '60m'
+export type MonitorSectionStatus = 'ok' | 'partial' | 'unavailable'
+
+export interface MonitorComponentError {
+  component: string
+  message: string
+}
+
+export interface MonitorSectionMeta {
+  generated_at: string
+  status: MonitorSectionStatus
+  sources: string[]
+  errors: MonitorComponentError[]
+}
+
+export interface MonitorBucket {
+  at: string
+  count: number
+  errors: number
+  p95_ms: number
+  avg_ms: number
+}
+
+export interface MonitorRequestStats {
+  has_samples: boolean
+  samples: number
+  success: number
+  client_errors: number
+  server_errors: number
+  error_rate_percent: number
+  p50_ms: number | null
+  p95_ms: number | null
+  p99_ms: number | null
+  max_ms: number | null
+  note?: string
+  buckets: MonitorBucket[]
+}
+
+export interface MonitorDBPool {
+  total_conns: number
+  idle_conns: number
+  acquired_conns: number
+  max_conns: number
+  constructing_conns: number
+  empty_acquire_count: number
+  acquire_duration_ms: number
+  utilization_percent: number
+  source: string
+}
+
+export interface MonitorGoRuntime {
+  goroutines: number
+  heap_alloc_mb: number
+  heap_sys_mb: number
+  heap_inuse_mb: number
+  gc_runs: number
+  gomaxprocs: number
+  cpu_percent: number
+  uptime_seconds: number
+  source: string
+  cpu_note: string
+}
+
+export interface MonitorEngineProcess {
+  configured: boolean
+  reachable: boolean
+  instances: number
+  version: string
+  uptime_seconds: number
+  memory_mb: number
+  cpu_percent: number
+  active_tasks: number
+  source: string
+  cpu_note: string
+}
+
+export interface MonitorPerformance extends MonitorSectionMeta {
+  window_seconds: number
+  window: string
+  requests: MonitorRequestStats
+  db_pool: MonitorDBPool | null
+  go_runtime: MonitorGoRuntime
+  engine: MonitorEngineProcess | null
+  redis_latency_ms: number | null
+  db_latency_ms: number | null
+}
+
+export interface MonitorStreamStats {
+  name: string
+  key: string
+  depth: number | null
+  pending: number | null
+  lag: number | null
+  groups: number | null
+  consumers: number | null
+  dlq_depth: number | null
+  oldest_wait_seconds: number | null
+  oldest_task_at?: string
+  source: string
+}
+
+export interface MonitorRunCounts {
+  active: number | null
+  awaiting_input: number | null
+  failed_last_hour: number | null
+  timeout_last_hour: number | null
+  run_leases: number | null
+  source: string
+}
+
+export interface MonitorQueue extends MonitorSectionMeta {
+  streams: MonitorStreamStats[]
+  run_state: MonitorRunCounts | null
+}
+
+export interface MonitorRedisCache {
+  used_memory_mb: number | null
+  max_memory_mb: number | null
+  hit_rate_percent: number | null
+  keyspace_hits: number | null
+  keyspace_misses: number | null
+  keys: number | null
+  keys_with_ttl: number | null
+  avg_ttl_ms: number | null
+  evicted_keys: number | null
+  expired_keys: number | null
+  maxmemory_policy: string
+  source: string
+}
+
+export interface MonitorLLMCache {
+  l1_hits: number
+  l2_hits: number
+  l3_hits: number
+  misses: number
+  hit_rate_percent: number
+  source: string
+}
+
+export interface MonitorCache extends MonitorSectionMeta {
+  redis: MonitorRedisCache | null
+  llm: MonitorLLMCache | null
+}
+
+export interface MonitorOverview {
+  generated_at: string
+  window_seconds: number
+  window: MonitorWindow
+  partial: boolean
+  performance: MonitorPerformance
+  queue: MonitorQueue
+  cache: MonitorCache
+}
+
 // ── API Keys ──
 
 export async function listApiKeys(): Promise<ApiKey[]> {
