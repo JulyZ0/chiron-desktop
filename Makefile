@@ -82,6 +82,18 @@ smoke:
 smoke-fast:
 	bash scripts/ci-smoke.sh --fast
 
+# ── 集成测试带（P0-2）──
+# `integration` 需要 docker compose：起 PG/Redis/网关/引擎/pageindex/假 LLM，
+# 跑 submit → usage → checkpoint/回滚 → 匿名分享 → @知识库 → deps → 隔离档。
+# 缺 docker / 守护进程未启动时脚本以 77 退出（"环境不具备"，不是失败）。
+# `integration-static` 不需要 docker：校验 compose 结构、run.sh 语法与关键断言、
+# JWT 自签与假 LLM 的流式形状（唯一能在本机离线跑的部分）。
+integration:
+	bash scripts/integration/run.sh
+
+integration-static:
+	python scripts/integration/test_assets.py
+
 check-all: check check-py check-web
 	@echo "check-all: OK"
 
@@ -94,5 +106,6 @@ docker-run:
 
 .PHONY: all build run clean test lint fmt dev dev-up dev-up-scale dev-down \
 	docs-check check-go check check-py check-web check-all smoke smoke-fast \
+	integration integration-static \
 	docker-build docker-run
 

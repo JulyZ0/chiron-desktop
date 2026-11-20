@@ -1,0 +1,44 @@
+# Dockerfile.gateway —— 集成测试用的 Go 网关镜像（仅此用途，不是发布镜像）。
+#
+# 与 `make build` 的差别只有两点：
+#   1. 运行时带 `git`：项目 VCS 初始化与检查点回滚都要调 git（见
+#      internal/api/project_vcs.go、python-engine/app/agent/git_checkpoint.py）；
+#   2. 带 `curl`：compose healthcheck 用它打 /health。
+#
+# 构建上下文必须是**仓库根**（compose 里 context: .），因为要 `go build ./cmd/chiron`。
+# 根目录的 .dockerignore 把 frontend-vue/node_modules 等排除在外。
+
+FROM golang:1.26-alpine AS build
+
+WORKDIR /src
+
+# 依赖层单独缓存：只改 Go 代码时不必重新下载模块。
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 go build -mod=mod -ldflags="-s -w" -o /out/chiron ./cmd/chiron
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates git curl tzdata \
+    && adduser -D -u 1000 chiron \
+    && mkdir -p /app /data /srv/chiron/projects /srv/chiron/checkpoints /srv/chiron/sandbox \
+    && chown -R chiron:chiron /data /srv/chiron /app
+
+WORKDIR /app
+
+COPY --from=build /out/chiron /app/chiron
+COPY migrations /app/migrations
+COPY scripts/integration/gateway-entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# 项目根目录在**两个容器里必须是同一个绝对路径**：网关按它建项目/跑 git，
+# 引擎按它建检查点/回滚。compose 把同一个 named volume 挂到两边的 /srv/chiron/projects。
+USER chiron
+
+EXPOSE 8080
+
+# 网关自己不做迁移（只校验 alembic_version），迁移由 migrate 服务先行完成。
+ENTRYPOINT ["/app/entrypoint.sh"]
