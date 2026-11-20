@@ -20,6 +20,9 @@ const net = vi.hoisted(() => ({
   listCalls: [] as Array<{ projectId: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }>,
   restoreCalls: [] as Array<{ id: string; options: Record<string, unknown> }>,
   restoreResult: {} as Record<string, unknown>,
+  previewCalls: [] as Array<{ id: string; resolve: (v: unknown) => void; reject: (e: unknown) => void }>,
+  gcCalls: [] as Array<{ options: Record<string, unknown> }>,
+  gcResult: {} as Record<string, unknown>,
 }))
 
 vi.mock('../../../api/checkpoints', () => ({
@@ -30,6 +33,14 @@ vi.mock('../../../api/checkpoints', () => ({
   restoreCheckpoint: (id: string, options: Record<string, unknown> = {}) => {
     net.restoreCalls.push({ id, options })
     return Promise.resolve(net.restoreResult)
+  },
+  previewCheckpointDiff: (id: string) =>
+    new Promise((resolve, reject) => {
+      net.previewCalls.push({ id, resolve, reject })
+    }),
+  runCheckpointGc: (options: Record<string, unknown> = {}) => {
+    net.gcCalls.push({ options })
+    return Promise.resolve(net.gcResult)
   },
 }))
 
@@ -82,10 +93,26 @@ function okResult(over: Record<string, unknown> = {}) {
   }
 }
 
+function diffResult(over: Record<string, unknown> = {}) {
+  return {
+    restored: [],
+    added: [],
+    removed: [],
+    protected_removed: [],
+    unsupported: [],
+    untracked_omitted: false,
+    stats: { sample_count: 0, avg_file_count: 0, avg_byte_size: 0, window_days: 30 },
+    ...over,
+  }
+}
+
 beforeEach(() => {
   net.listCalls.length = 0
   net.restoreCalls.length = 0
   net.restoreResult = okResult()
+  net.previewCalls.length = 0
+  net.gcCalls.length = 0
+  net.gcResult = {}
 })
 
 describe('还原点时间线', () => {
@@ -99,7 +126,7 @@ describe('还原点时间线', () => {
     net.restoreResult = okResult({ skipped_removed: ['new.ts'] })
     const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
     await flush()
-    net.listCalls[0].resolve([cp()])
+    net.listCalls[0].resolve({ checkpoints: [cp()], stats: null })
     await flush()
 
     await wrapper.find('.cp-btn-primary').trigger('click')
@@ -115,7 +142,7 @@ describe('还原点时间线', () => {
   it('state 非 ok 的点禁用回滚，且点下去不发请求', async () => {
     const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
     await flush()
-    net.listCalls[0].resolve([cp({ state: 'failed', error_code: 'cas_write_failed' })])
+    net.listCalls[0].resolve({ checkpoints: [cp({ state: 'failed', error_code: 'cas_write_failed' })], stats: null })
     await flush()
 
     const btn = wrapper.find('.cp-btn-primary')
@@ -137,11 +164,11 @@ describe('还原点时间线', () => {
     expect(net.listCalls).toHaveLength(2)
 
     // p1 的响应现在才回来：属于上一次的时间线，必须丢弃
-    net.listCalls[0].resolve([cp({ id: 'stale', label: 'STALE_FROM_P1' })])
+    net.listCalls[0].resolve({ checkpoints: [cp({ id: 'stale', label: 'STALE_FROM_P1' })], stats: null })
     await flush()
     expect(wrapper.text()).not.toContain('STALE_FROM_P1')
 
-    net.listCalls[1].resolve([cp({ id: 'fresh', label: 'FRESH_FROM_P2' })])
+    net.listCalls[1].resolve({ checkpoints: [cp({ id: 'fresh', label: 'FRESH_FROM_P2' })], stats: null })
     await flush()
     expect(wrapper.text()).toContain('FRESH_FROM_P2')
   })
@@ -153,7 +180,7 @@ describe('还原点时间线', () => {
     })
     const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
     await flush()
-    net.listCalls[0].resolve([cp()])
+    net.listCalls[0].resolve({ checkpoints: [cp()], stats: null })
     await flush()
 
     await wrapper.find('.cp-btn-primary').trigger('click')
@@ -168,7 +195,7 @@ describe('还原点时间线', () => {
     net.restoreResult = okResult({ skipped_removed: ['new-a.ts', 'new-b.ts'] })
     const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
     await flush()
-    net.listCalls[0].resolve([cp()])
+    net.listCalls[0].resolve({ checkpoints: [cp()], stats: null })
     await flush()
 
     await wrapper.find('.cp-btn-primary').trigger('click')
@@ -188,6 +215,128 @@ describe('还原点时间线', () => {
     // 只删这些路径：不带 paths 会让引擎按全量 diff 重算，把刚恢复的文件也纳入
     expect(second.options.allowDelete).toBe(true)
     expect(second.options.paths).toEqual(['new-a.ts', 'new-b.ts'])
+  })
+
+  it('预览差异列出路径清单与计数，且不触发回滚', async () => {
+    const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
+    await flush()
+    net.listCalls[0].resolve({ checkpoints: [cp()], stats: null })
+    await flush()
+
+    const previewBtn = wrapper.findAll('.cp-btn').find(b => b.text().includes('预览差异'))
+    expect(previewBtn, '每个点都应有预览入口').toBeTruthy()
+    await previewBtn!.trigger('click')
+    await flush()
+
+    expect(net.previewCalls).toHaveLength(1)
+    expect(net.previewCalls[0].id).toBe('cp-1')
+    net.previewCalls[0].resolve(diffResult({
+      restored: ['src/a.ts'],
+      removed: ['draft.md'],
+      protected_removed: ['.env'],
+      stats: { sample_count: 4, avg_file_count: 12, avg_byte_size: 2048, window_days: 30 },
+    }))
+    await flush()
+
+    // 路径清单与每栏计数都要能读出来
+    expect(wrapper.text()).toContain('src/a.ts')
+    expect(wrapper.text()).toContain('draft.md')
+    expect(wrapper.text()).toContain('.env')
+    expect(wrapper.find('.cp-preview').exists()).toBe(true)
+    // 预览是只读的：绝不能顺手发一个回滚请求
+    expect(net.restoreCalls).toHaveLength(0)
+  })
+
+  it('清单读不到时预览必须说明只覆盖 git 跟踪的文件', async () => {
+    const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
+    await flush()
+    net.listCalls[0].resolve({ checkpoints: [cp()], stats: null })
+    await flush()
+
+    const previewBtn = wrapper.findAll('.cp-btn').find(b => b.text().includes('预览差异'))
+    await previewBtn!.trigger('click')
+    await flush()
+    net.previewCalls[0].resolve(diffResult({ untracked_omitted: true }))
+    await flush()
+
+    expect(wrapper.text()).toContain('未跟踪文件清单读不到')
+  })
+
+  it('预览失败就地报错，而不是显示"没有差异"', async () => {
+    const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
+    await flush()
+    net.listCalls[0].resolve({ checkpoints: [cp()], stats: null })
+    await flush()
+
+    const previewBtn = wrapper.findAll('.cp-btn').find(b => b.text().includes('预览差异'))
+    await previewBtn!.trigger('click')
+    await flush()
+    net.previewCalls[0].reject(new Error('commit not found'))
+    await flush()
+
+    expect(wrapper.find('.cp-preview.is-bad').exists()).toBe(true)
+    expect(wrapper.text()).toContain('预览失败')
+    // 关键：失败**不能**退化成"没有差异"
+    expect(wrapper.text()).not.toContain('没有差异')
+  })
+
+  it('state 非 ok 的点预览按钮禁用且点不出请求', async () => {
+    const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
+    await flush()
+    net.listCalls[0].resolve({ checkpoints: [cp({ state: 'failed' })], stats: null })
+    await flush()
+
+    const previewBtn = wrapper.findAll('.cp-btn').find(b => b.text().includes('预览差异'))
+    expect(previewBtn!.attributes('disabled')).toBeDefined()
+    await previewBtn!.trigger('click')
+    await flush()
+    expect(net.previewCalls).toHaveLength(0)
+  })
+
+  it('管理员才看到回收入口，且先预演再确认', async () => {
+    // 非管理员：不显示按钮（权限仍由后端兜底）
+    const plain = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
+    await flush()
+    net.listCalls[0].resolve({ checkpoints: [cp()], stats: null })
+    await flush()
+    expect(plain.find('.cp-gc').exists()).toBe(false)
+
+    net.gcResult = {
+      scanned: 3, referenced: 5, deleted: 2, freed_bytes: 1024, dry_run: true,
+      retention_days: 30, planned: [], dangling_refs: [],
+      stats: { sample_count: 0, avg_file_count: 0, avg_byte_size: 0, window_days: 30 },
+    }
+    const admin = mount(CheckpointTimeline, { props: { projectId: 'p1', canAdmin: true } })
+    await flush()
+    net.listCalls[1].resolve({ checkpoints: [cp()], stats: null })
+    await flush()
+
+    const gcBtn = admin.find('.cp-gc .cp-btn')
+    expect(gcBtn.exists()).toBe(true)
+    await gcBtn.trigger('click')
+    await flush()
+
+    // 顺序不能反：**先预演**（dryRun true）拿到"会删多少"，确认之后才真删。
+    // 第一次就是 dryRun=false 的话，用户看到的数字永远只是事后统计。
+    expect(net.gcCalls).toHaveLength(2)
+    expect(net.gcCalls[0].options.dryRun).toBe(true)
+    expect(net.gcCalls[0].options.workspaceId).toBe('p1')
+    // Modal.confirm 在测试里被替换成"直接放行 onOk"，因此紧接着就是真删。
+    expect(net.gcCalls[1].options.dryRun).toBe(false)
+  })
+
+  it('头部显示近 30 天平均规模', async () => {
+    const wrapper = mount(CheckpointTimeline, { props: { projectId: 'p1' } })
+    await flush()
+    net.listCalls[0].resolve({
+      checkpoints: [cp()],
+      stats: { sample_count: 6, avg_file_count: 9, avg_byte_size: 4096, window_days: 30 },
+    })
+    await flush()
+
+    expect(wrapper.find('.cp-stats').exists()).toBe(true)
+    expect(wrapper.text()).toContain('近 30 天')
+    expect(wrapper.text()).toContain('9 个文件')
   })
 
   it('列表请求失败时就地报错，而不是显示"还没有还原点"', async () => {

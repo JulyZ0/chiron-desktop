@@ -14,6 +14,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mount } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 
 import WorkbenchPanel from '../WorkbenchPanel.vue'
 import CheckpointTimeline from '../CheckpointTimeline.vue'
@@ -46,8 +47,10 @@ vi.mock('../../../api/projectFiles', () => ({
  * 返回空列表即可：本文件要验证的是**回滚事件如何驱动文件树**，不是时间线本身。
  */
 vi.mock('../../../api/checkpoints', () => ({
-  listProjectCheckpoints: () => Promise.resolve([]),
+  listProjectCheckpoints: () => Promise.resolve({ checkpoints: [], stats: null }),
   restoreCheckpoint: () => Promise.reject(new Error('unused')),
+  previewCheckpointDiff: () => Promise.reject(new Error('unused')),
+  runCheckpointGc: () => Promise.reject(new Error('unused')),
 }))
 
 /** 让 resolve 之后串起来的微任务与 Vue 的下一次渲染跑完 */
@@ -67,7 +70,8 @@ function listing(root: string, name: string) {
  * 在没有项目时直接 return —— 测试因此不会发出任何网络请求，也不需要 mock api。
  */
 function mountPanel(props: Record<string, unknown> = {}) {
-  return mount(WorkbenchPanel, { props })
+  // 面板现在会读 auth store 来判断"是否显示管理员入口"，pinia 必须装到挂载环境里。
+  return mount(WorkbenchPanel, { props, global: { plugins: [createPinia()] } })
 }
 
 beforeEach(() => {

@@ -140,7 +140,14 @@ func (h *SessionMapHandler) ListProjectCheckpoints(w http.ResponseWriter, r *htt
 			CreatedAt:    smTimeOf(row["created_at"]),
 		})
 	}
-	OK(w, map[string]interface{}{"checkpoints": out})
+	OK(w, map[string]interface{}{
+		"checkpoints": out,
+		// 规模统计放在列表里一起返回：时间线头部要显示"当前快照多大、近 30 天
+		// 平均多大"，多一次往返会让首屏多等一个 RTT，而它只需要一条聚合查询。
+		// 查询失败只返回零值（`checkpointAverages` 内部吞掉错误）—— 统计坏掉
+		// 不该让时间线变成一条红字。
+		"stats": checkpointAverages(r.Context(), wsID),
+	})
 }
 
 // ── 检查点上报（写）──

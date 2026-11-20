@@ -37,9 +37,15 @@ import { pathKey, projectRelative } from './paths'
 import { describeApiError } from '../../utils/apiError'
 import { notify } from '../../utils/notify'
 import { desktopHost } from '../../stores/device'
+import { useAuthStore } from '../../stores/auth'
 import { revealRequest, WORKBENCH_WIDTH_KEY } from './useWorkbench'
 
 const { t: tr } = useI18n()
+
+// 「回收未引用缓存」入口只对管理员显示。**这只是可见性**：真正的权限在
+// `POST /v1/admin/checkpoints/gc`（平台 owner 写权限），前端藏按钮挡不住请求。
+const auth = useAuthStore()
+const canAdmin = computed(() => auth.isAdmin)
 
 const props = withDefaults(
   defineProps<{
@@ -981,6 +987,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
       >
         <CheckpointTimeline
           :project-id="projectId"
+          :can-admin="canAdmin"
           @restored="onCheckpointRestored"
         />
       </div>

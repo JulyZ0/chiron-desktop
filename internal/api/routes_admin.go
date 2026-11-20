@@ -50,6 +50,9 @@ func registerAdminRoutes(
 	// 新用户引导漏斗（P0-3 验收「完成率可查」）—— 只读统计，与其它 admin 读端点同口径。
 	mux.Handle("GET /v1/admin/onboarding/funnel", authMW(rlMW(adminReadMW(adminStrip))))
 	mux.Handle("POST /v1/admin/maintenance", authMW(rlMW(platformWriteMW(adminStrip))))
+	// 检查点 CAS 回收（P1-3）：删的是本机共享的未跟踪分片目录，一次操作影响
+	// 这台机器上所有项目的回滚能力 ⇒ 平台 owner 写权限。`dry_run` 缺省为 true。
+	mux.Handle("POST /v1/admin/checkpoints/gc", authMW(rlMW(platformWriteMW(http.HandlerFunc(CheckpointGcHandler(pythonClient))))))
 	mux.Handle("GET /v1/admin/kb", authMW(rlMW(adminReadMW(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if pythonClient == nil || !pythonClient.IsConnected() {
 			InternalError(w, "python engine not available")
