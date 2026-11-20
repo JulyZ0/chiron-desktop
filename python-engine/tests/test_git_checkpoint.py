@@ -634,6 +634,47 @@ def test_nested_root_does_not_contribute_other_sessions_refs(tmp_path: Path) -> 
     assert gc.next_checkpoint_seq(proj, "third-session") == 1
 
 
+def test_monorepo_snapshot_records_gitlink_without_content(tmp_path: Path) -> None:
+    """边界：工作区里有 submodule / 内嵌仓库（gitlink）时，只记指针、不记内容。
+
+    实测（本用例即样本）：父仓库里嵌一个已提交的内嵌仓库，父仓库 ``git add``
+    记下的是 ``160000`` 的 gitlink。快照里它只有**指针**（子仓库内容不在树里），
+    因此：
+
+    * ``tree_paths`` 不含它（不是普通文件），``non_regular`` 含它（项目根口径）；
+    * 回滚把它报进 ``unsupported`` —— 不是"忘了恢复"，而是**结构上无法恢复**
+      （要由用户自己 ``git submodule update``）。静默跳过才是不可接受的。
+
+    前缀裁剪也必须处理它：gitlink 在项目根子树之外时同样要被摘掉。
+    """
+    repo = _init(tmp_path / "repo")
+    lib = repo / "packages" / "foo" / "vendor" / "lib"
+    lib.mkdir(parents=True)
+    lib_self = _init(lib)
+    (lib_self / "x.py").write_bytes(b"x\n")
+    _commit_all(lib_self, "lib")
+    proj = repo / "packages" / "foo"
+    (proj / "a.py").write_bytes(b"a\n")
+    sibling = repo / "packages" / "sibling"
+    sibling.mkdir(parents=True)
+    (sibling / "s.py").write_bytes(b"s\n")
+    _commit_all(repo)
+
+    state = tmp_path / "state"
+    state.mkdir()
+    snap = gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
+
+    assert snap.tree_paths == {"a.py"}
+    assert snap.non_regular == {"vendor/lib"}
+    assert _git(repo, "ls-tree", "-r", "--name-only", snap.tree).stdout.decode().split() == [
+        "packages/foo/a.py",
+        "packages/foo/vendor/lib",
+    ]
+    result = gc.restore(proj, target=snap, store_root=state / "untracked", index_file=state / "snap.idx")
+    assert result.unsupported == ("vendor/lib",)
+    assert result.ok, result.failed
+
+
 def test_monorepo_untracked_subdir_falls_back_to_cas(tmp_path: Path) -> None:
     """子目录在父仓库里**还没有任何已跟踪文件**时：走 CAS，而不是"快照为空"。
 
