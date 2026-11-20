@@ -763,7 +763,10 @@ func (s skillMarketInstaller) Install(ctx context.Context, item market.Item, _ m
 		Skill map[string]any `json:"skill"`
 		Scope string         `json:"scope"`
 	}
-	body := map[string]any{"inline": string(item.Payload)}
+	// P1-2：把**市场来源**写进技能元数据（`market:<source>/<id>`），否则装完之后
+	// 技能列表分不清"市场装的 / 本地传的"，升级端点也找不到上游（它只对市场来源生效）。
+	origin := "market:" + item.Source + "/" + item.ID
+	body := map[string]any{"inline": string(item.Payload), "origin": origin}
 	if err := s.py.PostJSON(ctx, target, body, &resp); err != nil {
 		return nil, classifyUpstream("install skill", err)
 	}
@@ -775,6 +778,7 @@ func (s skillMarketInstaller) Install(ctx context.Context, item market.Item, _ m
 		"name":      name,
 		"scope":     firstNonEmpty(resp.Scope, "user"),
 		"market_id": item.ID,
+		"origin":    origin,
 	}, nil
 }
 

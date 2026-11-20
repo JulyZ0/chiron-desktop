@@ -44,6 +44,16 @@ interface Skill {
    * 老版本后端可能不带这个字段 —— 详情里的来源徽标对缺失值按"自定义"处理。
    */
   source?: string
+  /**
+   * P1-2 触发策略：是否每轮注入 system 上下文（后端缺省 true）。
+   * 关掉之后模型不会在技能目录里看到它，但仍可被显式 @ 或工具读取。
+   */
+  auto_inject?: boolean
+  /**
+   * P1-2 来源（与 `source`/scope 正交）：`market:<source>/<id>` / `local` / `generated` /
+   * `builtin`；老数据为空串，展示与分组都按「本地」处理。
+   */
+  origin?: string
 }
 
 const skills = ref<Skill[]>([])
@@ -135,6 +145,35 @@ function sourceKey(s: Skill): Exclude<SkillGroup, 'all'> {
   return 'custom'
 }
 
+/**
+ * P1-2 的第二个维度：**来源**（`origin`）。与上面的 scope 维度**二选一**显示 ——
+ * 两套芯片同时摆出来会让人分不清"团队共享"和"市场安装"到底哪个是主筛选。
+ * 这里选择 origin：它回答的是"这个技能怎么来的"，正好对上市场/本地/生成三种处置方式。
+ */
+type OriginGroup = 'all' | 'market' | 'local' | 'generated'
+const originFilter = ref<OriginGroup>('all')
+
+function originKey(s: Skill): Exclude<OriginGroup, 'all'> {
+  const origin = (s.origin || '').trim().toLowerCase()
+  if (origin.startsWith('market:')) return 'market'
+  if (origin === 'generated') return 'generated'
+  // local / builtin / 老数据空串 —— 都算"本地"（内置技能也是随包就有的本地资产）
+  return 'local'
+}
+
+function originLabel(s: Skill): string {
+  switch (originKey(s)) {
+    case 'market': return tr('agent.origin_market')
+    case 'generated': return tr('agent.origin_generated')
+    default: return tr('agent.origin_local')
+  }
+}
+
+/** 只有市场来源的技能才谈得上"升级"（本地/生成的没有上游） */
+function isMarketSkill(s: Skill): boolean {
+  return originKey(s) === 'market'
+}
+
 function sourceLabel(s: Skill): string {
   switch (sourceKey(s)) {
     case 'team': return tr('common.team_shared')
@@ -151,15 +190,15 @@ const selectedSkill = computed<Skill | null>(
 const detailVisible = computed(() => selectedSkillName.value !== '')
 
 const groupCounts = computed(() => {
-  const counts = { all: skills.value.length, builtin: 0, custom: 0, team: 0 }
-  for (const s of skills.value) counts[sourceKey(s)] += 1
+  const counts = { all: skills.value.length, market: 0, local: 0, generated: 0 }
+  for (const s of skills.value) counts[originKey(s)] += 1
   return counts
 })
 
 const filteredSkills = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
   return skills.value.filter((s) => {
-    if (groupFilter.value !== 'all' && sourceKey(s) !== groupFilter.value) return false
+    if (originFilter.value !== 'all' && originKey(s) !== originFilter.value) return false
     if (typeFilter.value !== 'all' && s.exec?.type !== typeFilter.value) return false
     if (!q) return true
     return (s.name || '').toLowerCase().includes(q)
@@ -184,10 +223,13 @@ const execSourceCode = computed(() => {
 
 function selectSkill(s: Skill) {
   selectedSkillName.value = s.name
+  // 换了技能就清掉上一条升级提示：否则"另一个技能已是最新"会显示在新技能详情里
+  upgradeNotice.value = null
 }
 
 function closeDetail() {
   selectedSkillName.value = ''
+  upgradeNotice.value = null
 }
 
 // ── 启停 ──
@@ -199,6 +241,74 @@ async function toggleEnabled(s: Skill, v: boolean) {
     else message.success(tr('common.name_is_disabled', { name: s.name }))
   } catch (e) {
     message.error(tr('errors.operation_failed_error', { error: serverErrorDetail(e, '') }))
+  }
+}
+
+// ── P1-2：触发策略（auto_inject）──
+//
+// 关掉之后该技能**不进每轮 system 上下文**（后端 skill catalog 过滤），但仍可被
+// 显式 @ 或工具读取。写的是**元数据**（PATCH /v1/skills/{name}/meta），不是完整的
+// 技能定义 —— 用 PUT 会把正文一起回写，生成型技能的正文可能因此被旧副本覆盖。
+const autoInjectSaving = ref('')
+
+async function toggleAutoInject(s: Skill, v: boolean) {
+  autoInjectSaving.value = s.name
+  try {
+    await api.patch(`/v1/skills/${encodeURIComponent(s.name)}/meta`, { auto_inject: v })
+    s.auto_inject = v
+    message.success(
+      v
+        ? tr('agent.auto_inject_on', { name: s.name })
+        : tr('agent.auto_inject_off', { name: s.name }),
+    )
+  } catch (e) {
+    message.error(tr('errors.operation_failed_error', { error: serverErrorDetail(e, '') }))
+  } finally {
+    autoInjectSaving.value = ''
+  }
+}
+
+// ── P1-2：检查更新 / 升级（仅市场来源）──
+const upgradeLoading = ref(false)
+/** 内联提示：升级结果就地显示，不再弹一个"成功"的 toast 然后什么也看不到 */
+const upgradeNotice = ref<{ type: 'success' | 'info' | 'warning' | 'error'; text: string } | null>(null)
+
+async function runUpgrade(s: Skill) {
+  upgradeLoading.value = true
+  upgradeNotice.value = null
+  try {
+    const resp = await api.post(`/v1/skills/${encodeURIComponent(s.name)}/upgrade`, {})
+    const d = (resp.data?.data ?? resp.data ?? {}) as {
+      upgraded?: boolean
+      reason?: string
+      from_version?: string
+      to_version?: string
+      latest_version?: string
+    }
+    if (d.upgraded) {
+      upgradeNotice.value = {
+        type: 'success',
+        text: tr('agent.upgraded_to', { from: d.from_version || s.version, to: d.to_version || '' }),
+      }
+      await loadSkills()
+      if (d.to_version) s.version = d.to_version
+    } else {
+      upgradeNotice.value = {
+        type: 'info',
+        text: tr('agent.already_latest_version', { version: d.latest_version || s.version }),
+      }
+    }
+  } catch (e) {
+    // 409 = 没有可用来源（非市场来源 / 没记下安装地址）：这是**稳定结论**，不是故障
+    const status = (e as { response?: { status?: number } })?.response?.status
+    upgradeNotice.value = {
+      type: status === 409 ? 'warning' : 'error',
+      text: status === 409
+        ? tr('agent.upgrade_no_source')
+        : tr('errors.operation_failed_error', { error: serverErrorDetail(e, '') }),
+    }
+  } finally {
+    upgradeLoading.value = false
   }
 }
 
@@ -444,9 +554,9 @@ async function installDiscovered(item: DiscoveredSkill) {
                 <button
                   type="button"
                   class="group-chip"
-                  :class="{ active: groupFilter === 'all' }"
-                  :aria-pressed="groupFilter === 'all'"
-                  @click="groupFilter = 'all'"
+                  :class="{ active: originFilter === 'all' }"
+                  :aria-pressed="originFilter === 'all'"
+                  @click="originFilter = 'all'"
                 >
                   {{ $t('agent.filter_all') }}
                   <span class="group-count">{{ groupCounts.all }}</span>
@@ -454,32 +564,32 @@ async function installDiscovered(item: DiscoveredSkill) {
                 <button
                   type="button"
                   class="group-chip"
-                  :class="{ active: groupFilter === 'builtin' }"
-                  :aria-pressed="groupFilter === 'builtin'"
-                  @click="groupFilter = 'builtin'"
+                  :class="{ active: originFilter === 'market' }"
+                  :aria-pressed="originFilter === 'market'"
+                  @click="originFilter = 'market'"
                 >
-                  {{ $t('common.built_in') }}
-                  <span class="group-count">{{ groupCounts.builtin }}</span>
+                  {{ $t('agent.origin_market') }}
+                  <span class="group-count">{{ groupCounts.market }}</span>
                 </button>
                 <button
                   type="button"
                   class="group-chip"
-                  :class="{ active: groupFilter === 'custom' }"
-                  :aria-pressed="groupFilter === 'custom'"
-                  @click="groupFilter = 'custom'"
+                  :class="{ active: originFilter === 'local' }"
+                  :aria-pressed="originFilter === 'local'"
+                  @click="originFilter = 'local'"
                 >
-                  {{ $t('common.custom') }}
-                  <span class="group-count">{{ groupCounts.custom }}</span>
+                  {{ $t('agent.origin_local') }}
+                  <span class="group-count">{{ groupCounts.local }}</span>
                 </button>
                 <button
                   type="button"
                   class="group-chip"
-                  :class="{ active: groupFilter === 'team' }"
-                  :aria-pressed="groupFilter === 'team'"
-                  @click="groupFilter = 'team'"
+                  :class="{ active: originFilter === 'generated' }"
+                  :aria-pressed="originFilter === 'generated'"
+                  @click="originFilter = 'generated'"
                 >
-                  {{ $t('common.team_shared') }}
-                  <span class="group-count">{{ groupCounts.team }}</span>
+                  {{ $t('agent.origin_generated') }}
+                  <span class="group-count">{{ groupCounts.generated }}</span>
                 </button>
               </div>
             </div>
@@ -664,6 +774,7 @@ async function installDiscovered(item: DiscoveredSkill) {
                   {{ selectedSkill.exec?.type || 'unknown' }}
                 </Tag>
                 <Tag>{{ $t('common.source') }}: {{ sourceLabel(selectedSkill) }}</Tag>
+                <Tag>{{ $t('agent.origin_label') }}: {{ originLabel(selectedSkill) }}</Tag>
                 <Tag>v{{ selectedSkill.version }}</Tag>
                 <Tag v-if="selectedSkill.parameters?.length">
                   {{ $t('agent.n_params', { n: selectedSkill.parameters.length }) }}
@@ -677,7 +788,44 @@ async function installDiscovered(item: DiscoveredSkill) {
                     @change="(v: any) => selectedSkill && toggleEnabled(selectedSkill, Boolean(v))"
                   />
                 </span>
+                <span
+                  class="detail-enable"
+                  :title="$t('agent.auto_inject_hint')"
+                >
+                  <span class="enable-label">{{ $t('agent.auto_inject') }}</span>
+                  <Switch
+                    :checked="selectedSkill.auto_inject !== false"
+                    size="small"
+                    :loading="autoInjectSaving === selectedSkill.name"
+                    :aria-label="`auto-inject-${selectedSkill.name}`"
+                    @change="(v: any) => selectedSkill && toggleAutoInject(selectedSkill, Boolean(v))"
+                  />
+                </span>
               </div>
+
+              <!-- 版本 / 升级：只有市场来源才谈得上"检查更新" -->
+              <div
+                v-if="isMarketSkill(selectedSkill)"
+                class="upgrade-row"
+              >
+                <span class="upgrade-current">
+                  {{ $t('agent.current_version', { version: selectedSkill.version }) }}
+                </span>
+                <Button
+                  size="small"
+                  :loading="upgradeLoading"
+                  @click="runUpgrade(selectedSkill)"
+                >
+                  {{ $t('agent.check_update_and_upgrade') }}
+                </Button>
+              </div>
+              <Alert
+                v-if="upgradeNotice"
+                class="upgrade-notice"
+                :type="upgradeNotice.type"
+                :message="upgradeNotice.text"
+                show-icon
+              />
 
               <div class="detail-actions-row">
                 <Button
@@ -1024,8 +1172,13 @@ async function installDiscovered(item: DiscoveredSkill) {
 .detail-sub { margin: 3px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); line-height: var(--lh-normal); }
 .detail-actions { display: flex; align-items: center; gap: 6px; }
 .detail-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
-.detail-enable { display: inline-flex; align-items: center; gap: 6px; margin-inline-start: auto; }
+.detail-enable { display: inline-flex; align-items: center; gap: 6px; }
+.detail-enable + .detail-enable { margin-inline-start: 0; }
 .enable-label { font-size: var(--fs-xs); color: var(--text-tertiary); }
+/* P1-2：版本 / 升级行与内联结果提示 */
+.upgrade-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.upgrade-current { font-size: var(--fs-xs); color: var(--text-tertiary); }
+.upgrade-notice { margin-top: 8px; }
 .detail-actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .detail-usage { margin-inline-start: auto; }
 .doc-section { display: flex; flex-direction: column; gap: 8px; }

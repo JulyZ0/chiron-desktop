@@ -196,6 +196,14 @@ def _render(
     return "\n".join(sections)
 
 
+def _auto_inject(skill: dict[str, Any]) -> bool:
+    """技能的 `auto_inject` 开关（缺省 true，兼容字符串 "false" 这类脏数据）。"""
+    v = skill.get("auto_inject", True)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(v)
+
+
 async def build_skill_catalog(
     *,
     selected: Sequence[str] = (),
@@ -223,6 +231,16 @@ async def build_skill_catalog(
     warnings = [str(w) for w in (result.get("load_warnings") or []) if str(w).strip()]
 
     wanted = {str(item).strip() for item in selected if str(item).strip()}
+    # P1-2 触发策略：`auto_inject=False` 的技能**不进每轮 system 上下文**（否则用户关掉
+    # 开关却仍在烧上下文），但仍可被显式 @（`selected`）或工具读取 —— 所以过滤条件是
+    # 「关掉了 AND 没被选中」。`selected` 非空时下面的 selected 过滤会进一步收窄。
+    skipped = {str(s.get("name") or "") for s in skills if not _auto_inject(s)}
+    if skipped:
+        skills = [
+            s for s in skills
+            if _auto_inject(s) or str(s.get("name") or "") in wanted
+        ]
+        logger.debug("skill catalog: auto_inject off, skipped %s", ", ".join(sorted(skipped)))
     if wanted:
         skills = [s for s in skills if str(s.get("name") or "") in wanted]
         # 选中了但**没有加载出来**（文件损坏 / 已被删除）必须告警：用户以为自己选了，

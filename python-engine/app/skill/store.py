@@ -36,6 +36,15 @@
 
 API 层（app/api/skills.py）与运行时工具链（app/tools/skill.py）共用此解析规则：
 API 从 query 参数（网关注入）取身份，工具链从 app.tools.context（contextvars）取身份。
+
+## P1-2：触发策略与来源（`auto_inject` / `origin`）
+
+- 两个字段都在 `SkillDef` 上、都进 `to_dict()`（清单 API 因此自动返回它们）：
+  `auto_inject`（默认 true）= 是否每轮注入 system 上下文；`origin`（默认空）= 来源标记
+  （`market:<source>/<id>` / `local` / `generated` / `builtin`，空串是老数据）。
+- 目录型技能的这两个字段写在**同目录旁挂的 `.skill.json`**（`META_FILE`）里：它在一级
+  子目录内，顶层的 `glob("*.skill.json")` 扫不到，因此不会变成第二份技能定义。
+- `update_meta()` 把改动写回**技能自己的载体**（见其 docstring），不制造本地覆盖。
 """
 
 from __future__ import annotations
@@ -72,6 +81,65 @@ SCOPE_TENANT = "tenant"
 SCOPE_SHARED = "shared"
 SCOPE_ROOT = "root"
 SCOPE_BUILTIN = "builtin"
+
+# ── P1-2：来源（origin）与触发策略（auto_inject）──
+#
+# `origin` 回答"这个技能从哪来"，与 `scope`（它在哪一层）正交：
+#   市场安装 → `market:<source>/<id>`（source 是市场源 id，id 是目录条目主键）
+#   手工安装 / 上传 → `local`
+#   LLM 生成 → `generated`
+#   内置技能源（market/skills）→ `builtin`
+# 空串是**合法旧值**（老数据没有这个字段），展示层按"本地"处理。
+ORIGIN_LOCAL = "local"
+ORIGIN_GENERATED = "generated"
+ORIGIN_BUILTIN = "builtin"
+ORIGIN_MARKET_PREFIX = "market:"
+
+#: 目录型技能的元数据旁挂文件（与 `SKILL.md` **同级**，不参与顶层 `*.skill.json` 扫描 ——
+#: 它在一级子目录里，`glob("*.skill.json")` 看不到它，因此不会变成第二份技能定义）。
+META_FILE = ".skill.json"
+
+
+def market_origin(source: str, market_id: str) -> str:
+    """拼装市场来源标记：`market:<source>/<id>`（参数为空时退化为 `market:`）。"""
+    src = str(source or "").strip()
+    mid = str(market_id or "").strip()
+    if not src and not mid:
+        return ORIGIN_MARKET_PREFIX
+    return f"{ORIGIN_MARKET_PREFIX}{src}/{mid}"
+
+
+def parse_market_origin(origin: str) -> tuple[str, str] | None:
+    """拆解市场来源标记；不是市场来源时返回 None。
+
+    容错：`market:<source>/<id>` 中 `<id>` 自身可能带 `/`（如 `skill:foo/bar`），
+    只按**第一个** `/` 切分，其余原样留给 id。
+    """
+    raw = str(origin or "").strip()
+    if not raw.startswith(ORIGIN_MARKET_PREFIX):
+        return None
+    rest = raw[len(ORIGIN_MARKET_PREFIX):]
+    source, _, market_id = rest.partition("/")
+    return source.strip(), market_id.strip()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写：先写同目录临时文件再 `os.replace`（同分区 ⇒ 替换是原子的）。
+
+    升级/元数据更新都用它：中途失败（磁盘满、进程被杀）只留下临时文件，
+    **旧文件仍然完整** —— 这是"失败不破坏旧版本"的落点。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}")
+    tmp.write_text(text, encoding="utf-8")
+    try:
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def _safe_segment(value: str, label: str) -> str:
@@ -124,6 +192,17 @@ def _migrate_tenant_legacy_to_shared(tenant_root: Path, shared: Path) -> None:
         shared.mkdir(parents=True, exist_ok=True)
         for p in legacy_files:
             shutil.copy2(p, shared / p.name)
+
+
+def _apply_scope_origin(skill: SkillDef, scope: str) -> None:
+    """填运行时字段：`scope` 来自目录命中位置；`origin` 为空且来自内置源时补 `builtin`。
+
+    内置技能源里的文件是仓库自带的「只读资产」，没有安装动作也就没人写 `origin`；
+    不补的话它们会落进"本地"分组，而用户对它们的处置方式（升级/删除）完全不同。
+    """
+    skill.scope = scope
+    if not skill.origin and scope == SCOPE_BUILTIN:
+        skill.origin = ORIGIN_BUILTIN
 
 
 @dataclass(frozen=True)
@@ -252,6 +331,12 @@ class SkillDef:
     # `source_dir` 是**服务器绝对路径**，刻意不写入 to_dict（避免经 /v1/skills 泄漏给前端）。
     attachments: list[str] = field(default_factory=list)
     source_dir: str = ""
+    # P1-2：触发策略与来源。
+    # `auto_inject=False` ⇒ **不进每轮 system 上下文**（skill catalog 过滤），但仍可被
+    # 显式 @（workbench 选中）或工具（skill_run / read_file）使用。
+    # `origin` 见模块级 ORIGIN_* 常量；空串 = 老数据 / 未标注。
+    auto_inject: bool = True
+    origin: str = ""
     # 运行时派生的来源标记（user/tenant/shared/root/builtin），不参与磁盘持久化语义；
     # list()/get() 按目录命中位置填充，供 API 层映射为返回结构里的 source 字段。
     scope: str = SCOPE_USER
@@ -272,6 +357,10 @@ class SkillDef:
             "allowed_tools": self.allowed_tools,
             "metadata": self.metadata,
             "attachments": self.attachments,
+            # P1-2：清单 API 必须返回这两个字段（前端按它分组 / 显示开关），
+            # 老数据缺省值就在 SkillDef 的默认值里（True / 空串）。
+            "auto_inject": self.auto_inject,
+            "origin": self.origin,
         }
 
 
@@ -359,7 +448,7 @@ class SkillStore:
         seen: dict[str, SkillDef] = {}
         for skill, scope in self._iter_search():
             if skill.name not in seen:
-                skill.scope = scope
+                _apply_scope_origin(skill, scope)
                 seen[skill.name] = skill
         return [seen[k] for k in sorted(seen)]
 
@@ -367,7 +456,7 @@ class SkillStore:
         """按 user → 租户 _shared → 全局 _shared 顺序找第一个命中并标记 scope。"""
         for skill, scope in self._iter_search():
             if skill.name == name:
-                skill.scope = scope
+                _apply_scope_origin(skill, scope)
                 return skill
         return None
 
@@ -378,9 +467,79 @@ class SkillStore:
         形成“本地覆盖”，读取时本地版本优先——团队共享技能可被成员本地停用。
         """
         p = self._path(skill.name)
-        p.write_text(
-            json.dumps(skill.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        _atomic_write_text(
+            p, json.dumps(skill.to_dict(), ensure_ascii=False, indent=2)
         )
+
+    # ── P1-2：元数据更新（auto_inject / origin / version）──
+    def _flat_carrier(self, name: str) -> Path | None:
+        """按搜索优先级找 `{dir}/{name}.skill.json` 的**物理位置**（找不到返回 None）。"""
+        for d, _scope in self._roots.search:
+            p = d / f"{name}.skill.json"
+            if p.is_file():
+                return p
+        return None
+
+    def _merge_meta(self, path: Path, updates: dict[str, Any]) -> None:
+        """把 updates 合并进一份技能 JSON（保留未知键，原子写）。"""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        data.update(updates)
+        _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+    def update_meta(
+        self,
+        name: str,
+        *,
+        auto_inject: bool | None = None,
+        origin: str | None = None,
+        version: str | None = None,
+    ) -> SkillDef | None:
+        """就地更新元数据字段并落盘；技能不存在返回 None。
+
+        **写回它原本所在的载体**，而不是像 `save()` 那样在写目录生成一份覆盖 ——
+        只有三个元数据键变化时制造"本地覆盖"会让技能列表出现两份定义、正文还可能被
+        旧副本盖住。载体规则：
+
+        * 目录型技能（有 `source_dir`）→ 同目录旁挂 `.skill.json`；
+        * 扁平技能 → 它自己那份 `{name}.skill.json`；
+        * 内置技能源 / 载体不可写 → 写目录里的覆盖文件（内置源可能只读，且不该被改）。
+        """
+        skill = self.get(name)
+        if skill is None:
+            return None
+        updates: dict[str, Any] = {}
+        if auto_inject is not None:
+            skill.auto_inject = bool(auto_inject)
+            updates["auto_inject"] = skill.auto_inject
+        if origin is not None:
+            skill.origin = str(origin).strip()
+            updates["origin"] = skill.origin
+        if version is not None:
+            skill.version = str(version).strip() or skill.version
+            updates["version"] = skill.version
+        if not updates:
+            return skill
+
+        if skill.scope != SCOPE_BUILTIN and skill.source_dir:
+            carrier = Path(skill.source_dir) / META_FILE
+            try:
+                self._merge_meta(carrier, updates)
+                return skill
+            except OSError as e:  # 目录只读等 → 退到写目录覆盖
+                logger.warning("skill store: meta write to %s failed: %s", carrier, e)
+
+        carrier = None if skill.scope == SCOPE_BUILTIN else self._flat_carrier(name)
+        try:
+            self._merge_meta(carrier or self._path(name), updates)
+        except OSError as e:
+            logger.warning("skill store: meta write for %r failed: %s", name, e)
+            raise
+        return skill
 
     def save_skill_md(self, name: str, text: str) -> Path:
         """写**目录型**技能（`{root}/{name}/SKILL.md`）—— `skill_generate`（D4）用。
@@ -457,4 +616,7 @@ class SkillStore:
             metadata=data.get("metadata", {}),
             attachments=data.get("attachments", []),
             source_dir=data.get("source_dir", ""),
+            # P1-2：老数据缺省视为 auto_inject=true / origin 空
+            auto_inject=bool(data.get("auto_inject", True)),
+            origin=str(data.get("origin", "") or ""),
         )

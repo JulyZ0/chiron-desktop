@@ -385,4 +385,18 @@ export default {
   skill_md_preview: "SKILL.md body",
   skill_no_preview: "This skill has no body to preview",
   source_shared: "Public shared",
+  // ── P1-2: origin groups / trigger policy / upgrade ──
+  origin_label: "Origin",
+  origin_market: "From market",
+  origin_local: "Local",
+  origin_generated: "Generated",
+  auto_inject: "Auto-inject",
+  auto_inject_hint: "When on, this skill appears in every turn's skill catalog; when off it can still be picked with {'@'} in chat or called by tools",
+  auto_inject_on: "Auto-inject enabled for {name}",
+  auto_inject_off: "Auto-inject disabled for {name} (still usable via {'@'} or tools)",
+  current_version: "Current version v{version}",
+  check_update_and_upgrade: "Check update / upgrade",
+  upgraded_to: "Upgraded: v{from} → v{to}",
+  already_latest_version: "Already at the latest version (v{version})",
+  upgrade_no_source: "No upgrade source available: reinstall from the market or make sure its source is recorded",
 }

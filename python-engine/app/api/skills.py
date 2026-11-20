@@ -17,6 +17,15 @@
 - 删除：`DELETE /v1/skills/{name}` 默认删 user 私有目录中的技能；带 `?scope=tenant` 时
   删**租户共享层**（团队资产，网关侧要求技能管理权限 `PermMarketManage`）。目标层里没有
   该技能时返回 404（不会"删了个空"却回 200）。
+
+## P1-2：触发策略 / 来源 / 升级
+
+- `GET /v1/skills` 的每个技能额外带 `auto_inject`（缺省 true）与 `origin`
+  （`market:<source>/<id>` / `local` / `generated` / `builtin`；老数据空串）；
+- `PATCH /v1/skills/{name}/meta` `{auto_inject}` —— 关掉后不进每轮 system 上下文，
+  但仍可被 @ 选中或工具调用（过滤在 app/tools/skill_catalog.py）；
+- `POST /v1/skills/{name}/upgrade` `{source_url?}` —— 只对市场来源生效：取源清单 → 比版本 →
+  **原子覆盖**（见 app/skill/upgrade.py）。已最新回 200，不可升级回 409。
 """
 
 from __future__ import annotations
@@ -28,7 +37,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.skill.store import SkillDef, SkillStore
+from app.skill.store import ORIGIN_LOCAL, SkillDef, SkillStore
 
 router = APIRouter(tags=["skills"])
 
@@ -74,6 +83,10 @@ class SkillInstallRequest(BaseModel):
     url: str = ""
     file: str = ""
     inline: str = ""
+    #: P1-2：来源标记（`market:<source>/<id>` / `local` / `generated` / `builtin`）。
+    #: 市场安装流水线（internal/api/market_install.go）显式传 `market:<source>/<id>`；
+    #: 其它调用方缺省按 `local` 处理。
+    origin: str = ""
 
 
 @router.post("/v1/skills/{name}/register")
@@ -160,6 +173,13 @@ async def install_skill(
     skill_name = data.get("name", "")
     if not skill_name:
         raise HTTPException(status_code=400, detail="skill definition missing 'name'")
+    # P1-2：来源标记。请求体优先，其次定义自带，最后按"本地安装"处理。
+    # 用 `url` 安装时把安装地址记进 metadata.source_url —— 升级端点靠它找到源清单，
+    # 否则用户装完就只能重装才能升级。
+    origin = (body.origin or str(data.get("origin") or "")).strip() or ORIGIN_LOCAL
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    if body.url:
+        metadata = {**metadata, "source_url": body.url}
     skill = SkillDef(
         name=skill_name,
         description=data.get("description", ""),
@@ -169,6 +189,8 @@ async def install_skill(
         exec_type=exec_cfg.get("type", "prompt"),
         source=exec_cfg.get("source", ""),
         parameters=data.get("parameters", []),
+        metadata=metadata,
+        origin=origin,
     )
     store.save(skill)
     payload = skill.to_dict()
@@ -256,6 +278,120 @@ async def delete_skill(
 
 class SkillToggleRequest(BaseModel):
     enabled: bool = True
+
+
+class SkillMetaRequest(BaseModel):
+    """PATCH /v1/skills/{name}/meta 的请求体（仅元数据，不含执行内容）。
+
+    `auto_inject` 是唯一对外可改的字段：`origin` / `version` 由安装与升级维护，
+    放开给前端改等于让"来源"变成用户可伪造的标签（分组/升级判定都会跟着错）。
+    """
+
+    auto_inject: bool | None = None
+
+
+@router.patch("/v1/skills/{name}/meta")
+async def patch_skill_meta(
+    name: str, body: SkillMetaRequest, user_id: str = "", tenant_id: int = 0
+) -> dict[str, Any]:
+    """更新技能元数据（P1-2 的触发策略开关）。
+
+    `auto_inject=false` ⇒ 该技能**不进每轮 system 上下文**（`skill_catalog` 过滤），
+    但仍可被对话里显式 @（工作台选中）或工具（`skill_run` / `read_file`）使用。
+    """
+    store = _store_for(user_id, tenant_id)
+
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
+        raise HTTPException(status_code=400, detail="invalid skill name")
+    if body.auto_inject is None:
+        raise HTTPException(status_code=400, detail="nothing to update: provide auto_inject")
+
+    skill = store.update_meta(name, auto_inject=body.auto_inject)
+    if skill is None:
+        raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
+    return {
+        "skill": _skill_payload(skill),
+        "message": (
+            f"Skill '{name}' will "
+            + ("be injected into every turn" if skill.auto_inject else "not be auto-injected")
+        ),
+    }
+
+
+class SkillUpgradeRequest(BaseModel):
+    """POST /v1/skills/{name}/upgrade 的请求体。
+
+    `source_url` 可省略：安装了地址（`metadata.source_url`）的技能会自动用它。
+    需要显式给出时，它可以是一份**技能定义**（JSON 对象）或一份**源清单**（JSON 数组，
+    按 name 命中）—— 后者正是"从市场目录检查更新"的形态。
+    """
+
+    source_url: str = ""
+
+
+@router.post("/v1/skills/{name}/upgrade")
+async def upgrade_skill_endpoint(
+    name: str, body: SkillUpgradeRequest | None = None, user_id: str = "", tenant_id: int = 0
+) -> dict[str, Any]:
+    """升级市场安装的技能（比较版本 → 原子覆盖；失败不破坏旧版本）。
+
+    状态码契约：
+
+    * 200 `{upgraded: true, from_version, to_version, skill}` —— 升级成功；
+    * 200 `{upgraded: false, reason: "already_latest", current_version, latest_version}`
+      —— 已是最新（**不是错误**，前端据此显示"已是最新"）；
+    * 409 —— 不可升级的**稳定原因**：非市场来源 / 没有源清单地址；
+    * 502 —— 取源清单失败（网络 / SSRF 拒绝）；
+    * 400 —— 远端定义非法（名字不符 / 缺字段）；
+    * 404 —— 技能不存在。
+    """
+    store = _store_for(user_id, tenant_id)
+
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
+        raise HTTPException(status_code=400, detail="invalid skill name")
+    if store.get(name) is None:
+        raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
+
+    from app.skill.upgrade import (
+        REASON_ALREADY_LATEST,
+        REASON_FETCH_FAILED,
+        REASON_NAME_MISMATCH,
+        REASON_NO_SOURCE,
+        REASON_NOT_MARKET,
+        upgrade_skill,
+    )
+
+    outcome = await upgrade_skill(
+        store, name, source_url=(body.source_url if body else "")
+    )
+
+    if not outcome.ok:
+        status = 409 if outcome.reason in (REASON_NOT_MARKET, REASON_NO_SOURCE) else 400
+        if outcome.reason == REASON_FETCH_FAILED:
+            status = 502
+        elif outcome.reason == REASON_NAME_MISMATCH:
+            status = 400
+        raise HTTPException(
+            status_code=status,
+            detail={"reason": outcome.reason, "error": outcome.error},
+        )
+
+    if outcome.reason == REASON_ALREADY_LATEST:
+        return {
+            "upgraded": False,
+            "reason": REASON_ALREADY_LATEST,
+            "current_version": outcome.current,
+            "latest_version": outcome.latest,
+            "message": f"Skill '{name}' is already at the latest version ({outcome.latest})",
+        }
+
+    return {
+        "upgraded": True,
+        "from_version": outcome.current,
+        "to_version": outcome.latest,
+        "skill": {**outcome.skill, "source": store.write_scope},
+        "message": f"Skill '{name}' upgraded {outcome.current} → {outcome.latest}",
+    }
 
 
 @router.put("/v1/skills/{name}")
