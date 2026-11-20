@@ -707,11 +707,13 @@ function startIndexPolling() {
   pollTimer = setTimeout(tick, INDEX_POLL_INTERVAL_MS)
 }
 
-/** 重建索引：`failed` = 只重试失败文档；`all` = 全库重建。 */
-async function reindex(scope: 'failed' | 'all') {
+/** 重建索引：`failed` = 只重试失败文档；`all` = 全库重建；`doc` = 只重试这一篇。 */
+async function reindex(scope: 'failed' | 'all' | 'doc', docId?: string) {
+  if (scope === 'doc' && !docId) return
   rebuilding.value = scope
+  retryingDocId.value = scope === 'doc' ? docId || '' : ''
   try {
-    const res = await reindexKnowledgeBase(kbId, scope)
+    const res = await reindexKnowledgeBase(kbId, scope, docId)
     if (res.enqueued) {
       message.success(t('knowledge.index_build_started'))
     } else if (res.reason === 'no failed documents') {
@@ -726,10 +728,31 @@ async function reindex(scope: 'failed' | 'all') {
     message.error(kbErrorText(e, t('errors.re_index_failed')))
   } finally {
     rebuilding.value = null
+    retryingDocId.value = ''
   }
 }
 
-const rebuilding = ref<'failed' | 'all' | null>(null)
+/**
+ * 全库重建的确认框。
+ *
+ * 必须显式确认，且**写清代价**：`scope=all` 会把每一篇文档重新提交给 PageIndex，
+ * LLM 索引费用按篇重算 —— 用户以为只是"刷一下界面"，账单上却是整库重跑。
+ * 相比浏览器原生 confirm，Modal 能带上"会消耗模型额度"这句说明与文档篇数。
+ */
+function confirmReindexAll() {
+  Modal.confirm({
+    title: t('knowledge.reindex_all_confirm_title'),
+    content: t('knowledge.reindex_all_confirm_content', { n: indexStatus.value?.total ?? kb.value?.document_count ?? 0 }),
+    okText: t('knowledge.reindex_all'),
+    okType: 'danger',
+    cancelText: t('common.cancel'),
+    onOk: () => reindex('all'),
+  })
+}
+
+const rebuilding = ref<'failed' | 'all' | 'doc' | null>(null)
+/** 正在单独重试的文档 id（只让那一行的按钮转圈，而不是整张卡片） */
+const retryingDocId = ref('')
 
 /** 失败文档（进度接口给出，不再从库级 error_message 反解析）。 */
 const failedDocuments = computed(() => indexStatus.value?.failed_documents ?? [])
@@ -918,10 +941,11 @@ function formatSize(bytes: number): string {
         </Button>
         <!-- 全库重建：换索引模型/升级 pageindex 后用（失败的少量文档走进度卡片里的"重试"） -->
         <Button
+          data-testid="kb-reindex-all"
           :loading="rebuilding === 'all'"
           :disabled="rebuilding !== null || kb?.enabled === false"
           :title="kb?.enabled === false ? $t('knowledge.kb_disabled_hint') : $t('knowledge.reindex_all_hint')"
-          @click="reindex('all')"
+          @click="confirmReindexAll"
         >
           <template #icon>
             <ReloadOutlined />
@@ -995,6 +1019,7 @@ function formatSize(bytes: number): string {
         <!-- 索引进度（服务端聚合，每 3s 轮询；仅在仍有文档在索引时轮询） -->
         <Card
           v-if="showIndexCard"
+          data-testid="kb-index-card"
           :title="$t('common.build_progress')"
           style="margin-top: 16px"
         >
@@ -1018,9 +1043,23 @@ function formatSize(bytes: number): string {
               <li
                 v-for="doc in failedDocuments"
                 :key="doc.id"
+                class="index-failure-row"
               >
-                <strong>{{ doc.name }}</strong>
-                <span v-if="doc.error_message">：{{ doc.error_message }}</span>
+                <span class="index-failure-text">
+                  <strong>{{ doc.name }}</strong>
+                  <span v-if="doc.error_message">：{{ doc.error_message }}</span>
+                </span>
+                <!-- 单篇重试：只把这一篇重置为 pending 并投递增量任务（不重跑整库） -->
+                <Button
+                  size="small"
+                  type="link"
+                  data-testid="retry-document"
+                  :loading="retryingDocId === doc.id"
+                  :disabled="rebuilding !== null"
+                  @click="reindex('doc', doc.id)"
+                >
+                  {{ $t('knowledge.retry_this_document') }}
+                </Button>
               </li>
             </ul>
             <Button
@@ -1509,6 +1548,9 @@ function formatSize(bytes: number): string {
 .index-failures-title { font-size: 13px; font-weight: var(--fw-medium); color: var(--text-primary); margin-bottom: 6px; }
 .index-failures ul { margin: 0 0 10px; padding-inline-start: 18px; font-size: 13px; color: var(--text-secondary); }
 .index-failures li { margin: 2px 0; word-break: break-word; }
+/* 每条失败文档一行：原因在左、单篇重试在右；长文件名先换行再挤按钮 */
+.index-failure-row { display: flex; align-items: flex-start; gap: 8px; justify-content: space-between; }
+.index-failure-text { flex: 1 1 auto; min-width: 0; }
 
 /* ── 引用落点高亮（/knowledge/:kbId?doc=:docId） ── */
 .doc-target-hint { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-size: 13px; color: var(--text-secondary); }
