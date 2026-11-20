@@ -6,7 +6,7 @@ import {
 } from 'ant-design-vue'
 import { BookOutlined, PlusOutlined, DeleteOutlined, SearchOutlined, EditOutlined, FileTextOutlined, DatabaseOutlined, TeamOutlined, LockOutlined } from '@ant-design/icons-vue'
 import { api, listAgents, setKBVisibility } from '../api'
-import { getKnowledgeSettings, setKnowledgeBaseEnabled } from '../api/knowledge'
+import { getKnowledgeSettings, getKnowledgeStats, setKnowledgeBaseEnabled, type KbStats } from '../api/knowledge'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import { collectKbUsage, kbUsageOf, type KbUsage } from '../utils/kbUsage'
@@ -131,6 +131,65 @@ async function loadKnowledgeBases() {
   } finally {
     loading.value = false
   }
+  // 检索统计与列表解耦：统计读不到不该让整页报错，也不该拖住卡片渲染
+  void loadKbStats(knowledgeBases.value)
+}
+
+// ── 近 24h 命中率（P1-8）──
+//
+// 数据来自既有的逐库 `/v1/kb/{id}/stats`（没有批量端点）：列表页卡片只展示一条
+// "命中率"，为它新增一个聚合接口不划算。代价是 N 次请求 —— 所以并发限 3、并且
+// 只取前 MAX_STATS_KBS 个库：一屏 100 个库时，统计是**附加信息**，不该打满网关。
+const MAX_STATS_KBS = 30
+const STATS_CONCURRENCY = 3
+/** 未取到 / 取失败 = 无此项（不显示），`available=false` 另算"暂不可读" */
+const kbStats = ref<Record<string, KbStats | null>>({})
+
+async function loadKbStats(list: KnowledgeBase[]) {
+  const queue = list.slice(0, MAX_STATS_KBS)
+  if (!queue.length) { kbStats.value = {}; return }
+  const out: Record<string, KbStats | null> = {}
+  const worker = async () => {
+    for (;;) {
+      const kb = queue.shift()
+      if (!kb) return
+      try {
+        out[kb.id] = await getKnowledgeStats(kb.id)
+      } catch {
+        out[kb.id] = null
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(STATS_CONCURRENCY, queue.length) }, worker))
+  kbStats.value = out
+}
+
+function statsOf(kbId: string): KbStats | null {
+  return kbStats.value[kbId] ?? null
+}
+
+/**
+ * 近 24h 命中率文案。
+ *
+ * 分母是**成功**的检索次数（引擎口径，失败另计），所以 `queries=0` 时不给百分比 ——
+ * "0/0 = 0%" 会被读成"检索了但全没命中"，与"根本没人检索过"是两件事。
+ */
+function hitRateLabel(kbId: string): string {
+  const stats = statsOf(kbId)
+  if (!stats || stats.available === false) return ''
+  const win = stats.window_hours_24
+  if (!win || !win.queries) return ''
+  const rate = Math.round((Number(win.hits) || 0) / win.queries * 100)
+  return t('knowledge.card_hit_rate', { rate, hits: win.hits, queries: win.queries })
+}
+
+/** 零命中提示：检索过但一条都没命中 —— 这是"要换问法/查索引"，不是"没检索过"。 */
+function zeroHitLabel(kbId: string): string {
+  const stats = statsOf(kbId)
+  if (!stats || stats.available === false) return ''
+  const win = stats.window_hours_24
+  if (!win || !win.queries || win.hits > 0) return ''
+  return t('knowledge.card_zero_hit_tag')
 }
 
 async function createKnowledgeBase() {
@@ -402,6 +461,20 @@ function statusLabel(status: string): string {
                   @click.stop
                 />
               </label>
+              <!-- 近 24h 命中率（来自 /v1/kb/{id}/stats）：只在真检索过时才显示 -->
+              <span
+                v-if="hitRateLabel(kb.id)"
+                class="stat kb-hit-rate"
+                data-testid="kb-hit-rate"
+              >{{ hitRateLabel(kb.id) }}</span>
+              <Tag
+                v-if="zeroHitLabel(kb.id)"
+                color="orange"
+                data-testid="kb-zero-hit"
+                :title="$t('knowledge.card_zero_hit_hint')"
+              >
+                {{ zeroHitLabel(kb.id) }}
+              </Tag>
               <Tag
                 v-if="usageLabel(kb.id)"
                 color="blue"
@@ -489,6 +562,19 @@ function statusLabel(status: string): string {
             <div class="kb-stats">
               <span class="stat"><FileTextOutlined /> {{ $t('knowledge.n_docs', { n: kb.document_count }) }}</span>
               <span class="stat"><DatabaseOutlined /> {{ formatSize(kb.total_size_bytes) }}</span>
+              <span
+                v-if="hitRateLabel(kb.id)"
+                class="stat kb-hit-rate"
+                data-testid="kb-hit-rate"
+              >{{ hitRateLabel(kb.id) }}</span>
+              <Tag
+                v-if="zeroHitLabel(kb.id)"
+                color="orange"
+                data-testid="kb-zero-hit"
+                :title="$t('knowledge.card_zero_hit_hint')"
+              >
+                {{ zeroHitLabel(kb.id) }}
+              </Tag>
               <Tag
                 v-if="usageLabel(kb.id)"
                 color="blue"
@@ -647,6 +733,8 @@ function statusLabel(status: string): string {
 }
 .type-tag { flex: none; }
 .kb-stats { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* 命中率是唯一带数字结论的统计项：字色稍深，避免和"文档数/体积"混成一片灰 */
+.kb-hit-rate { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 .stat { font-size: 12px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
 .stat :deep(svg) { font-size: 12px; color: var(--text-tertiary); }
 /* 启用开关：与其它 stat 同一行时垂直居中，文字与开关之间留一点呼吸 */

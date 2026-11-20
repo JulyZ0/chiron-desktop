@@ -125,14 +125,21 @@ export default {
   index_progress_n_of_m: "{done}/{total} 篇已完成索引",
   index_failed_documents: "索引失败的文档",
   retry_failed_documents: "重试失败文档",
+  retry_this_document: "重试本文件",
   reindex_all: "重建全部索引",
   reindex_all_hint: "重建整个库的索引（会重新消耗索引费用）",
+  reindex_all_confirm_title: "重建全部索引？",
+  reindex_all_confirm_content: "将把全部 {n} 篇文档重新提交索引，会按篇消耗模型额度（与首次构建相同），耗时可能较长。只想修复个别失败文件时，请改用列表里的「重试本文件」。",
   no_failed_documents: "没有失败的文档需要重试",
   index_already_running: "该知识库正在索引，请稍候",
   located_referenced_document: "已定位到引用的文档",
   clear_located_document: "取消定位",
   // ── 对话多库选择 ──
   max_knowledge_bases_n: "一次对话最多选择 {n} 个知识库",
+  // ── 多库检索权重（P1-8） ──
+  kb_weights: "知识库权重",
+  kb_weight_for: "{name} 的检索权重",
+  kb_weights_hint: "选中多个知识库时可调整各自权重（0.1–3.0，默认 1.0）：权重高的库在合并结果里排得更前，但不影响命中与否",
 
   // ── 检索观测与徽标（P1-6） ──
   badge_retrieval: "检索 {kb} 个库 · 命中 {hits} 条",
@@ -151,6 +158,10 @@ export default {
   stats_no_failures: "近 7 天没有检索失败",
   stats_unavailable: "检索观测暂不可读（Redis 不可用）",
   stats_refresh: "刷新统计",
+  // ── 列表卡片上的近 24h 命中率（P1-8） ──
+  card_hit_rate: "近 24h 命中率 {rate}%（{hits}/{queries}）",
+  card_zero_hit_tag: "近 24h 零命中",
+  card_zero_hit_hint: "近 24 小时检索过但一条都没命中：换一种问法，或确认相关文档已索引完成",
   model_settings_title: "模型覆盖（可选）",
   model_settings_hint: "留空则沿用网关「模型服务」里的默认模型；填写后该库单独使用这个模型",
   index_model: "索引模型",

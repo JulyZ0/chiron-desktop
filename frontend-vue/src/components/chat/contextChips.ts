@@ -23,10 +23,34 @@ export type ContextChipType = 'kb' | 'agent' | 'skill' | 'plugin' | 'memory'
  */
 export const MAX_CONTEXT_KBS = 5
 
+/**
+ * 多库权重（P1-6/P1-8）：0.1–3.0，默认 1.0。
+ *
+ * 默认 1.0 = 与引入权重之前的行为逐值相同；上下限是**界面**的约束（滑块范围），
+ * 引擎侧另有 0/负数/NaN 一律回落 1.0 的兜底（`workbench_context._coerce_weight`）：
+ * 前端拦人是体验，后端兜底是底线。
+ */
+export const KB_WEIGHT_MIN = 0.1
+export const KB_WEIGHT_MAX = 3.0
+export const DEFAULT_KB_WEIGHT = 1.0
+
+/** 把任意输入收敛成合法权重：非数字/越界落到 [0.1, 3.0]，保留一位小数。 */
+export function clampKbWeight(raw: unknown): number {
+  const value = typeof raw === 'number' ? raw : Number.parseFloat(String(raw ?? ''))
+  if (!Number.isFinite(value)) return DEFAULT_KB_WEIGHT
+  const clamped = Math.min(KB_WEIGHT_MAX, Math.max(KB_WEIGHT_MIN, value))
+  return Math.round(clamped * 10) / 10
+}
+
 export interface ContextChip {
   type: ContextChipType
   label: string
   value: string
+  /**
+   * 仅 `type='kb'` 使用：该库在本次对话里的检索权重。
+   * 缺省（undefined）= 1.0，与老链接/老会话完全一致。
+   */
+  weight?: number
 }
 
 /** 参数名 → chip 类型与展示名。展示名只是占位，真实名称由调用方按 id 补全。 */
@@ -78,6 +102,24 @@ function valuesOf(chips: readonly ContextChip[], type: ContextChipType): string[
 }
 
 /**
+ * 多库权重对：`[{ id, weight }]`。
+ *
+ * 引擎两种形态都认（`workbench_context._as_str_list` 只取 `id`、`context_weights`
+ * 取 `weight`），这里统一发对象形态：权重是**本次对话的显式意图**，用字符串数组
+ * 表达不了；同一个 id 重复出现时保留首次（与 `valuesOf` 的去重口径一致）。
+ */
+function kbWeightsOf(chips: readonly ContextChip[]): { id: string; weight: number }[] {
+  const out: { id: string; weight: number }[] = []
+  const seen = new Set<string>()
+  for (const chip of chips) {
+    if (chip.type !== 'kb' || !chip.value || seen.has(chip.value)) continue
+    seen.add(chip.value)
+    out.push({ id: chip.value, weight: clampKbWeight(chip.weight ?? DEFAULT_KB_WEIGHT) })
+  }
+  return out
+}
+
+/**
  * 组装发给引擎的 context。
  *
  * 单值字段（`kb_id`/`agent_id`）取首个：老后端只认这两个标量，
@@ -87,10 +129,12 @@ function valuesOf(chips: readonly ContextChip[], type: ContextChipType): string[
 export function buildWorkbenchContext(chips: readonly ContextChip[]): Record<string, unknown> | undefined {
   const ctx: Record<string, unknown> = {}
 
-  const kbIds = valuesOf(chips, 'kb').slice(0, MAX_CONTEXT_KBS)
-  if (kbIds.length) {
-    ctx.kb_id = kbIds[0]
-    ctx.kb_ids = kbIds
+  // 知识库：`kb_id` 仍取首个（老后端只认标量），`kb_ids` 用 `[{id, weight}]`
+  // 表达"多库 + 每个库多重要"（P1-8）。上限 5 与引擎 `MAX_CONTEXT_KBS` 逐值对齐。
+  const kbWeights = kbWeightsOf(chips).slice(0, MAX_CONTEXT_KBS)
+  if (kbWeights.length) {
+    ctx.kb_id = kbWeights[0]!.id
+    ctx.kb_ids = kbWeights
   }
 
   const agentIds = valuesOf(chips, 'agent')
@@ -151,6 +195,17 @@ export function chipsFromWorkbenchContext(
   const push = (type: ContextChipType, raw: unknown) => {
     if (!Array.isArray(raw)) return
     for (const item of raw) {
+      // 知识库可能是 `{id, weight}`（P1-8 权重）也可能是裸 id（老会话）：
+      // 只认字符串会让带权重的会话刷新后**整排 chip 消失**。
+      if (item && typeof item === 'object') {
+        const record = item as { id?: unknown; weight?: unknown }
+        const id = typeof record.id === 'string' ? record.id.trim() : ''
+        if (!id) continue
+        const chip: ContextChip = { type, label: LABELS[type](id), value: id }
+        if (type === 'kb' && record.weight !== undefined) chip.weight = clampKbWeight(record.weight)
+        chips.push(chip)
+        continue
+      }
       if (typeof item === 'string' && item.trim()) {
         chips.push({ type, label: LABELS[type](item.trim()), value: item.trim() })
       }

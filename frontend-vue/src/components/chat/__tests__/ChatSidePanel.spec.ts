@@ -46,6 +46,7 @@ beforeEach(() => {
 function mountPanel(
   sessions: any[] = [],
   view: 'trajectory' | 'sessions' | 'agents' | 'stats' = 'trajectory',
+  contextChips: Array<{ type: 'kb' | 'agent' | 'skill' | 'plugin' | 'memory'; label: string; value: string; weight?: number }> = [],
 ) {
   return mount(ChatSidePanel, {
     props: {
@@ -56,7 +57,7 @@ function mountPanel(
       sessions,
       activeSessionId: '',
       userName: '测试员',
-      contextChips: [],
+      contextChips,
     },
     // 底部主题 / 用户入口的两个子组件各自依赖 pinia（themeStore / authStore）。
     // 本测试只关心「可用工具」区块，故 stub 掉它们 —— 保持测试不引入 pinia，
@@ -223,5 +224,54 @@ describe('ChatSidePanel · 可用工具（让 MCP 注入的工具可见）', () 
     expect(api.listTools).toHaveBeenCalledTimes(2)
     expect(w.text()).toContain('x')
     expect(w.find('.tools-count').text()).toBe('1 个 MCP x')
+  })
+})
+
+/**
+ * 多库检索权重（P1-8）：选中多个知识库时，侧栏可展开滑块调整各自权重。
+ *
+ * 三条界面契约：单库不出现（权重对单库无意义）、≥2 库可展开、滑块发出
+ * `kb-weight` 事件且值已被收敛到 0.1–3.0（父级只负责写回，不做二次校验）。
+ */
+describe('ChatSidePanel · 知识库权重（P1-8）', () => {
+  const kb = (value: string, weight?: number) => ({
+    type: 'kb' as const,
+    label: `知识库 ${value}`,
+    value,
+    ...(weight === undefined ? {} : { weight }),
+  })
+
+  it('只有一个知识库时不出现权重入口（避免噪音）', () => {
+    const w = mountPanel([], 'trajectory', [kb('kb-1')])
+    expect(w.find('[data-testid="kb-weights-toggle"]').exists()).toBe(false)
+  })
+
+  it('★ 两个知识库时可展开，滑块初始值来自 chip 权重（缺省 1.0）', async () => {
+    const w = mountPanel([], 'trajectory', [kb('kb-1', 2.5), kb('kb-2')])
+    const toggle = w.find('[data-testid="kb-weights-toggle"]')
+    expect(toggle.exists()).toBe(true)
+
+    expect(w.find('[data-testid="kb-weights-body"]').exists()).toBe(false)
+    await toggle.trigger('click')
+
+    const rows = w.findAll('.weight-row')
+    expect(rows).toHaveLength(2)
+    const sliders = w.findAll('.weight-slider')
+    expect((sliders[0]!.element as HTMLInputElement).value).toBe('2.5')
+    expect((sliders[1]!.element as HTMLInputElement).value).toBe('1')
+    expect(w.findAll('.weight-value').map(e => e.text())).toEqual(['2.5', '1.0'])
+  })
+
+  it('★ 拖动滑块发出 kb-weight（越界值被收敛到 [0.1, 3.0]）', async () => {
+    const w = mountPanel([], 'trajectory', [kb('kb-1'), kb('kb-2')])
+    await w.find('[data-testid="kb-weights-toggle"]').trigger('click')
+
+    const slider = w.findAll('.weight-slider')[0]!
+    await slider.setValue('2.4')
+    expect(w.emitted('kb-weight')?.[0]).toEqual(['kb-1', 2.4])
+
+    // 手写/粘贴越界值：组件自己收敛，父级拿到的始终合法
+    await slider.setValue('9')
+    expect(w.emitted('kb-weight')?.[1]).toEqual(['kb-1', 3])
   })
 })

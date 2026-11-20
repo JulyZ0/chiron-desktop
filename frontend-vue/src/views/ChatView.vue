@@ -76,7 +76,7 @@ import { HistoryOutlined, ExportOutlined, BulbOutlined, BulbFilled, MoreOutlined
 import { splitThinking, stripUserInputTag, formatClock, formatSize, countItemsAfter, mergeTurnStats } from '../components/chat/chat-types'
 import { normalizeMeta } from '../components/chat/chat-history'
 import { describeApiError } from '../utils/apiError'
-import { buildWorkbenchContext, chipsFromWorkbenchContext, CONTEXT_QUERY_KEYS, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
+import { buildWorkbenchContext, chipsFromWorkbenchContext, clampKbWeight, CONTEXT_QUERY_KEYS, DEFAULT_KB_WEIGHT, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
 import { currentProject } from '../composables/useProject'
 import type { ChatItem, ChatSession, ChatAttachment, TurnStatsItem, TextItem } from '../components/chat/chat-types'
 
@@ -1189,6 +1189,16 @@ async function applyRouteQuery() {
 async function initContextChips(q: Record<string, unknown>) {
   // URL 约定与多值解析统一在 contextChips 模块里（同名参数可重复 => 可多选）
   const chips = parseContextQuery(q)
+  // URL 只表达"选了哪些库"，不表达权重（见 setKbWeight）。重新解析 URL 时把已有的
+  // 权重带到新 chip 上，否则任何一次 query 变化都会把用户调好的权重抹回 1.0。
+  const knownWeights = new Map(
+    contextChips.value
+      .filter(c => c.type === 'kb' && c.weight !== undefined)
+      .map(c => [c.value, c.weight as number]),
+  )
+  for (const chip of chips) {
+    if (chip.type === 'kb' && knownWeights.has(chip.value)) chip.weight = knownWeights.get(chip.value)
+  }
   const kb = chips.find(c => c.type === 'kb')?.value || ''
   const agent = chips.find(c => c.type === 'agent')?.value || ''
   const skill = chips.find(c => c.type === 'skill')?.value || ''
@@ -1231,6 +1241,23 @@ function removeContextChip(type: ContextChip['type'], value: string) {
   }
   void router.replace({ path: '/chat', query: q })
   appliedQueryKey = JSON.stringify(q)
+}
+
+/**
+ * 调整某个知识库的检索权重（P1-8，侧栏「知识库权重」滑块触发）。
+ *
+ * 权重只存在**会话上下文**里（`runtime.context.kb_ids[].weight`），不进 URL：
+ * URL 的 `?kb=` 约定是"哪些库"，权重是更细的意图，塞进 query 会把多值约定搅乱；
+ * 而 runtime.context 本来就是"已激活能力"的单一事实源（见 contextChips 的注释），
+ * 刷新 / 切会话都能原样还原。
+ */
+function setKbWeight(value: string, weight: number) {
+  const chip = contextChips.value.find(c => c.type === 'kb' && c.value === value)
+  if (!chip) return
+  const next = clampKbWeight(weight)
+  if ((chip.weight ?? DEFAULT_KB_WEIGHT) === next) return
+  chip.weight = next
+  persistRuntime({ context: buildWorkbenchContext(contextChips.value) })
 }
 
 /** 清空全部上下文：本地 context 与路由 query 一并清除（键取 PARAMS 定义，避免新增类型时漏清） */
@@ -2073,7 +2100,16 @@ async function switchSession(id: string) {
     if (fromRuntime.length) {
       const merged = [...contextChips.value]
       for (const chip of fromRuntime) {
-        if (!merged.some(c => c.type === chip.type && c.value === chip.value)) merged.push(chip)
+        const existing = merged.find(c => c.type === chip.type && c.value === chip.value)
+        if (!existing) {
+          merged.push(chip)
+        } else if (
+          // URL 只带 `?kb=id`（没有权重）：把会话上保存的权重补回已有 chip，
+          // 否则"刷新后权重悄悄回到 1.0"，用户会以为滑块坏了。
+          chip.type === 'kb' && chip.weight !== undefined && existing.weight === undefined
+        ) {
+          existing.weight = chip.weight
+        }
       }
       contextChips.value = merged
     }
@@ -3544,6 +3580,7 @@ function continueGeneration() {
       @share="openShare"
       @tag="setSessionTag"
       @remove-context="removeContextChip"
+      @kb-weight="setKbWeight"
       @clear-context="clearContext"
       @binding-changed="refreshActiveProject"
     />
