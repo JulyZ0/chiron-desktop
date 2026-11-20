@@ -11,6 +11,7 @@ package api
 //  4. **互斥/错误映射**：同一时刻只放一个变更请求；引擎的 400/409 原样透传，5xx 变 502。
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -42,6 +43,13 @@ type depsTestRig struct {
 
 func newDepsRig(t *testing.T, handler http.HandlerFunc) *depsTestRig {
 	t.Helper()
+	return newDepsRigWithTimeout(t, handler, 0)
+}
+
+// newDepsRigWithTimeout 与 newDepsRig 相同，但可指定客户端整体超时（0 = 包默认 60s）。
+// 用于验证"依赖管理端点用更长超时，不吃客户端短超时"。
+func newDepsRigWithTimeout(t *testing.T, handler http.HandlerFunc, clientTimeout time.Duration) *depsTestRig {
+	t.Helper()
 	rig := &depsTestRig{handler: handler}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -55,12 +63,36 @@ func newDepsRig(t *testing.T, handler http.HandlerFunc) *depsTestRig {
 	t.Cleanup(srv.Close)
 	rig.engineURL = srv.URL
 
-	pc := engine.NewPythonClient(srv.URL)
+	pc := engine.NewPythonClientWithTimeout(clientTimeout, srv.URL)
 	pc.SetInternalToken("engine-internal-token")
 
 	rig.mux = http.NewServeMux()
 	registerDepsRoutes(rig.mux, depsIdentityMW, depsIdentityMW, pc)
 	return rig
+}
+
+// newDepsRigAtURL 指向一个**已知不可用**的引擎地址（用于连接失败用例）。
+func newDepsRigAtURL(t *testing.T, engineURL string, clientTimeout time.Duration) *depsTestRig {
+	t.Helper()
+	pc := engine.NewPythonClientWithTimeout(clientTimeout, engineURL)
+	pc.SetInternalToken("engine-internal-token")
+	rig := &depsTestRig{engineURL: engineURL}
+	rig.mux = http.NewServeMux()
+	registerDepsRoutes(rig.mux, depsIdentityMW, depsIdentityMW, pc)
+	return rig
+}
+
+// depsErrorOf 取出网关返回的 error 文案（统一响应包一层 {success,error}）。
+func depsErrorOf(t *testing.T, body []byte) string {
+	t.Helper()
+	var resp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v (%s)", err, string(body))
+	}
+	return resp.Error
 }
 
 func (r *depsTestRig) seen() ([]string, []string, []string) {
@@ -592,5 +624,183 @@ func TestDepsRestoreSnapshotTakesBusyGate(t *testing.T) {
 	close(release)
 	if code := <-firstDone; code != http.StatusOK {
 		t.Fatalf("第一个请求应成功，得到 %d", code)
+	}
+}
+
+// ── 错误分类矩阵（404 / 401 / 超时 / 连接拒绝 / 5xx）──────────────────────
+//
+// 缺陷背景：修复前这四种失败里有三种都会显示 "python engine unreachable" ——
+// 因为 5xx 走重试、耗尽后的错误串（`request failed after 4 retries: server error 502`）
+// 不匹配 `returned <code>:` 正则，于是落进兜底文案。运维按"引擎挂了/网络不通"去排查，
+// 而引擎其实活着（pip 自己失败），或根本是凭据不一致（401）、只是慢（超时）。
+
+// 404：引擎明确说"没这个路由/任务" —— 原样透传状态码与 detail，不能报不可达。
+func TestDepsEngineNotFoundIsPassedThrough(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"detail":"job not found"}`))
+	})
+	req := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/jobs/abc123", nil), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("上游 404 应透传 404，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if msg := depsErrorOf(t, rec.Body.Bytes()); !strings.Contains(msg, "job not found") {
+		t.Fatalf("引擎 detail 未透出：%q", msg)
+	}
+	if strings.Contains(strings.ToLower(rec.Body.String()), "unreachable") {
+		t.Fatalf("404 不是「不可达」：%s", rec.Body.String())
+	}
+}
+
+// 401：网关→引擎的内部令牌不一致（INTERNAL_TOKEN 配错）。这不是用户请求的问题，
+// 回 401 会让用户以为要重新登录；应当 502 + 明确指出是令牌不一致。
+func TestDepsEngineUnauthorizedIsCredentialMismatch(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"detail":"invalid internal token"}`))
+	})
+	req := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/list", nil), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("引擎 401 应映射成 502，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	msg := depsErrorOf(t, rec.Body.Bytes())
+	if !strings.Contains(msg, "X-Internal-Token") || !strings.Contains(msg, "401") {
+		t.Fatalf("文案应指明内部令牌不一致，实际：%q", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "unreachable") {
+		t.Fatalf("401 是凭据问题，不是不可达：%q", msg)
+	}
+}
+
+// 超时：引擎在跑、只是慢（pip 冷启动/上游抖动）。必须是 504 + "timed out"，且**可重试**。
+//
+// 依赖端点自身超时已放宽到 depsCallTimeout（150s），所以这里用**调用方 ctx 截止**
+// 模拟真实场景里先触发的那条线：http.Server 的 WriteTimeout / 客户端断开。
+func TestDepsEngineTimeoutIsReportedAsTimeout(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"packages":[]}`))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/v1/admin/deps/list", nil).WithContext(
+		auth.WithClaims(ctx, ownerClaims()),
+	)
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("上游超时应映射成 504，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	msg := depsErrorOf(t, rec.Body.Bytes())
+	if !strings.Contains(strings.ToLower(msg), "timed out") {
+		t.Fatalf("文案应说明超时，实际：%q", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "connection failed") {
+		t.Fatalf("超时不是连接失败：%q", msg)
+	}
+}
+
+// 连接拒绝：引擎进程没起 / 地址写错。这才是真正该叫 "unreachable" 的情形。
+func TestDepsEngineConnectionRefusedIsUnreachable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := srv.URL
+	srv.Close() // 端口已关闭：拨号必然被拒
+
+	rig := newDepsRigAtURL(t, deadURL, 2*time.Second)
+	req := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/list", nil), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("连接失败应映射成 502，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	msg := depsErrorOf(t, rec.Body.Bytes())
+	if !strings.Contains(strings.ToLower(msg), "unreachable") || !strings.Contains(strings.ToLower(msg), "connection failed") {
+		t.Fatalf("文案应说明连不上，实际：%q", msg)
+	}
+}
+
+// 上游 5xx 不再走"重试 4 次 + 折成不可达"：只打一次，并把状态码写进文案。
+//
+// 迁移代价也在断言里：pip list 失败时引擎回 502，用户应当看到 502/引擎原因，
+// 而不是"不可达"。
+func TestDepsEngineServerErrorIsNotRetriedAndClassified(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("stack trace with internals"))
+	})
+	req := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/list", nil), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("上游 500 应映射成 502，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "stack trace") {
+		t.Fatalf("上游内部细节不该出现在响应体：%s", rec.Body.String())
+	}
+	msg := depsErrorOf(t, rec.Body.Bytes())
+	if strings.Contains(strings.ToLower(msg), "unreachable") {
+		t.Fatalf("引擎回了 500 说明它活着，不该报不可达：%q", msg)
+	}
+	if !strings.Contains(msg, "500") {
+		t.Fatalf("文案应带上游状态码，实际：%q", msg)
+	}
+	if reqs, _, _ := rig.seen(); len(reqs) != 1 {
+		t.Fatalf("5xx 不该重试（pip 失败重试只会把墙撞 4 遍），实际打了 %d 次：%v", len(reqs), reqs)
+	}
+}
+
+// 502（引擎侧 pip list 失败/超时的形态）要把引擎自己给的原因透出来，
+// 这是排障里唯一有用的一句话。
+func TestDepsEngineBadGatewaySurfacesEngineDetail(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"detail":{"error":"pip list timed out after 30s","output":"..."}}`))
+	})
+	req := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/list", nil), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("应 502，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	msg := depsErrorOf(t, rec.Body.Bytes())
+	if !strings.Contains(msg, "pip list timed out after 30s") {
+		t.Fatalf("引擎原因未透出：%q", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "unreachable") {
+		t.Fatalf("引擎明确回了 502，不是不可达：%q", msg)
+	}
+}
+
+// 依赖管理端点使用**更长**超时：客户端整体超时被配成 50ms 时，list 仍应成功
+// （pip 冷启动远比普通 API 慢，不能被短超时掐掉再报成不可达）。
+func TestDepsListUsesExtendedTimeout(t *testing.T) {
+	rig := newDepsRigWithTimeout(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"python":"3.12.0","packages":[],"count":0}`))
+	}, 50*time.Millisecond)
+
+	req := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/list", nil), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list 应使用较长超时并成功，得到 %d：%s", rec.Code, rec.Body.String())
 	}
 }

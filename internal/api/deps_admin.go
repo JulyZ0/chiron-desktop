@@ -22,12 +22,14 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
@@ -107,25 +109,126 @@ func depsEngineDetail(body string) string {
 
 // depsEngineFailure 把上游错误映射成合适的网关响应。
 //
-// 400/404/409/503 原样透传（那是引擎给出的**业务结论**：参数非法 / 任务不存在 /
-// 已有任务在跑 / 引擎未就绪），其余一律 502 —— 502 的语义是"引擎这一侧出了问题"，
-// 与"你的请求有问题"处置不同。
+// 判据顺序（**必须先分类再取文案**）：
+//
+//  1. 拿到响应 = `engine.UpstreamError`（带状态码）。401/404 之类的**业务结论**原样透传；
+//     5xx 一对一转成可读文案，而不是统统折成 "unreachable"。
+//  2. 没拿到响应 = `engine.TransportError`。再分"超时"（引擎在跑但慢，pip 冷启动）
+//     与"连不上"（进程没起/地址错）—— 这两种的处置完全不同。
+//  3. 其它（本包未分类的错误）：保留旧的错误串解析兜底，文案不猜原因。
+//
+// 修复前的形态：5xx 会走重试，耗尽后错误串是 `request failed after 4 retries:
+// server error 502`，不匹配 `returned <code>:` 正则 ⇒ 一律落到 "python engine
+// unreachable"。而真实情况恰恰是**引擎活着**、pip list 自己失败/超时（引擎回 502）。
 func depsEngineFailure(w http.ResponseWriter, err error) {
-	m := depsEngineStatusRe.FindStringSubmatch(err.Error())
-	if m == nil {
-		logAndRespond(w, err, http.StatusBadGateway, "python engine unreachable")
+	var up *engine.UpstreamError
+	if errors.As(err, &up) {
+		depsUpstreamFailure(w, err, up)
 		return
 	}
-	status, _ := strconv.Atoi(m[1])
-	detail := depsEngineDetail(m[2])
-	switch status {
-	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable:
-		JSON(w, status, APIResponse{Success: false, Error: detail})
+
+	switch engine.FailureKindOf(err) {
+	case engine.FailureTimeout:
+		logAndRespondRetryable(w, err, http.StatusGatewayTimeout,
+			"python engine timed out while running the dependency command — retry shortly (pip cold start can take a while)",
+			boolPtr(true))
+	case engine.FailureUnreachable:
+		logAndRespondRetryable(w, err, http.StatusBadGateway,
+			"python engine unreachable: connection failed (engine process down or address misconfigured)",
+			boolPtr(true))
 	default:
-		// 上游 5xx 不原样回给浏览器（详情进日志），对外统一 502。
-		logAndRespond(w, err, http.StatusBadGateway, "python engine error: "+detail)
+		// 兜底：错误串是旧格式（`python GET <path> returned <code>: <body>`）时
+		// 仍能按状态码处置 —— 本包之外构造的错误、以及历史包装点都走这里。
+		if m := depsEngineStatusRe.FindStringSubmatch(err.Error()); m != nil {
+			status, _ := strconv.Atoi(m[1])
+			depsUpstreamFailure(w, err, &engine.UpstreamError{
+				Method: "<unknown>", Path: "<unknown>", Status: status, Body: m[2],
+			})
+			return
+		}
+		// 响应体解不出来（引擎给了 200 但不是 JSON，常见于反向代理的错误页）：
+		// 这说明"契约对不上"，而不是引擎忙/网络断，文案要能区分。
+		var syn *json.SyntaxError
+		var typ *json.UnmarshalTypeError
+		if errors.As(err, &syn) || errors.As(err, &typ) {
+			logAndRespond(w, err, http.StatusBadGateway,
+				"python engine returned a malformed response (not JSON)")
+			return
+		}
+		logAndRespond(w, err, http.StatusBadGateway, "python engine request failed")
 	}
 }
+
+// depsUpstreamFailure 处理"引擎确实回了非 2xx"的情况。
+//
+// 状态码 → 对外文案（错误码矩阵见下）：
+//
+//	400/404/409 → 原样透传 + 引擎 detail（参数非法 / 路由或任务不存在 / 已有任务）
+//	401/403     → 502 + 提示令牌不一致：这是**网关→引擎**的凭据问题（INTERNAL_TOKEN），
+//	              不是用户请求的问题，回 401 会让用户以为要重新登录
+//	429         → 503 + 可重试：引擎在限流，过一会儿再来
+//	502         → 502 + 引擎 detail（pip list 失败/超时会被引擎包成 502，这条最有信息量）
+//	503         → 503 + detail（引擎自己说未就绪，如 INTERNAL_TOKEN 未配置）
+//	504         → 504 + 可重试（上游超时）
+//	其它 5xx    → 502 笼统文案：**不**透出响应体（可能是堆栈/内部路径）
+func depsUpstreamFailure(w http.ResponseWriter, err error, up *engine.UpstreamError) {
+	// 只信引擎自己产的 JSON 体：代理/反向代理的 HTML 错误页不该被当成用户提示。
+	body, jsonOK := depsEngineBody(up.Body)
+	detail := ""
+	if jsonOK {
+		detail = depsEngineDetail(body)
+	}
+
+	switch up.Status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict:
+		msg := detail
+		if msg == "" {
+			msg = http.StatusText(up.Status)
+		}
+		JSON(w, up.Status, APIResponse{Success: false, Error: msg})
+	case http.StatusUnauthorized, http.StatusForbidden:
+		logAndRespond(w, err, http.StatusBadGateway,
+			"python engine rejected the gateway credentials ("+strconv.Itoa(up.Status)+
+				"): X-Internal-Token mismatch between gateway and engine")
+	case http.StatusTooManyRequests:
+		logAndRespondRetryable(w, err, http.StatusServiceUnavailable,
+			"python engine is throttling gateway requests (429) — retry shortly", boolPtr(true))
+	case http.StatusServiceUnavailable:
+		msg := "python engine not ready (503)"
+		if detail != "" {
+			msg = detail
+		}
+		logAndRespondRetryable(w, err, http.StatusServiceUnavailable, msg, boolPtr(true))
+	case http.StatusGatewayTimeout:
+		logAndRespondRetryable(w, err, http.StatusGatewayTimeout,
+			"python engine timed out (504)", boolPtr(true))
+	case http.StatusBadGateway:
+		msg := "python engine reported a failure (502)"
+		if detail != "" {
+			msg = "python engine error: " + detail
+		}
+		logAndRespond(w, err, http.StatusBadGateway, msg)
+	default:
+		// 其它 5xx：状态码写进文案（运维据此判断是 500 还是别的），响应体不外泄。
+		logAndRespond(w, err, http.StatusBadGateway,
+			"python engine reported an internal error ("+strconv.Itoa(up.Status)+")")
+	}
+}
+
+// depsEngineBody 整份响应体是否是 JSON（引擎产物的最低特征）。
+func depsEngineBody(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", false
+	}
+	var probe map[string]interface{}
+	if json.Unmarshal([]byte(trimmed), &probe) != nil {
+		return "", false
+	}
+	return trimmed, true
+}
+
+func boolPtr(b bool) *bool { return &b }
 
 // auditDeps 记一条审计（成功/失败都要）。
 //
@@ -152,13 +255,52 @@ func (h *DepsHandler) requireEngine(w http.ResponseWriter) bool {
 	return true
 }
 
+// depsCallTimeout 是依赖管理端点单次调用的**最短**整体超时预算。
+//
+// 为什么必须比普通端点长：pip 跑在引擎自己的解释器里，`pip list` 冷启动要扫一遍
+// site-packages（首次可达数十秒），`uninstall` 引擎侧给 120s，恢复快照的批量安装
+// 给到 900s。而网关同步客户端默认整体超时来自 `PYTHON_ENGINE_TIMEOUT`（5 分钟），
+// 在某些部署里会被调小到 30–60s —— 那时"引擎正在正常跑 pip"会被客户端先掐掉，
+// 表现成 `context deadline exceeded`，再被误读成"引擎不可达"。
+//
+// 语义是下界而不是硬值：`depsRequestOptions` 取 max(客户端配置超时, 本值)，
+// 不会把部署方放宽的 `PYTHON_ENGINE_TIMEOUT` 又压回去。
+const depsCallTimeout = 150 * time.Second
+
+// depsRequestOptions 是依赖管理代理调用的统一策略。
+//
+//   - 长超时：见 depsCallTimeout（pip 冷启动慢）。
+//   - 不重试：上游 5xx/429 在这里几乎都是 pip 自身的结论（超时/编译失败），
+//     重试 4 次等于把同一堵墙撞 4 遍 —— 每次都要再等一个 pip 超时，用户看到的是
+//     "转圈两分钟然后报不可达"。
+//   - 不改熔断：这是后台只读/管理工作流，一次失败不该把引擎地址冷却 5s 从而
+//     波及正在进行的对话（会话流式请求与后台刷新共用同一张地址表）。
+func depsRequestOptions(pc *engine.PythonClient) []engine.RequestOption {
+	timeout := depsCallTimeout
+	if pc != nil {
+		if configured := pc.SyncTimeout(); configured > timeout {
+			timeout = configured
+		}
+	}
+	return []engine.RequestOption{
+		engine.WithRequestTimeout(timeout),
+		engine.WithoutRetry(),
+		engine.WithoutCooldown(),
+	}
+}
+
+// opts 便捷入口（handler 内部使用）。
+func (h *DepsHandler) opts() []engine.RequestOption {
+	return depsRequestOptions(h.pythonClient)
+}
+
 // List GET /v1/admin/deps/list
 func (h *DepsHandler) List(w http.ResponseWriter, r *http.Request) {
 	if !h.requireEngine(w) {
 		return
 	}
 	var resp map[string]interface{}
-	if err := h.pythonClient.GetJSON(r.Context(), "/internal/deps/list", &resp); err != nil {
+	if err := h.pythonClient.GetJSON(r.Context(), "/internal/deps/list", &resp, h.opts()...); err != nil {
 		depsEngineFailure(w, err)
 		return
 	}
@@ -184,7 +326,7 @@ func (h *DepsHandler) Search(w http.ResponseWriter, r *http.Request) {
 	}
 	var resp map[string]interface{}
 	if err := h.pythonClient.GetJSON(
-		r.Context(), "/internal/deps/search?q="+url.QueryEscape(q), &resp,
+		r.Context(), "/internal/deps/search?q="+url.QueryEscape(q), &resp, h.opts()...,
 	); err != nil {
 		depsEngineFailure(w, err)
 		return
@@ -223,7 +365,7 @@ func (h *DepsHandler) Install(w http.ResponseWriter, r *http.Request) {
 
 	var resp map[string]interface{}
 	err := h.pythonClient.PostJSON(
-		r.Context(), "/internal/deps/install", map[string]string{"spec": spec}, &resp,
+		r.Context(), "/internal/deps/install", map[string]string{"spec": spec}, &resp, h.opts()...,
 	)
 	if err != nil {
 		auditDeps(r, "deps.install", "pip:"+spec, "install rejected or failed: "+err.Error(), false)
@@ -263,7 +405,7 @@ func (h *DepsHandler) Uninstall(w http.ResponseWriter, r *http.Request) {
 
 	var resp map[string]interface{}
 	err := h.pythonClient.PostJSON(
-		r.Context(), "/internal/deps/uninstall", map[string]string{"name": name}, &resp,
+		r.Context(), "/internal/deps/uninstall", map[string]string{"name": name}, &resp, h.opts()...,
 	)
 	if err != nil {
 		auditDeps(r, "deps.uninstall", "pip:"+name, "uninstall failed: "+err.Error(), false)
@@ -285,7 +427,7 @@ func (h *DepsHandler) Job(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var resp map[string]interface{}
-	if err := h.pythonClient.GetJSON(r.Context(), "/internal/deps/jobs/"+escSeg(id), &resp); err != nil {
+	if err := h.pythonClient.GetJSON(r.Context(), "/internal/deps/jobs/"+escSeg(id), &resp, h.opts()...); err != nil {
 		depsEngineFailure(w, err)
 		return
 	}
@@ -301,7 +443,7 @@ func (h *DepsHandler) ListSnapshots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var resp map[string]interface{}
-	if err := h.pythonClient.GetJSON(r.Context(), "/internal/deps/snapshots", &resp); err != nil {
+	if err := h.pythonClient.GetJSON(r.Context(), "/internal/deps/snapshots", &resp, h.opts()...); err != nil {
 		depsEngineFailure(w, err)
 		return
 	}
@@ -334,7 +476,7 @@ func (h *DepsHandler) CreateSnapshot(w http.ResponseWriter, r *http.Request) {
 
 	var resp map[string]interface{}
 	err := h.pythonClient.PostJSON(
-		r.Context(), "/internal/deps/snapshots", map[string]string{"label": label}, &resp,
+		r.Context(), "/internal/deps/snapshots", map[string]string{"label": label}, &resp, h.opts()...,
 	)
 	if err != nil {
 		auditDeps(r, "deps.snapshot", "pip:snapshot", "snapshot failed: "+err.Error(), false)
@@ -387,6 +529,7 @@ func (h *DepsHandler) RestoreSnapshot(w http.ResponseWriter, r *http.Request) {
 		"/internal/deps/snapshots/"+escSeg(id)+"/restore",
 		map[string]bool{"dry_run": body.DryRun},
 		&resp,
+		h.opts()...,
 	)
 	if err != nil {
 		if !body.DryRun {
