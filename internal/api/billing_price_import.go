@@ -278,11 +278,16 @@ func readPriceImportPayload(w http.ResponseWriter, r *http.Request) (string, []b
 		return readMultipartPriceImport(w, r)
 	}
 
+	// 自己限长而不用 `DecodeJSON`：它固定 1MB，而 2000 行 JSON（每行带完整字段）
+	// 可能超过 —— 那会把一个合法批次报成 "invalid request body"，且看不出原因。
+	r.Body = http.MaxBytesReader(w, r.Body, priceImportMaxBytes)
 	var body struct {
 		Format string          `json:"format"`
 		Data   json.RawMessage `json:"data"`
 	}
-	if err := DecodeJSON(w, r, &body); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
 		return "", nil, errors.New("invalid request body")
 	}
 	format := normalizePriceImportFormat(body.Format)
