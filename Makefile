@@ -123,10 +123,7 @@ docker-run:
 
 .PHONY: all build run clean test lint fmt dev dev-up dev-up-scale dev-down \
 	docs-check check-go check check-py check-web check-all smoke smoke-fast \
-<<<<<<< HEAD
 	release-ready integration integration-static \
-=======
 	integration integration-static verify-after-build verify-after-build-json \
->>>>>>> worktree-agent-general-purpose-0dcfe789
 	docker-build docker-run
 
