@@ -99,12 +99,26 @@ class _SECURITY_CAPABILITIES(ctypes.Structure):  # noqa: N801 — 沿用 Windows
 
 @dataclass(frozen=True)
 class LaunchResult:
-    """一次受限执行的结果。`spawn_error` 非空表示**进程都没起来**，与"起来了但失败"分开。"""
+    """一次受限执行的结果。`spawn_error` 非空表示**进程都没起来**，与"起来了但失败"分开。
+
+    `token_*` 三个字段是 P0-1 的观测口：受限进程**实际**以哪个用户身份运行。
+    它们来自子进程令牌（`process_identity`），不是"我打算用谁的令牌"——
+    打算与事实的差别正是这次修复要钉住的东西。
+
+    * `token_target` —— `"caller"`（调用方用户）/ `"self"`（本进程，可能是提权的 helper）；
+    * `token_user_sid` —— 子进程令牌的用户 SID（取不到为空串）；
+    * `token_elevated` —— 子进程令牌是否提权；
+    * `degrade_reason` —— 为什么没能降到调用方身份（`token_target_unavailable` 等）。
+    """
 
     exit_code: int | None
     stdout: str
     stderr: str
     spawn_error: str = ""
+    token_target: str = ""
+    token_user_sid: str = ""
+    token_elevated: bool = False
+    degrade_reason: str = ""
 
     @property
     def started(self) -> bool:
@@ -270,20 +284,33 @@ def _advapi() -> Any:
 #:    `WinNullSid` 放进 `SidsToRestrict`，所以这条 ACE 是受限子进程能打开桌面的前提。
 #:    注意它**不能**代替第 1 条：NULL SID 不匹配普通（未受限）主体。
 #: 3. **SY / BA** —— 服务账户与管理员会话的正常路径。
-_DESKTOP_SDDL_TEMPLATE = "D:(A;;GA;;;{user})(A;;GA;;;S-1-0-0)(A;;GA;;;SY)(A;;GA;;;BA)"
+#:
+#: `{extra}` 是 P0-1 之后新增的一格：受限进程现在以**调用方**身份运行，而调用方
+#: 在"标准用户 + 输入管理员凭据"的 UAC 路径下与 helper **不是同一个账户**。
+#: 桌面 DACL 只授权 helper 自己（管理员），那个子进程连自己所在的桌面都打不开 ——
+#: 表现是 `CreateProcessAsUserW` 成功、进程启动后立刻退出且没有任何输出。
+_DESKTOP_SDDL_TEMPLATE = "D:(A;;GA;;;{user}){extra}(A;;GA;;;S-1-0-0)(A;;GA;;;SY)(A;;GA;;;BA)"
 
 _desktop_handle: Any = None
 _desktop_error: str = ""
 #: 实际使用的桌面名。多实例场景下可能不是 `win_token.DESKTOP_NAME`（见 `ensure_desktop`）。
 _desktop_name: str = win_token.DESKTOP_NAME
+#: 创建桌面时被显式授予完全控制的 SID 集合（当前用户之外的那些）。
+_desktop_sids: set[str] = set()
 
 
-def _desktop_sddl() -> str:
-    """按当前用户构造桌面 DACL。取不到用户 SID 返回空串（宁可失败也不要无权桌面）。"""
+def _desktop_sddl(extra_user_sid: str = "") -> str:
+    """按当前用户（与可选的调用方用户）构造桌面 DACL。
+
+    取不到当前用户 SID 返回空串（宁可失败也不要无权桌面）。
+    """
     user = win_token.current_user_sid()
     if not user:
         return ""
-    return _DESKTOP_SDDL_TEMPLATE.format(user=user)
+    extra = ""
+    if extra_user_sid and extra_user_sid != user:
+        extra = f"(A;;GA;;;{extra_user_sid})"
+    return _DESKTOP_SDDL_TEMPLATE.format(user=user, extra=extra)
 
 
 def _create_or_open_desktop(name: str, sddl: str) -> tuple[Any, str]:
@@ -340,8 +367,12 @@ def _create_or_open_desktop(name: str, sddl: str) -> tuple[Any, str]:
     )
 
 
-def ensure_desktop() -> tuple[bool, str]:
+def ensure_desktop(extra_user_sid: str = "") -> tuple[bool, str]:
     """创建（或复用）独立桌面 `ChironSandbox`。成功返回 `(True, "")`。
+
+    `extra_user_sid` 是**调用方**的用户 SID（P0-1：受限进程以调用方身份运行）。
+    当它与本进程用户不同（标准用户 + UAC 输入管理员凭据）时，桌面 DACL 必须
+    显式包含它，否则子进程打不开自己所在的桌面。
 
     句柄在本进程内缓存并不主动关闭：桌面在**创建它的进程退出时**自动销毁，
     这正是我们要的语义（引擎重启 ⇒ 桌面重建，不残留）。
@@ -356,15 +387,49 @@ def ensure_desktop() -> tuple[bool, str]:
     if not win.IS_WINDOWS:
         return False, "not windows"
     if _desktop_handle:
+        if extra_user_sid and extra_user_sid not in _desktop_sids:
+            # 桌面 DACL 在创建时定死，事后补 ACE 需要重开安全描述符，风险大于收益。
+            # 如实告警：子进程可能"起得来但打不开桌面"，而这条日志是唯一线索。
+            logger.warning(
+                "独立桌面 %s 的 DACL 不含 SID %s（桌面先于该身份创建），"
+                "以该身份运行的子进程可能无法打开桌面",
+                _desktop_name,
+                extra_user_sid,
+            )
         return True, ""
     if _desktop_error:
         return False, _desktop_error
 
-    sddl = _desktop_sddl()
+    sddl = _desktop_sddl(extra_user_sid)
     if not sddl:
         _desktop_error = "无法取得当前用户 SID，拒绝创建权限不明的桌面"
         logger.warning("ensure_desktop: %s", _desktop_error)
         return False, _desktop_error
+
+    base = win_token.DESKTOP_NAME
+    candidates = [base, f"{base}-{os.getpid()}"]
+    errors: list[str] = []
+    first_error = ""
+    for name in candidates:
+        handle, err = _create_or_open_desktop(name, sddl)
+        if handle:
+            _desktop_handle = handle
+            _desktop_name = name
+            if extra_user_sid:
+                _desktop_sids.add(extra_user_sid)
+            if first_error:
+                logger.warning(
+                    "独立桌面 %s 不可用（%s），改用 %s", base, first_error, name
+                )
+            logger.info("独立桌面已就绪: %s", name)
+            return True, ""
+        errors.append(err)
+        if not first_error:
+            first_error = err
+
+    _desktop_error = "；".join(errors)
+    logger.warning("ensure_desktop: %s", _desktop_error)
+    return False, _desktop_error
 
     base = win_token.DESKTOP_NAME
     candidates = [base, f"{base}-{os.getpid()}"]
@@ -424,6 +489,8 @@ def launch_restricted(
     env: dict[str, str],
     timeout: float = 60.0,
     max_output: int = 1_000_000,
+    target_pid: int | None = None,
+    expect_creation_time: int | None = None,
 ) -> LaunchResult:
     """以受限令牌 + 独立桌面启动 `argv`，等待其结束并取回输出。
 
@@ -445,6 +512,11 @@ def launch_restricted(
     `tests/test_isolation_restricted_enable.py` 的
     `test_elevated_process_never_goes_through_the_helper` 钉住这个顺序。
 
+    `target_pid` 是 **P0-1** 的入口：由 helper 在调用本函数时填入它记录的
+    调用方（引擎）pid，于是受限令牌派生自**调用方令牌**，子进程的用户身份
+    就是调用方用户，而不是 helper 的提权身份。`None` 表示"用本进程令牌"
+    （引擎自己已提权时的情形，此时调用方就是本进程）。
+
     两条路径都失败时才返回 `spawn_error`。**绝不**退回无隔离执行 ——
     `spawn_error` 非空就是"拒绝执行"。
 
@@ -459,7 +531,13 @@ def launch_restricted(
         # 本进程已有 SeIncreaseQuotaPrivilege：多绕一跳 helper 只会更慢，
         # 而且在 helper 进程内绕回自己会成环（见上面的说明）。
         return _launch_restricted_local(
-            argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output
+            argv,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            max_output=max_output,
+            target_pid=target_pid,
+            expect_creation_time=expect_creation_time,
         )
 
     helper_result = _via_helper(argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output)
@@ -472,7 +550,13 @@ def launch_restricted(
     # 非提权下这里会稳定 err=5，但那条错误串带 Win32 细节，比"helper 不可用"
     # 更能说明"到底是谁没做成"。
     return _launch_restricted_local(
-        argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output
+        argv,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        max_output=max_output,
+        target_pid=target_pid,
+        expect_creation_time=expect_creation_time,
     )
 
 
@@ -613,6 +697,32 @@ def helper_status() -> dict[str, Any]:
     }
 
 
+def _restricted_token_for(
+    target_pid: int | None, expect_creation_time: int | None
+) -> tuple[win_token.TargetToken, str]:
+    """取得受限令牌并断言"身份"字段。返回 `(TargetToken, 错误)`。
+
+    把"取令牌"收成一个点，是为了让 P0-1 的不变量**只有一条路**可走：
+    所有需要受限令牌的本地启动都从这里拿，谁也不能偷偷改回"用自己的令牌"。
+    """
+    target = win_token.restricted_token_for_caller(
+        target_pid, expect_creation_time=expect_creation_time
+    )
+    if target.token is None:
+        return target, f"受限令牌无法创建（{target.detail or '未知原因'}）"
+    if target.reason:
+        # 降级是**允许**的（限制性 SID 仍然生效），但绝不允许静默。
+        logger.warning(
+            "受限进程未能降到调用方身份（pid=%s）：%s —— %s；"
+            "限制性 SID 仍生效，但用户身份是本进程（%s）",
+            target_pid,
+            target.reason,
+            target.detail or "原因未给出",
+            target.user_sid or "未知",
+        )
+    return target, ""
+
+
 def _launch_restricted_local(
     argv: list[str],
     *,
@@ -620,26 +730,41 @@ def _launch_restricted_local(
     env: dict[str, str],
     timeout: float,
     max_output: int,
+    target_pid: int | None = None,
+    expect_creation_time: int | None = None,
 ) -> LaunchResult:
     """在本进程内直接用 `CreateProcessAsUserW` 建进程。
 
-    需要 `SeIncreaseQuotaPrivilege`，因此只在引擎本身已提权时才可能成功。
-    非提权下稳定 `err=5` —— 这是本机实测结论，不是推断。
+    需要 `SeIncreaseQuotaPrivilege`，因此只在引擎本身已提权（或本进程就是
+    提权 helper）时才可能成功。非提权下稳定 `err=5` —— 这是本机实测结论。
+
+    受限令牌来自 `_restricted_token_for`：`target_pid` 非空时派生自**调用方**
+    的令牌，子进程的用户身份因此是调用方用户，而不是本进程（可能是管理员）。
     """
     if not win.IS_WINDOWS:
         return LaunchResult(None, "", "", "not windows")
     if not argv:
         return LaunchResult(None, "", "", "empty argv")
 
-    made = win_token.create_restricted_token()
-    if made is None:
-        return LaunchResult(None, "", "", "受限令牌无法创建")
-    token, _sid = made
+    target, terr = _restricted_token_for(target_pid, expect_creation_time)
+    if target.token is None:
+        return LaunchResult(None, "", "", terr, degrade_reason=target.reason)
+    token = target.token
+    # 启动前的"身份打算"。进程起来之后会用子进程令牌的**实测值**覆盖（见下）。
+    meta = {
+        "token_target": target.source,
+        "token_user_sid": target.user_sid,
+        "token_elevated": target.elevated,
+        "degrade_reason": target.reason,
+    }
 
-    ok, derr = ensure_desktop()
+    # 桌面 DACL 必须覆盖实际的运行身份：调用方为另一账户时（标准用户 + UAC）
+    # 只授权 helper 自己会让子进程打不开桌面。
+    desktop_extra = target.user_sid if target.source == "caller" else ""
+    ok, derr = ensure_desktop(desktop_extra)
     if not ok:
         win_token._k32().CloseHandle(token)  # noqa: SLF001
-        return LaunchResult(None, "", "", f"独立桌面不可用: {derr}")
+        return LaunchResult(None, "", "", f"独立桌面不可用: {derr}", **meta)
 
     k32, adv = _k32(), _advapi()
     sa = _SECURITY_ATTRIBUTES(
@@ -689,7 +814,27 @@ def _launch_restricted_local(
         )
         if not started:
             return LaunchResult(
-                None, "", "", f"CreateProcessAsUserW 失败 err={ctypes.get_last_error()}"
+                None,
+                "",
+                "",
+                f"CreateProcessAsUserW 失败 err={ctypes.get_last_error()}",
+                **meta,
+            )
+
+        # **实测身份**：读子进程自己的令牌，而不是相信上面的"打算"。
+        # 这是 P0-1 不变量的唯一可信来源（测试与状态接口都看它）。
+        child_sid, child_elevated = win_token.process_identity(int(pi.dwProcessId))
+        if child_sid:
+            meta["token_user_sid"] = child_sid
+            meta["token_elevated"] = child_elevated
+        if win_token.is_administrator_identity(meta["token_user_sid"], meta["token_elevated"]):
+            logger.warning(
+                "受限进程以管理员身份运行（pid=%s sid=%s elevated=%s target=%s）："
+                "限制性 SID 只约束写访问，读权限与用户身份仍是管理员",
+                int(pi.dwProcessId),
+                meta["token_user_sid"],
+                meta["token_elevated"],
+                meta["token_target"],
             )
 
         # 子进程已持有写端，父进程必须立刻关掉，否则 ReadFile 等不到 EOF
@@ -706,14 +851,14 @@ def _launch_restricted_local(
         if waited != WAIT_OBJECT_0:
             k32.TerminateProcess(pi.hProcess, 124)
             k32.WaitForSingleObject(pi.hProcess, 5000)
-            return LaunchResult(124, stdout, stderr)
+            return LaunchResult(124, stdout, stderr, **meta)
 
         code = wt.DWORD()
         k32.GetExitCodeProcess(pi.hProcess, ctypes.byref(code))
-        return LaunchResult(int(code.value), stdout, stderr)
+        return LaunchResult(int(code.value), stdout, stderr, **meta)
     except Exception as exc:  # noqa: BLE001 — 任何异常都按"起不来"处理
         logger.warning("launch_restricted 异常", exc_info=True)
-        return LaunchResult(None, "", "", f"launch_restricted 异常: {exc}")
+        return LaunchResult(None, "", "", f"launch_restricted 异常: {exc}", **meta)
     finally:
         for handle in (out_w, err_w, out_r, err_r, pi.hProcess, pi.hThread, token):
             if handle:
@@ -1530,13 +1675,15 @@ def exec_error() -> str:
 def reset_probe() -> None:
     """清缓存，供测试与运行时切换档位后重新探测。"""
     global _smoke_ok, _smoke_error, _desktop_handle, _desktop_error, _desktop_name
-    global _appcontainer_ok, _appcontainer_error
+    global _appcontainer_ok, _appcontainer_error, _desktop_sids
     _smoke_ok = None
     _smoke_error = ""
     _desktop_handle = None
     _desktop_error = ""
     # 名字一并复位：上次可能退到了带 pid 的名字，重新探测应当从首选名字开始。
     _desktop_name = win_token.DESKTOP_NAME
+    # 桌面会被重建，之前授予的额外 SID 随旧桌面一起消失。
+    _desktop_sids = set()
     # AppContainer 的探测结果同样要清：重新探测的前提是"上次的结论不再可信"。
     _appcontainer_ok = None
     _appcontainer_error = ""

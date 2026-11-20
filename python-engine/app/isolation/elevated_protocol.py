@@ -29,9 +29,29 @@ import os
 from pathlib import Path
 from typing import Any
 
-#: 协议版本。helper 与引擎版本不一致时**拒绝**而不是尽力解析：
-#: 半懂不懂地解析一条"起进程"指令，比直接拒绝危险得多。
-PROTOCOL_VERSION = 1
+#: 协议版本。
+#:
+#: * **v1** —— 首版。请求只有 `argv` / `cwd` / `env` / `timeout` / `max_output`；
+#:   helper 用**自己**（已提权）的令牌派生受限令牌 ⇒ 子进程的用户身份是管理员。
+#: * **v2** —— P0-1：请求新增 `protocol` / `caller_pid`；helper 用**调用方令牌**
+#:   派生受限令牌，响应新增 `token_target` / `token_user_sid` / `token_elevated` /
+#:   `degrade_reason`。身份由 helper 启动时记录的父进程决定，`caller_pid` 只做
+#:   交叉校验，**不作为身份来源**。
+#:
+#: 版本不一致时引擎侧**拒绝**而不是尽力解析：半懂不懂地解析一条"起进程"指令，
+#: 比直接拒绝危险得多。但 v1 helper 仍在 `MIN_COMPATIBLE_PROTOCOL` 之内 ——
+#: 它只是无法降权，引擎会把 `degrade_reason=token_target_unavailable` 记下来
+#: 并在提示里让用户重启助手升级。
+PROTOCOL_VERSION = 2
+
+#: 仍可通话的最低版本。低于它的 helper/引擎必须被拒绝。
+MIN_COMPATIBLE_PROTOCOL = 1
+
+#: 降级理由字面量（与 `win_token.TOKEN_TARGET_UNAVAILABLE` 同值）。
+#:
+#: 放在协议层是因为它要**上线**：引擎从响应里读、或自己判定后写进
+#: `LaunchResult.degrade_reason`，两侧必须用同一个字符串。
+REASON_TOKEN_TARGET_UNAVAILABLE = "token_target_unavailable"
 
 #: 请求/响应都以单行 JSON 传输，这里是单帧上限。
 #:
@@ -123,6 +143,52 @@ def encode_frame(payload: dict[str, Any]) -> bytes:
     return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
 
 
+def compatible(version: Any) -> bool:
+    """对端协议版本是否在可通话范围内（`MIN_COMPATIBLE_PROTOCOL..PROTOCOL_VERSION`）。"""
+    try:
+        value = int(version)  # `None` / 字符串 / float 都在这里归一
+    except (TypeError, ValueError):
+        return False
+    return MIN_COMPATIBLE_PROTOCOL <= value <= PROTOCOL_VERSION
+
+
+def incompatible_reason(version: Any) -> str:
+    """版本不可用时**可行动**的说明；版本可用时返回空串。
+
+    只写"版本不一致"没有用 —— 用户能做的动作只有一个：让助手重启，
+    引擎会拉起当前版本的 helper。这句话必须出现在 `reasons` 与设置页里。
+    """
+    if compatible(version):
+        return ""
+    return (
+        f"提权助手协议版本 {version} 与引擎 {PROTOCOL_VERSION} 不兼容"
+        f"（支持 {MIN_COMPATIBLE_PROTOCOL}..{PROTOCOL_VERSION}）——"
+        "请在设置页停用后重新启用「受限令牌执行助手」，引擎会拉起当前版本的助手"
+    )
+
+
+def degrade_note(version: Any) -> str:
+    """旧版本（可通话但功能不足）的降级说明；无需降级时返回空串。
+
+    v1 helper 不认识 `caller_pid`，只能用**自己的**提权令牌派生受限令牌 ⇒
+    子进程的用户身份仍是管理员。这不是拒绝执行的理由（隔离仍在），
+    但必须记录成 `token_target_unavailable`，否则"降权"就成了口头承诺。
+    """
+    if not compatible(version):
+        return ""
+    try:
+        value = int(version)
+    except (TypeError, ValueError):  # pragma: no cover - compatible() 已挡掉
+        return ""
+    if value >= PROTOCOL_VERSION:
+        return ""
+    return (
+        f"提权助手协议版本 {value} 低于引擎 {PROTOCOL_VERSION}："
+        "该助手只能用自身（可能已提权）的令牌起受限进程，无法按调用方身份降权；"
+        f"请在设置页停用后重新启用助手升级到 v{PROTOCOL_VERSION}"
+    )
+
+
 def read_key(path: Path | None = None) -> bytes | None:
     """读共享密钥。不存在或长度不对都返回 `None`（调用方据此判"helper 不可用"）。"""
     target = path or key_path()
@@ -173,12 +239,17 @@ __all__ = [
     "KEY_BYTES",
     "LOOPBACK",
     "MAX_FRAME_BYTES",
+    "MIN_COMPATIBLE_PROTOCOL",
     "PING_TIMEOUT_SECONDS",
     "PROTOCOL_VERSION",
+    "REASON_TOKEN_TARGET_UNAVAILABLE",
     "SIGNATURE_HEADER",
     "SOCKET_TIMEOUT_SECONDS",
+    "compatible",
+    "degrade_note",
     "encode_frame",
     "helper_state_dir",
+    "incompatible_reason",
     "key_path",
     "port_path",
     "read_key",

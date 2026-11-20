@@ -203,11 +203,18 @@ def captured_launch(monkeypatch, tmp_path):
     `_handle_exec` 的唯一出口必须是 `launch_restricted`。替身在这里的作用是
     **证明**它确实走那条路 —— 如果哪天有人加了一条直接执行的捷径，这个测试
     会看到替身没被调用而变红。
+
+    替身接收 `**kwargs`：调用方现在还会下发 `target_pid` / `expect_creation_time`
+    （调用方身份，P0-1），签名写死会让"新增一个参数"变成"整组测试失败"。
     """
     seen: dict[str, object] = {}
+    # 调用方身份是模块级全局；不清会让上一个用例（或真实 serve）的记录带进来。
+    monkeypatch.setattr(helper, "_caller", None)
 
-    def fake_launch(argv, *, cwd, env, timeout, max_output):
-        seen.update(argv=argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output)
+    def fake_launch(argv, *, cwd, env, timeout, max_output, **kwargs):
+        seen.update(
+            argv=argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output, **kwargs
+        )
         return win_launch.LaunchResult(0, "out", "", "")
 
     monkeypatch.setattr(win_launch, "launch_restricted", fake_launch)
@@ -220,7 +227,15 @@ def test_valid_request_goes_through_restricted_launch(captured_launch):
 
     payload = helper._handle_exec(_launch_args(cwd=str(workspace)))
 
-    assert payload == {
+    # 身份字段（protocol / token_* / caller_user_sid）随协议 v2 新增，
+    # 旧引擎只读前五个键，因此这里是"包含"断言而不是整体相等。
+    assert {
+        "started": payload["started"],
+        "spawn_error": payload["spawn_error"],
+        "exit_code": payload["exit_code"],
+        "stdout": payload["stdout"],
+        "stderr": payload["stderr"],
+    } == {
         "started": True,
         "spawn_error": "",
         "exit_code": 0,
