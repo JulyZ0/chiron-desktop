@@ -242,6 +242,25 @@ def _interaction_ttl_seconds() -> int:
     return max(int(_interaction_wait_seconds()), min(ttl, 30 * 24 * 3600))
 
 
+def knowledge_context_timeout() -> float:
+    """知识库检索注入的等待上限，秒（`KNOWLEDGE_CONTEXT_TIMEOUT`）。
+
+    与 `knowledge_service_timeout` 同口径（默认 120s）：PageIndex 的 chat 是**分钟级**
+    的推理式检索，上限比它小就等于把"选了库"变成"永远超时"；没有上限则一次卡死的
+    检索会把整轮对话钉住（网关单轮超时到点只会给出一个没有任何说明的失败）。
+
+    非法值/0 一律回落到默认值 —— 配错的人不会去读注释，而 0 会变成"立刻超时"。
+    """
+    raw = (os.getenv("KNOWLEDGE_CONTEXT_TIMEOUT") or "").strip()
+    try:
+        value = float(raw) if raw else float(
+            getattr(settings, "knowledge_service_timeout", 120.0) or 120.0
+        )
+    except (TypeError, ValueError):
+        value = 120.0
+    return max(1.0, value)
+
+
 def _decision_key_ttl_seconds() -> int:
     """跨副本决策键 / 审批票据的 Redis TTL，秒。
 
@@ -2027,6 +2046,62 @@ class AgentRuntime:
                     len(messages),
                 )
 
+    async def _inject_knowledge_context(self, task: AgentTask) -> None:
+        """把对话里选中的知识库检索进 `task.knowledge_context`（B 断点的修复点）。
+
+        * 没选库 ⇒ 什么都不做（`task.knowledge_context` 保持空串 ⇒ 段不存在 ⇒ 零行为变化）；
+        * 选了库但 0 命中 ⇒ 注入"已检索、无命中"的说明（**不能静默**：否则模型会自信瞎答，
+          用户还会以为库里没文档）；
+        * 单个库失败 ⇒ 其余库照常注入，失败原因进日志 + 注入文本（可见但不致命）。
+
+        检索本身在 `app/agent/knowledge_context.py`（可注入 retriever，便于单测）。
+
+        **为什么是同步等待（会推迟首字）**：PageIndex 是推理式检索（分钟级 LLM 工具循环），
+        放到后台再"稍后插入"是不可能的 —— 上下文在第一次 LLM 调用时就定形了，事后插入
+        等于没插。所以宁可推迟首字，也不能让用户以为"选了库却没用上"。为了不让一次
+        卡死的检索把整轮对话钉住，这里给一个**上限**（`KNOWLEDGE_CONTEXT_TIMEOUT`，
+        默认与 `knowledge_service_timeout` 同口径）；超时同样会**留下可读的注入文本**。
+        """
+        from app.agent import knowledge_context as kb_ctx
+
+        kb_ids = kb_ctx.kb_ids_of(task.workbench_context)
+        if not kb_ids:
+            return
+        try:
+            injection = await asyncio.wait_for(
+                kb_ctx.collect(
+                    kb_ids,
+                    task.content,
+                    user_id=str(task.user_id or ""),
+                    tenant_id=to_tenant_int(task.tenant_id or ""),
+                ),
+                timeout=knowledge_context_timeout(),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("kb context injection timed out (%s)", kb_ids)
+            task.knowledge_context = (
+                f"【知识库检索】用户选中的知识库（{', '.join(kb_ids)}）检索超时"
+                f"（>{int(knowledge_context_timeout())}s）。请如实告诉用户这次没等到检索结果，"
+                "不要编造库里的内容。"
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — 检索是增强，绝不能让整轮对话失败
+            logger.warning("kb context injection skipped (%s): %s", kb_ids, exc)
+            task.knowledge_context = (
+                f"【知识库检索】用户选中的知识库（{', '.join(kb_ids)}）检索过程出错：{exc}。"
+                "请如实说明这次没能读到库内容，不要臆测。"
+            )
+            return
+        if not injection.block:
+            return
+        task.knowledge_context = injection.block
+        from app.tools.context import set_tool_context as _set_ctx
+
+        _set_ctx(knowledge_kb_ids=kb_ctx.kb_ids_of(task.workbench_context))
+        logger.info(
+            "kb context injected (session=%s %s)", getattr(task, "session_id", ""), injection.summary()
+        )
+
     async def run(self, task: AgentTask) -> AsyncIterator[AgentEvent]:
         """
         执行 Agent 推理循环
@@ -2495,6 +2570,15 @@ class AgentRuntime:
             # 数据面声明（autoloop §1）：只看本轮工具集是否含外部来源工具。
             # 不含 ⇒ 空串 ⇒ system 段与引入前逐字相同。
             _data_plane_policy = render_data_plane_policy(_tool_names)
+            # ── 1.6 知识库检索（B 修复）──
+            # 用户在对话里 `@` 选了库，就必须**真的**进上下文：这条链路（/v1/agent/submit
+            # → AgentRuntime.run）此前从未读过 `workbench_context.kb_ids`，于是选了库却
+            # 什么都没注入 —— 回答里自然没有任何库内容。
+            #
+            # 放在 system 段定形**之前**：注入走独立的 system 消息（`KNOWLEDGE` 段），
+            # 与记忆同款处置 —— 逐轮变化的内容不能拼进逐字稳定的前缀（缓存会整段失效）。
+            await self._inject_knowledge_context(task)
+
             # G-P1：本轮 system 段的分段视图（段名 → 内容）。定形时顺手填充，供回合末的
             # `_prefix_change` 做**按名 diff** —— 诊断要能回答"哪一段变了"。
             _system_sections: dict[str, str] = {}

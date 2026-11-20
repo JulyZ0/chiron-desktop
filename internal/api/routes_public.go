@@ -48,6 +48,12 @@ func registerPublicEndpoints(
 	// 引擎配置下发（X-Internal-Token 保护，Python 引擎启动拉取）
 	mux.Handle("GET /v1/internal/engine-config", rlMW(internalTokenMW(cfg, EngineConfig(cfg))))
 
+	// 知识库检索服务的**模型来源**（权威层 = llm_models + llm_provider_keys）。
+	// 启动器（run.py / Electron local-stack）在拉起 pageindex-service 之前调它，
+	// 把模型/端点/key 注入该进程的 env —— 否则用户明明在 /models 配了模型，
+	// 检索服务的 /healthz 仍报"未配置自托管模型"（见 knowledge_model.go）。
+	mux.Handle("GET /v1/internal/knowledge-model", rlMW(internalTokenMW(cfg, KnowledgeModel(cfg))))
+
 	// 知识库运行模式下发（本地模式 / 外部 pageindex 服务）：引擎启动与订阅重连时拉取。
 	// 与上面的 engine-config 分开是因为它属于 `knowledge` 分类，同时被后台页面与
 	// Redis 广播消费 —— 两处必须读同一份数据（见 internal/api/engine_config.go）。

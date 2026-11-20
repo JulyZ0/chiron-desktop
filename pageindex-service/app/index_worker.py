@@ -78,6 +78,16 @@ async def handle_kb_index(
             await store.set_kb_status(kb_id, "error", detail)
             return {"status": "error", "detail": detail}
 
+    # 模型解析（env → 网关 /models）：桌面单机的模型只在网关 PG 里配过，
+    # 只看 env 会让 worker 拿着空模型名去提交文档，报错点埋在 SDK 深处。
+    from app import models as models_mod
+
+    resolved = await models_mod.resolve(cfg)
+    if mode == "selfhosted" and not resolved.ready():
+        detail = models_mod.unavailable_detail(resolved)
+        await store.set_kb_status(kb_id, "error", detail)
+        return {"status": "error", "detail": detail}
+
     ctx = RequestContext(
         kb_id=kb_id,
         tenant_id=str(kb["tenant_id"] or ""),
@@ -85,9 +95,11 @@ async def handle_kb_index(
         index_ref=str(kb["index_ref"] or ""),
         user_folder_id=cloud_folder,
         api_key=api_key,
-        llm=cfg.llm_backend() if mode == "selfhosted" else {},
+        # LLM 连接与模型同源（resolved 是 env → 网关 /models 的结果）：
+        # 只取 cfg.llm_backend() 会漏掉"端点/key 只在网关里配过"的那份配置。
+        llm=(resolved.llm_backend() if mode == "selfhosted" else {}),
     )
-    adapter = Adapter(mode=mode, cfg=cfg)
+    adapter = Adapter(mode=mode, cfg=cfg, models=resolved)
     await store.set_kb_status(kb_id, "indexing")
 
     # 1) 位置（Cloud 的两层 folder / local 的租户-库目录）
