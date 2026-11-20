@@ -310,6 +310,10 @@ type checkpointStats struct {
 
 // checkCheckpoints 查 project_checkpoints 的近 24h 失败数、最近成功时间，
 // 以及近 7 天有活动但没有任何检查点的会话数（按 tenant 过滤）。
+//
+// "会话"要同时看 `sessions`（代码/桌面会话）与 `unified_sessions`（统合执行器）：
+// 只查一边会在另一种会话上恒定返回 0，把一个真实的"检查点根本没在写"显示成全绿。
+// 两张表共用 id 空间时 UNION 会去重，不会重复计数。
 func (h *AdminHandler) checkCheckpoints(ctx context.Context, claims *auth.Claims) DiagSummaryCheck {
 	if db.Pool == nil {
 		return checkpointsItem(checkpointStats{}, errDiagnosticsNoDB)
@@ -340,14 +344,21 @@ SELECT
      FROM project_checkpoints c
     WHERE ($1::smallint = 0 OR c.tenant_id = $1::smallint)
       AND c.state = 'ok'),
-  (SELECT COUNT(*) FROM sessions s
-    WHERE s.updated_at IS NOT NULL
-      AND s.updated_at > now() - interval '7 days'
-      AND ($1::smallint = 0 OR s.tenant_id = $1::smallint)
-      AND NOT EXISTS (
-        SELECT 1 FROM project_checkpoints c
-         WHERE c.session_id = s.id
-           AND c.created_at > now() - interval '7 days'))`
+  (SELECT COUNT(*) FROM (
+     SELECT s.id AS sid, s.tenant_id AS tid FROM sessions s
+      WHERE s.updated_at IS NOT NULL
+        AND s.updated_at > now() - interval '7 days'
+        AND ($1::smallint = 0 OR s.tenant_id = $1::smallint)
+     UNION
+     SELECT u.id AS sid, u.tenant_id AS tid FROM unified_sessions u
+      WHERE u.updated_at IS NOT NULL
+        AND u.updated_at > now() - interval '7 days'
+        AND ($1::smallint = 0 OR u.tenant_id = $1::smallint)
+   ) recent
+   WHERE NOT EXISTS (
+     SELECT 1 FROM project_checkpoints c
+      WHERE c.session_id = recent.sid
+        AND c.created_at > now() - interval '7 days'))`
 
 	stats := checkpointStats{Tenant: tenantLabel}
 	if err := db.Pool.QueryRow(ctx, q, tenantID).Scan(
