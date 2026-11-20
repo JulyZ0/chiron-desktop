@@ -540,6 +540,45 @@ export async function getDiagnostics(): Promise<DiagnosticsReport> {
   return data?.data ?? { generated_at: 0, status: 'skipped', counts: {}, checks: [] }
 }
 
+// ── P0-1：自诊断聚合清单（schema / 必需表 / 知识库 / 检查点 / 依赖）──────────
+
+/**
+ * 聚合清单的状态取值。与 `/diagnostics` 的四值**不是同一套**：
+ * 那边用 ok/warn/fail/skipped（体检项），这边用 ok/warn/error/unknown（结论项）。
+ * `unknown` 必须单独存在 —— "看不见"与"有问题"的处置正好相反。
+ */
+export type DiagSummaryStatus = 'ok' | 'warn' | 'error' | 'unknown'
+
+export interface DiagSummaryCheck {
+  /** schema / tables / knowledge / checkpoints / deps —— 决定标题与图标 */
+  key: string
+  /** 后端给的中文标题（缺少 i18n 键时的兜底） */
+  title: string
+  status: DiagSummaryStatus
+  /** 观测到的事实（不是建议） */
+  detail: string
+  /** 该怎么办；ok 时为空 */
+  fix: string
+}
+
+export interface DiagSummaryResponse {
+  generated_at: number
+  status: DiagSummaryStatus
+  counts: Record<string, number>
+  checks: DiagSummaryCheck[]
+}
+
+/**
+ * 读取聚合清单。
+ *
+ * 后端在 DB/引擎不可达时**仍回 200**（各项 status=unknown），所以这里的失败只代表
+ * "页面拿不到这份清单"（网络/鉴权），与"清单里有 unknown 项"是两件事。
+ */
+export async function getDiagnosticsSummary(): Promise<DiagSummaryResponse> {
+  const { data } = await api.get('/v1/admin/diagnostics/summary')
+  return data?.data ?? { generated_at: 0, status: 'unknown', counts: {}, checks: [] }
+}
+
 // ── LLM 熔断：读数与手动恢复 ─────────────────────────────────────────────
 
 /** 单个 provider 的熔断读数。空串表示引擎没报该表，与 'closed' 不同义。 */

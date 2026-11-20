@@ -215,6 +215,21 @@ export default {
   diag_category_config: "Configuration hygiene",
   diag_category_capability: "Capability availability",
   diag_category_other: "Other",
+  // ── P0-1: aggregated checklist (schema / tables / knowledge / checkpoints / deps) ──
+  diag_summary_title: "What actually works",
+  diag_summary_desc: "See at a glance which pieces are configured but not taking effect; each row carries a fix.",
+  diag_summary_unavailable: "Failed to load the diagnostic checklist",
+  diag_summary_empty: "No diagnostic conclusions yet.",
+  diag_sum_status_ok: "OK",
+  diag_sum_status_warn: "Suspicious",
+  diag_sum_status_error: "Broken",
+  // unknown is not "broken": it means "cannot see" (engine/DB down) — the opposite response.
+  diag_sum_status_unknown: "Unknown",
+  diag_sum_key_schema: "Schema version",
+  diag_sum_key_tables: "Required tables",
+  diag_sum_key_knowledge: "Knowledge service",
+  diag_sum_key_checkpoints: "Checkpoint protection",
+  diag_sum_key_deps: "Python dependency channel",
   // ── LLM circuit breakers: readings and manual recovery ──
   breaker_title: "LLM circuit breakers",
   breaker_desc: "Per-provider breaker state; chat and embeddings are two independent tables.",

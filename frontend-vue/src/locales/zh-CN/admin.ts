@@ -209,6 +209,21 @@ export default {
   diag_category_config: "配置卫生",
   diag_category_capability: "能力可用性",
   diag_category_other: "其它",
+  // ── P0-1：聚合清单（schema / 必需表 / 知识库 / 检查点 / 依赖）──
+  diag_summary_title: "生效清单",
+  diag_summary_desc: "一眼看清哪几件事「配了但没生效」；每一项都给出修复指引。",
+  diag_summary_unavailable: "诊断清单加载失败",
+  diag_summary_empty: "暂无诊断结论。",
+  diag_sum_status_ok: "正常",
+  diag_sum_status_warn: "可疑",
+  diag_sum_status_error: "异常",
+  // unknown ≠ 有问题：它是"看不见"（引擎/数据库没起来），处置正好相反。
+  diag_sum_status_unknown: "未知",
+  diag_sum_key_schema: "Schema 版本",
+  diag_sum_key_tables: "必需数据表",
+  diag_sum_key_knowledge: "知识库服务",
+  diag_sum_key_checkpoints: "检查点保护",
+  diag_sum_key_deps: "Python 依赖通道",
   // ── LLM 熔断：读数与手动恢复 ──
   breaker_title: "LLM 熔断",
   breaker_desc: "每个服务商各自的熔断状态；聊天与向量化是两张独立的表。",

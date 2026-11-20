@@ -44,6 +44,35 @@ async def _probe(url: str) -> dict[str, Any]:
         return {"ok": False, "status_code": 0, "detail": f"服务不可达: {exc}"}
 
 
+def _builtin_facts() -> dict[str, Any]:
+    """内置检索服务的本地事实（不触网，任何异常都降级为空值而不是抛）。
+
+    异常必须吞掉：这是诊断端点的附加信息，读不到不该让整个知识库状态变成 500 ——
+    那会把"某一项未知"放大成"整个页面坏了"。
+    """
+    from app.knowledge import settings_store
+    from app.knowledge.providers import registry
+
+    try:
+        health = registry.selfhosted_health()
+        ready, status, detail = bool(health.ok), str(health.status), str(health.detail or "")
+    except Exception as exc:  # noqa: BLE001
+        ready, status, detail = False, "error", str(exc)
+    try:
+        builtin_url = settings_store.builtin_service_url()
+        default_provider = settings_store.default_provider()
+    except Exception as exc:  # noqa: BLE001
+        builtin_url, default_provider = "", ""
+        detail = detail or str(exc)
+    return {
+        "builtin_service_url": builtin_url,
+        "default_provider": default_provider,
+        "service_ready": ready,
+        "service_status": status,
+        "service_detail": detail,
+    }
+
+
 @router.get("/v1/internal/knowledge-runtime")
 async def internal_knowledge_runtime(
     url: str = Query("", description="可选：只测这个地址（不改变生效状态）"),
@@ -58,6 +87,12 @@ async def internal_knowledge_runtime(
     from app.knowledge import runtime
 
     state = runtime.state()
+    # 后台「自诊断」还要回答"内置检索服务在哪 / 默认 provider 是谁 / 它活着吗"。
+    # 这三项都是引擎侧的本地事实（`settings_store.builtin_service_url()`、
+    # `settings_store.default_provider()`、`registry.selfhosted_health()`），
+    # 网关自己算不出来（它不知道引擎容器里的 `KNOWLEDGE_SERVICE_URL`），
+    # 所以随同一次调用一起回。
+    state.update(_builtin_facts())
     if not probe:
         return state
 

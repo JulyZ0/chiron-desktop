@@ -215,6 +215,21 @@ export default {
   diag_category_config: "سلامة الإعدادات",
   diag_category_capability: "توفّر القدرات",
   diag_category_other: "أخرى",
+  // ── P0-1: قائمة التحقق المجمّعة (المخطط / الجداول / المعرفة / نقاط الحفظ / الاعتماديات) ──
+  diag_summary_title: "ما يعمل فعليًا",
+  diag_summary_desc: "اطّلع سريعًا على العناصر التي تم إعدادها ولم تصبح فعّالة؛ كل عنصر يحمل إرشاد إصلاح.",
+  diag_summary_unavailable: "تعذّر تحميل قائمة التشخيص",
+  diag_summary_empty: "لا توجد نتائج تشخيص بعد.",
+  diag_sum_status_ok: "سليم",
+  diag_sum_status_warn: "مشبوه",
+  diag_sum_status_error: "معطّل",
+  // «غير معروف» لا يعني «معطّل»: بل «لا يمكن رؤيته» (المحرّك أو قاعدة البيانات متوقفة).
+  diag_sum_status_unknown: "غير معروف",
+  diag_sum_key_schema: "إصدار المخطط",
+  diag_sum_key_tables: "الجداول المطلوبة",
+  diag_sum_key_knowledge: "خدمة المعرفة",
+  diag_sum_key_checkpoints: "حماية نقاط الحفظ",
+  diag_sum_key_deps: "قناة اعتماديات Python",
   // ── قواطع دائرة LLM: القراءات والاستعادة اليدوية ──
   breaker_title: "قواطع دائرة LLM",
   breaker_desc: "حالة القاطع لكل مزوّد على حدة؛ المحادثة والتضمين جدولان مستقلان.",
