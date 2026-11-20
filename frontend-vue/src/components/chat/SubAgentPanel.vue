@@ -19,6 +19,7 @@ import {
   cancelSubagentRun,
   getSubagentRunEvents,
   listSubagentRuns,
+  rerunSubagentRun,
   type SubagentEvent,
   type SubagentRunView,
 } from '../../api/subagent'
@@ -35,10 +36,17 @@ import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
 
 /**
- * 「重试」：把失败任务放回输入框。
+ * 「重试」= **先真的重跑**，失败再回退到"放回输入框"。
  *
- * 后端没有"重跑某个 run"的端点（run 是父 Agent 的工具调用产物），在这里直接重发
- * 只能伪造上下文；把摘要交回输入框、由用户确认后再派发，是唯一不撒谎的重试。
+ * 为什么不再是"直接把摘要丢回输入框"：那个兜底动作会把已经跑过一次的任务当成新任务
+ * 重发 —— 血缘断了（新 run 与失败的那条毫无关系），重试计数也就无从统计。P0-2 之后
+ * 后端有了 `POST /v1/subagent/runs/{id}/rerun`：按**库里存的原任务**再派一次，
+ * 新 run 以 parent_run_id / rerun_of 挂回原 run。
+ *
+ * 什么时候回退（emit `retry-run`）：
+ *  - 409：原 run 还在跑，或库里没有任务描述（要求用户从前端输入框重发）；
+ *  - 404：这条 run 不属于当前会话/租户/用户；
+ *  - 其它错误（引擎不可用等）：也不假装成功 —— 放回输入框让用户决定。
  */
 const emit = defineEmits<{
   (e: 'retry-run', payload: { runId: string; text: string }): void
@@ -48,6 +56,9 @@ const emit = defineEmits<{
 const nowTick = ref(Date.now())
 let nowTimer: ReturnType<typeof globalThis.setInterval> | null = null
 
+/** 正在请求重跑的 run（按钮禁用 + 防连点：连点会真的派出多个作业） */
+const rerunning = ref<Set<string>>(new Set())
+
 function emitRetry(run: SubagentRunView) {
   const summary = (run.summary || '').trim()
   const name = run.profile || run.run_id
@@ -55,6 +66,34 @@ function emitRetry(run: SubagentRunView) {
     runId: run.run_id,
     text: summary || t('agent.subagent_card_retry_default', { name }),
   })
+}
+
+/** 卡片上的「重试」：先调重跑接口；被拒/失败再回退到"放回输入框"。 */
+async function rerunRun(run: SubagentRunView) {
+  const runId = run.run_id
+  if (!runId || rerunning.value.has(runId)) return
+  rerunning.value = new Set(rerunning.value).add(runId)
+  let started = ''
+  try {
+    const res = await rerunSubagentRun(runId)
+    if (res.status === 'accepted' && res.run_id) started = res.run_id
+  } catch {
+    // 409/404/网络/引擎不可用：统一走兜底路径（下面），不在这里弹全局错误
+  } finally {
+    const next = new Set(rerunning.value)
+    next.delete(runId)
+    rerunning.value = next
+  }
+  if (!started) {
+    // 兜底：把任务放回输入框，由用户确认后重新派发（并说明为什么没能直接重跑）
+    emitRetry(run)
+    void message.info(t('agent.subagent_rerun_fallback'))
+    return
+  }
+  void message.success(t('agent.subagent_rerun_started', { run: started }))
+  // 立刻刷新树并选中新 run：它的进度与审批都在新 run 下，用户不必等 3s 轮询
+  await loadRuns()
+  void selectRun(started)
 }
 
 const props = withDefaults(defineProps<{
@@ -519,6 +558,48 @@ const totals = computed(() => {
   return { input, output }
 })
 
+/** 失败率统计窗口（毫秒）：近 24 小时。 */
+const FAILURE_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/**
+ * 近 24h 的失败率 —— **只来自列表数据**（`GET /v1/subagent/runs`）。
+ *
+ * 为什么不另开一个统计接口：这条列表已经带着每条 run 的状态与 `created_at`，
+ * 再查一次只会多一个可能对不上的数字（而"失败率"最怕的就是"跟卡片上的状态不一致"）。
+ *
+ * 口径：
+ *  - 分母 = 窗口内创建的 run 总数（`created_at` 缺失的行**不计入**：宁可少算，
+ *    也不把一条时间未知的旧 run 塞进"最近 24 小时"）；
+ *  - 分子 = 其中 `failed`（真失败）与 `lost`（失联：实例重启/被驱逐，用户视角同样是没跑成）。
+ *    `cancelled`（用户自己停的）与 `partial`（有产出）**不算失败** —— 把它们算进去会让
+ *    失败率变成"我按了几次停止"的指标，失去预警意义。
+ */
+const failureStats = computed(() => {
+  const since = Date.now() - FAILURE_WINDOW_MS
+  let total = 0
+  let failed = 0
+  for (const run of runs.value) {
+    const ts = run.created_at ? new Date(run.created_at).getTime() : Number.NaN
+    if (Number.isNaN(ts) || ts < since) continue
+    total += 1
+    const status = String(run.status)
+    if (status === 'failed' || status === 'lost') failed += 1
+  }
+  const rate = total ? Math.round((failed / total) * 100) : 0
+  return { total, failed, rate }
+})
+
+/** 近 24h 有没有撞预算墙的 run（头部给一个汇总入口，卡片各自高亮） */
+const budgetHitCount = computed(() => {
+  const since = Date.now() - FAILURE_WINDOW_MS
+  return runs.value.filter((run) => {
+    const ts = run.created_at ? new Date(run.created_at).getTime() : Number.NaN
+    if (!Number.isNaN(ts) && ts < since) return false
+    return run.budget_exceeded === true || String(run.status) === 'partial' ||
+      String(run.error || '').startsWith('budget_exceeded')
+  }).length
+})
+
 const childCount = computed(() => {
   const map = new Map<string, number>()
   for (const run of runs.value) {
@@ -758,6 +839,24 @@ onBeforeUnmount(() => {
       <span class="panel-title">{{ $t('agent.sub_agent') }}</span>
       <span class="panel-meta">
         {{ runs.length }} {{ $t('common.running_3') }} ↑{{ totals.input }} / ↓{{ totals.output }}
+        <!-- 近 24h 失败率：列表数据直接算出来，不需要额外接口 -->
+        <Tooltip
+          v-if="failureStats.total"
+          :title="$t('agent.subagent_failure_rate_hint', { failed: failureStats.failed, total: failureStats.total })"
+        >
+          <span
+            class="failure-rate"
+            :class="{ bad: failureStats.rate >= 30 }"
+          >{{ $t('agent.subagent_failure_rate', { rate: failureStats.rate }) }}</span>
+        </Tooltip>
+        <!-- 预算超限汇总：卡片各自高亮，这里是"有几条" -->
+        <Tag
+          v-if="budgetHitCount"
+          color="warning"
+          :title="$t('agent.subagent_budget_exceeded_hint')"
+        >
+          {{ $t('agent.subagent_budget_exceeded') }} ×{{ budgetHitCount }}
+        </Tag>
         <Tooltip :title="$t('admin.data_source_redis_runtime_cache_db_history')">
           <Tag
             v-if="source"
@@ -839,12 +938,13 @@ onBeforeUnmount(() => {
           :live-tail="liveTail[run.run_id] || ''"
           :pending="pendingByRun[run.run_id] || 0"
           :cancelling="cancelling.has(run.run_id)"
+          :rerunning="rerunning.has(run.run_id)"
           :now="nowTick"
           @select="selectRun(run.run_id)"
           @toggle="toggleCollapse(run.run_id)"
           @stop="stopRun(run.run_id)"
           @pending="focusApprovals(run.run_id)"
-          @retry="emitRetry(run)"
+          @rerun="rerunRun(run)"
         />
       </div>
     </Spin>
@@ -1152,6 +1252,9 @@ onBeforeUnmount(() => {
 .panel-title { font-weight: var(--fw-semibold); }
 .panel-meta { color: var(--text-tertiary, #8c8c8c); font-size: 12px; display: flex; align-items: center; gap: 6px; }
 .source-tag { margin: 0; }
+/* 失败率：平常是中性数字，≥30% 才染成警示色（否则一整片红色等于没有红） */
+.failure-rate { font-variant-numeric: tabular-nums; color: var(--text-tertiary, #8c8c8c); }
+.failure-rate.bad { color: var(--warning); font-weight: var(--fw-medium); }
 
 .timeline { display: flex; flex-direction: column; }
 .tree-row {

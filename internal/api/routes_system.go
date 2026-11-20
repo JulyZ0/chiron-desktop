@@ -5,6 +5,7 @@ import (
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
+	"github.com/athenavi/chiron/internal/engine"
 )
 
 // routes_system.go —— 系统（工具/健康/追踪）的路由注册。
@@ -19,6 +20,7 @@ func registerSystemRoutes(
 	toolHandler *ToolHandler,
 	systemHandler *SystemHandler,
 	traceHandler *TraceHandler,
+	pythonClient *engine.PythonClient,
 ) {
 	// Tools (rate limited, proxies to Python)
 	// 工具面属于内部信息（含 MCP 注入工具名/描述/完整入参 schema），
@@ -51,14 +53,27 @@ func registerSystemRoutes(
 		mux.Handle("GET /v1/traces/{trace_id}/graph", authMW(rlMW(http.HandlerFunc(traceHandler.GetTraceGraph))))
 	}
 
+	// 子 Agent 运行观测 / 中止 / 重跑：见下方 registerSubagentRoutes。
+	registerSubagentRoutes(mux, authMW, rlMW, NewSubagentHandler(db.Redis, pythonClient))
+}
+
+// registerSubagentRoutes 单独成一个函数：子 Agent 这组端点的权限/路由链路值得被
+// **单独**测（`subagent_rerun_test.go` 只挂这一组，不装配整张网关路由表）。
+func registerSubagentRoutes(
+	mux *http.ServeMux,
+	authMW, rlMW routeMiddleware,
+	h *SubagentHandler,
+) {
 	// 子 Agent 运行观测（层级树 / 详情 / 过程）：Redis 优先、DB 回落，租户隔离。
 	// 见 docs/subagent-design.md §4.4；前端据此画递归树与侧边栏实时输出。
-	subagentHandler := NewSubagentHandler(db.Redis)
-	mux.Handle("GET /v1/subagent/runs", authMW(rlMW(http.HandlerFunc(subagentHandler.ListRuns))))
-	mux.Handle("GET /v1/subagent/runs/{run_id}", authMW(rlMW(http.HandlerFunc(subagentHandler.GetRun))))
-	mux.Handle("GET /v1/subagent/runs/{run_id}/events", authMW(rlMW(http.HandlerFunc(subagentHandler.GetRunEvents))))
+	mux.Handle("GET /v1/subagent/runs", authMW(rlMW(http.HandlerFunc(h.ListRuns))))
+	mux.Handle("GET /v1/subagent/runs/{run_id}", authMW(rlMW(http.HandlerFunc(h.GetRun))))
+	mux.Handle("GET /v1/subagent/runs/{run_id}/events", authMW(rlMW(http.HandlerFunc(h.GetRunEvents))))
 	// 中止：网关只做租户校验 + Redis 广播，真正取消由持有该 run 的引擎实例执行
 	// （引擎侧订阅见 python-engine/app/subagent/registry.py）
-	mux.Handle("POST /v1/subagent/runs/{run_id}/cancel", authMW(rlMW(http.HandlerFunc(subagentHandler.CancelRun))))
-	mux.Handle("POST /v1/subagent/sessions/{session_id}/cancel", authMW(rlMW(http.HandlerFunc(subagentHandler.CancelSessionRuns))))
+	mux.Handle("POST /v1/subagent/runs/{run_id}/cancel", authMW(rlMW(http.HandlerFunc(h.CancelRun))))
+	mux.Handle("POST /v1/subagent/sessions/{session_id}/cancel", authMW(rlMW(http.HandlerFunc(h.CancelSessionRuns))))
+	// P0-2 重跑：按**原任务描述**重新派发一个新 run（立即返回新 run_id）。
+	// 这是「重试」按钮的真实通道 —— 网关校验权限/会话归属/终态后转发给引擎。
+	mux.Handle("POST /v1/subagent/runs/{run_id}/rerun", authMW(rlMW(http.HandlerFunc(h.RerunRun))))
 }

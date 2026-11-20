@@ -16,15 +16,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["internal"])
+
+#: 重跑事件冲刷任务的引用（不持引用会被 GC 静默回收 —— 那时事件就再也不会进 Redis）
+_RERUN_TASKS: set[asyncio.Task[Any]] = set()
 
 
 class InternalSubagentRequest(BaseModel):
@@ -113,3 +118,169 @@ async def internal_subagent_run(body: InternalSubagentRequest) -> dict[str, Any]
 
     payload = result.to_tool_payload()
     return {"ok": True, "data": payload if isinstance(payload, dict) else {}}
+
+
+class InternalSubagentRerunRequest(BaseModel):
+    """重跑请求（**身份必填**，与 ``/run`` 同一套接收方重新校验）。
+
+    刻意**没有** ``task`` 字段：重跑必须用库里存的原任务描述。让调用方随请求带一份
+    "任务文本"，等于是给它一个伪造上下文的口子（与 ``/run`` 的"不信任请求体里的授权
+    标记"同一条纪律）。取不到原任务 ⇒ 409，由前端把任务放回输入框、交用户确认。
+    """
+
+    tenant_id: int = 0
+    user_id: str = ""
+    #: 原 run 归属的会话（网关从 subagent_runs.root_session_id 带过来）。
+    #: 访问谓词按它过滤 ⇒ 传错会话一律 404，不会"重跑到别的会话里"。
+    session_id: str = ""
+
+
+async def _deliver_rerun_event(payload: Any, runtime_cache: Any, cache_tenant: str) -> None:
+    """把重跑 run 的事件投进运行期缓存（Stream + pub/sub），网关中继后进会话事件流。
+
+    与 ``main.py`` 的 ``_persist_subagent_event`` **同一口径**（那边是父 SSE 路径）：
+    Stream 供回放、pub/sub 供实时；``event_id`` 供多副本网关去重。
+    """
+    from app.subagent import registry as subagent_registry
+
+    if not isinstance(payload, dict):
+        return
+    run_id = str(payload.get("run_id") or "")
+    if run_id:
+        # 事件即心跳：看门狗据此认定"仍在产出内容的 run"没有卡死
+        subagent_registry.touch(run_id)
+    if runtime_cache is None:
+        return
+    if run_id:
+        await runtime_cache.push_event(run_id=run_id, tenant=cache_tenant, payload=payload)
+    await runtime_cache.publish_live_event(payload={**payload, "event_id": uuid.uuid4().hex})
+
+
+async def _drain_sink_until_done(sink: Any, run_id: str) -> None:
+    """把合并类事件（text/reasoning/notice）冲出来。
+
+    为什么需要：``EventSink`` 对内容型事件做**合并窗口**缓冲，只有 ``drain()`` 会把它
+    们推进投递队列 —— 而这条路径**没有**父 SSE 生成器去 drain（``main.py`` 里是
+    生成器每轮调用）。少了这一步，重跑 run 的正文/思考永远留在 sink 里，前端只能看到
+    status / tool 事件，看起来像"跑起来了但什么都不输出"。
+    """
+    from app.subagent import registry as subagent_registry
+
+    try:
+        while True:
+            sink.drain()
+            if not subagent_registry.is_active(run_id):
+                # 终态前的最后一段内容可能刚好落在窗口内：等过窗口再冲一次再退出
+                await asyncio.sleep(0.3)
+                sink.drain()
+                return
+            await asyncio.sleep(0.25)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 冲刷是旁路，失败不能影响子 Agent
+        logger.debug("subagent rerun sink drain stopped: %s", str(exc)[:160])
+
+
+@router.post("/v1/internal/subagent/runs/{run_id}/rerun")
+async def internal_subagent_rerun(
+    run_id: str, body: InternalSubagentRerunRequest
+) -> dict[str, Any]:
+    """按**原任务描述**重新派发一个已结束的子 Agent run（P0-2）。
+
+    立即返回新 run 的 id（后台运行）；原 run 的终态校验、任务描述读取、写权限沿用与
+    ``rerun_subagent`` 工具**同一份实现**（:mod:`app.subagent.rerun`）。
+
+    状态码口径（网关据此如实回给前端，不做"假成功"）：
+
+    =========  ==========================================================
+    404        不存在 / 不属于该会话-租户-用户（不泄露存在性）
+    409        原 run 非终态、或库里没有任务描述（要求前端重发）
+    503        落库 / 派发能力不可用（引擎未接网关、DB 不可用、配额拒绝）
+    =========  ==========================================================
+    """
+    if not (body.user_id or "").strip() or not body.tenant_id:
+        # 身份重校验：无归属的重跑一律拒绝（否则无从做租户隔离与审计）
+        logger.warning("internal subagent rerun rejected: missing tenant/user identity")
+        raise HTTPException(
+            status_code=400, detail={"code": "identity_required",
+                                     "error": "tenant_id and user_id are required"}
+        )
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "session_required", "error": "session_id is required"},
+        )
+
+    try:
+        from app.main import get_gateway
+
+        gateway = await get_gateway()
+    except Exception as exc:  # noqa: BLE001 - 引擎未完成启动时如实报"不可用"
+        logger.warning("internal subagent rerun: gateway unavailable: %s", str(exc)[:160])
+        gateway = None
+    if gateway is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "engine_unavailable", "error": "engine gateway unavailable"},
+        )
+
+    # ── 事件旁路：新 run 的 subagent.* 必须出现在**会话事件流**里 ──
+    # 这条路径没有父 SSE 生成器，所以由端点自己造一个 sink 并挂常驻投递器
+    # （Stream + pub/sub → 网关 StartSubagentEventsRelay → SSE hub）。
+    from app.agent.event_sink import EventSink
+
+    sink = EventSink(session_id=session_id)
+    runtime_cache = None
+    try:
+        from app.subagent.runtime_cache import get_runtime_cache
+
+        runtime_cache = await get_runtime_cache()
+    except Exception as cache_err:  # noqa: BLE001 - 缓存不可用不影响重跑本身
+        logger.debug("subagent rerun: runtime cache unavailable: %s", str(cache_err)[:160])
+    sink.attach_persistent(
+        lambda payload: _deliver_rerun_event(payload, runtime_cache, str(body.tenant_id))
+    )
+
+    from app.subagent.rerun import RerunRefused, rerun_run
+    from app.tools.context import get_all, restore_context, set_tool_context
+
+    snapshot = get_all()
+    try:
+        set_tool_context(
+            session_id=session_id,
+            tenant_id=str(body.tenant_id),
+            user_id=str(body.user_id),
+            gateway=gateway,
+            event_sink=sink,
+            # 重跑没有人在等审批/提问：按无人值守处理（审批闸门直接拒绝而不是空等）
+            unattended=True,
+        )
+        payload = await rerun_run(run_id=run_id)
+    except RerunRefused as exc:
+        logger.info("internal subagent rerun refused (run=%s, code=%s)", run_id, exc.code)
+        raise HTTPException(
+            status_code=exc.status,
+            detail={"code": exc.code or "refused", "error": exc.error},
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - 未预期错误也要如实回答
+        logger.warning("internal subagent rerun failed (run=%s): %s", run_id, str(exc)[:200])
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "rerun_failed", "error": f"rerun failed: {str(exc)[:160]}"},
+        ) from exc
+    finally:
+        # 上下文是共享的：不清掉会让同一请求处理链上的后续调用继承"无人值守 + 这份 sink"
+        restore_context(snapshot)
+
+    new_run_id = str(payload.get("run_id") or "")
+    if new_run_id:
+        task = asyncio.create_task(_drain_sink_until_done(sink, new_run_id))
+        _RERUN_TASKS.add(task)
+        task.add_done_callback(_RERUN_TASKS.discard)
+
+    logger.info(
+        "internal subagent rerun accepted: from=%s to=%s session=%s",
+        run_id, new_run_id, session_id,
+    )
+    return {"ok": True, **payload}

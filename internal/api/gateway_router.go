@@ -366,7 +366,7 @@ func NewGatewayRouter(
 	mux.Handle("POST /v1/conversations/{id}/branch/retry", authMW(rlMW(BranchRetryHandler(sessionMgr, pythonClient))))
 	registerAuthRoutes(mux, authHandler, authMW, rlMW)
 
-	registerSystemRoutes(mux, authMW, rlMW, sanitizeMW, toolHandler, systemHandler, traceHandler)
+	registerSystemRoutes(mux, authMW, rlMW, sanitizeMW, toolHandler, systemHandler, traceHandler, pythonClient)
 	// 六大工作台互联：跨台最近活动聚合（租户+用户隔离）
 	mux.Handle("GET /v1/activities", authMW(rlMW(http.HandlerFunc(handleActivities))))
 	// 通知中心：只读 + 标已读（写入来自网关内部事件，见 notifications.go）

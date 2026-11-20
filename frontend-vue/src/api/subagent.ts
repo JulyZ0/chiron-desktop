@@ -26,6 +26,20 @@ export interface SubagentRunView {
   created_at?: string
   redacted_count?: number
   source?: string
+  /**
+   * 失败原因（DB 来源才有；Redis 运行期缓存里没有 `error`）。
+   *
+   * 面板据此区分"撞预算墙"与"普通失败" —— 引擎把预算越界写成
+   * `budget_exceeded:<轴>`（见 python-engine/app/agent/task_budget.py）。
+   */
+  error?: string
+  /**
+   * 是否撞上预算墙（`status=partial` 或 `error` 以 `budget_exceeded` 开头）。
+   *
+   * 由后端判定（`internal/api/subagent_handler.go` 的 `runHitBudgetWall`）：上限来自部署
+   * 环境的 `SUBAGENT_MAX_*`，前端与网关都读不到 —— 用写死的默认值去比 usage 只会误报。
+   */
+  budget_exceeded?: boolean
 }
 
 /** 进度事件（type 前缀 `subagent.`；经 SSE 实时到达，也可从事件端点回放）。 */
@@ -118,4 +132,36 @@ export async function cancelSubagentRun(runId: string): Promise<{ status: string
 export async function cancelSessionSubagents(sessionId: string): Promise<{ status: string }> {
   const { data } = await api.post(`/v1/subagent/sessions/${encodeURIComponent(sessionId)}/cancel`)
   return { status: data?.data?.status || 'accepted' }
+}
+
+/** 重跑受理结果：新 run 的 id 由网关转发引擎后立刻返回（新 run 在后台跑）。 */
+export interface SubagentRerunResult {
+  status: string
+  /** 新 run 的 id（**不是**原 run：原 run 的记录保持不变，血缘在 rerun_of 上） */
+  run_id: string
+  /** 被重跑的原 run */
+  rerun_of: string
+  parent_run_id?: string
+  depth?: number
+}
+
+/**
+ * 按**原任务描述**重跑一个已结束的子 Agent run（面板「重试」按钮的真实通道）。
+ *
+ * 契约（网关 `POST /v1/subagent/runs/{id}/rerun` → 引擎内网端点）：
+ *  - 204/200 + 新 `run_id`：真的派出去了，后续进度走 `subagent.*` 事件；
+ *  - **409**：原 run 非终态或库里没有任务描述 —— 调用方必须回退到"放回输入框"，
+ *    不能假装重试成功（那会让用户等一个永远不会来的 run）；
+ *  - **404**：这条 run 不属于当前会话/租户/用户（与只读端点同一口径，不泄露存在性）。
+ */
+export async function rerunSubagentRun(runId: string): Promise<SubagentRerunResult> {
+  const { data } = await api.post(`/v1/subagent/runs/${encodeURIComponent(runId)}/rerun`)
+  const d = data?.data || {}
+  return {
+    status: d.status || 'accepted',
+    run_id: d.run_id || '',
+    rerun_of: d.rerun_of || runId,
+    parent_run_id: d.parent_run_id,
+    depth: d.depth,
+  }
 }

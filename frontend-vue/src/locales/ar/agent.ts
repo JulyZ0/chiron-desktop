@@ -366,9 +366,16 @@ export default {
   subagent_card_budget: "↑{input} · ↓{output} · {steps} خطوات",
   subagent_card_children_n: "{n} مهام فرعية",
   subagent_card_depth: "العمق {n}",
-  subagent_card_retry_hint: "أعِد هذه المهمة إلى حقل الإدخال، والقرار لك في إعادة الإرسال",
+  subagent_card_retry_hint: "أعِد التشغيل من المهمة المخزنة؛ وإذا رفض الخادم، تعود المهمة إلى حقل الإدخال",
   subagent_card_retry_default: "فشلت المهمة الفرعية لـ {name}. يُرجى إعادة تشغيلها.",
   subagent_card_empty_summary: "(لا يوجد ملخّص بعد — افتحه لعرض تدفّق الأحداث)",
+  // ── P0-2: إعادة تشغيل حقيقية / معدل الفشل / تجاوز الميزانية ──
+  subagent_rerun_started: "أُعيد الإرسال من المهمة الأصلية: {run}",
+  subagent_rerun_fallback: "تعذّرت إعادة تشغيل هذه المهمة الفرعية مباشرةً (لا تزال قيد التشغيل أو لا توجد مهمة مخزنة) — أُعيدت المهمة إلى حقل الإدخال",
+  subagent_failure_rate: "معدل الفشل {rate}%",
+  subagent_failure_rate_hint: "آخر 24 ساعة: فشل أو فُقد {failed}/{total} من عمليات الوكيل الفرعي",
+  subagent_budget_exceeded: "تجاوز الميزانية",
+  subagent_budget_exceeded_hint: "وصل هذا الوكيل الفرعي إلى حد الميزانية (الرموز / الزمن / التكلفة)؛ الناتج جزئي — ارفع الحد ثم أعد التشغيل",
   // ── مساحة عمل بعمودين (Agents / Skills) ──
   list_pane_title: "قائمة الوكلاء",
   group_filter_label: "التصفية حسب المجموعة",

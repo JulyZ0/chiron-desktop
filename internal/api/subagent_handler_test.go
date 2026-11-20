@@ -123,7 +123,7 @@ func TestStringOfAndIntOfTolerateDriverTypes(t *testing.T) {
 
 // 无 Redis 时 handler 必须安全降级（回落 DB），不 panic。
 func TestSubagentHandlerWithoutRedisFallsBack(t *testing.T) {
-	h := NewSubagentHandler(nil)
+	h := NewSubagentHandler(nil, nil)
 	if runs, err := h.treeFromRedis(context.Background(), "t1", "s1"); err != nil || len(runs) != 0 {
 		t.Errorf("treeFromRedis with nil redis: runs=%v err=%v", runs, err)
 	}

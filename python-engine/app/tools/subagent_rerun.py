@@ -1,23 +1,18 @@
 """rerun_subagent 工具 —— 重跑一个**已结束**的子 Agent run（中断/失败后的补救）。
 
-为什么需要它：后台子 Agent 的生命周期与父回合解耦之后（"父回合结束"不再等于
-"子任务作废"），反过来也会出现新的常态：
+本模块只保留**工具形态**（注册表 + 模型可见的说明 + 错误转成 ``error`` 字段）；
+判定与派发的实现在 :mod:`app.subagent.rerun` —— 网关的内网端点
+（``POST /v1/internal/subagent/runs/{run_id}/rerun``，前端面板「重试」按钮）走同一份代码。
+两份实现必然漂移，而漂移方向通常是**放宽**（访问谓词少一条、写权限跟着变宽）。
 
-* 实例重启/被驱逐 → run 被判 ``lost``（不会有人再收尾它）；
-* 用户显式停止 → ``cancelled``；
-* 上游 provider 报错 → ``failed``。
+行为契约（与内网端点一致）：
 
-这些 run 的**任务描述与 Profile 都还在 DB 里**（``subagent_runs.task`` /
-``profile_name`` / ``read_only``），重跑只是"按原样再派一次"——不该让模型重新拼一遍
-任务文本（那几乎必然与原来不一致，也就不是"重跑"了）。
-
-设计约束：
-
-* 只允许**终态** run（running 的不需要、也不该被重跑 —— 会得到两份并发作业）；
-* 重新派发走**同一个** ``subagent`` 工具路径（同一套工具面/预算/栅栏/落库），
-  并用 ``rerun_of`` 记录血缘（新列，见迁移 ``f3a91c2d5e08``）；
-* 原 run 的写权限**照旧**：``read_only=true`` 的 run 重跑后仍是只读
-  （收紧默认工具面之后，这个映射尤其重要 —— 不能让重跑变成提权通道）。
+* 只允许**终态** run（``completed/failed/cancelled/lost/partial``）—— running 的已经有
+  owner，重跑会得到两份并发作业；
+* 任务描述取**库里那一列**（``subagent_runs.task``）：让模型重新拼一遍几乎必然与原来不
+  一致，那就不叫重跑了；``task_override`` 是给用户显式改写留的口子；
+* 原 run 的写权限**照旧**（``read_only=true`` 重跑后仍只读），``rerun_of`` 记录血缘，
+  ``parent_run_id`` 让新 run 在任务树里挂在原 run 下面。
 """
 
 from __future__ import annotations
@@ -25,22 +20,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app.subagent.access import RUN_ACCESS_CLAUSE
-from app.tools.context import get_session_id, get_tenant_id, get_user_id
+from app.subagent.rerun import (  # noqa: F401 - RUN_SQL / RERUNNABLE 供既有导入方复用
+    RERUNNABLE,
+    RERUN_RUN_SQL as RUN_SQL,
+    RerunRefused,
+    rerun_run,
+)
 from app.tools.registry import registry
 
 logger = logging.getLogger(__name__)
-
-#: 允许重跑的状态：都是终态。running 不在列 —— 它不需要重跑，重跑会得到两份并发作业。
-RERUNNABLE = ("completed", "failed", "cancelled", "lost")
-
-#: 访问谓词与 `read_subagent_result` / `resume_subagent` **共用一份**
-#: （`app/subagent/access.py`）：同一件事写三遍必然漂移，而漂移方向通常是放宽。
-RUN_SQL = f"""
-SELECT id, task, profile_name, read_only, status, depth
-  FROM subagent_runs
- WHERE id = $1{RUN_ACCESS_CLAUSE}
-"""
 
 
 async def rerun_subagent(run_id: str, task_override: str = "") -> dict[str, Any]:
@@ -50,68 +38,17 @@ async def rerun_subagent(run_id: str, task_override: str = "") -> dict[str, Any]
         run_id: 要重跑的 run（来自 ``subagent`` 的返回值或 ``list_subagent_runs``）。
         task_override: 可选——用新的任务描述重跑（其余保持原样）。
     """
-    run_id = (run_id or "").strip()
-    if not run_id:
-        return {"error": "run_id is required"}
-
     try:
-        from app.db import get_pool
-
-        pool = get_pool()
-    except Exception as exc:  # noqa: BLE001
-        return {"error": f"database unavailable: {str(exc)[:120]}"}
-    if pool is None:
-        return {"error": "database unavailable"}
-
-    root_session_id = get_session_id()
-    if not root_session_id:
-        return {"error": "no active session context"}
-    try:
-        row = await pool.fetchrow(
-            RUN_SQL, run_id, get_tenant_id(), get_user_id(), root_session_id
-        )
-    except Exception as exc:  # noqa: BLE001 - 表缺失 / 老库没有 rerun_of 列等
-        logger.warning("rerun_subagent 查询失败: %s", str(exc)[:200])
-        return {"error": "subagent run store unavailable (check migrations)"}
-    if not row:
-        return {"error": f"subagent run not found: {run_id}"}
-
-    status = str(row["status"] or "")
-    if status not in RERUNNABLE:
-        return {
-            "error": f"run {run_id} is {status or 'unknown'}; only finished runs can be rerun "
-                     f"({', '.join(RERUNNABLE)}) — a running one already has an owner",
-            "status": status,
-        }
-
-    task = (task_override or "").strip() or (row["task"] or "").strip()
-    if not task:
-        return {"error": f"run {run_id} has no stored task to rerun"}
-
-    # 局部导入：工具模块之间不互相 import，避免注册期的循环依赖
-    from app.tools.subagent import subagent as delegate
-
-    try:
-        result = await delegate(
-            task=task,
-            profile=str(row["profile_name"] or ""),
-            run_in_background=True,
-            # 写权限照旧：read_only 的 run 重跑后仍只读（重跑不是提权通道）
-            allow_write=not bool(row["read_only"]),
-            rerun_of=run_id,
-        )
+        payload = await rerun_run(run_id=run_id, task_override=task_override)
+    except RerunRefused as exc:
+        # 工具层只能返回结构化错误（没有 HTTP 状态码可言），但**绝不**返回假 run_id
+        return {"error": exc.error, "code": exc.code}
     except Exception as exc:  # noqa: BLE001 - 派发失败要如实返回
-        logger.warning("rerun_subagent 派发失败: %s", str(exc)[:200])
+        logger.warning("rerun_subagent 失败: %s", str(exc)[:200])
         return {"error": f"rerun failed: {str(exc)[:160]}"}
-
-    if isinstance(result, dict) and result.get("error"):
-        return result
-    if isinstance(result, dict):
-        result["rerun_of"] = run_id
-        result.pop("note", None)
-    logger.info("subagent rerun launched: from=%s to=%s", run_id,
-                result.get("run_id") if isinstance(result, dict) else "?")
-    return result if isinstance(result, dict) else {"error": "unexpected dispatch result"}
+    # 「请继续做别的事」那类提示是派发用的，重跑不带给模型（它已经知道这是后台）
+    payload.pop("note", None)
+    return payload
 
 
 registry.register(
@@ -119,9 +56,10 @@ registry.register(
     description=(
         "Re-run a **finished** subagent run by its run_id, reusing the task and profile it was "
         "originally dispatched with (optionally with a new task_override). Use it after a run "
-        "ended as failed / cancelled / lost — e.g. the engine instance restarted, the user "
-        "stopped it, or the upstream provider errored. Running runs cannot be rerun (they "
-        "already have an owner); the new run records rerun_of=<run_id> for lineage."
+        "ended as failed / cancelled / lost / partial — e.g. the engine instance restarted, the "
+        "user stopped it, or the upstream provider errored. Running runs cannot be rerun (they "
+        "already have an owner); the new run records rerun_of=<run_id> and parent_run_id=<run_id> "
+        "for lineage."
     ),
     parameters={
         "type": "object",
