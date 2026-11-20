@@ -215,6 +215,16 @@ onMounted(() => {
           <h2 class="dash-title">
             {{ $t('common.quick_start') }}
           </h2>
+          <!-- 首次运行引导（P1-10）的常驻入口：引导只在"无模型 + 未走完"时自动跳，
+               已配置好的人执行"重新运行"时仍需要一个手动入口。 -->
+          <button
+            type="button"
+            class="dash-link"
+            data-testid="home-welcome-entry"
+            @click="router.push('/welcome')"
+          >
+            {{ $t('welcome.restart') }}
+          </button>
         </div>
         <div class="entry-grid">
           <button

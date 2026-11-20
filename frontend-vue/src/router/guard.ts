@@ -2,6 +2,7 @@ import type { RouteLocationNormalized, NavigationGuardNext } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { currentDeviceMode, isDevAuthBypassEnabled } from '../stores/device'
 import { requestManager } from '../utils/requestOptimizer'
+import { WELCOME_ENTRY_PATHS, shouldAutoEnterWelcome } from '../api/welcomeStatus'
 
 /**
  * 全局路由守卫：
@@ -87,6 +88,28 @@ export async function authGuard(
     if (role !== 'admin' && role !== 'owner' && !isDevAuthBypassEnabled()) {
       next('/')
       return
+    }
+  }
+
+  // 首次运行引导（P1-10）：有登录、当前没有任何可用模型、且本账号还没走完引导时，
+  // 把**两个主入口**（"/" 与 "/chat"）的首次进入重定向到 /welcome。
+  //
+  // 三个"不打扰"的边界（判定细节见 api/welcomeStatus.ts:shouldAutoEnterWelcome）：
+  //   · 已有模型 → 不跳：能对话就说明不需要这一步；
+  //   · 已完成/已跳到底 → 不跳：进度按 userId 存 localStorage，不再反复弹；
+  //   · 探测失败 → 不跳：网关抖动时把人从首页拽走，比漏一次引导伤害更大。
+  //
+  // 只拦 entry paths 而非全部 requiresAuth 路由：/models、/knowledge、/admin/* 是
+  // 用户在引导里被"去配置"送去的目标页，拦它们会形成"点去配置→弹回引导"的死循环。
+  // 位置放在 requiresAdmin 之后：非管理员访问 admin 页应先被弹回首页，而不是被引导截走。
+  if (auth.user && WELCOME_ENTRY_PATHS.includes(to.path)) {
+    try {
+      if (await shouldAutoEnterWelcome(auth.user.id)) {
+        next('/welcome')
+        return
+      }
+    } catch {
+      /* 判定失败：按原有流程放行 */
     }
   }
 
