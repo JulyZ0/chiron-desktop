@@ -116,3 +116,29 @@ async def test_gc_execute_keeps_referenced(tmp_path, monkeypatch) -> None:
     assert out["deleted"] == 1
     assert (store / ("d" * 2) / ("d" * 62)).exists(), "被引用的分片永远不删"
     assert not (store / ("e" * 2) / ("e" * 62)).exists()
+
+
+async def test_gc_is_idempotent_across_scheduled_rounds(tmp_path, monkeypatch) -> None:
+    """定时化之后"同一个 GC 会反复跑"：第二轮必须删 0，且不报错。
+
+    这条是 GC 定时化（网关后台循环每 24h 发一次 ``dry_run=false``）的前提：
+    删除集合是"未被引用 **且** 超保留期"的分片，引用集合在删除前冻结；已删掉的
+    文件下一轮 ``FileNotFoundError`` 直接跳过。若这里不幂等，重启/多副本会让
+    运维看到 ``deleted`` 累计值远超实际分片数，也会把"删不到东西"误报成故障。
+    """
+    store = _store(tmp_path, monkeypatch)
+    stale = "f" * 64
+    _put(store, stale, b"stale" * 3, age_days=400)
+
+    async def _refs():
+        return set(), {stale}
+
+    monkeypatch.setattr(ic, "_reference_sets", _refs)
+
+    first = await ic.checkpoint_gc(ic.GcRequest(dry_run=False), _request())
+    second = await ic.checkpoint_gc(ic.GcRequest(dry_run=False), _request())
+
+    assert first["deleted"] == 1
+    assert second["deleted"] == 0, "第二轮不该重复计入已删分片"
+    assert second["store_files"] == 0
+    assert not (store / ("f" * 2) / ("f" * 62)).exists()

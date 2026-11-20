@@ -528,31 +528,87 @@ def test_restore_does_not_clobber_caller_index(env: Env) -> None:
     assert env.index.read_bytes() == sentinel
 
 
-def test_nested_project_root_is_rejected_instead_of_snapshotting_parent(tmp_path: Path) -> None:
-    """项目根嵌在父仓库里时：**明确拒绝**，而不是把父仓库内容当成项目快照。
+def test_monorepo_subdir_snapshot_only_contains_subtree(tmp_path: Path) -> None:
+    """项目根嵌在父仓库里时：**只快照子目录子树**，绝不把父仓库文件卷进来。
 
-    缺陷形态（实测）：``git -C <子目录>`` 会向上找到父仓库，``read-tree HEAD`` 与
-    ``write-tree`` 因此覆盖**整个父仓库**；ref 也写进父仓库。用户看到时间线"有检查点"，
-    可它保护的是另一个项目。
+    缺陷形态（实测）：``git -C <子目录>`` 会向上找到父仓库，``read-tree HEAD`` 是
+    **仓库全局**口径。若不做前缀裁剪，``write-tree`` 会把父仓库的所有文件写进快照，
+    而 ``ls-tree`` 在子目录里又按前缀过滤，读回来只剩子目录那几条 —— 用户看到
+    "保护了 3 个文件"，实际整个 monorepo（含别的项目的密钥）都被复制进了对象库。
 
-    取舍：monorepo 子目录暂不支持检查点（需要按 ``--show-prefix`` 重写索引口径），
-    拒绝必须带可行动的提示，而不是静默生成错误快照。
+    判据：树里只有项目根口径的路径；镜子（``sibling/``）里的文件一个都不在。
     """
     repo = _init(tmp_path / "repo")
     proj = repo / "packages" / "foo"
     proj.mkdir(parents=True)
     (proj / "a.py").write_bytes(b"v1\n")
+    (proj / "src").mkdir()
+    (proj / "src" / "b.py").write_bytes(b"b\n")
+    sibling = repo / "packages" / "sibling"
+    sibling.mkdir(parents=True)
+    (sibling / "secret.py").write_bytes(b"SIBLING\n")
+    (repo / "root_only.py").write_bytes(b"ROOT\n")
     _commit_all(repo)
 
     state = tmp_path / "state"
     state.mkdir()
-    with pytest.raises(gc.GitError) as exc:
-        gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
-    assert "another git repository" in str(exc.value)
+    snap = gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
+
+    # 项目根口径：只有子目录里的这两个文件。
+    assert snap.tree_paths == {"a.py", "src/b.py"}
+    # 树本身（仓库根口径）也只含前缀下的路径。
+    full = _git(repo, "ls-tree", "-r", "--name-only", "--full-name", snap.tree)
+    listed = full.stdout.decode().split()
+    assert sorted(listed) == ["packages/foo/a.py", "packages/foo/src/b.py"]
 
 
-def test_nested_root_does_not_contribute_refs_from_parent_repo(tmp_path: Path) -> None:
-    """父仓库里的检查点 ref 不参与子目录会话的序号计算。"""
+def test_monorepo_restore_lands_in_subdir_and_spares_siblings(tmp_path: Path) -> None:
+    """子目录项目的回滚落在子目录里，且一个字节都不碰兄弟目录。
+
+    这是"路径口径"最容易错的地方：``diff-tree`` / ``ls-tree`` 是仓库根口径，
+    而 ``restore`` 用 ``root / path`` 落地。口径混一次，文件就会写进
+    ``packages/foo/packages/foo/...``，而 ``ok=True``。
+    """
+    repo = _init(tmp_path / "repo")
+    proj = repo / "packages" / "foo"
+    proj.mkdir(parents=True)
+    (proj / "a.py").write_bytes(b"v1\n")
+    sibling = repo / "packages" / "sibling"
+    sibling.mkdir(parents=True)
+    (sibling / "keep.py").write_bytes(b"KEEP\n")
+    _commit_all(repo)
+
+    state = tmp_path / "state"
+    state.mkdir()
+    index = state / "snap.idx"
+    store = state / "untracked"
+    target = gc.snapshot(proj, index_file=index, store_root=store)
+
+    # 两边都改：子目录里改内容 + 新建文件，兄弟目录也改（回滚不该动它）。
+    (proj / "a.py").write_bytes(b"v2\n")
+    (proj / "new.py").write_bytes(b"agent\n")
+    (sibling / "keep.py").write_bytes(b"CHANGED-BY-USER\n")
+
+    result = gc.restore(proj, target=target, store_root=store, index_file=index)
+
+    assert result.ok, result.failed
+    assert (proj / "a.py").read_bytes() == b"v1\n"
+    # new.py 是 agent 新建的：目标里没有 ⇒ 只进 removed 清单，默认不删。
+    assert "new.py" in result.skipped_removed
+    assert (proj / "new.py").exists()
+    # 兄弟目录原样（哪怕内容脏了，也不该被"回滚"成别的东西）。
+    assert (sibling / "keep.py").read_bytes() == b"CHANGED-BY-USER\n"
+    # 没有把仓库根路径重复拼进子目录。
+    assert not (proj / "packages").exists()
+
+
+def test_nested_root_does_not_contribute_other_sessions_refs(tmp_path: Path) -> None:
+    """父仓库里**别的会话**的检查点 ref 不参与子目录会话的序号计算。
+
+    monorepo 支持后，子目录项目的 ref 也写在父仓库里（既定设计），因此
+    "父仓库有 ref" 本身不再是否决条件；隔离靠 ref 名里的 session_id。
+    这里钉住两点：别的会话不影响本会话；本会话自己写下的 ref 要能数到。
+    """
     repo = _init(tmp_path / "repo")
     proj = repo / "packages" / "foo"
     proj.mkdir(parents=True)
@@ -563,12 +619,70 @@ def test_nested_root_does_not_contribute_refs_from_parent_repo(tmp_path: Path) -
     sha = gc.commit_tree(repo, tree=tree)
     gc.write_ref(repo, "refs/chiron/checkpoints/parent-session/000001-pre_turn", sha)
 
+    assert gc.next_checkpoint_seq(proj, "child-session") == 1
+
+    # 子目录项目写下的 ref 落在同一个仓库，并且参与**本会话**的序号计算。
     state = tmp_path / "state"
     state.mkdir()
-    with pytest.raises(gc.GitError):
-        gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
-    # 子目录里读 ref 会得到空（顶层不匹配），而不是把父仓库的 ref 当成自己的
-    assert gc.next_checkpoint_seq(proj, "parent-session") == 1
+    snap = gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
+    child = gc.commit_tree(proj, tree=snap.tree)
+    gc.write_ref(proj, gc.checkpoint_ref("child-session", 1, "pre_turn"), child)
+
+    assert gc.next_checkpoint_seq(proj, "child-session") == 2
+    # 别的会话仍然不受影响。
+    assert gc.next_checkpoint_seq(proj, "parent-session") == 2
+    assert gc.next_checkpoint_seq(proj, "third-session") == 1
+
+
+def test_monorepo_untracked_subdir_falls_back_to_cas(tmp_path: Path) -> None:
+    """子目录在父仓库里**还没有任何已跟踪文件**时：走 CAS，而不是"快照为空"。
+
+    真实场景：monorepo 里新建的包（还没 commit）被当项目根。此时
+    ``read-tree HEAD`` 里根本没有该前缀下的条目，``add -u`` 什么也更新不了 ——
+    若不把文件收进 CAS，时间线会显示"这一刻保护了 0 个文件"，而回滚也无从取回。
+    """
+    repo = _init(tmp_path / "repo")
+    (repo / "root_only.py").write_bytes(b"ROOT\n")
+    _commit_all(repo)
+    proj = repo / "packages" / "fresh"
+    proj.mkdir(parents=True)
+    (proj / "main.py").write_bytes(b"print(1)\n")
+
+    state = tmp_path / "state"
+    state.mkdir()
+    snap = gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
+
+    assert snap.tree_paths == frozenset()
+    assert set(snap.untracked) == {"main.py"}
+    # 树是空的（项目里没有已跟踪文件），但树上**不能**出现父仓库的根层文件。
+    assert _git(repo, "ls-tree", "-r", "--name-only", snap.tree).stdout == b""
+
+
+def test_resolve_layout_reports_prefix_and_rejects_non_repo(tmp_path: Path) -> None:
+    """布局解析：顶层项目 prefix 为空；子目录给出前缀；非仓库给可行动错误。"""
+    repo = _init(tmp_path / "repo")
+    proj = repo / "packages" / "foo"
+    proj.mkdir(parents=True)
+    (proj / "a.py").write_bytes(b"v1\n")
+    _commit_all(repo)
+
+    top_layout = gc.resolve_layout(repo)
+    assert top_layout.prefix == "" and not top_layout.nested
+    assert top_layout.contains("any/path.py")
+
+    nested = gc.resolve_layout(proj)
+    assert nested.prefix == "packages/foo/"
+    assert nested.nested
+    assert nested.contains("packages/foo/a.py")
+    assert not nested.contains("packages/sibling/b.py")
+    assert nested.relative("packages/foo/a.py") == "a.py"
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with pytest.raises(gc.GitError) as exc:
+        gc.resolve_layout(plain)
+    assert "not a git repository" in str(exc.value)
+    assert "git init" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------

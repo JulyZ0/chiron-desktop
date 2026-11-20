@@ -99,14 +99,22 @@ class PreviewResult:
         }
 
 
-def _tree_entry_sizes(root: Path, tree: str) -> dict[str, int]:
+def _tree_entry_sizes(root: Path, tree: str, *, prefix: str = "") -> dict[str, int]:
     """``ls-tree -r -l`` 的 ``path -> size``（只含普通文件）。
 
     ``-l`` 给出 blob 体积；symlink 的 size 是链接目标长度、gitlink 是 ``-``，
     两者都不算"工作区字节"，因此只取 ``100644`` / ``100755``（口径与
     :func:`git_checkpoint._tree_entries` 一致）。
+
+    ``prefix`` 非空时按 ``--full-name`` 列出并剥前缀（monorepo 子目录），
+    否则默认输出会被 cwd 过滤成只剩子目录 —— 而这里只用于求和，过滤与否都会
+    让"当前工作区有多大"这个数字失真。键与 :func:`git_checkpoint._tree_entries`
+    同为项目根口径，调用方可以互换。
     """
-    proc = gc._run_git(root, "ls-tree", "-r", "-l", "-z", tree)
+    args = ["ls-tree", "-r", "-l", "-z"]
+    if prefix:
+        args.append("--full-name")
+    proc = gc._run_git(root, *args, tree)
     if proc.returncode != 0:
         return {}
     out: dict[str, int] = {}
@@ -123,7 +131,12 @@ def _tree_entry_sizes(root: Path, tree: str) -> dict[str, int]:
             size = int(parts[3])
         except ValueError:
             continue
-        out[os.fsdecode(raw_path)] = size
+        path = os.fsdecode(raw_path).replace(os.sep, "/")
+        if prefix:
+            if not path.startswith(prefix):
+                continue
+            path = path[len(prefix):]
+        out[path] = size
     return out
 
 
@@ -167,8 +180,8 @@ def preview_diff(
     if not _SHA_RE.match(commit):
         raise gc.GitError(f"invalid commit sha: {commit_sha!r}")
 
-    # 先把仓库校验掉：后续一切路径都是"项目根口径"，父仓库快照必须在这里拒绝。
-    gc.verify_repo_root(root)
+    # 先把仓库布局解析掉：后续一切路径都是"项目根口径"，父仓库内容不进快照。
+    layout = gc.resolve_layout(root)
 
     proc = gc._run_git(root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
     if proc.returncode != 0:
@@ -189,12 +202,13 @@ def preview_diff(
             settings=settings,
         )
         current_files = len(current.tree_paths) + len(current.untracked)
-        current_bytes = sum(_tree_entry_sizes(root, current.tree).values()) + _store_bytes(
-            workdir / "untracked", current.untracked.values()
-        )
+        current_bytes = sum(
+            _tree_entry_sizes(root, current.tree, prefix=layout.prefix).values()
+        ) + _store_bytes(workdir / "untracked", current.untracked.values())
 
-        target_paths, target_special = gc._tree_entries(root, tree)
-        target_sizes = _tree_entry_sizes(root, tree)
+        # 目标树的路径按项目根口径列（``prefix`` 用于剥掉 monorepo 前缀）。
+        target_paths, target_special = gc._tree_entries(root, tree, prefix=layout.prefix)
+        target_sizes = _tree_entry_sizes(root, tree, prefix=layout.prefix)
         omitted = untracked is None
         # 清单读不到时把**当前**清单当成目标：未跟踪那部分因此既不 added 也不
         # removed。用空字典代替会让每个当前存在的未跟踪文件都进 ``removed`` ——
@@ -283,6 +297,10 @@ def scan_checkpoint_refs(
     :func:`git_checkpoint.list_checkpoint_refs`：打包 ref 与 worktree）。
     ``roots`` 里不存在的目录 / 不是仓库的目录**跳过**（不抛）：项目被用户挪走或
     删掉是完全正常的事，GC 不该因此整体失败。
+
+    monorepo 子目录项目同样参与扫描：ref 写在父仓库里（既定设计），
+    ``-C <子目录>`` 的 ``for-each-ref`` 照样读得到。``tree_paths`` 只用于统计，
+    因此树路径按仓库根口径计数（不剥前缀）不会影响任何删除决策。
     """
     prefix = "refs/chiron/checkpoints/"
     sessions: set[str] = set()
@@ -295,7 +313,7 @@ def scan_checkpoint_refs(
         if not root.is_dir():
             continue
         try:
-            gc.verify_repo_root(root)
+            layout = gc.resolve_layout(root)
         except gc.GitError:
             continue
         proc = gc._run_git(
@@ -321,9 +339,12 @@ def scan_checkpoint_refs(
                 dangling.append(name)
                 continue
             commits.add(sha)
-            # 每个 commit 的 tree 路径摘要集合：用于"索引覆盖了多少路径"这一统计，
+            # 每个 commit 的 tree 路径集合：用于"索引覆盖了多少路径"这一统计，
             # 以及验证 tree 可读（读不出来说明对象库已经损坏，值得在报告里体现）。
-            tree_paths, _special = gc._tree_entries(root, f"{sha}^{{tree}}")
+            # 口径按该 root 的项目根（monorepo 下剥前缀），与快照口径一致。
+            tree_paths, _special = gc._tree_entries(
+                root, f"{sha}^{{tree}}", prefix=layout.prefix
+            )
             paths.update(tree_paths)
     return RefScan(
         refs=ref_count,

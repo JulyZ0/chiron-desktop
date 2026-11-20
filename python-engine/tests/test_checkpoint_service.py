@@ -99,7 +99,7 @@ def test_empty_session_id_is_rejected_without_touching_git(tmp_path: Path) -> No
 
 
 def _nested(tmp_path: Path) -> tuple[Path, Path]:
-    """``outer/`` 是仓库，``outer/inner`` 是"被当成项目根"的子目录。"""
+    """``outer/`` 是仓库，``outer/inner`` 是**作为项目根**的 monorepo 子目录。"""
     outer = _repo(tmp_path)
     inner = outer / "inner"
     inner.mkdir()
@@ -107,62 +107,93 @@ def _nested(tmp_path: Path) -> tuple[Path, Path]:
     return outer, inner
 
 
-def _all_refs(root: Path) -> str:
-    proc = subprocess.run(
-        ["git", "-C", str(root), "for-each-ref", "refs/chiron"],
-        capture_output=True,
-        check=False,
-    )
-    return proc.stdout.decode("utf-8", errors="replace")
+def test_nested_project_root_snapshots_only_its_subtree(tmp_path: Path) -> None:
+    """★★ 项目根套在父仓库里 ⇒ 只快照子目录子树（monorepo 支持）。
 
+    旧行为是**拒绝**（"project root is inside another git repository"）。原因是
+    ``read-tree HEAD`` / ``write-tree`` 都是仓库全局口径：不裁剪就会把父仓库的
+    全部文件（含别的项目的密钥）写进快照，而 ``ls-tree`` 在子目录里又被前缀过滤，
+    上报成"0 个文件"。
 
-def test_nested_project_root_does_not_snapshot_parent_repo(tmp_path: Path) -> None:
-    """★★ 项目根套在父仓库里 ⇒ 必须失败，**绝不**快照父仓库内容。
-
-    缺陷形态（实测）：``git -C inner write-tree`` 在子目录里同样成功 —— git 向上
-    找到了父仓库。于是
-      * 快照里是**父仓库**的文件（``outer_secret.py``），而不是 inner 里的；
-      * commit / ref 写进父仓库（``refs/chiron/checkpoints/...``）；
-      * 上报的却是 ``state='ok'``，且 ``ls-tree`` 在子目录下被路径前缀过滤成空清单
-        ⇒ 时间线上显示"这一刻保护成功、0 个文件"。
-
-    判据三条：失败态 + 可读原因 + 父仓库里一个 chiron ref 都没有。
+    现在的判据：
+      * 成功，且 ``file_count`` 只数子目录文件；
+      * 树里没有父仓库根层的文件；
+      * ref 落在父仓库（既定设计：对象库/ref 必须与树在同一个库里），`read_ref`
+        从子目录与仓库顶层都能读到同一个 commit；
+      * 未跟踪清单只含子目录的文件。
     """
     outer, inner = _nested(tmp_path)
+    (outer / "outer_root.py").write_text("ROOT\n", encoding="utf-8")
+    _git(outer, "add", "-A")
+    _git(outer, "commit", "-qm", "root file")
+    (inner / "draft.py").write_text("draft\n", encoding="utf-8")
+
     rec = cs.attempt_checkpoint(
         inner, session_id="s-nest", seq=1, kind="pre_turn", state_dir=tmp_path / "state"
     )
-    assert rec is not None
-    assert rec.state == "failed", "嵌套在父仓库里的项目根不能报成功"
-    assert "inside another git repository" in rec.error, rec.error
-    assert rec.error_code == "git"
-    assert rec.commit_sha == "" and rec.ref_name == ""
-    assert _all_refs(outer) == "", "检查点 ref 绝不能写进父仓库"
-    assert len(rec.untracked) == 0, "父仓库的未跟踪文件也绝不能进本次快照"
+    assert rec is not None and rec.state == "ok", rec.error
+    # 只有 inner/x.py（已跟踪）+ inner/draft.py（未跟踪）—— 父仓库根层文件不算。
+    assert rec.file_count == 1
+    assert [p for p, _ in rec.untracked] == ["draft.py"]
+
+    from app.agent import git_checkpoint as gc
+
+    # ref 与对象都写在父仓库（同一个对象库），读取口径在这里必须一致。
+    assert gc.read_ref(inner, rec.ref_name) == rec.commit_sha
+    assert gc.read_ref(outer, rec.ref_name) == rec.commit_sha
+    listed = subprocess.run(
+        ["git", "-C", str(outer), "ls-tree", "-r", "--name-only", rec.commit_sha],
+        capture_output=True,
+        check=False,
+    ).stdout.decode()
+    assert "inner/x.py" in listed
+    assert "outer_root.py" not in listed, "父仓库根层的文件绝不能进子目录快照"
+
+
+def test_nested_project_seq_ignores_other_sessions(tmp_path: Path) -> None:
+    """父仓库里别的会话的 ref 不影响子目录会话的序号（隔离靠 session_id）。"""
+    from app.agent import git_checkpoint as gc
+
+    outer, inner = _nested(tmp_path)
+    tree = subprocess.run(
+        ["git", "-C", str(outer), "write-tree"], capture_output=True, check=False
+    ).stdout.decode().strip()
+    sha = gc.commit_tree(outer, tree=tree)
+    gc.write_ref(outer, gc.checkpoint_ref("other-session", 1, "pre_turn"), sha)
+
+    assert gc.next_checkpoint_seq(inner, "s-nest") == 1
+    rec = cs.attempt_checkpoint(
+        inner, session_id="s-nest", seq=1, kind="pre_turn", state_dir=tmp_path / "state"
+    )
+    assert rec is not None and rec.succeeded
+    assert gc.next_checkpoint_seq(inner, "s-nest") == 2
 
 
 def test_uninitialized_project_fails_with_actionable_message(tmp_path: Path) -> None:
     """未 ``git init`` 的项目 ⇒ 失败态记录里的原因要能告诉用户"先 git init"。
 
     与上一条同源：此前非 git 目录若恰好位于某个仓库之下，会"成功"快照父仓库；
-    现在的行为是**明确失败**，前端因此能显示"这一刻没保护成功 + 原因"。
-
-    原因有两种正确的说法，取决于临时目录落在哪里 —— 这**不是**测试的模糊地带，
-    而是两条不同的真实分支：普通目录得到 ``not a git repository``；
-    而临时目录若正好在某个仓库里（本仓库的父目录、或 ``--basetemp`` 指到了仓库内），
-    得到的是 ``inside another git repository``。两种都必须带 ``git init`` 这一行动项。
+    现在这类目录是**受支持的 monorepo 子目录**，所以本用例只覆盖真正的
+    "不在任何仓库里"分支。若 ``--basetemp`` 恰好落在仓库内，这里跳过 ——
+    把两种语义塞进一个断言只会让用例在换环境时无故变红。
     """
     plain = tmp_path / "plain"
     plain.mkdir()
+    probe = subprocess.run(
+        ["git", "-C", str(plain), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        check=False,
+    )
+    if probe.returncode == 0:
+        import pytest
+
+        pytest.skip("basetemp 在某个 git 仓库内：该目录走 monorepo 子目录分支")
     rec = cs.attempt_checkpoint(
         plain, session_id="s-plain", seq=1, kind="pre_turn", state_dir=tmp_path / "state"
     )
     assert rec is not None and rec.state == "failed"
     assert rec.error_code == "git"
-    assert (
-        "not a git repository" in rec.error
-        or "inside another git repository" in rec.error
-    ), rec.error
+    assert "not a git repository" in rec.error, rec.error
     assert "git init" in rec.error, "原因里要给出下一步动作，而不只是结论"
 
 

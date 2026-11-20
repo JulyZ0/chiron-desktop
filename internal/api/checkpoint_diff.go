@@ -281,34 +281,10 @@ func CheckpointGcHandler(python *engine.PythonClient) http.HandlerFunc {
 		// 太容易由一次手滑的 {} 请求触发，而代价是本机所有项目的未跟踪缓存。
 		retention := resolveGcRetention(body.RetentionDays)
 
-		roots := make([]string, 0, 8)
-		wsID := strings.TrimSpace(body.WorkspaceID)
-		if wsID != "" {
-			row, err := db.GlobalDBManager.FetchOne(r.Context(),
-				`SELECT COALESCE(root_path,'') AS root_path FROM session_map_workspaces WHERE id = $1`,
-				wsID)
-			if err != nil {
-				logAndRespond(w, err, http.StatusInternalServerError, "workspace lookup failed")
-				return
-			}
-			if root := strings.TrimSpace(stringOf(row["root_path"])); root != "" {
-				roots = append(roots, root)
-			}
-		} else {
-			// 全平台：只取有绑定目录的项目。失效目录由引擎跳过（项目被挪走很常见）。
-			rows, err := db.GlobalDBManager.FetchAll(r.Context(),
-				`SELECT DISTINCT root_path FROM session_map_workspaces
-				  WHERE COALESCE(root_path,'') <> ''
-				  LIMIT 200`)
-			if err != nil {
-				logAndRespond(w, err, http.StatusInternalServerError, "workspace roots lookup failed")
-				return
-			}
-			for _, row := range rows {
-				if root := strings.TrimSpace(stringOf(row["root_path"])); root != "" {
-					roots = append(roots, root)
-				}
-			}
+		roots, err := checkpointGcRoots(r.Context(), body.WorkspaceID)
+		if err != nil {
+			logAndRespond(w, err, http.StatusInternalServerError, "workspace roots lookup failed")
+			return
 		}
 
 		payload := map[string]interface{}{

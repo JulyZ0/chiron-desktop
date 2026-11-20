@@ -9,7 +9,7 @@
 
 设计要点（每一条都在下面的实现里直接体现）：
 
-* 快照：独立 index + pathspec 排除
+* 快照：独立 index + pathspec 排除 + 前缀裁剪（monorepo 子目录）
 * 回滚：三分类差异 + 默认不删
 * 单文件/单回合：同一个原语
 * 密钥：``add`` 的同一次调用里排除，而不是 ``add`` 后 ``rm --cached``
@@ -25,10 +25,12 @@
    转成 ``"\\344\\270\\255.py"``，按行解析直接拿到错误文件名。
 4. 恢复 ``added`` 类文件前必须 ``mkdir -p`` 父目录，否则报
    ``No such file or directory`` —— 而且**退出码可能仍是 0**，不能只看返回值。
-5. 动手前必须校验"仓库顶层 == ``root``"（:func:`verify_repo_root`）。git 会向上
-   查找父仓库：项目根若是某个大仓库的子目录，``write-tree`` 照样成功 —— 但它快照的是
-   **父仓库**的工作区，ref/commit 也写进父仓库，而上报的却是 ``state='ok'``。
-   这是"检查点看起来从没正确跑过"的根因之一，务必不要为了省一次 ``rev-parse`` 去掉它。
+5. 动手前必须用 :func:`resolve_layout` 定出"项目根在仓库里的前缀"（``--show-prefix``）。
+   git 会向上查找父仓库：项目根若是某个大仓库的子目录，``read-tree HEAD`` /
+   ``write-tree`` 默认是**仓库全局**口径 —— 会把父仓库其它文件一起写进快照，
+   而上报的路径口径却是子目录。monorepo 模式下必须先摘掉独立索引里**前缀之外**
+   的条目（实测：光靠 pathspec 排除管不到 ``read-tree`` 已经带进来的条目），
+   再 ``write-tree``；写完后还要用 ``--full-name`` 复核一遍，见 :func:`snapshot`。
 
 D4（未跟踪文件）：默认**不进 git 对象库**，而进本模块自带的按 sha256 分片的
 内容寻址存储（``UntrackedStore``）。理由：agent 新建的文件数量不可控，塞进用户的
@@ -424,25 +426,59 @@ def _same_dir(a: Path, b: Path) -> bool:
     return left == right
 
 
-def verify_repo_root(root: Path) -> None:
-    """校验 ``root`` **本身就是**它所在 git 仓库的工作区顶层；不是就抛 ``GitError``。
+@dataclass(frozen=True)
+class RepoLayout:
+    """项目根与它所在 git 仓库的关系：``root`` 是仓库顶层，还是它下面某个前缀。
 
-    为什么必须校验（这是"检查点从没正确跑过"的根因之一）：
+    ``prefix`` 是**POSIX 风格、带结尾斜杠**的仓库内前缀（``packages/foo/``）；
+    项目根就是仓库顶层时为空串。空串与非空串的差别贯穿整个模块：
 
-    git 会**向上查找**父仓库。项目根若是某个大仓库的子目录（把
-    ``~/bigrepo/projects/demo`` 当项目根，或用户目录本身嵌在仓库里），
-    ``git -C demo write-tree`` 会成功，但它写的是**父仓库**的工作区：
+    * 快照：非空时独立索引必须先裁到前缀内（:func:`_restrict_index_to_prefix`）；
+    * 路径口径：``Snapshot.tree_paths`` / ``DiffPlan`` / ``restore`` 一律是
+      **项目根口径**（``src/a.py``），而不是仓库根口径（``packages/foo/src/a.py``），
+      因此所有 git 命令都带 ``--relative`` / 相对 cwd 的路径；
+    * commit / ref 仍然写进**父仓库**的对象库与 ref 命名空间 —— 这是既定设计：
+      用户的项目本来就在那个仓库里，把检查点放到别处会让 ``git gc`` 认不出它们。
 
-    * 快照里是父仓库的文件（用户以为保护了 demo，实际保护了别处）；
-    * commit / ref（``refs/chiron/checkpoints/...``）写进父仓库 ——
-      在别人的仓库里留下 ref 与对象；
-    * 失败是**静默**的：``state='ok'`` 报上去，而 ``ls-tree`` 在子目录里按
-      git 的路径前缀过滤，读回来是空清单 —— 时间线上看起来"这一刻保护成功、
-      0 个文件"，回滚却指向父仓库的历史。
+    为什么不再"拒绝子目录项目"：monorepo 是常见布局，把项目根指向子目录是用户
+    的正当选择。拒绝只会让这类项目完全没有还原点；正确做法是**限定快照范围**。
+    """
 
-    所以正确行为是**拒绝**：让上层落一条 ``state='failed'`` 的可读记录
-    （"project root is inside another git repository"），而不是错误快照。
-    未 ``git init`` 的项目同样落在这里 —— 明确的失败比伪装成成功的空快照好。
+    #: 项目根（调用方传入的 ``root``，未解析符号链接）。
+    root: Path
+    #: 仓库工作区顶层（``rev-parse --show-toplevel`` 的输出）。
+    top: Path
+    #: 项目根相对仓库顶层的前缀，POSIX 分隔、带结尾斜杠；顶层项目为空串。
+    prefix: str = ""
+
+    @property
+    def nested(self) -> bool:
+        """项目根是不是仓库里的子目录。"""
+        return bool(self.prefix)
+
+    def contains(self, repo_path: str) -> bool:
+        """仓库根口径的路径是否落在项目根子树内（索引条目都是文件，不必判目录）。"""
+        if not self.prefix:
+            return True
+        return repo_path.replace(os.sep, "/").startswith(self.prefix)
+
+    def relative(self, repo_path: str) -> str:
+        """仓库根口径 → 项目根口径；前缀之外的原样返回（调用方负责丢弃）。"""
+        if not self.prefix:
+            return repo_path
+        text = repo_path.replace(os.sep, "/")
+        return text[len(self.prefix):] if text.startswith(self.prefix) else text
+
+
+def resolve_layout(root: Path) -> RepoLayout:
+    """解析 ``root`` 所在的仓库布局；不是仓库时抛可行动的 ``GitError``。
+
+    这是原来的 ``verify_repo_root``：**不再拒绝**"项目根嵌在父仓库里"，
+    而是把前缀解析出来交给快照/回滚使用。仍会失败（并给出行动项）的只有两种：
+
+    * 根本不在任何仓库里 —— 提示先 ``git init``；
+    * 能进仓库、却拿不到可用前缀（``--show-prefix`` 失败或为空而顶层又不同）——
+      此时无法确定快照边界，宁可明确失败也不生成"看起来成功、实际是父仓库"的快照。
     """
     root = Path(root)
     proc = _run_git(root, "rev-parse", "--show-toplevel")
@@ -458,13 +494,31 @@ def verify_repo_root(root: Path) -> None:
         # 正常仓库不会走到这里；保底也拒绝，避免"空值当成匹配"。
         raise GitError(f"git rev-parse --show-toplevel returned nothing for {root}")
     top = Path(top_raw)
-    if not _same_dir(top, root):
+    if _same_dir(top, root):
+        return RepoLayout(root=root, top=top, prefix="")
+
+    # 子目录（monorepo）：前缀决定快照边界，拿不到就只能失败。
+    proc = _run_git(root, "rev-parse", "--show-prefix")
+    prefix = proc.stdout.decode("utf-8", errors="replace").strip().replace("\\", "/")
+    if proc.returncode != 0 or not prefix:
         raise GitError(
-            f"project root is inside another git repository: {root} "
-            f"(repository top-level: {top_raw})；"
-            "检查点不会快照父仓库的内容，请在项目根执行 git init，"
-            "或把项目根指向仓库顶层目录。"
+            f"cannot determine the project prefix inside the git repository: {root} "
+            f"(repository top-level: {top_raw})；检查点无法确定快照边界，"
+            "请确认项目目录位于仓库工作区内（不要是符号链接跳出去的目录），"
+            "或在项目根单独 git init。"
         )
+    if not prefix.endswith("/"):
+        prefix += "/"
+    return RepoLayout(root=root, top=top, prefix=prefix)
+
+
+def verify_repo_root(root: Path) -> RepoLayout:
+    """旧名保留：校验 ``root`` 在一个 git 仓库里，并返回它的 :class:`RepoLayout`。
+
+    语义已放宽 —— 子目录项目**不再**被拒绝（见 :class:`RepoLayout` 的说明）。
+    调用方拿返回值就能知道要不要走前缀裁剪；只关心"是不是仓库"的调用方可以忽略它。
+    """
+    return resolve_layout(root)
 
 
 def _repo_objects_bytes(root: Path) -> int:
@@ -572,13 +626,24 @@ class Snapshot:
         return frozenset(self.tree_paths) | frozenset(self.untracked)
 
 
-def _tree_entries(root: Path, tree: str) -> tuple[frozenset[str], frozenset[str]]:
+def _tree_entries(
+    root: Path, tree: str, *, prefix: str = ""
+) -> tuple[frozenset[str], frozenset[str]]:
     """列出树内的常规文件路径，以及非普通文件（gitlink 等）的路径。
 
     ``ls-tree -r -l -z`` 的格式是 ``<mode> <type> <sha> <size>\\t<path>\\0``
     （已实测）。``-z`` 不能省：否则中文路径是八进制转义的。
+
+    ``prefix`` 非空（monorepo 子目录）时加 ``--full-name`` 并**显式**剥前缀：
+    默认的 ``ls-tree`` 输出是相对 cwd 的（在子目录里调用时前缀已被 git 去掉、
+    且前缀之外的条目被过滤掉）—— 那正是"看起来 0 个文件"的成因。
+    显式剥前缀让口径与 :func:`diff`（``--relative``）和 :func:`restore`
+    （``root / path``）保持同一个：**项目根口径**。
     """
-    proc = _run_git(root, "ls-tree", "-r", "-l", "-z", tree)
+    args = ["ls-tree", "-r", "-l", "-z"]
+    if prefix:
+        args.append("--full-name")
+    proc = _run_git(root, *args, tree)
     if proc.returncode != 0:
         return frozenset(), frozenset()
     regular: set[str] = set()
@@ -591,13 +656,73 @@ def _tree_entries(root: Path, tree: str) -> tuple[frozenset[str], frozenset[str]
         if len(parts) < 3:
             continue
         mode = parts[0].decode("ascii", errors="replace")
-        path = os.fsdecode(raw_path)
+        path = os.fsdecode(raw_path).replace(os.sep, "/")
+        if prefix:
+            if not path.startswith(prefix):
+                # 前缀之外的条目不该出现在快照里；snapshot() 会用 --full-name
+                # 复核并报错，这里只是不让它混进"项目根口径"的清单。
+                continue
+            path = path[len(prefix):]
         # 160000 = gitlink（嵌套仓库 / submodule），其**内部内容不在树里**。
         if mode in ("100644", "100755"):
             regular.add(path)
         else:
             special.add(path)
     return frozenset(regular), frozenset(special)
+
+
+def _full_tree_paths(root: Path, tree: str) -> list[str]:
+    """树的**仓库根口径**路径清单（``--full-name``）。
+
+    只用于"快照有没有越过项目根"的复核：默认输出是相对 cwd 的，在子目录里
+    前缀之外的条目会被 git 过滤掉 —— 用它复核等于自欺。
+    """
+    proc = _run_git(root, "ls-tree", "-r", "-z", "--name-only", "--full-name", tree)
+    if proc.returncode != 0:
+        return []
+    return [p.replace(os.sep, "/") for p in _split_z(proc.stdout)]
+
+
+def _restrict_index_to_prefix(layout: RepoLayout, env: Mapping[str, str]) -> None:
+    """把独立索引里**项目根前缀之外**的条目全部摘掉（monorepo 子目录）。
+
+    为什么必须在 ``write-tree`` 之前、且必须**显式**摘：
+
+    * ``read-tree HEAD`` 是**仓库全局**口径 —— 索引里立刻有父仓库的所有条目；
+    * ``add -u -- .`` 只更新 cwd 子树，**不会**删除别的条目；
+    * 于是 ``write-tree`` 会把父仓库其它文件一起写进快照。用户以为保护了
+      ``packages/foo``，实际把整个 monorepo 存了一份（还混进别人的密钥）。
+
+    ``update-index --force-remove --stdin`` 的路径解析实测结论：**相对 cwd**。
+    因此这条命令必须在**仓库顶层**执行（``-C top``）。在子目录里执行时，
+    传进去的 ``other/o.py`` 会被解释成 ``packages/foo/other/o.py``，静默不匹配
+    —— 退出码仍是 0，父仓库条目原封不动留在索引里。
+
+    只删**索引条目**，不碰工作区文件、也不读 blob 内容（与密钥排除同一个理由：
+    ``add`` 之后再删，明文早已落盘）。
+    """
+    proc = _run_git(layout.top, "ls-files", "-z", "--cached", "--full-name", env=env)
+    if proc.returncode != 0:
+        # 索引刚建/空仓库：没有可摘的东西；后面的 --full-name 复核会兜底。
+        return
+    outside = [p for p in _split_z(proc.stdout) if not layout.contains(p)]
+    if not outside:
+        return
+    payload = b"".join(os.fsencode(p) + b"\0" for p in outside)
+    proc = _run_git(
+        layout.top,
+        "update-index",
+        "--force-remove",
+        "-z",
+        "--stdin",
+        env=env,
+        stdin=payload,
+    )
+    if proc.returncode != 0:
+        raise GitError(
+            "update-index (restrict to project prefix) failed: "
+            + proc.stderr.decode("utf-8", errors="replace").strip()
+        )
 
 
 def _oversized_paths(root: Path, limit: int) -> set[str]:
@@ -639,12 +764,18 @@ def snapshot(
     ``limits`` 显式传入时优先；否则按 ``settings``（D7 用户配置）+ 仓库对象体积
     解析 —— 单次预算硬下限 4 GB，用户设置只能往上调。
 
-    第一步**必须**是 :func:`verify_repo_root`：git 会向上找父仓库，不校验就会
-    把父仓库当工作区快照（见该函数的说明）。这一步失败抛 ``GitError``，
-    上层据此落 ``state='failed'`` 记录。
+    第一步**必须**是 :func:`resolve_layout`：git 会向上找父仓库，不解析前缀就会
+    把父仓库当工作区快照（见 :class:`RepoLayout`）。
+
+    **monorepo 子目录**（``root`` 是仓库里的子目录）走同一条路径，只是多两步：
+    ``read-tree HEAD`` 之后摘掉前缀之外的索引条目（:func:`_restrict_index_to_prefix`），
+    ``write-tree`` 之后再复核树里没有前缀之外的路径。于是 ``tree`` 只含项目根子树，
+    而路径口径仍是仓库根（tree 是仓库根的子树，``diff`` 用 ``--relative`` 转成
+    项目根口径，``restore`` 用 ``cat-file <tree>:./<path>`` 反过来取）。
     """
     root = Path(root)
-    verify_repo_root(root)
+    layout = resolve_layout(root)
+    prefix = layout.prefix
     index_file = Path(index_file)
     index_file.parent.mkdir(parents=True, exist_ok=True)
     env = _git_env(index_file)
@@ -653,6 +784,9 @@ def snapshot(
     # 1) 从 HEAD 起步，让未变更文件直接继承父树 —— write-tree 只写差异 blob。
     if _run_git(root, "read-tree", "HEAD", env=env).returncode != 0:
         _run_git(root, "read-tree", "--empty", env=env)
+    # 1.5) monorepo：read-tree 是**仓库全局**口径，必须裁到项目根子树。
+    if prefix:
+        _restrict_index_to_prefix(layout, env)
 
     oversized = _oversized_paths(root, limits.max_file_bytes)
     # 树快照**只**排除密钥，不排除噪声。
@@ -735,12 +869,28 @@ def snapshot(
 
     tree = _must(_run_git(root, "write-tree", env=env), "write-tree").decode("ascii").strip()
 
+    # 4) 复核：树里**不得**有项目根前缀之外的路径。
+    #
+    #    这一条是 monorepo 模式的安全边界。没有它，一次前缀裁剪失败（例如上面
+    #    ``update-index`` 静默不匹配）就会让快照变成"整个父仓库"，而上报的
+    #    ``file_count`` 还是子目录那点数字 —— 用户永远不会发现自己的 repo 被复制
+    #    进了检查点。宁可这次检查点失败（fail-open 只是少一个还原点）。
+    if prefix:
+        stray = [p for p in _full_tree_paths(root, tree) if not p.startswith(prefix)]
+        if stray:
+            preview = ", ".join(stray[:5]) + (" ..." if len(stray) > 5 else "")
+            raise GitError(
+                f"checkpoint snapshot leaked paths outside project root {root} "
+                f"(prefix {prefix!r}): {preview}；已放弃本次快照，"
+                "不会把父仓库的内容写进检查点。"
+            )
+
     untracked: dict[str, str] = {}
     skipped = 0
     if untracked_mode == "store":
         untracked, skipped = _collect_untracked(root, store_root, index_file, limits, oversized)
 
-    tree_paths, non_regular = _tree_entries(root, tree)
+    tree_paths, non_regular = _tree_entries(root, tree, prefix=prefix)
     secrets = sum(1 for p in _untracked_candidates(root) if _is_excluded(p, SECRET_GLOBS))
 
     return Snapshot(
@@ -871,10 +1021,12 @@ def _tree_diff(root: Path, base: str, target: str) -> list[tuple[str, str]]:
     ``-z`` 下每项是 ``<status>\\0<path>\\0``（已实测）。``R``/``C`` 会多带一个路径，
     这里按状态长度跳过额外项 —— 不加 ``-M`` 时不会出现，但解析要稳。
     """
-    # ``--relative`` 是这里的关键：``diff-tree`` 默认输出**仓库根**口径的路径
-    # （monorepo 子目录下是 ``packages/foo/src/a.txt``），而 ``_tree_entries`` /
-    # ``ls-files`` 都是项目根口径（``src/a.txt``）。不加它，`restore()` 会拿
-    # 仓库根路径去拼 ``root / path``，写进 ``packages/foo/packages/foo/src/a.txt``，
+    # ``--relative`` 是这里的关键：两份树都是**仓库根口径**（monorepo 子目录下
+    # 树里的路径是 ``packages/foo/src/a.txt``），而 ``_tree_entries`` /
+    # ``ls-files`` 都是**项目根口径**（``src/a.txt``）。``--relative`` 在
+    # ``-C root`` 的子目录里过滤并剥掉前缀，正好把树路径翻成项目根口径 ——
+    # 实测 ``M\\0a.py``。不加它，``restore()`` 会拿仓库根路径去拼
+    # ``root / path``，写进 ``packages/foo/packages/foo/src/a.txt``，
     # 而 ``written`` 返回空、``ok=True`` —— 用户看到"回滚成功"却没改动任何文件（实测）。
     proc = _run_git(
         root, "diff-tree", "-r", "-z", "--no-commit-id", "--relative", "--name-status", base, target
@@ -1215,6 +1367,11 @@ def commit_tree(
     与用户的分支历史纠缠：用户 rebase/amend 之后，检查点的祖先关系就代表不了
     "会话的时间顺序"。t当时的 HEAD 记在 trailer 里，仅供审计。
     实测对照：``-p HEAD`` 得到 ``CHAIN_BROKEN``，``-p <prev_cp>`` 得到 ``CHAIN_INTACT``。
+
+    **monorepo 子目录的 commit 也写父仓库的对象库**（既定设计）：树本身就放在那
+    个库里，写别处会让 ``git gc`` 立刻把它当垃圾回收掉；ref 命名不变
+    （``refs/chiron/checkpoints/<session>/...``），因此子目录项目与仓库顶层项目
+    共用同一个 ref 命名空间 —— 会话 id 唯一，不会撞号。
     """
     body = message
     if head_sha:
@@ -1246,14 +1403,14 @@ def list_checkpoint_refs(root: Path, session_id: str, *, index_file: Path | None
     `for-each-ref` 同时覆盖松散与打包 ref，也不关心 `.git` 是目录还是文件。
     命令失败时返回空列表（调用方据此从 1 开始）—— 与"没有检查点"同义，且不抛。
 
-    **项目根不是本目录自己的仓库时同样返回空**：否则子目录里的项目会读到
-    **父仓库**里同名会话的 ref，序号凭空进位（"这个会话已经有 7 个点"），
-    而随后写 ref 却因 ``verify_repo_root`` 被拒 —— 用户只能看到序号很怪、
-    且一条失败记录接着一条。父仓库的 ref 与本次会话无关，不该参与序号计算。
+    **monorepo 子目录同样要读父仓库的 ref**：ref 命名不变（既定设计），
+    子目录项目的检查点 ref 就落在父仓库的 `refs/chiron/**` 下。此前这里返回空，
+    导致子目录项目的序号恒为 1、`write_ref` 的 CAS 必然失败 —— 时间线永远不增长。
+    不相关的会话因为 ref 名里带 session_id 而天然隔离，不会互相影响序号。
     """
     prefix = checkpoint_ref_prefix(session_id)
     try:
-        verify_repo_root(root)
+        resolve_layout(root)
     except GitError:
         return []
     proc = _run_git(
