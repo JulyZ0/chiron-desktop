@@ -54,6 +54,7 @@ import { boardFromHistory } from '../components/chat/todoProjection'
 import TodoPanel from '../components/chat/TodoPanel.vue'
 import { useSessionMeta } from '../composables/useSessionMeta'
 import { usePanelCollapse } from '../composables/usePanelCollapse'
+import { useSessionActivity } from '../composables/useSessionActivity'
 import { useSubagentStream } from '../composables/useSubagentStream'
 import { useMessageFailure } from '../composables/useMessageFailure'
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
@@ -313,23 +314,6 @@ const splitTitle = computed(() => {
  * 取近似常量而非实时测量：多留一些比少留安全，且避免 ResizeObserver 的复杂度。
  */
 const floatingBottomInset = 160
-
-/**
- * 运行中的子 Agent 数（状态栏角标）。
- *
- * 直接数实时事件：遇到 `subagent.done` 就移除，否则记为运行中 ——
- * 不依赖面板是否打开、也不等侧栏轮询结果，所以"有子 Agent 在跑"永远看得出来。
- */
-const subagentActiveCount = computed(() => {
-  const active = new Set<string>()
-  for (const e of subagentLiveEvents.value) {
-    const id = (e as { run_id?: string }).run_id
-    if (!id) continue
-    if ((e as { type?: string }).type === 'subagent.done') active.delete(id)
-    else active.add(id)
-  }
-  return active.size
-})
 
 /** 当前模式的显示名 */
 const modeLabel = computed(() => modeOptions.find(o => o.value === mode.value)?.label || t('common.normal'))
@@ -1539,52 +1523,6 @@ const panelView = ref<'trajectory' | 'sessions' | 'agents' | 'stats'>('trajector
 const synapseMapOpen = ref(false)
 
 /**
- * 地图上标「运行中」的会话。
- *
- * 此前 ChatView 从不传 `runningIds`，于是地图里的 `.is-running` 与脉冲徽标是死代码。
- * 数据来源是子 Agent 的实时事件流：某会话出现 run 即标记为运行中，收到 `subagent.done`
- * 才清除 —— 多个 run 并发时会话始终保持标记（与"是否还有未终态的 run"同义）。
- */
-const runningSessionIds = computed<string[]>(() => {
-  const open = new Set<string>()
-  for (const raw of subagentLiveEvents.value) {
-    const e = raw as { session_id?: string; run_id?: string; type?: string }
-    const sid = e?.session_id
-    if (!sid || !e?.run_id) continue
-    if (e.type === 'subagent.done') open.delete(sid)
-    else open.add(sid)
-  }
-  return [...open]
-})
-
-/**
- * 侧栏会话行上心跳点用的**并集**：主回合在跑（`liveRunSessionIds`）或还有未终态的
- * 子 Agent run（`runningSessionIds`）都算"这个会话还在动"。
- *
- * 为什么必须取并集：两个信号各有盲区 —— 只跑主回合时 `subagentLiveEvents` 是空的；
- * 主回合结束但后台子 Agent 仍在跑时 `runtimes.loading` 已为 false。
- * 为什么必须声明在这里：`runningSessionIds` 依赖 `subagentLiveEvents`，
- * 放到文件前半段会触发 TDZ（同下方 watch 的注释）。
- */
-const sidebarRunningIds = computed(() => {
-  const set = new Set<string>(runningSessionIds.value)
-  for (const sid of liveRunSessionIds.value) set.add(sid)
-  return set
-})
-
-/**
- * 会话地图的实时状态。
- *
- * 旧实现靠 `postMessage` 把宿主的运行态与流式文本推给 iframe 里的画布，改造时
- * 那条通道随 iframe 一起被删掉 —— 于是地图只剩「运行中」脉冲点，看不到正在生成的
- * 文字。现在改为同进程单向 props：
- *   - `mapRunningSessionIds` 给卡片打「运行中」标记
- *   - `mapStreamPreviews` 给卡片提供正在输出的尾部文本
- * 不再有消息协议，也就没有"端口通配 '*'"、`origin === 'null'`、20 秒回执超时这一整类问题。
- */
-const mapRunningSessionIds = computed<string[]>(() => [...sidebarRunningIds.value])
-
-/**
  * 会话 id → 正在流式输出的尾部文本（卡片预览）。
  *
  * 只投影 `loading` 为真的会话：`streaming` 条目只在这期间存在，遍历全部会话纯属白算。
@@ -1631,6 +1569,30 @@ const {
   resolveRun: () => writingRun.value ?? currentRun.value,
   isTurnStreamOpen: () => activeSSE !== null,
 })
+
+/**
+ * 「这个会话还在动」的三份派生：状态栏角标、会话地图的运行中标记、侧栏心跳点。
+ *
+ * 规则搬到了 `composables/useSessionActivity.ts`（P2-1 第二刀）；这里只决定两个输入：
+ * 子 Agent 实时事件（会话级 SSE 推来的那一份）与主回合仍 `loading` 的会话集合。
+ * 取并集的理由在 composable 里 —— 两个信号各有盲区。
+ */
+const { subagentActiveCount, sidebarRunningIds } = useSessionActivity({
+  subagentLiveEvents: () => subagentLiveEvents.value,
+  liveRunSessionIds: () => liveRunSessionIds.value,
+})
+
+/**
+ * 会话地图的实时状态。
+ *
+ * 旧实现靠 `postMessage` 把宿主的运行态与流式文本推给 iframe 里的画布，改造时
+ * 那条通道随 iframe 一起被删掉 —— 于是地图只剩「运行中」脉冲点，看不到正在生成的
+ * 文字。现在改为同进程单向 props：
+ *   - `mapRunningSessionIds` 给卡片打「运行中」标记
+ *   - `mapStreamPreviews` 给卡片提供正在输出的尾部文本
+ * 不再有消息协议，也就没有"端口通配 '*'"、`origin === 'null'`、20 秒回执超时这一整类问题。
+ */
+const mapRunningSessionIds = computed<string[]>(() => [...sidebarRunningIds.value])
 
 /**
  * 子 Agent 卡片「重试」：把失败任务放回输入框，而不是替用户再派发一次。
