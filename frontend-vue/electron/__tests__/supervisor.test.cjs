@@ -15,7 +15,13 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createSupervisor, DEFAULT_MAX_RESTARTS, DEFAULT_BACKOFF_MS } = require('../supervisor.cjs')
+const {
+  createSupervisor,
+  DEFAULT_MAX_RESTARTS,
+  DEFAULT_BACKOFF_MS,
+  DEFAULT_CRASH_WINDOW_MS,
+  DEFAULT_STABLE_MS,
+} = require('../supervisor.cjs')
 
 /** 假时钟 + 立即执行的定时器：退避等待不需要真的 sleep */
 function fakeClock() {
@@ -161,9 +167,11 @@ test('稳定运行超过窗口后崩溃，预算清零重来', async () => {
   await new Promise(r => setImmediate(r))
   assert.equal(sup.snapshot('engine').restarts, 2)
 
-  // 这一次跑够了稳定期：就绪之后经过的时长才是"稳定运行了多久"
+  // 这一次跑够了稳定期：就绪之后经过的时长才是"稳定运行了多久"。
+  // 必须**超过时间窗**（10 分钟）：否则 3 次崩溃仍然落在窗口内，会命中"崩溃循环"
+  // 判据 —— 那正是本用例的反面（见下面"10 分钟内累计 3 次"那条）。
   sup.markAlive('engine')
-  clock.advance(120_000)
+  clock.advance(DEFAULT_CRASH_WINDOW_MS + 60_000)
 
   await sup.handleExit('engine', { code: 1 })
   await new Promise(r => setImmediate(r))
@@ -173,6 +181,44 @@ test('稳定运行超过窗口后崩溃，预算清零重来', async () => {
     1,
     '跑了一整天才偶发崩一次，不该被之前的累计次数拖进"放弃"',
   )
+})
+
+// ------------------------------------------------------------------ 判定 5（P0-3）
+
+test('10 分钟内累计崩溃 3 次即放弃，即使每次都撑过了稳定期', async () => {
+  const { sup, clock, restarts, giveUps } = setup()
+
+  for (let i = 0; i < 3; i += 1) {
+    // 每轮都"稳定"跑过 STABLE_MS：预算会清零，但时间窗里的崩溃次数不会
+    sup.markAlive('engine')
+    clock.advance(DEFAULT_STABLE_MS + 5_000)
+    const verdict = await sup.handleExit('engine', { code: 1 })
+    await new Promise(r => setImmediate(r))
+    if (i < 2) assert.equal(verdict.action, 'restart', `第 ${i + 1} 次崩溃仍该尝试自愈`)
+    else assert.equal(verdict.action, 'give-up', '能跑但每轮都崩，继续重启等不到结论')
+  }
+
+  assert.equal(restarts.length, 2, '第 3 次崩溃不该再重启')
+  assert.equal(giveUps.length, 1)
+  assert.equal(giveUps[0].info.reason, 'crash-loop')
+  assert.equal(sup.snapshot('engine').stopped, true)
+})
+
+test('放弃之后同角色再崩：不重启、不重复通知（停止自动重启）', async () => {
+  const { sup, restarts, giveUps } = setup({ options: { maxRestarts: 1 } })
+
+  await sup.handleExit('engine', { code: 1 })
+  await new Promise(r => setImmediate(r))
+  const second = await sup.handleExit('engine', { code: 1 })
+  assert.equal(second.action, 'give-up')
+
+  const after = await sup.handleExit('engine', { code: 1 })
+  await new Promise(r => setImmediate(r))
+
+  assert.equal(after.action, 'ignored')
+  assert.equal(after.reason, 'gave-up')
+  assert.equal(restarts.length, 1, '放弃后再重启就是刷屏兜圈')
+  assert.equal(giveUps.length, 1, '放弃通知只发一次，避免崩溃循环里反复弹窗')
 })
 
 // ------------------------------------------------------------------ 判定 4

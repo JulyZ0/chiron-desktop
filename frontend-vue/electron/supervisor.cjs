@@ -14,6 +14,9 @@
  *    任何结论**。放弃 + 明确通知才是可接受的终局。
  * 3. **稳定运行足够久之后预算清零**。跑了一整天的引擎偶发挂第三次，不该因为累计计数
  *    就永久放弃；反过来，起动即崩（永远到不了稳定期）三次就停，避免死循环刷日志。
+ * 4. **时间窗判据与预算并存**：预算被稳定期清零后，10 分钟内仍崩了 3 次就是
+ *    "能跑但每轮都崩"，照样放弃。否则这类故障永远等不到结论（见 `DEFAULT_CRASH_WINDOW_MS`）。
+ *    一旦放弃，该角色进入 `stopped`：后续崩溃只记账、不再重启也不再重复通知。
  */
 
 /** 默认退避表（毫秒）：与 `desktop-local/app/components/manager.py` 的 `RESTART_BACKOFF` 同口径 */
@@ -24,6 +27,19 @@ const DEFAULT_MAX_RESTARTS = 3
 
 /** 稳定运行判定窗口：与 `manager.py` 的 `STABLE_UPTIME` 同口径 */
 const DEFAULT_STABLE_MS = 60_000
+
+/**
+ * 崩溃循环窗口：**10 分钟内崩 3 次就停手**。
+ *
+ * 为什么在"连续次数预算"之外还必须有一条时间窗判定：预算会被"稳定期"清零
+ * （跑够 60s 就重新给满 3 次），于是一种很具体的故障永远落不进预算 —— 进程起来
+ * 撑过 61 秒又崩、再起再崩。预算每次都清零，重启永远在继续，用户看到的是
+ * "应用每隔一分钟自己抖一下"，磁盘上则是一串崩溃日志。10 分钟 3 次是这类
+ * "看起来能跑、其实每轮都崩"的最低成本判据。
+ */
+const DEFAULT_CRASH_WINDOW_MS = 10 * 60_000
+/** 时间窗内允许的崩溃次数；达到即放弃自愈（与真机 P0-3 的 3 次口径一致）。 */
+const DEFAULT_MAX_CRASHES_PER_WINDOW = 3
 
 /**
  * @param {object} options
@@ -48,6 +64,12 @@ function createSupervisor(options = {}) {
     : DEFAULT_BACKOFF_MS
   const maxRestarts = Number.isInteger(options.maxRestarts) ? options.maxRestarts : DEFAULT_MAX_RESTARTS
   const stableMs = Number.isFinite(options.stableMs) ? options.stableMs : DEFAULT_STABLE_MS
+  const crashWindowMs = Number.isFinite(options.crashWindowMs)
+    ? options.crashWindowMs
+    : DEFAULT_CRASH_WINDOW_MS
+  const maxCrashesInWindow = Number.isInteger(options.maxCrashesInWindow)
+    ? options.maxCrashesInWindow
+    : DEFAULT_MAX_CRASHES_PER_WINDOW
   const now = options.now || Date.now
   const schedule = options.setTimeout || setTimeout
   const unschedule = options.clearTimeout || clearTimeout
@@ -61,7 +83,9 @@ function createSupervisor(options = {}) {
   function slot(role) {
     // upSince 用 null 表示"从未就绪"：0 是合法时刻（假时钟/进程启动即 0ms），
     // 拿 0 当哨兵会让"在 0 时刻就绪"被判成"从未就绪"，稳定期永远不生效。
-    if (!slots.has(role)) slots.set(role, { restarts: 0, upSince: null, pending: false })
+    if (!slots.has(role)) {
+      slots.set(role, { restarts: 0, upSince: null, pending: false, crashes: [], stopped: false })
+    }
     return slots.get(role)
   }
 
@@ -91,18 +115,38 @@ function createSupervisor(options = {}) {
   async function handleExit(role, info = {}) {
     const s = slot(role)
     if (!active) return { action: 'ignored', reason: 'stopped' }
+    // 已经放弃过：不再重启、也不再重复通知。这是"停止自动重启"的落地点 ——
+    // 没有这一条，崩溃循环会继续以"每次崩都再弹一次放弃提示"的形式刷屏。
+    if (s.stopped) return { action: 'ignored', reason: 'gave-up' }
     // 同一个子进程可能有多条退出通道（error + exit）；已经在排队的不要再排一次，
     // 否则一次崩溃会吃掉两次预算、并拉起两个进程去抢同一个端口。
     if (s.pending) return { action: 'ignored', reason: 'pending' }
 
+    const t = now()
+    // 先记崩溃时间戳（并丢掉窗口外的旧记录）：崩溃循环判定要用它。
+    s.crashes = s.crashes.filter(ts => t - ts < crashWindowMs)
+    s.crashes.push(t)
+
     // 稳定够了就重新给满预算（见文件头第 3 条）
-    if (s.upSince !== null && now() - s.upSince >= stableMs) s.restarts = 0
+    if (s.upSince !== null && t - s.upSince >= stableMs) s.restarts = 0
     s.upSince = null
 
-    if (s.restarts >= maxRestarts) {
-      log(`${role}: 连续崩溃已达上限（${maxRestarts} 次），不再重启`)
-      onGiveUp(role, info)
-      return { action: 'give-up', restarts: s.restarts, reason: 'budget-exhausted' }
+    const windowHit = s.crashes.length >= maxCrashesInWindow
+    if (windowHit || s.restarts >= maxRestarts) {
+      const reason = windowHit ? 'crash-loop' : 'budget-exhausted'
+      s.stopped = true
+      log(
+        reason === 'crash-loop'
+          ? `${role}: ${Math.round(crashWindowMs / 60000)} 分钟内崩溃 ${s.crashes.length} 次，判定为崩溃循环，停止自愈`
+          : `${role}: 连续崩溃已达上限（${maxRestarts} 次），不再重启`,
+      )
+      onGiveUp(role, { ...info, reason, crashesInWindow: s.crashes.length })
+      return {
+        action: 'give-up',
+        restarts: s.restarts,
+        reason,
+        crashesInWindow: s.crashes.length,
+      }
     }
 
     s.pending = true
@@ -145,7 +189,13 @@ function createSupervisor(options = {}) {
 
   function snapshot(role) {
     const s = slot(role)
-    return { restarts: s.restarts, pending: s.pending, active }
+    return {
+      restarts: s.restarts,
+      pending: s.pending,
+      active,
+      stopped: s.stopped,
+      crashesInWindow: s.crashes.length,
+    }
   }
 
   return { handleExit, markAlive, stop, snapshot }
@@ -156,4 +206,6 @@ module.exports = {
   DEFAULT_BACKOFF_MS,
   DEFAULT_MAX_RESTARTS,
   DEFAULT_STABLE_MS,
+  DEFAULT_CRASH_WINDOW_MS,
+  DEFAULT_MAX_CRASHES_PER_WINDOW,
 }

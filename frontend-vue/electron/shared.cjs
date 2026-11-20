@@ -111,6 +111,19 @@ const RUNTIME_MIRROR_CHANNEL = 'desktop:runtime-mirror'
 const AUTO_LOCK_CHANNEL = 'desktop:auto-lock'
 
 /**
+ * 主进程 → 渲染进程：**引擎崩溃取证已落盘**。
+ *
+ * 负载只有取证文件的位置与摘要（`{ path, lastLine, at }`），没有 stderr 全文：
+ * 引擎崩溃时经常一个字节都没写（真机事故是退出码 1073807364 = `TerminateProcess`），
+ * 此时"文件在哪"比任何日志都重要 —— 用户可以把那个文件直接贴进反馈渠道。
+ *
+ * 通道名与 `RUNTIME_STAGE_CHANNEL` 同理由放在这里：主进程 send、preload 订阅
+ * 两处名字不一致时不会报错，只会静默失效 —— 而这条消息恰恰是"引擎再也起不来了"
+ * 的唯一通知。
+ */
+const ENGINE_CRASH_CHANNEL = 'desktop:engine-crash'
+
+/**
  * 主进程建窗时把「这个窗口有没有系统标题栏」告诉 preload。
  *
  * 取值 `custom` | `inset` | `native`（见 preload 的 titleBar.mode 注释）。
@@ -301,6 +314,7 @@ module.exports = {
   RUNTIME_CANCEL_CHANNEL,
   RUNTIME_MIRROR_CHANNEL,
   AUTO_LOCK_CHANNEL,
+  ENGINE_CRASH_CHANNEL,
   TITLEBAR_ARG_PREFIX,
   WINDOW_CHANNELS,
   PIP_INDEX_MIRRORS,

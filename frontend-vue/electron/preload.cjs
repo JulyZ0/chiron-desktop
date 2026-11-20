@@ -257,6 +257,19 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   },
 
   /**
+   * 订阅"引擎崩溃取证已落盘"（崩溃自愈放弃时由主进程推送）。
+   *
+   * 负载 `{ path, lastLine, at }`：崩溃日志文件位置 + 最后一行错误。页面**不需要**
+   * 解析格式，只需要把这两项摆给用户（"把这个文件发给我们"）。返回取消订阅函数。
+   */
+  onEngineCrash: callback => {
+    if (typeof callback !== 'function') return () => {}
+    const handler = (_event, info) => callback(info)
+    ipcRenderer.on(shared.ENGINE_CRASH_CHANNEL, handler)
+    return () => ipcRenderer.removeListener(shared.ENGINE_CRASH_CHANNEL, handler)
+  },
+
+  /**
    * 取消正在进行的运行时安装。
    *
    * 安装页必须有这条路：真机现场用户等了十几分钟没有任何反馈，只能关掉整个应用，

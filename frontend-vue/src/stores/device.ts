@@ -91,6 +91,16 @@ export interface ChironDesktopHost {
    * 没有这条通道时返回一个空的取消函数。
    */
   onAutoLock?: (callback: (payload: { reason?: string }) => void) => () => void
+  /**
+   * 订阅**引擎崩溃取证**（崩溃自愈放弃时由主进程推送）。
+   *
+   * 负载只有取证文件位置与最后一行错误 —— 引擎无声退出时（真机退出码
+   * 1073807364，一个字节都没写）这是用户能带出来的唯一证据。老外壳没有这条
+   * 通道时返回空取消函数，调用点不需要判空。
+   */
+  onEngineCrash?: (
+    callback: (payload: { path: string; lastLine?: string; at?: string }) => void,
+  ) => () => void
   beginTwoFactor?: () => Promise<{ ok: boolean; secret?: string; otpauth?: string; reason?: string; message?: string }>
   confirmTwoFactor?: (token: string) => Promise<{ ok: boolean; recoveryCodes?: string[]; reason?: string; message?: string }>
   disableTwoFactor?: (password: string) => Promise<{ ok: boolean; reason?: string; message?: string }>

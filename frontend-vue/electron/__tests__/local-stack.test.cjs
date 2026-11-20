@@ -15,6 +15,9 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 const stack = require('../local-stack.cjs')
 const components = require('../components.cjs')
@@ -1182,4 +1185,167 @@ test('probeSchemaMismatchInfo：404 / 非漂移 JSON / 连接失败都返回 nul
 test('schema 诊断路径与网关一致：/healthz（不是 /health）', () => {
   assert.equal(stack.GATEWAY_SCHEMA_PATH, '/healthz')
   assert.notEqual(stack.GATEWAY_SCHEMA_PATH, stack.GATEWAY_HEALTH_PATH)
+})
+
+// --------------------------------------------------- 崩溃取证（P0-3）
+//
+// 真机事故的形态：Electron 的 main.log 只有一行「python-engine 运行中退出（退出码
+// 1073807364）」，随后重启也没成功，**没有任何堆栈**。这里钉住两条判定：
+//
+// 1. 引擎崩溃后必须能把 Python 侧写下的取证文件（路径 + 最后一行错误）交给上层；
+// 2. 10 分钟内崩 3 次就**停止重启**并通知一次 —— 否则用户看到的是无限刷屏，
+//    而永远等不到"这次真的起不来了"的结论。
+
+/** 轮询等待条件成立（重启是异步的：退避 → spawn → 探针） */
+function waitFor(cond, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  return new Promise((resolve, reject) => {
+    const step = () => {
+      let ok = false
+      try {
+        ok = Boolean(cond())
+      } catch {
+        ok = false
+      }
+      if (ok) return resolve()
+      if (Date.now() > deadline) return reject(new Error('等待条件成立超时'))
+      setTimeout(step, 5)
+    }
+    step()
+  })
+}
+
+test('engineCrashLogInfo 取最新的非空崩溃日志，并跳过 === end === 取真正的错误行', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-crash-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+
+  const older = path.join(dir, 'engine-crash-20260101T000000.log')
+  fs.writeFileSync(older, 'older report\nRuntimeError: first failure\n=== end ===\n')
+  const newer = path.join(dir, 'engine-crash-20260101T000100.log')
+  fs.writeFileSync(newer, 'report\nRuntimeError: engine exploded on submit\n=== end ===\n')
+  // 空文件（这是硬杀留下的噪声）不该被当成"最新证据"
+  fs.writeFileSync(path.join(dir, 'engine-crash-20260101T000200.log'), '')
+  // 不同名的文件不参与匹配
+  fs.writeFileSync(path.join(dir, 'engine.log'), 'noise\n')
+  fs.utimesSync(older, new Date(1000), new Date(1000))
+  fs.utimesSync(newer, new Date(2000), new Date(2000))
+
+  const info = stack.engineCrashLogInfo(dir)
+  assert.ok(info, '有崩溃日志时必须返回它')
+  assert.equal(info.path, newer)
+  assert.match(info.lastLine, /engine exploded on submit/, '最后一行是排障摘要，不是结束标记')
+})
+
+test('engineCrashLogInfo：目录不存在 / 只有空文件时返回 null（"没有证据"≠"证据是空"）', async t => {
+  assert.equal(stack.engineCrashLogInfo(''), null)
+  assert.equal(stack.engineCrashLogInfo(path.join(os.tmpdir(), 'chiron-definitely-missing-dir')), null)
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-crash-empty-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(dir, 'engine-crash-20260101T000000.log'), '')
+  assert.equal(stack.engineCrashLogInfo(dir), null)
+})
+
+test('engine-faulthandler.log 也被认作崩溃证据（原生崩溃只有它有栈）', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-fatal-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const fatal = path.join(dir, 'engine-faulthandler.log')
+  fs.writeFileSync(fatal, '--- boot 2026 ---\nWindows fatal exception: access violation\n')
+
+  const info = stack.engineCrashLogInfo(dir)
+  assert.ok(info)
+  assert.equal(info.path, fatal)
+  assert.match(info.lastLine, /access violation/)
+})
+
+test('engine-faulthandler.log 只有 boot 头时不算证据（每次启动都会写一行）', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-fatal-boot-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  fs.writeFileSync(path.join(dir, 'engine-faulthandler.log'), '--- boot 2026-01-01 pid=1 ---\n')
+
+  assert.equal(
+    stack.engineCrashLogInfo(dir),
+    null,
+    '把 boot 头当成"最后一行错误"报给用户，等于在事故现场再骗他一次',
+  )
+})
+
+test('引擎 10 分钟内崩 3 次：停止自动重启，并把崩溃日志与最后一行交给上层', async t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-crash-loop-'))
+  t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }))
+  const logDir = path.join(dataDir, 'logs')
+  fs.mkdirSync(logDir, { recursive: true })
+  const crashFile = path.join(logDir, 'engine-crash-20260101T000000.log')
+  fs.writeFileSync(
+    crashFile,
+    [
+      '=== Chiron python-engine crash report ===',
+      'exit-type: uncaught-exception',
+      '--- traceback ---',
+      'RuntimeError: engine exploded on submit',
+      '=== end ===',
+      '',
+    ].join('\n'),
+  )
+
+  // spawn 顺序：引导器 → 引擎（首次）→ 网关 → 引擎（第 1 次重启）→ 引擎（第 2 次重启）
+  const launcherChild = fakeChild()
+  const firstEngine = fakeChild()
+  const gatewayChild = fakeChild()
+  const restartedEngine1 = fakeChild()
+  const restartedEngine2 = fakeChild()
+  const calls = withSpawnQueue(t, [
+    launcherChild,
+    firstEngine,
+    gatewayChild,
+    restartedEngine1,
+    restartedEngine2,
+  ])
+  mockFetch(t, async url => gatewayFetch(url))
+
+  const giveUps = []
+  const promise = stack.startLocalStack({
+    launcher: { command: 'py', cwd: '/' },
+    exe: 'gateway.exe',
+    port: 9500,
+    appSecret: VALID_SECRET,
+    dataDir,
+    engine: { command: 'py-engine', args: ['-m', 'app.main'], cwd: '/' },
+    enginePort: 9501,
+    intervalMs: 1,
+    onSupervisorGiveUp: (role, info) => giveUps.push({ role, info }),
+    // 退避压到 0：用例要跑完"崩溃 → 重启 → 再崩 → 放弃"的整条链
+    supervisorOptions: { backoffMs: [0] },
+  })
+  launcherChild.stdout.write(
+    JSON.stringify({
+      event: 'launcher-ready',
+      pg_dsn: 'postgresql://u@127.0.0.1:1/c',
+      redis_addr: '127.0.0.1:2',
+    }) + '\n',
+  )
+  const started = await promise
+  assert.equal(started.engine.ok, true)
+
+  firstEngine.emit('exit', 5)
+  await waitFor(() => calls.length === 4)
+  restartedEngine1.emit('exit', 5)
+  await waitFor(() => calls.length === 5)
+  // 第三次崩溃仍在 10 分钟窗口内 ⇒ 判定崩溃循环
+  restartedEngine2.emit('exit', 5)
+  await waitFor(() => giveUps.length === 1)
+
+  assert.equal(calls.length, 5, '放弃自愈后不许再 spawn，否则就是刷屏兜圈')
+  const [{ role, info }] = giveUps
+  assert.equal(role, 'engine')
+  assert.equal(info.reason, 'crash-loop')
+  assert.ok(info.crashLog, '崩溃取证文件必须随放弃通知一起交上去')
+  assert.equal(info.crashLog.path, crashFile)
+  assert.match(info.crashLog.lastLine, /engine exploded on submit/)
+
+  // 放弃之后再崩一次：只记账，不再拉起新进程、也不再重复通知
+  restartedEngine2.emit('exit', 5)
+  await new Promise(r => setTimeout(r, 50))
+  assert.equal(calls.length, 5, '放弃自愈后不许再 spawn，否则就是刷屏兜圈')
+  assert.equal(giveUps.length, 1, '放弃通知只发一次，避免崩溃循环里反复弹窗')
 })
