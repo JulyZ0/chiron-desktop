@@ -64,6 +64,9 @@ func registerAdminRoutes(
 	// 参考数据，租户 admin 改它等于替所有人改成本口径（与 settings / models 同口径）。
 	// 路径段里的模型名必须 URL 编码（`/` 要写成 `%2F`），请求体的 `model` 可作回退键。
 	mux.Handle("PUT /v1/admin/model-prices/{model}", authMW(rlMW(platformWriteMW(http.HandlerFunc(UpsertModelPrice)))))
+	// 批量导入单价（CSV/JSON）：价格表是全平台共享的参考数据，写权限与手工单价同口径。
+	// 单次上限 2000 行，事务写；全部行非法时不碰数据库（见 ImportModelPrices 头注释）。
+	mux.Handle("POST /v1/admin/billing/model-prices/import", authMW(rlMW(platformWriteMW(ImportModelPrices(dbPriceStore{})))))
 	// 新用户引导漏斗（P0-3 验收「完成率可查」）—— 只读统计，与其它 admin 读端点同口径。
 	mux.Handle("GET /v1/admin/onboarding/funnel", authMW(rlMW(adminReadMW(adminStrip))))
 	mux.Handle("POST /v1/admin/maintenance", authMW(rlMW(platformWriteMW(adminStrip))))
