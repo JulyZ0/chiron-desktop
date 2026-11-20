@@ -35,7 +35,7 @@ import {
   type IsolationStatus,
 } from '../../api'
 import { useAuthStore } from '../../stores/auth'
-import { serverErrorMessage } from '../../utils/apiError'
+import { serverErrorDetail, serverErrorMessage } from '../../utils/apiError'
 
 const { t } = useI18n()
 const authStore = useAuthStore()
@@ -58,6 +58,19 @@ const pendingLevel = ref<IsolationLevel | null>(null)
 const helperStatus = ref<IsolationHelperStatus | null>(null)
 /** 启停助手进行中（UAC 弹窗期间可能停留数秒，必须给按钮加 loading） */
 const helperBusy = ref(false)
+/**
+ * 启用助手失败时**留在面板上**的原因（`message.error` 几秒后就消失了，
+ * 而用户往往是在 UAC 弹窗之后才回来看这一屏）。
+ *
+ * 为什么不复用 `helperStatus.detail`：那个字段是"助手现在为什么不可用"的探测结论，
+ * 属于**状态**；这里是"上一次启用动作为什么失败"的**事件**。两者会同时成立且内容不同
+ * （例如 UAC 被拒绝：状态仍是"未启动"，事件是"你取消了授权"）。
+ */
+const helperError = ref('')
+/** 与 `helperError` 配套的可执行指引（后端下发；空串表示不需要额外动作） */
+const helperHint = ref('')
+/** 面板上那条错误的**标题**：启用与停用失败的措辞不同，所以标题随动作而变 */
+const helperErrorTitle = ref('')
 
 /** 档位由弱到强，与后端 `_ORDER` 严格一致 */
 const ALL_LEVELS: IsolationLevel[] = ['none', 'job', 'low_il', 'restricted', 'appcontainer']
@@ -313,22 +326,38 @@ async function enableHelper() {
     status.value = result
     helperStatus.value = result.helper
     if (result.ok) {
+      helperError.value = ''
+      helperHint.value = ''
+      helperErrorTitle.value = ''
       message.success(t('settings.isolation_helper_enabled'))
     } else if (result.cancelled) {
       // 用户主动拒绝 UAC：正常选择，用 info 而不是 error。
+      helperError.value = ''
+      helperHint.value = ''
+      helperErrorTitle.value = ''
       message.info(t('settings.isolation_helper_cancelled'))
     } else {
-      message.error(t('settings.isolation_helper_enable_failed', { reason: result.reason }))
+      // `reason` 是后端逐条给出的人类可读原因（缺端口文件 / 未提权 / 进程被拦…）。
+      // 只有它为空时才退回通用文案 —— 反过来（总是用通用文案）会让每一台机器上的
+      // 每一种失败都长成同一句"本机无法启用此档位"，用户和我们都无从下手。
+      helperError.value = result.reason || t('settings.isolation_unavailable_unknown')
+      helperHint.value = result.hint || ''
+      helperErrorTitle.value = t('settings.isolation_helper_enable_failed', {
+        reason: helperError.value,
+      })
+      message.error(helperErrorTitle.value)
     }
   } catch (err) {
-    message.error(
-      serverErrorMessage(
-        err,
-        t('settings.isolation_helper_enable_failed', {
-          reason: t('settings.isolation_unavailable_unknown'),
-        }),
-      ),
-    )
+    // 走到这里说明请求本身没成功（网关 404/500、超时、网络断开）。
+    // 必须把**后端原文**带出来：这正是"网关缺路由"那次事故里唯一能指向病因的线索，
+    // 而兜底文案把它盖成了一句像是"本机能力不足"的空话。
+    const detail = serverErrorDetail(err, '')
+    helperError.value = detail || t('settings.isolation_unavailable_unknown')
+    helperHint.value = ''
+    helperErrorTitle.value = t('settings.isolation_helper_enable_failed', {
+      reason: helperError.value,
+    })
+    message.error(helperErrorTitle.value)
   } finally {
     helperBusy.value = false
   }
@@ -342,23 +371,26 @@ async function disableHelper() {
     status.value = result
     helperStatus.value = result.helper
     if (result.ok) {
+      helperError.value = ''
+      helperHint.value = ''
+      helperErrorTitle.value = ''
       message.success(t('settings.isolation_helper_disabled'))
     } else {
-      message.error(
-        t('settings.isolation_helper_disable_failed', {
-          reason: result.reason || t('settings.isolation_unavailable_unknown'),
-        }),
-      )
+      helperError.value = result.reason || t('settings.isolation_unavailable_unknown')
+      helperHint.value = ''
+      helperErrorTitle.value = t('settings.isolation_helper_disable_failed', {
+        reason: helperError.value,
+      })
+      message.error(helperErrorTitle.value)
     }
   } catch (err) {
-    message.error(
-      serverErrorMessage(
-        err,
-        t('settings.isolation_helper_disable_failed', {
-          reason: t('settings.isolation_unavailable_unknown'),
-        }),
-      ),
-    )
+    const detail = serverErrorDetail(err, '')
+    helperError.value = detail || t('settings.isolation_unavailable_unknown')
+    helperHint.value = ''
+    helperErrorTitle.value = t('settings.isolation_helper_disable_failed', {
+      reason: helperError.value,
+    })
+    message.error(helperErrorTitle.value)
   } finally {
     helperBusy.value = false
   }
@@ -532,6 +564,19 @@ onMounted(load)
           class="iso-alert"
           :message="$t('settings.isolation_helper_blocked')"
           :description="helperStatus?.detail || ''"
+        />
+        <!--
+          上一次启用/停用动作的失败原因：**留在面板上**而不是只弹一条 message。
+          UAC 弹窗会把焦点抢走，用户回来时那条 toast 往往已经消失了，只剩一个
+          "助手未运行"的状态 —— 于是他能做的只有再点一次同样的按钮。
+        -->
+        <a-alert
+          v-if="helperError"
+          type="error"
+          show-icon
+          class="iso-alert"
+          :message="helperErrorTitle"
+          :description="helperHint"
         />
         <div
           v-if="helperStatus?.engine_elevated"

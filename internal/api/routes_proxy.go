@@ -306,6 +306,28 @@ func registerProxyRoutes(
 	mux.Handle("DELETE /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation"))))))
 	mux.Handle("POST /v1/system/isolation/revoke", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation/revoke"))))))
 
+	// 提权助手（`restricted` 档的执行前置）：查询 / 启用（**会弹一次 UAC**）/ 停用。
+	//
+	// 这三条此前**没有注册**，于是设置页每次点「启用助手」都在网关拿到 404，
+	// 前端 `catch` 落到兜底文案 —— 用户看到的是
+	// 「受限令牌执行助手：启用助手失败：本机无法启用此档位」。
+	// 它与管理员身份、令牌权限、`SeAssignPrimaryTokenPrivilege` **全都无关**：
+	// 引擎侧的 `/v1/system/isolation/helper` 早就实现了，缺的只是网关这一跳。
+	// 也就是说任何机器上都必然失败，而排障线索（"404"）被前端的兜底文案吃掉了。
+	//
+	// 三条都必须注册，缺任何一条都会退化成不同的假象：
+	//   * 缺 GET ⇒ `loadHelper()` 失败，`helperStatus` 恒为 null，界面既不显示
+	//     "助手挡住了 restricted"，也永远不会出现「启用助手」按钮；
+	//   * 缺 POST ⇒ 点了也只会得到上面那句兜底文案；
+	//   * 缺 DELETE ⇒ "停用助手"同样 404，用户无法撤销这条提权通道。
+	//
+	// 鉴权口径与同组隔离端点一致：读要 admin:read（响应里有本机路径与能力矩阵），
+	// 启停要 admin:write（它是能改安全边界的动作）。
+	helperPath := pathFn("/v1/system/isolation/helper")
+	mux.Handle("GET /v1/system/isolation/helper", authMW(rlMW(RequirePermission(auth.PermAdminRead)(isoP(helperPath)))))
+	mux.Handle("POST /v1/system/isolation/helper", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(helperPath)))))
+	mux.Handle("DELETE /v1/system/isolation/helper", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(helperPath)))))
+
 	// 还原点回滚：把某个检查点重新应用到项目工作区。
 	//
 	// 这里**不走** `newProxy`：那条通道只把路径与身份透传给引擎，而引擎的回滚端点

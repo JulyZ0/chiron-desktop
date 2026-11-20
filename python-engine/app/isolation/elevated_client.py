@@ -301,20 +301,32 @@ def helper_exec(
 # ── 启动（UAC） ──────────────────────────────────────────
 
 
-def helper_argv(parent_pid: int) -> list[str]:
+def helper_argv(parent_pid: int, state_dir: str | None = None) -> list[str]:
     """helper 的命令行。
 
     用 `-m` 而不是文件路径：helper 由**提权**进程启动，其工作目录由 UAC 决定，
     文件路径会解析到别处。`-m` 靠的是**子进程 cwd 在 `sys.path` 里**，
     所以调用方必须把 `working_dir` 指到引擎根（见 `spawn_elevated`）——
     光拼出这行 argv 并不足以让 `app` 包解析成功。
+
+    `--state-dir` 是**必需**的：标准用户（非管理员）走 UAC 时必须输入另一个
+    管理员账户的凭据，helper 因此在**另一个账户**下运行，它的 `%LOCALAPPDATA%`
+    不是引擎的那个 —— 读不到引擎写好的共享密钥，`serve()` 直接返回 2，
+    引擎侧只看到"helper 已启动但未就绪"。把引擎自己的状态目录显式传过去，
+    这条路上的两个账户才共享同一个密钥/端口文件。
+
+    参数里只有**路径**，没有密钥：密钥依旧只能从那个目录读，而那个目录本来
+    就只有引擎所在用户可写，安全边界不变（见 `proto.helper_state_dir`）。
     """
-    return [
+    argv = [
         sys.executable,
         "-m",
         "app.isolation.elevated_helper",
         f"--parent-pid={parent_pid}",
     ]
+    if state_dir:
+        argv.append(f"--state-dir={state_dir}")
+    return argv
 
 
 def spawn_elevated(parent_pid: int | None = None) -> tuple[bool, str, bool]:
@@ -338,7 +350,7 @@ def spawn_elevated(parent_pid: int | None = None) -> tuple[bool, str, bool]:
     if not key:
         return False, "无法建立 helper 共享密钥", False
 
-    argv = helper_argv(pid)
+    argv = helper_argv(pid, str(proto.helper_state_dir()))
     # 提权进程的工作目录由 UAC 决定，所以显式指到引擎根，`-m app...` 才解析得到。
     working_dir = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

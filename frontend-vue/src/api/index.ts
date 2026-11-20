@@ -1342,6 +1342,15 @@ export interface IsolationHelperResult extends IsolationStatus {
    */
   cancelled: boolean
   reason: string
+  /**
+   * 与 `reason` 并列的**可执行指引**（后端下发）。
+   *
+   * 为什么不把指引塞进 `reason`：`reason` 是"哪里失败了"的诊断串（可能带 Win32
+   * 错误码），指引是"你该做什么"（去 UAC 点一次「是」/ 用当前账户批准）。
+   * 两者混成一句后，界面要么把错误码念给用户听，要么把"点一次是"淹没在错误码里。
+   * 启用成功或用户主动取消时为**空串**。
+   */
+  hint: string
   helper: IsolationHelperStatus
 }
 
@@ -1378,6 +1387,8 @@ export async function startIsolationHelper(): Promise<IsolationHelperResult> {
     // `cancelled` 是接口的必填字段（UAC 取消 ≠ 启动失败，界面文案完全不同）
     cancelled: Boolean((raw as { cancelled?: boolean } | undefined)?.cancelled),
     reason: raw?.reason || '',
+    // 后端没给就退空串：界面只在非空时渲染引导，空串等于"不需要额外指引"。
+    hint: raw?.hint || '',
     helper: toHelperStatus(raw?.helper),
   }
 }
@@ -1392,6 +1403,8 @@ export async function stopIsolationHelper(): Promise<IsolationHelperResult> {
     // `cancelled` 是接口的必填字段（UAC 取消 ≠ 启动失败，界面文案完全不同）
     cancelled: Boolean((raw as { cancelled?: boolean } | undefined)?.cancelled),
     reason: raw?.reason || '',
+    // 后端没给就退空串：界面只在非空时渲染引导，空串等于"不需要额外指引"。
+    hint: raw?.hint || '',
     helper: toHelperStatus(raw?.helper),
   }
 }

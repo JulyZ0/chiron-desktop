@@ -57,13 +57,39 @@ SOCKET_TIMEOUT_SECONDS = 30.0
 PING_TIMEOUT_SECONDS = 2.0
 
 
+#: helper 与引擎交换密钥/端口的目录，由**引擎侧**决定并可显式下发。
+#:
+#: 为什么需要这个覆盖：默认路径从 `%LOCALAPPDATA%` 推出来，而 UAC 有两种同意方式 ——
+#: 当前用户本身是管理员时直接点「是」，helper 与引擎同一账户；标准用户
+#: （非管理员）则必须**输入另一个管理员账户的凭据**，此时 helper 运行在**另一个账户**
+#: 下，`%LOCALAPPDATA%` 是那个管理员的目录：它读不到引擎写的密钥，启动即退出
+#: （`serve()` 返回 2），引擎侧只能看到"helper 已启动但未就绪（缺少端口文件）"。
+#: 这是标准用户账户上"启用助手必然失败"的第二个原因（第一个是网关缺路由）。
+#:
+#: 解法是让引擎把**自己的**状态目录用命令行参数告诉 helper（见
+#: `elevated_client.helper_argv`）。参数里只有路径，不含密钥 —— 密钥仍然只能
+#: 从那个目录里读，而那个目录本来就只有引擎所在用户可写，安全边界不变。
+_state_dir_override: Path | None = None
+
+
+def set_state_dir(path: str | Path | None) -> None:
+    """显式指定状态目录（helper 从 `--state-dir` 收到时调用）。`None` 恢复默认。"""
+    global _state_dir_override
+    _state_dir_override = Path(path) if path else None
+
+
 def helper_state_dir() -> Path:
     """helper 与引擎交换密钥/端口的目录。
 
     刻意放在 `%LOCALAPPDATA%` 而不是临时目录：临时目录在多用户机器上可能被
     其他账户预置同名文件（Windows 的 `%TEMP%` 是每用户独立的，但共享目录不是），
     而这里放的是**提权通道的密钥**，必须只有本用户可写。
+
+    引擎可能通过 `set_state_dir()` 显式指定（见上）：标准用户走"输入管理员凭据"
+    的 UAC 时，helper 的 `%LOCALAPPDATA%` 与引擎的不是同一个。
     """
+    if _state_dir_override is not None:
+        return _state_dir_override
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or os.getcwd()
     return Path(base) / "Chiron" / "isolation"
 
@@ -156,6 +182,7 @@ __all__ = [
     "key_path",
     "port_path",
     "read_key",
+    "set_state_dir",
     "sign",
     "verify",
     "write_key",

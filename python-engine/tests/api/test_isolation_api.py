@@ -222,3 +222,189 @@ async def test_revoke_returns_disk_artifact_report(monkeypatch):
     assert body["ok"] is True
     assert body["appcontainer_profile"] == "已删除"
     assert body["integrity_labels"], "必须回报完整性标签是否已还原"
+
+
+# ── 提权助手（`restricted` 档的执行前置） ────────────────────────
+#
+# 三条端点（GET/POST/DELETE）此前在**网关**上没有注册，前端每次都拿到 404，
+# 于是界面只能说「启用助手失败：本机无法启用此档位」。接口本身的契约在这里钉住：
+# 失败必须带 `reason` 与 `hint`，`cancelled` 必须能与"真失败"分开。
+
+
+def _fixed_status() -> dict:
+    return {
+        "requested": "restricted",
+        "effective": "low_il",
+        "degraded": True,
+        "floor": "low_il",
+        "below_floor": False,
+        "user_selected": False,
+        "reasons": ["缺执行层"],
+        "downgrade_allowed": True,
+        "selectable": ["none", "job", "low_il"],
+        "acknowledge_required": ["none"],
+        "unavailable_reasons": {"restricted": "缺执行层"},
+        "capabilities": {},
+        "appcontainer_name": "chiron",
+        "appcontainer_workspace": r"C:\work",
+    }
+
+
+def _patch_helper(monkeypatch, *, start=None, stop=None, status=None):
+    import app.isolation.win_launch as win_launch
+
+    monkeypatch.setattr(iso, "status", _fixed_status)
+    monkeypatch.setattr(iso, "reset_probes", lambda: None)
+    monkeypatch.setattr(
+        win_launch, "helper_status", status or (lambda: {
+            "available": False, "detail": "提权 helper 未启动（缺少端口文件）",
+            "engine_elevated": False, "supported": True,
+        })
+    )
+    if start is not None:
+        monkeypatch.setattr(win_launch, "helper_start", start)
+    if stop is not None:
+        monkeypatch.setattr(win_launch, "helper_stop", stop)
+
+
+@pytest.mark.asyncio
+async def test_helper_status_is_reachable(monkeypatch):
+    """`GET /isolation/helper` 必须能单独问到助手状态（不夹在档位快照里）。"""
+    _patch_helper(monkeypatch)
+
+    async with await _client() as ac:
+        resp = await ac.get("/v1/system/isolation/helper", headers=HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is False
+    assert body["supported"] is True
+    assert body["detail"], "不可用时必须给出原因，否则前端只能显示一个灰按钮"
+
+
+@pytest.mark.asyncio
+async def test_helper_start_success_returns_fresh_status(monkeypatch):
+    """启用成功后要把清过缓存的档位状态一起回给前端（不必再拉一次 GET）。"""
+    _patch_helper(monkeypatch, start=lambda _pid=None: (True, "", False))
+
+    async with await _client() as ac:
+        resp = await ac.post("/v1/system/isolation/helper", headers=HEADERS)
+
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["reason"] == ""
+    assert body["hint"] == ""
+    assert body["requested"] == "restricted"
+    assert "selectable" in body
+
+
+@pytest.mark.asyncio
+async def test_helper_start_failure_passes_reason_and_hint(monkeypatch):
+    """失败时 `reason` 原样透传，并附带可执行指引（`hint`）。
+
+    「本机无法启用此档位」这句话是前端兜底，不是引擎说的；引擎必须给出
+    **具体缺什么**，否则用户与运维都无从下手。
+    """
+    reason = "提权助手已启动但未就绪（提权 helper 未启动（缺少端口文件））"
+    _patch_helper(monkeypatch, start=lambda _pid=None: (False, reason, False))
+
+    async with await _client() as ac:
+        resp = await ac.post("/v1/system/isolation/helper", headers=HEADERS)
+
+    body = resp.json()
+    assert resp.status_code == 200, "UAC 失败不是服务器错误"
+    assert body["ok"] is False
+    assert body["cancelled"] is False
+    assert body["reason"] == reason
+    assert body["hint"], "必须给出可执行指引（在 UAC 里允许一次）"
+
+
+@pytest.mark.asyncio
+async def test_helper_start_without_reason_falls_back_to_actionable_text(monkeypatch):
+    """引擎没给原因时也不能回一句空话 —— 兜底文案本身要能行动。"""
+    _patch_helper(monkeypatch, start=lambda _pid=None: (False, "", False))
+
+    async with await _client() as ac:
+        resp = await ac.post("/v1/system/isolation/helper", headers=HEADERS)
+
+    body = resp.json()
+    assert body["reason"] == iso_api.HELPER_START_FALLBACK_REASON
+    assert "本机无法启用此档位" not in body["reason"]
+
+
+@pytest.mark.asyncio
+async def test_helper_start_cancelled_is_distinguishable(monkeypatch):
+    """用户取消 UAC ⇒ `cancelled=True`（界面用 info，不报错）。"""
+    _patch_helper(monkeypatch, start=lambda _pid=None: (False, "ShellExecuteW=5", True))
+
+    async with await _client() as ac:
+        resp = await ac.post("/v1/system/isolation/helper", headers=HEADERS)
+
+    body = resp.json()
+    assert body["ok"] is False
+    assert body["cancelled"] is True
+
+
+@pytest.mark.asyncio
+async def test_helper_stop_is_idempotent(monkeypatch):
+    """停用幂等：本来没在跑也算成功。"""
+    _patch_helper(monkeypatch, stop=lambda: (True, ""))
+
+    async with await _client() as ac:
+        first = await ac.delete("/v1/system/isolation/helper", headers=HEADERS)
+        second = await ac.delete("/v1/system/isolation/helper", headers=HEADERS)
+
+    assert first.json()["ok"] is True
+    assert second.json()["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_switch_to_none_is_not_blocked_by_helper_probes(monkeypatch):
+    """「无隔离」档不得依赖提权助手（也不依赖任何被它拖住的前置探测）。
+
+    用户在这里明确说的是"我不要隔离"。如果这条路径先要求 `restricted` 的探测
+    成立（那个探测要大费周章才能过），"关掉隔离"就变成了"先修好隔离" ——
+    请求被满足不了，而理由与他的诉求毫无关系。
+    """
+    # 受限令牌档在本机不可用（真实场景：没启用助手）；同时把它探成"会抛异常"，
+    # 模拟探测自身出问题。两种情况都不该影响 `none` 的切换。
+    monkeypatch.setattr(iso, "_probe_restricted", lambda: False)
+    monkeypatch.setattr(iso, "_probe_appcontainer", lambda: False)
+
+    async with await _client() as ac:
+        resp = await ac.put(
+            "/v1/system/isolation",
+            json={"level": "none", "acknowledge_below_floor": True, "reason": "用户要求关闭隔离"},
+            headers=HEADERS,
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["requested"] == "none"
+    assert body["effective"] == "none", "用户确认过的档位必须如实生效"
+    assert body["user_selected"] is True
+    assert body["below_floor"] is True
+
+
+@pytest.mark.asyncio
+async def test_no_isolation_official_path_does_not_require_the_helper(monkeypatch):
+    """助手探测整个坏掉时，`none` 仍能切换（探测错误只影响它自己那一档）。"""
+
+    def _boom():
+        raise RuntimeError("helper 探测炸了")
+
+    monkeypatch.setattr(iso, "_probe_restricted", _boom)
+    monkeypatch.setattr(iso, "_probe_appcontainer", _boom)
+
+    async with await _client() as ac:
+        resp = await ac.put(
+            "/v1/system/isolation",
+            json={"level": "none", "acknowledge_below_floor": True},
+            headers=HEADERS,
+        )
+
+    assert resp.status_code == 200, (
+        "与 none 无关的档位探测出错，不能把「关掉隔离」打成 500："
+        f"{resp.text}"
+    )
+    assert resp.json()["effective"] == "none"
