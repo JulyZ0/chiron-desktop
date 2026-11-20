@@ -299,6 +299,45 @@ async def test_helper_start_success_returns_fresh_status(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_helper_start_success_but_degraded_records_reason_in_audit(monkeypatch):
+    """助手启用成功、档位却没生效 ⇒ 审计的 `reason` **必须非空**。
+
+    真机审计里出现过：``action=helper_start requested=restricted effective=low_il
+    reason=""`` —— 那一行看起来一切正常，事后完全无法解释"为什么还是 low_il"，
+    用户也没有任何自查线索。降级本身是允许的（执行仍 fail-closed），
+    但绝不能静默。
+    """
+    _patch_helper(monkeypatch, start=lambda _pid=None: (True, "", False))
+    records: list[dict] = []
+    monkeypatch.setattr(iso, "record_level_change", lambda **kw: records.append(kw))
+
+    async with await _client() as ac:
+        resp = await ac.post("/v1/system/isolation/helper", headers=HEADERS)
+
+    assert resp.json()["ok"] is True
+    entry = next(item for item in records if item.get("action") == "helper_start")
+    assert entry["reason"], "降级必须写进审计，否则这一行只剩 requested/effective 两个值"
+    assert "restricted" in entry["reason"] and "low_il" in entry["reason"], entry["reason"]
+    # 机器原因（"缺执行层"）要一起带上，它是唯一能指向修法的线索。
+    assert "缺执行层" in entry["reason"], entry["reason"]
+
+
+@pytest.mark.asyncio
+async def test_helper_start_failure_always_records_a_reason(monkeypatch):
+    """失败但引擎没给 reason ⇒ 审计也要写兜底文案，不能留下空的 `reason`。"""
+    _patch_helper(monkeypatch, start=lambda _pid=None: (False, "", False))
+    records: list[dict] = []
+    monkeypatch.setattr(iso, "record_level_change", lambda **kw: records.append(kw))
+
+    async with await _client() as ac:
+        await ac.post("/v1/system/isolation/helper", headers=HEADERS)
+
+    entry = next(item for item in records if item.get("action") == "helper_start")
+    assert entry["reason"].startswith("失败：")
+    assert iso_api.HELPER_START_FALLBACK_REASON in entry["reason"]
+
+
+@pytest.mark.asyncio
 async def test_helper_start_failure_passes_reason_and_hint(monkeypatch):
     """失败时 `reason` 原样透传，并附带可执行指引（`hint`）。
 

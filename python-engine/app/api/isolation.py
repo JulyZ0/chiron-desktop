@@ -203,7 +203,9 @@ def _switch_level(
         effective=decision.effective.value,
         previous=previous.value if previous is not None else None,
         actor=actor,
-        reason=reason,
+        # 用户没写理由时，若档位被降级，就把**机器原因**写进审计。
+        # 否则这条流水只剩 "requested=restricted effective=low_il"，事后无解。
+        reason=reason or _degrade_audit_reason(state),
     )
 
     # 切换**立刻**影响后续执行，但已经在跑的进程不受影响（各自的隔离在 spawn 时定了）。
@@ -302,6 +304,30 @@ HELPER_START_HINT = (
 )
 
 
+def _degrade_audit_reason(state: dict[str, Any]) -> str:
+    """档位没生效时，给审计流水一条**非空**的机器原因。
+
+    ## 为什么必须补这一条
+
+    真机审计里出现过这样的行：``action=helper_start requested=restricted
+    effective=low_il reason=""`` —— 助手启用成功、档位却仍在 `low_il`，而
+    `reason` 为空，事后只剩"看起来正常"这一条线索。降级本身是允许的
+    （fail-closed 执行仍然成立），但**静默**降级会让用户与运维都无从下手。
+
+    原因直接取自 `status()["unavailable_reasons"][requested]`：那里已经有
+    "缺哪个特权 / 哪个 API 名"这一层细节（如 `CreateProcessAsUserW 失败 err=5`
+    或 `无法启用 … SeIncreaseQuotaPrivilege`），不必在这里重新拼一遍。
+    """
+    requested = str(state.get("requested") or "")
+    effective = str(state.get("effective") or "")
+    if not requested or not effective or requested == effective:
+        return ""
+    reasons = state.get("unavailable_reasons") or {}
+    detail = str(reasons.get(requested) or "").strip()
+    head = f"档位未生效：{requested} → {effective}"
+    return f"{head}；原因：{detail}" if detail else head
+
+
 @router.get("/isolation/helper")
 async def get_helper(request: Request) -> dict[str, Any]:
     """提权 helper 的当前状态。
@@ -344,13 +370,24 @@ async def start_helper(request: Request) -> dict[str, Any]:
     # 既慢又可能给出前后不一致的结论（"界面说可用、审计说降级"）。
     state = await asyncio.to_thread(_status_payload)
 
+    # 审计的 `reason` 三态互斥：
+    #   * 成功但档位没生效（降级）⇒ 写机器原因，别让审计出现 reason=""；
+    #   * 用户取消 UAC ⇒ 如实记，不需要排障；
+    #   * 真的失败 ⇒ 带 `reason`，缺省也要有兜底文案。
+    if ok:
+        audit_reason = _degrade_audit_reason(state)
+    elif cancelled:
+        audit_reason = "用户取消 UAC"
+    else:
+        audit_reason = f"失败：{reason or HELPER_START_FALLBACK_REASON}"
+
     iso.record_level_change(
         action="helper_start",
         requested=state["requested"],
         effective=state["effective"],
         previous=None,
         actor=_actor(request),
-        reason="" if ok else ("用户取消 UAC" if cancelled else f"失败：{reason}"),
+        reason=audit_reason,
     )
     return {
         "ok": ok,

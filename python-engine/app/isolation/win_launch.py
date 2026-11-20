@@ -47,6 +47,9 @@ WAIT_OBJECT_0 = 0
 STILL_ACTIVE = 259
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
+#: `CreateProcessAsUserW` 在"令牌特权没启用"时的典型错误码。
+ERROR_ACCESS_DENIED = 5
+
 #: `STARTUPINFOEXW` 的标志位。用 attribute list 就必须带它，否则 `lpAttributeList`
 #: 被内核忽略 —— 表现是"进程起来了，但完全不在 AppContainer 里跑"，比直接失败更糟。
 EXTENDED_STARTUPINFO_PRESENT = 0x0008_0000
@@ -723,6 +726,39 @@ def _restricted_token_for(
     return target, ""
 
 
+def _ensure_launch_privileges() -> str:
+    """在 `CreateProcessAsUserW` **之前**启用当前进程令牌的两个启动特权。
+
+    返回空串表示两项都已启用；否则返回可行动的中文原因（点名缺哪个特权/API）。
+
+    为什么必须在建进程**之前**、且每一次都做：`AdjustTokenPrivileges` 改的是
+    当前**进程令牌**的状态，而令牌可能在运行期被重置（组策略刷新、安全软件
+    重新套用策略）。缓存"上次启用过"只会让失败变成间歇性的 `err=5`。
+
+    两条执行路径（引擎已提权的本地路径、提权 helper 进程里的同一条本地路径）
+    都经过这里 —— helper 侧另外在 `serve()` 启动时先预热一次（见
+    `elevated_helper.serve`），好让"启用失败"在就绪阶段就出现在日志里。
+    """
+    ok, reason = win_token.enable_launch_privileges()
+    return "" if ok else reason
+
+
+def _spawn_error_with_hint(err: int) -> str:
+    """把 `CreateProcessAsUserW` 的错误码补成"缺什么"。
+
+    `err=5` 是这条路上最常见的失败，而它本身**完全不含指向性**：可能是特权没启用、
+    可能是安全软件拦截、也可能是桌面 DACL 不对。用户机器上就发生过一次
+    "engine_elevated=true 却 err=5"，只有把特权这一层写进文案才查得下去。
+    """
+    if err == ERROR_ACCESS_DENIED:
+        return (
+            "CreateProcessAsUserW 失败 err=5（拒绝访问）—— 通常是当前进程令牌未**启用** "
+            "SeAssignPrimaryTokenPrivilege / SeIncreaseQuotaPrivilege（持有 ≠ 启用），"
+            "或被安全软件拦截了提权建进程"
+        )
+    return f"CreateProcessAsUserW 失败 err={err}"
+
+
 def _launch_restricted_local(
     argv: list[str],
     *,
@@ -765,6 +801,14 @@ def _launch_restricted_local(
     if not ok:
         win_token._k32().CloseHandle(token)  # noqa: SLF001
         return LaunchResult(None, "", "", f"独立桌面不可用: {derr}", **meta)
+
+    # **时序要求**：必须在 `CreateProcessAsUserW` 之前启用特权。
+    # 提权令牌只是"持有"这两个特权（UAC 拆分令牌默认禁用），没启用就恒 err=5 ——
+    # 这正是 engine_elevated=true 仍报"执行层不可用"的根因。
+    priv_err = _ensure_launch_privileges()
+    if priv_err:
+        win_token._k32().CloseHandle(token)  # noqa: SLF001
+        return LaunchResult(None, "", "", priv_err, **meta)
 
     k32, adv = _k32(), _advapi()
     sa = _SECURITY_ATTRIBUTES(
@@ -817,7 +861,7 @@ def _launch_restricted_local(
                 None,
                 "",
                 "",
-                f"CreateProcessAsUserW 失败 err={ctypes.get_last_error()}",
+                _spawn_error_with_hint(ctypes.get_last_error()),
                 **meta,
             )
 
@@ -1496,6 +1540,13 @@ def open_restricted_session(
         win_token._k32().CloseHandle(token)  # noqa: SLF001
         return None, f"独立桌面不可用: {derr}"
 
+    # 与一次性路径同一条硬要求：`CreateProcessAsUserW` 之前必须先把
+    # SeAssignPrimaryTokenPrivilege / SeIncreaseQuotaPrivilege 从"持有"翻成"启用"。
+    priv_err = _ensure_launch_privileges()
+    if priv_err:
+        win_token._k32().CloseHandle(token)  # noqa: SLF001
+        return None, priv_err
+
     k32, adv = _k32(), _advapi()
     sa = _SECURITY_ATTRIBUTES(
         nLength=ctypes.sizeof(_SECURITY_ATTRIBUTES),
@@ -1544,7 +1595,7 @@ def open_restricted_session(
             ctypes.byref(pi),
         )
         if not started:
-            return None, f"CreateProcessAsUserW 失败 err={ctypes.get_last_error()}"
+            return None, _spawn_error_with_hint(ctypes.get_last_error())
     except Exception as exc:  # noqa: BLE001 — 任何异常都按"起不来"处理
         logger.warning("open_restricted_session 异常", exc_info=True)
         return None, f"open_restricted_session 异常: {exc}"
