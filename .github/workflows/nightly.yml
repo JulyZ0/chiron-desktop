@@ -1,0 +1,186 @@
+name: Nightly
+
+# ── 夜间全量巡检（P2-12）────────────────────────────────────────────────
+#
+# PR 门禁（ci.yml）跑的是"分片快档"：每个 job 一条门禁、只跑一轮，够快但不够久。
+# 夜间这条线补的是**长期趋势**，三件事都是 PR 上做不划算的：
+#
+#   * 前端**完整全量**（`src` 全部 spec）—— 与 ci.yml 的 `unit tests (full)` 同一
+#     条命令，失败时留 JSON 报告，用来区分"新提交引入"与"跑了 30 天今天第一次红"；
+#   * 引擎**稳定子集**（`-m "not live and not integration and not network"`）——
+#     marker 口径与 ci.yml 的单测 job 完全一致：夜间跑得久，不代表可以换一套判据；
+#   * `scripts/test-stability.sh` 连跑 ROUNDS 轮 —— 它要的是**同一份代码连跑多轮**
+#     才能把 flaky（某轮红、某轮绿）与真回归（每轮都红）分开。高负载抖动在干净的
+#     runner 上恰好最不容易复现，所以这件事只能放在夜间做。
+#
+# 失败不互相拖累（三个独立 job），报告一律上传，见各自的 `if:`。
+#
+# flaky **不判红**：test-stability.sh 用退出码区分 1=每轮都红（真回归）、2=仅 flaky。
+# 2 只写 `::warning::` 并把 summary.md 传上来 —— 夜间门禁一旦被抖动刷红，人就会
+# 学会忽略它，那比没有门禁更糟。
+on:
+  schedule:
+    # 每天 03:17 UTC（与 evals-nightly 同一时段错开分钟，避开整点抢 runner）
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: 'test-stability.sh 连跑轮数（默认 2；判 flaky 至少要 2 轮）'
+        required: false
+        default: '2'
+
+permissions:
+  contents: read
+
+concurrency:
+  # 夜间任务跑得久，两次运行互相取消会白烧一遍 runner 分钟数
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  frontend-full:
+    name: Frontend (full suite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend-vue
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend-vue/pnpm-lock.yaml
+      # 与 ci.yml 同一套 registry 选择逻辑（对候选源测速取最快者）
+      - name: Pick fastest npm registry
+        run: echo "NPM_CONFIG_REGISTRY=$(node scripts/pick-registry.mjs || echo https://registry.npmjs.org)" >> "$GITHUB_ENV"
+      - run: pnpm install --frozen-lockfile
+      - name: Unit tests (full)
+        # 全量档：与 ci.yml 的 `unit tests (full)` 同一条命令（含 JSON 报告）。
+        # 超时/并发口径在 frontend-vue/vitest.config.ts：5s 抖动是机器争用，
+        # 放宽等待上限是正解，不是把用例改绿。
+        run: >-
+          npx vitest run src
+          --reporter=dot --reporter=json --outputFile.json=vitest-report.json
+      - name: Vite build
+        # 单测全绿但构建红了同样发不出去（缺依赖/入口写错），夜间一起看
+        run: npx vite build
+      - name: Upload vitest report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-vitest-report
+          path: frontend-vue/vitest-report.json
+          if-no-files-found: warn
+
+  engine-stable:
+    name: Engine (stable subset)
+    runs-on: ubuntu-latest
+    # 稳定子集里仍有核心逻辑依赖 Redis（审批票、KeyRing 仲裁等），
+    # 与 ci.yml 的 engine job 起同一个 service：不是"外部集成"，而是逻辑本身需要。
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      APP_SECRET: nightly-engine-app-secret-0123456789abcdef
+      JWT_SECRET: nightly-engine-jwt-secret-0123456789abcdef
+      REDIS_URL: redis://127.0.0.1:6379/0
+    defaults:
+      run:
+        working-directory: python-engine
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12 与 ci.yml 的 engine job 同口径（打包运行时也钉这个版本）
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: python-engine/requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+      - name: Pytest (stable subset)
+        # `--junitxml` 是夜间唯一的增量：PR 上只看得见终端摘要，夜里要能翻到具体用例。
+        run: >-
+          python -m pytest tests -q
+          -m "not live and not integration and not network"
+          --junitxml=pytest-junit.xml
+      - name: Upload junit report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-pytest-junit
+          path: python-engine/pytest-junit.xml
+          if-no-files-found: warn
+
+  frontend-stability:
+    name: Frontend stability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend-vue/pnpm-lock.yaml
+      - name: Pick fastest npm registry
+        working-directory: frontend-vue
+        run: echo "NPM_CONFIG_REGISTRY=$(node scripts/pick-registry.mjs || echo https://registry.npmjs.org)" >> "$GITHUB_ENV"
+      - name: Install dependencies
+        working-directory: frontend-vue
+        run: pnpm install --frozen-lockfile
+      - name: Stability rounds (test-stability.sh)
+        id: stability
+        # 轮数只由 dispatch 输入决定：定时任务没有输入 ⇒ 兜底 2
+        # （判 flaky 至少要 2 轮；默认 3 轮在夜间是没必要的分钟数）。
+        env:
+          ROUNDS: ${{ github.event.inputs.rounds || '2' }}
+        run: |
+          set +e
+          bash scripts/test-stability.sh
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -eq 2 ]; then
+            echo "flaky=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::test-stability：仅 flaky（有轮次红、有轮次绿）—— 夜间不判红，看报告判定是否抖动"
+            exit 0
+          fi
+          exit "$rc"
+      - name: Upload stability report
+        # 失败要报告；仅 flaky 时任务本身是绿的，但报告正是需要人看的那份
+        if: failure() || steps.stability.outputs.flaky == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-test-stability
+          path: .artifacts/test-stability
+          if-no-files-found: warn
+      - name: Step summary
+        if: always()
+        run: |
+          {
+            echo "## Frontend stability"
+            echo ""
+            echo "- 轮数：\`${{ github.event.inputs.rounds || '2' }}\`"
+            echo "- 退出码：\`${{ steps.stability.outputs.rc }}\`（1 = 每轮都红 · 2 = 仅 flaky）"
+            echo ""
+            if [ -f .artifacts/test-stability/summary.md ]; then
+              head -60 .artifacts/test-stability/summary.md
+            else
+              echo "无 summary.md（脚本未跑起来？）"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
