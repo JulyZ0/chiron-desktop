@@ -101,6 +101,16 @@ integration:
 integration-static:
 	python scripts/integration/test_assets.py
 
+# ── 重建后验收（P0-1）──
+# 前置：桌面应用**已在本机启动**（本地模式）。端口从
+# %APPDATA%\gh_Athenavi_chiron\local\runtime-state.json 读，不接受手填。
+# 退出码：0=无 FAIL，1=有 FAIL，2=环境不具备（应用没起来/换不到会话）。
+verify-after-build:
+	bash scripts/verify-after-build.sh
+
+verify-after-build-json:
+	bash scripts/verify-after-build.sh --json
+
 check-all: check check-py check-web
 	@echo "check-all: OK"
 
@@ -113,6 +123,10 @@ docker-run:
 
 .PHONY: all build run clean test lint fmt dev dev-up dev-up-scale dev-down \
 	docs-check check-go check check-py check-web check-all smoke smoke-fast \
+<<<<<<< HEAD
 	release-ready integration integration-static \
+=======
+	integration integration-static verify-after-build verify-after-build-json \
+>>>>>>> worktree-agent-general-purpose-0dcfe789
 	docker-build docker-run
 
