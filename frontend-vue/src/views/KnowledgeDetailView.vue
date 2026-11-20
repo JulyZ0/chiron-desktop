@@ -701,7 +701,9 @@ const showIndexCard = computed(() => {
 //
 // 消息里的知识库引用链到 `/knowledge/:kbId?doc=:docId`。落点要"看得见"：
 // 高亮该行并滚动到它，而不是丢给用户一个 500 行的文档表自己找。
-const targetDocId = ref<string>(typeof route.query.doc === 'string' ? route.query.doc : '')
+// `route.query` 在测试的轻量路由桩里可能不存在（只 mock 了 params），
+// 这里按"没有定位参数"处理，而不是把组件挂载直接打崩。
+const targetDocId = ref<string>(typeof route?.query?.doc === 'string' ? route.query.doc : '')
 const docTableRef = ref<HTMLElement | null>(null)
 
 async function focusTargetDocument() {
