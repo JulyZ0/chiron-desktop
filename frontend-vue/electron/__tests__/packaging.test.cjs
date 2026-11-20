@@ -52,9 +52,22 @@ test('main.cjs：webRoot 由 resolveWebRoot() 算出并交给本地栈', () => {
     /webRoot:\s*resolveWebRoot\(\)/,
     'startLocalStack 必须收到 webRoot: resolveWebRoot()',
   )
-  // 打包态按 resources/web 找，开发态回落源码 dist/；找不到返回空串（网关不托管）
-  assert.match(main, /process\.resourcesPath[\s\S]{0,80}'web'/, '打包态要定位 resources/web')
-  assert.match(main, /return ''/, '找不到时必须返回空串而不是抛错')
+  // 实现只有一份（local-stack.cjs 的 resolver）：壳层把 resourcesPath 与开发态 dist
+  // 交给它算，不再自己拼 `resources/web` —— 两处各拼一份就会静默漂移。
+  assert.match(
+    main,
+    /stack\.resolveWebRoot\(\{[\s\S]{0,120}process\.resourcesPath[\s\S]{0,120}devDist/,
+    'main.cjs 必须委托 local-stack.resolveWebRoot（打包态 resourcesPath / 开发态 dist）',
+  )
+  assert.match(main, /return ''/, '拿不到 resolver 时必须返回空串而不是抛错')
+})
+
+test('local-stack.cjs：webRoot 解析只有一份实现（打包态 resources/web、开发态 dist）', () => {
+  const stack = fs.readFileSync(path.join(ELECTRON_DIR, 'local-stack.cjs'), 'utf8')
+  assert.match(stack, /function resolveWebRoot\s*\(/, '必须导出 resolveWebRoot 作为唯一实现')
+  assert.match(stack, /path\.join\(resourcesDir,\s*'web'\)/, '打包态必须定位 <resources>/web')
+  assert.match(stack, /index\.html/, '必须检查 index.html（目录存在但没产物等于没托管）')
+  assert.match(stack, /resolveResourcesDir\(options\)/, '资产根解析也必须走同一入口')
 })
 
 test('local-stack.cjs：把 webRoot 注入网关 spawn 环境的 CHIRON_WEB_ROOT', () => {

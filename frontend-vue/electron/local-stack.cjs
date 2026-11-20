@@ -19,6 +19,7 @@
 
 const childProcess = require('node:child_process')
 const crypto = require('node:crypto')
+const fs = require('node:fs')
 const path = require('node:path')
 const components = require('./components.cjs')
 const runtimeState = require('./runtime-state.cjs')
@@ -80,6 +81,44 @@ function localDataPaths(dataDir) {
 
 /** 审计落盘目录：四处 `*_audit.py` 都读 `Settings.log_dir`（`LOG_DIR`） */
 const AUDIT_DIR_ENV = 'LOG_DIR'
+
+/**
+ * 随包资产根：打包态是 `process.resourcesPath`（`<安装根>/resources`）。
+ *
+ * 显式 `options.resourcesDir` 优先，便于单测/运维把路径钉到临时目录。
+ * 空串 = 拿不到（纯 Node 单测环境），调用方据此跳过一切"随包资产"推断。
+ */
+function resolveResourcesDir(options = {}) {
+  return String(options.resourcesDir || process.resourcesPath || '').trim()
+}
+
+/**
+ * 前端产物目录（含 index.html）—— 壳层与网关 spawn 环境的**唯一**实现。
+ *
+ * 两种布局：
+ *   - 打包态：`<resources>/web`。electron-builder.yml 把 `dist/` 额外复制到这里，
+ *     因为 asar 是归档格式、Go 子进程用普通文件 API 打不开 —— 直接给 asar 内的
+ *     `dist/` 会得到"托管成功但永远 404"；
+ *   - 开发态：源码目录的 `frontend-vue/dist`（`devDist` 由壳层传入）。
+ *
+ * 以前这段逻辑在 main.cjs 里另写了一份，`buildGatewayEnv` 只接收算好的字符串；
+ * 两处各拼一次路径就有两套口径（改了一处、另一处静默失效）。现在统一走这里：
+ * 找不到返回空串 = 不托管，本地栈照常启动（配错路径不该阻断栈）。
+ */
+function resolveWebRoot(options = {}) {
+  const resourcesDir = resolveResourcesDir(options)
+  const candidates = []
+  if (resourcesDir) candidates.push(path.join(resourcesDir, 'web'))
+  if (options.devDist) candidates.push(String(options.devDist))
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(path.join(candidate, 'index.html'))) return candidate
+    } catch {
+      // 读不到的候选（权限/坏链接）直接跳过，继续看下一个。
+    }
+  }
+  return ''
+}
 
 /** 引导器就绪事件（与 `desktop-local/app/launcher.py::READY_EVENT` 一致） */
 const LAUNCHER_READY_EVENT = 'launcher-ready'
@@ -403,11 +442,13 @@ function buildGatewayEnv(info, options = {}) {
   // 不注入的话，网关只提供 JSON 接口，`/share/<token>` 在任何 host 上都不存在 ——
   // 桌面端的分享链接只能是 `file://`，换台机器就是「找不到文件」。
   //
-  // 路径由壳层算好（`resolveWebRoot()`）：打包态是 `resources/web`（见
+  // 路径由 `resolveWebRoot()` 统一算：打包态是 `resources/web`（见
   // electron-builder.yml 的 extraResources —— **不能**用 asar 里的 dist，
   // Go 进程读不了归档），开发态是 `frontend-vue/dist`。
+  // 调用方（壳层）已算好时尊重它；否则这里从资产根探测，**不再各自拼路径**。
   // 空串 = 不托管，网关行为与引入前一致（配错路径不该阻断本地栈）。
-  const webRoot = String(options.webRoot || '').trim()
+  const webRoot =
+    String(options.webRoot || '').trim() || resolveWebRoot(options)
   if (webRoot) env.CHIRON_WEB_ROOT = webRoot
 
   // 本地模式身份：打开网关的免口令会话引导（`POST /v1/auth/session`）。
@@ -953,7 +994,7 @@ function buildEngineEnv(info, options = {}) {
   // `pip list exited with code 1`。uv 是那种环境里唯一能装包的工具，但引擎
   // 猜不到安装目录（venv 在 userData 下、uv 在 Program Files 下），只能由壳层给。
   // 开发态（`process.resourcesPath` 不存在）不写这一项：引擎会退回 PATH 上的 uv。
-  const resourcesDir = String(options.resourcesDir || process.resourcesPath || '').trim()
+  const resourcesDir = resolveResourcesDir(options)
   if (resourcesDir && (options.env || {}).CHIRON_RESOURCES_DIR === undefined) {
     env.CHIRON_RESOURCES_DIR = resourcesDir
   }
@@ -1794,6 +1835,9 @@ module.exports = {
   deriveSubsecret,
   LOCAL_BOOTSTRAP_ENV,
   DISABLE_REGISTRATION_ENV,
+  /** 随包资产根 / 前端产物目录：壳层与 spawn 环境共用同一实现 */
+  resolveResourcesDir,
+  resolveWebRoot,
   parseLauncherLine,
   buildGatewayEnv,
   buildEngineEnv,
