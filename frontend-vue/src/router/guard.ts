@@ -37,9 +37,21 @@ export async function authGuard(
 
   const auth = useAuthStore()
 
-  // 桌面端 token 解密是异步的；main.ts 通常已等待，这里兜底保证首屏请求带上 Bearer。
-  // 本地模式下这一步建立的是本地会话（见 stores/auth.ts 的 initToken / ensureLocalSession）。
-  await auth.initToken?.()
+  // 匿名页面（`meta.public`，如分享落地页 `/s/:token`）**不等待任何鉴权初始化**。
+  //
+  // 这里的 `await` 是"永远转圈"的直接来源之一：`initToken` 在桌面端要等主进程解密
+  // token（safeStorage/IPC）、本地模式会顺带发起 `POST /v1/auth/session`、开发绕过模式
+  // 还会真登录一次 —— 这些都与一个匿名访客无关，却卡在**组件挂载之前**：`loading`
+  // 还没来得及被任何分支清掉，页面就已经停在骨架/启动转圈上。请求失败尚有 catch，
+  // 这个 await 没有兜底 —— 它不 settle，页面就永远不结束。
+  //
+  // 分享数据本身不需要身份（后端 `GET /v1/share/{id}` 只放行未撤销、未过期的分享），
+  // 所以这里既不放宽权限，也不引入登录依赖：只是不再为一个公开页面去建立会话。
+  if (to.meta?.public !== true) {
+    // 桌面端 token 解密是异步的；main.ts 通常已等待，这里兜底保证后续请求带上 Bearer。
+    // 本地模式下这一步建立的是本地会话（见 stores/auth.ts 的 initToken / ensureLocalSession）。
+    await auth.initToken?.()
+  }
 
   const localMode = currentDeviceMode() === 'local'
 

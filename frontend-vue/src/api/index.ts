@@ -428,10 +428,42 @@ export interface PublicShare {
   messages: SharedMessage[]
 }
 
-/** 公开分享读取（无鉴权；已撤销返回 410）。走 /v1/share/{id} 与 SPA /share/:id 路由分离（S 修复 路径冲突）。 */
+/**
+ * 公开分享读取的**硬超时**。
+ *
+ * 为什么必须比全局 30s 短得多：分享落地页是匿名访客的第一屏，没有任何其它内容可看 ——
+ * 转圈 30 秒与"永远转圈"对用户是同一种体验（他们会关掉标签页）。10s 之后必须给出
+ * 明确结论（成功 / 已失效 / 网络错误可重试），见 views/ShareView.vue 的 `loadShare`。
+ *
+ * 与 axios 的 `timeout` 是**两道**保障：这一道管"浏览器/代理把连接挂住"，
+ * 视图里的 `withDeadline` 再兜一层（连适配器都不回包时也能收口）。
+ */
+export const PUBLIC_SHARE_TIMEOUT_MS = 10_000
+
+/**
+ * 公开分享读取（无鉴权；已撤销返回 410、已过期返回 410+`share_expired`）。
+ * 走 /v1/share/{id} 与 SPA /share/:id 路由分离（S 修复 路径冲突）。
+ *
+ * 两个刻意的请求选项：
+ * - `timeout`：匿名首屏不能等满全局 30s（见 PUBLIC_SHARE_TIMEOUT_MS）。
+ * - `__silent`：**不参与任何全局错误处理**。分享页是独立公开页面，而拦截器在 401 时
+ *   会清登录态并 `location.href='/'` —— 对一个匿名访客，那等于"链接打开后被弹走"，
+ *   页面自己永远拿不到终态。同理也不该为一个匿名页面弹全局 toast：它有自己的
+ *   错误态与重试按钮。
+ *
+ * 非 JSON / 空 body 一律**抛错**：`data?.data` 为空时若静默返回 undefined，调用方会
+ * 渲染出一页既不是骨架也不是错误提示的空白（曾经就是"看着在加载"的来源之一）。
+ */
 export async function getPublicShare(shareId: string): Promise<PublicShare> {
-  const { data } = await api.get(`/v1/share/${encodeURIComponent(shareId)}`)
-  return data?.data
+  const { data } = await api.get(`/v1/share/${encodeURIComponent(shareId)}`, {
+    timeout: PUBLIC_SHARE_TIMEOUT_MS,
+    __silent: true,
+  })
+  const payload = data?.data
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('share: empty payload')
+  }
+  return payload as PublicShare
 }
 
 // 鉴权凭 httpOnly cookie 自动携带（withCredentials），无需请求拦截器设置 Authorization。
