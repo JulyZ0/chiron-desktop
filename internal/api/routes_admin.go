@@ -45,6 +45,11 @@ func registerAdminRoutes(
 	mux.Handle("GET /v1/admin/system", authMW(rlMW(adminReadMW(adminStrip))))
 	// D1：自诊断报告（只读）—— 权限口径与其它 admin 读端点一致。
 	mux.Handle("GET /v1/admin/diagnostics", authMW(rlMW(adminReadMW(adminStrip))))
+	// P0-1：自诊断**聚合清单**。用 platformReadMW 而不是 adminReadMW：
+	// 它一次回全平台的 schema 版本、必需表、检查点健康（可能跨租户汇总）与引擎状态，
+	// 属平台级运行事实；租户 admin 的 `admin:read` 不该看到别家租户的检查点统计。
+	mux.Handle("GET /v1/admin/diagnostics/summary", authMW(rlMW(platformReadMW(adminStrip))))
+
 	// D3：用量目录（只读）—— 与其它 admin 读端点同一权限口径。
 	mux.Handle("GET /v1/admin/usage/catalog", authMW(rlMW(adminReadMW(adminStrip))))
 	// 新用户引导漏斗（P0-3 验收「完成率可查」）—— 只读统计，与其它 admin 读端点同口径。

@@ -20,6 +20,63 @@
       </Button>
     </div>
 
+    <!-- P0-1：聚合清单。放在最顶部，因为它是"先看这一屏就知道哪几件事没生效"的那一屏；
+         逐项体检（下面的分组）是"具体是哪条配置"的第二层。 -->
+    <div class="summary-section">
+      <div class="summary-head">
+        <h3 class="group-title">
+          {{ $t('admin.diag_summary_title') }}
+        </h3>
+        <span class="summary-desc">{{ $t('admin.diag_summary_desc') }}</span>
+      </div>
+
+      <!-- 清单拉取失败单独提示：不能渲染成"没有异常"（那是相反结论）。 -->
+      <Alert
+        v-if="summaryError"
+        class="summary"
+        type="error"
+        show-icon
+        :message="$t('admin.diag_summary_unavailable')"
+        :description="summaryError"
+      />
+      <Spin
+        v-else
+        :spinning="summaryLoading"
+      >
+        <div class="summary-grid">
+          <div
+            v-for="item in summaryChecks"
+            :key="item.key"
+            class="summary-card"
+            :class="`summary-card--${item.status}`"
+            data-test="diag-summary-card"
+          >
+            <div class="summary-card-head">
+              <span class="summary-card-title">{{ summaryTitle(item) }}</span>
+              <Tag :color="summaryColor(item.status)">
+                {{ $t(`admin.diag_sum_status_${item.status}`) }}
+              </Tag>
+            </div>
+            <div class="summary-card-detail">
+              {{ item.detail }}
+            </div>
+            <!-- 修复指引只在"需要处理"时出现：ok 的行不需要噪音。 -->
+            <div
+              v-if="item.fix"
+              class="summary-card-fix"
+            >
+              <BulbOutlined />
+              <span>{{ item.fix }}</span>
+            </div>
+          </div>
+        </div>
+        <Empty
+          v-if="!summaryLoading && !summaryChecks.length"
+          :description="$t('admin.diag_summary_empty')"
+        />
+      </Spin>
+    </div>
+
     <Alert
       v-if="report"
       class="summary"
@@ -146,11 +203,14 @@ import { Alert, Button, Empty, Popconfirm, Spin, Tag, message } from 'ant-design
 import { BulbOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import {
   getDiagnostics,
+  getDiagnosticsSummary,
   getGatewayBreakers,
   resetGatewayBreaker,
   type DiagnosticCheck,
   type DiagnosticStatus,
   type DiagnosticsReport,
+  type DiagSummaryCheck,
+  type DiagSummaryStatus,
   type GatewayBreaker,
 } from '../../api/admin'
 import { useI18n } from 'vue-i18n'
@@ -159,6 +219,21 @@ const { t } = useI18n()
 
 const loading = ref(false)
 const report = ref<DiagnosticsReport | null>(null)
+
+// ── P0-1：聚合清单 ──
+const summaryLoading = ref(false)
+// 拉取失败与"清单里有 unknown 项"是两件事：前者是这份清单拿不到（网络/鉴权），
+// 后者是拿到了、但某一项看不见。混成一个空数组会让页面显示"一切正常"。
+const summaryError = ref('')
+const summaryChecks = ref<DiagSummaryCheck[]>([])
+
+const SUMMARY_KEY: Record<string, string> = {
+  schema: 'admin.diag_sum_key_schema',
+  tables: 'admin.diag_sum_key_tables',
+  knowledge: 'admin.diag_sum_key_knowledge',
+  checkpoints: 'admin.diag_sum_key_checkpoints',
+  deps: 'admin.diag_sum_key_deps',
+}
 
 const breakers = ref<GatewayBreaker[]>([])
 // 与"没有熔断"区分开：读不到时不能渲染成空列表 —— 排障页上"没有异常"和
@@ -227,6 +302,40 @@ function statusColor(s: DiagnosticStatus): string {
   }
 }
 
+// ── 聚合清单的展示辅助 ──
+
+/** 标题优先走 i18n（三语），缺键时回退后端的 title（那是最新事实，不该被旧翻译盖住）。 */
+function summaryTitle(item: DiagSummaryCheck): string {
+  const key = SUMMARY_KEY[item.key]
+  if (!key) return item.title
+  const translated = t(key)
+  return translated === key ? item.title : translated
+}
+
+function summaryColor(s: DiagSummaryStatus): string {
+  switch (s) {
+    case 'ok': return 'success'
+    case 'warn': return 'warning'
+    case 'error': return 'error'
+    default: return 'default'
+  }
+}
+
+async function loadSummary() {
+  summaryLoading.value = true
+  try {
+    const res = await getDiagnosticsSummary()
+    summaryChecks.value = res.checks ?? []
+    summaryError.value = ''
+  } catch (e) {
+    // 失败必须清空清单：否则上一次的"全绿"会留在屏幕上，比什么都不显示更误导。
+    summaryChecks.value = []
+    summaryError.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    summaryLoading.value = false
+  }
+}
+
 async function load() {
   loading.value = true
   try {
@@ -234,6 +343,8 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // 三段串行拉取但彼此隔离：清单 / 体检 / 熔断任一失败都不该让另外两块空白。
+  await loadSummary()
   await loadBreakers()
 }
 
@@ -294,6 +405,33 @@ onMounted(load)
 .diagnostics-view { padding: 4px; }
 .page-desc { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
 .summary { margin-bottom: 16px; }
+.summary-section { margin-bottom: 18px; }
+.summary-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.summary-desc { font-size: 12px; color: var(--text-secondary); }
+/* auto-fit + minmax：窄屏自动降成单列，不需要媒体查询；RTL 下 grid 顺序自动镜像。 */
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+}
+.summary-card {
+  padding: 10px 12px;
+  border: var(--hairline-width) solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+  /* 左侧色条用 border-inline-start：RTL 下自动翻到右侧，不用写 left/right。 */
+  border-inline-start-width: 3px;
+  border-inline-start-style: solid;
+  border-inline-start-color: var(--border);
+}
+.summary-card--ok { border-inline-start-color: var(--success); }
+.summary-card--warn { border-inline-start-color: var(--warning); }
+.summary-card--error { border-inline-start-color: var(--error); }
+.summary-card--unknown { border-inline-start-color: var(--text-secondary); }
+.summary-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.summary-card-title { font-weight: var(--fw-medium); }
+.summary-card-detail { font-size: 12px; color: var(--text-secondary); margin-top: 4px; word-break: break-word; }
+.summary-card-fix { display: flex; gap: 6px; font-size: 12px; margin-top: 6px; padding: 6px 8px; border-radius: var(--radius-md); border: 1px dashed var(--border); }
 .group { margin-bottom: 18px; }
 .group-title { font-size: 13px; font-weight: var(--fw-semibold); margin: 0 0 8px; color: var(--text-secondary); }
 .check-row { display: flex; gap: 10px; padding: 10px 12px; border: var(--hairline-width) solid var(--border); border-radius: var(--radius-lg); margin-bottom: 8px; background: var(--bg-card); }

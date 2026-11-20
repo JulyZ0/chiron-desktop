@@ -52,6 +52,9 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	r.HandleFunc("GET /system", h.SystemInfo)
 	// D1："配了但不生效"的自诊断 —— 与部署审计同一条线，把配置陷阱与依赖断链变成可自答。
 	r.HandleFunc("GET /diagnostics", h.GetDiagnostics)
+	// P0-1：同一问题的**聚合清单**（schema / 必需表 / 知识库 / 检查点 / 依赖）。
+	// 与上面是两条独立端点：逐项体检与"五行待办"的判据不同，混在一起会互相拉扯。
+	r.HandleFunc("GET /diagnostics/summary", h.GetDiagnosticsSummary)
 	// 新用户引导漏斗：逐步完成/跳过/待办计数（供管理端看完成率与流失点）。
 	r.HandleFunc("GET /onboarding/funnel", h.GetOnboardingFunnel)
 	r.HandleFunc("POST /maintenance", h.TriggerMaintenance)
