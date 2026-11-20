@@ -495,6 +495,33 @@ func (c *PythonClient) PostJSON(ctx context.Context, path string, in any, out an
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// PatchJSON performs a PATCH request with JSON body and decodes JSON into out.
+func (c *PythonClient) PatchJSON(ctx context.Context, path string, in any, out any) error {
+	body, err := json.Marshal(in)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, c.addressFor(ctx)+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.injectInternalToken(req)
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("python PATCH %s returned %d: %s", path, resp.StatusCode, string(b))
+	}
+	if out != nil {
+		return json.NewDecoder(resp.Body).Decode(out)
+	}
+	return nil
+}
+
 // PutJSON performs a PUT request with JSON body and decodes JSON into out.
 func (c *PythonClient) PutJSON(ctx context.Context, path string, in any, out any) error {
 	body, err := json.Marshal(in)

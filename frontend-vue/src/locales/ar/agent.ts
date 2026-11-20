@@ -385,4 +385,18 @@ export default {
   skill_md_preview: "نصّ SKILL.md",
   skill_no_preview: "لا يوجد نصّ للمعاينة في هذه المهارة",
   source_shared: "مشترك عام",
+  // ── P1-2: تصنيف المصدر / سياسة الحقن / الترقية ──
+  origin_label: "المصدر",
+  origin_market: "من السوق",
+  origin_local: "محلي",
+  origin_generated: "مُولِّد",
+  auto_inject: "حقن تلقائي",
+  auto_inject_hint: "عند التفعيل تظهر المهارة في دليل كل جولة؛ وعند الإيقاف يمكن اختيارها بـ {'@'} في المحادثة أو استدعاؤها بالأدوات",
+  auto_inject_on: "تم تفعيل الحقن التلقائي لـ {name}",
+  auto_inject_off: "تم إيقاف الحقن التلقائي لـ {name} (لا يزال بالإمكان استخدامها بـ {'@'} أو بالأدوات)",
+  current_version: "الإصدار الحالي v{version}",
+  check_update_and_upgrade: "التحقّق من التحديث / الترقية",
+  upgraded_to: "تمت الترقية: v{from} → v{to}",
+  already_latest_version: "لديك أحدث إصدار بالفعل (v{version})",
+  upgrade_no_source: "لا يوجد مصدر ترقية متاح: أعد التثبيت من السوق أو تأكّد من تسجيل المصدر",
 }

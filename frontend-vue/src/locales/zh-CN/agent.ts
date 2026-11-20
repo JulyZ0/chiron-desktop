@@ -386,4 +386,18 @@ export default {
   skill_md_preview: "SKILL.md 正文",
   skill_no_preview: "该技能没有可预览的正文",
   source_shared: "公共共享",
+  // ── P1-2：来源分组 / 触发策略 / 升级 ──
+  origin_label: "来源",
+  origin_market: "市场安装",
+  origin_local: "本地",
+  origin_generated: "生成",
+  auto_inject: "自动注入",
+  auto_inject_hint: "开启后该技能会出现在每一轮对话的技能目录里；关闭后仍可在对话中用 {'@'} 选择，或由工具调用",
+  auto_inject_on: "{name} 已开启自动注入",
+  auto_inject_off: "{name} 已关闭自动注入（仍可 {'@'} 或工具调用）",
+  current_version: "当前版本 v{version}",
+  check_update_and_upgrade: "检查更新 / 升级",
+  upgraded_to: "已升级：v{from} → v{to}",
+  already_latest_version: "已是最新版本（v{version}）",
+  upgrade_no_source: "该技能没有可用的升级来源：请从市场重新安装，或确认来源已记录",
 }

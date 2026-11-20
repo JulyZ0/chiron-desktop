@@ -199,6 +199,7 @@ async def generate_skill_md(
 
     # ── 落盘 + **复查**（引擎真能加载它才算成功）+ 失败回滚 ──
     from app.skill.skillmd import load_skill_dir
+    from app.skill.store import ORIGIN_GENERATED
 
     try:
         path = store.save_skill_md(skill_name, generated)
@@ -219,5 +220,14 @@ async def generate_skill_md(
         )
 
     outcome.path = str(path)
+    # P1-2：生成物标 `origin=generated`（旁挂 `.skill.json`）。生成失败在上面已经回滚，
+    # 这里失败不该把技能判成"没生成"—— 丢一个来源标签比丢一个技能轻得多，但要留日志。
+    try:
+        store.update_meta(skill_name, origin=ORIGIN_GENERATED)
+        refreshed = store.get(skill_name)
+        if refreshed is not None:
+            skill = refreshed
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("skill generate: failed to tag origin for %r: %s", skill_name, exc)
     outcome.skill = skill.to_dict()
     return outcome

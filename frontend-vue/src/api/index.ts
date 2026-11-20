@@ -1372,14 +1372,28 @@ export async function getIsolationHelper(): Promise<IsolationHelperStatus> {
 export async function startIsolationHelper(): Promise<IsolationHelperResult> {
   const resp = await api.post('/v1/system/isolation/helper')
   const raw = (resp.data?.data ?? resp.data) as IsolationHelperResult
-  return { ...toIsolationStatus(raw), ok: Boolean(raw?.ok), reason: raw?.reason || '', helper: toHelperStatus(raw?.helper) }
+  return {
+    ...toIsolationStatus(raw),
+    ok: Boolean(raw?.ok),
+    // `cancelled` 是接口的必填字段（UAC 取消 ≠ 启动失败，界面文案完全不同）
+    cancelled: Boolean((raw as { cancelled?: boolean } | undefined)?.cancelled),
+    reason: raw?.reason || '',
+    helper: toHelperStatus(raw?.helper),
+  }
 }
 
 /** 停用提权助手。幂等：本来没在跑也算成功。 */
 export async function stopIsolationHelper(): Promise<IsolationHelperResult> {
   const resp = await api.delete('/v1/system/isolation/helper')
   const raw = (resp.data?.data ?? resp.data) as IsolationHelperResult
-  return { ...toIsolationStatus(raw), ok: Boolean(raw?.ok), reason: raw?.reason || '', helper: toHelperStatus(raw?.helper) }
+  return {
+    ...toIsolationStatus(raw),
+    ok: Boolean(raw?.ok),
+    // `cancelled` 是接口的必填字段（UAC 取消 ≠ 启动失败，界面文案完全不同）
+    cancelled: Boolean((raw as { cancelled?: boolean } | undefined)?.cancelled),
+    reason: raw?.reason || '',
+    helper: toHelperStatus(raw?.helper),
+  }
 }
 
 // ── Super-agent 接管（周期巡检 + 自主推进）──────────────────────────────

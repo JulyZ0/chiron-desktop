@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -38,6 +39,101 @@ func (h *SkillHandler) RegisterRoutes(mux *http.ServeMux, authMW, rlMW, sanitize
 	// 市场技能注册（P1 修复：前端 SkillMarketCard 调用 /v1/skills/{id}/register，
 	// 此前两端均无此路由导致注册 404）
 	mux.Handle("POST /v1/skills/{name}/register", authMW(rlMW(http.HandlerFunc(h.register))))
+	// P1-2：技能升级（只对市场来源有效）。独立 handler 而不是走 proxy ——
+	// proxy 的 POST 分支把身份写进 **body**，而引擎的 upgrade handler 从 **query**
+	// 读 user_id / tenant_id（与 GET 一致），body 里的身份会被 FastAPI 直接丢掉。
+	mux.Handle("POST /v1/skills/{name}/upgrade", authMW(rlMW(sanitizeMW(http.HandlerFunc(h.upgrade)))))
+	// P1-2：触发策略开关（auto_inject）—— 同样是"身份经 query"的 PATCH。
+	mux.Handle("PATCH /v1/skills/{name}/meta", authMW(rlMW(sanitizeMW(http.HandlerFunc(h.patchMeta)))))
+}
+
+// patchMeta 转发元数据更新（`PATCH /v1/skills/{name}/meta`，body: {auto_inject}）。
+func (h *SkillHandler) patchMeta(w http.ResponseWriter, r *http.Request) {
+	if !h.prepare(w, r, "meta") {
+		return
+	}
+	body := map[string]interface{}{}
+	if r.ContentLength > 0 {
+		if err := DecodeJSON(w, r, &body); err != nil {
+			BadRequest(w, ErrInvalidReq)
+			return
+		}
+	}
+	h.forwardIdentity(w, r, "/v1/skills/"+r.PathValue("name")+"/meta", body, http.MethodPatch)
+}
+
+// prepare 做 name 校验与引擎可用性检查；校验失败时已写好响应，返回 false 即可结束。
+//
+// **先校验名字再看引擎**：非法名字（`../evil`）根本不该被转发，即便引擎不可用也应回
+// 400 而不是 500 —— 否则调用方会把"自己传错了"理解成"服务坏了"。
+func (h *SkillHandler) prepare(w http.ResponseWriter, r *http.Request, _ string) bool {
+	name := r.PathValue("name")
+	if name == "" {
+		BadRequest(w, "name is required")
+		return false
+	}
+	if !validSkillName.MatchString(name) {
+		BadRequest(w, "invalid skill name")
+		return false
+	}
+	if h.python == nil {
+		InternalError(w, "python engine not available")
+		return false
+	}
+	return true
+}
+
+// forwardIdentity 把目标路径 + query 身份 + 请求体转发给引擎（POST / PATCH）。
+//
+// 为什么不用 proxy：proxy 把身份塞进 body，而这两个引擎端点从 **query** 读身份
+// （FastAPI 把非模型参数的 handler 参数当 query），identity 写 body 等于没传 ——
+// 引擎会回退到全局共享层，把技能改到"所有人"那一层去。
+func (h *SkillHandler) forwardIdentity(
+	w http.ResponseWriter, r *http.Request, target string, body map[string]interface{}, method string,
+) {
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		target += "?" + identityQuery(claims)
+	}
+	var result map[string]interface{}
+	var err error
+	if method == http.MethodPatch {
+		err = h.python.PatchJSON(r.Context(), target, body, &result)
+	} else {
+		err = h.python.PostJSON(r.Context(), target, body, &result)
+	}
+	if err != nil {
+		writeSkillEngineError(w, "skill meta", err)
+		return
+	}
+	OK(w, result)
+}
+
+// writeSkillEngineError 把引擎的 4xx（尤其升级端点的 409「不可升级 / 没有来源」）
+// 原样透出，而不是一律折成 500 —— 前端要按状态码显示可操作的提示。
+func writeSkillEngineError(w http.ResponseWriter, prefix string, err error) {
+	var up *upstreamError
+	if errors.As(classifyUpstream(prefix, err), &up) {
+		JSON(w, up.status, APIResponse{Success: false, Error: up.detail})
+		return
+	}
+	logAndRespond(w, err, http.StatusInternalServerError, "python engine error")
+}
+
+// upgrade 转发技能升级请求到引擎（`POST /v1/skills/{name}/upgrade`）。
+//
+// 身份走 query（引擎侧从 query 读），请求体原样透传（`source_url` 可选）。
+func (h *SkillHandler) upgrade(w http.ResponseWriter, r *http.Request) {
+	if !h.prepare(w, r, "upgrade") {
+		return
+	}
+	body := map[string]interface{}{}
+	if r.ContentLength > 0 {
+		if err := DecodeJSON(w, r, &body); err != nil {
+			BadRequest(w, ErrInvalidReq)
+			return
+		}
+	}
+	h.forwardIdentity(w, r, "/v1/skills/"+r.PathValue("name")+"/upgrade", body, http.MethodPost)
 }
 
 // register 将能力注册中心的技能注册为本地技能（转发 Python /v1/skills/{name}/register）。

@@ -22,12 +22,13 @@ Chiron 既有技能载体是**扁平**的 `{name}.skill.json`（`exec`/`paramete
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
 from typing import Any
 
-from app.skill.store import SkillDef
+from app.skill.store import META_FILE, SkillDef
 
 logger = logging.getLogger(__name__)
 
@@ -237,9 +238,32 @@ def load_skill_dir(skill_dir: Path) -> SkillDef:
     if license_value is None:
         license_value = ""
 
+    # P1-2：`version` / `auto_inject` / `origin`。
+    # SKILL.md 的 frontmatter 可以自带 version；`auto_inject` / `origin` 由**同目录旁挂的
+    # `.skill.json`**（安装/开关写入，见 store.py 的 META_FILE）覆盖 —— frontmatter 是作者
+    # 写的、旁挂文件是本机状态，本机状态优先级更高。
+    version_value = str(frontmatter.get("version") or "0.1.0").strip() or "0.1.0"
+    auto_inject = True
+    origin = ""
+    sidecar = skill_dir / META_FILE
+    if sidecar.is_file():
+        try:
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:  # 坏旁挂文件不该让技能整体消失
+            logger.warning("skill meta sidecar invalid %s: %s", sidecar, exc)
+            meta = {}
+        if isinstance(meta, dict):
+            if "auto_inject" in meta:
+                auto_inject = bool(meta.get("auto_inject"))
+            if isinstance(meta.get("origin"), str):
+                origin = meta["origin"]
+            if isinstance(meta.get("version"), str) and meta["version"].strip():
+                version_value = meta["version"].strip()
+
     return SkillDef(
         name=name,
         description=description,
+        version=version_value,
         exec_type="prompt",
         source=body,
         license=str(license_value),
@@ -248,6 +272,8 @@ def load_skill_dir(skill_dir: Path) -> SkillDef:
         metadata=metadata,
         attachments=_collect_attachments(skill_dir),
         source_dir=str(skill_dir),
+        auto_inject=auto_inject,
+        origin=origin,
     )
 
 
