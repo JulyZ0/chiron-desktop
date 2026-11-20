@@ -94,6 +94,15 @@ func registerProxyRoutes(
 		// 谁先谁后取决于拼接顺序 —— 这正是 routes_proxy_escseg_test.go 钉住的 P0
 		// 越权回归。只按明确的键取值，身份永远来自 claims，伪造的同名参数进不来。
 		forwardQuery []string
+		// afterResponse 在成功转发、写出响应**之前**收到引擎回包（已解码的 map）。
+		//
+		// 存在的唯一理由：统一链路 `/v1/chat/submit` 是**直通代理**，网关此前
+		// 完全不看回包 —— 于是它产生的用量一条都进不了 `usage_events`（计费页里
+		// 这些回合连行都没有）。钩子让记账挂在既有转发上一次做完，而不是再写一条
+		// 平行的代理实现（两套就有两处会漂移）。
+		//
+		// 失败绝不影响响应：钩子内部必须自己吞异常（见 recordUnifiedUsageFromResponse）。
+		afterResponse func(r *http.Request, reqBody map[string]any, resp map[string]any)
 	}
 	newProxy := func(prefix string, opt proxyOpt) func(func(*http.Request) string) http.HandlerFunc {
 		return func(buildPath func(*http.Request) string) http.HandlerFunc {
@@ -129,6 +138,8 @@ func registerProxyRoutes(
 				proxiedPath += "user_id=" + url.QueryEscape(claims.UserID) + "&tenant_id=" + url.QueryEscape(tenantStr(claims.TenantID))
 				var resp interface{}
 				var err error
+				// reqBody 留给 afterResponse：记账要看请求里的 session_id / llm_config。
+				var reqBody map[string]interface{}
 				switch r.Method {
 				case "GET":
 					err = pythonClient.GetJSON(r.Context(), proxiedPath, &resp)
@@ -143,6 +154,7 @@ func registerProxyRoutes(
 					if opt.guardBody != nil && !opt.guardBody(w, r, body) {
 						return
 					}
+					reqBody = body
 					err = pythonClient.PostJSON(r.Context(), proxiedPath, body, &resp)
 				case "PUT":
 					body, ok := decodeOptionalJSON(w, r)
@@ -155,6 +167,7 @@ func registerProxyRoutes(
 					if opt.guardBody != nil && !opt.guardBody(w, r, body) {
 						return
 					}
+					reqBody = body
 					err = pythonClient.PutJSON(r.Context(), proxiedPath, body, &resp)
 				case "DELETE":
 					err = pythonClient.DeleteJSON(r.Context(), proxiedPath, &resp)
@@ -163,6 +176,14 @@ func registerProxyRoutes(
 					slog.Error(opt.logTag+" proxy error", "path", proxiedPath, "error", err)
 					logAndRespond(w, err, http.StatusInternalServerError, "internal error")
 					return
+				}
+				// 旁路记账（只有需要的路由注册了钩子）：写法见 unified_usage.go。
+				// 放在 OK 之前、转发之后 —— 顺序上它只影响"什么时候写库"，不影响回包；
+				// 但必须在这里而不是 goroutine 里，否则进程退出/请求密集时记账会丢。
+				if opt.afterResponse != nil {
+					if payload, ok := resp.(map[string]interface{}); ok {
+						opt.afterResponse(r, reqBody, payload)
+					}
 				}
 				OK(w, resp)
 			}
@@ -251,9 +272,16 @@ func registerProxyRoutes(
 	}))))
 
 	// Unified chat / quick-execute (六大工作台统一入口, proxies to Python TaskRouter)
+	//
+	// `afterResponse` 是这条链路的**用量记账**（此前完全没有）：回包里带
+	// `usage`（引擎 `submit_task` 产出）→ 写 `usage_events`。挂在这里而不是新写
+	// 一个专用 handler，是为了让"转发口径"和"记账口径"只有一处实现。
 	chatP := newProxy("", proxyOpt{
 		logTag:     "chat",
 		mutateBody: InjectSessionRuntime,
+		afterResponse: func(r *http.Request, reqBody map[string]interface{}, resp map[string]interface{}) {
+			recordUnifiedUsageFromResponse(r, auth.GetClaims(r.Context()), reqBody, resp)
+		},
 	})
 	mux.Handle("POST /v1/chat/submit", authMW(rlMW(chatP(pathFn("/v1/chat/submit")))))
 	mux.Handle("GET /v1/chat/sessions/{id}/messages", authMW(rlMW(chatP(pathParamSuffix("/v1/chat/sessions", "/messages")))))

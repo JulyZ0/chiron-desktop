@@ -33,10 +33,26 @@ type UsageEvent struct {
 // **绝不返回错误给调用方**：明细写入失败不能让已完成的扣费回滚，也不能让一次成功
 // 的对话因统计失败而报错。失败只告警。
 func RecordUsageEvent(ctx context.Context, ev UsageEvent) {
-	if db.GlobalDBManager == nil {
+	// 全空行不写：连模型名都没有、token 也全是 0 的那一行没有任何信息量。
+	// `CachedTokens` 必须参与判断 —— 只有缓存命中的调用（输入全命中、输出截断为 0）
+	// 是真事实，此前会被这条守卫当空气丢掉。
+	if ev.Model == "" && ev.InputTokens == 0 && ev.OutputTokens == 0 && ev.CachedTokens == 0 {
 		return
 	}
-	if ev.Model == "" && ev.InputTokens == 0 && ev.OutputTokens == 0 {
+	usageEventWrite(ctx, ev)
+}
+
+// usageEventWrite 是**实际落库**的那一步，抽成变量只为一件事：让单测能用一个
+// 假引擎把整条链路（引擎 SSE → 事件 → 归因 → 落库行）跑通并断言写入的行内容。
+//
+// 为什么值得留这个缝：`usage_events` 的写入以前只有 `usd`/`tokens` 全零的形态被
+// 观察到（"有行、tokens 全 0"），而这条链路跨三段序列化 + 一层归因，靠读代码
+// 看不出是哪一段丢的。能断言"写进去的行"，才谈得上回归保护。
+// 生产路径永远是 insertUsageEvent，替换只发生在测试里（`_test.go` 中 no-op 时还原）。
+var usageEventWrite = insertUsageEvent
+
+func insertUsageEvent(ctx context.Context, ev UsageEvent) {
+	if db.GlobalDBManager == nil {
 		return
 	}
 	_, err := db.GlobalDBManager.Exec(ctx,

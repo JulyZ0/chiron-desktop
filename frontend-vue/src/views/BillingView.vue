@@ -47,6 +47,10 @@ interface UsageData {
   total_output?: number
   total_cached?: number
   total_cost?: number
+  /** 记账行数（一行 = 某个模型在一个回合里的调用；同模型同回合合并） */
+  total_calls?: number
+  /** 区间内 token 全为 0 的记账行数：升级前的历史行没有 token 明细 */
+  zero_token_events?: number
   /** 后端只返回花费最高的 limit 项；truncated=true 表示还有没返回的 bucket */
   truncated?: boolean
   /** 聚合后的 bucket 总数（截断前），用于提示"共 N 项" */
@@ -115,6 +119,20 @@ const chartMax = computed(() => Math.max(1, ...chartData.value.map(d => d.spent)
 
 /** 是否处于"按天"视图：决定展示柱状图还是明细表 */
 const isDayGroup = computed(() => usageGroup.value === 'day')
+
+/**
+ * 是否存在"没有 token 明细"的记账行（升级前的历史数据）。
+ *
+ * 为什么要单独提示：这些行是**真实发生过的调用**，但当时链路只写了"有一次调用"、
+ * 没拿到 token —— 页面若只显示 0，用户会以为统计坏了；而回填是不可能的（等于编数据）。
+ * 所以标注口径，而不是假装数据完整。
+ */
+const hasLegacyZeroTokenRows = computed(() => (usage.value?.zero_token_events ?? 0) > 0)
+
+/** 区间内的总 token（输入 + 输出；缓存命中的输入已包含在输入里，不重复相加） */
+const totalTokens = computed(() =>
+  (usage.value?.total_input ?? 0) + (usage.value?.total_output ?? 0),
+)
 
 /** 明细表的行：把后端的 bucket 翻译成可读文本（空值后端归为 'unknown'） */
 const breakdownRows = computed(() =>
@@ -234,6 +252,24 @@ function onUsageQueryChange() {
               <span class="stat-label">{{ $t('common.total_consumed') }}</span>
               <span class="stat-value stat-spent">{{ usage?.total_spent ?? 0 }}</span>
             </div>
+            <!-- token 在按天视图里也要显示：只看花费的话，"花费算不出来"（无单价）
+                 会让整页看起来像"什么都没记"，而用量其实一直在。 -->
+            <div class="stat-item">
+              <span class="stat-label">{{ $t('billing.usage_col_input_tokens') }}</span>
+              <span class="stat-value">{{ usage?.total_input ?? 0 }}</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">{{ $t('billing.usage_col_output_tokens') }}</span>
+              <span class="stat-value">{{ usage?.total_output ?? 0 }}</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">{{ $t('billing.usage_col_cached_tokens') }}</span>
+              <span class="stat-value">{{ usage?.total_cached ?? 0 }}</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">{{ $t('billing.usage_col_events') }}</span>
+              <span class="stat-value">{{ usage?.total_calls ?? 0 }}</span>
+            </div>
           </template>
           <template v-else>
             <div class="stat-item">
@@ -252,7 +288,24 @@ function onUsageQueryChange() {
               <span class="stat-label">{{ $t('billing.usage_col_cost') }}</span>
               <span class="stat-value stat-spent">{{ usage?.total_cost ?? 0 }}</span>
             </div>
+            <div class="stat-item">
+              <span class="stat-label">{{ $t('billing.usage_col_events') }}</span>
+              <span class="stat-value">{{ usage?.total_calls ?? 0 }}</span>
+            </div>
           </template>
+        </div>
+        <!-- 票据口径说明：调用次数 = 记账行数（一行 = 某模型在某回合的调用）。
+             写清楚是为了让"调用次数和我数的不一样"有据可查，而不是靠猜。 -->
+        <div class="breakdown-hint">
+          {{ $t('billing.usage_count_basis', { rows: usage?.total_calls ?? 0, tokens: totalTokens }) }}
+        </div>
+        <!-- 历史数据标注：升级前的行只记了"调用了一次"，没有 token 明细。
+             不回填（那等于编数据），但要明确告诉用户这段时间的数据不完整。 -->
+        <div
+          v-if="hasLegacyZeroTokenRows"
+          class="breakdown-hint breakdown-truncated"
+        >
+          {{ $t('billing.usage_legacy_no_tokens', { n: usage?.zero_token_events ?? 0 }) }}
         </div>
       </Card>
 

@@ -48,7 +48,17 @@ var usageGroupColumn = map[string]string{
 // 用 `date_trunc('day', now())` 对齐到自然日边界，而不是 `now() - interval`：
 // 后者会让窗口起点落在半天处，与下面补零生成的"整天"序列错开一格，
 // 表现为趋势图第一根柱子永远比明细少。
-const usageWindow = `created_at >= date_trunc('day', now()) - make_interval(days => $2::int - 1)`
+//
+// **必须显式 `AT TIME ZONE 'UTC'`**：`created_at` 是 timestamptz，库的会话时区
+// 可能是 Asia/Shanghai 而 Go 侧补零用的是 UTC 日期串 —— 两边各按自己的时区切天，
+// 会让"近 N 天"的第一天/最后一天与明细互相对不上（差 8 小时的错位只在晚间出现，
+// 白天一切正常，所以极难复现）。切天口径统一到 UTC，与 `buildDailySeries` 一致。
+const usageWindow = `created_at >= (
+	date_trunc('day', now() AT TIME ZONE 'UTC') - make_interval(days => $2::int - 1)
+) AT TIME ZONE 'UTC'`
+
+// usageDayKey 把 `created_at` 折成**UTC** 的 `YYYY-MM-DD`，与 usageWindow 同口径。
+const usageDayKey = `to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`
 
 // GetUsage 返回区间内的用量汇总（按天 / 按模型 / 按会话）。
 func GetUsage(w http.ResponseWriter, r *http.Request) {
@@ -105,15 +115,25 @@ func GetUsage(w http.ResponseWriter, r *http.Request) {
 	OK(w, view)
 }
 
-// usageDaily 是按天视图：daily 序列 + 区间累计花费。
+// usageDaily 是按天视图：daily 序列 + 区间累计花费与 token。
 //
 // **补零到整天**：只回"有消耗的那几天"会让趋势图把 30 天压成两三根柱子，
 // 看起来像数据丢了。补齐后 x 轴才是真实的时间轴。
+//
+// **token 必须在这里也 SUM**：此前按天视图只汇总 `cost_cents`，于是"花费算不出来"
+// （模型名缺失 ⇒ 无单价 ⇒ 列是 NULL）时整页看起来只有一串 0，而 token 其实完全
+// 正常地躺在表里。按天视图缺 token，等于让用户无法自证"用量确实被记下来了"。
 func usageDaily(ctx context.Context, userID string, days int) (map[string]any, error) {
 	rows, err := db.GlobalDBManager.FetchAll(ctx, `
-		SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day,
-		       count(*)                             AS event_count,
-		       COALESCE(SUM(cost_cents), 0)         AS cost_cents
+		SELECT `+usageDayKey+`                    AS day,
+		       count(*)                           AS event_count,
+		       COALESCE(SUM(cost_cents), 0)       AS cost_cents,
+		       COALESCE(SUM(input_tokens), 0)     AS input_tokens,
+		       COALESCE(SUM(output_tokens), 0)    AS output_tokens,
+		       COALESCE(SUM(cached_tokens), 0)    AS cached_tokens,
+		       count(*) FILTER (
+		           WHERE input_tokens + output_tokens + cached_tokens = 0
+		       )                                  AS zero_token_events
 		  FROM usage_events
 		 WHERE user_id = $1 AND `+usageWindow+`
 		 GROUP BY 1`, userID, days)
@@ -121,21 +141,82 @@ func usageDaily(ctx context.Context, userID string, days int) (map[string]any, e
 		return nil, err
 	}
 
-	spentByDay := make(map[string]int, len(rows))
-	eventsByDay := make(map[string]int, len(rows))
+	daily := make([]usageDayRow, 0, len(rows))
 	for _, row := range rows {
-		day := stringOf(row["day"])
-		spentByDay[day] = intOf(row["cost_cents"])
-		eventsByDay[day] = intOf(row["event_count"])
+		daily = append(daily, usageDayRow{
+			day:             stringOf(row["day"]),
+			events:          intOf(row["event_count"]),
+			costCents:       intOf(row["cost_cents"]),
+			inputTokens:     intOf(row["input_tokens"]),
+			outputTokens:    intOf(row["output_tokens"]),
+			cachedTokens:    intOf(row["cached_tokens"]),
+			zeroTokenEvents: intOf(row["zero_token_events"]),
+		})
 	}
 
-	daily, total := buildDailySeries(spentByDay, eventsByDay, days, time.Now())
+	view := buildDailyView(daily, days, time.Now().UTC())
+	return view, nil
+}
+
+// usageDayRow 是一天的聚合值（`usageDaily` 的中间形态，便于纯函数测试）。
+type usageDayRow struct {
+	day             string
+	events          int
+	costCents       int
+	inputTokens     int
+	outputTokens    int
+	cachedTokens    int
+	zeroTokenEvents int
+}
+
+// buildDailyView 把按天的聚合补齐成连续 days 天，并算出区间合计。
+//
+// 与 `buildDailySeries` 的关系：那个只处理"花费 + 事件数"（旧契约），这里扩到
+// token 维度。补零、升序、只累加窗口内的天 —— 三条不变式完全一致，故复用同一份
+// 逻辑：先用行构造 map，再交给 buildDailySeries 生成骨架，最后把 token 填回去。
+// 这样两条路径不可能在"哪些天算进来"上漂移。
+func buildDailyView(rows []usageDayRow, days int, today time.Time) map[string]any {
+	spent := make(map[string]int, len(rows))
+	events := make(map[string]int, len(rows))
+	byDay := make(map[string]usageDayRow, len(rows))
+	for _, r := range rows {
+		spent[r.day] = r.costCents
+		events[r.day] = r.events
+		byDay[r.day] = r
+	}
+
+	daily, totalSpent := buildDailySeries(spent, events, days, today)
+
+	totalInput, totalOutput, totalCached, totalCalls, zeroToken := 0, 0, 0, 0, 0
+	for _, point := range daily {
+		day, _ := point["day"].(string)
+		r := byDay[day]
+		point["input_tokens"] = r.inputTokens
+		point["output_tokens"] = r.outputTokens
+		point["cached_tokens"] = r.cachedTokens
+		point["zero_token_events"] = r.zeroTokenEvents
+		totalInput += r.inputTokens
+		totalOutput += r.outputTokens
+		totalCached += r.cachedTokens
+		totalCalls += r.events
+		zeroToken += r.zeroTokenEvents
+	}
 
 	return map[string]any{
-		"daily":       daily,
-		"total_spent": total,
-		"period_days": days,
-	}, nil
+		"daily":             daily,
+		"total_spent":       totalSpent,
+		"period_days":       days,
+		"total_input":       totalInput,
+		"total_output":      totalOutput,
+		"total_cached":      totalCached,
+		"total_calls":       totalCalls,
+		"zero_token_events": zeroToken,
+		// 调用次数口径：`event_count` / `tx_count` = `usage_events` 的**记账行数**。
+		// 一行对应"某个模型在这一轮里的一次或多次调用"（同模型同轮合并），
+		// 所以它是**调用次数的下界**，不是精确调用数 —— 字段写清楚是为了让
+		// "9 次调用 / 12 次调用"这类对不上的疑问有据可查，而不是靠猜。
+		"count_basis": "usage_rows",
+	}
 }
 
 // buildDailySeries 把"有消耗的那几天"补成连续 days 天的序列（升序）。
@@ -179,6 +260,9 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 	totals, err := db.GlobalDBManager.FetchOne(ctx, fmt.Sprintf(`
 		SELECT count(DISTINCT %[1]s)                AS buckets,
 		       count(*)                             AS event_count,
+		       count(*) FILTER (
+		           WHERE input_tokens + output_tokens + cached_tokens = 0
+		       )                                    AS zero_token_events,
 		       COALESCE(SUM(input_tokens), 0)        AS input_tokens,
 		       COALESCE(SUM(output_tokens), 0)       AS output_tokens,
 		       COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
@@ -218,6 +302,7 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 	}
 
 	buckets := 0
+	zeroToken := 0
 	view := map[string]any{
 		"group_by":    groupBy,
 		"period_days": days,
@@ -226,14 +311,22 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 		// daily 在非按天分组时是空数组占位：前端用它判断"要不要画柱状图"，
 		// 键缺失会让它读到 undefined 而不是"没有数据"。
 		"daily": []any{},
+		// 调用次数口径见 usageDaily 的注释：`event_count` 是记账行数。
+		"count_basis": "usage_rows",
 	}
 	if totals != nil {
 		buckets = intOf(totals["buckets"])
+		zeroToken = intOf(totals["zero_token_events"])
 		view["total_input"] = intOf(totals["input_tokens"])
 		view["total_output"] = intOf(totals["output_tokens"])
 		view["total_cached"] = intOf(totals["cached_tokens"])
 		view["total_cost"] = intOf(totals["cost_cents"])
+		view["total_calls"] = intOf(totals["event_count"])
 	}
+	// 零 token 的记账行：升级前的历史行（当时链路只写"有一次调用"，没拿到 token）
+	// 与"引擎没回报用量"的行混在一起，无法事后区分，也不做回填（那等于编数据）。
+	// 界面据此标注"这段时间的记录不含 token 明细"，而不是让用户以为统计坏了。
+	view["zero_token_events"] = zeroToken
 	view["total_buckets"] = buckets
 	view["truncated"] = buckets > len(breakdown)
 	return view, nil
