@@ -630,6 +630,35 @@ describe('BillingView 零 token 来源分类（P1-7）', () => {
     expect(text).toContain('主动停止')
     expect(text).toContain('观测缺口')
     expect(text).toContain('不按猜测归类')
+    // 有了分类就不要再叠一句"升级前记录"：同一批行两种说法会被读成两个问题
+    expect(text).not.toContain('升级前')
+  })
+
+  it('计数为 0 的类别不渲染（面板只留真实存在的来源）', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') {
+        return Promise.resolve({
+          data: {
+            data: {
+              ...USAGE_ZERO_TOKEN,
+              zero_token_breakdown: {
+                total: 2, failed: 0, aborted: 2, upstream_no_usage: 0, unknown: 0,
+              },
+            },
+          },
+        })
+      }
+      return Promise.resolve({ data: { data: {} } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('用户中断：2 条')
+    expect(text).not.toContain('失败：0 条')
+    expect(text).not.toContain('上游未回 usage：0 条')
+    expect(text).not.toContain('无法判定：0 条')
   })
 
   it('后端没有分类结果时整块隐藏，不显示成 0 条', async () => {

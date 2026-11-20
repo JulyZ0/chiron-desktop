@@ -285,7 +285,13 @@ const isDayGroup = computed(() => usageGroup.value === 'day')
  * 没拿到 token —— 页面若只显示 0，用户会以为统计坏了；而回填是不可能的（等于编数据）。
  * 所以标注口径，而不是假装数据完整。
  */
-const hasLegacyZeroTokenRows = computed(() => (usage.value?.zero_token_events ?? 0) > 0)
+const hasLegacyZeroTokenRows = computed(() =>
+  (usage.value?.zero_token_events ?? 0) > 0
+  // 后端给出了来源分类（P1-7）时，**只用分类面板**说这件事：同一批行被两处
+  // 文案各说一遍（"有 N 条升级前记录" + "本区间 N 条没有 token"），用户会以为
+  // 是两个不同的问题。分类不可用时才退回这句兜底说明。
+  && !usage.value?.zero_token_breakdown,
+)
 
 /** 区间内的总 token（输入 + 输出；缓存命中的输入已包含在输入里，不重复相加） */
 const totalTokens = computed(() =>
