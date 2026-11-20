@@ -624,10 +624,13 @@ func (h *UploadHandler) finalizeKBDoc(r *http.Request, tenantID string, up struc
 		return "", err
 	}
 	// 重算 KB 统计（带 tenant_id 限制）
+	// `SUM(...)::bigint`：`file_size_bytes` 是 bigint，`SUM` 返回 numeric；赋值给
+	// `total_size_bytes` 虽能隐式转换，但把类型在 SQL 里钉死更不容易被后续改动
+	// （例如换成 `ROUND` / 除算）带偏。
 	_, _ = db.GlobalDBManager.Exec(r.Context(),
 		`UPDATE knowledge_bases
 		 SET document_count = (SELECT COUNT(*) FROM knowledge_documents WHERE knowledge_base_id = $1 AND tenant_id = $2),
-		     total_size_bytes = COALESCE((SELECT SUM(file_size_bytes) FROM knowledge_documents WHERE knowledge_base_id = $1 AND tenant_id = $2), 0),
+		     total_size_bytes = COALESCE((SELECT SUM(file_size_bytes) FROM knowledge_documents WHERE knowledge_base_id = $1 AND tenant_id = $2)::bigint, 0),
 		     updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, up.ParentID, tenantID)
 	return fmt.Sprintf("/kb/%s/documents/%s", up.ParentID, docID), nil
 }

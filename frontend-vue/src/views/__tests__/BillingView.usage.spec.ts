@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { mount, flushPromises } from '@vue/test-utils'
+import { mount, flushPromises, DOMWrapper } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 
 /**
@@ -16,6 +16,8 @@ import { createRouter, createMemoryHistory } from 'vue-router'
 const apiMocks = vi.hoisted(() => ({
   get: vi.fn(),
   post: vi.fn(),
+  // 补价（PUT /v1/admin/model-prices/{model}）走 put
+  put: vi.fn(),
 }))
 
 // antd 的 Table 走 useBreakpoint → responsiveObserve，jsdom 没有 matchMedia。
@@ -29,7 +31,7 @@ if (!window.matchMedia) {
 }
 
 vi.mock('../../api', () => ({
-  api: { get: apiMocks.get, post: apiMocks.post },
+  api: { get: apiMocks.get, post: apiMocks.post, put: apiMocks.put },
 }))
 
 import BillingView from '../BillingView.vue'
@@ -423,5 +425,149 @@ describe('BillingView 缺价与价格覆盖率（P1-9）', () => {
     expect(text).not.toContain('0%')
     // 用量明细不受影响
     expect(text).toContain('gpt-4o')
+  })
+})
+
+// ── 手工设置单价（PUT /v1/admin/model-prices/{model}）────────────────
+
+/**
+ * 用户可见的缺口：价格表只有"多源交叉验证"的自动写入方，而它默认关闭；于是
+ * 未定价模型在界面上只出现一行文字，**没有任何入口能补价**，计费页的花费永远是 0。
+ *
+ * 这里钉的是那条闭环：
+ *  1. 未定价行必须带「设置单价」按钮；
+ *  2. 对话框**预填 0**（不替用户猜价）；
+ *  3. 保存走 `PUT /v1/admin/model-prices/{model}`，路径段要 URL 编码；
+ *  4. 保存后**重新拉覆盖率与用量** —— 不重取的话用户会以为没生效。
+ */
+const COVERAGE_UNPRICED = {
+  period_days: 90,
+  total_models: 2,
+  priced_models: 1,
+  unpriced_models: 1,
+  coverage: 0.5,
+  unpriced: [
+    // 名字里带 `/`：路径段必须编码，否则请求会打到另一个路由上
+    { model: 'meta-llama/Llama-3', calls: 7, token_calls: 7, input_tokens: 700, output_tokens: 70, last_seen: '2026-11-19' },
+  ],
+  prices_entry_url: '/billing/prices',
+}
+
+/** Modal 默认 teleport 到 body：断言与操作都得在 document.body 里找 */
+function bodyFindAll(selector: string): HTMLElement[] {
+  return Array.from(document.body.querySelectorAll(selector)) as HTMLElement[]
+}
+
+/**
+ * 按文案找按钮。**必须去掉空白再比**：antd 会给两个汉字的按钮自动插入空格
+ * （"保存" 渲染成 "保 存"），按原文匹配会全部落空 —— 这种失败看起来像"按钮不存在"。
+ */
+function bodyButtonByText(text: string): HTMLElement | undefined {
+  const want = text.replace(/\s+/g, '')
+  return bodyFindAll('button').find(b => (b.textContent ?? '').replace(/\s+/g, '') === want)
+}
+
+/**
+ * 挂到真实 document.body 上：Modal 的内容是 teleport 出去的，没挂载时
+ * `document.body.querySelector` 看不到任何东西（弹窗断言会全部落空）。
+ */
+async function mountAttached() {
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const wrapper = mount(BillingView, { global: { plugins: [router] }, attachTo: host })
+  await flushPromises()
+  return wrapper
+}
+
+describe('BillingView 手工设置单价', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    document.body.innerHTML = ''
+    stubApi()
+  })
+
+  it('未定价行提供「设置单价」，保存时按 URL 编码写上模型并刷新覆盖率', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/admin/billing/price-coverage') return Promise.resolve({ data: { data: COVERAGE_UNPRICED } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    // 第二次拉覆盖率时模型已定价 ⇒ 覆盖率达到 100%（对应后端"保存即生效"）
+    let coverageCalls = 0
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/admin/billing/price-coverage') {
+        coverageCalls++
+        if (coverageCalls === 1) return Promise.resolve({ data: { data: COVERAGE_UNPRICED } })
+        return Promise.resolve({
+          data: {
+            data: { ...COVERAGE_UNPRICED, total_models: 2, priced_models: 2, unpriced_models: 0, coverage: 1, unpriced: [] },
+          },
+        })
+      }
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    apiMocks.put.mockResolvedValue({ data: { success: true } })
+
+    const wrapper = await mountAttached()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    // ① 未定价行有入口
+    const setPrice = bodyButtonByText('设置单价')
+    expect(setPrice).toBeTruthy()
+    setPrice!.click()
+    await flushPromises()
+
+    // ② 对话框预填 0（绝不替用户猜一个价）
+    const inputs = bodyFindAll('.price-dialog-form input')
+    expect(inputs.length).toBe(2)
+    // InputNumber 带 precision=6：预填 0 显示成 0.000000，数值上必须是 0
+    expect(Number((inputs[0] as HTMLInputElement).value)).toBe(0)
+    expect(Number((inputs[1] as HTMLInputElement).value)).toBe(0)
+
+    // ③ 填真实单价后保存
+    await new DOMWrapper(inputs[0]).setValue('0.27')
+    await new DOMWrapper(inputs[1]).setValue('1.1')
+    await flushPromises()
+
+    const ok = bodyButtonByText('保存')
+    expect(ok).toBeTruthy()
+    ok!.click()
+    await flushPromises()
+
+    expect(apiMocks.put).toHaveBeenCalledTimes(1)
+    const [path, payload] = apiMocks.put.mock.calls[0]
+    // 路径段必须编码：`/` 不编码会落到别的路由上（后端同一个通配段匹配不到）
+    expect(path).toBe(`/v1/admin/model-prices/${encodeURIComponent('meta-llama/Llama-3')}`)
+    expect(payload).toEqual({ input_per_1k: 0.27, output_per_1k: 1.1, currency: 'USD' })
+
+    // ④ 保存后必须重取覆盖率（否则用户会以为没生效）
+    expect(coverageCalls).toBeGreaterThanOrEqual(2)
+    await flushPromises()
+    expect(wrapper.text()).toContain('100%')
+
+    wrapper.unmount()
+  })
+
+  it('两个单价都是 0 时不发请求：0 表示「不知道」而不是「免费」', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/admin/billing/price-coverage') return Promise.resolve({ data: { data: COVERAGE_UNPRICED } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+
+    const wrapper = await mountAttached()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    bodyButtonByText('设置单价')!.click()
+    await flushPromises()
+    bodyButtonByText('保存')!.click()
+    await flushPromises()
+
+    expect(apiMocks.put).not.toHaveBeenCalled()
+
+    wrapper.unmount()
   })
 })

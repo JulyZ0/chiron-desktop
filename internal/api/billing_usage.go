@@ -123,14 +123,20 @@ func GetUsage(w http.ResponseWriter, r *http.Request) {
 // **token 必须在这里也 SUM**：此前按天视图只汇总 `cost_cents`，于是"花费算不出来"
 // （模型名缺失 ⇒ 无单价 ⇒ 列是 NULL）时整页看起来只有一串 0，而 token 其实完全
 // 正常地躺在表里。按天视图缺 token，等于让用户无法自证"用量确实被记下来了"。
+//
+// **每个 SUM 都必须 `::bigint`**：`usage_events` 的 token 三列是 `bigint`，而 PG 的
+// `SUM(bigint)` 返回 **numeric**。`FetchAll` 把行扫进 `*interface{}` 时 pgx 给出的是
+// `pgtype.Numeric`，`intOf` 以前不认它 —— 于是"表里有 30 行真实 token、接口全回 0"
+// 而 `count(*)`（int8 → int64）却是对的。cast 一次就把类型钉死在 int64 上，
+// 不依赖任何一种驱动解码形态；`intOf` 侧另有一层 numeric 兜底。
 func usageDaily(ctx context.Context, userID string, days int) (map[string]any, error) {
 	rows, err := db.GlobalDBManager.FetchAll(ctx, `
 		SELECT `+usageDayKey+`                    AS day,
 		       count(*)                           AS event_count,
-		       COALESCE(SUM(cost_cents), 0)       AS cost_cents,
-		       COALESCE(SUM(input_tokens), 0)     AS input_tokens,
-		       COALESCE(SUM(output_tokens), 0)    AS output_tokens,
-		       COALESCE(SUM(cached_tokens), 0)    AS cached_tokens,
+		       COALESCE(SUM(cost_cents), 0)::bigint       AS cost_cents,
+		       COALESCE(SUM(input_tokens), 0)::bigint     AS input_tokens,
+		       COALESCE(SUM(output_tokens), 0)::bigint    AS output_tokens,
+		       COALESCE(SUM(cached_tokens), 0)::bigint    AS cached_tokens,
 		       count(*) FILTER (
 		           WHERE input_tokens + output_tokens + cached_tokens = 0
 		       )                                  AS zero_token_events,
@@ -287,23 +293,32 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 		           WHERE input_tokens + output_tokens + cached_tokens > 0
 		             AND cost_cents IS NULL
 		       )                                    AS unpriced_calls,
-		       COALESCE(SUM(input_tokens), 0)        AS input_tokens,
-		       COALESCE(SUM(output_tokens), 0)       AS output_tokens,
-		       COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
-		       COALESCE(SUM(cost_cents), 0)          AS cost_cents
+		       COALESCE(SUM(input_tokens), 0)::bigint  AS input_tokens,
+		       COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+		       COALESCE(SUM(cached_tokens), 0)::bigint AS cached_tokens,
+		       COALESCE(SUM(cost_cents), 0)::bigint    AS cost_cents
 		  FROM usage_events
 		 WHERE user_id = $1 AND `+usageWindow, column), userID, days)
 	if err != nil {
 		return nil, err
 	}
 
+	// provider 只在按模型分组时有意义（按会话/按天没有单一厂商）。
+	// 取 `max(provider)` 而不是 `max(...) FILTER (...)`:分组内混着有值与空串时，
+	// 字符串比较下非空值必然大于空串，等价于"取那个已知的厂商"。
+	providerExpr := `''::text AS provider`
+	if groupBy == "model" {
+		providerExpr = `COALESCE(NULLIF(max(provider), ''), '')::text AS provider`
+	}
+
 	rows, err := db.GlobalDBManager.FetchAll(ctx, fmt.Sprintf(`
 		SELECT %[1]s                               AS bucket,
 		       count(*)                             AS event_count,
-		       COALESCE(SUM(input_tokens), 0)        AS input_tokens,
-		       COALESCE(SUM(output_tokens), 0)       AS output_tokens,
-		       COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
-		       COALESCE(SUM(cost_cents), 0)          AS cost_cents,
+		       COALESCE(SUM(input_tokens), 0)::bigint  AS input_tokens,
+		       COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+		       COALESCE(SUM(cached_tokens), 0)::bigint AS cached_tokens,
+		       COALESCE(SUM(cost_cents), 0)::bigint    AS cost_cents,
+		       %[2]s,
 		       count(*) FILTER (
 		           WHERE input_tokens + output_tokens + cached_tokens > 0
 		             AND cost_cents IS NOT NULL
@@ -316,7 +331,7 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 		 WHERE user_id = $1 AND `+usageWindow+`
 		 GROUP BY 1
 		 ORDER BY cost_cents DESC, bucket ASC
-		 LIMIT $3`, column), userID, days, usageBucketLimit)
+		 LIMIT $3`, column, providerExpr), userID, days, usageBucketLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +340,7 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 	for _, row := range rows {
 		bucketRows = append(bucketRows, usageBucketRow{
 			bucket:        stringOf(row["bucket"]),
+			provider:      stringOf(row["provider"]),
 			events:        intOf(row["event_count"]),
 			inputTokens:   intOf(row["input_tokens"]),
 			outputTokens:  intOf(row["output_tokens"]),
@@ -372,7 +388,48 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 	view["zero_token_events"] = zeroToken
 	view["total_buckets"] = buckets
 	view["truncated"] = buckets > len(breakdown)
+	if groupBy == "model" {
+		// 读路径的 provider 兜底：老行的 provider 是空的（写入侧当时拿不到），
+		// 但"这个模型属于哪个厂商"按模型名仍然查得到（见 usage_provider.go）。
+		// 查不到就留空并标 `provider_missing` —— **不按名字前缀猜厂商**。
+		missing := enrichBreakdownProviders(ctx, breakdown)
+		view["provider_missing_models"] = missing
+		view["provider_missing"] = missing > 0
+	} else {
+		// 按天 / 按会话没有"单一厂商"这回事：把这些键删掉，而不是回一串
+		// `provider_missing: true` —— 那会让前端误报"归属缺失"，而事实是
+		// 这个维度根本没有归属概念。
+		for _, row := range breakdown {
+			delete(row, "provider")
+			delete(row, "provider_missing")
+		}
+	}
 	return view, nil
+}
+
+// enrichBreakdownProviders 为按模型分组的明细补 provider，返回仍然缺失的行数。
+//
+// 就地改写明细行（每个元素是一行响应），让"厂商"这一维度在界面与 API 上都可用；
+// 缺失的数量单独返回，供汇总卡说明"这一列有 N 个模型不知道归属"。
+func enrichBreakdownProviders(ctx context.Context, rows []map[string]any) int {
+	missing := 0
+	for _, row := range rows {
+		if _, ok := row["provider"]; !ok {
+			row["provider"] = ""
+		}
+		provider := stringOf(row["provider"])
+		if provider == "" {
+			provider = resolveProviderForModel(ctx, stringOf(row["bucket"]))
+			if provider != "" {
+				row["provider"] = provider
+			}
+		}
+		row["provider_missing"] = provider == ""
+		if provider == "" {
+			missing++
+		}
+	}
+	return missing
 }
 
 // usageBucketRow 是一个分组（模型 / 会话）的聚合值。
@@ -380,7 +437,10 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 // 单独成结构是为了让「缺价怎么派生」这一条口径能在**纯函数**里被测到：
 // 它决定界面显示数字还是 "—"，而两者在合计里都是 0。
 type usageBucketRow struct {
-	bucket        string
+	bucket string
+	// provider 空串 = 记账行的 provider 缺失（或按会话分组时无意义）。
+	// 补全与"是否补到了"由 enrichBreakdownProviders 负责，纯函数只管透传。
+	provider      string
 	events        int
 	inputTokens   int
 	outputTokens  int
@@ -396,19 +456,23 @@ type usageBucketRow struct {
 //   - `cost_cents` 仍回"已定价部分之和"（保持老客户端可用）；
 //   - `priced_calls` / `unpriced_calls` 让界面知道这个数是否**只覆盖了一部分**；
 //   - `price_missing` = unpriced_calls > 0，前端据此显示 "—" + tooltip 而不是 0。
+//   - `provider` 原样透传（空串保持空串）；`provider_missing` 也在这里先给出初值，
+//     读路径补不到时它就是最终值 —— 键必须存在，否则前端读到 undefined。
 func buildBreakdownRows(rows []usageBucketRow) []map[string]any {
 	out := make([]map[string]any, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, map[string]any{
-			"bucket":         r.bucket,
-			"event_count":    r.events,
-			"input_tokens":   r.inputTokens,
-			"output_tokens":  r.outputTokens,
-			"cached_tokens":  r.cachedTokens,
-			"cost_cents":     r.costCents,
-			"priced_calls":   r.pricedCalls,
-			"unpriced_calls": r.unpricedCalls,
-			"price_missing":  r.unpricedCalls > 0,
+			"bucket":           r.bucket,
+			"provider":         r.provider,
+			"provider_missing": r.provider == "",
+			"event_count":      r.events,
+			"input_tokens":     r.inputTokens,
+			"output_tokens":    r.outputTokens,
+			"cached_tokens":    r.cachedTokens,
+			"cost_cents":       r.costCents,
+			"priced_calls":     r.pricedCalls,
+			"unpriced_calls":   r.unpricedCalls,
+			"price_missing":    r.unpricedCalls > 0,
 		})
 	}
 	return out

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import dayjs from 'dayjs'
-import { Card, Spin, Radio, Table, Button, message } from 'ant-design-vue'
+import { Card, Spin, Radio, Table, Button, InputNumber, Modal, message } from 'ant-design-vue'
 import { useRouter } from 'vue-router'
 import EmptyState from '../components/common/EmptyState.vue'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
@@ -35,6 +35,12 @@ interface DailyUsage {
 /** 非按天分组时的一行（后端 usage_events 聚合结果） */
 interface BreakdownRow {
   bucket: string
+  /**
+   * 厂商归属（`usage_events.provider`；写入时缺失则后端按模型名回填）。
+   * 空串 + `provider_missing` = 后端查不到，**不是**"没有厂商"。
+   */
+  provider?: string
+  provider_missing?: boolean
   event_count: number
   input_tokens: number
   output_tokens: number
@@ -51,6 +57,8 @@ interface BreakdownRow {
 /** 明细表里的一行：在契约字段之外补上"这一格怎么显示" */
 interface BreakdownDisplayRow extends BreakdownRow {
   label: string
+  /** 厂商列：查不到归属时显示 "—"（不能让空串渲染成一片空白，那看起来像 bug） */
+  provider_display: string
   cost_display: string
   cost_tooltip?: string
 }
@@ -80,11 +88,15 @@ interface UsageData {
   /** 聚合后的 bucket 总数（截断前），用于提示"共 N 项" */
   total_buckets?: number
   limit?: number
+  /** 按模型分组时：多少个模型的厂商归属查不到（后端标，不猜） */
+  provider_missing_models?: number
 }
 
 /** 价格覆盖率（GET /v1/admin/billing/price-coverage） */
 interface PriceCoverageUnpriced {
   model: string
+  /** 厂商（后端按模型名反查；查不到为空串，界面不显示"未知厂商"这种编造值） */
+  provider?: string
   calls: number
   token_calls: number
   input_tokens: number
@@ -156,6 +168,58 @@ const coveragePercent = computed(() => {
   if (!coverage.value || coverage.value.total_models <= 0) return ''
   return `${Math.round((coverage.value.coverage ?? 0) * 100)}%`
 })
+
+// ── 手工设置单价（PUT /v1/admin/model-prices/{model}）──
+//
+// 为什么要有这个对话框：价格表只有"多源交叉验证"的自动写入方，而它**默认关闭**，
+// 所以自建 / 聚合网关 / 新发布的模型永远没有价 —— 计费页只能看着一串 0，没有任何
+// 入口能补。这里就是那个入口：由人填，**预填 0**（绝不替用户猜一个数）。
+const priceDialogOpen = ref(false)
+/** 正在定价的模型名（同时是请求路径段，需 URL 编码） */
+const priceModel = ref('')
+const priceInput = ref<number>(0)
+const priceOutput = ref<number>(0)
+const priceSaving = ref(false)
+
+function openPriceDialog(model: string) {
+  priceModel.value = model
+  // 预填 0 而不是某个"看起来合理"的默认价：猜错的价格会被当成事实长期留着。
+  priceInput.value = 0
+  priceOutput.value = 0
+  priceDialogOpen.value = true
+}
+
+/**
+ * 保存单价。成功后**立刻重取覆盖率与用量**：
+ * 后端写完就清空单价缓存（下一次调用立即按新价折算），覆盖率按"模型有没有价"
+ * 判定，所以刷新后该模型立即算已定价（不需要等缓存 TTL）。
+ */
+async function savePrice() {
+  const model = priceModel.value
+  if (!model || priceSaving.value) return
+  const input = Number(priceInput.value ?? 0)
+  const output = Number(priceOutput.value ?? 0)
+  if (!(input > 0) && !(output > 0)) {
+    // 0/0 后端会 400：0 不会被当成"免费"，而是"不知道"，保存了也不会有任何效果
+    message.error(t('billing.price_dialog_zero'))
+    return
+  }
+  priceSaving.value = true
+  try {
+    await api.put(`/v1/admin/model-prices/${encodeURIComponent(model)}`, {
+      input_per_1k: input,
+      output_per_1k: output,
+      currency: 'USD',
+    })
+    message.success(t('billing.price_dialog_saved', { model }))
+    priceDialogOpen.value = false
+    await Promise.all([loadCoverage(), loadUsage()])
+  } catch (error) {
+    message.error(errorMessageText(error, t('errors.failed_to_load')))
+  } finally {
+    priceSaving.value = false
+  }
+}
 
 // ── 计算属性 ──
 
@@ -239,6 +303,10 @@ const breakdownRows = computed<BreakdownDisplayRow[]>(() =>
     label: row.bucket === 'unknown'
       ? t('billing.usage_unknown_bucket')
       : row.bucket,
+    // 厂商：后端查不到就给空串 + provider_missing，这里显示 "—" 而不是编一个名字
+    provider_display: row.provider && row.provider !== ''
+      ? row.provider
+      : (row.provider_missing ? '—' : ''),
     ...costCell(row),
   })),
 )
@@ -253,8 +321,22 @@ const breakdownColumns = computed(() => {
     model: { title: t('billing.usage_col_model'), key: 'label', dataIndex: 'label', width: 240 },
     session: { title: t('billing.usage_col_session'), key: 'label', dataIndex: 'label', width: 240 },
   }[usageGroup.value]
+  // 厂商列只在按模型分组时出现：按天/按会话没有单一厂商，加一列只会显示一排 "—"。
+  const providerColumn = usageGroup.value === 'model'
+    ? [{
+        title: t('billing.usage_col_provider'),
+        key: 'provider',
+        dataIndex: 'provider_display',
+        width: 140,
+        // 归属查不到时给出说明（不是"没有厂商"，而是"没记下来也查不到"）
+        customCell: (record: BreakdownDisplayRow) => (
+          record.provider_missing ? { title: t('billing.usage_provider_missing_tooltip') } : {}
+        ),
+      }]
+    : []
   return [
     first,
+    ...providerColumn,
     { title: t('billing.usage_col_events'), key: 'event_count', dataIndex: 'event_count', width: 100, align: 'right' as const },
     { title: t('billing.usage_col_input_tokens'), key: 'input_tokens', dataIndex: 'input_tokens', width: 130, align: 'right' as const },
     { title: t('billing.usage_col_output_tokens'), key: 'output_tokens', dataIndex: 'output_tokens', width: 130, align: 'right' as const },
@@ -476,7 +558,8 @@ async function loadCoverage() {
             {{ $t('billing.coverage_action') }}
           </Button>
         </div>
-        <!-- 未定价模型列表：按调用数降序（后端排好），决定补价优先级 -->
+        <!-- 未定价模型列表：按调用数降序（后端排好），决定补价优先级。
+             每行都能直接设置单价 —— 此前只能跳去价格表看一眼，然后无路可走。 -->
         <ul
           v-if="coverage.unpriced.length"
           class="coverage-list"
@@ -484,11 +567,55 @@ async function loadCoverage() {
           <li
             v-for="item in coverage.unpriced"
             :key="item.model"
+            class="coverage-item"
           >
-            {{ $t('billing.coverage_unpriced_item', { model: item.model, calls: item.calls }) }}
+            <span class="coverage-item-text">
+              {{ $t('billing.coverage_unpriced_item', { model: item.model, calls: item.calls }) }}
+            </span>
+            <Button
+              size="small"
+              type="link"
+              class="coverage-item-action"
+              @click="openPriceDialog(item.model)"
+            >
+              {{ $t('billing.price_set_action') }}
+            </Button>
           </li>
         </ul>
       </Card>
+
+      <!-- 设置单价：预填 0，由人给出真实单价（后端不猜、不写死任何厂商价格） -->
+      <Modal
+        v-model:open="priceDialogOpen"
+        :title="$t('billing.price_dialog_title', { model: priceModel })"
+        :confirm-loading="priceSaving"
+        :ok-text="$t('billing.price_dialog_save')"
+        @ok="savePrice"
+      >
+        <p class="price-dialog-hint">
+          {{ $t('billing.price_dialog_hint') }}
+        </p>
+        <div class="price-dialog-form">
+          <label>{{ $t('billing.price_dialog_input') }}</label>
+          <InputNumber
+            v-model:value="priceInput"
+            class="price-dialog-field"
+            :min="0"
+            :step="0.01"
+            :precision="6"
+            addon-after="USD / 1k"
+          />
+          <label>{{ $t('billing.price_dialog_output') }}</label>
+          <InputNumber
+            v-model:value="priceOutput"
+            class="price-dialog-field"
+            :min="0"
+            :step="0.01"
+            :precision="6"
+            addon-after="USD / 1k"
+          />
+        </div>
+      </Modal>
 
       <!-- 分组 / 区间切换：放在图表与明细之上，切换只重查用量 -->
       <div class="usage-filters">
@@ -581,6 +708,14 @@ async function loadCoverage() {
               total: usage.total_buckets ?? breakdownRows.length,
             }) }}
           </div>
+          <!-- 厂商归属缺失：老行写入时拿不到 provider，且按模型名也查不到。
+               不猜（不按名字前缀推断），只把"我们不知道"说清楚。 -->
+          <div
+            v-if="(usage?.provider_missing_models ?? 0) > 0 && usageGroup === 'model'"
+            class="breakdown-hint"
+          >
+            {{ $t('billing.usage_provider_missing', { n: usage?.provider_missing_models ?? 0 }) }}
+          </div>
         </Spin>
       </Card>
     </template>
@@ -616,6 +751,13 @@ async function loadCoverage() {
 .coverage-text { flex: 1; min-width: 200px; font-size: 13px; color: var(--text-secondary); }
 .coverage-list { margin: 10px 0 0; padding-inline-start: 18px; font-size: 12px; color: var(--text-tertiary); }
 .coverage-list li { margin-top: 2px; }
+/* 未定价行：文案在左、设置单价在右（窄屏自动折行，不挤成一列） */
+.coverage-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.coverage-item-text { flex: 1; min-width: 160px; }
+.coverage-item-action { padding: 0 4px; height: auto; }
+.price-dialog-hint { margin: 0 0 12px; font-size: 12px; color: var(--text-tertiary); }
+.price-dialog-form { display: flex; flex-direction: column; gap: 6px; }
+.price-dialog-field { width: 100%; }
 
 .bar-chart { display: flex; align-items: flex-end; gap: 6px; height: 170px; overflow-x: auto; padding-top: 8px; -webkit-overflow-scrolling: touch; }
 .bar-col { flex: 1; min-width: 26px; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }

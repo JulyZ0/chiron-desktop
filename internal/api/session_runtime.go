@@ -529,16 +529,16 @@ func (h *SessionRuntimeHandler) metricsFromDB(ctx context.Context, sessionID str
 	}
 	row, err := db.GlobalDBManager.FetchOne(ctx, `
 		SELECT count(*)                                                  AS turns,
-		       COALESCE(SUM(input_tokens), 0)                            AS input_tokens,
-		       COALESCE(SUM(output_tokens), 0)                           AS output_tokens,
-		       COALESCE(SUM(cached_tokens), 0)                          AS cached_tokens,
-		       COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)   AS cache_hits
+		       COALESCE(SUM(input_tokens), 0)::bigint                     AS input_tokens,
+		       COALESCE(SUM(output_tokens), 0)::bigint                    AS output_tokens,
+		       COALESCE(SUM(cached_tokens), 0)::bigint                    AS cached_tokens,
+		       COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)::bigint AS cache_hits
 		  FROM turns WHERE session_id = $1`, sessionID)
 	if err != nil || row == nil {
 		return out
 	}
 	item, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT COALESCE(SUM(cost_cents), 0) AS cost_cents FROM usage_events WHERE session_id = $1`, sessionID)
+		`SELECT COALESCE(SUM(cost_cents), 0)::bigint AS cost_cents FROM usage_events WHERE session_id = $1`, sessionID)
 	cost := 0
 	if err == nil && item != nil {
 		cost = intOf(item["cost_cents"])
