@@ -528,48 +528,15 @@ def test_restore_does_not_clobber_caller_index(env: Env) -> None:
     assert env.index.read_bytes() == sentinel
 
 
-def test_restore_lands_inside_project_root_when_repo_is_monorepo(tmp_path: Path) -> None:
-    """项目根是仓库子目录时，回滚必须落在**项目根**。
+def test_nested_project_root_is_rejected_instead_of_snapshotting_parent(tmp_path: Path) -> None:
+    """项目根嵌在父仓库里时：**明确拒绝**，而不是把父仓库内容当成项目快照。
 
-    实测缺陷：``diff-tree`` 默认输出**仓库根**口径（``packages/foo/src/a.txt``），
-    而 ``ls-files`` / ``ls-tree`` 是**项目根**口径（``src/a.txt``）。混用会让
-    ``restore()`` 拼出 ``packages/foo/packages/foo/src/a.txt``：内容落在了错误
-    位置，而 ``written`` 返回空、``ok=True`` —— 用户看到"回滚成功"却没改动
-    任何文件（实测样本）。
-    """
-    repo = _init(tmp_path / "repo")
-    proj = repo / "packages" / "foo"
-    (proj / "src").mkdir(parents=True)
-    (repo / "packages" / "bar").mkdir(parents=True)
-    (proj / "src" / "a.txt").write_bytes(b"orig\n")
-    (repo / "packages" / "bar" / "b.txt").write_bytes(b"bar\n")
-    _commit_all(repo)
+    缺陷形态（实测）：``git -C <子目录>`` 会向上找到父仓库，``read-tree HEAD`` 与
+    ``write-tree`` 因此覆盖**整个父仓库**；ref 也写进父仓库。用户看到时间线"有检查点"，
+    可它保护的是另一个项目。
 
-    state = tmp_path / "state"
-    state.mkdir()
-    index = state / "snap.idx"
-    store = state / "untracked"
-
-    target = gc.snapshot(proj, index_file=index, store_root=store)
-    (proj / "src" / "a.txt").write_bytes(b"MUTATED\n")
-
-    result = gc.restore(proj, target=target, store_root=store, index_file=index)
-
-    assert result.ok, result.failed
-    assert result.written == ("src/a.txt",)
-    assert (proj / "src" / "a.txt").read_bytes() == b"orig\n"
-    # 缺陷的指纹：项目根下多出一层同名目录
-    assert not (proj / "packages").exists()
-    # 兄弟包不该被波及
-    assert (repo / "packages" / "bar" / "b.txt").read_bytes() == b"bar\n"
-
-
-def test_staged_new_file_in_monorepo_subdir_is_included(tmp_path: Path) -> None:
-    """子目录里 ``git add`` 的新文件也要进快照。
-
-    ``diff --cached --name-only`` 不带 ``--relative`` 时返回仓库根口径
-    （``packages/foo/new.py``）；拿它去 ``git add`` 会因路径不对而失败，
-    或者把仓库根的路径当成项目根路径。
+    取舍：monorepo 子目录暂不支持检查点（需要按 ``--show-prefix`` 重写索引口径），
+    拒绝必须带可行动的提示，而不是静默生成错误快照。
     """
     repo = _init(tmp_path / "repo")
     proj = repo / "packages" / "foo"
@@ -577,15 +544,31 @@ def test_staged_new_file_in_monorepo_subdir_is_included(tmp_path: Path) -> None:
     (proj / "a.py").write_bytes(b"v1\n")
     _commit_all(repo)
 
-    (proj / "new.py").write_bytes(b"staged\n")
-    assert _git(proj, "add", "new.py").returncode == 0
+    state = tmp_path / "state"
+    state.mkdir()
+    with pytest.raises(gc.GitError) as exc:
+        gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
+    assert "another git repository" in str(exc.value)
+
+
+def test_nested_root_does_not_contribute_refs_from_parent_repo(tmp_path: Path) -> None:
+    """父仓库里的检查点 ref 不参与子目录会话的序号计算。"""
+    repo = _init(tmp_path / "repo")
+    proj = repo / "packages" / "foo"
+    proj.mkdir(parents=True)
+    (proj / "a.py").write_bytes(b"v1\n")
+    _commit_all(repo)
+    # 父仓库里存在一个"别的会话"的检查点 ref
+    tree = _git(repo, "write-tree").stdout.decode().strip()
+    sha = gc.commit_tree(repo, tree=tree)
+    gc.write_ref(repo, "refs/chiron/checkpoints/parent-session/000001-pre_turn", sha)
 
     state = tmp_path / "state"
     state.mkdir()
-    snap = gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
-
-    assert "new.py" in snap.tree_paths
-    assert "a.py" in snap.tree_paths
+    with pytest.raises(gc.GitError):
+        gc.snapshot(proj, index_file=state / "snap.idx", store_root=state / "untracked")
+    # 子目录里读 ref 会得到空（顶层不匹配），而不是把父仓库的 ref 当成自己的
+    assert gc.next_checkpoint_seq(proj, "parent-session") == 1
 
 
 # ---------------------------------------------------------------------------
