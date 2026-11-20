@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {CONTEXT_QUERY_KEYS, MAX_CONTEXT_KBS, buildWorkbenchContext, parseContextQuery, type ContextChip} from '../contextChips'
+import {CONTEXT_QUERY_KEYS, DEFAULT_KB_WEIGHT, KB_WEIGHT_MAX, KB_WEIGHT_MIN, MAX_CONTEXT_KBS, buildWorkbenchContext, chipsFromWorkbenchContext, clampKbWeight, parseContextQuery, type ContextChip} from '../contextChips'
 
 const chips = (...pairs: [ContextChip['type'], string][]): ContextChip[] =>
   pairs.map(([type, value]) => ({ type, label: value, value }))
@@ -37,7 +37,11 @@ describe('parseContextQuery（URL 约定）', () => {
 describe('buildWorkbenchContext（发给引擎的形态）', () => {
   it('单值字段取首个，同时给出多值数组（新旧后端都能工作）', () => {
     const ctx = buildWorkbenchContext(chips(['kb', 'kb-1'], ['kb', 'kb-2']))
-    expect(ctx).toEqual({ kb_id: 'kb-1', kb_ids: ['kb-1', 'kb-2'] })
+    // kb_ids 是 `[{id, weight}]`（P1-8）：缺省权重 1.0，老库行为不变
+    expect(ctx).toEqual({
+      kb_id: 'kb-1',
+      kb_ids: [{ id: 'kb-1', weight: 1 }, { id: 'kb-2', weight: 1 }],
+    })
   })
 
   it('各类上下文各自成字段，技能本来就是数组', () => {
@@ -46,7 +50,7 @@ describe('buildWorkbenchContext（发给引擎的形态）', () => {
     ))
     expect(ctx).toEqual({
       kb_id: 'kb-1',
-      kb_ids: ['kb-1'],
+      kb_ids: [{ id: 'kb-1', weight: 1 }],
       agent_id: 'ag-1',
       agent_ids: ['ag-1'],
       plugin_names: ['fs'],
@@ -56,7 +60,7 @@ describe('buildWorkbenchContext（发给引擎的形态）', () => {
 
   it('同类重复值去重（URL 里手写重复不该变成两次检索）', () => {
     const ctx = buildWorkbenchContext(chips(['kb', 'kb-1'], ['kb', 'kb-1']))
-    expect(ctx).toEqual({ kb_id: 'kb-1', kb_ids: ['kb-1'] })
+    expect(ctx).toEqual({ kb_id: 'kb-1', kb_ids: [{ id: 'kb-1', weight: 1 }] })
   })
 
   it('没有上下文时返回 undefined（调用方据此不写 context 字段）', () => {
@@ -97,27 +101,34 @@ describe('知识库多选（P1-1：上限 5）', () => {
     // 网关照旧透传、引擎照旧解析，但解析结果恒为空 —— 表现就是"选了库却没有任何注入"。
     const ctx = buildWorkbenchContext(manyKb(2)) as Record<string, unknown>
     expect(Object.keys(ctx).sort()).toEqual(['kb_id', 'kb_ids'])
-    expect(ctx.kb_ids).toEqual(['kb-0', 'kb-1'])
+    expect(ctx.kb_ids).toEqual([{ id: 'kb-0', weight: 1 }, { id: 'kb-1', weight: 1 }])
     expect(ctx).not.toHaveProperty('knowledge_base_ids')
     expect(ctx).not.toHaveProperty('kbIds')
   })
 
   it('多选提交：kb_ids 数组带上全部已选库（单值 kb_id 仍取首个）', () => {
     const ctx = buildWorkbenchContext(manyKb(3))
-    expect(ctx).toEqual({ kb_id: 'kb-0', kb_ids: ['kb-0', 'kb-1', 'kb-2'] })
+    expect(ctx).toEqual({
+      kb_id: 'kb-0',
+      kb_ids: [
+        { id: 'kb-0', weight: 1 },
+        { id: 'kb-1', weight: 1 },
+        { id: 'kb-2', weight: 1 },
+      ],
+    })
   })
 
   it('超过上限时截断到 5 个（与引擎 MAX_CONTEXT_KBS 对齐）', () => {
-    const ctx = buildWorkbenchContext(manyKb(8)) as { kb_ids: string[]; kb_id: string }
+    const ctx = buildWorkbenchContext(manyKb(8)) as { kb_ids: { id: string }[]; kb_id: string }
     expect(MAX_CONTEXT_KBS).toBe(5)
-    expect(ctx.kb_ids).toEqual(['kb-0', 'kb-1', 'kb-2', 'kb-3', 'kb-4'])
+    expect(ctx.kb_ids.map(k => k.id)).toEqual(['kb-0', 'kb-1', 'kb-2', 'kb-3', 'kb-4'])
     expect(ctx.kb_id).toBe('kb-0')
   })
 
   it('URL 里手写 8 个 kb 参数也只在提交时带 5 个', () => {
     const chips = parseContextQuery({ kb: manyKb(8).map(c => c.value) })
     expect(chips).toHaveLength(8) // 解析全保留（用户可能想先看到自己传了什么）
-    const ctx = buildWorkbenchContext(chips) as { kb_ids: string[] }
+    const ctx = buildWorkbenchContext(chips) as { kb_ids: unknown[] }
     expect(ctx.kb_ids).toHaveLength(MAX_CONTEXT_KBS)
   })
 
@@ -125,8 +136,73 @@ describe('知识库多选（P1-1：上限 5）', () => {
     const ctx = buildWorkbenchContext([
       ...manyKb(7),
       ...Array.from({ length: 6 }, (_, i) => ({ type: 'skill' as const, label: '', value: `s-${i}` })),
-    ]) as { kb_ids: string[]; skill_names: string[] }
+    ]) as { kb_ids: unknown[]; skill_names: string[] }
     expect(ctx.kb_ids).toHaveLength(5)
     expect(ctx.skill_names).toHaveLength(6)
+  })
+})
+
+/**
+ * 多库权重（P1-8）：选中多个库时可以调"这个库多重要"。
+ *
+ * 引擎侧（`workbench_context.context_weights`）按 `weight × 名次分` 排序后合并结果；
+ * 前端这里只负责两件事：**发对形状**、**不把非法权重发出去**。
+ */
+describe('知识库权重（0.1–3.0，默认 1.0）', () => {
+  it('★ 多库时 kb_ids 带上每个库的权重（默认 1.0）', () => {
+    const ctx = buildWorkbenchContext([
+      { type: 'kb', label: 'a', value: 'kb-a', weight: 2 },
+      { type: 'kb', label: 'b', value: 'kb-b' },
+    ]) as { kb_id: string; kb_ids: { id: string; weight: number }[] }
+
+    expect(ctx.kb_id).toBe('kb-a')
+    expect(ctx.kb_ids).toEqual([
+      { id: 'kb-a', weight: 2 },
+      { id: 'kb-b', weight: 1 },
+    ])
+  })
+
+  it('★ 权重越界/非法一律收敛到 [0.1, 3.0]（引擎另有一道兜底，但别指望它）', () => {
+    const ctx = buildWorkbenchContext([
+      { type: 'kb', label: 'a', value: 'kb-a', weight: 99 },
+      { type: 'kb', label: 'b', value: 'kb-b', weight: -3 },
+      { type: 'kb', label: 'c', value: 'kb-c', weight: Number.NaN },
+    ]) as { kb_ids: { id: string; weight: number }[] }
+
+    expect(KB_WEIGHT_MAX).toBe(3)
+    expect(KB_WEIGHT_MIN).toBe(0.1)
+    expect(ctx.kb_ids).toEqual([
+      { id: 'kb-a', weight: 3 },
+      { id: 'kb-b', weight: 0.1 },
+      { id: 'kb-c', weight: 1 },
+    ])
+  })
+
+  it('权重保留一位小数（滑块 0.1 步进的输入不该出现 1.7000000000000002）', () => {
+    expect(clampKbWeight(1.74)).toBe(1.7)
+    expect(clampKbWeight('2.25')).toBe(2.3)
+    expect(clampKbWeight(undefined)).toBe(1)
+    expect(clampKbWeight('abc')).toBe(1)
+  })
+
+  it('★ 刷新后从 runtime.context 还原权重（否则用户调好的权重悄悄回到 1.0）', () => {
+    const chips = chipsFromWorkbenchContext({
+      kb_ids: [{ id: 'kb-a', weight: 2.5 }, 'kb-b'],
+    })
+    expect(chips.map(c => [c.value, c.weight])).toEqual([
+      ['kb-a', 2.5],
+      ['kb-b', undefined],
+    ])
+    // 往返一致：还原后再组装，权重不丢
+    const ctx = buildWorkbenchContext(chips) as { kb_ids: { id: string; weight: number }[] }
+    expect(ctx.kb_ids).toEqual([
+      { id: 'kb-a', weight: 2.5 },
+      { id: 'kb-b', weight: 1 },
+    ])
+  })
+
+  it('梦游 URL（裸字符串 kb_ids 的老会话）仍能还原成 chip', () => {
+    const chips = chipsFromWorkbenchContext({ kb_ids: ['kb-x', 'kb-y'] })
+    expect(chips.map(c => c.value)).toEqual(['kb-x', 'kb-y'])
   })
 })

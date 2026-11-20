@@ -134,6 +134,9 @@ export default {
   located_referenced_document: "Located the cited document",
   clear_located_document: "Clear",
   max_knowledge_bases_n: "A conversation can include at most {n} knowledge bases",
+  kb_weights: "Knowledge base weights",
+  kb_weight_for: "Retrieval weight for {name}",
+  kb_weights_hint: "With several knowledge bases selected you can weight them (0.1–3.0, default 1.0): a higher weight ranks that base earlier in the merged results, it does not change whether something is found",
 
   badge_retrieval: "{kb} knowledge base(s) searched · {hits} hit(s)",
   badge_zero_hit: "{kb} knowledge base(s) searched · no hits",

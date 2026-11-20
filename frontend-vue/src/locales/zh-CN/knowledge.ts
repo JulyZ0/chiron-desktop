@@ -136,6 +136,10 @@ export default {
   clear_located_document: "取消定位",
   // ── 对话多库选择 ──
   max_knowledge_bases_n: "一次对话最多选择 {n} 个知识库",
+  // ── 多库检索权重（P1-8） ──
+  kb_weights: "知识库权重",
+  kb_weight_for: "{name} 的检索权重",
+  kb_weights_hint: "选中多个知识库时可调整各自权重（0.1–3.0，默认 1.0）：权重高的库在合并结果里排得更前，但不影响命中与否",
 
   // ── 检索观测与徽标（P1-6） ──
   badge_retrieval: "检索 {kb} 个库 · 命中 {hits} 条",

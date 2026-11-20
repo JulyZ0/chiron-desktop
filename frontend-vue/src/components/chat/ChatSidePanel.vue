@@ -11,6 +11,7 @@ import { useRouter } from 'vue-router'
 import { api, listTools } from '../../api'
 import type { ToolInfo } from '../../utils/toolList'
 import type { ContextChip } from './contextChips'
+import { DEFAULT_KB_WEIGHT, KB_WEIGHT_MAX, KB_WEIGHT_MIN, clampKbWeight } from './contextChips'
 import { formatRelativeTime } from './chat-types'
 import type { ChatItem, ChatSession } from './chat-types'
 import { mergeTagOptions, normalizeTag, TAG_MAX_LEN } from './sessionTags'
@@ -113,6 +114,8 @@ const emit = defineEmits<{
   (e: 'tag', id: string, tag: string): void
   /** 移除单个上下文芯片（父级同步改写路由 query；同类可能还有其它值） */
   (e: 'remove-context', type: ContextChip['type'], value: string): void
+  /** 调整某个知识库的检索权重（P1-8；父级写回 chip 与 runtime.context） */
+  (e: 'kb-weight', value: string, weight: number): void
   /** 清空全部上下文（父级同步清空路由 query） */
   (e: 'clear-context'): void
   /** 项目归属发生变化（侧边栏绑定 / 移出 / 移动），父级需重查当前会话的项目 */
@@ -180,6 +183,25 @@ function chipOrder(chip: ContextChip): number {
   const sameType = props.contextChips.filter(c => c.type === chip.type)
   if (sameType.length < 2) return 0
   return sameType.findIndex(c => c.value === chip.value) + 1
+}
+
+// ── 多库检索权重（P1-8）──
+//
+// 只有**选中 2 个以上知识库**时才展开：单库时权重没有意义（只影响多库结果的
+// 排序合并），常驻一个滑块只会让面板更挤。
+// 语义：权重只影响多库结果合并的优先级（引擎 `merge_weighted`），不做硬截断 ——
+// 所以文案说"更重要"，而不是"只查这个库"。
+const kbChips = computed(() => props.contextChips.filter(c => c.type === 'kb'))
+const weightsExpanded = ref(false)
+
+/** chip 的当前权重；缺省 1.0（与引入权重前逐值相同） */
+function kbWeightOf(chip: ContextChip): number {
+  return clampKbWeight(chip.weight ?? DEFAULT_KB_WEIGHT)
+}
+
+function onWeightInput(chip: ContextChip, event: Event) {
+  const raw = (event.target as HTMLInputElement).value
+  emit('kb-weight', chip.value, clampKbWeight(raw))
 }
 
 // ── 可用工具（/v1/tools：含 MCP/插件注入的代理工具，source='mcp'）──
@@ -519,6 +541,54 @@ function pickSession(id: string) {
             @click="emit('remove-context', c.type, c.value)"
           />
         </span>
+      </div>
+      <!-- 多库权重（≥2 个知识库时才出现）：权重只影响多库结果的合并优先级 -->
+      <div
+        v-if="kbChips.length >= 2"
+        class="ctx-weights"
+      >
+        <button
+          type="button"
+          class="weights-head"
+          data-testid="kb-weights-toggle"
+          :title="$t('knowledge.kb_weights_hint')"
+          :aria-expanded="weightsExpanded"
+          @click="weightsExpanded = !weightsExpanded"
+        >
+          <span class="weights-title">{{ $t('knowledge.kb_weights') }}</span>
+          <DownOutlined
+            class="weights-arrow"
+            :class="{ expanded: weightsExpanded }"
+          />
+        </button>
+        <div
+          v-if="weightsExpanded"
+          class="weights-body"
+          data-testid="kb-weights-body"
+        >
+          <div
+            v-for="chip in kbChips"
+            :key="chip.value"
+            class="weight-row"
+            :data-testid="`kb-weight-row-${chip.value}`"
+          >
+            <span
+              class="weight-name"
+              :title="chip.label"
+            >{{ chip.label }}</span>
+            <input
+              class="weight-slider"
+              type="range"
+              :min="KB_WEIGHT_MIN"
+              :max="KB_WEIGHT_MAX"
+              step="0.1"
+              :value="kbWeightOf(chip)"
+              :aria-label="$t('knowledge.kb_weight_for', { name: chip.label })"
+              @input="onWeightInput(chip, $event)"
+            >
+            <span class="weight-value">{{ kbWeightOf(chip).toFixed(1) }}</span>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1096,6 +1166,24 @@ function pickSession(id: string) {
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .ctx-chip-remove:hover { color: var(--danger, var(--error)); }
+
+/* ── 多库检索权重（P1-8）：≥2 个知识库时才出现 ── */
+.ctx-weights { margin-top: 6px; }
+.weights-head {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 6px; border: none; background: none; cursor: pointer;
+  font-size: var(--fs-xs); color: var(--text-tertiary); border-radius: var(--sig-radius-button);
+  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease;
+}
+.weights-head:hover { color: var(--primary); background: var(--primary-bg); }
+.weights-title { white-space: nowrap; }
+.weights-arrow { transition: transform var(--dur-fast) ease; }
+.weights-arrow.expanded { transform: rotate(180deg); }
+.weights-body { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.weight-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.weight-name { flex: 0 1 40%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.weight-slider { flex: 1 1 auto; min-width: 0; accent-color: var(--primary); }
+.weight-value { flex: none; font-variant-numeric: tabular-nums; color: var(--text-tertiary); }
 
 /* ── 可用工具：让 MCP/插件注入的工具在对话页可见（默认收起）── */
 .panel-tools { flex: none; border-bottom: var(--hairline-width) solid var(--border); }
