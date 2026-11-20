@@ -3,7 +3,20 @@ name: CI
 on:
   push:
     branches: [master]
+    # 发布 tag 也要跑一遍：`release-preflight`（文件末尾）只在 tag / dispatch 下生效，
+    # 而分支过滤会把 tag 推送整个挡掉。大小写都要 —— 本仓历史 tag 是**大写**
+    # V0.1.<YYMMDD>.<NN>，与 desktop.yml 的触发条件保持同一口径。
+    tags: ['v*', 'V*']
   pull_request:
+  # 手动触发只为一件事：按**发布口径**跑 `release-preflight`
+  # （= 全量 ci-smoke + 打包含产物检查），不发版、不出包 —— 出包在 desktop.yml。
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '按发布口径跑 release-preflight（全量 ci-smoke + 打包含产物检查）'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -520,3 +533,145 @@ jobs:
         # 用上面已构建好的 /tmp/chiron，不再重复编译。
         working-directory: python-engine
         run: python tests/drills/multi_instance_drill.py /tmp/chiron
+
+  # ── 发布前置（P2-12）────────────────────────────────────────────────────
+  #
+  # 只在**发布口径**下跑：tag 推送（v*/V*）或 workflow_dispatch 勾 release=true。
+  # 它不发布任何东西 —— 出包与上传由 desktop.yml 负责；这里的价值是把
+  # 「各分片都绿」换成「用户实际会跑的那条命令是绿的」：
+  #
+  #   * PR 门禁是**分片**（每个 job 一条），分片全绿而 `scripts/ci-smoke.sh`
+  #     本身坏掉（参数、路径、顺序、marker 口径）是真实发生过的失效类别；
+  #   * 产物形状单独再钉一次：dist 存在、dist→resources/web 的复制配置在、
+  #     `chiron.exe` 真能建出来。这三项任何一项静默失效，装出来的都是**残包**
+  #     （用户侧表现为"分享链接 404 / 哪都点不动"），而分片门禁全绿。
+  release-preflight:
+    name: Release preflight
+    runs-on: ubuntu-latest
+    # 稳定子集里仍有一批**核心逻辑**依赖 Redis（审批票 submit_approval、
+    # KeyRing 的 Lua 仲裁）。与 engine / desktop-local job 起同一个 service：
+    # 没有它，`TestToolGuardConfirmPath` 会因"票据存不进"整片红 —— 那是环境缺失，
+    # 不是集成测试，所以不该在发布门禁里"跳过"。
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      REDIS_URL: redis://127.0.0.1:6379/0
+      # APP_SECRET / JWT_SECRET 由 ci-smoke.sh 自带默认值（32+ 字符），这里不重复设。
+    # `github.event.inputs.release` 是**字符串**（workflow_dispatch 的布尔输入序列化后
+    # 也是 "true"/"false"），所以与字面量比较，不要写 `inputs.release`。
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      startsWith(github.ref, 'refs/tags/V') ||
+      github.event.inputs.release == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: frontend-vue/pnpm-lock.yaml
+
+      - uses: actions/setup-python@v5
+        with:
+          # 与 engine job 同口径（3.12）
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: python-engine/requirements-dev.txt
+
+      - name: Install frontend deps
+        working-directory: frontend-vue
+        run: |
+          echo "NPM_CONFIG_REGISTRY=$(node scripts/pick-registry.mjs || echo https://registry.npmjs.org)" >> "$GITHUB_ENV"
+          pnpm install --frozen-lockfile
+
+      - name: Install engine deps
+        working-directory: python-engine
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+
+      - name: Full smoke (bash scripts/ci-smoke.sh)
+        # 全量口径：go + schema + engine（CI 下即全量单测）+ frontend 全量。
+        # 这一条是**发布门禁的硬前提** —— 下面两项只是它没覆盖到的产物形状。
+        run: bash scripts/ci-smoke.sh
+
+      - name: Packaging smoke (static)
+        # 单独再跑一遍是有意的：ci-smoke 的 --fast 也包含这一步，而这里要的是
+        # "即使有人改了 ci-smoke 的顺序，打包断言仍然被执行"。
+        run: node --test frontend-vue/electron/__tests__/packaging.test.cjs
+
+      - name: Build bundled Go gateway (chiron.exe)
+        # 显式把 platform 钉成 win32：`buildGateway` 默认按**runner** 平台决定产物名
+        # （Linux 上会叫 `chiron`），而安装包要的是 `chiron.exe`。钉 platform 而不是
+        # 手写 `go build`：产物参数（-mod=mod / -ldflags / CGO_ENABLED=0）与真实的
+        # 出包路径保持单一来源，否则"门禁建出来的二进制"和"装包里的二进制"不是一回事。
+        working-directory: frontend-vue
+        run: >-
+          node --input-type=module -e "import { pathToFileURL } from 'node:url';
+          import { resolve } from 'node:path';
+          const mod = await import(pathToFileURL(resolve('scripts/build-gateway.mjs')).href);
+          const built = mod.buildGateway({ platform: 'win32', goos: 'windows', goarch: 'amd64' });
+          console.log('ok', built.output, built.size + ' bytes');"
+
+      - name: Assert release artifacts
+        # 全部是**正向断言**（缺了就红），理由与 desktop.yml 的同名步骤一致：
+        # electron-builder 对匹配不到的 extraResources 只 warn 不报错，产物照样"成功"。
+        shell: bash
+        run: |
+          fail=0
+
+          if [ -s frontend-vue/dist/index.html ]; then
+            echo "ok  frontend-vue/dist/index.html"
+          else
+            echo "::error::缺少 frontend-vue/dist/index.html —— 前端产物没建出来，安装包会是白屏"
+            fail=1
+          fi
+
+          # dist → resources/web：网关是独立 Go 进程，打不开 asar，只能读真实目录；
+          # 少了这一份 /s/<token> 分享链接在任何浏览器里都 404。
+          if awk '/^extraResources:/{f=1} f && /from: dist/{d=1} f && d && /to: web/{w=1} END{exit !(d && w)}' \
+              frontend-vue/electron-builder.yml; then
+            echo "ok  electron-builder.yml: extraResources dist -> web"
+          else
+            echo "::error::electron-builder.yml 缺少 extraResources 的 from: dist / to: web"
+            fail=1
+          fi
+          # 壳层按 process.resourcesPath/web 定位，两侧路径必须一致（main.cjs 的 resolveWebRoot）
+          if grep -q "resourcesPath" frontend-vue/electron/main.cjs \
+              && grep -q "'web'" frontend-vue/electron/main.cjs; then
+            echo "ok  main.cjs: resolveWebRoot 定位 resources/web"
+          else
+            echo "::error::main.cjs 不再按 process.resourcesPath/'web' 定位前端产物"
+            fail=1
+          fi
+
+          # 网关：本地模式的唯一业务入口。缺了壳会静默退回 desktop-local core，
+          # 用户看到的是"Windows 桌面端几乎什么都用不了"，而 CI 全绿。
+          gateway=frontend-vue/assets/gateway/chiron.exe
+          if [ -s "$gateway" ]; then
+            echo "ok  $gateway $(wc -c < "$gateway") bytes"
+          else
+            echo "::error::缺少 $gateway（或它是空文件）—— 安装包没有业务入口"
+            fail=1
+          fi
+
+          exit "$fail"
