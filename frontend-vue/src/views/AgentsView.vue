@@ -206,6 +206,8 @@ const groupCounts = computed(() => ({
 }))
 
 const filteredAgents = computed(() => {
+  // 「全部」不做启用态过滤：已停用的 Agent 同样列出（行内带「已停用」标记），
+  // 否则用户没有重新启用的入口，页面会像"没装过"；只有显式选「已停用」时才只看停用项。
   const q = searchQuery.value.trim().toLowerCase()
   return agents.value.filter((a) => {
     if (q) {
@@ -695,11 +697,20 @@ function toolCount(a: Agent): number {
                   </Button>
                 </template>
               </Alert>
+              <!--
+                空状态分两种，判定口径不能混：
+                ① `agents.length === 0` —— 真的一个 Agent 都没有（含"装完了但后端没回"的情况），
+                   给的是"去市场装一个"的入口；
+                ② `filteredAgents.length === 0` —— 有 Agent，只是当前分组/搜索把它们筛掉了，
+                   这时说的是"没有匹配"，不能引导用户去市场重装。
+                已停用的 Agent 属于第一种的"非空"：它在「全部」分组里仍然列出（带「已停用」标记），
+                否则用户会失去启用入口 —— 页面看起来就像"没装过"。
+              -->
               <EmptyState
                 v-else-if="agents.length === 0"
                 :icon="markRaw(RobotOutlined)"
                 :description="$t('agent.no_agents_yet')"
-                :hint="$t('workflow.click_new_agent_at_the_top_right_to_define_its_prompt_and_tools_then_start_dispatching_tasks')"
+                :hint="$t('agent.install_agents_from_the_market_to_get_started')"
               >
                 <Button
                   type="primary"

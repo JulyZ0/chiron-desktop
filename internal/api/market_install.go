@@ -523,6 +523,54 @@ type agentPayload struct {
 	TimeoutSeconds int             `json:"timeout_seconds"`
 }
 
+// agentInstallQuery 把市场条目落成一条 agents 行。**列的取舍必须与 agents.go 的
+// 读取口径逐列对齐**，否则"装成功但列表为空"：
+//
+//   - tenant_id / user_id 取 claims：列表按 `tenant_id = $1 AND (user_id = $2 OR visibility = 'tenant')`
+//     过滤，这两个值就是那半条 WHERE 的输入；
+//   - visibility 显式写 'private'（agents.visibility 在 DDL 里可空、无默认值）。留 NULL
+//     只能靠读侧 COALESCE 兜，"这行归谁"在写入侧就成了隐含假设；
+//   - kind 显式写 'chat'：列表只收 `kind IS NULL OR kind = 'chat'`，一旦默认值漂移或
+//     子 Agent 写入路径混用，整行会被列表静默排除；
+//   - enabled 写 true：市场装完即用；"外部源需显式启用"是 market_installations.enabled
+//     的语义（市场页徽标），与这一行能不能被 Agents 页列出无关；
+//   - created_at / updated_at 必须写：agents 表这两列**无默认值**，省略即 NULL，
+//     而列表把 NULL 时间戳扫进 time.Time 会报错并整行跳过 —— 这正是此前
+//     "市场装完 Agents 页仍是空状态"的根因。
+const agentInstallQuery = `
+INSERT INTO agents (id, tenant_id, user_id, name, description, system_prompt, tools, llm_config,
+                    max_turns, timeout_seconds, enabled, visibility, kind, kb_id, skills, plugins,
+                    created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'private', 'chat', '', '[]'::json, '[]'::json,
+        NOW(), NOW())`
+
+// agentInstallArgs 是 agentInstallQuery 的参数（顺序即 $1..$11）。
+//
+// 抽成函数是为了让"装进去的那一行到底属于谁、能不能被列表看到"可被单测直接断言，
+// 而不是只能对 SQL 字符串做 contains。返回 nil 之外的错误留给调用方包成 502。
+func agentInstallArgs(claims *auth.Claims, agentID string, item market.Item, p agentPayload) []any {
+	description := p.Description
+	if description == "" {
+		description = item.Description
+	}
+	toolsJSON := jsonOrEmptyArray(p.Tools)
+	llmJSON := string(p.LLMConfig)
+	if len(p.LLMConfig) == 0 || string(p.LLMConfig) == "null" {
+		llmJSON = "{}"
+	}
+	maxTurns, timeout := p.MaxTurns, p.TimeoutSeconds
+	if maxTurns <= 0 {
+		maxTurns = 5
+	}
+	if timeout <= 0 {
+		timeout = 120
+	}
+	return []any{
+		agentID, claims.TenantID, claims.UserID, item.Name, description, p.SystemPrompt,
+		toolsJSON, llmJSON, maxTurns, timeout, true,
+	}
+}
+
 func (agentMarketInstaller) Install(ctx context.Context, item market.Item, env map[string]string) (map[string]any, error) {
 	claims := auth.GetClaims(ctx)
 	if claims == nil || claims.UserID == "" {
@@ -540,32 +588,13 @@ func (agentMarketInstaller) Install(ctx context.Context, item market.Item, env m
 			return nil, fmt.Errorf("%w: invalid agent payload: %v", market.ErrBadRequest, err)
 		}
 	}
-	toolsJSON := jsonOrEmptyArray(p.Tools)
-	llmJSON := string(p.LLMConfig)
-	if len(p.LLMConfig) == 0 || string(p.LLMConfig) == "null" {
-		llmJSON = "{}"
-	}
-	if p.MaxTurns <= 0 {
-		p.MaxTurns = 5
-	}
-	if p.TimeoutSeconds <= 0 {
-		p.TimeoutSeconds = 120
-	}
-	description := p.Description
-	if description == "" {
-		description = item.Description
-	}
 
 	agentID, err := id.UUID()
 	if err != nil {
 		return nil, fmt.Errorf("generate agent id: %w", err)
 	}
-	if _, err := db.GlobalDBManager.Exec(ctx,
-		`INSERT INTO agents (id, tenant_id, user_id, name, description, system_prompt, tools, llm_config,
-		                     max_turns, timeout_seconds, enabled, kb_id, skills, plugins)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '', '[]', '[]')`,
-		agentID, claims.TenantID, claims.UserID, item.Name, description, p.SystemPrompt,
-		toolsJSON, llmJSON, p.MaxTurns, p.TimeoutSeconds, true); err != nil {
+	if _, err := db.GlobalDBManager.Exec(ctx, agentInstallQuery,
+		agentInstallArgs(claims, agentID, item, p)...); err != nil {
 		return nil, fmt.Errorf("%w: create agent: %v", errInstallUpstream, err)
 	}
 
