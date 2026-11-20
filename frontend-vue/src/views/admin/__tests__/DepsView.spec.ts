@@ -34,6 +34,8 @@ vi.mock('../../../api/deps', async importOriginal => {
     validatePackageName: actual.validatePackageName,
     isNewerVersion: actual.isNewerVersion,
     isTerminalJob: actual.isTerminalJob,
+    // 冲突详情解析也是真实实现：它决定"409 是冲突还是任务在跑"，糊掉就没意义了。
+    depConflictOf: actual.depConflictOf,
     MAX_SPEC_LEN: actual.MAX_SPEC_LEN,
     MAX_RESTORE_INSTALLS: actual.MAX_RESTORE_INSTALLS,
     PIP_SPEC_RE: actual.PIP_SPEC_RE,
@@ -145,6 +147,9 @@ describe('DepsView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     document.body.innerHTML = ''
+    // 重启横幅跨页持久（sessionStorage）；用例之间必须清掉，否则前一个用例的
+    // "需要重启"会漏到下一个用例里，让断言变成"永远为真"。
+    sessionStorage.clear()
     apiMocks.listDeps.mockResolvedValue(PACKAGES)
     apiMocks.searchPypi.mockResolvedValue({ query: '', results: [], count: 0, found: false })
     apiMocks.listDepSnapshots.mockResolvedValue(SNAPSHOTS)
@@ -360,6 +365,92 @@ describe('DepsView', () => {
 
     expect(modalText()).toContain('50')
     expect(modalOkButton().disabled).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('安装成功且引擎要求重启：顶部出现常驻横幅（不是一闪而过的 toast）', async () => {
+    apiMocks.getDepJob.mockResolvedValue({
+      id: 'job1',
+      kind: 'install',
+      target: 'requests==2.31.0',
+      status: 'succeeded',
+      message: 'installed',
+      progress: 100,
+      output: '',
+      restart_required: true,
+      created_at: 0,
+      finished_at: 1,
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    await cmdInput(wrapper).setValue('requests==2.31.0')
+    await installButton(wrapper).trigger('click')
+    await flushPromises()
+    modalOkButton().click()
+    await flushPromises()
+
+    await new Promise(resolve => setTimeout(resolve, 1500))
+    await flushPromises()
+
+    // 横幅必须**留在页面上**：包已经装上，但引擎进程里还是旧模块。
+    expect(wrapper.find('.restart-banner').exists()).toBe(true)
+    expect(wrapper.text()).toContain('需重启引擎')
+    // 也说明该怎么重启（我们刻意不提供"重启引擎"的 HTTP 端点）
+    expect(wrapper.text()).toContain('重新打开应用')
+    // 跨页/刷新仍然可见
+    expect(sessionStorage.getItem('chiron:deps:restart-required')).toBe('1')
+
+    // 用户确认重启后横幅消失（不新造危险端点，只有本地状态与刷新）
+    const ack = wrapper.findAll('.restart-banner button').at(-1)
+    expect(ack).toBeTruthy()
+    await ack!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.restart-banner').exists()).toBe(false)
+    expect(sessionStorage.getItem('chiron:deps:restart-required')).toBeNull()
+    wrapper.unmount()
+  })
+
+  it('引擎的 pip check 报冲突（409）：把冲突原文摆出来，而不是只说"操作失败"', async () => {
+    apiMocks.installDep.mockRejectedValue({
+      response: {
+        status: 409,
+        data: {
+          error: 'dependency conflicts detected',
+          params: {
+            conflicts: 'requests 2.31.0 has requirement urllib3<2, but you have urllib3 2.0.7.',
+          },
+        },
+      },
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    await cmdInput(wrapper).setValue('requests==2.31.0')
+    await installButton(wrapper).trigger('click')
+    await flushPromises()
+    modalOkButton().click()
+    await flushPromises()
+
+    const banner = wrapper.find('.conflict-banner')
+    expect(banner.exists()).toBe(true)
+    // 冲突文本是用户唯一的行动依据：必须能读到"哪个包要什么版本"
+    expect(banner.text()).toContain('urllib3<2')
+    expect(wrapper.text()).toContain('依赖冲突')
+    // 冲突时不该出现"需要重启"——环境根本没改
+    expect(wrapper.find('.restart-banner').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('快照降级到文件后端时明确提示"只在本机可见"', async () => {
+    apiMocks.listDepSnapshots.mockResolvedValue({ ...SNAPSHOTS, storage: 'file' })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('本机文件')
     wrapper.unmount()
   })
 })

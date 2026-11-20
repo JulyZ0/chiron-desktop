@@ -531,6 +531,13 @@ export default {
   deps_restore_extra: "将卸载（快照里没有，{count} 个）",
   deps_restore_missing: "将安装（现在缺失，{count} 个）",
   deps_restore_changed: "将改版本（{count} 个）",
+
+  // ── 变更后的重启提示与冲突前置检 ──
+  deps_restart_banner: "依赖已变更，需重启引擎生效",
+  deps_restart_banner_desc: "安装 / 卸载 / 恢复只改了磁盘上的 site-packages，引擎进程里已加载的模块仍是旧版本。请重启 Python 引擎（桌面版：退出并重新打开应用；服务端：重启引擎进程）后再使用。",
+  deps_restart_banner_ack: "已完成重启并刷新",
+  deps_conflict_title: "检测到依赖冲突，操作已被拒绝",
+  deps_snapshot_storage_file: "数据库不可用：快照已退化为本机文件存储，换一个引擎副本可能看不到这份历史。",
   // ── 运行时监控（性能 / 队列 / 缓存）──
   // 口径：未知一律显示「—」，不用 0 顶替（见 components/admin/monitor/format.ts）。
   monitor_status_ok: "数据完整",

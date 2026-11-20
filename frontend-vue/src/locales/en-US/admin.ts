@@ -535,6 +535,13 @@ export default {
   deps_restore_extra: "Will uninstall (not in snapshot, {count})",
   deps_restore_missing: "Will install (missing now, {count})",
   deps_restore_changed: "Will change version ({count})",
+
+  // ── Post-change restart prompt & conflict preflight ──
+  deps_restart_banner: "Dependencies changed — restart the engine to apply",
+  deps_restart_banner_desc: "Install / uninstall / restore only rewrites site-packages on disk; modules already loaded in the engine process are still the old versions. Restart the Python engine (desktop: quit and reopen the app; server: restart the engine process) before relying on the change.",
+  deps_restart_banner_ack: "Restarted — refresh",
+  deps_conflict_title: "Dependency conflict detected — the action was rejected",
+  deps_snapshot_storage_file: "Database unavailable: snapshots have fallen back to local files, and another engine replica may not see this history.",
   // ── Runtime monitor (performance / queue / cache) ──
   monitor_status_ok: "Complete",
   monitor_status_partial: "Partially available",

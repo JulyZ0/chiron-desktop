@@ -332,6 +332,99 @@ func TestDepsEngineConflictIsPassedThrough(t *testing.T) {
 	}
 }
 
+// 引擎的冲突前置检（pip check）也是 409，但语义完全不同：它带多行冲突文本，
+// 必须转成 `params.conflicts` 原样透出 —— 前端要把它摆给用户去修。
+// 若被折成一句 "already running"，用户会一直等一个永远不会结束的任务。
+func TestDepsInstallConflictTextIsPassedThrough(t *testing.T) {
+	conflicts := "requests 2.31.0 has requirement urllib3<2, but you have urllib3 2.0.7."
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"detail":{"error":"dependency conflicts detected","conflicts":"` + conflicts + `","hint":"run pip check"}}`))
+	})
+
+	req := withClaims(httptest.NewRequest(http.MethodPost, "/v1/admin/deps/install", strings.NewReader(`{"spec":"requests"}`)), ownerClaims())
+	rec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("应透传 409，得到 %d：%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+		Params  struct {
+			Conflicts string `json:"conflicts"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v (%s)", err, rec.Body.String())
+	}
+	if body.Success {
+		t.Fatalf("冲突必须是失败响应：%s", rec.Body.String())
+	}
+	if body.Error == "" || !strings.Contains(body.Error, "conflict") {
+		t.Fatalf("引擎的 error 文案应透出：%s", rec.Body.String())
+	}
+	if body.Params.Conflicts != conflicts {
+		t.Fatalf("冲突文本未透传（前端唯一的行动依据）：%q", body.Params.Conflicts)
+	}
+}
+
+// 变更成功后引擎会带回 restart_required，网关必须让它原样过桥：
+// 丢了它，界面就不会提示"需要重启引擎"，用户会以为新包装上就已生效。
+func TestDepsRestartRequiredIsPassedThrough(t *testing.T) {
+	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/internal/deps/jobs/job1":
+			_, _ = w.Write([]byte(`{"id":"job1","kind":"install","target":"requests","status":"succeeded","progress":100,"restart_required":true}`))
+		case "/internal/deps/uninstall":
+			_, _ = w.Write([]byte(`{"ok":true,"name":"requests","output":"ok","restart_required":true}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	jobReq := withClaims(httptest.NewRequest(http.MethodGet, "/v1/admin/deps/jobs/job1", nil), ownerClaims())
+	jobRec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(jobRec, jobReq)
+	if jobRec.Code != http.StatusOK {
+		t.Fatalf("job 应 200，得到 %d：%s", jobRec.Code, jobRec.Body.String())
+	}
+	var jobBody struct {
+		Data struct {
+			RestartRequired bool `json:"restart_required"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(jobRec.Body.Bytes(), &jobBody); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if !jobBody.Data.RestartRequired {
+		t.Fatalf("job 的 restart_required 未透传：%s", jobRec.Body.String())
+	}
+
+	uninstallReq := withClaims(httptest.NewRequest(
+		http.MethodPost, "/v1/admin/deps/uninstall", strings.NewReader(`{"name":"requests"}`),
+	), ownerClaims())
+	uninstallRec := httptest.NewRecorder()
+	rig.mux.ServeHTTP(uninstallRec, uninstallReq)
+	if uninstallRec.Code != http.StatusOK {
+		t.Fatalf("uninstall 应 200，得到 %d：%s", uninstallRec.Code, uninstallRec.Body.String())
+	}
+	var uninstallBody struct {
+		Data struct {
+			RestartRequired bool `json:"restart_required"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(uninstallRec.Body.Bytes(), &uninstallBody); err != nil {
+		t.Fatalf("响应不是合法 JSON：%v", err)
+	}
+	if !uninstallBody.Data.RestartRequired {
+		t.Fatalf("uninstall 的 restart_required 未透传：%s", uninstallRec.Body.String())
+	}
+}
+
 func TestDepsEngineServerErrorBecomesBadGateway(t *testing.T) {
 	rig := newDepsRig(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
