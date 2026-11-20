@@ -72,6 +72,16 @@ check-py:
 check-web:
 	cd frontend-vue && npm run build && npm test
 
+# ── CI 冒烟（P2-2）──
+# 与 .github/workflows/ci.yml 的三条门禁同口径：go（build+单测，排除 live/diag）·
+# engine（pytest 单测）· frontend（check:ui / vue-tsc / vitest / vite build），
+# 外加"迁移链只有 1 个 head"。`smoke-fast` 跳过前端全量（仍跑打包静态冒烟）。
+smoke:
+	bash scripts/ci-smoke.sh
+
+smoke-fast:
+	bash scripts/ci-smoke.sh --fast
+
 check-all: check check-py check-web
 	@echo "check-all: OK"
 
@@ -83,5 +93,6 @@ docker-run:
 	docker compose up -d
 
 .PHONY: all build run clean test lint fmt dev dev-up dev-up-scale dev-down \
-	docs-check check-go check check-py check-web check-all docker-build docker-run
+	docs-check check-go check check-py check-web check-all smoke smoke-fast \
+	docker-build docker-run
 
