@@ -92,7 +92,7 @@ func TestMonitorRollupAdvisoryLockContract(t *testing.T) {
 	if !strings.Contains(rollupUpsertSQL, "ON CONFLICT (ts_minute, route_class)") {
 		t.Fatalf("写入必须幂等 upsert 到复合主键，实际 %q", rollupUpsertSQL)
 	}
-	for _, col := range []string{"count", "errors", "p95_ms"} {
+	for _, col := range []string{"count", "errors", "p95_ms", "instance"} {
 		if !strings.Contains(rollupUpsertSQL, col) {
 			t.Fatalf("upsert 缺少列 %s", col)
 		}

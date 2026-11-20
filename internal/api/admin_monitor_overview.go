@@ -84,10 +84,13 @@ func (m *MonitorSectionMeta) note(component, msg string) {
 // MonitorRequestStats 是「近 N 分钟」的请求统计。
 type MonitorRequestStats struct {
 	// HasSamples=false 时前端必须显示"无采样数据"，而不是 0。
-	HasSamples       bool                   `json:"has_samples"`
-	Samples          int64                  `json:"samples"`
-	Success          int64                  `json:"success"`
-	ClientErrors     int64                  `json:"client_errors"` // 4xx
+	HasSamples   bool `json:"has_samples"`
+	Samples      int64 `json:"samples"`
+	Success      int64 `json:"success"`
+	// ClientErrors 是 4xx 数。**rollup 路径下为 null**：分钟聚合表只存 5xx
+	// （errors 列），4xx 只在 count 里"被计数"而无从单独还原。写 0 会让
+	// "错误请求数"看起来一切正常，所以这里用指针把"未知"如实表达出来。
+	ClientErrors     *int64                 `json:"client_errors"` // 4xx
 	ServerErrors     int64                  `json:"server_errors"` // 5xx
 	ErrorRatePercent float64                `json:"error_rate_percent"`
 	P50Ms            *float64               `json:"p50_ms"`
@@ -317,15 +320,16 @@ func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window tim
 
 	// ① 请求窗口：P2 起改为「窗口内 rollup 汇总（多副本合计）+ 本进程实时尾巴」。
 	//
-	// 拆分点固定在**整分钟边界**：rollup 只写"已走完的分钟"，所以
-	// [now-window, 上一分钟末) 查 PG，[上一分钟末, now) 用本进程采样。
-	// 两边不重叠 —— 否则同一批请求被算两次，错误率会看起来比实际好。
+	// 拆分点固定在**整分钟边界**（见 splitRollupWindow）：rollup 只写"已走完的分钟"，
+	// 所以 [窗口起点上取整, 上一分钟末) 查 PG，[上一分钟末, now) 用本进程采样。
+	// 两侧左闭右开、首尾相接 —— 既不重叠（否则同一批请求被算两次，错误率看起来
+	// 比实际好），也不越界（rollup 侧不再多吃窗口外的半个分钟）。
 	snap := monitor.RequestWindowStats.Snapshot(window)
 	now := time.Now()
-	rollupTo := now.Truncate(time.Minute)
-	rollupFrom := rollupTo.Add(-window)
-	tail := monitor.RequestWindowStats.SnapshotInterval(rollupTo, now)
-	rollupAgg, rollupErr := queryRollupWindow(ctx, rollupFrom, rollupTo)
+	split := splitRollupWindow(now, window)
+	tail := monitor.RequestWindowStats.SnapshotInterval(split.TailFrom, split.TailTo)
+	rollupRows, rollupErr := rollupReads.Rows(ctx, split.RollupFrom, split.RollupTo)
+	rollupAgg := aggregateRollupRows(rollupRows)
 	usedRollup := rollupErr == nil && rollupAgg.Rows > 0
 
 	p.Requests = MonitorRequestStats{
@@ -339,6 +343,11 @@ func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window tim
 		p.Requests.Samples = merged.Count
 		// rollup 只存 errors(5xx)，没有 4xx 列：成功数按"总数 - 5xx"给，
 		// 前端口径文案里明确写出"含 4xx"。
+		//
+		// ClientErrors 显式留空（JSON null）而不是 0：这一栏在 rollup 路径下**确实
+		// 采不到**，写 0 会让"4xx 数量"看起来一切正常 —— 与整页"采不到就 null"的
+		// 约定一致。退回路径（本进程采样）能给出真实 4xx，见 fillLocalRequestStats。
+		p.Requests.ClientErrors = nil
 		p.Requests.ServerErrors = merged.Errors
 		p.Requests.Success = merged.Count - merged.Errors
 		p.Requests.ErrorRatePercent = 0
@@ -355,22 +364,22 @@ func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window tim
 			p.Requests.P99Ms = floatPtr(snap.P99Ms)
 			p.Requests.MaxMs = floatPtr(snap.MaxMs)
 		}
-		buckets, err := queryRollupBuckets(ctx, rollupFrom, rollupTo, bucketWidthSeconds(window, 24))
-		if err != nil {
-			p.note("postgres", "rollup 趋势读取失败: "+err.Error())
-		} else {
-			p.Requests.Buckets = appendTailBucket(buckets, rollupTo, tail)
-		}
+		// 趋势桶与窗口合计共用同一批行（一次查询），不会出现"合计已更新、
+		// 趋势还停在上一次查询"的错位。
+		buckets := aggregateRollupBuckets(rollupRows, bucketWidthSeconds(window, 24))
+		p.Requests.Buckets = appendTailBucket(buckets, split.RollupTo, tail)
 		p.Requests.Sources = []string{
-			"postgres metrics_rollup_minute（已走完的分钟，跨副本合计、跨重启）",
+			fmt.Sprintf("postgres metrics_rollup_minute（已走完的分钟；%s，跨重启合计）",
+				rollupReplicaLabel(rollupAgg)),
 			"monitor.RequestWindowStats（本进程当前分钟的实时尾巴）",
 		}
 		p.Sources = append(p.Sources,
 			"postgres metrics_rollup_minute（窗口内分钟聚合）")
 		p.Requests.Note = fmt.Sprintf(
-			"合计 = rollup %d 条 + 实时尾巴 %d 条；错误率 = 5xx / 合计（rollup 只存 5xx，成功数含 4xx）。"+
-				"p95 为 rollup 与尾巴的较大值（分位数不可加，属保守近似）；p50/p99/max 仅来自本进程样本。",
-			rollupAgg.Count, tail.Count)
+			"合计 = rollup %d 条（%s）+ 实时尾巴 %d 条；错误率 = 5xx / 合计（rollup 只存 5xx，成功数含 4xx）。"+
+				"p95 为 rollup 与尾巴的较大值（分位数不可加，属保守近似）；p50/p99/max 仅来自本进程样本。"+
+				"rollup 路径下 4xx 计数未知，面板显示「—」。",
+			rollupAgg.Count, rollupReplicaLabel(rollupAgg), tail.Count)
 	case rollupErr == nil:
 		// PG 连得上但窗口内没有 rollup 行（刚部署 / 落库循环还没跑满一分钟）。
 		// 退回纯实时窗口，并如实说明覆盖范围，而不是报 0。
@@ -487,7 +496,9 @@ func fillLocalRequestStats(p *MonitorPerformance, snap monitor.WindowSnapshot, w
 	p.Requests.HasSamples = snap.HasSamples
 	p.Requests.Samples = snap.Samples
 	p.Requests.Success = snap.Success
-	p.Requests.ClientErrors = snap.ClientErrors
+	// 退回路径的 4xx 是**真实的**：本进程采样逐条知道状态码，所以这里给出数字
+	//（与 rollup 路径的 null 相对照 —— 见 MonitorRequestStats.ClientErrors 注释）。
+	p.Requests.ClientErrors = int64Ptr(snap.ClientErrors)
 	p.Requests.ServerErrors = snap.ServerErrors
 	p.Requests.ErrorRatePercent = snap.ErrorRatePct
 	p.Requests.TailSamples = snap.Samples
@@ -501,12 +512,27 @@ func fillLocalRequestStats(p *MonitorPerformance, snap monitor.WindowSnapshot, w
 		p.Requests.P95Ms = floatPtr(snap.P95Ms)
 		p.Requests.P99Ms = floatPtr(snap.P99Ms)
 		p.Requests.MaxMs = floatPtr(snap.MaxMs)
-		p.Requests.Note = fmt.Sprintf("错误率 = 5xx / 全部样本；窗口内共 %d 条样本（上限 %d）。",
+		p.Requests.Note = fmt.Sprintf("错误率 = 5xx / 全部样本（4xx 只计数、不计错误率）；窗口内共 %d 条样本（上限 %d）。",
 			snap.Samples, monitor.RequestSampleWindowMax)
 		return
 	}
 	p.Requests.Note = fmt.Sprintf("近 %s 无请求采样数据（MonitoringMiddleware 未采到任何请求）。", windowLabel(window))
 	p.note("request-sampler", "无采样数据")
+}
+
+// rollupReplicaLabel 把「参与落库的副本数」写成可直接嵌进 sources / note 的短语。
+//
+// Instances=0 有两种情况：窗口内的行是 0006 之前写的（没有 instance 列），
+// 或者全都是 default ''。两种都只能如实说"未知"，不能默认写成 1。
+func rollupReplicaLabel(agg rollupWindowAgg) string {
+	switch {
+	case agg.Instances <= 0:
+		return "副本数未知（这些分钟行没有记录写入者）"
+	case agg.Instances == 1:
+		return "1 个副本参与落库"
+	default:
+		return fmt.Sprintf("%d 个副本参与落库", agg.Instances)
+	}
 }
 
 // ── 队列 ──
@@ -899,6 +925,9 @@ func infoFloat(m map[string]string, key string) (float64, bool) {
 }
 
 func floatPtr(v float64) *float64 { return &v }
+
+// int64Ptr 是"已知的整数"的指针包装（与 null 区分）。见 MonitorRequestStats.ClientErrors。
+func int64Ptr(v int64) *int64 { return &v }
 
 func windowLabel(d time.Duration) string {
 	if d%time.Hour == 0 {

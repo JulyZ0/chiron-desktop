@@ -19,6 +19,7 @@ python-engine/app/providers/openai.py），所以这里必须**按 OpenAI 的流
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -150,8 +151,29 @@ class Handler(BaseHTTPRequestHandler):
         self._send_sse(frames)
 
 
+def resolve_port() -> int:
+    """端口：``FAKE_LLM_PORT`` 优先，缺省 8081（容器/健康检查的既有约定）。
+
+    需要环境变量而不是命令行参数：compose 已经用环境变量传端口（与其它服务一致），
+    而 Windows 本地档（scripts/integration/run-local.ps1）要把端口错开 8081，
+    两条路径共用同一个开关比各写一套参数解析更不容易漂移。
+    """
+    raw = os.environ.get("FAKE_LLM_PORT", "").strip()
+    if raw:
+        try:
+            port = int(raw)
+        except ValueError:
+            raise SystemExit(f"[fake-llm] FAKE_LLM_PORT 不是整数: {raw!r}") from None
+        if not 0 < port < 65536:
+            raise SystemExit(f"[fake-llm] FAKE_LLM_PORT 超出范围: {port}")
+        return port
+    return 8081
+
+
 def main() -> None:
-    port = 8081
+    port = resolve_port()
+    # 必须绑全部网卡：compose 里引擎容器按服务名（fake-llm:8081）访问它，
+    # 只听回环会让 docker 档在"引擎拿不到模型"处失败（Healthcheck 仍是绿的）。
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"[fake-llm] listening on :{port}", flush=True)
     server.serve_forever()

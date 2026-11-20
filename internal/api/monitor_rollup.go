@@ -31,6 +31,18 @@ package api
 // 无法从多个副本事后拼出准确值（每个副本只有自己的样本），单写者至少保证
 // 「每一分钟要么有完整的一份，要么没有」，而不是 N 份互相覆盖的部分数据。
 //
+// **抢锁失败也必须记下这一分钟**（`lastRolledMinute`）：tick 是 30s 一次，若失败
+// 只 return，30s 后本轮会再抢一次锁；此时对手往往已经写完并释放，于是本副本用
+// **只有自己样本**的 upsert 覆盖掉那一分钟的完整数据 —— 数字变小、没有任何
+// 错误日志，正是上面这段要防的那件事。跳过即认账，是单写者语义的一部分。
+//
+// ## 每一行都带写入者身份（instance）
+//
+// 迁移 0006 给聚合表加了 `instance` 列。单写者只解决"同一分钟不被覆盖"，
+// 但窗口内的多条 rollup 行可能来自**不同的**副本（每轮抢到锁的副本不一定相同），
+// 面板因此必须能说出"这些数字是几个副本合出来的" —— 否则"多副本合计"这句话
+// 无法自证。副本数由查询侧对 distinct instance 计数得出，见 aggregateRollupRows。
+//
 // ## 没有补写
 //
 // 只写「刚走完的那一分钟」。进程停机期间缺的分钟不会补 —— 那些样本在进程内
@@ -38,15 +50,21 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/athenavi/chiron/internal/db"
 	"github.com/athenavi/chiron/internal/monitor"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 const (
@@ -75,18 +93,103 @@ const (
 )
 
 // rollupUpsertSQL 幂等写入一行分钟聚合。
+//
+// instance 是**写入者身份**（见 rollupInstanceID）：单写者保证同一分钟只有一份，
+// 但不同分钟可能由不同副本写入，窗口汇总据此报出"参与落库的副本数"。
 const rollupUpsertSQL = `
-INSERT INTO metrics_rollup_minute (ts_minute, route_class, count, errors, p95_ms)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO metrics_rollup_minute (ts_minute, route_class, count, errors, p95_ms, instance)
+VALUES ($1, $2, $3, $4, $5, $6)
 ON CONFLICT (ts_minute, route_class) DO UPDATE
 SET count = EXCLUDED.count,
     errors = EXCLUDED.errors,
-    p95_ms = EXCLUDED.p95_ms`
+    p95_ms = EXCLUDED.p95_ms,
+    instance = EXCLUDED.instance`
 
-// lastRolledMinute 记录本进程最后一次成功落库的分钟（unix 秒），防止
+// errRollupNoPostgres 表示"没有 PG，本轮不落库"。它不是故障：调用方在没配库时
+// 根本不会启动写循环，只有单测/降级路径会走到这里，因此按 Debug 记录。
+var errRollupNoPostgres = errors.New("postgres 未配置，metrics_rollup_minute 不落库")
+
+// rollupInstanceMaxLen 与迁移 0006 的列宽无关（text），只用于避免把超长主机名
+// 写进主键之外的列；64 字符足够区分 StatefulSet pod 与 host:pid。
+const rollupInstanceMaxLen = 64
+
+var (
+	rollupInstanceOnce sync.Once
+	rollupInstance     string
+)
+
+// rollupInstanceID 返回本副本身份（写进 rollup 行的 instance 列）。
+//
+// 优先级：CHIRON_INSTANCE_ID（编排显式注入）→ `<hostname>:<pid>`。后者让
+// "同一台机器上起两个网关"也彼此可辨 —— 只用 hostname 时，本地双实例调试
+// 会被算成同一个副本，副本数永远显示 1。
+func rollupInstanceID() string {
+	rollupInstanceOnce.Do(func() {
+		host, err := os.Hostname()
+		if err != nil {
+			host = ""
+		}
+		rollupInstance = resolveRollupInstance(os.Getenv("CHIRON_INSTANCE_ID"), host, os.Getpid())
+	})
+	return rollupInstance
+}
+
+// resolveRollupInstance 是身份的纯规则（rollupInstanceID 的取值实现），
+// 便于单测直接验算"显式值优先 + 超长截断 + 同机多实例可辨"。
+func resolveRollupInstance(explicit, host string, pid int) string {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return truncateInstance(v)
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	return truncateInstance(fmt.Sprintf("%s:%d", host, pid))
+}
+
+func truncateInstance(s string) string {
+	if len(s) <= rollupInstanceMaxLen {
+		return s
+	}
+	return s[:rollupInstanceMaxLen]
+}
+
+// lastRolledMinute 记录本进程最后一次**认账**的分钟（unix 秒），防止
 // 30s tick 对同一分钟重复写入 —— 重复写入会用「更晚的采样子集」覆盖
-// 「完整的那一分钟」，数字反而变小。
+// 「完整的那一分钟」，数字反而变小。抢锁失败同样要记账（见文件头注释）。
 var lastRolledMinute int64
+
+// rollupSampler 是写分钟聚合所需的采样能力（*monitor.RequestWindow 实现）。
+// 抽成接口是为了让"写哪一分钟 / 抢锁失败怎么收场"能在没有 PG 的单测里钉住。
+type rollupSampler interface {
+	SnapshotIntervalByClass(from, to time.Time) map[string]monitor.IntervalStats
+}
+
+// rollupWriterConn 是写分钟聚合所需的最小连接能力（*pgxpool.Conn 实现）。
+type rollupWriterConn interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Release()
+}
+
+// rollupConnProvider 提供"带会话级锁"的连接。抽出来同样是为了单测能注入
+// 抢锁成功/失败两种结果。
+type rollupConnProvider interface {
+	AcquireRollupConn(ctx context.Context) (rollupWriterConn, error)
+}
+
+type pgxRollupConns struct{}
+
+func (pgxRollupConns) AcquireRollupConn(ctx context.Context) (rollupWriterConn, error) {
+	if db.Pool == nil {
+		return nil, errRollupNoPostgres
+	}
+	return db.Pool.Acquire(ctx)
+}
+
+var (
+	rollupSamples rollupSampler      = monitor.RequestWindowStats
+	rollupConns   rollupConnProvider = pgxRollupConns{}
+)
 
 // routeClassOf 把请求路径归到一个**低基数**分类。
 //
@@ -192,15 +295,12 @@ func StartMonitorRollup(ctx context.Context) {
 // now 由调用方传入（便于测试）；内部按 now.Truncate(分钟) 取左闭右开区间
 // [minute-1m, minute)。
 func writeRollupMinute(ctx context.Context, now time.Time) {
-	if db.Pool == nil {
-		return
-	}
 	minuteEnd := now.Truncate(time.Minute)
 	minuteStart := minuteEnd.Add(-time.Minute)
 	if minuteStart.Unix() <= lastRolledMinute {
 		return // 这一分钟已经写过（或已经过去了更晚的分钟）
 	}
-	byClass := monitor.RequestWindowStats.SnapshotIntervalByClass(minuteStart, minuteEnd)
+	byClass := rollupSamples.SnapshotIntervalByClass(minuteStart, minuteEnd)
 	rows := rollupRows(minuteStart, byClass)
 	if len(rows) == 0 {
 		// 没有样本也要记账：否则 30s tick 会每分钟重复扫一遍环缓冲。
@@ -211,9 +311,11 @@ func writeRollupMinute(ctx context.Context, now time.Time) {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), monitorRollupTimeout)
 	defer cancel()
 
-	conn, err := db.Pool.Acquire(cctx)
+	conn, err := rollupConns.AcquireRollupConn(cctx)
 	if err != nil {
-		slog.Warn("monitor rollup: acquire connection failed", "error", err)
+		if !errors.Is(err, errRollupNoPostgres) {
+			slog.Warn("monitor rollup: acquire connection failed", "error", err)
+		}
 		return
 	}
 	defer conn.Release()
@@ -224,8 +326,13 @@ func writeRollupMinute(ctx context.Context, now time.Time) {
 		return
 	}
 	if !locked {
-		// 另一个副本正在写这一分钟：跳过，不是错误。
-		slog.Debug("monitor rollup skipped: another replica holds the advisory lock")
+		// 另一个副本正在写这一分钟：跳过，**并且把这一分钟记成已处理**。
+		// 只跳过不记账的话，30s 后的下一轮 tick 会再抢一次锁；对手写完释放后
+		// 本副本就能拿到锁，用自己的样本 upsert 覆盖掉那一分钟的完整数据 ——
+		// 表现为面板数字变小、且没有任何错误日志。
+		lastRolledMinute = minuteStart.Unix()
+		slog.Debug("monitor rollup skipped: another replica holds the advisory lock",
+			"minute", minuteStart.Format(time.RFC3339))
 		return
 	}
 	defer func() {
@@ -234,10 +341,11 @@ func writeRollupMinute(ctx context.Context, now time.Time) {
 		}
 	}()
 
+	instance := rollupInstanceID()
 	var written int
 	for _, row := range rows {
 		if _, err := conn.Exec(cctx, rollupUpsertSQL,
-			row.Minute, row.Class, row.Count, row.Errors, row.P95); err != nil {
+			row.Minute, row.Class, row.Count, row.Errors, row.P95, instance); err != nil {
 			slog.Warn("monitor rollup: upsert failed",
 				"minute", row.Minute.Format(time.RFC3339), "route_class", row.Class, "error", err)
 			return
@@ -246,10 +354,61 @@ func writeRollupMinute(ctx context.Context, now time.Time) {
 	}
 	lastRolledMinute = minuteStart.Unix()
 	slog.Debug("monitor rollup written",
-		"minute", minuteStart.Format(time.RFC3339), "rows", written)
+		"minute", minuteStart.Format(time.RFC3339), "rows", written, "instance", instance)
 }
 
 // ── 查询 ──
+
+// rollupWindowSplit 是「窗口内已落库的分钟」与「本进程当前分钟的实时尾巴」的切分。
+//
+// 切点固定在**整分钟边界**（RollupTo == TailFrom），两侧左闭右开，因此：
+//   - 不重叠：同一批请求不会被 rollup 与 tail 各算一次（错误率会看起来比实际好）；
+//   - 不留缝：恰好落在整分钟那一刻的样本进 tail，上一纳秒的进 rollup；
+//   - 不越界：RollupFrom 上取整到分钟，覆盖总长**不超过**调用方要的 window。
+//     历史实现用 `now.Truncate(分钟) - window`，实际覆盖是 window + 零头（最多多
+//     算 59 秒），面板上写着「近 15 分钟」而数字来自 15 分 59 秒。
+type rollupWindowSplit struct {
+	RollupFrom time.Time
+	RollupTo   time.Time
+	TailFrom   time.Time
+	TailTo     time.Time
+}
+
+// splitRollupWindow 计算切分点。window<=0 按 15 分钟处理（与 parseMonitorWindow 一致）。
+func splitRollupWindow(now time.Time, window time.Duration) rollupWindowSplit {
+	if window <= 0 {
+		window = 15 * time.Minute
+	}
+	rollupTo := now.Truncate(time.Minute)
+	start := now.Add(-window)
+	rollupFrom := start.Truncate(time.Minute)
+	if rollupFrom.Before(start) {
+		rollupFrom = rollupFrom.Add(time.Minute) // 上取整：不把窗口外的半分钟算进来
+	}
+	if rollupFrom.After(rollupTo) {
+		// 窗口不足一分钟（或 now 恰在整分钟）：rollup 侧为空，全部由尾巴承担。
+		rollupFrom = rollupTo
+	}
+	return rollupWindowSplit{
+		RollupFrom: rollupFrom,
+		RollupTo:   rollupTo,
+		TailFrom:   rollupTo,
+		TailTo:     now,
+	}
+}
+
+// rollupRowSample 是 metrics_rollup_minute 的一行（查询侧形状）。
+//
+// P95Ms 用 0 表示该行没有可计耗时的样本（表里是 NULL）—— 与 IntervalStats 同口径：
+// 分位数"没有"和"是 0ms"必须能区分，但 bucket 汇总只关心 MAX，0 不会污染最大值。
+type rollupRowSample struct {
+	Minute   time.Time
+	Class    string
+	Count    int64
+	Errors   int64
+	P95Ms    float64
+	Instance string
+}
 
 // rollupWindowAgg 是窗口内 rollup 的合计（多副本、多分钟、多分类）。
 type rollupWindowAgg struct {
@@ -259,22 +418,121 @@ type rollupWindowAgg struct {
 	// Rows 是参与汇总的聚合行数。0 表示「窗口内没有任何分钟被落库」——
 	// 调用方必须据此退回「仅本进程实时窗口」，而不是把 0 当成流量为 0。
 	Rows int64
+	// Instances 是窗口内参与落库的**副本数**（distinct instance，忽略空值）。
+	// 单写者保证同一分钟只有一行来源，但不同分钟可能由不同副本抢到锁。
+	Instances int64
 }
 
-func queryRollupWindow(ctx context.Context, from, to time.Time) (rollupWindowAgg, error) {
-	var agg rollupWindowAgg
+// monitorRollupReader 是 rollup 读取的最小接口。
+//
+// 抽成接口的唯一理由是**口径可测**：多副本合计（SUM / MAX(p95) / 副本数）
+// 必须能用两行"来自不同副本"的数据钉住，而 *pgxpool.Pool 无法在单测里伪造。
+type monitorRollupReader interface {
+	Rows(ctx context.Context, from, to time.Time) ([]rollupRowSample, error)
+}
+
+type pgRollupReader struct{}
+
+func (pgRollupReader) Rows(ctx context.Context, from, to time.Time) ([]rollupRowSample, error) {
 	if db.Pool == nil {
-		return agg, fmt.Errorf("postgres 未配置")
+		return nil, errRollupNoPostgres
 	}
-	err := db.Pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(count), 0)::bigint,
-		       COALESCE(SUM(errors), 0)::bigint,
-		       COALESCE(MAX(p95_ms), 0)::float8,
-		       COUNT(*)::bigint
+	// 一次取回窗口内的原始分钟行，SUM/MAX/副本数在 Go 侧算：
+	//   - 口径只有一处实现（aggregateRollupRows），可以用 fake 数据单测；
+	//   - overview 的趋势桶与窗口合计共用同一次查询（少一次往返）。
+	// 窗口上限 60 分钟，行数 = 分钟 × 分类，量级在千行以内。
+	pgRows, err := db.Pool.Query(ctx, `
+		SELECT ts_minute,
+		       route_class,
+		       count,
+		       errors,
+		       COALESCE(p95_ms, 0)::float8,
+		       COALESCE(instance, '')
 		  FROM metrics_rollup_minute
-		 WHERE ts_minute >= $1 AND ts_minute < $2`, from, to).
-		Scan(&agg.Count, &agg.Errors, &agg.MaxP95, &agg.Rows)
-	return agg, err
+		 WHERE ts_minute >= $1 AND ts_minute < $2
+		 ORDER BY ts_minute ASC`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer pgRows.Close()
+
+	out := make([]rollupRowSample, 0, 64)
+	for pgRows.Next() {
+		var row rollupRowSample
+		if err := pgRows.Scan(&row.Minute, &row.Class, &row.Count, &row.Errors, &row.P95Ms, &row.Instance); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, pgRows.Err()
+}
+
+// rollupReads 是 overview/history 读取 rollup 的入口（单测可替换成 fake）。
+var rollupReads monitorRollupReader = pgRollupReader{}
+
+// aggregateRollupRows 把窗口内的分钟行汇成总计。
+//
+// 口径（与 API 的 note 一致）：
+//   - count / errors **相加**：多副本、多分钟的请求量与 5xx 都是可加的；
+//   - p95 取**最大值**：分位数不可加，取最大是保守近似（尾延迟不会比任何一分钟更差）；
+//   - 副本数取 distinct instance，空串不计（0006 之前写入的历史行没有身份）。
+func aggregateRollupRows(rows []rollupRowSample) rollupWindowAgg {
+	agg := rollupWindowAgg{Rows: int64(len(rows))}
+	instances := make(map[string]struct{}, 4)
+	for _, row := range rows {
+		agg.Count += row.Count
+		agg.Errors += row.Errors
+		if row.P95Ms > agg.MaxP95 {
+			agg.MaxP95 = row.P95Ms
+		}
+		if inst := strings.TrimSpace(row.Instance); inst != "" {
+			instances[inst] = struct{}{}
+		}
+	}
+	agg.Instances = int64(len(instances))
+	return agg
+}
+
+// aggregateRollupBuckets 把窗口内的分钟行按固定宽度分组（跨副本 SUM、p95 取 MAX）。
+//
+// 与 queryRollupBuckets 的 SQL 分组**同口径**（epoch 对齐 + SUM + MAX），区别只是
+// 这里算在 Go 侧、与窗口合计共用同一份行，少一次往返。桶的归属用 epoch 取整而非
+// 窗口起点：这样同一段历史在「近 24h」与「近 1h」两个视图里落在同一个时间刻度上。
+func aggregateRollupBuckets(rows []rollupRowSample, widthSeconds int) []monitor.WindowBucket {
+	if widthSeconds <= 0 {
+		widthSeconds = 300
+	}
+	width := int64(widthSeconds)
+	type acc struct {
+		bucket monitor.WindowBucket
+	}
+	byBucket := make(map[int64]*acc, 16)
+	order := make([]int64, 0, 16)
+	for _, row := range rows {
+		key := row.Minute.Unix() / width * width
+		a, ok := byBucket[key]
+		if !ok {
+			a = &acc{bucket: monitor.WindowBucket{At: time.Unix(key, 0).UTC()}}
+			byBucket[key] = a
+			order = append(order, key)
+		}
+		a.bucket.Count += row.Count
+		a.bucket.Errors += row.Errors
+		if row.P95Ms > a.bucket.P95Ms {
+			a.bucket.P95Ms = row.P95Ms
+		}
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	// 行是按时序查出来的，但 map 的迭代顺序不是：按时间排序后再返回，
+	// 否则趋势图的线会随机连线（且同一份数据两次请求可能画出不同图形）。
+	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+	out := make([]monitor.WindowBucket, 0, len(order))
+	for _, key := range order {
+		out = append(out, byBucket[key].bucket)
+	}
+	return out
 }
 
 // mergeRollupWithTail 合并「窗口内已落库的分钟聚合」与「本进程当前分钟的实时尾巴」。
