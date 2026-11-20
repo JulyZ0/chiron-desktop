@@ -133,7 +133,11 @@ func usageDaily(ctx context.Context, userID string, days int) (map[string]any, e
 		       COALESCE(SUM(cached_tokens), 0)    AS cached_tokens,
 		       count(*) FILTER (
 		           WHERE input_tokens + output_tokens + cached_tokens = 0
-		       )                                  AS zero_token_events
+		       )                                  AS zero_token_events,
+		       count(*) FILTER (
+		           WHERE input_tokens + output_tokens + cached_tokens > 0
+		             AND cost_cents IS NULL
+		       )                                  AS unpriced_calls
 		  FROM usage_events
 		 WHERE user_id = $1 AND `+usageWindow+`
 		 GROUP BY 1`, userID, days)
@@ -151,6 +155,7 @@ func usageDaily(ctx context.Context, userID string, days int) (map[string]any, e
 			outputTokens:    intOf(row["output_tokens"]),
 			cachedTokens:    intOf(row["cached_tokens"]),
 			zeroTokenEvents: intOf(row["zero_token_events"]),
+			unpricedCalls:   intOf(row["unpriced_calls"]),
 		})
 	}
 
@@ -167,6 +172,10 @@ type usageDayRow struct {
 	outputTokens    int
 	cachedTokens    int
 	zeroTokenEvents int
+	// unpricedCalls 是「有真实 token、但取不到单价」的记账行数。
+	// **不由 0 分冒充**：0 分是"这个模型免费"，缺价是"我们不知道"，
+	// 两者在合计里都是 0，但在明细里必须能分开（派生口径：cost_cents IS NULL）。
+	unpricedCalls int
 }
 
 // buildDailyView 把按天的聚合补齐成连续 days 天，并算出区间合计。
@@ -187,7 +196,7 @@ func buildDailyView(rows []usageDayRow, days int, today time.Time) map[string]an
 
 	daily, totalSpent := buildDailySeries(spent, events, days, today)
 
-	totalInput, totalOutput, totalCached, totalCalls, zeroToken := 0, 0, 0, 0, 0
+	totalInput, totalOutput, totalCached, totalCalls, zeroToken, unpriced := 0, 0, 0, 0, 0, 0
 	for _, point := range daily {
 		day, _ := point["day"].(string)
 		r := byDay[day]
@@ -195,11 +204,14 @@ func buildDailyView(rows []usageDayRow, days int, today time.Time) map[string]an
 		point["output_tokens"] = r.outputTokens
 		point["cached_tokens"] = r.cachedTokens
 		point["zero_token_events"] = r.zeroTokenEvents
+		point["unpriced_calls"] = r.unpricedCalls
+		point["price_missing"] = r.unpricedCalls > 0
 		totalInput += r.inputTokens
 		totalOutput += r.outputTokens
 		totalCached += r.cachedTokens
 		totalCalls += r.events
 		zeroToken += r.zeroTokenEvents
+		unpriced += r.unpricedCalls
 	}
 
 	return map[string]any{
@@ -211,6 +223,10 @@ func buildDailyView(rows []usageDayRow, days int, today time.Time) map[string]an
 		"total_cached":      totalCached,
 		"total_calls":       totalCalls,
 		"zero_token_events": zeroToken,
+		// 缺价（有 token 但取不到单价）的记账行数：汇总卡据此显示"部分未定价"，
+		// 而不是把一个偏小的合计当成全部花费。历史零值不回填，这里只陈述事实。
+		"total_unpriced_calls": unpriced,
+		"price_missing":        unpriced > 0,
 		// 调用次数口径：`event_count` / `tx_count` = `usage_events` 的**记账行数**。
 		// 一行对应"某个模型在这一轮里的一次或多次调用"（同模型同轮合并），
 		// 所以它是**调用次数的下界**，不是精确调用数 —— 字段写清楚是为了让
@@ -263,6 +279,14 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 		       count(*) FILTER (
 		           WHERE input_tokens + output_tokens + cached_tokens = 0
 		       )                                    AS zero_token_events,
+		       count(*) FILTER (
+		           WHERE input_tokens + output_tokens + cached_tokens > 0
+		             AND cost_cents IS NOT NULL
+		       )                                    AS priced_calls,
+		       count(*) FILTER (
+		           WHERE input_tokens + output_tokens + cached_tokens > 0
+		             AND cost_cents IS NULL
+		       )                                    AS unpriced_calls,
 		       COALESCE(SUM(input_tokens), 0)        AS input_tokens,
 		       COALESCE(SUM(output_tokens), 0)       AS output_tokens,
 		       COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
@@ -279,7 +303,15 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 		       COALESCE(SUM(input_tokens), 0)        AS input_tokens,
 		       COALESCE(SUM(output_tokens), 0)       AS output_tokens,
 		       COALESCE(SUM(cached_tokens), 0)       AS cached_tokens,
-		       COALESCE(SUM(cost_cents), 0)          AS cost_cents
+		       COALESCE(SUM(cost_cents), 0)          AS cost_cents,
+		       count(*) FILTER (
+		           WHERE input_tokens + output_tokens + cached_tokens > 0
+		             AND cost_cents IS NOT NULL
+		       )                                    AS priced_calls,
+		       count(*) FILTER (
+		           WHERE input_tokens + output_tokens + cached_tokens > 0
+		             AND cost_cents IS NULL
+		       )                                    AS unpriced_calls
 		  FROM usage_events
 		 WHERE user_id = $1 AND `+usageWindow+`
 		 GROUP BY 1
@@ -289,17 +321,20 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 		return nil, err
 	}
 
-	breakdown := make([]map[string]any, 0, len(rows))
+	bucketRows := make([]usageBucketRow, 0, len(rows))
 	for _, row := range rows {
-		breakdown = append(breakdown, map[string]any{
-			"bucket":        stringOf(row["bucket"]),
-			"event_count":   intOf(row["event_count"]),
-			"input_tokens":  intOf(row["input_tokens"]),
-			"output_tokens": intOf(row["output_tokens"]),
-			"cached_tokens": intOf(row["cached_tokens"]),
-			"cost_cents":    intOf(row["cost_cents"]),
+		bucketRows = append(bucketRows, usageBucketRow{
+			bucket:        stringOf(row["bucket"]),
+			events:        intOf(row["event_count"]),
+			inputTokens:   intOf(row["input_tokens"]),
+			outputTokens:  intOf(row["output_tokens"]),
+			cachedTokens:  intOf(row["cached_tokens"]),
+			costCents:     intOf(row["cost_cents"]),
+			pricedCalls:   intOf(row["priced_calls"]),
+			unpricedCalls: intOf(row["unpriced_calls"]),
 		})
 	}
+	breakdown := buildBreakdownRows(bucketRows)
 
 	buckets := 0
 	zeroToken := 0
@@ -317,11 +352,19 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 	if totals != nil {
 		buckets = intOf(totals["buckets"])
 		zeroToken = intOf(totals["zero_token_events"])
+		priced := intOf(totals["priced_calls"])
+		unpriced := intOf(totals["unpriced_calls"])
 		view["total_input"] = intOf(totals["input_tokens"])
 		view["total_output"] = intOf(totals["output_tokens"])
 		view["total_cached"] = intOf(totals["cached_tokens"])
 		view["total_cost"] = intOf(totals["cost_cents"])
 		view["total_calls"] = intOf(totals["event_count"])
+		// 缺价派生（**不改表**）：cost_cents IS NULL ⇒ 这一行当时取不到单价。
+		// priced_calls + unpriced_calls + zero_token_events = total_calls，
+		// 三条互斥：有价 / 无价 / 连用量都没有。
+		view["total_priced_calls"] = priced
+		view["total_unpriced_calls"] = unpriced
+		view["price_missing"] = unpriced > 0
 	}
 	// 零 token 的记账行：升级前的历史行（当时链路只写"有一次调用"，没拿到 token）
 	// 与"引擎没回报用量"的行混在一起，无法事后区分，也不做回填（那等于编数据）。
@@ -330,4 +373,43 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 	view["total_buckets"] = buckets
 	view["truncated"] = buckets > len(breakdown)
 	return view, nil
+}
+
+// usageBucketRow 是一个分组（模型 / 会话）的聚合值。
+//
+// 单独成结构是为了让「缺价怎么派生」这一条口径能在**纯函数**里被测到：
+// 它决定界面显示数字还是 "—"，而两者在合计里都是 0。
+type usageBucketRow struct {
+	bucket        string
+	events        int
+	inputTokens   int
+	outputTokens  int
+	cachedTokens  int
+	costCents     int
+	pricedCalls   int
+	unpricedCalls int
+}
+
+// buildBreakdownRows 把聚合行转成前端契约（**派生** price_missing，不改表）。
+//
+// 口径：
+//   - `cost_cents` 仍回"已定价部分之和"（保持老客户端可用）；
+//   - `priced_calls` / `unpriced_calls` 让界面知道这个数是否**只覆盖了一部分**；
+//   - `price_missing` = unpriced_calls > 0，前端据此显示 "—" + tooltip 而不是 0。
+func buildBreakdownRows(rows []usageBucketRow) []map[string]any {
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, map[string]any{
+			"bucket":         r.bucket,
+			"event_count":    r.events,
+			"input_tokens":   r.inputTokens,
+			"output_tokens":  r.outputTokens,
+			"cached_tokens":  r.cachedTokens,
+			"cost_cents":     r.costCents,
+			"priced_calls":   r.pricedCalls,
+			"unpriced_calls": r.unpricedCalls,
+			"price_missing":  r.unpricedCalls > 0,
+		})
+	}
+	return out
 }

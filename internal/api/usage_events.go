@@ -26,6 +26,13 @@ type UsageEvent struct {
 	OutputTokens int
 	CachedTokens int
 	CostCents    *int
+	// UsageMissing 标记「调用真实发生，但引擎没有回报 token 明细」（auto 链路的
+	// 纯工具回合 / 老引擎 / 中断的流）。
+	//
+	// **它不是数据库列**：`usage_events` 没有这一列，也不改迁移。它只在进程内
+	// 传递（日志 / 用例断言）；持久化口径由「三列 token 全 0」派生，与计费接口的
+	// `zero_token_events` 完全一致 —— 两者不能各说一套。
+	UsageMissing bool
 }
 
 // RecordUsageEvent 写一条用量明细。

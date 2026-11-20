@@ -7,7 +7,7 @@ import EmptyState from '../components/common/EmptyState.vue'
 import PageSkeleton from '../components/common/PageSkeleton.vue'
 import { errorMessageText } from '../utils/apiError'
 import {
-  CreditCardOutlined, ThunderboltOutlined, BarChartOutlined,
+  CreditCardOutlined, ThunderboltOutlined, BarChartOutlined, MoneyCollectOutlined,
 } from '@ant-design/icons-vue'
 import { api } from '../api'
 
@@ -23,6 +23,13 @@ interface DailyUsage {
   tx_count: number
   credits_spent: number
   credits_added: number
+  input_tokens?: number
+  output_tokens?: number
+  cached_tokens?: number
+  zero_token_events?: number
+  /** 当天「有 token 但没有单价」的记账行数（后端派生自 cost_cents IS NULL） */
+  unpriced_calls?: number
+  price_missing?: boolean
 }
 
 /** 非按天分组时的一行（后端 usage_events 聚合结果） */
@@ -33,6 +40,19 @@ interface BreakdownRow {
   output_tokens: number
   cached_tokens: number
   cost_cents: number
+  /** 有单价、真实折算成金额的调用数 */
+  priced_calls?: number
+  /** 有 token、但取不到单价的调用数（金额里不含这部分） */
+  unpriced_calls?: number
+  /** 后端派生的缺价标记：unpriced_calls > 0 */
+  price_missing?: boolean
+}
+
+/** 明细表里的一行：在契约字段之外补上"这一格怎么显示" */
+interface BreakdownDisplayRow extends BreakdownRow {
+  label: string
+  cost_display: string
+  cost_tooltip?: string
 }
 
 interface UsageData {
@@ -51,11 +71,36 @@ interface UsageData {
   total_calls?: number
   /** 区间内 token 全为 0 的记账行数：升级前的历史行没有 token 明细 */
   zero_token_events?: number
+  /** 区间内缺价（有 token、取不到单价）的记账行数：花费只覆盖已定价部分 */
+  total_unpriced_calls?: number
+  total_priced_calls?: number
+  price_missing?: boolean
   /** 后端只返回花费最高的 limit 项；truncated=true 表示还有没返回的 bucket */
   truncated?: boolean
   /** 聚合后的 bucket 总数（截断前），用于提示"共 N 项" */
   total_buckets?: number
   limit?: number
+}
+
+/** 价格覆盖率（GET /v1/admin/billing/price-coverage） */
+interface PriceCoverageUnpriced {
+  model: string
+  calls: number
+  token_calls: number
+  input_tokens: number
+  output_tokens: number
+  last_seen: string
+}
+
+interface PriceCoverage {
+  period_days: number
+  total_models: number
+  priced_models: number
+  unpriced_models: number
+  /** 0..1；分母只算"有 token 消耗"的模型 */
+  coverage: number
+  unpriced: PriceCoverageUnpriced[]
+  prices_entry_url?: string
 }
 
 /** 与后端 usageGroupByWhitelist 一一对应；写死成联合类型，参数拼错在编译期就红 */
@@ -97,6 +142,21 @@ const rangeDays = computed(() =>
 
 const loading = ref(true)
 
+/**
+ * 价格覆盖率面板（P1-9）。
+ *
+ * `null` 表示"这次拿不到"（非 admin 的 403 / 老后端 404 / 网络错误）—— 面板
+ * 直接不显示，**不报错也不显示 0%**：把一次"没权限/没部署"渲染成"覆盖率 0%"
+ * 会误导运营去补一堆其实已有价格的模型。
+ */
+const coverage = ref<PriceCoverage | null>(null)
+
+/** 覆盖率百分数（整数）；无模型可定价时不显示 0%，由文案说明 */
+const coveragePercent = computed(() => {
+  if (!coverage.value || coverage.value.total_models <= 0) return ''
+  return `${Math.round((coverage.value.coverage ?? 0) * 100)}%`
+})
+
 // ── 计算属性 ──
 
 const todaySpent = computed(() => {
@@ -134,13 +194,52 @@ const totalTokens = computed(() =>
   (usage.value?.total_input ?? 0) + (usage.value?.total_output ?? 0),
 )
 
+/**
+ * 是否存在「有 token、但取不到单价」的记账行（P1-9 缺价派生）。
+ *
+ * 为什么必须单独提示：这些行的 `cost_cents` 是 NULL，合计里表现为 0 —— 用户会
+ * 以为"这个模型免费"或"统计坏了"。事实是**价格表缺行**，金额不可知。历史零值
+ * 不回填，但必须说清楚"这个合计不完整"。
+ */
+const hasUnpricedCalls = computed(() => (usage.value?.total_unpriced_calls ?? 0) > 0)
+
+/**
+ * 明细行的花费格：缺价显示 "—"（而不是 0），并给出 tooltip 说明原因。
+ *
+ * 三种形态：
+ *  - 全部已定价：显示金额；
+ *  - **部分**缺价：显示金额（只含已定价部分）+ tooltip 说明还差多少次调用，
+ *    这样已知的钱不丢；
+ *  - 全部缺价：显示 "—"，金额无从谈起（不能写 0，0 是"免费"）。
+ */
+function costCell(row: BreakdownRow): { cost_display: string; cost_tooltip?: string } {
+  const unpriced = Number(row.unpriced_calls ?? 0)
+  const priced = Number(
+    row.priced_calls ?? (unpriced > 0 ? 0 : row.event_count ?? 0),
+  )
+  if (unpriced > 0 && priced === 0) {
+    return { cost_display: '—', cost_tooltip: t('billing.usage_price_missing_tooltip') }
+  }
+  if (unpriced > 0) {
+    return {
+      cost_display: String(row.cost_cents ?? 0),
+      cost_tooltip: t('billing.usage_price_partial_tooltip', {
+        n: unpriced,
+        cost: row.cost_cents ?? 0,
+      }),
+    }
+  }
+  return { cost_display: String(row.cost_cents ?? 0) }
+}
+
 /** 明细表的行：把后端的 bucket 翻译成可读文本（空值后端归为 'unknown'） */
-const breakdownRows = computed(() =>
+const breakdownRows = computed<BreakdownDisplayRow[]>(() =>
   (usage.value?.breakdown ?? []).map(row => ({
     ...row,
     label: row.bucket === 'unknown'
       ? t('billing.usage_unknown_bucket')
       : row.bucket,
+    ...costCell(row),
   })),
 )
 
@@ -160,14 +259,27 @@ const breakdownColumns = computed(() => {
     { title: t('billing.usage_col_input_tokens'), key: 'input_tokens', dataIndex: 'input_tokens', width: 130, align: 'right' as const },
     { title: t('billing.usage_col_output_tokens'), key: 'output_tokens', dataIndex: 'output_tokens', width: 130, align: 'right' as const },
     { title: t('billing.usage_col_cached_tokens'), key: 'cached_tokens', dataIndex: 'cached_tokens', width: 130, align: 'right' as const },
-    { title: t('billing.usage_col_cost'), key: 'cost_cents', dataIndex: 'cost_cents', width: 130, align: 'right' as const },
+    {
+      title: t('billing.usage_col_cost'),
+      key: 'cost_cents',
+      // 走算好的显示值：缺价要显示 "—" 而不是把 0 当成免费
+      dataIndex: 'cost_display',
+      width: 130,
+      align: 'right' as const,
+      // 原生 title 即 tooltip（无 JS 定位开销）；缺价行的说明靠它承载
+      customCell: (record: BreakdownDisplayRow) => (
+        record.cost_tooltip ? { title: record.cost_tooltip } : {}
+      ),
+    },
   ]
 })
 
 // ── 数据加载 ──
 
 onMounted(async () => {
-  await loadUsage(true)
+  // 覆盖率与用量互不依赖：并行发，任何一个失败都不影响另一个（覆盖率的失败
+  // 只是"不显示面板"）。
+  await Promise.all([loadUsage(true), loadCoverage()])
 })
 
 /**
@@ -207,6 +319,22 @@ async function loadUsage(initial = false) {
  */
 function onUsageQueryChange() {
   void loadUsage()
+}
+
+/**
+ * 加载价格覆盖率（admin 端点；非 admin 会 403）。
+ *
+ * 失败时静默隐藏面板：这一块是**辅助信息**，不能因为它让整页报错。数据形状也
+ * 校验一层 —— 老后端回 `{}` 时若当成覆盖率渲染，会显示"0 个模型 / 0%"。
+ */
+async function loadCoverage() {
+  try {
+    const resp = await api.get('/v1/admin/billing/price-coverage')
+    const data = resp.data?.data as PriceCoverage | undefined
+    coverage.value = data && typeof data.total_models === 'number' ? data : null
+  } catch {
+    coverage.value = null
+  }
 }
 </script>
 
@@ -307,6 +435,59 @@ function onUsageQueryChange() {
         >
           {{ $t('billing.usage_legacy_no_tokens', { n: usage?.zero_token_events ?? 0 }) }}
         </div>
+        <!-- 缺价标注（P1-9）：有 token 但取不到单价的调用不计入花费。
+             不写 0（0 是"免费"），而是说明"这个合计只覆盖已定价部分"。 -->
+        <div
+          v-if="hasUnpricedCalls"
+          class="breakdown-hint breakdown-unpriced"
+        >
+          {{ $t('billing.usage_price_partial', { n: usage?.total_unpriced_calls ?? 0 }) }}
+        </div>
+      </Card>
+
+      <!-- 价格覆盖率面板：回答"花费为什么算不出来"——不是统计坏了，是价格表缺行。
+           只在拿得到数据时渲染（非 admin / 老后端时整块消失，不显示假的 0%）。 -->
+      <Card
+        v-if="coverage"
+        class="coverage-card"
+      >
+        <template #title>
+          <MoneyCollectOutlined /> {{ $t('billing.coverage_title') }}
+        </template>
+        <div class="coverage-row">
+          <span
+            v-if="coveragePercent"
+            class="coverage-rate"
+          >{{ coveragePercent }}</span>
+          <span class="coverage-text">
+            {{ coverage.total_models > 0
+              ? $t('billing.coverage_hint', {
+                days: coverage.period_days,
+                models: coverage.total_models,
+                priced: coverage.priced_models,
+              })
+              : $t('billing.coverage_empty', { days: coverage.period_days }) }}
+          </span>
+          <Button
+            size="small"
+            class="coverage-action"
+            @click="router.push('/billing/prices')"
+          >
+            {{ $t('billing.coverage_action') }}
+          </Button>
+        </div>
+        <!-- 未定价模型列表：按调用数降序（后端排好），决定补价优先级 -->
+        <ul
+          v-if="coverage.unpriced.length"
+          class="coverage-list"
+        >
+          <li
+            v-for="item in coverage.unpriced"
+            :key="item.model"
+          >
+            {{ $t('billing.coverage_unpriced_item', { model: item.model, calls: item.calls }) }}
+          </li>
+        </ul>
       </Card>
 
       <!-- 分组 / 区间切换：放在图表与明细之上，切换只重查用量 -->
@@ -425,6 +606,16 @@ function onUsageQueryChange() {
 .usage-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 16px; }
 .filter-label { font-size: 13px; color: var(--text-tertiary); }
 .breakdown-hint { margin-top: 10px; font-size: 12px; color: var(--text-tertiary); }
+/* 缺价标注用"提醒"色而不是错误色：数据是真的，只是金额不完整 */
+.breakdown-unpriced { color: var(--colorWarning, var(--warning)); }
+
+/* 价格覆盖率：一行三项，窄屏折行 */
+.coverage-card { margin-top: 16px; }
+.coverage-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.coverage-rate { font-size: 22px; font-weight: var(--fw-semibold); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.coverage-text { flex: 1; min-width: 200px; font-size: 13px; color: var(--text-secondary); }
+.coverage-list { margin: 10px 0 0; padding-inline-start: 18px; font-size: 12px; color: var(--text-tertiary); }
+.coverage-list li { margin-top: 2px; }
 
 .bar-chart { display: flex; align-items: flex-end; gap: 6px; height: 170px; overflow-x: auto; padding-top: 8px; -webkit-overflow-scrolling: touch; }
 .bar-col { flex: 1; min-width: 26px; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }

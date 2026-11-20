@@ -52,6 +52,10 @@ func registerAdminRoutes(
 
 	// D3：用量目录（只读）—— 与其它 admin 读端点同一权限口径。
 	mux.Handle("GET /v1/admin/usage/catalog", authMW(rlMW(adminReadMW(adminStrip))))
+	// P1-9：价格覆盖率面板（只读）。聚合口径与 `usage_pricing.go` 同一套
+	// （精确名 → 规范化前缀回落），按租户过滤。用 adminReadMW：它回答的是
+	// "平台的价格表补得够不够"，属于运营视角，与普通用户的用量页不同。
+	mux.Handle("GET /v1/admin/billing/price-coverage", authMW(rlMW(adminReadMW(http.HandlerFunc(GetPriceCoverage)))))
 	// 新用户引导漏斗（P0-3 验收「完成率可查」）—— 只读统计，与其它 admin 读端点同口径。
 	mux.Handle("GET /v1/admin/onboarding/funnel", authMW(rlMW(adminReadMW(adminStrip))))
 	mux.Handle("POST /v1/admin/maintenance", authMW(rlMW(platformWriteMW(adminStrip))))

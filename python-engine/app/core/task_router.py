@@ -69,6 +69,83 @@ class ExecutedTask:
     status: TaskStatus = TaskStatus.COMPLETED
 
 
+@dataclass
+class UsageAccumulator:
+    """auto 链路（TaskRouter）的 token 用量累加器。
+
+    ## 为什么需要它
+
+    `mode=auto` 走的是 `route_task`：意图理解要调一次 LLM，命中的 `agent:*`
+    能力还要各调一次。此前这两段的 `usage` 都没人接 —— 统一链路回包里的
+    `usage` 恒为 `None`，网关只能记"有一次调用、0 token"，计费页里这条链路
+    看起来像"没花钱"。
+
+    ## 口径（与 SSE 链路一致）
+
+    * **一次 `chat_stream` 算一次调用**（`calls`），无论上游有没有回报 token；
+      "调用发生了"与"拿到了明细"是两件事，不能互相冒充。
+    * token 按模型归集，回包报**合计 + 主模型名**：网关只按单一模型查单价，
+      把"多模型合计"挂在主模型名下会有一点价差（fallback / 摘要通常更便宜），
+      但**总量一条不丢** —— 反过来只报主模型的 token 会让其余调用凭空消失，
+      那是少记账，比算贵了更难发现。
+    * provider 取主模型对应的那个（`chunk.provider` 由网关统一填）。
+
+    **只在有调用时产出 block**：纯工具链路（kb 检索 / 读文件）确实没有 LLM
+    调用，回 `None` 让网关走"无 usage"分支标记 `usage_missing`，而不是编一个
+    全 0 的 usage 冒充"已知无用量"。
+    """
+
+    calls: int = 0
+    #: model -> [input, output, cached, provider]
+    by_model: dict[str, list[Any]] = field(default_factory=dict)
+    #: 一个模型名都没拿到时的兜底归属（会话模型 / 网关默认模型）
+    fallback_model: str = ""
+
+    def add(
+        self,
+        *,
+        model: str = "",
+        provider: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cached_tokens: int = 0,
+    ) -> None:
+        self.calls += 1
+        name = (model or self.fallback_model or "").strip()
+        if not name:
+            # 模型名是网关的**价格查询键**，宁可记成 unknown 也不能丢：
+            # 丢了列就是 NULL，成本永远是"不知道"。
+            name = "unknown"
+        slot = self.by_model.setdefault(name, [0, 0, 0, ""])
+        slot[0] += max(0, int(input_tokens or 0))
+        slot[1] += max(0, int(output_tokens or 0))
+        slot[2] += max(0, int(cached_tokens or 0))
+        if provider and not slot[3]:
+            slot[3] = provider
+
+    def to_block(self) -> dict[str, Any] | None:
+        """转成回包里的 `usage` 块；没有任何调用时返回 None（不编造用量）。"""
+        if self.calls <= 0 or not self.by_model:
+            return None
+        model, slot = max(
+            self.by_model.items(),
+            key=lambda kv: kv[1][0] + kv[1][1] + kv[1][2],
+        )
+        # token 取**全部模型之和**：网关按 model 查单价，合并会让成本略有偏差，
+        # 但只报主模型的 token 会让其余调用凭空消失（少记账）。
+        total_in = sum(int(v[0]) for v in self.by_model.values())
+        total_out = sum(int(v[1]) for v in self.by_model.values())
+        total_cached = sum(int(v[2]) for v in self.by_model.values())
+        return {
+            "model": model,
+            "provider": str(slot[3] or ""),
+            "input_tokens": total_in,
+            "output_tokens": total_out,
+            "cached_tokens": total_cached,
+            "calls": self.calls,
+        }
+
+
 class TaskRouter:
     """跨工作台任务路由器
 
@@ -123,19 +200,25 @@ class TaskRouter:
             trace_id,
         )
 
+        # 会话运行时状态（P1-d）：统一链路的模型/provider 选择在此进入意图理解。
+        # 此前这里没有传，于是意图理解恒用写死的 gpt-4o-mini。
+        llm_config = (context or {}).get("llm_config") or {}
+        llm_model = str(llm_config.get("model") or "")
+        llm_hint = str(llm_config.get("provider") or "")
+        # auto 链路的用量累加器（P1-9）：意图理解与各 agent:* 能力的 LLM 调用
+        # 都登记到这里，最后随回包交给网关记账（引擎自己不记账）。
+        # 必须建在 try 之外：异常路径也要把**已经花掉的** token 带回去。
+        usage_acc = UsageAccumulator(fallback_model=llm_model)
+
         try:
             # ── 阶段 1: 意图理解 ─────────────────────────────────────
-            # 会话运行时状态（P1-d）：统一链路的模型/provider 选择在此进入意图理解。
-            # 此前这里没有传，于是意图理解恒用写死的 gpt-4o-mini。
-            llm_config = (context or {}).get("llm_config") or {}
-            llm_model = str(llm_config.get("model") or "")
-            llm_hint = str(llm_config.get("provider") or "")
             intent = await self._understand_intent(
                 user_input,
                 context or {},
                 model=llm_model,
                 provider_hint=llm_hint,
                 tenant_id=tenant_id,
+                usage=usage_acc,
             )
 
             # ── 阶段 2: 任务拆解 ─────────────────────────────────────
@@ -148,6 +231,7 @@ class TaskRouter:
                     "output": {"error": "未找到匹配的能力"},
                     "trace_id": trace_id,
                     "duration_ms": int((time.time() - start_time) * 1000),
+                    "usage": usage_acc.to_block(),
                 }
 
             # ── 阶段 3: 能力匹配 & DAG 构建 ─────────────────────────
@@ -163,6 +247,7 @@ class TaskRouter:
                 trace_id=trace_id,
                 llm_model=llm_model,
                 provider_hint=llm_hint,
+                usage=usage_acc,
             )
 
             # ── 阶段 6: 结果聚合 ─────────────────────────────────────
@@ -186,6 +271,9 @@ class TaskRouter:
                 "trace_id": trace_id,
                 "total_duration_ms": total_duration,
                 "priority": priority.value,
+                # 用量：没有发生 LLM 调用时为 None（网关据此标记 usage_missing），
+                # 而不是全 0 的假 usage。
+                "usage": usage_acc.to_block(),
             }
 
             logger.info(
@@ -205,6 +293,9 @@ class TaskRouter:
                 "output": {"error": str(e)},
                 "trace_id": trace_id,
                 "duration_ms": int((time.time() - start_time) * 1000),
+                # 失败前那几次调用是真实花掉的：用量照样带回去（与 `_execute_via_agent`
+                # 把 usage 挂在异常上同一口径）。
+                "usage": usage_acc.to_block(),
             }
 
     async def _understand_intent(
@@ -214,6 +305,7 @@ class TaskRouter:
         model: str = "",
         provider_hint: str = "",
         tenant_id: int = 0,
+        usage: UsageAccumulator | None = None,
     ) -> dict[str, Any]:
         """理解用户意图
 
@@ -233,6 +325,7 @@ class TaskRouter:
                 model=model,
                 provider_hint=provider_hint,
                 tenant_id=tenant_id,
+                usage=usage,
             )
         except Exception as e:
             logger.warning(
@@ -253,11 +346,15 @@ class TaskRouter:
         model: str = "",
         provider_hint: str = "",
         tenant_id: int = 0,
+        usage: UsageAccumulator | None = None,
     ) -> dict[str, Any]:
         """使用 LLM 理解用户意图 (生产级实现)
 
         model/provider_hint/tenant_id 由 route_task 从会话运行时状态注入（P1-d）；
         为空时回落默认轻量模型，保持既有行为不变。
+
+        `usage` 是 auto 链路的用量累加器（P1-9）：这一段的调用此前完全没有记账，
+        于是统一链路的回合在计费页里是"有行、0 token"。
         """
         from app.main import get_gateway
 
@@ -293,14 +390,36 @@ Return ONLY valid JSON without markdown formatting."""
 
         # 调用 LLM：模型/provider 来自会话运行时状态（P1-d）；tenant_id 传入使租户路由生效
         response_text = ""
+        attr_model = model or "gpt-4o-mini"
+        attr_provider = ""
+        tok_in = tok_out = tok_cached = 0
         async for chunk in gateway.chat_stream(
             messages=messages,
-            model=model or "gpt-4o-mini",
+            model=attr_model,
             provider_hint=provider_hint,
             tenant_id=tenant_id,
         ):
             if chunk.content:
                 response_text += chunk.content
+            # 逐帧累加 token（与 SubAgent 的流式累计同口径）：多数 provider 只在
+            # 最后一帧带 usage，但网关会把每帧的字段透传过来，累加是唯一稳妥的读法。
+            tok_in += int(getattr(chunk, "input_tokens", 0) or 0)
+            tok_out += int(getattr(chunk, "output_tokens", 0) or 0)
+            tok_cached += int(getattr(chunk, "cached_tokens", 0) or 0)
+            if getattr(chunk, "model", ""):
+                attr_model = chunk.model
+            if getattr(chunk, "provider", ""):
+                attr_provider = chunk.provider
+
+        # 无论下面的 JSON 解析是否成功，这次调用都已经发生了 —— 先记账再解析。
+        if usage is not None:
+            usage.add(
+                model=attr_model,
+                provider=attr_provider,
+                input_tokens=tok_in,
+                output_tokens=tok_out,
+                cached_tokens=tok_cached,
+            )
 
         # 解析 LLM 响应
         import re
@@ -598,8 +717,14 @@ Return ONLY valid JSON without markdown formatting."""
         trace_id: str = "",
         llm_model: str = "",
         provider_hint: str = "",
+        usage: UsageAccumulator | None = None,
     ) -> list[ExecutedTask]:
-        """执行所有子任务 (有依赖的按序执行,无依赖可并行)"""
+        """执行所有子任务 (有依赖的按序执行,无依赖可并行)
+
+        `usage` 由 route_task 传入并**原地累加**：各子任务的执行器（`agent:*` 走
+        `_llm_executor`）把用量挂在输出的 `usage` 键上，这里收集后从输出里摘掉，
+        保证聚合结果里不会多出一个用户可见的字段。
+        """
         import asyncio
 
         results = []
@@ -622,6 +747,7 @@ Return ONLY valid JSON without markdown formatting."""
                     completed_tasks,
                     llm_model=llm_model,
                     provider_hint=provider_hint,
+                    usage=usage,
                 )
                 for task in layer
             ]
@@ -706,6 +832,7 @@ Return ONLY valid JSON without markdown formatting."""
         completed_tasks: dict[str, ExecutedTask],
         llm_model: str = "",
         provider_hint: str = "",
+        usage: UsageAccumulator | None = None,
     ) -> ExecutedTask:
         """执行单个子任务"""
         cap = await self.registry.get_by_id(task.capability_id, tenant_id)
@@ -768,6 +895,21 @@ Return ONLY valid JSON without markdown formatting."""
                 output = executor(**input_params)
 
             duration_ms = int((time.time() - start_time) * 1000)
+
+            # 执行器自报的用量（目前只有 LLM 型能力会带）：**摘下来再聚合**，
+            # 否则它会混进用户可见的输出（例如 agent:general_chat 的 result 会被
+            # 原样拼进回答）。登记到累加器后由回包统一交给网关记账。
+            reported_usage = None
+            if isinstance(output, dict) and "usage" in output:
+                reported_usage = output.pop("usage")
+            if isinstance(reported_usage, dict) and usage is not None:
+                usage.add(
+                    model=str(reported_usage.get("model") or ""),
+                    provider=str(reported_usage.get("provider") or ""),
+                    input_tokens=int(reported_usage.get("input_tokens") or 0),
+                    output_tokens=int(reported_usage.get("output_tokens") or 0),
+                    cached_tokens=int(reported_usage.get("cached_tokens") or 0),
+                )
 
             # 工具型输出约定 {"error": ...} 即失败（fail loud，不当作成功结果聚合）
             failed = isinstance(output, dict) and "error" in output
