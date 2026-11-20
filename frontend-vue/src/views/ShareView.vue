@@ -12,7 +12,7 @@ import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 import { useI18n } from 'vue-i18n'
 
-import { errorStatus } from '../utils/apiError'
+import { errorStatus, errorCode } from '../utils/apiError'
 const { t } = useI18n()
 
 const route = useRoute()
@@ -20,6 +20,21 @@ const route = useRoute()
 const share = ref<PublicShare | null>(null)
 const loading = ref(true)
 const error = ref('')
+/** 失败是否值得重试：网络/超时/5xx 值得，404/410 不值得（重试一百次也还是失效）。 */
+const canRetry = ref(false)
+
+/**
+ * 请求硬超时（与 `getPublicShare` 内部的 axios timeout 同一量级）。
+ *
+ * 为什么视图层还要一道：axios 的 timeout 依赖适配器回包/取消**真的**被触发；
+ * 代理把连接挂住、适配器被 mock、或宿主（file:// 外壳）吞掉错误时它可能永远不 settle。
+ * 匿名落地页没有任何别的内容可看，"一直转圈"就是最差的终态 —— 这里用竞速保证
+ * 10s 内必定落到 成功 / 失效 / 可重试 三种终态之一。
+ */
+const SHARE_DEADLINE_MS = 10_000
+
+/** 本次加载的代号：重试或卸载后回来的旧响应直接丢弃，不再改写页面状态。 */
+let loadSeq = 0
 
 // 轻量 markdown 渲染（公开页不引入 KaTeX/mermaid，代码块带复制按钮）
 const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
@@ -77,20 +92,68 @@ function handleClick(e: MouseEvent) {
   }).catch(() => { /* clipboard unavailable */ })
 }
 
-onMounted(async () => {
+/**
+ * 给任意 promise 加硬超时（超时 reject，不让页面无限等待）。
+ *
+ * 不接 AbortSignal：请求由 `getPublicShare` 自己的 axios timeout 负责取消，
+ * 这里只管"页面状态必须收口"这一件事，避免两个取消源互相干扰。
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('share: deadline exceeded'))
+    }, ms)
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (err) => { clearTimeout(timer); reject(err) },
+    )
+  })
+}
+
+/**
+ * 加载分享内容 —— 本页**唯一**的状态机入口，保证必然收口到三种终态：
+ *   成功（渲染会话内容）/ 明确失效（404 不存在或已过期、410 已被撤销或过期）/ 可重试失败。
+ *
+ * 之前的写法把清除 loading 只放在 `finally` 里，看似必然执行，实际漏了「等不到」这一态：
+ * 请求被全局拦截器挂住（401 跳转、限流退避）、或迟迟不 settle 时，`finally` 永远不会到达。
+ */
+async function loadShare() {
+  const seq = ++loadSeq
   // 短链 `/s/:token` 与兼容别名 `/share/:id` 共用本页，参数名不同，两处都读。
   const id = String(route.params.token || route.params.id || '')
+
+  loading.value = true
+  error.value = ''
+  canRetry.value = false
+  share.value = null
+
   try {
-    share.value = await getPublicShare(id)
+    if (!id) throw new Error('share: missing token')
+    const data = await withDeadline(getPublicShare(id), SHARE_DEADLINE_MS)
+    // 空 body / 非 JSON（网关兜底吐了 HTML）也按失败处理：静默渲染空白同样是"没终态"。
+    if (!data || !Array.isArray(data.messages)) throw new Error('share: malformed payload')
+    if (seq === loadSeq) share.value = data
   } catch (e) {
+    if (seq !== loadSeq) return
     const status = errorStatus(e)
-    if (status === 410) error.value = t('common.this_share_was_deleted_by_its_creator')
-    else if (status === 404) error.value = t('errors.share_does_not_exist_or_has_expired')
-    else error.value = t('errors.load_failed_please_retry_later')
+    const code = errorCode(e)
+    if (code === 'share_revoked') {
+      // 被创建者主动撤销：与"过了有效期"是两件事，文案必须分开
+      error.value = t('common.this_share_was_deleted_by_its_creator')
+    } else if (status === 410 || status === 404) {
+      // 410 share_expired 与 404 都可以用"不存在或已失效"覆盖（不误导成"被删除"）
+      error.value = t('errors.share_does_not_exist_or_has_expired')
+    } else {
+      error.value = t('errors.load_failed_please_retry_later')
+      canRetry.value = true
+    }
   } finally {
-    loading.value = false
+    // 只有"最新一次加载"才有权收口，避免旧请求把新一轮的 loading 提前关掉
+    if (seq === loadSeq) loading.value = false
   }
-})
+}
+
+onMounted(loadShare)
 
 function formatDate(iso: string): string {
   const d = new Date(iso)
@@ -117,11 +180,24 @@ function formatDate(iso: string): string {
         variant="detail"
         :rows="4"
       />
-      <EmptyState
+      <div
         v-else-if="error"
-        size="page"
-        :description="error"
-      />
+        class="share-error"
+      >
+        <EmptyState
+          size="page"
+          :description="error"
+        />
+        <!-- 只有"重试有意义"的失败才给按钮：失效链接重试一百次也还是失效 -->
+        <button
+          v-if="canRetry"
+          type="button"
+          class="share-retry"
+          @click="loadShare"
+        >
+          {{ $t('common.retry') }}
+        </button>
+      </div>
       <template v-else-if="share">
         <div class="share-head">
           <h1 class="share-title">
@@ -187,6 +263,16 @@ function formatDate(iso: string): string {
 .share-title { font-size: 22px; line-height: 30px; font-weight: var(--fw-bold); margin: 0 0 6px; word-break: break-word; }
 .share-meta { font-size: 12px; color: var(--text-tertiary); }
 .share-thread { display: flex; flex-direction: column; gap: 18px; }
+.share-error { display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.share-retry {
+  min-height: 36px; padding: 8px 18px; cursor: pointer;
+  font-family: inherit; font-size: 14px; color: var(--text-primary);
+  background: var(--bg-card); border: var(--hairline-width) solid var(--border);
+  border-radius: var(--radius-md);
+  transition: background-color var(--dur-normal), border-color var(--dur-normal);
+}
+.share-retry:hover { background: var(--bg-hover); border-color: var(--primary); }
+.share-retry:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .share-msg { display: flex; }
 .share-msg.user { justify-content: flex-end; }
 .share-msg-bubble { min-width: 0; max-width: 100%; }

@@ -72,7 +72,7 @@ export function statusMessage(status?: number): string | null {
 const SERVER_ERROR_MIN = 500
 
 interface ErrorResponseLike {
-  response?: { status?: number; data?: { error?: unknown } }
+  response?: { status?: number; data?: { error?: unknown; code?: unknown } }
 }
 
 /**
@@ -91,6 +91,18 @@ export function serverErrorMessage(error: unknown, fallback: string): string {
 /** 取 HTTP 状态码（用于 429/409 这类要单独提示的分支） */
 export function errorStatus(error: unknown): number | undefined {
   return (error as ErrorResponseLike).response?.status
+}
+
+/**
+ * 取后端稳定错误码（`response.data.code`，见 internal/api/error_codes.go）；没有则 undefined。
+ *
+ * 为什么需要它：状态码表达的是"哪一类"，而同一状态码下语义可能不同 —— 分享页的
+ * 410 既可能是「被创建者撤销」也可能是「过了有效期」，两者的用户结论完全不同，
+ * 只能靠 `code`（`share_revoked` / `share_expired`）区分。
+ */
+export function errorCode(error: unknown): string | undefined {
+  const code = (error as ErrorResponseLike).response?.data?.code
+  return typeof code === 'string' && code ? code : undefined
 }
 
 /**

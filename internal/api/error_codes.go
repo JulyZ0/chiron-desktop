@@ -68,6 +68,14 @@ const (
 	// 属于用户可自行解决的一类（换个小文件、或改用系统程序打开），所以要带上实际
 	// 大小与上限；只报"失败"会让用户以为文件坏了。
 	CodeFileTooLarge = "file_too_large"
+	// CodeShareRevoked 表示分享链接被创建者主动撤销（410）。
+	CodeShareRevoked = "share_revoked"
+	// CodeShareExpired 表示分享链接超过有效期（410）。
+	//
+	// 与 `share_revoked` **必须分开**：两者都是 410、都不可再访问，但用户能做的事不同
+	// ——撤销是"创建者关了它"，求创建者重发；过期是"链接太老"，也要求重发但不必怀疑
+	// 被谁动了手脚。合并成一个码时分享页只能猜，实测文案会把过期链接说成"已被删除"。
+	CodeShareExpired = "share_expired"
 )
 
 // knownMessageCodes 已知文案 → 错误码（键为小写原文）。

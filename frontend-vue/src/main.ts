@@ -63,20 +63,42 @@ message.config({ duration: 2.5 })
 
 // 桌面端 token 由 safeStorage 异步解密；先拿到再挂载，避免首屏请求缺少 Bearer。
 // Web 端 initToken 立即返回，不影响启动。
-void useAuthStore(pinia)
-  .initToken()
-  .finally(() => {
-    app.mount('#app')
+//
+// **但必须有上限**：`initToken` 在桌面端 await 主进程 IPC（safeStorage / 设备 token），
+// 本地模式还会发起 `POST /v1/auth/session`。这些一旦不 settle，`app.mount` 就永远不会
+// 执行 —— 用户看到的是 index.html 里 `#app:empty::before` 那个**启动转圈**，
+// 既没有内容也没有错误提示（"一直转圈，永远不结束"就是这么来的）。
+// 超时放行不会丢身份：token 落地时写的是请求层每次请求现读的变量（`setAuthToken`），
+// 先到的请求最多缺一次 Bearer，后续请求照常带上。
+const BOOT_TOKEN_WAIT_MS = 5000
+let mounted = false
+function mountApp() {
+  // 竞速的两侧都可能 settle，挂载只能发生一次
+  if (mounted) return
+  mounted = true
+  app.mount('#app')
 
-    // 标记首次渲染完成
-    performance.mark('vue-first-render')
-    performance.mark('app-init-end')
+  // 标记首次渲染完成
+  performance.mark('vue-first-render')
+  performance.mark('app-init-end')
 
-    // Lighthouse 性能评分优化标记
-    if (import.meta.env.PROD) {
-      performance.measure('app-init-duration', 'app-init-start', 'app-init-end')
-    }
-  })
+  // Lighthouse 性能评分优化标记
+  if (import.meta.env.PROD) {
+    performance.measure('app-init-duration', 'app-init-start', 'app-init-end')
+  }
+}
+
+const auth = useAuthStore(pinia)
+const bootWait = new Promise<void>((resolve) => {
+  setTimeout(resolve, BOOT_TOKEN_WAIT_MS)
+})
+void Promise.race([
+  auth.initToken().catch((err: unknown) => {
+    // 拿不到 token 也要出第一帧；页面各自的 401 分支会给出提示
+    console.warn('[boot] token init failed:', err)
+  }),
+  bootWait,
+]).then(mountApp, mountApp)
 
 // PWA：生产环境注册 Service Worker（离线壳；开发环境跳过）
 // file://（Electron 桌面壳）不是安全上下文，注册只会产生一条 404 失败请求。

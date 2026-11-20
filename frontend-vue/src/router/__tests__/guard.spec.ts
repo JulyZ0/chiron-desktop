@@ -73,6 +73,31 @@ describe('authGuard', () => {
     expect(next).toHaveBeenCalledWith()
   })
 
+  it('★ meta.public 不等待鉴权初始化（initToken 挂住也必须放行）', async () => {
+    // 这是"分享页永远转圈"的直接根因：守卫在组件挂载**之前** `await initToken()`，
+    // 而它可能等主进程 IPC、等本地会话、等一次开发态登录。对匿名访客来说这些都是
+    // 无关的等待，且没有超时 —— 不 settle 就等于页面永远停在加载态。
+    // 用"永不 resolve"的 initToken 证明：公开路由不碰它。
+    const store = makeStore({ role: null, isAuthenticated: false })
+    store.initToken = vi.fn(() => new Promise<void>(() => {}))
+    const next = fakeNext()
+
+    await authGuard(fakeRoute({ public: true }), {} as RouteLocationNormalized, next)
+
+    expect(store.initToken).not.toHaveBeenCalled()
+    expect(next).toHaveBeenCalledWith()
+  })
+
+  it('非公开路由仍然等待 token 初始化（首屏请求要带 Bearer）', async () => {
+    const store = makeStore({ role: 'user', isAuthenticated: true })
+    const next = fakeNext()
+
+    await authGuard(fakeRoute({ requiresAuth: true }), {} as RouteLocationNormalized, next)
+
+    expect(store.initToken).toHaveBeenCalled()
+    expect(next).toHaveBeenCalledWith()
+  })
+
   describe('requiresAdmin', () => {
     it('后端 profile 返回 admin 放行', async () => {
       const store = makeStore({ role: 'user' }) // localStorage 为 user

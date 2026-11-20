@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base32"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -14,6 +16,7 @@ import (
 	"github.com/athenavi/chiron/internal/db"
 	"github.com/athenavi/chiron/internal/model"
 	"github.com/athenavi/chiron/internal/session"
+	"github.com/jackc/pgx/v5"
 )
 
 // ShareHandler manages public conversation shares (rendered at /s/{token}
@@ -24,10 +27,20 @@ type ShareHandler struct {
 	// cfg 只用于两件事：PUBLIC_BASE_URL（分享链接的对外基址）与 TRUSTED_PROXY_CIDRS
 	// （是否采信 X-Forwarded-*）。允许为 nil（测试）：此时按请求的 scheme+Host 推导。
 	cfg *config.Config
+	// store 是 `PublicGet` 的数据来源。默认取 `db.GlobalDBManager`（见 NewShareHandler），
+	// 抽出接口只为一件事：让"行不存在"与"库连不上"两条分支可被单测区分 —— 这两个在
+	// 免鉴权端点上必须给出**不同**的状态码（404 vs 503），否则库挂了会伪装成"链接不存在"。
+	store shareQuerier
+}
+
+// shareQuerier 收拢 `PublicGet` 需要的两个方法；`*db.DBManager` 天然满足。
+type shareQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row
+	Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error)
 }
 
 func NewShareHandler(a *auth.Authenticator, sm *session.Manager, cfg *config.Config) *ShareHandler {
-	return &ShareHandler{authenticator: a, sessionMgr: sm, cfg: cfg}
+	return &ShareHandler{authenticator: a, sessionMgr: sm, cfg: cfg, store: db.GlobalDBManager}
 }
 
 // shareToken generates a random unguessable share id (80 bits entropy, base32
@@ -309,25 +322,34 @@ func (h *ShareHandler) PublicGet(w http.ResponseWriter, r *http.Request) {
 	// expires_at 允许为 NULL（回填前的极端历史行），但读侧一律按"已过期"处理：
 	// 免鉴权路径上的默认值必须是拒绝，见迁移 0017。
 	var expiresAt *time.Time
-	err := db.GlobalDBManager.QueryRow(r.Context(),
+	err := h.store.QueryRow(r.Context(),
 		`SELECT id, session_id, title, message_ids, created_at, revoked_at, expires_at
 		 FROM conversation_shares WHERE id = $1`, token).
 		Scan(&shareID, &sessionID, &title, &messageIDs, &createdAt, &revokedAt, &expiresAt)
 	if err != nil {
-		NotFound(w, "share not found")
+		// 「行不存在」与「库连不上」必须分开：前者是用户事实（404，链接无效），
+		// 后者是服务端故障（503，稍后重试就好）。此前一律 404，库抖一下会让所有
+		// 分享链接看起来"被删了"，前端也就只能显示"链接不存在或已失效"。
+		if errors.Is(err, pgx.ErrNoRows) {
+			NotFound(w, "share not found")
+			return
+		}
+		logAndRespond(w, err, http.StatusServiceUnavailable, ErrDBUnavailable)
 		return
 	}
 	if revokedAt != nil {
-		JSON(w, http.StatusGone, APIResponse{Success: false, Error: "share revoked"})
+		// code 与状态码分层：410 表达"永久失效"，code 区分"谁让它失效的"，
+		// 分享页据此选文案（见 frontend-vue/src/views/ShareView.vue）。
+		JSONWithCode(w, http.StatusGone, CodeShareRevoked, nil, "share revoked")
 		return
 	}
 	if expiresAt == nil || time.Now().After(*expiresAt) {
-		JSON(w, http.StatusGone, APIResponse{Success: false, Error: "share expired"})
+		JSONWithCode(w, http.StatusGone, CodeShareExpired, nil, "share expired")
 		return
 	}
 
 	// 只暴露用户选中的文本消息（user/assistant），按时间正序
-	rows, err := db.GlobalDBManager.Query(r.Context(),
+	rows, err := h.store.Query(r.Context(),
 		`SELECT role, content, created_at FROM messages
 		 WHERE session_id = $1 AND id = ANY($2::text[]) AND role IN ('user', 'assistant')
 		 ORDER BY created_at ASC, id ASC`, sessionID, messageIDs)
