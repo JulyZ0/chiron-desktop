@@ -479,6 +479,9 @@ var settingsCategories = []string{
 	// knowledge：知识库用「本地模式」还是外部 pageindex 服务（mode / service_url）。
 	// 引擎侧由 app/knowledge/runtime.py 消费（订阅广播 + 启动补拉）。
 	"knowledge",
+	// retention：数据保留期（usage_days / share_days / checkpoint_days）。
+	// 由后台每小时一轮的清理任务读取（见 internal/api/retention.go）。
+	"retention",
 }
 
 func validSettingsCategory(c string) bool {

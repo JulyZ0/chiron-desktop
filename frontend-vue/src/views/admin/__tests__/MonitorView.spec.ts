@@ -3,7 +3,7 @@ import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 
 import { resetMonitorOverviewForTest } from '@/composables/useMonitorOverview'
-import type { MonitorOverview } from '@/api/admin'
+import type { MonitorHistory, MonitorOverview } from '@/api/admin'
 
 /**
  * `MonitorView`（后台「运行时监控」）。
@@ -15,10 +15,18 @@ import type { MonitorOverview } from '@/api/admin'
  *   4. 时间范围切换会带参重取。
  */
 
-const apiMocks = vi.hoisted(() => ({ getMonitorOverview: vi.fn() }))
+const apiMocks = vi.hoisted(() => ({
+  getMonitorOverview: vi.fn(),
+  getMonitorHistory: vi.fn(),
+  getRetention: vi.fn(),
+  saveSettings: vi.fn(),
+}))
 
 vi.mock('@/api/admin', () => ({
   getMonitorOverview: apiMocks.getMonitorOverview,
+  getMonitorHistory: apiMocks.getMonitorHistory,
+  getRetention: apiMocks.getRetention,
+  saveSettings: apiMocks.saveSettings,
 }))
 
 import MonitorView from '../MonitorView.vue'
@@ -178,6 +186,61 @@ function overview(patch: Partial<MonitorOverview> = {}): MonitorOverview {
   return { ...base, ...patch }
 }
 
+/** 历史趋势：rollup 分钟聚合（跨副本）——两个点 + 合计 330 请求 / 3 个 5xx。 */
+function historyFixture(): MonitorHistory {
+  return {
+    generated_at: '2026-11-20T10:00:00Z',
+    from: '2026-11-19T10:00:00Z',
+    to: '2026-11-20T10:00:00Z',
+    hours: 24,
+    step_seconds: 300,
+    status: 'ok',
+    sources: ['postgres metrics_rollup_minute'],
+    errors: [],
+    points: [
+      { at: '2026-11-20T09:50:00Z', count: 180, errors: 1, p95_ms: 90 },
+      { at: '2026-11-20T09:55:00Z', count: 150, errors: 2, p95_ms: 110 },
+    ],
+    total_count: 330,
+    total_errors: 3,
+    note: 'rollup',
+  }
+}
+
+/** 保留期回收量：最近一轮删了 usage_events 1200 行 + 分享 40 行 + 检查点 3 个分片。 */
+function retentionFixture() {
+  return {
+    config: { usage_days: 180, share_days: 90, checkpoint_days: 30 },
+    defaults: { usage_days: 180, share_days: 90, checkpoint_days: 30 },
+    settings_category: 'retention',
+    interval_minutes: 60,
+    batch_limit: 5000,
+    database_available: true,
+    last_run: {
+      run_at: '2026-11-20T09:00:00Z',
+      duration_ms: 42,
+      dry_run: false,
+      config: { usage_days: 180, share_days: 90, checkpoint_days: 30 },
+      tasks: [
+        { table: 'usage_events', cutoff: '2026-05-24T00:00:00Z', deleted: 1200, batches: 1, dry_run: false },
+        { table: 'conversation_shares', cutoff: '2026-08-22T00:00:00Z', deleted: 40, batches: 1, dry_run: false },
+      ],
+      checkpoint: {
+        retention_days: 30,
+        dry_run: false,
+        roots: 2,
+        deleted: 3,
+        freed_bytes: 4096,
+        expired: 3,
+        orphan: 0,
+        kept_young: 7,
+      },
+      total_deleted: 1243,
+    },
+    note: '只按时间删除',
+  }
+}
+
 async function mountView() {
   const router = makeRouter()
   await router.push('/admin/monitor')
@@ -196,6 +259,9 @@ describe('MonitorView 的运行时监控仪表盘', () => {
     vi.clearAllMocks()
     resetMonitorOverviewForTest()
     apiMocks.getMonitorOverview.mockResolvedValue(overview())
+    apiMocks.getMonitorHistory.mockResolvedValue(historyFixture())
+    apiMocks.getRetention.mockResolvedValue(retentionFixture())
+    apiMocks.saveSettings.mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -332,6 +398,42 @@ describe('MonitorView 的运行时监控仪表盘', () => {
     const alert = wrapper.find('[data-test="monitor-error"]')
     expect(alert.exists()).toBe(true)
     expect(alert.text()).toContain('network down')
+    wrapper.unmount()
+  })
+
+  it('渲染历史趋势（来自 rollup）与保留期回收量卡片', async () => {
+    const wrapper = await mountView()
+    await flushPromises()
+
+    // 历史趋势：卡片存在、合计来自 rollup、错误数独立展示。
+    const historyCard = wrapper.find('[data-test="monitor-history"]')
+    expect(historyCard.exists()).toBe(true)
+    expect(wrapper.find('[data-test="history-points"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="history-total"]').text()).toBe('330')
+    expect(wrapper.find('[data-test="history-errors"]').text()).toBe('3')
+
+    // 保留期回收量：总量与逐表回收量都要出现（usage_events 1200）。
+    const retentionCard = wrapper.find('[data-test="retention-card"]')
+    expect(retentionCard.exists()).toBe(true)
+    expect(wrapper.find('[data-test="retention-total"]').text()).toBe('1,243')
+    expect(wrapper.find('[data-test="retention-deleted-usage_events"]').text()).toBe('1,200')
+    expect(wrapper.find('[data-test="retention-deleted-conversation_shares"]').text()).toBe('40')
+    expect(wrapper.find('[data-test="retention-deleted-checkpoints"]').text()).toBe('3')
+
+    wrapper.unmount()
+  })
+
+  it('rollup 无数据时历史趋势显示「无采样数据」而不是 0', async () => {
+    const hist = historyFixture()
+    hist.points = []
+    hist.total_count = 0
+    hist.status = 'partial'
+    apiMocks.getMonitorHistory.mockResolvedValue(hist)
+
+    const wrapper = await mountView()
+    await flushPromises()
+    expect(wrapper.find('[data-test="history-empty"]').exists()).toBe(true)
+    expect(wrapper.find('[data-test="history-empty"]').text()).toContain('无采样数据')
     wrapper.unmount()
   })
 })

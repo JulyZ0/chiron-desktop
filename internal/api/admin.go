@@ -77,6 +77,12 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	r.HandleFunc("GET /performance", h.GetPerformance)
 	// 运行时监控统一数据源：性能 / 队列 / 缓存三个面板一次取全（见 admin_monitor_overview.go）。
 	r.HandleFunc("GET /monitor/overview", h.GetMonitorOverview)
+	// P2：历史趋势（最近 N 小时，来自 metrics_rollup_minute；跨副本、跨重启）。
+	r.HandleFunc("GET /monitor/history", h.GetMonitorHistory)
+
+	// P0-4：保留期配置与最近一轮回收量（删除由后台周期任务执行）。
+	r.HandleFunc("GET /retention", h.GetRetentionInfo)
+	r.HandleFunc("POST /retention/run", h.RunRetentionNow)
 
 	// LLM 熔断读数与手动恢复。引擎 `/v1/gateway/reset-breaker` 早就存在，
 	// 但网关此前没有任何转发路由 —— 前端只认网关，于是这个能力实际上用不了。

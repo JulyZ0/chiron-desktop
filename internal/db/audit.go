@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/athenavi/chiron/internal/monitor"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -300,7 +301,7 @@ func (c *AuditConsumer) claimOnce(ctx context.Context, consumerID string) {
 			// 审计记录丢失必须可见 —— 这是唯一能发现"有审计没落库"的线索。
 			slog.Error("审计日志消息超过投递上限，放弃",
 				"msg_id", p.ID, "deliveries", p.RetryCount, "consumer", p.Consumer)
-			c.rdb.XAck(ctx, c.stream, c.group, p.ID)
+			c.ackAndRecord(ctx, p.ID)
 			continue
 		}
 		ids = append(ids, p.ID)
@@ -333,10 +334,21 @@ func (c *AuditConsumer) claimOnce(ctx context.Context, consumerID string) {
 		msg := msg
 		runAuditCycle("audit-claim-msg", func() {
 			if c.handleMessage(context.WithoutCancel(ctx), msg) {
-				c.rdb.XAck(ctx, c.stream, c.group, msg.ID)
+				c.ackAndRecord(ctx, msg.ID)
 			}
 		})
 	}
+}
+
+// ackAndRecord 成功 ACK 后记一条消费速率采样（每分钟 XACK 数，见
+// monitor.XackWindow）。只统计**本进程**的 ack：引擎侧消费由 python-engine
+// 负责，网关看不到，面板上据此标注来源。
+func (c *AuditConsumer) ackAndRecord(ctx context.Context, msgID string) {
+	if err := c.rdb.XAck(ctx, c.stream, c.group, msgID).Err(); err != nil {
+		slog.Debug("审计日志 ACK 失败", "msg_id", msgID, "error", err)
+		return
+	}
+	monitor.RecordXack(c.stream)
 }
 
 // Start 启动消费者
@@ -396,7 +408,7 @@ func (c *AuditConsumer) Start(ctx context.Context) error {
 				msg := msg
 				runAuditCycle("audit-consume-msg", func() {
 					if c.handleMessage(ctx, msg) {
-						c.rdb.XAck(ctx, c.stream, c.group, msg.ID)
+						c.ackAndRecord(ctx, msg.ID)
 					}
 				})
 			}

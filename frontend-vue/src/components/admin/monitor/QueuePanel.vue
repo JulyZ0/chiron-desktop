@@ -174,6 +174,7 @@ function oldestWait(row: { oldest_wait_seconds: number | null }): string {
                   <th scope="col">{{ t('admin.monitor_consumers') }}</th>
                   <th scope="col">{{ t('admin.monitor_dlq') }}</th>
                   <th scope="col">{{ t('admin.monitor_oldest_wait') }}</th>
+                  <th scope="col">{{ t('admin.queue_xack_rate') }}</th>
                 </tr>
               </thead>
               <tbody>
@@ -194,6 +195,17 @@ function oldestWait(row: { oldest_wait_seconds: number | null }): string {
                   <td>{{ fmtNum(row.consumers) }}</td>
                   <td>{{ fmtNum(row.dlq_depth) }}</td>
                   <td>{{ oldestWait(row) }}</td>
+                  <td :data-test="`stream-xack-${row.name}`">
+                    <!-- 速率是窗口采样（XACK）；无样本显示「—」并靠 title 说明只统计本进程，
+                         绝不写成 0（会把"引擎在消费"读成"消费者挂了"）。 -->
+                    <span :title="row.consumption?.source || ''">
+                      {{ row.consumption?.has_samples ? fmtNum(row.consumption.xack_per_minute) : UNKNOWN }}
+                      <span
+                        v-if="row.consumption?.has_samples"
+                        class="monitor-table__sub"
+                      >/min</span>
+                    </span>
+                  </td>
                 </tr>
               </tbody>
             </table>

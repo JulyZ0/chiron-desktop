@@ -263,6 +263,32 @@ export async function getMonitorOverview(window: MonitorWindow = '15m'): Promise
   return data.data
 }
 
+/**
+ * 历史趋势（P2）：最近 `hours` 小时的分钟聚合，来自 PG `metrics_rollup_minute`。
+ *
+ * 与 overview 的差别：它跨副本、跨重启，但**只覆盖已走完的分钟**
+ * （当前分钟在 overview 的实时尾巴里）。点稀疏 = 那段时间没有数据，
+ * 不要插值成 0。
+ */
+export async function getMonitorHistory(hours = 24): Promise<MonitorHistory> {
+  const { data } = await api.get('/v1/admin/monitor/history', { params: { hours } })
+  return data.data
+}
+
+// ── 保留期（P0-4）──
+
+/** 当前生效的保留期配置 + 最近一轮回收量（本进程）。 */
+export async function getRetention(): Promise<AdminRetentionInfo> {
+  const { data } = await api.get('/v1/admin/retention')
+  return data.data
+}
+
+/** 立刻跑一轮清理；`dry_run` 缺省 true（只统计不删除）。 */
+export async function runRetention(dryRun = true): Promise<RetentionRunStats> {
+  const { data } = await api.post('/v1/admin/retention/run', { dry_run: dryRun })
+  return data.data
+}
+
 // ── 运行时监控（统一数据源）──
 //
 // 与 GET /v1/admin/monitor/overview 一一对应。所有"可能采不到"的数值都是
@@ -305,6 +331,12 @@ export interface MonitorRequestStats {
   max_ms: number | null
   note?: string
   buckets: MonitorBucket[]
+  /** 其中来自 PG 分钟聚合（跨副本、跨重启）的样本数。 */
+  rollup_samples?: number
+  /** 其中来自本进程当前分钟的实时采样数。 */
+  tail_samples?: number
+  /** 本次合成的数据来源（逐个列出，避免把多副本合计读成本进程）。 */
+  sources?: string[]
 }
 
 export interface MonitorDBPool {
@@ -368,6 +400,22 @@ export interface MonitorStreamStats {
   oldest_wait_seconds: number | null
   oldest_task_at?: string
   source: string
+  consumption?: MonitorStreamConsumption | null
+}
+
+/**
+ * 按时间窗采样的消费速率（XACK）。
+ *
+ * `has_samples=false` 只代表**本副本**没有 ack 采样（例如该流由引擎消费），
+ * 不代表队列没在消费 —— 界面必须显示「—」并标注来源。
+ */
+export interface MonitorStreamConsumption {
+  has_samples: boolean
+  xack_per_minute: number
+  samples: number
+  window_seconds: number
+  per_minute: number[]
+  source: string
 }
 
 export interface MonitorRunCounts {
@@ -411,6 +459,78 @@ export interface MonitorLLMCache {
 export interface MonitorCache extends MonitorSectionMeta {
   redis: MonitorRedisCache | null
   llm: MonitorLLMCache | null
+}
+
+export interface MonitorHistoryPoint {
+  at: string
+  count: number
+  errors: number
+  p95_ms: number | null
+}
+
+export interface MonitorHistory {
+  generated_at: string
+  from: string
+  to: string
+  hours: number
+  step_seconds: number
+  status: MonitorSectionStatus
+  sources: string[]
+  errors: MonitorComponentError[]
+  points: MonitorHistoryPoint[]
+  total_count: number
+  total_errors: number
+  note?: string
+}
+
+export interface RetentionConfig {
+  usage_days: number
+  share_days: number
+  checkpoint_days: number
+}
+
+export interface RetentionTaskStats {
+  table: string
+  cutoff: string
+  deleted: number
+  matched?: number
+  batches: number
+  dry_run: boolean
+  truncated?: boolean
+  error?: string
+}
+
+export interface CheckpointGcStats {
+  retention_days: number
+  dry_run: boolean
+  roots: number
+  deleted: number
+  freed_bytes: number
+  expired: number
+  orphan: number
+  kept_young: number
+  error?: string
+}
+
+export interface RetentionRunStats {
+  run_at: string
+  duration_ms: number
+  dry_run: boolean
+  config: RetentionConfig
+  tasks: RetentionTaskStats[]
+  checkpoint?: CheckpointGcStats | null
+  total_deleted: number
+}
+
+export interface AdminRetentionInfo {
+  config: RetentionConfig
+  defaults: RetentionConfig
+  settings_category: string
+  interval_minutes: number
+  batch_limit: number
+  database_available: boolean
+  last_run: RetentionRunStats | null
+  note: string
 }
 
 export interface MonitorOverview {

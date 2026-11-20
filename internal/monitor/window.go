@@ -29,10 +29,15 @@ const RequestSampleWindowMax = 20000
 const RequestSampleRetention = 60 * time.Minute
 
 // RequestSample 是一次已完成请求的采样。
+//
+// Class 是路由分类（见 api.routeClassOf），供分钟级落库按 route_class 分组；
+// 为空时由落库方归一到 "default"。它是**低基数**的分类（路径首段），
+// 不会像完整路径那样把聚合表撑成每请求一行。
 type RequestSample struct {
 	At       time.Time
 	Duration time.Duration
 	Status   int
+	Class    string
 }
 
 // WindowBucket 是趋势图的一个时间桶。
@@ -86,11 +91,17 @@ var RequestWindowStats = NewRequestWindow(RequestSampleWindowMax)
 
 // Record 记录一条样本，并顺带丢弃超过保留期的旧样本。
 func (w *RequestWindow) Record(d time.Duration, status int) {
+	w.RecordClass("", d, status)
+}
+
+// RecordClass 记录一条带路由分类的样本。分类只用于分钟聚合的分组，
+// 不影响 Snapshot 的任何口径。
+func (w *RequestWindow) RecordClass(class string, d time.Duration, status int) {
 	now := time.Now()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	w.samples[w.pos] = RequestSample{At: now, Duration: d, Status: status}
+	w.samples[w.pos] = RequestSample{At: now, Duration: d, Status: status, Class: class}
 	w.pos = (w.pos + 1) % len(w.samples)
 	if w.count < len(w.samples) {
 		w.count++
@@ -230,6 +241,79 @@ func (w *RequestWindow) Snapshot(window time.Duration) WindowSnapshot {
 		snap.Buckets[i].AvgMs = durationMs(sum / time.Duration(len(ds)))
 	}
 	return snap
+}
+
+// IntervalStats 是某个**左闭右开**区间内的请求统计（分钟级落库与实时尾巴用）。
+//
+// 与 WindowSnapshot 的区别：这里不做 24 桶趋势，也不区分 4xx/2xx —— 落库表
+// 只有 count / errors(5xx) / p95，多了也存不下来。P95Ms 在样本只有
+// 101/304 时保持 0（与 WindowSnapshot 同口径：没有可统计的耗时）。
+type IntervalStats struct {
+	Count      int64   `json:"count"`
+	Errors     int64   `json:"errors"`
+	P95Ms      float64 `json:"p95_ms"`
+	HasSamples bool    `json:"has_samples"`
+}
+
+// SnapshotInterval 汇总 [from, to) 内的样本（不按分类拆分）。
+func (w *RequestWindow) SnapshotInterval(from, to time.Time) IntervalStats {
+	var out IntervalStats
+	for _, st := range w.SnapshotIntervalByClass(from, to) {
+		out.Count += st.Count
+		out.Errors += st.Errors
+		out.HasSamples = out.HasSamples || st.HasSamples
+		// 多分类合并时 p95 取最大值：分位数不可加，取最大是保守的
+		// 「尾延迟不会比任何一类更差」，并把口径写进接口注释与面板说明。
+		if st.P95Ms > out.P95Ms {
+			out.P95Ms = st.P95Ms
+		}
+	}
+	return out
+}
+
+// SnapshotIntervalByClass 汇总 [from, to) 内的样本并按路由分类拆分。
+//
+// 分类为空的样本落在 ""（落库方归一到 "default"）。返回的 map 只在
+// 有样本的分类上出现键 —— 调用方据此区分「这一分钟没流量」与「这一分钟延迟为 0」。
+func (w *RequestWindow) SnapshotIntervalByClass(from, to time.Time) map[string]IntervalStats {
+	type agg struct {
+		count  int64
+		errors int64
+		durs   []time.Duration
+	}
+	byClass := make(map[string]*agg, 8)
+
+	w.mu.Lock()
+	for i := 0; i < w.count; i++ {
+		s := w.samples[(w.oldestIndex()+i)%len(w.samples)]
+		if s.At.Before(from) || !s.At.Before(to) {
+			continue
+		}
+		a := byClass[s.Class]
+		if a == nil {
+			a = &agg{}
+			byClass[s.Class] = a
+		}
+		a.count++
+		if s.Status >= 500 {
+			a.errors++
+		}
+		if trackable(s.Status) {
+			a.durs = append(a.durs, s.Duration)
+		}
+	}
+	w.mu.Unlock()
+
+	out := make(map[string]IntervalStats, len(byClass))
+	for class, a := range byClass {
+		st := IntervalStats{Count: a.count, Errors: a.errors, HasSamples: a.count > 0}
+		if len(a.durs) > 0 {
+			sort.Slice(a.durs, func(i, j int) bool { return a.durs[i] < a.durs[j] })
+			st.P95Ms = durationMs(a.durs[pick(len(a.durs), 95)])
+		}
+		out[class] = st
+	}
+	return out
 }
 
 // pick 返回分位数下标，四舍五入到最近的序号（小样本下也稳定）。

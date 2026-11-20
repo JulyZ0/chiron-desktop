@@ -96,6 +96,12 @@ type MonitorRequestStats struct {
 	MaxMs            *float64               `json:"max_ms"`
 	Note             string                 `json:"note,omitempty"`
 	Buckets          []monitor.WindowBucket `json:"buckets"`
+	// RollupSamples / TailSamples 说明 samples 的构成（P2）：
+	// rollup 来自 PG 分钟聚合（多副本、跨重启），tail 是本进程当前分钟的实时采样。
+	RollupSamples int64 `json:"rollup_samples"`
+	TailSamples   int64 `json:"tail_samples"`
+	// Sources 逐个列出本次合成的数据来源，避免"多副本合计"被误读成"本进程数字"。
+	Sources []string `json:"sources"`
 }
 
 // MonitorDBPool 是 pgxpool.Stat() 的投影。
@@ -152,6 +158,23 @@ type MonitorPerformance struct {
 	DBLatency     *float64              `json:"db_latency_ms"`
 }
 
+// MonitorStreamConsumption 是按时间窗采样的**消费速率**（P2）。
+//
+// 为什么需要它：XLEN / XPENDING / lag 都是瞬时快照，回答不了「有没有在消费」。
+// 这里统计的是 XACK 事件（一条消息处理成功的唯一明确信号）。
+//
+// 边界：只有**本进程**的 XACK 可见 —— 引擎队列由 python-engine 消费，
+// 网关看不到。所以 HasSamples=false 只代表「本副本没有 ack 采样」，
+// 不代表队列没在消费；必须如实标注，否则会把正常流转读成消费者挂了。
+type MonitorStreamConsumption struct {
+	HasSamples     bool    `json:"has_samples"`
+	XackPerMinute  float64 `json:"xack_per_minute"`
+	Samples        int64   `json:"samples"`
+	WindowSeconds  int     `json:"window_seconds"`
+	PerMinute      []int64 `json:"per_minute"`
+	Source         string  `json:"source"`
+}
+
 // MonitorStreamStats 是一条 Redis Stream 队列的真实读数。
 type MonitorStreamStats struct {
 	Name              string   `json:"name"`
@@ -165,6 +188,8 @@ type MonitorStreamStats struct {
 	OldestWaitSeconds *float64 `json:"oldest_wait_seconds"`
 	OldestTaskAt      string   `json:"oldest_task_at,omitempty"`
 	Source            string   `json:"source"`
+	// Consumption 是窗口内的 XACK 速率（见 MonitorStreamConsumption 的边界说明）。
+	Consumption *MonitorStreamConsumption `json:"consumption"`
 }
 
 // MonitorRunCounts 是 run 状态计数（DB）与 run 归属租约（Redis）两个视角。
@@ -290,30 +315,74 @@ func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window tim
 		Window:             windowLabel(window),
 	}
 
-	// ① 请求窗口：真实采样，无样本时明确说"无采样数据"。
+	// ① 请求窗口：P2 起改为「窗口内 rollup 汇总（多副本合计）+ 本进程实时尾巴」。
+	//
+	// 拆分点固定在**整分钟边界**：rollup 只写"已走完的分钟"，所以
+	// [now-window, 上一分钟末) 查 PG，[上一分钟末, now) 用本进程采样。
+	// 两边不重叠 —— 否则同一批请求被算两次，错误率会看起来比实际好。
 	snap := monitor.RequestWindowStats.Snapshot(window)
+	now := time.Now()
+	rollupTo := now.Truncate(time.Minute)
+	rollupFrom := rollupTo.Add(-window)
+	tail := monitor.RequestWindowStats.SnapshotInterval(rollupTo, now)
+	rollupAgg, rollupErr := queryRollupWindow(ctx, rollupFrom, rollupTo)
+	usedRollup := rollupErr == nil && rollupAgg.Rows > 0
+
 	p.Requests = MonitorRequestStats{
-		HasSamples:       snap.HasSamples,
-		Samples:          snap.Samples,
-		Success:          snap.Success,
-		ClientErrors:     snap.ClientErrors,
-		ServerErrors:     snap.ServerErrors,
-		ErrorRatePercent: snap.ErrorRatePct,
-		Buckets:          snap.Buckets,
+		RollupSamples: rollupAgg.Count,
+		TailSamples:   tail.Count,
 	}
-	if len(snap.Buckets) == 0 {
-		p.Requests.Buckets = []monitor.WindowBucket{}
-	}
-	if snap.HasSamples {
-		p.Requests.P50Ms = floatPtr(snap.P50Ms)
-		p.Requests.P95Ms = floatPtr(snap.P95Ms)
-		p.Requests.P99Ms = floatPtr(snap.P99Ms)
-		p.Requests.MaxMs = floatPtr(snap.MaxMs)
-		p.Requests.Note = fmt.Sprintf("错误率 = 5xx / 全部样本；窗口内共 %d 条样本（上限 %d）。",
-			snap.Samples, monitor.RequestSampleWindowMax)
-	} else {
-		p.Requests.Note = fmt.Sprintf("近 %s 无请求采样数据（MonitoringMiddleware 未采到任何请求）。", windowLabel(window))
-		p.note("request-sampler", "无采样数据")
+	switch {
+	case usedRollup:
+		merged := mergeRollupWithTail(rollupAgg, tail)
+		p.Requests.HasSamples = merged.HasSamples
+		p.Requests.Samples = merged.Count
+		// rollup 只存 errors(5xx)，没有 4xx 列：成功数按"总数 - 5xx"给，
+		// 前端口径文案里明确写出"含 4xx"。
+		p.Requests.ServerErrors = merged.Errors
+		p.Requests.Success = merged.Count - merged.Errors
+		p.Requests.ErrorRatePercent = 0
+		if merged.Count > 0 {
+			p.Requests.ErrorRatePercent = round2(float64(merged.Errors) / float64(merged.Count) * 100)
+		}
+		if merged.P95Ms > 0 {
+			p.Requests.P95Ms = floatPtr(merged.P95Ms)
+		}
+		// P50/P99/Max 无法从 rollup 复原（表里只有 p95），只能用本进程采样补；
+		// 没有本进程样本时保持 null，而不是把 p95 抄成 p50。
+		if snap.HasSamples {
+			p.Requests.P50Ms = floatPtr(snap.P50Ms)
+			p.Requests.P99Ms = floatPtr(snap.P99Ms)
+			p.Requests.MaxMs = floatPtr(snap.MaxMs)
+		}
+		buckets, err := queryRollupBuckets(ctx, rollupFrom, rollupTo, bucketWidthSeconds(window, 24))
+		if err != nil {
+			p.note("postgres", "rollup 趋势读取失败: "+err.Error())
+		} else {
+			p.Requests.Buckets = appendTailBucket(buckets, rollupTo, tail)
+		}
+		p.Requests.Sources = []string{
+			"postgres metrics_rollup_minute（已走完的分钟，跨副本合计、跨重启）",
+			"monitor.RequestWindowStats（本进程当前分钟的实时尾巴）",
+		}
+		p.Sources = append(p.Sources,
+			"postgres metrics_rollup_minute（窗口内分钟聚合）")
+		p.Requests.Note = fmt.Sprintf(
+			"合计 = rollup %d 条 + 实时尾巴 %d 条；错误率 = 5xx / 合计（rollup 只存 5xx，成功数含 4xx）。"+
+				"p95 为 rollup 与尾巴的较大值（分位数不可加，属保守近似）；p50/p99/max 仅来自本进程样本。",
+			rollupAgg.Count, tail.Count)
+	case rollupErr == nil:
+		// PG 连得上但窗口内没有 rollup 行（刚部署 / 落库循环还没跑满一分钟）。
+		// 退回纯实时窗口，并如实说明覆盖范围，而不是报 0。
+		fillLocalRequestStats(&p, snap, window)
+		p.Requests.Sources = []string{"monitor.RequestWindowStats（本进程实时窗口）"}
+		p.Requests.Note = fmt.Sprintf(
+			"近 %s 无 rollup 行（分钟落库可能刚启用），以下仅本进程实时窗口：%d 条样本。",
+			windowLabel(window), snap.Samples)
+	default:
+		fillLocalRequestStats(&p, snap, window)
+		p.Requests.Sources = []string{"monitor.RequestWindowStats（本进程实时窗口）"}
+		p.note("postgres", "rollup 查询失败，退回本进程实时窗口: "+rollupErr.Error())
 	}
 	if snap.HasSamples && snap.Samples >= int64(monitor.RequestSampleWindowMax) {
 		p.note("request-sampler", "样本量已达环形缓冲上限，分位数只覆盖最近 20000 条请求")
@@ -410,6 +479,36 @@ func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window tim
 	return p
 }
 
+// fillLocalRequestStats 用本进程实时窗口填充请求统计（rollup 不可用时的退回路径）。
+//
+// 单独一个函数是为了让"退回路径与 rollup 路径的字段覆盖范围"在代码里可比：
+// 退回路径能给出 4xx/成功数/全部分位数，rollup 路径只能给 5xx 与近似 p95。
+func fillLocalRequestStats(p *MonitorPerformance, snap monitor.WindowSnapshot, window time.Duration) {
+	p.Requests.HasSamples = snap.HasSamples
+	p.Requests.Samples = snap.Samples
+	p.Requests.Success = snap.Success
+	p.Requests.ClientErrors = snap.ClientErrors
+	p.Requests.ServerErrors = snap.ServerErrors
+	p.Requests.ErrorRatePercent = snap.ErrorRatePct
+	p.Requests.TailSamples = snap.Samples
+	p.Requests.RollupSamples = 0
+	p.Requests.Buckets = snap.Buckets
+	if len(snap.Buckets) == 0 {
+		p.Requests.Buckets = []monitor.WindowBucket{}
+	}
+	if snap.HasSamples {
+		p.Requests.P50Ms = floatPtr(snap.P50Ms)
+		p.Requests.P95Ms = floatPtr(snap.P95Ms)
+		p.Requests.P99Ms = floatPtr(snap.P99Ms)
+		p.Requests.MaxMs = floatPtr(snap.MaxMs)
+		p.Requests.Note = fmt.Sprintf("错误率 = 5xx / 全部样本；窗口内共 %d 条样本（上限 %d）。",
+			snap.Samples, monitor.RequestSampleWindowMax)
+		return
+	}
+	p.Requests.Note = fmt.Sprintf("近 %s 无请求采样数据（MonitoringMiddleware 未采到任何请求）。", windowLabel(window))
+	p.note("request-sampler", "无采样数据")
+}
+
 // ── 队列 ──
 
 // monitorStreams 是要观测的队列。前两条是 python-engine 的任务流
@@ -470,6 +569,17 @@ func (h *AdminHandler) collectMonitorQueue(ctx context.Context) MonitorQueue {
 			// 队列其实已经空了也会显示几小时的等待。
 			if wait, at, err := oldestStreamWait(ctx, spec.key, lastID); err == nil {
 				st.OldestWaitSeconds, st.OldestTaskAt = wait, at
+			}
+			// 消费速率：5 分钟窗口折算成每分钟 XACK 数 + 最近 15 个自然分钟的桶。
+			// 与上面几个瞬时读数并列给出，才能区分"积压大但正在消化"和"积压大且停滞"。
+			rate := monitor.XackStats.Rate(spec.key, 5*time.Minute)
+			st.Consumption = &MonitorStreamConsumption{
+				HasSamples:    rate.HasSamples,
+				XackPerMinute: rate.PerMinutePerSecond,
+				Samples:       rate.Samples,
+				WindowSeconds: rate.WindowSeconds,
+				PerMinute:     monitor.XackStats.PerMinute(spec.key, 15),
+				Source: "本进程 XACK 采样（仅统计网关自己 ack 的流；引擎消费不在其中）",
 			}
 			q.Streams = append(q.Streams, st)
 		}
