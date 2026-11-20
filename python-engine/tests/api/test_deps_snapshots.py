@@ -46,6 +46,12 @@ def _isolated_state(monkeypatch, tmp_path):
     monkeypatch.setattr(deps_api, "_running_job_id", None)
     monkeypatch.setattr(deps_api, "_pypi_cache", {})
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    # 工具选择钉到 pip：不钉的话结果取决于跑测试的机器有没有装 uv（见 test_deps_api）
+    monkeypatch.setattr(
+        deps_api,
+        "resolve_package_tool",
+        lambda: deps_api.PackageTool(deps_api.TOOL_PIP, reason="test pinned pip"),
+    )
     return tmp_path
 
 

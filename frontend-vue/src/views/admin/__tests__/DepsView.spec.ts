@@ -76,6 +76,8 @@ if (typeof window !== 'undefined' && typeof window.matchMedia !== 'function') {
 const PACKAGES = {
   python: '3.12.0',
   executable: '/opt/venv/bin/python',
+  // 桌面运行时 venv 里没有 pip，引擎会退回随包 uv（见 python-engine/app/api/deps.py）
+  tool: 'uv' as const,
   packages: [
     { name: 'fastapi', version: '0.115.0' },
     { name: 'requests', version: '2.31.0' },
@@ -191,6 +193,36 @@ describe('DepsView', () => {
     expect(wrapper.text()).toContain('0.115.0')
     // 解释器路径必须显示：用户据此确认"装的是不是同一个 venv"
     expect(wrapper.text()).toContain('/opt/venv/bin/python')
+    wrapper.unmount()
+  })
+
+  it('展示当前包管理器（uv），而不是让用户猜为什么没有 pip', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+
+    const tool = wrapper.find('.engine-tool')
+    expect(tool.exists()).toBe(true)
+    expect(tool.text()).toContain('uv')
+    // 正常路径不该出现降级提示
+    expect(wrapper.find('.ant-alert-warning').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('无 pip/uv（tool=metadata）时提示只能读，并说明原因', async () => {
+    apiMocks.listDeps.mockResolvedValue({
+      ...PACKAGES,
+      tool: 'metadata',
+      degraded: true,
+      tool_reason: 'uv not found (checked CHIRON_UV_BIN, CHIRON_RESOURCES_DIR, PATH, runtime dir)',
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.find('.engine-tool').text()).toContain('metadata')
+    const alert = wrapper.find('.ant-alert-warning')
+    expect(alert.exists()).toBe(true)
+    expect(alert.text()).toContain('CHIRON_UV_BIN')
     wrapper.unmount()
   })
 

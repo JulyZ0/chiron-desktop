@@ -35,6 +35,9 @@ from app.main import create_app
 
 BASE = "/internal/deps"
 
+#: autouse fixture 之前的**真实**工具解析实现（用例要验证优先级本身时换回来）
+_REAL_RESOLVE_PACKAGE_TOOL = deps_api.resolve_package_tool
+
 
 @pytest.fixture(autouse=True)
 def _reset_deps_state(monkeypatch, tmp_path):
@@ -49,6 +52,13 @@ def _reset_deps_state(monkeypatch, tmp_path):
     monkeypatch.setattr(deps_api, "_running_job_id", None)
     monkeypatch.setattr(deps_api, "_pypi_cache", {})
     monkeypatch.setattr(settings, "data_dir", str(tmp_path))
+    # 工具选择必须钉死，否则用例结果取决于**跑测试的机器**有没有装 uv：
+    # 默认按 pip 跑（与既有断言一致），uv / metadata 场景由各自的用例覆盖。
+    monkeypatch.setattr(
+        deps_api,
+        "resolve_package_tool",
+        lambda: deps_api.PackageTool(deps_api.TOOL_PIP, reason="test pinned pip"),
+    )
     yield
 
 
@@ -790,3 +800,211 @@ def test_pip_env_excludes_secrets(monkeypatch) -> None:
         assert leaked not in env
     assert env["PIP_NO_INPUT"] == "1"
     assert env["PIP_DISABLE_PIP_VERSION_CHECK"] == "1"
+
+
+# ── 包工具降级链（uv → pip → metadata）────────────────────────────────────
+#
+# 现场事故：桌面运行时 venv 里**没有 pip**（`python -m pip` → `No module named pip`），
+# 依赖页整页 502 `pip list exited with code 1`。安装包随带 uv，所以正确顺序是
+# uv → python -m pip（仅当 pip 模块真的存在）→ importlib.metadata（只读）。
+
+
+def _fake_uv(directory: Any) -> str:
+    """造一个"存在的" uv 可执行文件（只用于路径解析，不会被真的执行）。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    exe = directory / deps_api.uv_executable_name()
+    exe.write_text("", encoding="utf-8")
+    return str(exe)
+
+
+def test_build_uv_command_pins_python_interpreter() -> None:
+    """uv 必须带 ``--python sys.executable``：VIRTUAL_ENV 残留会让它装错环境。"""
+    cmd = deps_api.build_uv_command("list", [], "/fake/uv")
+    assert cmd == ["/fake/uv", "pip", "list", "--python", sys.executable, "--format", "json"]
+
+    install = deps_api.build_uv_command("install", ["requests==2.31.0"], "/fake/uv")
+    assert install == ["/fake/uv", "pip", "install", "--python", sys.executable, "requests==2.31.0"]
+
+    uninstall = deps_api.build_uv_command("uninstall", ["requests"], "/fake/uv")
+    assert uninstall == ["/fake/uv", "pip", "uninstall", "--python", sys.executable, "requests"]
+
+    check = deps_api.build_uv_command("check", [], "/fake/uv")
+    assert check == ["/fake/uv", "pip", "check", "--python", sys.executable]
+
+
+def test_uv_bin_env_wins_over_resources_and_path(monkeypatch, tmp_path) -> None:
+    """优先级：``CHIRON_UV_BIN`` → ``<resources>/uv/<platform>`` → PATH。"""
+    env_uv = _fake_uv(tmp_path / "explicit")
+    resources = tmp_path / "resources"
+    bundled = resources / "uv" / deps_api.uv_platform_key() / deps_api.uv_executable_name()
+    bundled.parent.mkdir(parents=True, exist_ok=True)
+    bundled.write_text("", encoding="utf-8")
+    path_uv = _fake_uv(tmp_path / "onpath")
+
+    monkeypatch.setenv(deps_api.UV_BIN_ENV, env_uv)
+    monkeypatch.setenv(deps_api.RESOURCES_DIR_ENV, str(resources))
+    monkeypatch.setattr(deps_api.shutil, "which", lambda name: path_uv)
+
+    assert deps_api.resolve_uv_bin() == env_uv
+
+    # 没有显式 env ⇒ 随包那份优先于 PATH（安装包的口径）
+    monkeypatch.delenv(deps_api.UV_BIN_ENV, raising=False)
+    assert deps_api.resolve_uv_bin() == str(bundled)
+
+    # 资源目录也不给 ⇒ PATH
+    monkeypatch.delenv(deps_api.RESOURCES_DIR_ENV, raising=False)
+    assert deps_api.resolve_uv_bin() == path_uv
+
+
+def test_resolve_package_tool_prefers_uv_then_pip_then_metadata(monkeypatch) -> None:
+    # autouse fixture 把工具钉成了 pip；这里换回**真实**实现来验证优先级本身
+    # （必须在模块导入时抓住原函数 —— 测试体内读到的已经是替身）。
+    monkeypatch.setattr(deps_api, "resolve_package_tool", _REAL_RESOLVE_PACKAGE_TOOL)
+
+    monkeypatch.setattr(deps_api, "resolve_uv_bin", lambda: "/fake/uv")
+    assert deps_api.resolve_package_tool().kind == deps_api.TOOL_UV
+
+    # 没有 uv 且 pip 模块可导入 ⇒ pip
+    monkeypatch.setattr(deps_api, "resolve_uv_bin", lambda: "")
+    monkeypatch.setattr(deps_api, "pip_module_available", lambda: True)
+    assert deps_api.resolve_package_tool().kind == deps_api.TOOL_PIP
+
+    # 两者都没有 ⇒ metadata（只读），且 reason 说清楚为什么
+    monkeypatch.setattr(deps_api, "pip_module_available", lambda: False)
+    tool = deps_api.resolve_package_tool()
+    assert tool.kind == deps_api.TOOL_METADATA
+    assert tool.can_mutate is False
+    assert "pip" in tool.reason
+
+
+async def test_list_degrades_to_metadata_without_pip_or_uv(monkeypatch) -> None:
+    """无 pip / 无 uv 时 ``/list`` 仍返回 200（``tool: "metadata"``），不再 502。"""
+    monkeypatch.setattr(
+        deps_api,
+        "resolve_package_tool",
+        lambda: deps_api.PackageTool(deps_api.TOOL_METADATA, reason="no pip, no uv"),
+    )
+
+    async with _client() as client:
+        resp = await client.get(f"{BASE}/list")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tool"] == "metadata"
+    assert body["degraded"] is True
+    # 标准库视角：本用例所在解释器至少装了 pytest/httpx，不可能是空表
+    assert body["count"] > 0
+    assert all(pkg["name"] and pkg["version"] for pkg in body["packages"])
+
+
+async def test_list_uses_uv_when_pip_is_missing(monkeypatch) -> None:
+    """pip 模块缺失时 list 必须走 uv，且命令带 ``--python sys.executable``。"""
+    seen: list[list[str]] = []
+
+    async def fake_uv(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        seen.append(args)
+        return deps_api.PipResult(ok=True, returncode=0, output='[{"name":"fastapi","version":"0.115.0"}]')
+
+    monkeypatch.setattr(deps_api, "pip_module_available", lambda: False)
+    monkeypatch.setattr(deps_api, "resolve_uv_bin", lambda: "/fake/uv")
+    monkeypatch.setattr(deps_api, "_run_uv", fake_uv)
+    # 恢复真实的解析逻辑（autouse fixture 把工具钉成了 pip）
+    monkeypatch.setattr(
+        deps_api,
+        "resolve_package_tool",
+        lambda: deps_api.PackageTool(deps_api.TOOL_UV, path="/fake/uv"),
+    )
+
+    async with _client() as client:
+        resp = await client.get(f"{BASE}/list")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tool"] == "uv"
+    assert body["degraded"] is False
+    assert body["packages"] == [{"name": "fastapi", "version": "0.115.0"}]
+    assert seen == [["/fake/uv", "pip", "list", "--python", sys.executable, "--format", "json"]]
+
+
+async def test_list_failure_carries_redacted_stderr_tail(monkeypatch) -> None:
+    """失败必须带 stderr 尾部（脱敏）：只有退出码无法定位原因。"""
+
+    async def fake_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        return deps_api.PipResult(
+            ok=False,
+            returncode=1,
+            output="No module named pip\nhttps://user:secret@idx.example/simple\n",
+        )
+
+    monkeypatch.setattr(deps_api, "_run_pip", fake_run)
+
+    async with _client() as client:
+        resp = await client.get(f"{BASE}/list")
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert detail["tool"] == "pip"
+    assert "exited with code 1" in detail["error"]
+    assert "No module named pip" in detail["stderr_tail"]
+    assert "secret" not in json.dumps(resp.json())
+
+
+async def test_install_without_pip_or_uv_is_503_with_actionable_message(monkeypatch) -> None:
+    ran: list[list[str]] = []
+
+    async def fake_run(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        ran.append(args)
+        return deps_api.PipResult(ok=True, returncode=0, output="")
+
+    monkeypatch.setattr(deps_api, "_run_pip", fake_run)
+    monkeypatch.setattr(
+        deps_api,
+        "resolve_package_tool",
+        lambda: deps_api.PackageTool(deps_api.TOOL_METADATA, reason="no pip, no uv"),
+    )
+
+    async with _client() as client:
+        resp = await client.post(f"{BASE}/install", json={"spec": "requests==2.31.0"})
+        uninstall = await client.post(f"{BASE}/uninstall", json={"name": "requests"})
+    assert resp.status_code == 503
+    assert "未包含 pip/uv" in json.dumps(resp.json(), ensure_ascii=False)
+    assert "CHIRON_UV_BIN" in json.dumps(resp.json(), ensure_ascii=False)
+    assert uninstall.status_code == 503
+    assert ran == []
+    assert deps_api._jobs == {}
+
+
+async def test_uv_check_missing_subcommand_is_skipped_not_conflict(monkeypatch) -> None:
+    """老版本 uv 没有 ``pip check``：跳过预检并说明，不能把安装挡在 409 后面。"""
+
+    async def fake_uv(args: list[str], *, timeout: float, on_line: Any = None) -> deps_api.PipResult:
+        return deps_api.PipResult(
+            ok=False, returncode=2, output="error: unrecognized subcommand 'check'\n"
+        )
+
+    monkeypatch.setattr(deps_api, "_run_uv", fake_uv)
+    monkeypatch.setattr(
+        deps_api,
+        "resolve_package_tool",
+        lambda: deps_api.PackageTool(deps_api.TOOL_UV, path="/fake/uv"),
+    )
+
+    check = await deps_api.check_dependency_conflicts()
+    assert check.ok is True
+    assert check.skipped is True
+    assert check.tool == "uv"
+    assert "check" in check.note
+
+
+def test_pip_module_available_checks_find_spec_not_the_pip_executable(monkeypatch) -> None:
+    """判据必须是 ``find_spec("pip")``：PATH 上有 pip 命令不代表**这个解释器**有 pip 模块。"""
+    real_find_spec = deps_api.importlib.util.find_spec
+
+    def fake_find_spec(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "pip":
+            return None
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(deps_api.importlib.util, "find_spec", fake_find_spec)
+    # 换回真实解析（fixture 钉的是 pip）
+    monkeypatch.setattr(deps_api, "resolve_package_tool", _REAL_RESOLVE_PACKAGE_TOOL)
+    monkeypatch.setattr(deps_api, "resolve_uv_bin", lambda: "")
+    assert deps_api.pip_module_available() is False
+    assert deps_api.resolve_package_tool().kind == deps_api.TOOL_METADATA

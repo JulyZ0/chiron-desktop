@@ -74,8 +74,23 @@
       class="engine-meta"
     >
       <span>{{ $t('admin.deps_python_version', { version: list.python }) }}</span>
+      <!-- 包管理器：桌面运行时 venv 可能没有 pip，引擎会退回 uv / 标准库元数据。
+           不显示这一项的话，"为什么装不上包"就只剩下一个 502 可看。 -->
+      <span
+        v-if="list.tool"
+        class="engine-tool"
+      >{{ $t('admin.deps_tool', { tool: list.tool }) }}</span>
       <code class="engine-path">{{ list.executable }}</code>
     </div>
+
+    <Alert
+      v-if="list?.degraded"
+      class="block"
+      type="warning"
+      show-icon
+      :message="$t('admin.deps_tool_metadata_hint')"
+      :description="list.tool_reason"
+    />
 
     <!-- 安装任务进度：pip 安装在引擎里后台跑，这里只轮询它的状态 -->
     <Card
@@ -1039,6 +1054,15 @@ onUnmounted(stopPolling)
   border: var(--hairline-width) solid var(--border);
   font-size: 11px;
   word-break: break-all;
+}
+/* 包管理器标签：与 python 版本同一行，但更"硬"一点（它是排查装包问题的第一线索） */
+.engine-tool {
+  padding: 2px 6px;
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle, transparent);
+  border: var(--hairline-width) solid var(--border);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .job-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
