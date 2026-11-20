@@ -124,10 +124,21 @@ extend-immutable-calls = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# `--strict-markers`：拼错的 marker 直接让收集阶段报错，而不是**静默地当成无标记**。
+# 后者是最坏的形态 —— 一个 `@pytest.mark.liv` 会悄悄回到默认集合里，
+# 于是"稳定子集"看起来干净、实际仍拖着外部依赖用例，失败时才在 CI 上暴露。
+# 新增 marker 必须先登记在下面的 markers 清单里。
+addopts = ["--strict-markers"]
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
     "live: 需要真实外部依赖(Redis 等)、但不需要 PostgreSQL 的用例；连不上即自跳过(与 integration 分开门控，避免被 PG autouse fixture 拦下)",
+    "network: 需要真实网络出口、或在本机拉起监听端口的服务进程（本地网关 / uvicorn 子进程 / provider HTTP 桩）的用例；受限环境（离线、端口受限、SDK 模块缺失）下不稳定，从稳定子集中排除",
 ]
+
+# 稳定子集（P2-13）：`pytest -m "not live and not integration and not network"`
+# 只跑**零外部依赖**的用例 —— 不连 Redis/PG、不发真实网络、不起子进程。
+# CI 的单测 job 与 scripts/test-stability.sh 都按这个口径跑；外部依赖用例由
+# real-stack job 单独覆盖（那里有 service 容器与真实网关），不会有覆盖盲区。
 
 [tool.mypy]
 python_version = "3.11"

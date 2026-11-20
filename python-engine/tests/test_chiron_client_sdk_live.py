@@ -21,6 +21,13 @@ import uuid
 
 import pytest
 
+# 模块级标记（与函数级的 `@pytest.mark.integration` 并存，语义互补）：
+#   * integration —— 要真实网关 + 真 Redis 把事件投进去；
+#   * network     —— 还要能**真的连上** 127.0.0.1:8080 的 HTTP 端口。
+# 两者分开是因为失败原因不同：integration 缺的是服务栈，network 缺的是网络/端口
+# 可达性（离线机、端口被占、代理拦截）。稳定子集两个都要排除。
+pytestmark = [pytest.mark.integration, pytest.mark.network]
+
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "clients" / "python"))
 

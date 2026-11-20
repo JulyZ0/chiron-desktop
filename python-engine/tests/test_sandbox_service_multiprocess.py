@@ -21,6 +21,12 @@ from pathlib import Path
 
 import pytest
 
+# 模块级 `network`：本文件把 sandbox-service 用 uvicorn 起成**独立进程**并绑定端口，
+# 再从引擎侧发真实 HTTP 请求。它依赖本机可用的空闲端口、可 spawn 的子进程、
+# 以及 sandbox-service 的依赖（在只装了引擎依赖的环境里会失败）。
+# 这些都是"环境是否具备"而非"代码是否正确"，因此从稳定子集中整片排除。
+pytestmark = pytest.mark.network
+
 SERVICE_DIR = Path(__file__).resolve().parents[2] / "sandbox-service"
 TOKEN = "multiprocess-test-token"
 HEALTH_PATH = "/v1/internal/exec/health"
