@@ -88,9 +88,13 @@ func TestMonitorMigrationChainSingleHead(t *testing.T) {
 	if len(heads) != 1 {
 		t.Fatalf("迁移链有 %d 个 head（应为 1）: %v", len(heads), heads)
 	}
-	// 当前链头由 0005 占据；0003 必须在链上且只有一个父（0002）。
-	if heads[0] != "0005_share_ops" {
-		t.Fatalf("链头应为 0005_share_ops，实际 %q", heads[0])
+	// 当前链头由 0006 占据（价格源健康表 + 回填索引）；0003 必须在链上且只有一个父（0002）。
+	if heads[0] != "0006_price_backfill" {
+		t.Fatalf("链头应为 0006_price_backfill，实际 %q", heads[0])
+	}
+	// 0006 必须从 0005 接上（不许改既有迁移的分叉结构），且建出网关读写的两张/列。
+	if migs["0006_price_backfill"].down != "0005_share_ops" {
+		t.Fatalf("0006 的 down_revision 应为 0005_share_ops，实际 %q", migs["0006_price_backfill"].down)
 	}
 	if migs["0003_metrics_rollup"].down != "0002_inapp_notifications" {
 		t.Fatalf("0003 的 down_revision 被改动了: %q", migs["0003_metrics_rollup"].down)

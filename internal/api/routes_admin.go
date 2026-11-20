@@ -56,10 +56,19 @@ func registerAdminRoutes(
 	// （精确名 → 规范化前缀回落），按租户过滤。用 adminReadMW：它回答的是
 	// "平台的价格表补得够不够"，属于运营视角，与普通用户的用量页不同。
 	mux.Handle("GET /v1/admin/billing/price-coverage", authMW(rlMW(adminReadMW(http.HandlerFunc(GetPriceCoverage)))))
+	// 价格源健康（只读）：把"哪个源失败、失败原因是什么"暴露给运营。
+	// 用 platformReadMW 而不是 adminReadMW —— 源目录与失败原因是**全平台共享**的
+	// 运行事实（与 diagnostics/summary 同口径），租户 admin 不需要它。
+	mux.Handle("GET /v1/admin/billing/price-sources", authMW(rlMW(platformReadMW(http.HandlerFunc(GetPriceSources)))))
 	// 手工设置单价（补价的唯一写入口）。平台 owner 写权限：价格表是**全平台共享**的
 	// 参考数据，租户 admin 改它等于替所有人改成本口径（与 settings / models 同口径）。
 	// 路径段里的模型名必须 URL 编码（`/` 要写成 `%2F`），请求体的 `model` 可作回退键。
 	mux.Handle("PUT /v1/admin/model-prices/{model}", authMW(rlMW(platformWriteMW(http.HandlerFunc(UpsertModelPrice)))))
+	// 批量导入单价（CSV/JSON）：价格表是全平台共享的参考数据，写权限与手工单价同口径。
+	// 单次上限 2000 行，事务写；全部行非法时不碰数据库（见 ImportModelPrices 头注释）。
+	mux.Handle("POST /v1/admin/billing/model-prices/import", authMW(rlMW(platformWriteMW(ImportModelPrices(dbPriceStore{})))))
+	// 历史 provider 回填：批量改写历史价格行 ⇒ 平台写权限；默认 dry_run=true。
+	mux.Handle("POST /v1/admin/billing/backfill-provider", authMW(rlMW(platformWriteMW(BackfillModelPriceProviders(dbProviderBackfillStore{})))))
 	// 新用户引导漏斗（P0-3 验收「完成率可查」）—— 只读统计，与其它 admin 读端点同口径。
 	mux.Handle("GET /v1/admin/onboarding/funnel", authMW(rlMW(adminReadMW(adminStrip))))
 	mux.Handle("POST /v1/admin/maintenance", authMW(rlMW(platformWriteMW(adminStrip))))
