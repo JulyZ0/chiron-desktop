@@ -174,7 +174,7 @@ raise SystemExit(99)
     assert not _crash_files(tmp_path), "收到停止信号属于正常关停，不是崩溃"
 
 
-def test_report_keeps_only_last_20_events():
+def test_crash_report_keeps_only_last_20_events():
     """报告尾部只留 20 条：再多就是噪声，而文件要能被用户直接贴出来。"""
     from app import crash_forensics
 
