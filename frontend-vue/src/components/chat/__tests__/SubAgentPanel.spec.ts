@@ -19,6 +19,7 @@ const subagentApi = vi.hoisted(() => ({
   getSubagentRunEvents: vi.fn(),
   cancelSubagentRun: vi.fn(),
   cancelSessionSubagents: vi.fn(),
+  rerunSubagentRun: vi.fn(),
 }))
 vi.mock('../../../api/subagent', () => subagentApi)
 
@@ -265,5 +266,106 @@ describe('SubAgentPanel 的运行跟随', () => {
     await flushPromises()
 
     expect(subagentApi.getSubagentRunEvents).toHaveBeenCalledWith('rs_2')
+  })
+})
+
+/**
+ * P0-2：卡片上的「重试」要**真的重跑**，被拒才回退到"放回输入框"。
+ *
+ * 这条链路的两种结局必须都测到：
+ *  - 成功：调 `POST /v1/subagent/runs/{id}/rerun`，**不**把任务丢回输入框
+ *    （丢回去等于让用户重发一条毫无血缘的新任务）；
+ *  - 被拒（409 非终态/无原任务、404 不属于本会话）：回退 emit `retry-run`，
+ *    并明确告诉用户为什么没能直接重跑 —— 不做假成功。
+ */
+describe('SubAgentPanel 的失败重试（P0-2）', () => {
+  const FAILED_RUN = {
+    run_id: 'rs_failed',
+    status: 'failed',
+    depth: 1,
+    profile: 'reviewer',
+    summary: '下标越界，改到一半停了',
+    usage: { input_tokens: 1200, output_tokens: 340, steps: 7 },
+  }
+
+  function mountWithFailedRun() {
+    subagentApi.listSubagentRuns.mockResolvedValue({ runs: [FAILED_RUN], source: 'db' })
+    subagentApi.getSubagentRunEvents.mockResolvedValue({ events: [], source: 'db' })
+    return mount(SubAgentPanel, { props: { sessionId: 's1', liveEvents: [] as never } })
+  }
+
+  it('重跑成功：调用重跑接口、选中新 run，且不把任务放回输入框', async () => {
+    subagentApi.rerunSubagentRun.mockResolvedValue({
+      status: 'accepted',
+      run_id: 'rs_new',
+      rerun_of: 'rs_failed',
+      parent_run_id: 'rs_failed',
+      depth: 2,
+    })
+    const wrapper = mountWithFailedRun()
+    await flushPromises()
+
+    const retry = wrapper.find('.run-retry')
+    expect(retry.exists()).toBe(true)
+    await retry.trigger('click')
+    await flushPromises()
+
+    expect(subagentApi.rerunSubagentRun).toHaveBeenCalledWith('rs_failed')
+    // 兜底路径**不该**被触发
+    expect(wrapper.emitted('retry-run')).toBeUndefined()
+    // 新 run 立刻被选中（用户不必等 3s 轮询）
+    expect(subagentApi.getSubagentRunEvents).toHaveBeenCalledWith('rs_new')
+  })
+
+  it('重跑被拒（409）：回退到放回输入框，并说明原因', async () => {
+    subagentApi.rerunSubagentRun.mockRejectedValue(
+      Object.assign(new Error('conflict'), { response: { status: 409 } }),
+    )
+    const wrapper = mountWithFailedRun()
+    await flushPromises()
+
+    await wrapper.find('.run-retry').trigger('click')
+    await flushPromises()
+
+    expect(subagentApi.rerunSubagentRun).toHaveBeenCalledWith('rs_failed')
+    const emitted = wrapper.emitted('retry-run') as
+      | Array<[{ runId: string; text: string }]>
+      | undefined
+    expect(emitted).toBeTruthy()
+    expect(emitted![0][0].runId).toBe('rs_failed')
+    expect(emitted![0][0].text).toContain('下标越界')
+  })
+
+  it('重跑 404：同样回退（不假装重试成功）', async () => {
+    subagentApi.rerunSubagentRun.mockRejectedValue(
+      Object.assign(new Error('not found'), { response: { status: 404 } }),
+    )
+    const wrapper = mountWithFailedRun()
+    await flushPromises()
+
+    await wrapper.find('.run-retry').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.emitted('retry-run')).toBeTruthy()
+  })
+
+  it('预算超限：卡片高亮 + 头部汇总（来自 runs 列表数据）', async () => {
+    subagentApi.listSubagentRuns.mockResolvedValue({
+      runs: [
+        { ...FAILED_RUN, run_id: 'rs_partial', status: 'partial', budget_exceeded: true },
+        { run_id: 'rs_ok', status: 'completed', depth: 1, created_at: new Date().toISOString() },
+        { run_id: 'rs_bad', status: 'failed', depth: 1, created_at: new Date().toISOString() },
+      ],
+      source: 'db',
+    })
+    subagentApi.getSubagentRunEvents.mockResolvedValue({ events: [], source: 'db' })
+    const wrapper = mount(SubAgentPanel, { props: { sessionId: 's1', liveEvents: [] as never } })
+    await flushPromises()
+
+    // 撞预算墙的那张卡高亮 + 带标记
+    expect(wrapper.find('.run-card.budget-hit').exists()).toBe(true)
+    expect(wrapper.text()).toContain('预算超限')
+    // 头部失败率：近 24h 2 条里有 1 条 failed → 50%
+    expect(wrapper.find('.failure-rate').text()).toContain('50')
   })
 })

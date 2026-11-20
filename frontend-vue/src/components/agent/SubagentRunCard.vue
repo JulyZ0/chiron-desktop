@@ -34,6 +34,8 @@ const props = withDefaults(defineProps<{
   pending?: number
   /** 正在请求取消 */
   cancelling?: boolean
+  /** 正在请求重跑（按钮禁用，避免连点派出多个作业） */
+  rerunning?: boolean
   /** 统一时钟（毫秒）：只在有活跃 run 时由父组件每秒推进 */
   now?: number
 }>(), {
@@ -44,6 +46,7 @@ const props = withDefaults(defineProps<{
   liveTail: '',
   pending: 0,
   cancelling: false,
+  rerunning: false,
   now: 0,
 })
 
@@ -52,13 +55,16 @@ const emit = defineEmits<{
   (e: 'toggle'): void
   (e: 'stop'): void
   (e: 'pending'): void
-  (e: 'retry'): void
+  /** 「重试」：父组件先尝试**真实重跑**（POST rerun），失败再回退到放回输入框 */
+  (e: 'rerun'): void
 }>()
 
-const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'killed', 'stopped', 'lost', 'done'])
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'killed', 'stopped', 'lost', 'done', 'partial'])
 
 const terminal = computed(() => TERMINAL.has(String(props.run.status)))
 const failed = computed(() => String(props.run.status) === 'failed')
+/** 部分完成：有产物但不完整（撞上 wall/token 预算的典型终态）—— 同样值得重跑 */
+const partial = computed(() => String(props.run.status) === 'partial')
 
 const STATUS_COLOR: Record<string, string> = {
   queued: 'default',
@@ -91,6 +97,19 @@ const usage = computed(() => ({
   steps: props.run.usage?.steps || 0,
 }))
 
+/**
+ * 是否撞上**预算墙**（卡片高亮 + 「预算超限」标记）。
+ *
+ * 依据只有后端给的权威结论（`budget_exceeded`）与引擎的终态证据（`partial` +
+ * `budget_exceeded:<轴>`）：上限来自部署环境（`SUBAGENT_MAX_*`），前端看不到 ——
+ * 拿一个写死的默认值去比 usage 会在高上限部署里误报、低上限部署里漏报。
+ */
+const budgetExceeded = computed(() => {
+  if (props.run.budget_exceeded === true) return true
+  if (String(props.run.status) === 'partial') return true
+  return String(props.run.error || '').startsWith('budget_exceeded')
+})
+
 /** 缩进封顶：深层嵌套只留 3 档视觉差异，再深就靠折叠箭头说明层级 */
 const indent = computed(() => 8 + Math.min(props.depth - 1, 3) * 14)
 
@@ -104,7 +123,7 @@ function onKeydown(e: KeyboardEvent) {
 <template>
   <article
     class="run-card"
-    :class="{ selected, running: !terminal, failed, terminal }"
+    :class="{ selected, running: !terminal, failed, terminal, 'budget-hit': budgetExceeded }"
     :style="{ marginInlineStart: `${indent}px` }"
     :aria-current="selected ? 'true' : undefined"
   >
@@ -156,10 +175,20 @@ function onKeydown(e: KeyboardEvent) {
 
         <span
           class="run-budget"
+          :class="{ 'budget-hit': budgetExceeded }"
           :title="$t('agent.subagent_card_budget', { input: usage.input, output: usage.output, steps: usage.steps })"
         >
           ↑{{ usage.input }} · ↓{{ usage.output }}<template v-if="usage.steps"> · {{ usage.steps }}</template>
         </span>
+        <!-- 预算超限：贴着 budget 数字出现 —— 那个数字为什么这么大，答案就在旁边 -->
+        <Tag
+          v-if="budgetExceeded"
+          color="warning"
+          class="budget-tag"
+          :title="$t('agent.subagent_budget_exceeded_hint')"
+        >
+          {{ $t('agent.subagent_budget_exceeded') }}
+        </Tag>
 
         <span class="card-actions">
           <!-- 待处理徽标：不点开这张卡也能看见（审批/提问在等） -->
@@ -181,15 +210,18 @@ function onKeydown(e: KeyboardEvent) {
           >
             {{ $t('agent.subagent_card_view') }}
           </button>
-          <!-- 失败重试：不做假重发（后端没有 retry 端点），把任务放回输入框由用户决定 -->
+          <!-- 失败重试：先**真的重跑**（后端 POST rerun，按原任务再派一次）；
+               重跑被拒（409 非终态/无原任务、404 不属于本会话）时，父组件回退到
+               "放回输入框"，由用户确认后重新发起 —— 不做假重发。 -->
           <button
-            v-if="failed"
+            v-if="failed || partial"
             type="button"
             class="run-retry"
+            :disabled="rerunning"
             :title="$t('agent.subagent_card_retry_hint')"
-            @click.stop="emit('retry')"
+            @click.stop="emit('rerun')"
           >
-            {{ $t('agent.subagent_card_retry') }}
+            {{ rerunning ? '…' : $t('agent.subagent_card_retry') }}
           </button>
           <button
             v-if="!terminal"
@@ -270,6 +302,11 @@ function onKeydown(e: KeyboardEvent) {
   border-color: var(--error);
   background: var(--error-bg);
 }
+/* 预算超限：与 failed 分开配色 —— 它不是"出错"，而是"钱用完了"，用户的下一步动作不同 */
+.run-card.budget-hit {
+  border-color: var(--warning);
+  background: var(--warning-bg, var(--bg-card));
+}
 .run-card:focus-within { box-shadow: 0 0 0 var(--focus-ring-width) var(--focus-ring-glow); }
 
 /* 时间线：一条竖线 + 状态圆点。竖线用伪元素画，不额外占 DOM */
@@ -346,6 +383,8 @@ function onKeydown(e: KeyboardEvent) {
 
 .run-elapsed { font-size: 11px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 .run-budget { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.run-budget.budget-hit { color: var(--warning); font-weight: var(--fw-medium); }
+.budget-tag { margin-inline-start: 2px; }
 
 .card-actions { display: flex; align-items: center; gap: 4px; margin-inline-start: auto; }
 .card-actions button {

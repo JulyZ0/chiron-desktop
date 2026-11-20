@@ -126,6 +126,7 @@ async def subagent(
     resume_context: str = "",
     resumed_from: str = "",
     resume_at_step: int | None = None,
+    parent_run_id: str = "",
     *,
     target: str = "",
 ) -> dict[str, Any]:
@@ -171,6 +172,11 @@ async def subagent(
     ``skill_run`` 的四类执行）、``workflow:<id>``（复用 ``run_workflow``）。注册表是**白名单**
     —— 只认仓库内置实现，不提供"用户上传可调用对象"的通道。注意 ``target=`` 走**同步**委派
     （技能/工作流没有后台生命周期语义），需要后台请用 ``profile=`` 或默认子 Agent。
+
+    parent_run_id: **R5(c) 的内部通道**（`subagent` 工具不向模型暴露）：显式指定新 run 在
+    任务树里的父节点。由 `app/subagent/rerun.py` 传"被重跑的那个 run"，让重跑在树里挂在
+    原 run 下面（血缘之外还能看见"从哪一条重来的"）。空串 = 沿用旧行为（父层 tool context
+    里的 ``subagent_run_id``，顶层委派则为空）。
     """
     if not task.strip():
         return {"error": "task is required"}
@@ -234,6 +240,8 @@ async def subagent(
                 resume_context=resume_context,
                 resumed_from=resumed_from,
                 resume_at_step=resume_at_step,
+                # R5(c)：重跑时把新 run 挂在原 run 下面（由 app/subagent/rerun.py 传入）
+                parent_run_id=parent_run_id,
             )
             return await child.run(
                 child_task,
@@ -307,6 +315,9 @@ async def subagent(
         resume_context=resume_context,
         resumed_from=resumed_from,
         resume_at_step=resume_at_step,
+        # R5(c)：重跑血缘之外还显式指定父节点（见 app/subagent/rerun.py）。
+        # 空串 ⇒ runner 回落到 `_context_run_id()`，与改动前逐字相同。
+        parent_run_id=parent_run_id,
     )
     # ── 分布式配额（设计 §9.1）──
     #

@@ -26,6 +26,7 @@ import (
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
+	"github.com/athenavi/chiron/internal/engine"
 )
 
 const (
@@ -36,10 +37,13 @@ const (
 
 type SubagentHandler struct {
 	rdb db.RedisClient
+	// engine 只用于**写操作**（目前的 P0-2 重跑转发）：只读端点仍走 Redis/DB，
+	// 不经过引擎（避免一次观测请求被引擎的可用性绑架）。
+	engine *engine.PythonClient
 }
 
-func NewSubagentHandler(rdb db.RedisClient) *SubagentHandler {
-	return &SubagentHandler{rdb: rdb}
+func NewSubagentHandler(rdb db.RedisClient, pc *engine.PythonClient) *SubagentHandler {
+	return &SubagentHandler{rdb: rdb, engine: pc}
 }
 
 // subagentTenant 与 trace_handler 保持同一套租户判定（TenantID 回退 UserID）。
@@ -382,6 +386,23 @@ func stepKindToEventType(kind string) string {
 	}
 }
 
+// runHitBudgetWall 判定这条 run 是否**撞上了预算墙**（面板据此高亮「预算超限」）。
+//
+// 依据只能是引擎写下的**权威证据**，不能靠前端猜一个上限去比较 usage ——
+// 上限由部署环境的 `SUBAGENT_MAX_*` 决定，网关与前端都看不到；按一个写死的默认值
+// 比较，在高上限部署里会误报、在低上限部署里会漏报，两种都让标记变成噪声。
+//
+// 两条证据（见 python-engine/app/agent/task_budget.py 与 subagent_runner 的收尾）：
+//
+//	status=partial          有产出但不完整，典型就是撞上 wall/token 上限；
+//	error=budget_exceeded:* 预算越界（`<轴>` = tokens / steps / wall / cost）。
+func runHitBudgetWall(status, errText string) bool {
+	if strings.EqualFold(strings.TrimSpace(status), "partial") {
+		return true
+	}
+	return strings.HasPrefix(strings.TrimSpace(errText), "budget_exceeded")
+}
+
 // normalizeRunRow 统一 Redis/DB 两条来源的字段名与类型（前端只认这一份契约）。
 func normalizeRunRow(row map[string]interface{}) map[string]interface{} {
 	view := map[string]interface{}{"source": "db"}
@@ -416,6 +437,11 @@ func normalizeRunRow(row map[string]interface{}) map[string]interface{} {
 	}
 	if v := stringOf(row["write_paths"]); v != "" && v != "[]" {
 		view["write_paths"] = v
+	}
+	// 预算超限标记：面板据此把卡片高亮。Redis 来源没有 error 字段时，
+	// status=partial 这一条仍然成立（见 runHitBudgetWall 的说明）。
+	if runHitBudgetWall(view["status"].(string), stringOf(row["error"])) {
+		view["budget_exceeded"] = true
 	}
 	return view
 }

@@ -366,9 +366,16 @@ export default {
   subagent_card_budget: "↑{input} · ↓{output} · {steps} 步",
   subagent_card_children_n: "{n} 个子任务",
   subagent_card_depth: "第 {n} 层",
-  subagent_card_retry_hint: "把这条任务放回输入框，由你决定是否重新派发",
+  subagent_card_retry_hint: "按原任务直接重跑；后端拒绝时把任务放回输入框由你决定",
   subagent_card_retry_default: "{name} 的子任务失败了，请重新执行。",
   subagent_card_empty_summary: "（还没有摘要，点开看事件流）",
+  // ── P0-2：真实重跑 / 失败率 / 预算超限 ──
+  subagent_rerun_started: "已按原任务重新派发：{run}",
+  subagent_rerun_fallback: "这条子任务无法直接重跑（还在跑或没有存下任务描述），已把任务放回输入框",
+  subagent_failure_rate: "失败率 {rate}%",
+  subagent_failure_rate_hint: "近 24 小时：{failed}/{total} 条子 Agent 失败或失联",
+  subagent_budget_exceeded: "预算超限",
+  subagent_budget_exceeded_hint: "这条子 Agent 撞上了预算上限（tokens / 时长 / 费用），有产出但不完整；可提额后重跑",
   // ── 两栏工作台（Agents / Skills 重构）──
   // 左栏列表、右栏详情，窄屏回退单栏。文案集中在这里，模板不写死中文。
   list_pane_title: "Agent 列表",

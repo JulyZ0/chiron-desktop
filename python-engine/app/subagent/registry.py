@@ -121,6 +121,20 @@ def touch(run_id: str) -> None:
         handle.last_event_at = time.time()
 
 
+def is_active(run_id: str) -> bool:
+    """这个 run 是否还有本地任务在跑（注册表命中与否）。
+
+    用途：无父 SSE 生成器的路径（内网重跑端点）要自己冲刷 EventSink 的合并缓冲，
+    而"什么时候可以停"只有这里知道 —— 收尾那一步（``unregister``）就是终点。
+    """
+    if not run_id:
+        return False
+    handle = _RUNS.get(run_id)
+    if handle is None:
+        return False
+    return not handle.task.done()
+
+
 def cancel(run_id: str, reason: str) -> bool:
     """取消单个 run；返回是否真的发出了取消（未知 run / 已结束返回 False，幂等）。"""
     handle = _RUNS.get(run_id)
