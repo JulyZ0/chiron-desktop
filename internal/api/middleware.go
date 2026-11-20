@@ -633,17 +633,69 @@ func (rl *RateLimiter) Stop() {
 }
 
 // MonitoringMiddleware tracks request counts and request latency.
+//
+// 除了原有的累计计数与直方图，这里还把「时间戳 + 状态码 + 耗时」写进
+// monitor.RequestWindowStats —— 后台「运行时监控」页的「近 N 分钟请求量 / 错误率 /
+// P50/P95/P99」全部来自这份窗口采样。没有状态码就没有错误率；没有时间戳就没有
+// 「近 15 分钟」这个限定（旧直方图只有最近 N 条，窗口是猜的）。
 func MonitoringMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		monitor.IncRequests()
 		start := time.Now()
-		// 并发数与耗时都在 defer 中记录：异常路径也不遗漏采样，避免 p99 只统计
-		// 成功请求而失真。此前 RequestHistogram 只有定义、无任何写入点，
-		// 导致看板的 api_latency_p99 恒为空值。
+		sw := &monitorStatusWriter{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
 			monitor.DecRequests()
-			monitor.RequestHistogram.Record(time.Since(start))
+			d := time.Since(start)
+			monitor.RequestHistogram.Record(d)
+			monitor.RequestWindowStats.Record(d, sw.status)
 		}()
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(sw, r)
 	})
+}
+
+// monitorStatusWriter 只做一件事：记住最终写出的状态码。
+//
+// 不直接断言底层是 *responseWriter：中间件顺序会变（LoggingMiddleware 在最外层，
+// 但单测与其它入口可能单独挂 MonitoringMiddleware），依赖具体类型会在重组时
+// 静默退化成「永远 200、错误率恒为 0」—— 那正是本页要避免的假数据。
+type monitorStatusWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (w *monitorStatusWriter) WriteHeader(code int) {
+	if !w.wrote {
+		w.status = code
+		w.wrote = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *monitorStatusWriter) Write(b []byte) (int, error) {
+	if !w.wrote {
+		w.status = http.StatusOK
+		w.wrote = true
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush 透传：SSE 端点依赖它，被中间件包一层后不能丢。
+func (w *monitorStatusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack 透传：WebSocket 升级依赖它。
+func (w *monitorStatusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+}
+
+// Unwrap 让 http.NewResponseController 能穿透到原始 ResponseWriter。
+func (w *monitorStatusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

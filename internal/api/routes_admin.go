@@ -111,6 +111,10 @@ func registerAdminRoutes(
 	// Performance admin routes
 	mux.Handle("GET /v1/admin/performance", authMW(rlMW(platformReadMW(adminStrip))))
 
+	// 运行时监控统一数据源（性能 / 队列 / 缓存）。平台读门禁：回的是全平台运行事实
+	// （别家租户的 run 计数、引擎队列深度），租户 admin 的 admin:read 不该看到。
+	mux.Handle("GET /v1/admin/monitor/overview", authMW(rlMW(platformReadMW(adminStrip))))
+
 	// LLM 熔断读数 / 手动恢复。
 	// 读用 platformReadMW（回的是全局运行状态，租户 admin 不该看见别家的 provider 熔断）；
 	// 重置用 platformWriteMW —— 它会把一个被判熔断的 provider **立刻重新放流量**，
