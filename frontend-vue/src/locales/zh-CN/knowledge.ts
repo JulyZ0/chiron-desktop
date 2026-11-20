@@ -154,6 +154,10 @@ export default {
   stats_no_failures: "近 7 天没有检索失败",
   stats_unavailable: "检索观测暂不可读（Redis 不可用）",
   stats_refresh: "刷新统计",
+  // ── 列表卡片上的近 24h 命中率（P1-8） ──
+  card_hit_rate: "近 24h 命中率 {rate}%（{hits}/{queries}）",
+  card_zero_hit_tag: "近 24h 零命中",
+  card_zero_hit_hint: "近 24 小时检索过但一条都没命中：换一种问法，或确认相关文档已索引完成",
   model_settings_title: "模型覆盖（可选）",
   model_settings_hint: "留空则沿用网关「模型服务」里的默认模型；填写后该库单独使用这个模型",
   index_model: "索引模型",

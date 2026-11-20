@@ -102,3 +102,89 @@ describe('KnowledgeView（此前零测试）', () => {
     wrapper.unmount()
   })
 })
+
+/**
+ * 近 24h 命中率（P1-8）：列表卡片直接回答"这个库到底有没有用"。
+ *
+ * 三种状态必须能分开，否则用户会被引导去删库重建：
+ * - 检索过且有命中 → 显示百分比；
+ * - 检索过但 0 命中 → 显示"零命中"并给出排查提示；
+ * - **根本没检索过**（queries=0）→ 什么都不显示（"0/0=0%" 会被读成"检索了全没命中"）。
+ */
+describe('KnowledgeView：近 24h 命中率', () => {
+  const emptyWin = { queries: 0, hits: 0, zero_hit: 0, errors: 0, avg_latency_ms: 0, zero_hit_rate: 0 }
+
+  function installStats(win: Record<string, number>, available = true) {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/kb') {
+        return Promise.resolve({ data: { data: { knowledge_bases: [KB] } } })
+      }
+      if (url === '/v1/kb/kb-1/stats') {
+        return Promise.resolve({
+          data: { data: {
+            kb_id: 'kb-1',
+            window_hours_24: { ...emptyWin, ...win },
+            window_days_7: { ...emptyWin, ...win },
+            recent_failures: [],
+            diagnosis: [],
+            available,
+          } },
+        })
+      }
+      return Promise.resolve({ data: { data: {} } })
+    })
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    apiMocks.listAgents.mockResolvedValue([])
+  })
+
+  it('★ 有命中时显示命中率与命中/检索次数', async () => {
+    installStats({ queries: 4, hits: 3 })
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(apiMocks.get).toHaveBeenCalledWith('/v1/kb/kb-1/stats')
+    const label = wrapper.find('[data-testid="kb-hit-rate"]')
+    expect(label.exists()).toBe(true)
+    expect(label.text()).toContain('75%')
+    expect(label.text()).toContain('3/4')
+    expect(wrapper.find('[data-testid="kb-zero-hit"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('★ 检索过但零命中时显示提示（带排查建议）', async () => {
+    installStats({ queries: 3, hits: 0, zero_hit: 3 })
+    const wrapper = mountView()
+    await flushPromises()
+
+    const tag = wrapper.find('[data-testid="kb-zero-hit"]')
+    expect(tag.exists()).toBe(true)
+    expect(tag.text()).toContain('零命中')
+    expect(tag.attributes('title')).toContain('换一种问法')
+    // 命中率是 0% —— 有显示（真检索过），但零命中提示已经说清了原因
+    expect(wrapper.find('[data-testid="kb-hit-rate"]').text()).toContain('0%')
+    wrapper.unmount()
+  })
+
+  it('★ 从未检索过（queries=0）时不显示任何命中信息', async () => {
+    installStats({})
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="kb-hit-rate"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="kb-zero-hit"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('★ 统计不可读（available=false）时不显示，也不显示成 0%', async () => {
+    installStats({ queries: 9, hits: 0 }, false)
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="kb-hit-rate"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="kb-zero-hit"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+})
