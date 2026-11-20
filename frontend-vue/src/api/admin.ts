@@ -322,7 +322,11 @@ export interface MonitorRequestStats {
   has_samples: boolean
   samples: number
   success: number
-  client_errors: number
+  /**
+   * 4xx 数。**rollup 路径下为 null**：分钟聚合表只存 5xx，4xx 只在总数里
+   * "被计数"而无从单独还原。null 必须渲染成「—」，不能当成 0。
+   */
+  client_errors: number | null
   server_errors: number
   error_rate_percent: number
   p50_ms: number | null

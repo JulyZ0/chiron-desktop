@@ -436,4 +436,73 @@ describe('MonitorView 的运行时监控仪表盘', () => {
     expect(wrapper.find('[data-test="history-empty"]').text()).toContain('无采样数据')
     wrapper.unmount()
   })
+
+  it('XACK 无采样时消费速率显示「—」，有采样时才给出 /min', async () => {
+    // 消费速率只统计**本副本** ack 的流：has_samples=false 不等于"没在消费"，
+    // 因此必须是「—」而不是 0。写 0 会把"引擎在消费"读成"消费者挂了"。
+    const data = overview()
+    data.queue.streams = [
+      {
+        ...data.queue.streams[0],
+        consumption: {
+          has_samples: false,
+          xack_per_minute: 0,
+          samples: 0,
+          window_seconds: 300,
+          per_minute: [0, 0, 0],
+          source: '本进程 XACK 采样',
+        },
+      },
+    ]
+    apiMocks.getMonitorOverview.mockResolvedValue(data)
+
+    const wrapper = await mountView()
+    await tabButtons(wrapper)[1].trigger('click')
+    await flushPromises()
+
+    const empty = wrapper.find('[data-test="stream-xack-engine"]')
+    expect(empty.exists()).toBe(true)
+    expect(empty.text()).toBe('—')
+
+    // 有采样：给出折算值 + /min 单位。
+    const sampled = overview()
+    sampled.queue.streams = [
+      {
+        ...sampled.queue.streams[0],
+        consumption: {
+          has_samples: true,
+          xack_per_minute: 42.4,
+          samples: 17,
+          window_seconds: 300,
+          per_minute: [3, 4, 10],
+          source: '本进程 XACK 采样',
+        },
+      },
+    ]
+    apiMocks.getMonitorOverview.mockResolvedValue(sampled)
+    await wrapper.find('[data-test="monitor-refresh"]').trigger('click')
+    await flushPromises()
+
+    const filled = wrapper.find('[data-test="stream-xack-engine"]').text()
+    expect(filled).toContain('42')
+    expect(filled).toContain('/min')
+    wrapper.unmount()
+  })
+
+  it('rollup 路径下 4xx 未知时显示「—」，不回落到 0', async () => {
+    // 分钟聚合表只有 5xx（errors 列），4xx 只在总数里被计数而无从还原：
+    // 后端此时返回 null，界面必须显示「—」，否则"错误请求数 0"看起来一切正常。
+    const data = overview()
+    data.performance.requests.client_errors = null
+    apiMocks.getMonitorOverview.mockResolvedValue(data)
+
+    const wrapper = await mountView()
+    const errCard = wrapper.find('[data-test="kpi-error-rate"]')
+    expect(errCard.text()).toBe('1.7%')
+    const hint = errCard.element.parentElement?.textContent ?? ''
+    expect(hint).toContain('4xx —')
+    // 5xx 仍是真实数字（rollup 的 errors 列）。
+    expect(hint).toContain('5xx 2')
+    wrapper.unmount()
+  })
 })
