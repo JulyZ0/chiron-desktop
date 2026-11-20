@@ -56,6 +56,10 @@ func registerAdminRoutes(
 	// （精确名 → 规范化前缀回落），按租户过滤。用 adminReadMW：它回答的是
 	// "平台的价格表补得够不够"，属于运营视角，与普通用户的用量页不同。
 	mux.Handle("GET /v1/admin/billing/price-coverage", authMW(rlMW(adminReadMW(http.HandlerFunc(GetPriceCoverage)))))
+	// 价格源健康（只读）：把"哪个源失败、失败原因是什么"暴露给运营。
+	// 用 platformReadMW 而不是 adminReadMW —— 源目录与失败原因是**全平台共享**的
+	// 运行事实（与 diagnostics/summary 同口径），租户 admin 不需要它。
+	mux.Handle("GET /v1/admin/billing/price-sources", authMW(rlMW(platformReadMW(http.HandlerFunc(GetPriceSources)))))
 	// 手工设置单价（补价的唯一写入口）。平台 owner 写权限：价格表是**全平台共享**的
 	// 参考数据，租户 admin 改它等于替所有人改成本口径（与 settings / models 同口径）。
 	// 路径段里的模型名必须 URL 编码（`/` 要写成 `%2F`），请求体的 `model` 可作回退键。

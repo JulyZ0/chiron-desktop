@@ -27,8 +27,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.observability.metrics import MODEL_PRICE_SYNC
 
@@ -71,6 +75,96 @@ class ModelPrice:
     provider: str
     input_per_1k: float
     output_per_1k: float
+
+
+#: 失败原因的最大长度（与 `price_source_status.error` 的展示口径一致）。
+ERROR_MAX_CHARS = 200
+
+#: 形如 ``key=value`` 的敏感参数（错误文本里可能夹带查询串或 header 片段）。
+_SECRET_RE = re.compile(r"(?i)\b(api[_-]?key|token|secret|password|authorization)\b\s*[=:]\s*\S+")
+#: 完整 URL：只保留 scheme://host[:port]，路径与查询串可能含一次性凭证。
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+")
+
+
+def sanitize_reason(raw: object, *, limit: int = ERROR_MAX_CHARS) -> str:
+    """把异常文本压成**可展示**的一行：去掉凭证、去掉 URL 路径/查询串、截断。
+
+    为什么不能直接把 ``str(exc)`` 写进库：httpx 的异常会带完整 URL（可能含查询串里的
+    key），SSRF 防护层还可能把整段响应体拼进来。健康面板是**所有人可见**的运营视图，
+    把凭证复制到那里等于扩大泄露面。截到 200 字符是因为这里只需要"哪个环节坏了"，
+    完整堆栈在各进程日志里。
+    """
+
+    def _host_only(match: re.Match[str]) -> str:
+        try:
+            parts = urlsplit(match.group(0))
+        except ValueError:
+            return "<url>"
+        host = parts.hostname or ""
+        if not host:
+            return "<url>"
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme}://{host}{port}"
+
+    text = _URL_RE.sub(_host_only, str(raw))
+    text = _SECRET_RE.sub(lambda m: f"{m.group(1)}=***", text)
+    # 折叠空白：多行异常会让表格行高乱掉，也便于截断判断
+    text = " ".join(text.split())
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+@dataclass(frozen=True)
+class SourceStatus:
+    """一个源在一轮同步里的结果（写入 `price_source_status` 的形状）。"""
+
+    source_key: str
+    parser: str
+    provider: str
+    url_host: str
+    status: str  # ok | empty | failed
+    rows: int
+    duration_ms: int
+    error: str
+
+
+def build_source_status(
+    *,
+    parser: str,
+    provider: str,
+    url: str,
+    rows: int,
+    duration_ms: int,
+    error: str = "",
+) -> SourceStatus:
+    """把一次拉取的观测量折成健康行。
+
+    ``status`` 三态：``ok``（解析出 ≥1 条）/ ``empty``（成功但 0 条）/ ``failed``。
+    把 ``empty`` 单列出来是因为它有独立含义 —— 源活着，但对我们的模型名一个都对不上；
+    与"源不可达"混为一谈会把排查引向网络。
+    """
+    if error:
+        status = "failed"
+    elif rows > 0:
+        status = "ok"
+    else:
+        status = "empty"
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        host = ""
+    return SourceStatus(
+        source_key=f"{parser}:{provider}" if provider else parser,
+        parser=parser,
+        provider=provider,
+        url_host=host,
+        status=status,
+        rows=max(int(rows), 0),
+        duration_ms=max(int(duration_ms), 0),
+        error=sanitize_reason(error) if error else "",
+    )
+
 
 
 def normalize_model(name: str) -> str:
@@ -249,18 +343,33 @@ def cross_validate(
 
 
 async def _fetch_source(
-    name: str, url: str, *, provider: str = "", timeout: float = 20.0
+    name: str,
+    url: str,
+    *,
+    provider: str = "",
+    timeout: float = 20.0,
+    record_error: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     """拉一个源并解析。任何失败都返回 ``None``（调用方按"这个源这轮没数据"处理）。
 
     ``provider`` 由源目录给出（portkey 按厂商分文件）；解析器自己决定要不要用它。
+
+    ``record_error`` 是可选的失败原因出口：同步循环用它把"这个源为什么没数据"
+    写进 `price_source_status`。**不用返回值传**是为了不破坏既有调用/测试契约
+    （返回 ``None`` 就代表"这轮没数据"，其余细节走回调）。
     """
     import httpx
 
     from app.tools.ssrf import fetch_url_safe
 
+    def _report(reason: str) -> None:
+        if record_error is not None:
+            record_error(reason)
+
     parser = PARSERS.get(name)
     if parser is None:
+        # 源目录里有、解析器表里没有 = 代码自身不一致，必须可见而不是静默跳过。
+        _report(f"no parser for source {name}")
         return None
     try:
         # follow_redirects=False 是 `fetch_url_safe` 的前置条件（它自己逐跳校验重定向）。
@@ -271,20 +380,24 @@ async def _fetch_source(
     except Exception as exc:  # noqa: BLE001 — 外部数据源的任何问题都不该打断同步循环
         MODEL_PRICE_SYNC.labels(outcome="fetch_failed", source=name).inc()
         logger.warning("model price fetch failed (%s): %s", name, str(exc)[:160])
+        _report(f"{type(exc).__name__}: {exc}")
         return None
     if not isinstance(payload, dict):
         MODEL_PRICE_SYNC.labels(outcome="bad_payload", source=name).inc()
+        _report(f"unexpected payload type: {type(payload).__name__}")
         return None
     try:
         parsed = parser(payload, provider=provider)
     except Exception as exc:  # noqa: BLE001 — 源改了结构 = 解析失败，按"这轮没数据"处理
         MODEL_PRICE_SYNC.labels(outcome="parse_failed", source=name).inc()
         logger.warning("model price parse failed (%s): %s", name, str(exc)[:160])
+        _report(f"parse: {type(exc).__name__}: {exc}")
         return None
     if not isinstance(parsed, dict):
         # 解析函数契约是"返回 {规范化名: ModelPrice}" —— 返回别的东西按坏载荷处理，
         # 而不是把 Any 透传给下游（下游会拿它当 dict 用）。
         MODEL_PRICE_SYNC.labels(outcome="bad_payload", source=name).inc()
+        _report(f"parser returned {type(parsed).__name__}, expected dict")
         return None
     return parsed
 
@@ -294,17 +407,40 @@ async def sync_once() -> tuple[int, list[str]]:
 
     ⚠ **至少要有两个源成功**才做交叉验证：只有一个源时 :func:`cross_validate` 会把所有模型
     都判成 `single_source` ⇒ 一行都不写（这是**正确**的降级：宁可这轮不更新，也不写入未验证值）。
+
+    每个源的结果（成功/失败/条数/耗时/脱敏原因）会写入 `price_source_status`，
+    供管理端 `GET /v1/admin/billing/price-sources` 展示。**写诊断失败不影响同步**
+    —— 它是旁路观测，不该让"价格没同步上"变成"还多报一个数据库错误"。
     """
     # 键必须是**每个 URL 唯一**的：`portkey` 在源目录里出现 4 次（按厂商分文件），
     # 若直接用解析器名做键，四次拉取会互相覆盖，最后只剩最后一个厂商的文件生效 ——
     # 表象是"价格表里只有 deepseek 的模型"，而代码看不出任何丢弃动作。
     fetched: dict[str, dict[str, ModelPrice]] = {}
     base_sources: set[str] = set()
+    statuses: list[SourceStatus] = []
     for name, url, provider in SOURCES:
-        prices = await _fetch_source(name, url, provider=provider)
+        reason: list[str] = []
+        started = time.monotonic()
+        prices = await _fetch_source(
+            name, url, provider=provider, record_error=reason.append
+        )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        statuses.append(
+            build_source_status(
+                parser=name,
+                provider=provider,
+                url=url,
+                rows=len(prices) if prices else 0,
+                duration_ms=duration_ms,
+                error=reason[0] if reason else "",
+            )
+        )
         if prices:
             fetched[f"{name}:{provider}" if provider else name] = prices
             base_sources.add(name)
+
+    await _write_source_status(statuses)
+
     if not fetched:
         MODEL_PRICE_SYNC.labels(outcome="no_source", source="-").inc()
         return 0, []
@@ -316,6 +452,61 @@ async def sync_once() -> tuple[int, list[str]]:
 
     written = await _upsert(agreed, sources=sorted(base_sources))
     return written, disagreements
+
+
+async def _write_source_status(statuses: list[SourceStatus]) -> None:
+    """把本轮每个源的结果写进 `price_source_status`（upsert，一源一行）。
+
+    纯旁路：池未就绪 / 表未迁移 / 写失败都只记 debug，**绝不抛出**。原因很实际 ——
+    诊断数据缺失是"少一块面板信息"，而一次未捕获异常会让整轮同步以失败收场，
+    那才是用户真正在意的部分。
+    """
+    if not statuses:
+        return
+    try:
+        from app.db import get_pool
+
+        pool = get_pool()
+    except Exception:  # noqa: BLE001 — 池未初始化（RuntimeError）也走这里
+        return
+    if pool is None:
+        return
+    keys = [s.source_key for s in statuses]
+    try:
+        async with pool.acquire() as conn:
+            for s in statuses:
+                await conn.execute(
+                    """
+                    INSERT INTO price_source_status
+                        (source_key, parser, provider, url_host, status, rows,
+                         duration_ms, error, checked_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+                    ON CONFLICT (source_key) DO UPDATE SET
+                        parser      = EXCLUDED.parser,
+                        provider    = EXCLUDED.provider,
+                        url_host    = EXCLUDED.url_host,
+                        status      = EXCLUDED.status,
+                        rows        = EXCLUDED.rows,
+                        duration_ms = EXCLUDED.duration_ms,
+                        error       = EXCLUDED.error,
+                        checked_at  = now()
+                    """,
+                    s.source_key,
+                    s.parser,
+                    s.provider,
+                    s.url_host,
+                    s.status,
+                    s.rows,
+                    s.duration_ms,
+                    s.error,
+                )
+            # 源目录里删掉的源不该永远留在面板上显示"上次失败"
+            await conn.execute(
+                "DELETE FROM price_source_status WHERE source_key <> ALL($1::text[])", keys
+            )
+    except Exception as exc:  # noqa: BLE001 — 诊断写入失败不该影响同步结果
+        logger.debug("price source status write skipped: %s", sanitize_reason(exc))
+
 
 
 async def _upsert(prices: list[ModelPrice], *, sources: list[str]) -> int:

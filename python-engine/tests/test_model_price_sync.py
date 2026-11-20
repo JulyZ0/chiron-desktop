@@ -364,3 +364,132 @@ async def test_upsert_tolerates_uninitialized_pool(monkeypatch: pytest.MonkeyPat
 
     assert written == 0
 
+
+
+# ── 源健康：失败要**脱敏**且可展示 ──
+
+
+def test_sanitize_reason_strips_query_secrets_and_keeps_host() -> None:
+    """异常文本里的 URL 只保留 scheme://host：路径/查询串可能含一次性凭证。
+
+    实测的失败形态是 httpx 把完整 URL 带出来（`?api_key=...`），而这张表是**所有人
+    可见**的运营面板 —— 直接把 `str(exc)` 落库等于把凭证复制到更松的地方。
+    """
+    raw = (
+        "HTTPStatusError: 401 for url 'https://pricetoken.ai/api/v1/text"
+        "?api_key=sk-live-123&x=1'"
+    )
+
+    cleaned = s.sanitize_reason(raw)
+
+    assert "sk-live-123" not in cleaned
+    assert "api_key" not in cleaned
+    assert "pricetoken.ai" in cleaned
+    # 保留错误类型，否则面板只剩一句"失败了"
+    assert "401" in cleaned
+
+
+def test_sanitize_reason_truncates_to_200() -> None:
+    """截到 200 字符：这里是展示字段，不是排障全文（完整堆栈在进程日志）。"""
+    cleaned = s.sanitize_reason("x" * 1000)
+
+    assert len(cleaned) == s.ERROR_MAX_CHARS
+    assert cleaned.endswith("…")
+
+
+def test_build_source_status_three_states() -> None:
+    """``ok`` / ``empty`` / ``failed`` 必须可分：把"源活着但没匹配"报成"不可达"会误导排查。"""
+    ok = s.build_source_status(
+        parser="pricetoken", provider="", url="https://pricetoken.ai/api/v1/text",
+        rows=12, duration_ms=340,
+    )
+    empty = s.build_source_status(
+        parser="llmrates", provider="", url="https://www.llmrates.ai/api/dataset",
+        rows=0, duration_ms=90,
+    )
+    failed = s.build_source_status(
+        parser="pricetoken", provider="", url="https://pricetoken.ai/api/v1/text",
+        rows=0, duration_ms=800, error="ReadTimeout: timed out",
+    )
+
+    assert (ok.status, ok.source_key, ok.url_host) == ("ok", "pricetoken", "pricetoken.ai")
+    assert empty.status == "empty"
+    assert failed.status == "failed" and "timed out" in failed.error
+
+
+def test_build_source_status_keeps_portkey_files_apart() -> None:
+    """同一解析器的多份厂商文件必须是**不同的键**，否则健康面板只剩最后一个源。"""
+    a = s.build_source_status(
+        parser="portkey", provider="openai", url="https://configs.portkey.ai/pricing/openai.json",
+        rows=3, duration_ms=10,
+    )
+    b = s.build_source_status(
+        parser="portkey", provider="anthropic", url="https://configs.portkey.ai/pricing/anthropic.json",
+        rows=4, duration_ms=10,
+    )
+
+    assert a.source_key == "portkey:openai"
+    assert b.source_key == "portkey:anthropic"
+
+
+async def test_write_source_status_upserts_and_prunes_removed_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """诊断写入：一源一行 upsert，并删除已不在源目录里的旧键。
+
+    不删旧键的后果是面板永远显示一个"上次失败"的源 —— 而它已经不在目录里了。
+    """
+    executed: list[tuple[str, tuple[object, ...]]] = []
+
+    class _FakeConn:
+        async def execute(self, sql: str, *args: object) -> str:
+            executed.append((sql, args))
+            return "OK"
+
+    class _FakeAcquire:
+        async def __aenter__(self) -> _FakeConn:
+            return _FakeConn()
+
+        async def __aexit__(self, *_exc: object) -> bool:
+            return False
+
+    class _FakePool:
+        def acquire(self) -> _FakeAcquire:
+            return _FakeAcquire()
+
+    import app.db as db_module
+
+    monkeypatch.setattr(db_module, "get_pool", lambda: _FakePool())
+
+    await s._write_source_status([
+        s.build_source_status(
+            parser="pricetoken", provider="", url="https://pricetoken.ai/api/v1/text",
+            rows=0, duration_ms=800, error="ReadTimeout: timed out",
+        )
+    ])
+
+    inserts = [e for e in executed if "INSERT INTO price_source_status" in e[0]]
+    deletes = [e for e in executed if e[0].startswith("DELETE FROM price_source_status")]
+    assert len(inserts) == 1
+    # INSERT 参数顺序：source_key, parser, provider, url_host, status, rows, duration_ms, error
+    assert inserts[0][1][0] == "pricetoken"
+    assert inserts[0][1][4] == "failed"
+    assert len(deletes) == 1 and deletes[0][1][0] == ["pricetoken"]
+
+
+async def test_write_source_status_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """诊断写入是旁路：池坏了也只记 debug，不能把同步结果变成异常。"""
+    import app.db as db_module
+
+    def _raise() -> object:
+        raise RuntimeError("PostgreSQL pool not initialized")
+
+    monkeypatch.setattr(db_module, "get_pool", _raise)
+
+    # 不抛即通过
+    await s._write_source_status([
+        s.build_source_status(
+            parser="llmrates", provider="", url="https://www.llmrates.ai/api/dataset",
+            rows=0, duration_ms=1,
+        )
+    ])
