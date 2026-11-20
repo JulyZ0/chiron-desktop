@@ -4395,6 +4395,11 @@ class AgentRuntime:
         # 不可逆操作必须确认）。
         # **fail-closed**：拿不到服务端判定就拒绝执行这类工具 —— 按引擎自己的判定放行，
         # 等于把这一层抹掉。
+        #
+        # `broker_requires_approval`：服务端明确要求"这一步要人"。guardian 随后**不得**
+        # 把它放行 —— 服务端是判定的权威，引擎侧的旁路评审不能覆盖它（否则 delete 级
+        # 的"免人工"就变成绕过服务端策略的另一条路）。
+        broker_requires_approval = False
         if verdict.second_check:
             from app.tools import broker
 
@@ -4422,6 +4427,8 @@ class AgentRuntime:
                 logger.warning("tool broker denied %s: %s", tool_name, reason)
                 return {"error": f"Tool '{tool_name}' denied by server policy: {reason}"}, None
 
+            if decision.get("requires_user_approval"):
+                broker_requires_approval = True
             if decision.get("requires_user_approval") and verdict.action == "allow":
                 # 服务端把"放行"收紧成"要确认"（典型：yolo 下的不可逆操作）
                 logger.info(
@@ -4445,9 +4452,16 @@ class AgentRuntime:
             }, None
         # ── P2：confirm 之前先过 **LLM 安全评审**（guardian）──
         #
-        # 它替代"每次都弹窗"：write 级可被放行（免人工），delete / external 级**永不**放行
-        # （见 app/agent/guardian.py 的 may_release —— 不可逆 / 对外可见的操作始终要人）。
-        # 评审失败 / 未启用 / 无模型 ⇒ 什么都不改，走原有的人工审批（不猜测）。
+        # 它替代"每次都弹窗"：写类可被放行（免人工）；名字**声明**为 delete / external 的
+        # 仍必须人（见 app/agent/guardian.py 的 may_release）。
+        #
+        # 三条必须守住的语义（2026-11 修正）：
+        # 1. **只按本次调用的参数/代码判定**。工具名与动作级别是启发式标签（`execute_python`
+        #    无法归类时保守停在 delete），不能成为 deny 的依据 —— 否则"只打印问候语"
+        #    也会因为标签被拒，而理由里还写着"未发现风险"，自相矛盾。
+        # 2. **评审 allow 但级别不许免人工 ⇒ 走人工审批，不是 deny**。以前这里落到
+        #    `elif not failed` 的 deny 分支，于是"评审说没风险"和"被拒绝"同时发生。
+        # 3. 评审没做成 / 解析失败 / 服务端要求人工 ⇒ fail-open 回退人工审批，绝不 deny。
         if verdict.action == "confirm":
             from app.agent.guardian import may_release as guardian_may_release
 
@@ -4465,11 +4479,26 @@ class AgentRuntime:
                 if self._current_mode == SESSION_MODE_ASK
                 else await self._guardian_review(tool_call, task, verdict, targs)
             )
-            if assessment is not None and guardian_may_release(verdict.level, assessment):
+            # 动作级别是从**内容**推断的（命令类工具），还是从注册表**声明**的？
+            # 只有前者能靠"本次代码的评审结论"覆盖标签（见 guardian.may_release 第 4 条）。
+            from app.agent.tool_policy import COMMAND_TOOLS
+
+            level_is_declared = tool_name not in COMMAND_TOOLS
+            if (
+                assessment is not None
+                and not broker_requires_approval
+                and guardian_may_release(
+                    verdict.level,
+                    assessment,
+                    targs,
+                    level_is_declared=level_is_declared,
+                )
+            ):
                 logger.info(
-                    "guardian released %s (level=%s risk=%s): %s",
+                    "guardian released %s (level=%s declared=%s risk=%s): %s",
                     tool_name,
                     verdict.level,
+                    level_is_declared,
                     assessment.risk_level,
                     assessment.rationale,
                 )
@@ -4480,7 +4509,9 @@ class AgentRuntime:
                     level=verdict.level,
                     second_check=verdict.second_check,
                 )
-            elif assessment is not None and not assessment.failed:
+            elif assessment is not None and assessment.outcome == "deny":
+                # 真正 deny 的唯一条件：评审**明确**给出 deny（且不是"自述无风险"的
+                # 矛盾判词 —— 那种已在 parse_assessment 里归一为 allow）。
                 logger.warning(
                     "guardian denied %s (level=%s risk=%s): %s",
                     tool_name,
@@ -4493,7 +4524,23 @@ class AgentRuntime:
                         f"Tool '{tool_name}' denied by security review: {assessment.rationale}"
                     )
                 }, None
-            # assessment is None（未启用 / 无 gateway）或 failed（评审没做成）⇒ 保持 confirm
+            else:
+                # 其余情况一律**保持人工审批**（fail-open，不猜测）：
+                # - assessment is None：未启用 / 无 gateway / `ask` 模式；
+                # - assessment.failed：评审没做成或输出不可解析；
+                # - 评审 allow 但级别/服务端要求人工（典型：标签把无害代码判成 delete）。
+                logger.info(
+                    "security review kept %s for human approval "
+                    "(level=%s declared=%s broker_requires_approval=%s "
+                    "assessment=%s failed=%s reason=%s)",
+                    tool_name,
+                    verdict.level,
+                    level_is_declared,
+                    broker_requires_approval,
+                    "none" if assessment is None else assessment.outcome,
+                    bool(assessment is not None and assessment.failed),
+                    "n/a" if assessment is None else assessment.rationale[:120],
+                )
         if verdict.action == "confirm":
             if not allow_approval:
                 # 不可交互的调用方（并发批）：显式失败，而不是交出无人认领的审批事件。
