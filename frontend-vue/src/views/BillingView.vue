@@ -90,6 +90,40 @@ interface UsageData {
   limit?: number
   /** 按模型分组时：多少个模型的厂商归属查不到（后端标，不猜） */
   provider_missing_models?: number
+  /** 按模型分组时：缺归属的模型名（回填的作用对象） */
+  provider_missing_model_list?: string[]
+  /** 回填端点路径（后端给，前端不写死） */
+  provider_backfill_url?: string
+  /**
+   * 零 token 行的来源分类（P1-7）。
+   *
+   * 缺键 = 这次没算出来（查询失败），**不等于"没有零 token 行"** —— 面板据此
+   * 整块隐藏，而不是显示一排 0。
+   */
+  zero_token_breakdown?: ZeroTokenBreakdown
+}
+
+/** 零 token 行的四个来源（互斥，合计 = total） */
+interface ZeroTokenBreakdown {
+  total: number
+  failed: number
+  aborted: number
+  upstream_no_usage: number
+  unknown: number
+  /** 口径标识（后端给）：只按 turn/run 终态判定 */
+  basis?: string
+}
+
+/** 回填端点（POST /v1/billing/backfill-provider）的预览响应 */
+interface ProviderBackfillPreview {
+  dry_run: boolean
+  period_days: number
+  candidates: { model: string; provider: string; rows: number }[]
+  unresolved: { model: string; rows: number }[]
+  would_update_rows?: number
+  updated_rows?: number
+  updated_models?: number
+  truncated?: boolean
 }
 
 /** 价格覆盖率（GET /v1/admin/billing/price-coverage） */
@@ -268,6 +302,54 @@ const totalTokens = computed(() =>
 const hasUnpricedCalls = computed(() => (usage.value?.total_unpriced_calls ?? 0) > 0)
 
 /**
+ * 零 token 记录的来源分类（P1-7）。
+ *
+ * 只显示计数 > 0 的类别：四个类别里有三个是 0 时，把它们都列出来只会让面板变成
+ * 噪声，用户还是看不出"到底为什么没有用量"。
+ *
+ * `unknown` 也要显示（不是隐藏）：它代表"我们判不出来"，藏起来等于假装分完了。
+ */
+const zeroTokenRows = computed(() => {
+  const breakdown = usage.value?.zero_token_breakdown
+  if (!breakdown || breakdown.total <= 0) return []
+  const rows = [
+    {
+      key: 'failed',
+      count: breakdown.failed ?? 0,
+      label: t('billing.zero_token_failed', { n: breakdown.failed ?? 0 }),
+      desc: t('billing.zero_token_failed_desc'),
+    },
+    {
+      key: 'aborted',
+      count: breakdown.aborted ?? 0,
+      label: t('billing.zero_token_aborted', { n: breakdown.aborted ?? 0 }),
+      desc: t('billing.zero_token_aborted_desc'),
+    },
+    {
+      key: 'upstream_no_usage',
+      count: breakdown.upstream_no_usage ?? 0,
+      label: t('billing.zero_token_upstream_no_usage', { n: breakdown.upstream_no_usage ?? 0 }),
+      desc: t('billing.zero_token_upstream_no_usage_desc'),
+    },
+    {
+      key: 'unknown',
+      count: breakdown.unknown ?? 0,
+      label: t('billing.zero_token_unknown', { n: breakdown.unknown ?? 0 }),
+      desc: t('billing.zero_token_unknown_desc'),
+    },
+  ]
+  return rows.filter(row => row.count > 0)
+})
+
+/** 缺归属的模型名（按花费倒序，后端排好）：回填按钮只在有对象时出现 */
+const providerMissingList = computed(() => usage.value?.provider_missing_model_list ?? [])
+
+/** 回填入口地址：优先用后端给的，老后端没有这个键时回落到约定路径 */
+const providerBackfillUrl = computed(
+  () => usage.value?.provider_backfill_url || '/v1/billing/backfill-provider',
+)
+
+/**
  * 明细行的花费格：缺价显示 "—"（而不是 0），并给出 tooltip 说明原因。
  *
  * 三种形态：
@@ -418,6 +500,96 @@ async function loadCoverage() {
     coverage.value = null
   }
 }
+
+// ── 明细 CSV 导出（P1-7）──
+//
+// 为什么按 blob 下载而不是直接 `window.open(url)`：导出接口要带 Authorization
+// 头（只导出本人），新窗口打开拿不到 token，直接 401。所以必须走 axios 带凭证，
+// 再把响应体转成本地 Blob 触发下载。
+//
+// 文件名与后端 Content-Disposition 的形状保持一致（`chiron-usage-<group>-<days>d-<date>.csv`）：
+// 浏览器若因跨域读不到那个头，至少本地文件名不会退化成 "download"。
+
+const exporting = ref(false)
+
+async function exportUsageCSV() {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const resp = await api.get('/v1/billing/usage/export.csv', {
+      params: { days: String(rangeDays.value), group: usageGroup.value },
+      responseType: 'blob',
+    })
+    const blob = resp.data instanceof Blob
+      ? resp.data
+      : new Blob([resp.data as string], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `chiron-usage-${usageGroup.value}-${rangeDays.value}d-${dayjs().format('YYYYMMDD')}.csv`
+    document.body.appendChild(anchor)
+    anchor.click()
+    document.body.removeChild(anchor)
+    URL.revokeObjectURL(url)
+    message.success(t('billing.usage_export_started', { days: rangeDays.value }))
+  } catch (error) {
+    message.error(errorMessageText(error, t('billing.usage_export_failed')))
+  } finally {
+    exporting.value = false
+  }
+}
+
+// ── provider 归属回填（P1-7）──
+//
+// 两步：先 `dry_run=true` 拿预览（哪个模型能填成什么厂商、影响多少行），把规模
+// 摆给用户看；确认后**才**发 `dry_run=false` 落库。一次点击可能改写上万行，
+// 所以"先预览再确认"不是可选流程，而是这个功能的默认形态。
+
+const backfillOpen = ref(false)
+const backfillLoading = ref(false)
+const backfillApplying = ref(false)
+const backfillPreview = ref<ProviderBackfillPreview | null>(null)
+
+async function startProviderBackfill() {
+  if (backfillLoading.value) return
+  backfillLoading.value = true
+  try {
+    const resp = await api.post(providerBackfillUrl.value, {
+      dry_run: true,
+      days: rangeDays.value,
+    })
+    backfillPreview.value = (resp.data?.data as ProviderBackfillPreview | undefined) ?? null
+    backfillOpen.value = true
+  } catch (error) {
+    message.error(errorMessageText(error, t('billing.provider_backfill_failed')))
+  } finally {
+    backfillLoading.value = false
+  }
+}
+
+async function confirmProviderBackfill() {
+  if (backfillApplying.value) return
+  backfillApplying.value = true
+  try {
+    const resp = await api.post(providerBackfillUrl.value, {
+      dry_run: false,
+      days: rangeDays.value,
+    })
+    const result = (resp.data?.data as ProviderBackfillPreview | undefined) ?? null
+    message.success(t('billing.provider_backfill_done', {
+      rows: result?.updated_rows ?? 0,
+      models: result?.updated_models ?? 0,
+    }))
+    backfillOpen.value = false
+    // 回填改变了供应商归属列：用量视图必须重取，否则界面还停在旧值（用户
+    // 会以为没生效，然后再点一次）。
+    await loadUsage()
+  } catch (error) {
+    message.error(errorMessageText(error, t('billing.provider_backfill_failed')))
+  } finally {
+    backfillApplying.value = false
+  }
+}
 </script>
 
 <template>
@@ -525,6 +697,30 @@ async function loadCoverage() {
         >
           {{ $t('billing.usage_price_partial', { n: usage?.total_unpriced_calls ?? 0 }) }}
         </div>
+        <!-- 零 token 记录的来源（P1-7）：一个总数说明不了"为什么没有用量"。
+             failed（值得排查）/ aborted（正常操作）/ upstream_no_usage（观测缺口）
+             三种的处置完全不同，所以分开显示；判不了的单独一档，不混进去。 -->
+        <div
+          v-if="zeroTokenRows.length"
+          class="zero-token-block"
+        >
+          <div class="breakdown-hint zero-token-hint">
+            {{ $t('billing.zero_token_hint', { n: usage?.zero_token_breakdown?.total ?? 0 }) }}
+          </div>
+          <ul class="zero-token-list">
+            <li
+              v-for="row in zeroTokenRows"
+              :key="row.key"
+              class="zero-token-item"
+            >
+              <span
+                class="zero-token-label"
+                :class="`zero-token-${row.key}`"
+              >{{ row.label }}</span>
+              <span class="zero-token-desc">{{ row.desc }}</span>
+            </li>
+          </ul>
+        </div>
       </Card>
 
       <!-- 价格覆盖率面板：回答"花费为什么算不出来"——不是统计坏了，是价格表缺行。
@@ -617,6 +813,55 @@ async function loadCoverage() {
         </div>
       </Modal>
 
+      <!-- provider 回填：先预览（dry_run），确认后才写入。预览里把"能填多少行"
+           和"还有多少查不到"一起给出 —— 只报好消息会让用户以为回填之后就全好了。 -->
+      <Modal
+        v-model:open="backfillOpen"
+        :title="$t('billing.provider_backfill_title')"
+        :confirm-loading="backfillApplying"
+        :ok-text="$t('billing.provider_backfill_confirm')"
+        @ok="confirmProviderBackfill"
+      >
+        <p class="provider-backfill-hint">
+          {{ $t('billing.provider_backfill_scope_hint') }}
+        </p>
+        <template v-if="backfillPreview">
+          <p
+            v-if="(backfillPreview.candidates?.length ?? 0) > 0"
+            class="provider-backfill-summary"
+          >
+            {{ $t('billing.provider_backfill_preview', {
+              days: backfillPreview.period_days ?? rangeDays,
+              models: backfillPreview.candidates?.length ?? 0,
+              rows: backfillPreview.would_update_rows ?? 0,
+            }) }}
+          </p>
+          <p
+            v-else
+            class="provider-backfill-summary"
+          >
+            {{ $t('billing.provider_backfill_none') }}
+          </p>
+          <ul
+            v-if="(backfillPreview.candidates?.length ?? 0) > 0"
+            class="provider-backfill-list"
+          >
+            <li
+              v-for="item in backfillPreview.candidates"
+              :key="item.model"
+            >
+              {{ $t('billing.provider_backfill_item', { model: item.model, provider: item.provider, rows: item.rows }) }}
+            </li>
+          </ul>
+          <p
+            v-if="(backfillPreview.unresolved?.length ?? 0) > 0"
+            class="provider-backfill-unresolved"
+          >
+            {{ $t('billing.provider_backfill_unresolved', { n: backfillPreview.unresolved.length }) }}
+          </p>
+        </template>
+      </Modal>
+
       <!-- 分组 / 区间切换：放在图表与明细之上，切换只重查用量 -->
       <div class="usage-filters">
         <span class="filter-label">{{ $t('billing.usage_group_by') }}</span>
@@ -633,6 +878,15 @@ async function loadCoverage() {
           option-type="button"
           @change="onUsageQueryChange"
         />
+        <!-- 导出当前口径（分组 + 区间）的明细：页面只能看，对账需要文件 -->
+        <Button
+          class="usage-export-action"
+          size="small"
+          :loading="exporting"
+          @click="exportUsageCSV"
+        >
+          {{ $t('billing.usage_export_csv') }}
+        </Button>
       </div>
 
       <!-- 按天：消耗趋势；按模型/会话：明细表 -->
@@ -709,12 +963,27 @@ async function loadCoverage() {
             }) }}
           </div>
           <!-- 厂商归属缺失：老行写入时拿不到 provider，且按模型名也查不到。
-               不猜（不按名字前缀推断），只把"我们不知道"说清楚。 -->
+               不猜（不按名字前缀推断），只把"我们不知道"说清楚。
+               旁边给「回填」入口：能反查到归属的行可以真的写回去，否则这个计数
+               永远停在那里，用户没有任何可做的下一步。 -->
           <div
             v-if="(usage?.provider_missing_models ?? 0) > 0 && usageGroup === 'model'"
-            class="breakdown-hint"
+            class="breakdown-hint provider-missing-row"
           >
-            {{ $t('billing.usage_provider_missing', { n: usage?.provider_missing_models ?? 0 }) }}
+            <span class="provider-missing-text">
+              {{ $t('billing.usage_provider_missing', { n: usage?.provider_missing_models ?? 0 }) }}
+              <template v-if="providerMissingList.length">
+                （{{ providerMissingList.join('、') }}）
+              </template>
+            </span>
+            <Button
+              size="small"
+              class="provider-backfill-action"
+              :loading="backfillLoading"
+              @click="startProviderBackfill"
+            >
+              {{ $t('billing.provider_backfill_action') }}
+            </Button>
           </div>
         </Spin>
       </Card>
@@ -743,6 +1012,26 @@ async function loadCoverage() {
 .breakdown-hint { margin-top: 10px; font-size: 12px; color: var(--text-tertiary); }
 /* 缺价标注用"提醒"色而不是错误色：数据是真的，只是金额不完整 */
 .breakdown-unpriced { color: var(--colorWarning, var(--warning)); }
+
+/* 零 token 来源分类：一个块里列计数 + 一句说明；失败用提醒色（值得排查），
+   中断与上游缺口用中性色（不是故障，也不是用户的问题）。 */
+.zero-token-block { margin-top: 10px; }
+.zero-token-hint { margin-bottom: 6px; }
+.zero-token-list { margin: 0; padding-inline-start: 18px; font-size: 12px; color: var(--text-tertiary); }
+.zero-token-item { margin-top: 3px; }
+.zero-token-label { font-weight: var(--fw-medium, 500); color: var(--text-secondary); }
+.zero-token-failed { color: var(--colorWarning, var(--warning)); }
+.zero-token-desc { margin-inline-start: 6px; }
+
+/* 缺归属行：文案在左、回填按钮在右（窄屏折行，不挤成一列） */
+.provider-missing-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.provider-missing-text { flex: 1; min-width: 180px; }
+.provider-backfill-action { padding: 0 8px; height: auto; }
+.provider-backfill-hint { margin: 0 0 10px; font-size: 12px; color: var(--text-tertiary); }
+.provider-backfill-summary { margin: 0 0 8px; font-size: 13px; color: var(--text-primary); }
+.provider-backfill-list { margin: 0 0 8px; padding-inline-start: 18px; font-size: 12px; color: var(--text-tertiary); max-height: 220px; overflow-y: auto; }
+.provider-backfill-unresolved { margin: 0; font-size: 12px; color: var(--colorWarning, var(--warning)); }
+.usage-export-action { margin-inline-start: auto; }
 
 /* 价格覆盖率：一行三项，窄屏折行 */
 .coverage-card { margin-top: 16px; }

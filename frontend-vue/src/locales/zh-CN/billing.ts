@@ -45,6 +45,36 @@ export default {
   usage_provider_missing: "有 {n} 个模型查不到厂商归属（历史记录写入时未记录，也未在模型目录中找到），因此留空而不是猜测。",
   usage_provider_missing_tooltip: "该模型的厂商归属未记录，且按模型名在模型目录/价格表中查不到；系统不会按名字前缀猜测。",
 
+  // ── 零 token 记录的来源分类（P1-7）──
+  // 口径：只按 turn/run 的终态判定，判不了归"无法判定"。不要在这里加入任何
+  // "看起来像"的推断（例如"失败多半是超时"），它会被当成事实读。
+  zero_token_hint: "本区间有 {n} 条记录没有 token 明细（调用确实发生过，只是没拿到用量），按终态区分来源：",
+  zero_token_failed: "失败：{n} 条",
+  zero_token_failed_desc: "轮次或后台 run 以失败结束，用量没能结算。",
+  zero_token_aborted: "用户中断：{n} 条",
+  zero_token_aborted_desc: "你主动停止（或引擎侧标记 abandoned/lost），属正常操作。",
+  zero_token_upstream_no_usage: "上游未回 usage：{n} 条",
+  zero_token_upstream_no_usage_desc: "轮次正常结束，但上游（provider）没有回 usage 帧，属观测缺口。",
+  zero_token_unknown: "无法判定：{n} 条",
+  zero_token_unknown_desc: "缺少对应的轮次/run 记录或仍在进行中，无法判定来源；不按猜测归类。",
+
+  // ── 明细导出（P1-7）──
+  usage_export_csv: "导出 CSV",
+  usage_export_started: "正在下载近 {days} 天的明细 CSV",
+  usage_export_failed: "导出失败",
+
+  // ── provider 归属回填（P1-7）──
+  provider_backfill_action: "回填厂商",
+  provider_backfill_title: "回填厂商归属",
+  provider_backfill_preview: "近 {days} 天有 {models} 个模型可以按模型名回填厂商，共 {rows} 行记录。",
+  provider_backfill_none: "没有可回填的模型（这些模型按名字查不到厂商归属）。",
+  provider_backfill_unresolved: "另有 {n} 个模型仍查不到归属，会保持为空（不猜测）。",
+  provider_backfill_scope_hint: "只写「厂商」这一列，不改动 token 与金额。确认前不会写入任何数据。",
+  provider_backfill_item: "{model} → {provider}（{rows} 行）",
+  provider_backfill_confirm: "确认回填",
+  provider_backfill_done: "已回填 {rows} 行（{models} 个模型）",
+  provider_backfill_failed: "回填失败",
+
   prices_title: "模型价格一览",
   prices_hint: "价格来自多个公开数据源的交叉验证，单位 USD / 1k tokens。仅作成本参考，不作为扣费依据。",
   prices_sync_now: "立即同步",
