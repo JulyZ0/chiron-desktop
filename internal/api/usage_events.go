@@ -46,6 +46,13 @@ func RecordUsageEvent(ctx context.Context, ev UsageEvent) {
 	if ev.Model == "" && ev.InputTokens == 0 && ev.OutputTokens == 0 && ev.CachedTokens == 0 {
 		return
 	}
+	// provider 归属在这里补齐（**所有写入链路的唯一漏斗**：submit / unified_usage /
+	// usage-events 上报 / OpenAI 兼容端点都经过它）。调用方给的 provider 是"本次请求
+	// 配的那个"，与"实际跑的模型属于哪个厂商"经常不一致（fallback / 子 Agent /
+	// auto 路由），而后者是可以按模型名查出来的事实。查不到就保持空 —— 不猜。
+	if ev.Provider == "" {
+		ev.Provider = resolveProviderForModel(ctx, ev.Model)
+	}
 	usageEventWrite(ctx, ev)
 }
 

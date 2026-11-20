@@ -61,14 +61,19 @@ func GetPriceCoverage(w http.ResponseWriter, r *http.Request) {
 
 	// 按租户聚合（平台 owner 的 TenantID 为 0 时不做过滤）：覆盖率是运营指标，
 	// 不该让一个租户看到别家的模型使用结构。
+	//
+	// `SUM(...)::bigint` 不能省：token 三列是 bigint，PG 的 `SUM(bigint)` 返回
+	// **numeric**，而 `FetchAll` 扫进 `*interface{}` 时得到 `pgtype.Numeric`。
+	// 漏了 cast 的后果不是报错，而是"未定价列表里的 token 数恒为 0" ——
+	// 面板看起来正常，实际把"用了多少"这一栏做废了。
 	sql := `
 		SELECT COALESCE(NULLIF(model, ''), 'unknown')            AS model,
 		       count(*)                                          AS calls,
 		       count(*) FILTER (
 		           WHERE input_tokens + output_tokens + cached_tokens > 0
 		       )                                                 AS token_calls,
-		       COALESCE(SUM(input_tokens), 0)                    AS input_tokens,
-		       COALESCE(SUM(output_tokens), 0)                   AS output_tokens,
+		       COALESCE(SUM(input_tokens), 0)::bigint             AS input_tokens,
+		       COALESCE(SUM(output_tokens), 0)::bigint            AS output_tokens,
 		       to_char(max(created_at), 'YYYY-MM-DD')            AS last_seen
 		  FROM usage_events
 		 WHERE created_at >= now() - make_interval(days => $1::int)`

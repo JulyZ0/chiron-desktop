@@ -19,10 +19,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
@@ -484,10 +487,49 @@ func intOf(v interface{}) int {
 		return int(value)
 	case float64:
 		return int(value)
+	// `pgtype.Numeric` = Postgres `numeric`。与上面的 int16 是同一类"驱动形态没被认"
+	// 的缺陷，只是触发条件更隐蔽：**`SUM(bigint)` / `AVG(bigint)` 在 PG 里返回
+	// numeric**（`SUM(int4)` 才返回 bigint）。`usage_events.input_tokens` 是 bigint，
+	// 于是计费页的 `SUM(input_tokens)` 解出来是 numeric，落进 default 返回 0 ——
+	// 用户实测形态：`usage_events` 有 30 行、token 真实非零，而 `/v1/billing/usage`
+	// 的 daily/total 全是 0，**只有 `count(*)`（int8）是对的**。
+	//
+	// 修法有两道：SQL 侧统一 `COALESCE(SUM(x),0)::bigint`（首选，类型明确），
+	// 这里再兜一层 —— 任何人新写一条 SUM 忘了 cast，也不会静默变成 0。
+	case pgtype.Numeric:
+		return numericToInt(value)
+	case *pgtype.Numeric:
+		if value == nil {
+			return 0
+		}
+		return numericToInt(*value)
 	case string:
 		if n, err := strconv.Atoi(value); err == nil {
 			return n
 		}
+		// numeric 也可能以十进制串的形态出现（"43620.0000"）：Atoi 会失败，
+		// 但这正是最需要救回来的那种值。
+		if f, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+			return int(math.Round(f))
+		}
+	}
+	return 0
+}
+
+// numericToInt 把 PG `numeric` 转成 int（截断前四舍五入）。
+//
+// 走 `Int64Value()` 而不是 `Float64Value()`：金额/计数的精度在 int64 范围内，
+// 绕一趟 float64 会在超大值上丢位；`Int64Value` 内部用 big.Int 精确换算，
+// 只在超出 int64 时才报错（那时返回 0 也胜过返回一个错得离谱的数）。
+func numericToInt(n pgtype.Numeric) int {
+	if !n.Valid {
+		return 0
+	}
+	if v, err := n.Int64Value(); err == nil && v.Valid {
+		return int(v.Int64)
+	}
+	if f, err := n.Float64Value(); err == nil && f.Valid {
+		return int(math.Round(f.Float64))
 	}
 	return 0
 }

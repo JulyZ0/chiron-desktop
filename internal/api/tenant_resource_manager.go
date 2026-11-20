@@ -232,9 +232,12 @@ func (trm *TenantResourceManager) CheckStorageQuota(ctx context.Context, tenantI
 	}
 
 	// 查询当前存储用量
+	// `::bigint` 不能省：`SUM(bigint)` 在 PG 里返回 numeric，而这里是**类型化
+	// Scan(&int64)** —— numeric 到 int64 的扫描会直接报错（不是回 0），于是配额
+	// 检查永远 fail-open，"超限"这条保护形同不存在。
 	var currentBytes int64
 	err := db.GlobalDBManager.QueryRow(ctx,
-		`SELECT COALESCE(SUM(file_size), 0) FROM media WHERE tenant_id = $1`, tenantID).Scan(&currentBytes)
+		`SELECT COALESCE(SUM(file_size), 0)::bigint FROM media WHERE tenant_id = $1`, tenantID).Scan(&currentBytes)
 	if err != nil {
 		slog.Warn("tenant resource: check storage quota failed", "tenant", tenantID, "error", err)
 		return true, 0, cfg.MaxStorageBytes // fail-open

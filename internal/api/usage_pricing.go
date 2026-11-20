@@ -125,6 +125,21 @@ func aggregateCostCents(usdTotal float64, unknown, hasUsage bool) *int {
 	return roundCents(usdTotal, hasUsage)
 }
 
+// clearPriceCache 清空进程内的单价缓存。
+//
+// **整体清空而不是只删某个键**：`fetchPrice` 的第二段查询是"规范化名前缀回落"
+// （`lower($1) LIKE lower(model) || '%'`），所以补上 `gpt-4o` 的价会改变
+// `gpt-4o-2024-08-06` 的解析结果 —— 只失效被写的那个键，会让"补了价但部分模型
+// 仍按旧价（或仍缺价）"的状态一直留到 TTL 过期（最长 5 分钟）。
+//
+// 调用点：手工设置单价（`UpsertModelPrice`）。价格是慢变量、清空代价只是多几次
+// 回源，用"宁可多查"换"改完立刻一致"。
+func clearPriceCache() {
+	priceCacheMu.Lock()
+	priceCache = map[string]priceEntry{}
+	priceCacheMu.Unlock()
+}
+
 // lookupPrice 取单价：精确名优先，回落到规范化名（去日期后缀/分隔符差异）。
 func lookupPrice(ctx context.Context, model string) priceEntry {
 	now := time.Now()
