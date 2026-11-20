@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,9 +54,32 @@ var usageGroupColumn = map[string]string{
 // 可能是 Asia/Shanghai 而 Go 侧补零用的是 UTC 日期串 —— 两边各按自己的时区切天，
 // 会让"近 N 天"的第一天/最后一天与明细互相对不上（差 8 小时的错位只在晚间出现，
 // 白天一切正常，所以极难复现）。切天口径统一到 UTC，与 `buildDailySeries` 一致。
-const usageWindow = `created_at >= (
-	date_trunc('day', now() AT TIME ZONE 'UTC') - make_interval(days => $2::int - 1)
-) AT TIME ZONE 'UTC'`
+const usageWindowBody = `date_trunc('day', now() AT TIME ZONE 'UTC') - make_interval(days => $2::int - 1)`
+
+const usageWindow = `created_at >= (` + usageWindowBody + `) AT TIME ZONE 'UTC'`
+
+// usageWindowOn 把同一个时间窗谓词限定到某张表。
+//
+// join 查询里 `turns` / `agent_runs` 也有 `created_at`，不限定表名就是**歧义列**
+// 报错（Postgres: column reference "created_at" is ambiguous）—— 而这类错误的
+// 表现是整个用量端点 500，不是少几行。窗口口径本身仍只有一份（usageWindowBody）。
+func usageWindowOn(alias string) string {
+	return usageWindowAt(alias, 2)
+}
+
+// usageWindowAt 是 usageWindowOn 的通用形态：`dayArg` 指定"天数"落在第几个占位符上。
+//
+// 聚合查询里天数恰好是 $2，但 UPDATE / 其它顺序的语句不是 —— 把序号写死会让
+// 时间窗悄悄指向错误的参数（例如 provider 回填的 UPDATE，$2 是 user_id，
+// `make_interval(days => $2)` 会直接报类型错，或更糟：按用户 id 的天数筛窗口）。
+func usageWindowAt(alias string, dayArg int) string {
+	column := "created_at"
+	if alias != "" {
+		column = alias + ".created_at"
+	}
+	body := strings.Replace(usageWindowBody, "$2", "$"+strconv.Itoa(dayArg), 1)
+	return column + ` >= (` + body + `) AT TIME ZONE 'UTC'`
+}
 
 // usageDayKey 把 `created_at` 折成**UTC** 的 `YYYY-MM-DD`，与 usageWindow 同口径。
 const usageDayKey = `to_char(date_trunc('day', created_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD')`
@@ -102,6 +126,7 @@ func GetUsage(w http.ResponseWriter, r *http.Request) {
 			InternalError(w, "usage query failed")
 			return
 		}
+		attachZeroTokenBreakdown(ctx, view, claims.UserID, days)
 		OK(w, view)
 		return
 	}
@@ -112,7 +137,23 @@ func GetUsage(w http.ResponseWriter, r *http.Request) {
 		InternalError(w, "usage query failed")
 		return
 	}
+	attachZeroTokenBreakdown(ctx, view, claims.UserID, days)
 	OK(w, view)
+}
+
+// attachZeroTokenBreakdown 给响应补上「零 token 行为什么没有用量」的分类。
+//
+// **失败只降级、不拖垮整个端点**：这是解释性数据，主聚合已经算出来了；让它
+// 把一次成功的用量查询变成 500，等于为了"附加说明"丢掉"主事实"。键缺失时前端
+// 隐藏这块面板（与覆盖率面板同一处理方式），而不是显示 0。
+func attachZeroTokenBreakdown(ctx context.Context, view map[string]any, userID string, days int) {
+	breakdown, err := usageZeroTokenBreakdown(ctx, userID, days)
+	if err != nil {
+		slog.Warn("billing usage: zero-token classification failed",
+			"user", userID, "error", err)
+		return
+	}
+	view["zero_token_breakdown"] = breakdown
 }
 
 // usageDaily 是按天视图：daily 序列 + 区间累计花费与 token。
@@ -395,6 +436,20 @@ func usageBreakdown(ctx context.Context, userID, groupBy string, days int) (map[
 		missing := enrichBreakdownProviders(ctx, breakdown)
 		view["provider_missing_models"] = missing
 		view["provider_missing"] = missing > 0
+		// 缺归属的**模型名列表**（P1-7）：只给一个计数，界面就只能说"有 N 个不知道"，
+		// 用户没有任何可操作的下一步。列表让「回填」有明确的作用对象。
+		//
+		// 顺序沿用明细（花费倒序）：用得多的模型先回填，收益最大。
+		missingModels := make([]string, 0, missing)
+		for _, row := range breakdown {
+			if stringOf(row["provider"]) == "" {
+				missingModels = append(missingModels, stringOf(row["bucket"]))
+			}
+		}
+		view["provider_missing_model_list"] = missingModels
+		// 回填入口：由后端给路径，避免"路径写死在前端、后端改路由后 404"。
+		// 该端点响应 dry_run 预览与真正写入两种模式（见 billing_provider_backfill.go）。
+		view["provider_backfill_url"] = providerBackfillPath
 	} else {
 		// 按天 / 按会话没有"单一厂商"这回事：把这些键删掉，而不是回一串
 		// `provider_missing: true` —— 那会让前端误报"归属缺失"，而事实是

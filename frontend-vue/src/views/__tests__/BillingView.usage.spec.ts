@@ -571,3 +571,269 @@ describe('BillingView 手工设置单价', () => {
     wrapper.unmount()
   })
 })
+
+// ── P1-7：零 token 来源分类 / provider 回填 / CSV 导出 ─────────────
+
+/**
+ * 零 token 记录此前只给一个总数（`zero_token_events`），用户从界面无法判断
+ * "为什么没有用量"。后端现在按 turn/run 终态给出四档，这里钉的是：
+ *  - 四档计数与各自说明必须真的渲染出来（否则等于没做）；
+ *  - 后端没给 `zero_token_breakdown`（老后端/查询失败）时整块隐藏，
+ *    **不能**显示成"0 条"，那会把"没算出来"说成"没有这种情况"。
+ */
+const USAGE_ZERO_TOKEN = {
+  group_by: 'model',
+  period_days: 30,
+  breakdown: [
+    { bucket: 'gpt-4o', event_count: 2, input_tokens: 100, output_tokens: 10, cached_tokens: 0, cost_cents: 12 },
+  ],
+  total_input: 100,
+  total_output: 10,
+  total_cached: 0,
+  total_cost: 12,
+  total_calls: 14,
+  zero_token_events: 12,
+  zero_token_breakdown: {
+    total: 12,
+    failed: 3,
+    aborted: 5,
+    upstream_no_usage: 2,
+    unknown: 2,
+    basis: 'zero_token_rows_by_turn_or_run_terminal_status',
+  },
+  daily: [],
+}
+
+describe('BillingView 零 token 来源分类（P1-7）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    stubApi()
+  })
+
+  it('四档计数与说明都渲染出来，来源可分辨', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: USAGE_ZERO_TOKEN } })
+      return Promise.resolve({ data: { data: {} } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('失败：3 条')
+    expect(text).toContain('用户中断：5 条')
+    expect(text).toContain('上游未回 usage：2 条')
+    expect(text).toContain('无法判定：2 条')
+
+    // 每一档都要有"该怎么办"的说明，否则用户只知道数字不知道意义
+    expect(text).toContain('以失败结束')
+    expect(text).toContain('主动停止')
+    expect(text).toContain('观测缺口')
+    expect(text).toContain('不按猜测归类')
+    // 有了分类就不要再叠一句"升级前记录"：同一批行两种说法会被读成两个问题
+    expect(text).not.toContain('升级前')
+  })
+
+  it('计数为 0 的类别不渲染（面板只留真实存在的来源）', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') {
+        return Promise.resolve({
+          data: {
+            data: {
+              ...USAGE_ZERO_TOKEN,
+              zero_token_breakdown: {
+                total: 2, failed: 0, aborted: 2, upstream_no_usage: 0, unknown: 0,
+              },
+            },
+          },
+        })
+      }
+      return Promise.resolve({ data: { data: {} } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('用户中断：2 条')
+    expect(text).not.toContain('失败：0 条')
+    expect(text).not.toContain('上游未回 usage：0 条')
+    expect(text).not.toContain('无法判定：0 条')
+  })
+
+  it('后端没有分类结果时整块隐藏，不显示成 0 条', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      return Promise.resolve({ data: { data: {} } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    // 标记文案：只有拿到分类结果才会出现
+    expect(wrapper.text()).not.toContain('按终态区分来源')
+  })
+})
+
+/**
+ * provider 缺失的闭环：以前只有一句"有 N 个模型不知道归属"，没有任何入口。
+ * 现在要求：
+ *  1. 列出缺归属的模型名；
+ *  2. 「回填厂商」先发 `dry_run=true` 拿预览（不写库）；
+ *  3. 预览里给出能填的模型与影响行数、以及仍然查不到的模型；
+ *  4. 确认后才发 `dry_run=false`，并重取用量（否则界面停在旧值）。
+ */
+const USAGE_PROVIDER_MISSING = {
+  group_by: 'model',
+  period_days: 30,
+  breakdown: [
+    { bucket: 'mystery-a', event_count: 3, input_tokens: 100, output_tokens: 10, cached_tokens: 0, cost_cents: 0, priced_calls: 0, unpriced_calls: 3, price_missing: true, provider: '', provider_missing: true },
+    { bucket: 'mystery-b', event_count: 1, input_tokens: 10, output_tokens: 1, cached_tokens: 0, cost_cents: 0, provider: '', provider_missing: true },
+  ],
+  total_input: 110,
+  total_output: 11,
+  total_cached: 0,
+  total_cost: 0,
+  total_calls: 4,
+  provider_missing_models: 2,
+  provider_missing_model_list: ['mystery-a', 'mystery-b'],
+  provider_backfill_url: '/v1/billing/backfill-provider',
+  daily: [],
+}
+
+const BACKFILL_PREVIEW = {
+  dry_run: true,
+  period_days: 30,
+  candidates: [
+    { model: 'mystery-a', provider: 'openai', rows: 3 },
+  ],
+  unresolved: [{ model: 'mystery-b', rows: 1 }],
+  would_update_rows: 3,
+  updated_rows: 0,
+}
+
+describe('BillingView provider 回填（P1-7）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    document.body.innerHTML = ''
+    stubApi()
+  })
+
+  it('列出缺归属模型，先预览再确认，写入后重取用量', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: USAGE_PROVIDER_MISSING } })
+      return Promise.resolve({ data: { data: {} } })
+    })
+    apiMocks.post.mockImplementation((url: string, body: { dry_run?: boolean }) => {
+      if (url !== '/v1/billing/backfill-provider') return Promise.resolve({ data: { data: {} } })
+      if (body?.dry_run === false) {
+        return Promise.resolve({
+          data: { data: { ...BACKFILL_PREVIEW, dry_run: false, updated_rows: 3, updated_models: 1 } },
+        })
+      }
+      return Promise.resolve({ data: { data: BACKFILL_PREVIEW } })
+    })
+
+    const wrapper = await mountAttached()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    // ① 缺归属的模型名必须可见（只给"2 个"用户无从判断是哪些）
+    expect(wrapper.text()).toContain('mystery-a')
+    expect(wrapper.text()).toContain('mystery-b')
+
+    const usageCallsBefore = apiMocks.get.mock.calls.filter(c => c[0] === '/v1/billing/usage').length
+
+    // ② 点「回填厂商」=> 只发预览（dry_run=true）
+    const backfillBtn = bodyButtonByText('回填厂商')
+    expect(backfillBtn).toBeTruthy()
+    backfillBtn!.click()
+    await flushPromises()
+
+    expect(apiMocks.post).toHaveBeenCalledTimes(1)
+    const [previewPath, previewBody] = apiMocks.post.mock.calls[0]
+    expect(previewPath).toBe('/v1/billing/backfill-provider')
+    // 预览绝不能带 dry_run=false —— 那是写库
+    expect(previewBody).toEqual({ dry_run: true, days: 30 })
+
+    // ③ 预览里能看到"能填成什么"和"还有多少查不到"
+    expect(document.body.textContent).toContain('mystery-a → openai')
+    expect(document.body.textContent).toContain('仍查不到归属')
+
+    // ④ 确认后才真正写入
+    const confirmBtn = bodyButtonByText('确认回填')
+    expect(confirmBtn).toBeTruthy()
+    confirmBtn!.click()
+    await flushPromises()
+
+    expect(apiMocks.post).toHaveBeenCalledTimes(2)
+    expect(apiMocks.post.mock.calls[1][1]).toEqual({ dry_run: false, days: 30 })
+
+    // ⑤ 写完重取用量：不重取的话界面还显示旧归属，用户会以为没生效
+    const usageCallsAfter = apiMocks.get.mock.calls.filter(c => c[0] === '/v1/billing/usage').length
+    expect(usageCallsAfter).toBeGreaterThan(usageCallsBefore)
+
+    wrapper.unmount()
+  })
+})
+
+/**
+ * CSV 导出：页面只能看不能带走，对账就无从谈起。
+ *  - 必须带 `responseType: 'blob'`（按 JSON 解析会把 CSV 解析坏）；
+ *  - 必须带当前分组与区间（否则导出的口径和看到的不是一份）；
+ *  - 必须真的触发一次 a[download] 点击，而不是只弹个成功提示。
+ */
+describe('BillingView 明细 CSV 导出（P1-7）', () => {
+  let clicked: HTMLAnchorElement | null = null
+  const createObjectURL = vi.fn(() => 'blob:chiron-usage')
+  const revokeObjectURL = vi.fn()
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    clicked = null
+    // jsdom 没有 createObjectURL；不补这一层，点击导出会直接抛错
+    ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = createObjectURL
+    ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = revokeObjectURL
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      clicked = this
+    })
+    stubApi()
+  })
+
+  it('按当前分组/区间请求 CSV 并触发下载', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/billing/usage/export.csv') {
+        return Promise.resolve({ data: new Blob(['session_id,day\ns-1,\n'], { type: 'text/csv' }) })
+      }
+      return Promise.resolve({ data: { data: {} } })
+    })
+
+    const wrapper = await mountAttached()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const exportBtn = wrapper.findAll('button').find(b => b.text().replace(/\s+/g, '') === '导出CSV')
+    expect(exportBtn).toBeTruthy()
+    await exportBtn!.trigger('click')
+    await flushPromises()
+
+    const call = apiMocks.get.mock.calls.find(c => c[0] === '/v1/billing/usage/export.csv')
+    expect(call).toBeTruthy()
+    // 分组 + 区间必须跟着走：导出的口径要和页面上看到的一致
+    expect(call![1]).toMatchObject({
+      params: { days: '30', group: 'model' },
+      responseType: 'blob',
+    })
+
+    // 真的点了 <a download>，且文件名以 .csv 结尾
+    expect(createObjectURL).toHaveBeenCalledTimes(1)
+    expect(clicked).toBeTruthy()
+    expect(clicked!.download.endsWith('.csv')).toBe(true)
+    expect(clicked!.download).toContain('model')
+    // 释放 blob URL：不释放会一直占着内存
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:chiron-usage')
+
+    wrapper.unmount()
+  })
+})
