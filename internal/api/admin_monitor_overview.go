@@ -43,16 +43,20 @@ type MonitorComponentError struct {
 
 // MonitorSectionMeta 是三个区块共用的"体检结果"。
 type MonitorSectionMeta struct {
-	Status  string                  `json:"status"`
-	Sources []string                `json:"sources"`
-	Errors  []MonitorComponentError `json:"errors"`
+	// GeneratedAt 是该区块的采集时刻。块级时间戳是有意的：一次 overview 里
+	// 三块是顺序采集的，慢的那块可能比快的晚几百毫秒，排障时对得上。
+	GeneratedAt time.Time               `json:"generated_at"`
+	Status      string                  `json:"status"`
+	Sources     []string                `json:"sources"`
+	Errors      []MonitorComponentError `json:"errors"`
 }
 
 func newSectionMeta(sources ...string) MonitorSectionMeta {
 	return MonitorSectionMeta{
-		Status:  monitorStatusOK,
-		Sources: sources,
-		Errors:  []MonitorComponentError{},
+		GeneratedAt: time.Now().UTC(),
+		Status:      monitorStatusOK,
+		Sources:     sources,
+		Errors:      []MonitorComponentError{},
 	}
 }
 
@@ -259,9 +263,12 @@ func (h *AdminHandler) GetMonitorOverview(w http.ResponseWriter, r *http.Request
 		WindowSeconds: int(window.Seconds()),
 		Window:        label,
 	}
-	out.Performance = h.collectMonitorPerformance(ctx, window)
+	// 引擎 /info 只拉一次：性能面板要 RSS/CPU、缓存面板要 gateway.cache，
+	// 分头再拉会让两个面板的数字来自不同瞬间（而且引擎不可达时白打两次）。
+	engineInfo := h.fetchPyEngineInfo(ctx)
+	out.Performance = h.collectMonitorPerformance(ctx, window, engineInfo)
 	out.Queue = h.collectMonitorQueue(ctx)
-	out.Cache = h.collectMonitorCache(ctx)
+	out.Cache = h.collectMonitorCache(ctx, engineInfo)
 	out.Partial = out.Performance.Status != monitorStatusOK ||
 		out.Queue.Status != monitorStatusOK ||
 		out.Cache.Status != monitorStatusOK
@@ -270,7 +277,7 @@ func (h *AdminHandler) GetMonitorOverview(w http.ResponseWriter, r *http.Request
 
 // ── 性能 ──
 
-func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window time.Duration) MonitorPerformance {
+func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window time.Duration, engineInfo *pyEngineInfo) MonitorPerformance {
 	meta := newSectionMeta(
 		"monitor.RequestWindowStats（MonitoringMiddleware 逐请求采样）",
 		"monitor.Snapshot() + runtime.ReadMemStats",
@@ -359,7 +366,7 @@ func (h *AdminHandler) collectMonitorPerformance(ctx context.Context, window tim
 		}
 	} else {
 		instances := len(h.pythonClient.StaticAddresses())
-		info := h.fetchPyEngineInfo(ctx)
+		info := engineInfo
 		if info == nil {
 			p.Engine = &MonitorEngineProcess{
 				Configured: true, Reachable: false, Instances: instances,
@@ -450,13 +457,18 @@ func (h *AdminHandler) collectMonitorQueue(ctx context.Context) MonitorQueue {
 					st.DLQDepth = &n
 				}
 			}
+			var lastID string
 			if g, err := readStreamGroupsStrict(ctx, spec.key); err == nil {
 				groups, consumers := g.Groups, g.Consumers
 				pending, lag := g.Pending, g.Lag
 				st.Groups, st.Consumers = &groups, &consumers
 				st.Pending, st.Lag = &pending, &lag
+				lastID = g.LastDeliveredID
 			}
-			if wait, at, err := oldestStreamWait(ctx, spec.key); err == nil {
+			// 最老等待只算**尚未投递**的第一条（XRANGE 从 last-delivered-id 之后取）。
+			// 直接从 "-" 取会把已被消费、尚未被 MAXLEN 修剪的老消息算成"排队中"，
+			// 队列其实已经空了也会显示几小时的等待。
+			if wait, at, err := oldestStreamWait(ctx, spec.key, lastID); err == nil {
 				st.OldestWaitSeconds, st.OldestTaskAt = wait, at
 			}
 			q.Streams = append(q.Streams, st)
@@ -542,18 +554,52 @@ func readStreamGroupsStrict(ctx context.Context, key string) (streamGroups, erro
 				out.Lag += redisToInt64(fields[i+1])
 			case "consumers":
 				out.Consumers += int(redisToInt64(fields[i+1]))
+			case "last-delivered-id":
+				id, _ := fields[i+1].(string)
+				// 多组时取**最小**的 last-delivered-id：那是最慢的一组，
+				// 它的下一条就是全局最老的未投递任务。
+				if id != "" && (out.LastDeliveredID == "" || streamIDLess(id, out.LastDeliveredID)) {
+					out.LastDeliveredID = id
+				}
 			}
 		}
 	}
 	return out, nil
 }
 
-// oldestStreamWait 读最老一条消息并换算等待时长。空 Stream 返回 (nil, "", nil)。
-func oldestStreamWait(ctx context.Context, key string) (*float64, string, error) {
+// streamIDLess 比较两个 Stream ID（`<ms>-<seq>`）的大小。
+func streamIDLess(a, b string) bool {
+	ams, aseq, _ := strings.Cut(a, "-")
+	bms, bseq, _ := strings.Cut(b, "-")
+	an, aerr := strconv.ParseInt(ams, 10, 64)
+	bn, berr := strconv.ParseInt(bms, 10, 64)
+	if aerr != nil || berr != nil {
+		return a < b
+	}
+	if an != bn {
+		return an < bn
+	}
+	as, _ := strconv.ParseInt(aseq, 10, 64)
+	bs, _ := strconv.ParseInt(bseq, 10, 64)
+	return as < bs
+}
+
+// oldestStreamWait 读**尚未投递**的第一条消息并换算等待时长。
+// afterID 为空（没有消费者组）时退回"保留的第一条"。空 Stream 返回 (nil, "", nil)。
+func oldestStreamWait(ctx context.Context, key, afterID string) (*float64, string, error) {
 	if db.Redis == nil {
 		return nil, "", fmt.Errorf("redis 未配置")
 	}
-	res, err := db.Redis.Do(ctx, "XRANGE", key, "-", "+", "COUNT", 1).Result()
+	start := "-"
+	if afterID != "" {
+		// `(` 前缀是 XRANGE 的排他起点（Redis 6.2+）。
+		start = "(" + afterID
+	}
+	res, err := db.Redis.Do(ctx, "XRANGE", key, start, "+", "COUNT", 1).Result()
+	if err != nil && afterID != "" {
+		// 老版本 Redis 不认 `(` 语法：退回"保留的第一条"，宁可偏大也不报错。
+		res, err = db.Redis.Do(ctx, "XRANGE", key, "-", "+", "COUNT", 1).Result()
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -615,7 +661,7 @@ func countRunLeases(ctx context.Context) (int64, error) {
 
 // ── 缓存 ──
 
-func (h *AdminHandler) collectMonitorCache(ctx context.Context) MonitorCache {
+func (h *AdminHandler) collectMonitorCache(ctx context.Context, engineInfo *pyEngineInfo) MonitorCache {
 	meta := newSectionMeta(
 		"Redis INFO memory/stats/keyspace",
 		"python-engine GET /info → gateway.cache",
@@ -635,12 +681,12 @@ func (h *AdminHandler) collectMonitorCache(ctx context.Context) MonitorCache {
 
 	if h.pythonClient == nil {
 		c.fail("python-engine", "引擎未配置，LLM 缓存命中未知")
-	} else if info := h.fetchPyEngineInfo(ctx); info == nil {
+	} else if engineInfo == nil {
 		c.fail("python-engine", "GET /info 不可达，LLM 缓存命中未知")
-	} else if info.Gateway.Cache == nil {
+	} else if engineInfo.Gateway.Cache == nil {
 		c.fail("python-engine", "引擎未上报 gateway.cache（旧版本或缓存未启用）")
 	} else {
-		cache := info.Gateway.Cache
+		cache := engineInfo.Gateway.Cache
 		c.LLM = &MonitorLLMCache{
 			L1Hits:         cache.L1Hits,
 			L2Hits:         cache.L2Hits,
