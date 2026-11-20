@@ -56,19 +56,29 @@ type unifiedUsage struct {
 // 形状容忍：`usage` 可能在顶层，也可能挂在 `metadata.usage` 下（引擎按工作台
 // 不同把统计放在 metadata 里），两种都要认 —— 只认一种就会出现"某个模式有账、
 // 另一个模式没有"，而这正是这条链路最初的问题形态。
-func unifiedUsageFromResponse(resp map[string]any) (unifiedUsage, bool) {
+//
+// 第三个返回值是引擎显式标注的 `usage_missing`（引擎确实发生了调用、但没拿到
+// token 明细：auto 链路的纯工具回合 / 老引擎）。它与"没有 usage 字段"同义，
+// 但保留下来是为了让记账侧能在事件上留痕，而不是把二者混成"token 是 0"。
+func unifiedUsageFromResponse(resp map[string]any) (unifiedUsage, bool, bool) {
 	if resp == nil {
-		return unifiedUsage{}, false
+		return unifiedUsage{}, false, false
 	}
 	raw, ok := resp["usage"].(map[string]any)
 	if !ok {
 		meta, _ := resp["metadata"].(map[string]any)
 		raw, ok = meta["usage"].(map[string]any)
 	}
+	missing := boolOf(resp["usage_missing"])
+	if !missing {
+		if meta, ok := resp["metadata"].(map[string]any); ok {
+			missing = boolOf(meta["usage_missing"])
+		}
+	}
 	if !ok {
-		// 没有 usage 字段：不代表没发生调用（老引擎）。返回 false 让调用方决定
-		// 要不要写"零 token 行"—— 这里选择**写**，理由见文件头。
-		return unifiedUsage{}, false
+		// 没有 usage 字段：不代表没发生调用（老引擎 / 纯工具链路）。返回 false 让
+		// 调用方决定要不要写"零 token 行"—— 这里选择**写**，理由见文件头。
+		return unifiedUsage{}, false, missing
 	}
 	return unifiedUsage{
 		Model:        strings.TrimSpace(stringOf(raw["model"])),
@@ -76,7 +86,7 @@ func unifiedUsageFromResponse(resp map[string]any) (unifiedUsage, bool) {
 		InputTokens:  intOf(raw["input_tokens"]),
 		OutputTokens: intOf(raw["output_tokens"]),
 		CachedTokens: intOf(raw["cached_tokens"]),
-	}, true
+	}, true, missing
 }
 
 // recordUnifiedUsage 把统一链路的一次调用写进 `usage_events`。
@@ -91,6 +101,7 @@ func recordUnifiedUsage(
 	sessionID, turnID, model string,
 	u unifiedUsage,
 	hasUsage bool,
+	usageMissing bool,
 ) {
 	if claims == nil {
 		return
@@ -127,6 +138,9 @@ func recordUnifiedUsage(
 		OutputTokens: u.OutputTokens,
 		CachedTokens: u.CachedTokens,
 		CostCents:    costCents,
+		// 调用发生了、但没有 token 明细：标记在事件上（不落库，派生口径见
+		// UsageEvent.UsageMissing 的注释），让"只记调用"这件事可被观测。
+		UsageMissing: usageMissing || !hasUsage,
 	})
 }
 
@@ -142,7 +156,7 @@ func recordUnifiedUsageFromResponse(
 		return
 	}
 	// 引擎侧 `success:false` 的回包同样可能带用量（半途失败的调用也是真花钱）。
-	usage, hasUsage := unifiedUsageFromResponse(resp)
+	usage, hasUsage, usageMissing := unifiedUsageFromResponse(resp)
 
 	sessionID := stringOf(requestBody["session_id"])
 	model := ""
@@ -159,7 +173,7 @@ func recordUnifiedUsageFromResponse(
 
 	if !hasUsage {
 		slog.Debug("unified usage: engine reported no usage; recording call with zero tokens",
-			"session", sessionID, "turn", turnID)
+			"session", sessionID, "turn", turnID, "model", model, "usage_missing", usageMissing)
 	}
-	recordUnifiedUsage(r, claims, sessionID, turnID, model, usage, hasUsage)
+	recordUnifiedUsage(r, claims, sessionID, turnID, model, usage, hasUsage, usageMissing)
 }

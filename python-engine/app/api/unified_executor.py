@@ -380,7 +380,12 @@ class UnifiedChatHandler:
                     if isinstance(output_data, dict)
                     else "execution failed"
                 )
-                raise RuntimeError(str(error_msg))
+                # auto 链路失败前的调用也是真实花掉的：把 TaskRouter 汇总的用量
+                # 挂在异常上带到回包（与 `_execute_via_agent` 的失败路径同口径）。
+                err = RuntimeError(str(error_msg))
+                if isinstance(result.get("usage"), dict):
+                    err.usage = result.get("usage")  # type: ignore[attr-defined]
+                raise err
 
             final_output = self._extract_output(result)
 
@@ -390,13 +395,19 @@ class UnifiedChatHandler:
                 "duration_ms": result.get("total_duration_ms"),
                 "subtasks": result.get("subtasks", []),
             }
-            # 用量（agent 模式由 `_execute_via_agent` 带回；auto 模式的路由不统计时为
-            # `None`）。**顶层与 metadata 各放一份**：网关两处都认（见
-            # internal/api/unified_usage.go），这样老/新网关都能记账，不会因为
-            # "字段挪了个位置"就静默丢账。
+            # 用量（agent 模式由 `_execute_via_agent` 带回；auto 模式由 TaskRouter
+            # 的 UsageAccumulator 汇总意图理解 + agent:* 能力的调用）。**顶层与
+            # metadata 各放一份**：网关两处都认（见 internal/api/unified_usage.go），
+            # 这样老/新网关都能记账，不会因为"字段挪了个位置"就静默丢账。
             usage_block = result.get("usage")
-            if isinstance(usage_block, dict):
+            usage_missing = not isinstance(usage_block, dict)
+            if not usage_missing:
                 meta["usage"] = usage_block
+            else:
+                # 引擎没回报用量（纯工具链路 / 老版本）：显式标注，让网关"只记一次
+                # 调用"而不是把 0 当成"已知无用量"。表里没有 usage_missing 列，持久化
+                # 口径仍由 token 全 0 派生（计费接口的 zero_token_events）。
+                meta["usage_missing"] = True
             # 多值用 kb_ids 呈现；同时保留单值的首个，避免既有前端
             # （metadata.kb_id 驱动的知识库引用标签）失效。
             if ctx_kb_ids:
@@ -458,6 +469,9 @@ class UnifiedChatHandler:
                 "output": final_output,
                 # 顶层 usage：网关据此写 `usage_events`（引擎不记账）。
                 "usage": usage_block if isinstance(usage_block, dict) else None,
+                # 无用量时显式标注（见上面 meta["usage_missing"] 的注释）：
+                # 网关记录调用、token 记 0，而不是把这次调用整个丢掉。
+                "usage_missing": usage_missing,
                 "metadata": {
                     **meta,
                     "subtasks_completed": result.get("output", {}).get(
@@ -496,6 +510,7 @@ class UnifiedChatHandler:
                 # 失败回合也可能已经消耗了 token（见 `_execute_via_agent` 的异常附件）。
                 # 没有就是 None —— 不编一个 0 出来冒充"已知无用量"。
                 "usage": getattr(e, "usage", None),
+                "usage_missing": not isinstance(getattr(e, "usage", None), dict),
             }
 
     async def _execute_via_agent(

@@ -36,7 +36,11 @@ import BillingView from '../BillingView.vue'
 
 const router = createRouter({
   history: createMemoryHistory(),
-  routes: [{ path: '/billing', component: { template: '<div />' } }],
+  routes: [
+    { path: '/billing', component: { template: '<div />' } },
+    // 补价入口的目标页：缺价面板要能真的跳过去
+    { path: '/billing/prices', component: { template: '<div />' } },
+  ],
 })
 
 const BALANCE = { balance: 1200, daily_free_limit: 10, daily_free_used: 2, daily_free_remaining: 8 }
@@ -280,5 +284,144 @@ describe('BillingView 用量分摊', () => {
     await flushPromises()
 
     expect(wrapper.text()).not.toContain('升级前')
+  })
+})
+
+// ── P1-9：缺价显示「未知」而不是 0 ─────────────────────────────────
+
+/** 缺价行：后端派生 price_missing（cost_cents IS NULL ⇒ 全部未定价） */
+const MODEL_USAGE_WITH_UNPRICED = {
+  group_by: 'model',
+  period_days: 30,
+  breakdown: [
+    // 全部已定价：显示数字，不能出现 "—"
+    { bucket: 'gpt-4o', event_count: 2, input_tokens: 100, output_tokens: 10, cached_tokens: 0, cost_cents: 12, priced_calls: 2, unpriced_calls: 0, price_missing: false },
+    // 全部缺价：显示 "—"（0 会被读成"免费"）
+    { bucket: 'mystery-model', event_count: 3, input_tokens: 900, output_tokens: 90, cached_tokens: 0, cost_cents: 0, priced_calls: 0, unpriced_calls: 3, price_missing: true },
+    // 部分缺价：金额是"已定价部分"，tooltip 说明还差几次
+    { bucket: 'half-priced', event_count: 4, input_tokens: 50, output_tokens: 5, cached_tokens: 0, cost_cents: 3, priced_calls: 1, unpriced_calls: 3, price_missing: true },
+  ],
+  total_input: 1050,
+  total_output: 105,
+  total_cached: 0,
+  total_cost: 15,
+  total_calls: 9,
+  total_priced_calls: 3,
+  total_unpriced_calls: 6,
+  price_missing: true,
+  zero_token_events: 0,
+  daily: [],
+}
+
+describe('BillingView 缺价与价格覆盖率（P1-9）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    stubApi()
+  })
+
+  it('缺价的明细行显示 "—" 与 tooltip，不用 0 冒充免费', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE_WITH_UNPRICED } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('mystery-model')
+    expect(text).toContain('—')
+
+    // tooltip 挂在单元格的 title 上（原生 title 即悬浮说明）
+    const tooltips = wrapper.findAll('td[title]').map(c => c.attributes('title') ?? '')
+    expect(tooltips.some(t => t.includes('没有可用单价'))).toBe(true)
+    // 部分缺价行：金额仍显示（已知的钱不能丢），并说明只覆盖已定价部分
+    expect(tooltips.some(t => t.includes('只统计已定价部分') || t.includes('只含已定价部分') || t.includes('已定价'))).toBe(true)
+    expect(text).toContain('3')
+  })
+
+  it('汇总卡标注"部分未定价"，不把不完整的合计当作全部花费', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE_WITH_UNPRICED } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('部分未定价')
+    expect(wrapper.text()).toContain('6')
+  })
+
+  it('全部有价时不显示缺价标注', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('部分未定价')
+    expect(wrapper.text()).not.toContain('—')
+  })
+
+  it('覆盖率卡片显示百分比、未定价模型与补价入口', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/admin/billing/price-coverage') {
+        return Promise.resolve({
+          data: {
+            data: {
+              period_days: 90,
+              total_models: 4,
+              priced_models: 3,
+              unpriced_models: 1,
+              coverage: 0.75,
+              unpriced: [
+                { model: 'mystery-model', calls: 5, token_calls: 5, input_tokens: 100, output_tokens: 10, last_seen: '2026-11-19' },
+              ],
+              prices_entry_url: '/billing/prices',
+            },
+          },
+        })
+      }
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('价格覆盖率')
+    expect(text).toContain('75%')
+    // 未定价模型要可读（补价优先级由调用数决定）
+    expect(text).toContain('mystery-model')
+    expect(text).toContain('5')
+
+    // 补价入口：点一下必须真的跳到 /billing/prices
+    const action = wrapper.findAll('button').find(b => b.text().includes('去补价格'))
+    expect(action).toBeTruthy()
+    await action!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/billing/prices')
+  })
+
+  it('覆盖率接口失败（非 admin / 老后端）时整块隐藏且不报错', async () => {
+    apiMocks.get.mockImplementation((url: string) => {
+      if (url === '/v1/billing/usage') return Promise.resolve({ data: { data: MODEL_USAGE } })
+      if (url === '/v1/admin/billing/price-coverage') return Promise.reject(new Error('403'))
+      return Promise.resolve({ data: { data: BALANCE } })
+    })
+    const wrapper = await mountView()
+    await chooseRadio(wrapper, 'model')
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).not.toContain('价格覆盖率')
+    // 也不能渲染成 0%（那会把"读不到"说成"全都没价"）
+    expect(text).not.toContain('0%')
+    // 用量明细不受影响
+    expect(text).toContain('gpt-4o')
   })
 })

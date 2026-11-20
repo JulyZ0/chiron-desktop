@@ -415,7 +415,13 @@ def _tool_executor(tool_name: str) -> Any:
 
 
 def _llm_executor(system_prompt: str) -> Any:
-    """LLM 型能力执行器工厂 (Agent 工作台) — 懒取 gateway，未初始化时 fail loud"""
+    """LLM 型能力执行器工厂 (Agent 工作台) — 懒取 gateway，未初始化时 fail loud
+
+    返回值里带 `usage`（P1-9）：auto 链路（TaskRouter）此前拿不到这些能力的
+    token 用量，统一链路的回包因此 `usage=None`，网关只能记"有一次调用、0 token"。
+    `usage` 由 `TaskRouter._execute_single_task` 摘下并登记到累加器，不会出现在
+    用户可见的聚合输出里。
+    """
 
     async def _execute(task: str, **kwargs: Any) -> dict[str, Any]:
         from app.gateway.provider import ChatMessage
@@ -430,6 +436,11 @@ def _llm_executor(system_prompt: str) -> Any:
             ChatMessage(role="system", content=system_prompt),
             ChatMessage(role="user", content=task),
         ]
+        # 模型名是网关的**价格查询键**：请求里没带就用网关默认口径（gpt-4o-mini），
+        # 不能留空 —— 空模型会让 cost_cents 恒为 NULL（"花费永远是 0"）。
+        attr_model = str(kwargs.get("model") or "") or "gpt-4o-mini"
+        attr_provider = ""
+        tok_in = tok_out = tok_cached = 0
         async for chunk in gateway.chat_stream(
             messages=messages,
             model=kwargs.get("model", ""),
@@ -437,11 +448,27 @@ def _llm_executor(system_prompt: str) -> Any:
         ):
             if getattr(chunk, "content", ""):
                 response_text += chunk.content
+            tok_in += int(getattr(chunk, "input_tokens", 0) or 0)
+            tok_out += int(getattr(chunk, "output_tokens", 0) or 0)
+            tok_cached += int(getattr(chunk, "cached_tokens", 0) or 0)
+            if getattr(chunk, "model", ""):
+                attr_model = chunk.model
+            if getattr(chunk, "provider", ""):
+                attr_provider = chunk.provider
         if not response_text:
             raise RuntimeError(
                 f"LLM capability returned empty response (task: {task[:80]})"
             )
-        return {"result": response_text}
+        return {
+            "result": response_text,
+            "usage": {
+                "model": attr_model,
+                "provider": attr_provider,
+                "input_tokens": tok_in,
+                "output_tokens": tok_out,
+                "cached_tokens": tok_cached,
+            },
+        }
 
     return _execute
 
