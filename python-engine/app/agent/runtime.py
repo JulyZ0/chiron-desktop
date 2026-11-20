@@ -2046,7 +2046,7 @@ class AgentRuntime:
                     len(messages),
                 )
 
-    async def _inject_knowledge_context(self, task: AgentTask) -> None:
+    async def _inject_knowledge_context(self, task: AgentTask) -> dict[str, Any] | None:
         """把对话里选中的知识库检索进 `task.knowledge_context`（B 断点的修复点）。
 
         * 没选库 ⇒ 什么都不做（`task.knowledge_context` 保持空串 ⇒ 段不存在 ⇒ 零行为变化）；
@@ -2054,7 +2054,12 @@ class AgentRuntime:
           用户还会以为库里没文档）；
         * 单个库失败 ⇒ 其余库照常注入，失败原因进日志 + 注入文本（可见但不致命）。
 
-        检索本身在 `app/agent/knowledge_context.py`（可注入 retriever，便于单测）。
+        检索本身在 `app/agent/knowledge_context.py`（可通过 `retriever=` 注入，便于单测）。
+
+        **返回值是给前端的结构化事件**（P1-6）：`None` = 本轮没选库（不发事件）；
+        否则返回 `{kb_ids, queried, hits, citations, zero_hit, errors}`，由 `run()` 作为
+        一条 `knowledge_retrieval` 事件发出 —— "为什么没检索到"必须能在**会话里**回答，
+        而不是只留在服务端日志里（用户看不到日志）。
 
         **为什么是同步等待（会推迟首字）**：PageIndex 是推理式检索（分钟级 LLM 工具循环），
         放到后台再"稍后插入"是不可能的 —— 上下文在第一次 LLM 调用时就定形了，事后插入
@@ -2063,10 +2068,13 @@ class AgentRuntime:
         默认与 `knowledge_service_timeout` 同口径）；超时同样会**留下可读的注入文本**。
         """
         from app.agent import knowledge_context as kb_ctx
+        from app.agent.workbench_context import context_weights
 
         kb_ids = kb_ctx.kb_ids_of(task.workbench_context)
         if not kb_ids:
-            return
+            return None
+        # 权重（P1-6）：`[{id, weight}]` 与纯字符串都接受，缺省 1.0（见 workbench_context）
+        weights = context_weights(task.workbench_context, "kb")
         try:
             injection = await asyncio.wait_for(
                 kb_ctx.collect(
@@ -2074,6 +2082,7 @@ class AgentRuntime:
                     task.content,
                     user_id=str(task.user_id or ""),
                     tenant_id=to_tenant_int(task.tenant_id or ""),
+                    weights=weights,
                 ),
                 timeout=knowledge_context_timeout(),
             )
@@ -2084,16 +2093,42 @@ class AgentRuntime:
                 f"（>{int(knowledge_context_timeout())}s）。请如实告诉用户这次没等到检索结果，"
                 "不要编造库里的内容。"
             )
-            return
+            # 超时也是"检索过、失败了"：必须作为结构化事件回前端，否则用户只看到
+            # 一个没有任何库内容的回答，无从判断是超时还是库里没有。
+            return {
+                "kb_ids": list(kb_ids),
+                "queried": len(kb_ids),
+                "hits": 0,
+                "citations": 0,
+                "zero_hit": False,
+                "errors": [
+                    {
+                        "kb_id": kb,
+                        "category": "timeout",
+                        "message": f"检索超时（>{int(knowledge_context_timeout())}s）",
+                    }
+                    for kb in kb_ids
+                ],
+            }
         except Exception as exc:  # noqa: BLE001 — 检索是增强，绝不能让整轮对话失败
             logger.warning("kb context injection skipped (%s): %s", kb_ids, exc)
             task.knowledge_context = (
                 f"【知识库检索】用户选中的知识库（{', '.join(kb_ids)}）检索过程出错：{exc}。"
                 "请如实说明这次没能读到库内容，不要臆测。"
             )
-            return
+            from app.knowledge.metrics import describe_failure
+
+            detail = describe_failure(exc)
+            return {
+                "kb_ids": list(kb_ids),
+                "queried": len(kb_ids),
+                "hits": 0,
+                "citations": 0,
+                "zero_hit": False,
+                "errors": [{"kb_id": kb, **detail} for kb in kb_ids],
+            }
         if not injection.block:
-            return
+            return injection.as_event()
         task.knowledge_context = injection.block
         from app.tools.context import set_tool_context as _set_ctx
 
@@ -2101,6 +2136,7 @@ class AgentRuntime:
         logger.info(
             "kb context injected (session=%s %s)", getattr(task, "session_id", ""), injection.summary()
         )
+        return injection.as_event()
 
     async def run(self, task: AgentTask) -> AsyncIterator[AgentEvent]:
         """
@@ -2577,7 +2613,18 @@ class AgentRuntime:
             #
             # 放在 system 段定形**之前**：注入走独立的 system 消息（`KNOWLEDGE` 段），
             # 与记忆同款处置 —— 逐轮变化的内容不能拼进逐字稳定的前缀（缓存会整段失效）。
-            await self._inject_knowledge_context(task)
+            #
+            # P1-6：检索结果同时作为**结构化事件**随回合流回前端（`knowledge_retrieval`）。
+            # 只注入不给前端等于"用户永远不知道有没有检索"——徽标让"命中 0 条"当场可见。
+            # 事件形状与 `todo_updated` 同款（类型 + JSON content）：网关的事件结构里
+            # 没有专门的字段位置，走 content 才能保证不被中间层丢掉。
+            _kb_event = await self._inject_knowledge_context(task)
+            if _kb_event:
+                yield AgentEvent(
+                    type="knowledge_retrieval",
+                    content=json.dumps(_kb_event, ensure_ascii=False),
+                    trace_id=trace_id,
+                )
 
             # G-P1：本轮 system 段的分段视图（段名 → 内容）。定形时顺手填充，供回合末的
             # `_prefix_change` 做**按名 diff** —— 诊断要能回答"哪一段变了"。

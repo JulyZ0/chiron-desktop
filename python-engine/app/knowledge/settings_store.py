@@ -220,3 +220,97 @@ async def set_cloud_folder(*, user_id: str, folder_id: str) -> None:
         user_id,
         folder_id,
     )
+
+
+# ── 逐库模型覆盖（P1-6：索引模型 / 问答模型可切换） ──
+#
+# 存哪里：**知识库行的 `config` jsonb 列**（已存在的列）。为什么不加列：迁移文件
+# 本轮冻结（并行开发下固定 revision 链），而这项覆盖天然就是"逐库设置"—— 放在
+# `user_knowledge_settings`（用户级）反而会强迫同一个用户的所有库共用一个模型。
+#
+# 缺省语义：键不存在 ⇒ 沿用网关 `/v1/internal/knowledge-model` 注入的默认模型
+# （见 pageindex-service/app/models.py 的 env → gateway 解析）。**只存显式覆盖过的值**，
+# 不把默认值抄一份进来 —— 抄进来之后"管理员改了默认模型"对所有库都不生效了。
+
+#: 允许覆盖的模型字段（键名与 pageindex-service 的 ResolvedModels 逐字对齐）。
+MODEL_OVERRIDE_KEYS: tuple[str, ...] = ("index_model", "chat_model")
+#: 模型名的长度上限：正常名字几十字符，超过这个数基本是粘错内容了。
+MAX_MODEL_NAME_LENGTH = 120
+
+
+def normalize_model_name(raw: Any) -> str:
+    """模型名收敛：去空白、拒绝换行/控制字符、限长。
+
+    非法输入**抛 `KnowledgeError`** 而不是静默截断：这是显式配置项，用户写错时
+    最该看到的是"这个名字不合法"，而不是"保存成功但检索时用了别的模型"。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if len(text) > MAX_MODEL_NAME_LENGTH:
+        raise KnowledgeError(
+            f"模型名过长（>{MAX_MODEL_NAME_LENGTH} 字符）：{text[:40]}…"
+        )
+    if any(ch.isspace() or ord(ch) < 32 for ch in text):
+        raise KnowledgeError(f"模型名不能包含空白或控制字符：{text!r}")
+    return text
+
+
+def kb_model_overrides(config: Any) -> dict[str, str]:
+    """从库的 config 里读出显式覆盖的模型（未覆盖的键**不出现**）。"""
+    from app.knowledge.service import _as_dict
+
+    data = _as_dict(config) if not isinstance(config, dict) else config
+    out: dict[str, str] = {}
+    for key in MODEL_OVERRIDE_KEYS:
+        value = normalize_model_name(data.get(key) or "")
+        if value:
+            out[key] = value
+    return out
+
+
+async def save_kb_models(
+    *, kb_id: str, index_model: str | None = None, chat_model: str | None = None
+) -> dict[str, str]:
+    """写逐库模型覆盖（``None`` = 不动该键，空串 = 清除覆盖回落到默认）。
+
+    单条 SQL 完成"删键 + 并键"：先 ``- text[]`` 删掉要清除的键，再 ``|| jsonb`` 覆盖
+    新值。读—改—写会与并发保存互相覆盖（两个标签页各存一个字段就会丢一个），
+    而这条语句的语义是确定的。
+    """
+    updates: dict[str, str] = {}
+    removals: list[str] = []
+    if index_model is not None:
+        value = normalize_model_name(index_model)
+        if value:
+            updates["index_model"] = value
+        else:
+            removals.append("index_model")
+    if chat_model is not None:
+        value = normalize_model_name(chat_model)
+        if value:
+            updates["chat_model"] = value
+        else:
+            removals.append("chat_model")
+    if not updates and not removals:
+        return kb_model_overrides((await _load_config(kb_id)))
+
+    import json
+
+    pool = await _pool()
+    await pool.execute(
+        """UPDATE knowledge_bases
+              SET config = ((COALESCE(config, '{}'::jsonb) - $2::text[]) || $3::jsonb),
+                  updated_at = NOW()
+            WHERE id = $1""",
+        kb_id,
+        removals,
+        json.dumps(updates, ensure_ascii=False),
+    )
+    logger.info("knowledge: kb=%s model overrides saved (%s)", kb_id, ",".join(updates) or "-")
+    return kb_model_overrides(await _load_config(kb_id))
+
+
+async def _load_config(kb_id: str) -> Any:
+    pool = await _pool()
+    return await pool.fetchval("SELECT config FROM knowledge_bases WHERE id = $1", kb_id)

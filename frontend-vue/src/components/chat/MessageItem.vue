@@ -29,7 +29,7 @@ import { buildKbCitationLink, kbCitationLabel, normalizeKbCitations } from '../.
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   item: ChatItem
   anchorKey?: number
   highlighted?: boolean
@@ -52,7 +52,18 @@ const props = defineProps<{
    * 那里没有对照栏可开，画一个点了没反应的按钮比不画更糟。
    */
   canOpenSubagent?: boolean
-}>()
+  /**
+   * 是否显示知识库检索徽标（P1-6）。
+   *
+   * 默认显示；**只读/对外的渲染面必须传 false**：分享页（ShareView）是给没有库权限的
+   * 人看的，那里的"检索了 3 个库、0 命中、某库 403"属于运维信息，泄露的是库的存在性与
+   * 权限边界。留一个显式开关，比在模板里各写一个 `v-if` 可靠。
+   */
+  showKnowledgeBadge?: boolean
+}>(), {
+  // 默认显示：不传的调用点（主对话流）行为与本项引入之前一致（那时根本没有这种 item）
+  showKnowledgeBadge: true,
+})
 
 /** 正文容器：mermaid 渲染需要拿到已挂载的 DOM */
 const msgTextRef = ref<HTMLElement | null>(null)
@@ -98,6 +109,33 @@ const waitSeconds = computed(() => {
   if (!('errorCode' in it) || it.errorCode !== 'session_busy') return 0
   const sec = 'errorRetryAfterSec' in it ? Number(it.errorRetryAfterSec || 0) : 0
   return sec > 0 ? Math.ceil(sec) : 0
+})
+
+/**
+ * 知识库检索徽标（P1-6）：把"检索了几个库 / 命中几条 / 有没有失败"压成一行。
+ *
+ * 三种态互斥且优先级明确：**有失败先报失败**（用户得去修配置），其次报零命中
+ * （用户该换关键词），最后才是"命中 N 条"（正常态，不需要动作）。
+ * 只读渠道（分享页）不渲染这一行 —— 见 `showKnowledgeBadge`。
+ */
+const kbBadgeText = computed(() => {
+  const it = props.item
+  if (it.kind !== 'knowledge') return ''
+  if (it.errors.length) {
+    return t('knowledge.badge_error', { kb: it.queried, errors: it.errors.length })
+  }
+  if (it.zeroHit) return t('knowledge.badge_zero_hit', { kb: it.queried })
+  return t('knowledge.badge_retrieval', { kb: it.queried, hits: it.hits })
+})
+
+const kbBadgeTitle = computed(() => {
+  const it = props.item
+  if (it.kind !== 'knowledge') return ''
+  const lines = [kbBadgeText.value]
+  if (it.kbIds.length) lines.push(`kb: ${it.kbIds.join(', ')}`)
+  if (it.citations) lines.push(`citations: ${it.citations}`)
+  for (const err of it.errors) lines.push(`${err.kbId} · ${err.category}`)
+  return lines.join('\n')
 })
 
 /**
@@ -1103,6 +1141,30 @@ watch(
   </div>
 
   <div
+    v-else-if="item.kind === 'knowledge' && showKnowledgeBadge"
+    v-bind="$attrs"
+    class="kb-badge-row"
+  >
+    <!-- 知识库检索徽标（P1-6）：回答"为什么没检索到"。
+         `role="status"` + `aria-live`：这条是**过程事实**，读屏也要播报。
+         徽标本身不放可点动作（改关键词要用户自己写），但零命中时给出明确建议 ——
+         否则用户只会看到"回答里没有库内容"然后反复重问。 -->
+    <span
+      class="kb-badge"
+      :class="{ 'zero-hit': item.zeroHit, error: item.errors.length }"
+      role="status"
+      :title="kbBadgeTitle"
+    >
+      <span class="kb-badge-icon" aria-hidden="true">{{ item.errors.length ? '⚠' : '📚' }}</span>
+      <span class="kb-badge-text">{{ kbBadgeText }}</span>
+    </span>
+    <span v-if="item.zeroHit" class="kb-badge-hint">{{ $t('knowledge.badge_zero_hit_hint') }}</span>
+    <span v-else-if="item.errors.length" class="kb-badge-hint">
+      {{ item.errors[0].category }}：{{ item.errors[0].message }}
+    </span>
+  </div>
+
+  <div
     v-else-if="item.kind === 'notice'"
     v-bind="$attrs"
     class="notice-row"
@@ -1135,6 +1197,31 @@ watch(
   background: var(--primary-bg, var(--bg-secondary));
 }
 .notice-icon { flex: none; }
+/* 知识库检索徽标（P1-6）：贴着消息流的一行小字，不抢正文的注意力，
+   但必须在滚动时一眼可辨 —— 所以用胶囊 + 三态配色（正常/零命中/失败）。 */
+.kb-badge-row {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  max-width: min(var(--chat-content-width), 92%); margin: 2px auto 4px;
+  font-size: var(--fs-xs, 12px); line-height: 1.5;
+  color: var(--text-tertiary, var(--text-secondary));
+}
+.kb-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 999px;
+  border: var(--hairline-width) solid var(--border-color, var(--border));
+  background: var(--bg-secondary);
+  cursor: default;
+}
+.kb-badge.zero-hit {
+  border-color: var(--warning-border, var(--border-color));
+  background: var(--warning-bg, var(--bg-secondary));
+}
+.kb-badge.error {
+  border-color: var(--danger-border, var(--warning-border, var(--border-color)));
+  color: var(--danger, var(--text-secondary));
+}
+.kb-badge-icon { flex: none; font-size: 11px; }
+.kb-badge-hint { color: var(--text-tertiary, var(--text-secondary)); }
 .msg-row.user { display: flex; justify-content: flex-end; }
 /* 纵向律动（CDS v1 §3.1.2）：同一回合内的行距 = 用户选的「消息间距」；
    用户消息开启新回合，所以它上方按 1.5 倍放大 —— 手册给的 turn gap / item gap

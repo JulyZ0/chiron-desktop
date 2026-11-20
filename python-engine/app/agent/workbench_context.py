@@ -28,6 +28,10 @@ def _as_str_list(raw: Any) -> list[str]:
     if isinstance(raw, (list, tuple)):
         out: list[str] = []
         for item in raw:
+            # P1-6：多库权重（`[{id, weight}]`）与纯字符串并存。这里**只取 id**，
+            # 权重走 `context_weights` —— 两个函数读同一份解析规则，调用方按需取。
+            if isinstance(item, dict):
+                item = item.get("id")
             if not isinstance(item, str):
                 continue
             value = item.strip()
@@ -35,6 +39,78 @@ def _as_str_list(raw: Any) -> list[str]:
                 out.append(value)
         return out
     return []
+
+
+#: 权重缺省值与上限。1.0 = 与引入权重之前的行为逐值相同（不改变老前端的结果）；
+#: 上限 10 是"别把某一个库权重调到吃掉全部配额"的防线（权重只影响排序，不做硬截断）。
+DEFAULT_CONTEXT_WEIGHT = 1.0
+MAX_CONTEXT_WEIGHT = 10.0
+
+
+def _coerce_weight(raw: Any) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_WEIGHT
+    if value <= 0 or value != value:  # <=0 或 NaN
+        return DEFAULT_CONTEXT_WEIGHT
+    return min(value, MAX_CONTEXT_WEIGHT)
+
+
+def context_weights(workbench_context: Any, name: str) -> dict[str, float]:
+    """读取 ``<name>_ids`` 里每个 id 的权重（缺省 1.0）。
+
+    兼容三种形态：``["a","b"]``（纯字符串，全部 1.0）、
+    ``[{"id":"a","weight":2}]``、以及两者混用。非法权重（0/负数/NaN/非数字）**回落 1.0**，
+    而不是抛错或当成 0 —— 用户手写 URL 时一个笔误不该让整个库从结果里消失。
+    """
+    ctx = workbench_context if isinstance(workbench_context, dict) else {}
+    raw = ctx.get(f"{name}_ids")
+    if not isinstance(raw, (list, tuple)):
+        # 单值回退（老前端 `?kb=xxx`）：只有 id，没有权重
+        single = _as_str_list(ctx.get(f"{name}_id"))
+        return {value: DEFAULT_CONTEXT_WEIGHT for value in single}
+    out: dict[str, float] = {}
+    for item in raw:
+        if isinstance(item, dict):
+            item_id = item.get("id")
+            weight = _coerce_weight(item.get("weight", DEFAULT_CONTEXT_WEIGHT))
+        else:
+            item_id, weight = item, DEFAULT_CONTEXT_WEIGHT
+        if not isinstance(item_id, str):
+            continue
+        key = item_id.strip()
+        if not key:
+            continue
+        # 重复 id：保留**首次**出现的权重（与 `_as_str_list` 的"去重保序"同口径）
+        out.setdefault(key, weight)
+    return out
+
+
+def merge_weighted(groups: list[tuple[float, list[T]]], limit: int) -> list[T]:
+    """按 ``weight × score`` 合并多来源结果（P1-6：多库权重）。
+
+    与 :func:`merge_by_quota` 的差别：配额合并**刻意不看分数**，因为不同知识库的
+    embedding 与索引不同、分数不可比；一旦用户显式给了权重，他要的就是"这个库更重要"
+    —— 此时不看权重反而违背意图。
+
+    口径：每个来源内部按**名次**折算分数 ``1/(rank+1)``（名次内可比，跨库不可比，
+    所以用名次而不是原始分数），再乘以该来源的权重排序。权重相等时退化为
+    "各来源首条轮流、再第二条……"，与 :func:`merge_by_quota` 结果一致 —— 老前端
+    （不传权重）看到的东西不变。
+
+    ``limit <= 0`` 返回空。
+    """
+    if limit <= 0:
+        return []
+    scored: list[tuple[float, int, T]] = []
+    for weight, items in groups:
+        effective = _coerce_weight(weight)
+        for rank, item in enumerate(items):
+            scored.append((effective / (rank + 1), rank, item))
+    # 稳定排序：分数相同则按来源顺序、组内名次 —— 结果可复现，测试不会因实现抖动
+    scored.sort(key=lambda entry: (-entry[0], entry[1]))
+    return [item for _score, _rank, item in scored[:limit]]
 
 
 def context_ids(workbench_context: Any, name: str) -> list[str]:
