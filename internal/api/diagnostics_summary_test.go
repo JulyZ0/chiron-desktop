@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/athenavi/chiron/internal/db"
+	"github.com/athenavi/chiron/internal/engine"
 )
 
 // withoutDB 把全局连接池摘掉，确保被测路径走"看不见库"的分支。
@@ -332,4 +333,145 @@ func TestDiagnosticsSummaryRouteIsExposedAndGated(t *testing.T) {
 // contains 是 strings.Contains 的小名，让表格用例读起来更短。
 func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
+}
+
+// ── 引擎侧契约（用假引擎走真实 HTTP）──────────────────────────────────────
+//
+// 这一组钉住的是**字段名与路径**：`engineTablesResult` / `engineKnowledgeState` 的
+// json tag 写错一个字符，端点照样 200，但每一行都会显示成"0 张表齐全"/"未配置地址"——
+// 那是最难自查的一种谎（数据在，解码不到）。所以用假引擎把请求路径与响应字段
+// 端到端跑一遍，并顺带确认内部令牌真的被注入（引擎侧 fail-closed，缺它会 503）。
+
+// fakeEngine 起一个只实现三个路径的假引擎，并记录收到的路径与内部令牌。
+func fakeDiagEngine(t *testing.T, handlers map[string]string) (*httptest.Server, *[]string, *[]string) {
+	t.Helper()
+	paths := &[]string{}
+	tokens := &[]string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*paths = append(*paths, r.URL.Path)
+		*tokens = append(*tokens, r.Header.Get("X-Internal-Token"))
+		body, ok := handlers[r.URL.Path]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"detail":"not found"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, paths, tokens
+}
+
+func summaryByKey(t *testing.T, checks []DiagSummaryCheck, key string) DiagSummaryCheck {
+	t.Helper()
+	for _, c := range checks {
+		if c.Key == key {
+			return c
+		}
+	}
+	t.Fatalf("清单里没有 %q 这一项", key)
+	return DiagSummaryCheck{}
+}
+
+func TestDiagnosticsSummaryDecodesEnginePayloads(t *testing.T) {
+	withoutDB(t)
+	srv, paths, tokens := fakeDiagEngine(t, map[string]string{
+		"/internal/diagnostics/tables": `{"checked":true,"required_count":25,"present_count":25,"missing":[],"missing_count":0,"detail":""}`,
+		"/v1/internal/knowledge-runtime": `{"mode":"local","service_url":"http://127.0.0.1:8100",
+			"builtin_service_url":"http://127.0.0.1:8100","default_provider":"selfhosted",
+			"service_ready":true,"service_detail":"","probe":{"ok":true,"status_code":200,"detail":""}}`,
+		"/internal/deps/list": `{"python":"3.12.0","packages":[],"count":0}`,
+	})
+
+	client := engine.NewPythonClient(srv.URL)
+	client.SetInternalToken("internal-token-for-test")
+	h := &AdminHandler{pythonClient: client}
+
+	rec := httptest.NewRecorder()
+	h.GetDiagnosticsSummary(rec, httptest.NewRequest(http.MethodGet, "/v1/admin/diagnostics/summary", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 200，得到 %d", rec.Code)
+	}
+	var body struct {
+		Data DiagSummaryResponse
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v", err)
+	}
+
+	if got := summaryByKey(t, body.Data.Checks, "tables"); got.Status != diagStateOK || !contains(got.Detail, "25") {
+		t.Errorf("tables 应为 ok 并显示 25 张表，得到 %q / %q", got.Status, got.Detail)
+	}
+	know := summaryByKey(t, body.Data.Checks, "knowledge")
+	if know.Status != diagStateOK {
+		t.Fatalf("knowledge 应为 ok，得到 %q / %q", know.Status, know.Detail)
+	}
+	// 三项事实缺一都不能算"回答清楚"：内置服务地址、默认 provider、模式。
+	for _, frag := range []string{"127.0.0.1:8100", "selfhosted", "local"} {
+		if !contains(know.Detail, frag) {
+			t.Errorf("knowledge detail 应包含 %q，得到 %q", frag, know.Detail)
+		}
+	}
+	if got := summaryByKey(t, body.Data.Checks, "deps"); got.Status != diagStateOK {
+		t.Errorf("deps 应为 ok，得到 %q / %q", got.Status, got.Detail)
+	}
+	// DB 不可用 ⇒ schema / checkpoints 仍是 unknown（引擎好不代表库好）。
+	for _, key := range []string{"schema", "checkpoints"} {
+		if got := summaryByKey(t, body.Data.Checks, key); got.Status != diagStateUnknown {
+			t.Errorf("%s 应为 unknown（DB 未起），得到 %q", key, got.Status)
+		}
+	}
+
+	// 路径必须与引擎注册的完全一致 —— 少一层前缀就是 404，而 404 会被读成"引擎坏了"。
+	for _, want := range []string{"/internal/diagnostics/tables", "/v1/internal/knowledge-runtime", "/internal/deps/list"} {
+		found := false
+		for _, p := range *paths {
+			if p == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("没有请求 %q，实际请求了 %v", want, *paths)
+		}
+	}
+	// 内部令牌必须被注入：引擎侧未配置/不匹配会 fail-closed 返回 401/503。
+	for i, tok := range *tokens {
+		if tok != "internal-token-for-test" {
+			t.Errorf("第 %d 个请求缺少 X-Internal-Token（得到 %q）", i, tok)
+		}
+	}
+}
+
+func TestDiagnosticsSummarySurfacesMissingTablesFromEngine(t *testing.T) {
+	withoutDB(t)
+	srv, _, _ := fakeDiagEngine(t, map[string]string{
+		"/internal/diagnostics/tables": `{"checked":true,"required_count":25,"present_count":23,
+			"missing":["project_checkpoints","checkpoint_untracked"],"missing_count":2,
+			"detail":"缺少必需表，请执行 alembic upgrade head"}`,
+		"/v1/internal/knowledge-runtime": `{"mode":"remote","service_url":"http://pi.internal:9100",
+			"default_provider":"selfhosted","probe":{"ok":false,"status_code":0,"detail":"服务不可达: dial tcp"}}`,
+		"/internal/deps/list": `{"python":"3.12.0","packages":[],"count":0}`,
+	})
+	h := &AdminHandler{pythonClient: engine.NewPythonClient(srv.URL)}
+
+	checks := []DiagSummaryCheck{h.checkTables(context.Background()), h.checkKnowledge(context.Background())}
+
+	tables := summaryByKey(t, checks, "tables")
+	if tables.Status != diagStateError {
+		t.Fatalf("缺表应为 error，得到 %q / %q", tables.Status, tables.Detail)
+	}
+	for _, name := range []string{"project_checkpoints", "checkpoint_untracked"} {
+		if !contains(tables.Detail, name) {
+			t.Errorf("detail 应列出 %q，得到 %q", name, tables.Detail)
+		}
+	}
+	know := summaryByKey(t, checks, "knowledge")
+	if know.Status != diagStateWarn {
+		t.Fatalf("检索服务探不通应为 warn，得到 %q / %q", know.Status, know.Detail)
+	}
+	if !contains(know.Detail, "dial tcp") {
+		t.Errorf("detail 应保留引擎给的失败原因，得到 %q", know.Detail)
+	}
 }
