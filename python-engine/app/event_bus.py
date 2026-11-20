@@ -35,6 +35,18 @@ async def emit_event(event_type: str, payload: dict[str, Any], tenant_id: int = 
     Returns:
         bool: 是否成功推送
     """
+    # 崩溃取证的"最近事件"来源：所有对外事件都经过这里，它是最便宜的统一埋点。
+    # **必须在投递之前记**：未配置 token 的跳过、投递失败，恰恰都是"引擎不对劲"的
+    # 早期信号；只记成功事件会让崩溃报告在最需要的时候是空的。
+    from app import crash_forensics
+
+    crash_forensics.record_event(
+        "event",
+        type=event_type,
+        session=payload.get("session_id"),
+        tenant=tenant_id or payload.get("tenant_id"),
+    )
+
     if not settings.internal_token:
         logger.debug("emit_event skipped: internal_token not configured")
         return False

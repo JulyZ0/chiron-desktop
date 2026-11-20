@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from app import crash_forensics
 from app.config import settings
 from app.deps import (
     verify_isolation_level,
@@ -143,6 +144,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── 0. 全局异常处理 ──
     await _install_global_exception_handler()
+    # 崩溃取证：uvicorn 在 `Server.run()` 里**后**装 SIGTERM/SIGINT 处理者，会盖掉
+    # `main()` 阶段装的那份；lifespan 启动时（此时它已在位）再套一层，才能既记录
+    # 退出原因、又保留它的优雅关停。asyncio 钩子只能挂在已运行的事件循环上。
+    crash_forensics.install_signal_handlers()
+    crash_forensics.install_asyncio_hook(asyncio.get_running_loop())
+    crash_forensics.record_event("engine-startup", port=settings.http_port)
     # ── 1. 可观测性 ──
     _start_observability()
 
@@ -240,6 +247,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("=" * 60)
     logger.info("Ready. HTTP port: %d", settings.http_port)
     logger.info("=" * 60)
+    crash_forensics.record_event("engine-ready", port=settings.http_port)
 
     yield  # ── 应用运行中 ──
 
@@ -261,10 +269,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 async def _install_global_exception_handler() -> None:
-    """安装全局异常处理器（从 `lifespan` 抽出；必须在最早期）。"""
+    """安装全局异常处理器（从 `lifespan` 抽出；必须在最早期）。
+
+    顺序有讲究：**先**装崩溃取证钩子（`crash_forensics.install()` 会把写报告的
+    hook 挂到 `sys.excepthook`），**再**把这里的结构化日志 handler 包在它外面。
+    反过来（先赋值 `sys.excepthook`）会让取证 hook 被直接覆盖 —— 真机事故里
+    日志一条 traceback 都没留下，正是因为原实现把 `sys.excepthook` 独占成了
+    "只写 logger"。
+    """
 
     import sys
     import traceback
+
+    crash_forensics.install()
+    previous_hook = sys.excepthook
 
     def global_exception_handler(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
         if issubclass(exc_type, KeyboardInterrupt):
@@ -276,6 +294,12 @@ async def _install_global_exception_handler() -> None:
                 "traceback": "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
             },
         )
+        # 链式调用：取证 hook 负责落盘，缺了它就只有日志（而日志可能正是坏的那一环）。
+        try:
+            if previous_hook is not None and previous_hook is not global_exception_handler:
+                previous_hook(exc_type, exc_value, exc_tb)
+        except Exception:  # pragma: no cover — 收尾路径不允许再抛
+            pass
 
     sys.excepthook = global_exception_handler
 
@@ -2053,6 +2077,10 @@ async def agent_submit(
 
         run_token = uuid.uuid4().hex
         _ACTIVE_RUNTIMES[session_id] = (runtime, task.user_id, run_token)
+        # 崩溃取证：报告要能回答"崩的时候谁在跑"。session 与 run token 前 8 位够定位，
+        # 不落 user_id（报告可能被用户原样贴进反馈渠道）。
+        crash_forensics.set_active_run(session_id, run_token)
+        crash_forensics.record_event("run-start", session=session_id)
         # C1 批 3+：token 交给 task —— 落盘进 checkpoint 后，接管 CAS 才能判定
         # "要接管的正是这个 run"（而不是一个已经换了主的 run）。
         task.run_token = run_token
@@ -2189,6 +2217,7 @@ async def agent_submit(
                             logger.debug("run lease stop failed: %s", lease_err)
                     if session_id:
                         _ACTIVE_RUNTIMES.pop(session_id, None)
+                        crash_forensics.clear_active_run(session_id)
 
             bg = asyncio.create_task(_finish())
             _BACKGROUND_TURNS.add(bg)
@@ -2311,6 +2340,7 @@ async def agent_submit(
                     await run_lease.stop()
                 if session_id:
                     _ACTIVE_RUNTIMES.pop(session_id, None)
+                    crash_forensics.clear_active_run(session_id)
 
     return StreamingResponse(
         event_generator(),
@@ -2690,6 +2720,10 @@ async def _run_queue_worker(redis: aioredis.Redis, gateway: Any = None) -> None:
 
 def main() -> None:
     """主函数"""
+    # 取证必须早于任何可能失败的初始化：uvicorn 起不来、前置校验 sys.exit 都走不到
+    # `create_app()`，而那些恰恰是最常见的"无声退出"。
+    crash_forensics.install()
+    crash_forensics.record_event("engine-main", port=settings.http_port)
     uvicorn.run(
         "app.main:create_app",
         factory=True,
@@ -2702,6 +2736,7 @@ def main() -> None:
 
 def create_app() -> FastAPI:
     """创建 FastAPI 应用实例（供 uvicorn factory 模式使用）"""
+    crash_forensics.install()
     # API 文档默认**关闭**：`/docs` 与 `/openapi.json` 在 `app/middleware/auth.py` 的
     # `PUBLIC_PATHS` 里是**免认证**的 —— 端口一旦被反向代理误暴露，就等于公开整个 API 契约。
     # 本地调试用 `DOCS_ENABLED=true` 打开。
@@ -2789,4 +2824,7 @@ def _setup_middleware_early(app: FastAPI) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # `sys.excepthook` 收不到 `SystemExit`（解释器把它当正常退出），而真机上
+    # `sys.exit(非零)` 是最常见的无声退出成因，所以入口自己包一层取证。
+    crash_forensics.install()
+    crash_forensics.run_guarded(main)
