@@ -1,0 +1,266 @@
+# docker-compose.integration.yml —— P0-2 真机集成测试带（一条命令跑通关键链路）
+#
+# 目标：在**干净的容器环境**里验证下面这条链路，不依赖开发机上的 .env / 本地库 /
+# 真实模型 key：
+#
+#   submit → usage_events 非零 → checkpoint 落库 + 回滚
+#          → /s/<token>（匿名分享数据）→ @知识库命中 → deps list → 隔离档切换
+#
+# 使用方法（唯一入口是 run.sh，它负责建会话、断言与清理）：
+#
+#   bash scripts/integration/run.sh
+#   make integration
+#
+# 端口刻意错开开发环境（15432/16379/18080/18000/18100/18081），
+# 与 `make dev-up`（5432/6379/8080/8000）可同时存在。
+#
+# 启动顺序靠 healthcheck 表达，而不是靠 `sleep`：
+#   postgres/redis healthy → migrate（一次性，跑完退出）→ gateway healthy
+#   → python-engine healthy（它启动时要拉网关 /v1/internal/engine-config）
+#   pageindex 侧只依赖 postgres/redis/fake-llm。
+#
+# 所有密钥都是**集成测试专用**的固定值：它们只在这套临时容器里有效，
+# 不得复制到任何真实部署。run.sh 用同一份 JWT_SECRET 现签一个 owner JWT。
+
+name: chiron-integration
+
+x-integration-secrets: &integration-secrets
+  # 三处（网关 / 引擎 / pageindex）必须逐字一致：引擎与网关都要校验 X-Internal-Token，
+  # 知识库 worker 还要用 APP_SECRET 解 Cloud key（本测试不用 Cloud，但同源更省事）。
+  APP_SECRET: integration-app-secret-0123456789abcdef
+  JWT_SECRET: integration-jwt-secret-0123456789abcdef
+  INTERNAL_TOKEN: integration-internal-token-0123456789abcdef
+  POSTGRES_DSN: postgresql://chiron:chiron@postgres:5432/chiron?sslmode=disable
+  DATABASE_DSN: postgresql://chiron:chiron@postgres:5432/chiron?sslmode=disable
+  REDIS_URL: redis://redis:6379/0
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: chiron
+      POSTGRES_PASSWORD: chiron
+      POSTGRES_DB: chiron
+      # 集成测试不关心持久性，关掉 fsync 换启动速度。
+      POSTGRES_INITDB_ARGS: --no-sync
+    command: ["postgres", "-c", "fsync=off", "-c", "synchronous_commit=off"]
+    ports:
+      - "127.0.0.1:${INTEGRATION_PG_PORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chiron -d chiron"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${INTEGRATION_REDIS_PORT:-16379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # 一次性迁移 + 种子账号。跑完即退出，网关用 service_completed_successfully 等它。
+  migrate:
+    build:
+      context: .
+      dockerfile: scripts/integration/Dockerfile.migrate
+    environment:
+      <<: *integration-secrets
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: scripts/integration/Dockerfile.gateway
+    environment:
+      <<: *integration-secrets
+      PORT: "8080"
+      BIND_HOST: 0.0.0.0
+      PYTHON_ENGINE_ADDRESS: python-engine:8000
+      PUBLIC_BASE_URL: http://127.0.0.1:${INTEGRATION_GATEWAY_PORT:-18080}
+      STORAGE_BACKEND: local
+      STORAGE_ROOT: /data/workspace
+      CHIRON_DATA_DIR: /data
+      MIGRATIONS_DIR: /app/migrations/versions
+      # 集成测试单用户单机：放开限流，避免脚本被自己的断言打到 429。
+      RATE_LIMIT_RPM: "1000"
+      RATE_LIMIT_GLOBAL: "10000"
+      LOG_LEVEL: info
+      # 本地引导会话保持关闭：脚本用共享 JWT_SECRET 自签 owner JWT，
+      # 不依赖"请求必须来自 loopback"这条产品约束（容器 NAT 后源地址不是回环）。
+      LOCAL_BOOTSTRAP: "0"
+    ports:
+      - "127.0.0.1:${INTEGRATION_GATEWAY_PORT:-18080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - projects:/srv/chiron/projects
+      - checkpoints:/srv/chiron/checkpoints
+    restart: unless-stopped
+
+  fake-llm:
+    build:
+      context: ./scripts/integration/fake_llm
+    ports:
+      - "127.0.0.1:${INTEGRATION_FAKE_LLM_PORT:-18081}:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8081/healthz')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  python-engine:
+    build:
+      context: ./python-engine
+      dockerfile: Dockerfile
+    environment:
+      <<: *integration-secrets
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "8000"
+      REDIS_ADDR: redis:6379
+      GATEWAY_INTERNAL_URL: http://gateway:8080
+      # 引擎启动时向网关拉配置；网关先 healthy 再起引擎（见 depends_on）。
+      # 假 LLM：OpenAI 兼容端点。deepseek 前缀是网关默认模型（deepseek-chat）的路由键，
+      # 两者都指向同一个假服务，避免默认模型落到真实外网。
+      OPENAI_API_KEY: mock-key
+      OPENAI_BASE_URL: http://fake-llm:8081/v1
+      DEEPSEEK_API_KEY: mock-key
+      DEEPSEEK_BASE_URL: http://fake-llm:8081/v1
+      LLM_API_KEY: mock-key
+      LLM_BASE_URL: http://fake-llm:8081/v1
+      LLM_MODEL: deepseek-chat
+      # 知识库检索走 pageindex 服务（与 worker 同一份卷）。
+      KNOWLEDGE_SERVICE_URL: http://pageindex-service:8100
+      KNOWLEDGE_LOCAL_PATH: /srv/chiron/knowledge
+      # 集成测试不跑独立 sandbox 服务；显式 opt-out（否则启动门禁会拒绝）。
+      SANDBOX_BACKEND: local
+      SANDBOX_ROOT: /srv/chiron/sandbox
+      # Linux 容器里没有 Windows 原生隔离机制，`resolve_level` 会把任何请求档位
+      # 落成 `none`；若配置层仍写默认 `restricted`，启动门禁会以"降级未确认"
+      # 拒绝启动（见 app/deps.py::verify_isolation_level）。显式配置成 none 表达
+      # "本环境本来就没有这一层"，而不是让门禁撞一次降级。
+      SANDBOX_ISOLATION_LEVEL: none
+      SANDBOX_ISOLATION_ALLOW_DOWNGRADE: "true"
+      CHIRON_CHECKPOINT_STATE_DIR: /srv/chiron/checkpoints
+      # MCP 插件池每个实例持连接；集成测试没有插件配置，关掉免得刷告警。
+      MCP_POOL_ENABLED: "false"
+      LOG_LEVEL: INFO
+    ports:
+      - "127.0.0.1:${INTEGRATION_ENGINE_PORT:-18000}:8000"
+    depends_on:
+      gateway:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      fake-llm:
+        condition: service_healthy
+      pageindex-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - projects:/srv/chiron/projects
+      - checkpoints:/srv/chiron/checkpoints
+      - knowledge:/srv/chiron/knowledge
+      - knowledge_index:/srv/chiron/knowledge_index
+      - sandbox:/srv/chiron/sandbox
+    restart: unless-stopped
+
+  pageindex-service:
+    image: chiron-integration-pageindex:local
+    build:
+      context: ./pageindex-service
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.search_api:app", "--host", "0.0.0.0", "--port", "8100"]
+    environment:
+      <<: *integration-secrets
+      PAGEINDEX_PORT: "8100"
+      # 自托管模式：模型名只是路由键，真实请求打到 fake-llm。
+      KNOWLEDGE_SELFHOSTED_ROOT: /srv/chiron/knowledge_index
+      KNOWLEDGE_LOCAL_PATH: /srv/chiron/knowledge
+      KNOWLEDGE_SELFHOSTED_INDEX_MODEL: deepseek-chat
+      KNOWLEDGE_SELFHOSTED_CHAT_MODEL: deepseek-chat
+      KNOWLEDGE_SELFHOSTED_LLM_BASE_URL: http://fake-llm:8081/v1
+      KNOWLEDGE_SELFHOSTED_LLM_API_KEY: mock-key
+      PAGEINDEX_WORKER_CONCURRENCY: "1"
+    ports:
+      - "127.0.0.1:${INTEGRATION_PAGEINDEX_PORT:-18100}:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      fake-llm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8100/healthz"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    volumes:
+      - knowledge:/srv/chiron/knowledge
+      - knowledge_index:/srv/chiron/knowledge_index
+    restart: unless-stopped
+
+  # 索引执行者：与检索服务**同一镜像**、不同入口（见 pageindex-service/Dockerfile 注释）。
+  # 少了它 KB 永远停在 pending —— @知识库那条断言就会退化成"接口 200 但没有命中"。
+  pageindex-worker:
+    image: chiron-integration-pageindex:local
+    command: ["python", "-m", "app.index_worker"]
+    environment:
+      <<: *integration-secrets
+      KNOWLEDGE_SELFHOSTED_ROOT: /srv/chiron/knowledge_index
+      KNOWLEDGE_LOCAL_PATH: /srv/chiron/knowledge
+      KNOWLEDGE_SELFHOSTED_INDEX_MODEL: deepseek-chat
+      KNOWLEDGE_SELFHOSTED_CHAT_MODEL: deepseek-chat
+      KNOWLEDGE_SELFHOSTED_LLM_BASE_URL: http://fake-llm:8081/v1
+      KNOWLEDGE_SELFHOSTED_LLM_API_KEY: mock-key
+      PAGEINDEX_WORKER_CONCURRENCY: "1"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      fake-llm:
+        condition: service_healthy
+      pageindex-service:
+        condition: service_healthy
+    volumes:
+      - knowledge:/srv/chiron/knowledge
+      - knowledge_index:/srv/chiron/knowledge_index
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  projects:
+  checkpoints:
+  knowledge:
+  knowledge_index:
+  sandbox:

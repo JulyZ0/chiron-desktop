@@ -1,0 +1,29 @@
+# 仓库根构建上下文的排除清单（供 scripts/integration/Dockerfile.gateway 与
+# Dockerfile.migrate 使用）。python-engine / pageindex-service / frontend-vue 各自
+# 以子目录为上下文构建，不受本文件影响。
+#
+# 目的只有一个：别把 node_modules / .git / 本地运行数据塞进构建上下文 ——
+# 否则每次 `docker compose build` 都要额外传输几百 MB，集成测试的启动耗时会被
+# 构建传输主导。
+
+.git
+.github
+.qoder
+logs
+.pids
+data
+workspace
+node_modules
+frontend-vue/node_modules
+frontend-vue/dist
+frontend-vue/release
+**/__pycache__
+**/*.pyc
+.venv
+venv
+.pytest_cache
+.ruff_cache
+build
+*.exe
+.env
+.env.*

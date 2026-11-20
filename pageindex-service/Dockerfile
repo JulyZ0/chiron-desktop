@@ -28,6 +28,11 @@ COPY app/ app/
 COPY tests/ tests/
 
 RUN useradd -m -u 1000 pi
+# 共享卷挂载点：索引目录（worker 写 / 检索只读）与原文目录。
+# 镜像里就建好并 chown，避免 named volume 首次挂载时被 Docker 以 root 建空目录，
+# 运行用户（uid=1000）写不进去 —— 那会表现为"索引永远停在 pending"。
+RUN mkdir -p /srv/chiron/knowledge /srv/chiron/knowledge_index \
+    && chown -R pi:pi /srv/chiron
 USER pi
 
 EXPOSE 8100

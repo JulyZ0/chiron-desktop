@@ -4,11 +4,17 @@ FROM python:3.11-slim AS base
 WORKDIR /app
 
 # 系统依赖（ffmpeg：video_analyze 抽帧需要；**不引 Python 依赖**，见 app/tools/video.py）
+#
+# git：**运行时必需**，不是开发工具。`app/agent/git_checkpoint.py` 的还原点
+# （`git init` / `read-tree` / `commit-tree` / `restore`）全部通过子进程调 git，
+# 镜像里没有它时每个回合的检查点都会落成 `state='failed'`，而 fail-open 语义
+# 让这件事只出现在日志里 —— 用户看到的是"还原点列表永远为空"。
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     libmagic1 \
     file \
     ffmpeg \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # 依赖安装（缓存层）
@@ -24,6 +30,13 @@ COPY app/ app/
 
 # 非 root 用户
 RUN useradd -m -u 1000 appuser
+# 共享卷挂载点（项目根 / 检查点 / 知识库原文与索引 / 沙箱）。
+# **必须在镜像里就建好并 chown 到运行用户**：named volume 首次挂载到不存在的路径时，
+# Docker 会以 root 建空目录，容器内 uid=1000 写不进去（表现为检查点全 failed、
+# 知识库上传 503）。目录已存在时卷会沿用镜像里的属主。
+RUN mkdir -p /srv/chiron/projects /srv/chiron/checkpoints /srv/chiron/sandbox \
+        /srv/chiron/knowledge /srv/chiron/knowledge_index \
+    && chown -R appuser:appuser /srv/chiron
 USER appuser
 
 # 端口

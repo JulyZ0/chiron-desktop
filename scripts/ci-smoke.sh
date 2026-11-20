@@ -17,12 +17,16 @@
 # 用法：
 #   bash scripts/ci-smoke.sh          # 全量
 #   bash scripts/ci-smoke.sh --fast   # 跳过前端 typecheck/单测/构建（仍跑打包静态冒烟）
+#   bash scripts/ci-smoke.sh --integration
+#                                     # 追加 P0-2 真机集成测试带（docker compose，数分钟）；
+#                                     # 默认**不跑**；缺 docker / 守护进程未启动时按 skipped 处理
+#                                     # （run.sh 以 77 退出，不算失败）
 #
 # 环境变量：
-#   CHIRON_SMOKE_SKIP=go,python,frontend  跳过指定环节（局部调试用）
+#   CHIRON_SMOKE_SKIP=go,python,frontend,integration  跳过指定环节（局部调试用）
 #
 # 前置：go / node / python 在 PATH 上；全量前端需要 `frontend-vue/node_modules`
-# （先 `pnpm install --frozen-lockfile`）。
+# （先 `pnpm install --frozen-lockfile`）；--integration 需要 docker compose。
 
 set -u
 
@@ -30,15 +34,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
 FAST=0
+INTEGRATION=0
 for arg in "$@"; do
   case "$arg" in
     --fast) FAST=1 ;;
+    --integration) INTEGRATION=1 ;;
     -h | --help)
-      sed -n '2,28p' "$0"
+      sed -n '2,32p' "$0"
       exit 0
       ;;
     *)
-      echo "未知参数：$arg（可用：--fast）" >&2
+      echo "未知参数：$arg（可用：--fast --integration）" >&2
       exit 2
       ;;
   esac
@@ -207,7 +213,20 @@ stage_frontend_full() {
   npx vite build
 }
 
-echo "ci-smoke：root=$ROOT fast=$FAST"
+# ── 5. 真机集成测试带（opt-in）────────────────────────────────────────────
+# 默认不跑：它要 docker compose 起 PG/Redis/网关/引擎/pageindex/假 LLM，数分钟起。
+# run.sh 的契约是"环境不具备 → 77"，这里翻译成 stage 的"跳过（2）"，与 go/python
+# 两边缺失依赖的语义一致；真正的断言失败仍然是 1。
+stage_integration() {
+  bash scripts/integration/run.sh
+  local rc=$?
+  if [ "$rc" -eq 77 ]; then
+    return 2
+  fi
+  return "$rc"
+}
+
+echo "ci-smoke：root=$ROOT fast=$FAST integration=$INTEGRATION"
 
 if skipped go; then
   skip_stage "go（build + 单测）" "CHIRON_SMOKE_SKIP 指定"
@@ -233,6 +252,16 @@ else
   else
     stage "frontend 全量（check:ui / vue-tsc / vitest / vite build）" stage_frontend_full
   fi
+fi
+
+if [ "$INTEGRATION" = "1" ]; then
+  if skipped integration; then
+    skip_stage "integration（真机 compose 链路）" "CHIRON_SMOKE_SKIP 指定"
+  else
+    stage "integration（真机 compose 链路）" stage_integration
+  fi
+else
+  skip_stage "integration（真机 compose 链路）" "默认跳过；加 --integration 开启"
 fi
 
 echo ""

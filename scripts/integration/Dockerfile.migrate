@@ -1,0 +1,21 @@
+# Dockerfile.migrate —— 一次性迁移容器（alembic upgrade head + 集成测试种子账号）。
+#
+# 为什么要独立镜像而不是用网关镜像跑迁移：
+#   应用镜像里**没有** python/alembic（发布原则见 requirements-migrate.txt 的注释：
+#   "应用不自行迁移"）。把迁移依赖塞进网关镜像等于把一条运维通道焊进运行时。
+#
+# 构建上下文 = 仓库根，因为需要 alembic.ini 与 migrations/。
+
+FROM python:3.11-slim
+
+WORKDIR /migrate
+
+COPY requirements-migrate.txt ./
+RUN pip install --no-cache-dir -r requirements-migrate.txt
+
+COPY alembic.ini ./
+COPY migrations ./migrations
+COPY scripts/integration/migrate_entrypoint.py ./migrate_entrypoint.py
+
+# DATABASE_DSN 由 compose 注入（与 POSTGRES_DSN 同值；env.py 只认 DATABASE_DSN）。
+CMD ["python", "migrate_entrypoint.py"]
