@@ -1,11 +1,23 @@
 """隔离档位 API —— 查询、切换、撤销（内部端点，共享密钥校验）。
 
-四个端点：
+六个端点：
 
 - ``GET    /v1/system/isolation``         当前档位：请求值 / 实际值 / 能力矩阵 / 可选档位
 - ``PUT    /v1/system/isolation``         切换档位（**只在进程内生效，不写 .env**）
 - ``DELETE /v1/system/isolation``         撤销运行时覆盖，回到配置文件的值
 - ``POST   /v1/system/isolation/revoke``  撤销**磁盘产物**（AppContainer profile、目录标签）
+- ``GET    /v1/system/isolation/helper``  提权助手状态（``restricted`` 档的执行前置）
+- ``POST   /v1/system/isolation/helper``  启用提权助手（**弹一次 UAC**）
+- ``DELETE /v1/system/isolation/helper``  停用提权助手
+
+## 关于 `/isolation/helper` 的三条
+
+网关（`internal/api/routes_proxy.go`）**必须**同时注册这三条。缺 GET，前端
+``helperStatus`` 恒为 null，界面既不提示"助手挡住了 restricted"，也不会出现
+「启用助手」按钮；缺 POST，点了只会拿到前端兜底文案
+（真机事故：界面显示「启用助手失败：本机无法启用此档位」，而那不是引擎说的
+任何一句话，是网关 404 被前端兜底文案盖住了）；缺 DELETE，用户无法撤销这条
+提权通道。
 
 ## 为什么切换不写 .env
 
@@ -120,13 +132,23 @@ async def get_isolation(request: Request) -> dict[str, Any]:
 
     返回里 ``requested`` 是**配置请求值**，``effective`` 是**本机真能提供的值**。
     两者不同就是发生了降级 —— 前端必须把这件事显示出来，否则就是"静默降级"。
+
+    ``status()`` 里的可用性判定是**端到端冒烟**（真的起一个子进程），首次调用
+    可能要数秒（`restricted` 走 helper 时要多一跳 HTTP）。所以它必须放到线程里跑：
+    这是一条 ``async`` 端点，同步探测会把整个引擎事件循环堵住 —— 同进程里正在
+    流式输出的对话、正在轮询的会话全都会跟着卡住，而用户只是打开了设置页。
     """
     _verify_gateway_key(request)
-    payload = iso.status()
+    payload = await asyncio.to_thread(_status_payload)
     payload["runtime_override"] = (
         iso.runtime_override().value if iso.runtime_override() is not None else None
     )
     return payload
+
+
+def _status_payload() -> dict[str, Any]:
+    """`iso.status()` 的线程内入口（见各端点里关于事件循环的说明）。"""
+    return iso.status()
 
 
 @router.put("/isolation")
@@ -142,13 +164,37 @@ async def set_isolation(body: LevelChange, request: Request) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    result = await asyncio.to_thread(
+        _switch_level, level, body.acknowledge_below_floor, _actor(request), body.reason
+    )
+    return result
+
+
+def _switch_level(
+    level: iso.Level,
+    acknowledge: bool,
+    actor: str,
+    reason: str,
+) -> dict[str, Any]:
+    """切换档位并返回切换后的完整状态（**在一个线程里**跑完）。
+
+    为什么整段要在线程里：`resolve_level()` / `status()` 都会触发端到端探测，
+    同步跑会堵住事件循环（见 `get_isolation`）。把"探测 + 切档"收进同一个线程，
+    也保证 ``running_processes_unaffected`` 用的是同一份前后快照。
+    """
     # 必须在 set 之前取：configured_level() 会把 runtime_override 算进去，
     # 设置之后再取就拿不到"配置文件原本是什么"了。
     previous = iso.runtime_override()
     config_level = iso.configured_level()
-    previous_decision = iso.resolve_level()
+    # 切前的实际档位取 `status()["effective"]` 而不是裸 `resolve_level()`：
+    # `status()` 里每个档位的探测各自 try/except（`_level_executable`），
+    # 某一档探测出问题只会让那一档不可选，不会把整个切换动作打成 500。
+    # 否则"关掉隔离"会被与它无关的前置探测（受限令牌 helper / AppContainer）
+    # 挡住 —— 用户明明要的是"不要隔离"，却被要求先修好隔离。
+    before = iso.status()
 
-    iso.set_runtime_level(level, acknowledge_below_floor=body.acknowledge_below_floor)
+    iso.set_runtime_level(level, acknowledge_below_floor=acknowledge)
+    state = iso.status()
     decision = iso.resolve_level()
 
     iso.record_level_change(
@@ -156,16 +202,16 @@ async def set_isolation(body: LevelChange, request: Request) -> dict[str, Any]:
         requested=decision.requested.value,
         effective=decision.effective.value,
         previous=previous.value if previous is not None else None,
-        actor=_actor(request),
-        reason=body.reason,
+        actor=actor,
+        reason=reason,
     )
 
     # 切换**立刻**影响后续执行，但已经在跑的进程不受影响（各自的隔离在 spawn 时定了）。
     # 把这件事明说，否则用户会以为改完就能约束正在运行的进程。
-    running = previous_decision.effective != decision.effective
+    running = before["effective"] != state["effective"]
 
     return {
-        **iso.status(),
+        **state,
         "runtime_override": level.value,
         "running_processes_unaffected": running,
         "note": (
@@ -184,23 +230,28 @@ async def clear_isolation(request: Request) -> dict[str, Any]:
     """
     _verify_gateway_key(request)
 
+    previous, state = await asyncio.to_thread(_clear_level, _actor(request))
+    return {
+        **state,
+        "runtime_override": None,
+        "cleared": previous.value if previous is not None else None,
+    }
+
+
+def _clear_level(actor: str) -> tuple[iso.Level | None, dict[str, Any]]:
     previous = iso.clear_runtime_level()
     decision = iso.resolve_level()
+    state = iso.status()
 
     iso.record_level_change(
         action="clear",
         requested=decision.requested.value,
         effective=decision.effective.value,
         previous=previous.value if previous is not None else None,
-        actor=_actor(request),
+        actor=actor,
         reason="撤销运行时覆盖",
     )
-
-    return {
-        **iso.status(),
-        "runtime_override": None,
-        "cleared": previous.value if previous is not None else None,
-    }
+    return previous, state
 
 
 @router.post("/isolation/revoke")
@@ -232,6 +283,23 @@ async def revoke_isolation(request: Request) -> dict[str, Any]:
 #
 # 为什么不需要额外做"仅本地可调"限制：`_verify_gateway_key` 已经要求网关凭据，
 # 而网关本身只听本机回环（桌面端形态）。
+
+#: 启用助手失败时的**兜底**原因。
+#:
+#: 必须是一句能让用户动手的话，而不是"本机无法启用此档位"那种把三种事故
+#: （用户取消 / 真的起不来 / 网关不通）混成一句的空话 —— 那句话此前还会因为
+#: 网关缺路由而在**任何**机器上稳定出现。
+HELPER_START_FALLBACK_REASON = "未能启动提权助手（原因未上报）"
+
+#: 与失败原因并列给前端的**可执行指引**，前端单独渲染，不与 reason 混排。
+#:
+#: 放在后端而不是前端文案里：这条指引与"实际要发生什么"强绑定（弹一次 UAC、
+#: 用哪个账户批准），改动它们的是引擎侧的启动逻辑。
+HELPER_START_HINT = (
+    "启用「受限令牌」档需要在系统授权（UAC）窗口点一次「是」。"
+    "若窗口没有出现，请检查安全软件是否拦住了提权进程；"
+    "若你用非管理员账户登录，请在窗口里输入任意管理员账户的凭据。"
+)
 
 
 @router.get("/isolation/helper")
@@ -271,10 +339,15 @@ async def start_helper(request: Request) -> dict[str, Any]:
         # 两份缓存（本包的 `_restricted_ok` 与 win_launch 的 `_smoke_ok`）一起清。
         iso.reset_probes()
 
+    # **一次**探测同时供三处使用：返回给前端的档位状态、审计里的 effective、
+    # 以及 helper 最新状态。探测是端到端冒烟（真起一个受限进程），重复探测
+    # 既慢又可能给出前后不一致的结论（"界面说可用、审计说降级"）。
+    state = await asyncio.to_thread(_status_payload)
+
     iso.record_level_change(
         action="helper_start",
-        requested=iso.configured_level().value,
-        effective=iso.resolve_level().effective.value,
+        requested=state["requested"],
+        effective=state["effective"],
         previous=None,
         actor=_actor(request),
         reason="" if ok else ("用户取消 UAC" if cancelled else f"失败：{reason}"),
@@ -285,9 +358,10 @@ async def start_helper(request: Request) -> dict[str, Any]:
         # 「你取消了授权」还是「启用失败」两种完全不同的提示，而 `reason` 是
         # 人类可读字符串、措辞会随版本变化。
         "cancelled": cancelled,
-        "reason": "" if ok else (reason or "提权助手启动失败"),
+        "reason": "" if ok else (reason or HELPER_START_FALLBACK_REASON),
+        "hint": "" if ok else HELPER_START_HINT,
         "helper": await asyncio.to_thread(_helper_status_payload),
-        **iso.status(),
+        **state,
     }
 
 
@@ -304,10 +378,11 @@ async def stop_helper(request: Request) -> dict[str, Any]:
     ok, reason = await asyncio.to_thread(win_launch.helper_stop)
     iso.reset_probes()
 
+    state = await asyncio.to_thread(_status_payload)
     iso.record_level_change(
         action="helper_stop",
-        requested=iso.configured_level().value,
-        effective=iso.resolve_level().effective.value,
+        requested=state["requested"],
+        effective=state["effective"],
         previous=None,
         actor=_actor(request),
         reason="" if ok else f"失败：{reason}",
@@ -316,6 +391,6 @@ async def stop_helper(request: Request) -> dict[str, Any]:
         "ok": ok,
         "reason": "" if ok else (reason or "提权助手未能退出"),
         "helper": await asyncio.to_thread(_helper_status_payload),
-        **iso.status(),
+        **state,
     }
 

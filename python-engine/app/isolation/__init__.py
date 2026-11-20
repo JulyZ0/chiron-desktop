@@ -247,6 +247,28 @@ class IsolationDecision:
         return f"isolation={self.effective.value}（请求 {self.requested.value}，降级: {detail}）"
 
 
+def _probe_safely(probe: Any, label: str) -> bool:
+    """跑一个可用性探测，**异常一律当作"不可用"**。
+
+    为什么不能让它抛出去：`resolve_level()` 是所有档位共同的判据入口 ——
+    启动门禁、`GET /v1/system/isolation`、`PUT` 切档、每次 `require_or_raise`
+    都会经过它。某一个档位的探测（例如受限令牌要端到端起一个进程、还可能要
+    ping 提权 helper）抛异常，会把**所有**档位的判定一起打成失败：
+
+    * 用户想切到 `none`（"我不要隔离"）时收到 500，理由却来自他根本没选的
+      `restricted` 探测 —— 诉求与报错毫无关系；
+    * 引擎启动门禁变成"某个高档位探测崩了 ⇒ 整个引擎起不来"。
+
+    探测失败的语义本来就只有一个：这一档现在不可用。所以在这里收口，
+    并把异常记进日志（丢失它会让"为什么这档突然不可用"无从查起）。
+    """
+    try:
+        return bool(probe())
+    except Exception as exc:  # noqa: BLE001 — 见 docstring：探测失败 = 该档不可用
+        logger.warning("isolation probe %s failed: %s", label, exc)
+        return False
+
+
 def resolve_level(requested: Level | None = None) -> IsolationDecision:
     """把"请求的档位"落到"本机真能提供的档位"。
 
@@ -308,11 +330,11 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
             want = FLOOR_LEVEL
 
     # Job Object 是所有高于 none 的档位共同的地基
-    if want.rank >= Level.JOB.rank and not _probe_job():
+    if want.rank >= Level.JOB.rank and not _probe_safely(_probe_job, "job"):
         reasons.append("Job Object 不可用")
         return IsolationDecision(want, Level.NONE, reasons, below_floor=True)
 
-    if want.rank >= Level.LOW_IL.rank and not _probe_low_il():
+    if want.rank >= Level.LOW_IL.rank and not _probe_safely(_probe_low_il, "low_il"):
         reasons.append("Low 完整性级别不可设置")
         return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
 
@@ -328,11 +350,11 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
             return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
 
     if want is Level.RESTRICTED:
-        if not _probe_restricted():
+        if not _probe_safely(_probe_restricted, "restricted"):
             # 把**具体**原因写进 reasons：`exec_unavailable_reason()` 会说清是
             # "未以管理员身份运行"还是"令牌造不出来"。只写"不可用"等于让用户
             # 去查 Win32 错误码才知道该做什么。
-            if win_token.probe():
+            if _probe_safely(win_token.probe, "restricted-token"):
                 reasons.append(
                     win_token.exec_unavailable_reason() or "受限令牌执行层不可用（原因未知）"
                 )
@@ -389,7 +411,7 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
         # 因此不要求 `SeIncreaseQuotaPrivilege` —— 普通（非提权）账户也能用。
         # 本机实测：非提权下 `restricted` 恒 `err=5`（`CreateProcessAsUserW` 起不来），
         # 而 AppContainer 冒烟测试通过。所以它才是这台机器上真正可达的高档位。
-        if not _probe_appcontainer():
+        if not _probe_safely(_probe_appcontainer, "appcontainer"):
             reasons.append(
                 _appcontainer_probe_error() or "AppContainer 执行层不可用（原因未知）"
             )

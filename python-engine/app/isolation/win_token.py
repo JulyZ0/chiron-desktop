@@ -230,6 +230,13 @@ def _k32() -> Any:
     lib.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
     lib.LocalFree.restype = ctypes.c_void_p
     lib.LocalFree.argtypes = [ctypes.c_void_p]
+    # `OpenProcess` 的返回类型**必须**显式声明成 HANDLE。
+    # 不声明时 ctypes 按 `c_int`（32 位）解析返回值，64 位句柄会被截断：
+    # 在 `elevated_helper._parent_alive` 里表现为 `GetExitCodeProcess(截断后的句柄)`
+    # 失败 → 判定"父进程已死" → 提权 helper 启动约 2 秒后自杀，
+    # 用户看到的是"助手启用成功但档位仍不可用"，日志里只有一句"父进程已退出"。
+    lib.OpenProcess.restype = wt.HANDLE
+    lib.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
     return lib
 
 

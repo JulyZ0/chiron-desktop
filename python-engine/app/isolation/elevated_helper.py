@@ -388,7 +388,21 @@ def main(argv: list[str] | None = None) -> int:
         help="引擎 pid；它退出后 helper 自动结束（0 表示不监视）",
     )
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
+    parser.add_argument(
+        "--state-dir",
+        default="",
+        help=(
+            "密钥/端口文件所在目录。由引擎下发：标准用户走 UAC 时 helper 运行在"
+            "另一个管理员账户下，其 LOCALAPPDATA 与引擎不同，不指定就会读不到密钥"
+            "（注意：help 文本里不能出现裸的百分号，argparse 会把它当格式符解析）"
+        ),
+    )
     args = parser.parse_args(argv)
+
+    from app.isolation import elevated_protocol as proto
+
+    if args.state_dir:
+        proto.set_state_dir(args.state_dir)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

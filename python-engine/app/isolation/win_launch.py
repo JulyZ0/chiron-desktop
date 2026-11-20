@@ -429,10 +429,21 @@ def launch_restricted(
 
     ## 两条执行路径
 
-    1. **提权 helper**（优先）：`CreateProcessAsUserW` 需要 `SeIncreaseQuotaPrivilege`，
-       只有提权令牌才有。引擎自己不提权（它承载模型输出，爆炸半径最大），所以
-       正常路径是把请求交给那个瘦 helper 去做。
-    2. **本进程直接建**：仅当本进程恰好已提权（用户以管理员运行引擎）。
+    1. **本进程已提权**（用户以管理员运行引擎，或者**调用方就是提权 helper 自己**）：
+       直接走 `_launch_restricted_local`。
+    2. **本进程未提权**：交给提权 helper（`CreateProcessAsUserW` 需要
+       `SeIncreaseQuotaPrivilege`，只有提权令牌才有）。引擎自己不提权（它承载
+       模型输出，爆炸半径最大），所以这才是桌面端的正常路径。
+
+    顺序**必须**是"先判提权、再考虑 helper"，不能反过来先试 helper：
+
+    提权 helper 收到 `/v1/exec` 后调用的正是本函数。若这里仍优先走 helper，
+    而 helper 自己 `is_admin()` 为真、`helper_available()` 又会 ping 到**自己**
+    （端口文件是它写的），于是它会向自己发一条 `/v1/exec` —— 无限递归，
+    每层多一个线程、每层等一个超时，请求永不返回。表现是"助手启用成功，
+    档位却永远不可用"，同时在用户机上泄漏大量阻塞线程。
+    `tests/test_isolation_restricted_enable.py` 的
+    `test_elevated_process_never_goes_through_the_helper` 钉住这个顺序。
 
     两条路径都失败时才返回 `spawn_error`。**绝不**退回无隔离执行 ——
     `spawn_error` 非空就是"拒绝执行"。
@@ -444,16 +455,22 @@ def launch_restricted(
 
     超时后 `TerminateProcess` 直接终结，不等它优雅退出：受限进程可能卡在等输入上。
     """
-    helper_result = _via_helper(argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output)
-    if helper_result is not None:
-        # helper 起来了，或者本进程也没提权（没有第二条路可走）——
-        # 两种情况都如实返回，让调用方按 fail-closed 处理。
-        if helper_result.started or not is_admin():
-            return helper_result
-        logger.warning(
-            "helper 执行失败（%s），本进程已提权，改走本地路径", helper_result.spawn_error
+    if is_admin():
+        # 本进程已有 SeIncreaseQuotaPrivilege：多绕一跳 helper 只会更慢，
+        # 而且在 helper 进程内绕回自己会成环（见上面的说明）。
+        return _launch_restricted_local(
+            argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output
         )
 
+    helper_result = _via_helper(argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output)
+    if helper_result is not None:
+        # helper 已给出结论（成功或真实失败）。未提权时没有第二条路可走，
+        # 如实返回让调用方按 fail-closed 处理。
+        return helper_result
+
+    # helper 这条路不适用（未启动 / 未提权 / 客户端不可用）时才落到本地：
+    # 非提权下这里会稳定 err=5，但那条错误串带 Win32 细节，比"helper 不可用"
+    # 更能说明"到底是谁没做成"。
     return _launch_restricted_local(
         argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output
     )
@@ -534,7 +551,23 @@ def helper_start(parent_pid: int | None = None) -> tuple[bool, str, bool]:
     ready, wait_reason = client.wait_ready()
     if not ready:
         # UAC 同意了但它没起来：把原因如实带出去，别让用户以为"授权成功了"。
-        return False, f"helper 已启动但未就绪（{wait_reason or '未知原因'}）", False
+        #
+        # 这句必须**可行动**。此前只写"helper 已启动但未就绪（缺少端口文件）"，
+        # 用户能做的最多是把同一件事再做一遍；而这条路上的失败几乎总是下面两种，
+        # 且处置方式完全不同：
+        #   * UAC 窗口里用了**其他管理员账户**（标准用户的唯一选择）—— helper 运行在
+        #     另一个账户下。现在引擎会把 `--state-dir` 显式下发（见
+        #     `elevated_client.helper_argv`），所以正常不该再出现；若仍出现，说明
+        #     那个账户连该目录都读不了（权限被改过），需要改用当前账户批准。
+        #   * 安全软件拦截了提权子进程 —— 它不会出现在任何日志里，只能靠用户放行。
+        return (
+            False,
+            f"提权助手已启动但未就绪（{wait_reason or '未知原因'}）。"
+            "请在 UAC 窗口里用**当前登录账户**允许一次；若窗口里输入的是其他管理员账户，"
+            "助手会以该账户身份运行，可能读不到本机的共享密钥与端口文件。"
+            "另外请检查安全软件是否拦截了提权进程。",
+            False,
+        )
 
     # 就绪后必须清探测缓存：`_probe_restricted` 之前算出的"不可用"现在过期了。
     # 漏了这一步，用户会看到"授权成功了但档位还是灰的"。
