@@ -396,17 +396,22 @@ def _audit(entry: dict[str, Any]) -> None:
     "系统为什么在无人值守时动了手"，不是再存一份对话。
     """
     try:
-        from pathlib import Path
-
         from app.audit_log import utc_timestamp
+        from app.paths import log_dir as resolve_log_dir
 
-        log_dir = Path("logs")
+        configured = ""
+        data_root = ""
         try:
             from app.config import settings
 
-            log_dir = Path(getattr(settings, "log_dir", "") or "logs")
+            configured = getattr(settings, "log_dir", "")
+            data_root = getattr(settings, "data_dir", "")
         except Exception:  # noqa: BLE001 — 配置不可读则用默认目录
             pass
+
+        # 绝对路径（见 app/paths.py）：相对 CWD 的 `logs` 在打包态只读目录里
+        # mkdir 必失败，审计静默全丢。
+        log_dir = resolve_log_dir(configured, data_root)
 
         log_dir.mkdir(parents=True, exist_ok=True)
         payload = {"ts": utc_timestamp(), **entry}
