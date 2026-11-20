@@ -35,7 +35,6 @@ import type { SubagentEvent } from '../api/subagent'
 import MessageList from '../components/chat/MessageList.vue'
 import MessageItem from '../components/chat/MessageItem.vue'
 import ChatEmptyHero from '../components/chat/ChatEmptyHero.vue'
-import { addToOutbox, bumpRetryCount, clearOutbox, readOutbox, removeFromOutbox, type OutboxEntry } from '../components/chat/failedOutbox'
 import ChatInput from '../components/chat/ChatInput.vue'
 import WorkbenchPanel from '../components/workbench/WorkbenchPanel.vue'
 import { toggleWorkbench, workbenchOpen } from '../components/workbench/useWorkbench'
@@ -56,6 +55,7 @@ import { useSessionMeta } from '../composables/useSessionMeta'
 import { usePanelCollapse } from '../composables/usePanelCollapse'
 import { useSessionActivity } from '../composables/useSessionActivity'
 import { useSubagentStream } from '../composables/useSubagentStream'
+import { useComposerBridge } from '../composables/useComposerBridge'
 import { useMessageFailure } from '../composables/useMessageFailure'
 import { useKeyboardShortcuts } from '../composables/useKeyboardShortcuts'
 import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
@@ -75,9 +75,8 @@ import { HistoryOutlined, ExportOutlined, BulbOutlined, BulbFilled, MoreOutlined
 import { splitThinking, stripUserInputTag, formatClock, formatSize, countItemsAfter, mergeTurnStats } from '../components/chat/chat-types'
 import { mergeHistory, normalizeMeta } from '../components/chat/chat-history'
 import { describeApiError, errorStatus } from '../utils/apiError'
-import { buildWorkbenchContext, chipsFromWorkbenchContext, CONTEXT_QUERY_KEYS, MAX_CONTEXT_KBS, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
+import { buildWorkbenchContext, chipsFromWorkbenchContext, CONTEXT_QUERY_KEYS, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
 import { currentProject } from '../composables/useProject'
-import { buildPrefillText, setChatPrefill, takeChatPrefill } from '../components/chat/chatPrefill'
 import type { ChatItem, ChatSession, ChatAttachment, TurnStatsItem, TextItem } from '../components/chat/chat-types'
 
 import { useI18n } from 'vue-i18n'
@@ -227,13 +226,6 @@ function onToolbarMenu(info: { key: string | number }) {
   else if (info.key === 'swap_layout') toggleLayout()
 }
 
-// 消息区「引用到输入框」：把选中文本交给输入框（ChatInput 暴露 insertText）
-const chatInputRef = ref<InstanceType<typeof ChatInput> | null>(null)
-
-function onQuoteText(text: string) {
-  chatInputRef.value?.insertText(text)
-}
-
 // ── 会话内检索（正文与思考；工具输出不进结果）────────────────────────────
 // 实现见 `composables/useTranscriptSearch.ts`。`items` 与 `trajectoryFocus` 在本文件里
 // 都声明得更晚，所以两个依赖必须是**惰性**的（getter 与回调），不能传值。
@@ -345,6 +337,31 @@ listModels()
 const sessions = ref<ChatSession[]>([])
 const activeSessionId = ref('')
 
+// 输入区的装配胶水（引用投递 / 附件通道 / `@` 提及 / 失败暂存队列）
+// 实现见 `composables/useComposerBridge.ts`。`chatInputRef` 仍是模板 `ref=` 绑定的那个
+// 名字；会话 id、账号、激活芯片、发送路径都晚于这里声明，故一律以惰性 getter 传入。
+const {
+  chatInputRef,
+  onQuoteText,
+  onWorkbenchReference,
+  onMentionAdd,
+  applyChatPrefill,
+  outbox,
+  outboxPreview,
+  retrieveOutbox,
+  retryOutbox,
+  discardOutbox,
+  queueFailedSend,
+} = useComposerBridge({
+  sessionId: () => activeSessionId.value,
+  userId: () => authStore.user?.id,
+  contextChips: () => contextChips.value,
+  setContextChips: (chips) => { contextChips.value = chips },
+  persistRuntime: (patch) => persistRuntime(patch),
+  sendMessage: (text, attachments) => sendMessage(text, attachments),
+})
+
+
 /**
  * 当前会话所属的项目（session-map project id），`@` 引用项目文件要用。
  *
@@ -367,16 +384,6 @@ const activeProjectId = computed(() => activeProject.value?.id || '')
  */
 const activeProjectError = ref('')
 
-/**
- * 工作台里点「加入对话」：走的是输入框**同一条附件通道**。
- *
- * 不在 ChatView 里另读一次文件再 push 附件，是因为那样就有两处构造 `data:` URL
- * 的逻辑（编码方式、id 去重、二进制处理各一份），而它们一旦漂移，模型收到的
- * 内容就取决于用户是"@ 选的"还是"面板点的"。
- */
-function onWorkbenchReference(payload: { path: string; name: string }) {
-  void chatInputRef.value?.attachProjectFile?.(payload.path, payload.name)
-}
 /**
  * 重新解析"当前会话属于哪个项目"。
  *
@@ -432,34 +439,8 @@ watch(activeSessionId, () => { void refreshActiveProject() })
 const todoPanel = useTodoPanel()
 const todoBoard = computed(() => todoPanel.boardOf(activeSessionId.value))
 
-/** 发送失败、已暂存到本地的消息（见 components/chat/failedOutbox.ts）。
- *  按会话隔离：切会话就重新读 —— 否则会把 A 会话的失败消息挂到 B 会话的重发按钮上。 */
-const outbox = ref<OutboxEntry[]>([])
-function refreshOutbox() {
-  outbox.value = activeSessionId.value ? readOutbox(activeSessionId.value, authStore.user?.id) : []
-}
-watch(activeSessionId, refreshOutbox, { immediate: true })
-
-/** 横幅预览用的降维视图：输入区只关心"哪条、长什么样、几个附件"，
- *  不该接触 outbox 的存储格式（failedOutbox.ts 属于持久化细节）。
- *  摘要按**单行**收敛：换行会把条目撑高，列表里三行放不下。 */
-const outboxPreview = computed(() => outbox.value.map(e => ({
-  id: e.id,
-  preview: e.content.replace(/\s+/g, ' ').trim().slice(0, 200),
-  attachmentCount: e.attachments?.length ?? 0,
-})))
-
-/** 把一条暂存消息取回输入框重新编辑：从队列里删掉它，内容（含附件）交回 Composer。
- *  队列随之少一条 —— 留在队列里再取回一次会变成两条相同的草稿。 */
-function retrieveOutbox(id: string) {
-  const sid = activeSessionId.value
-  if (!sid) return
-  const entry = outbox.value.find(e => e.id === id)
-  if (!entry) return
-  removeFromOutbox(sid, authStore.user?.id, id)
-  refreshOutbox()
-  chatInputRef.value?.restoreDraft?.(entry.content, entry.attachments)
-}
+/** 失败暂存队列（按会话隔离、横幅预览、取回编辑）：见 `composables/useComposerBridge.ts`，
+ *  已在上方解构。它只与输入框交互，不参与消息流投影。 */
 const activeSession = computed(() => sessions.value.find(s => s.id === activeSessionId.value) || null)
 /**
  * ── 多会话运行：运行时状态**按会话**存 ──
@@ -1113,33 +1094,9 @@ function persistRuntime(patch: Record<string, unknown>) {
 }
 
 /**
- * `@` 提及选中的资源 → 加进"激活引用"的 chips，并**同步到单一事实源**（`runtime.context`）。
- *
- * 与 URL chips 走同一条链路：chips 只是 UI 呈现，`runtime.context` 才是提交时真正生效的东西
- * —— 只改 chips 不写 runtime，刷新后引用就会从界面上消失（这正是我们修过的那类问题）。
+ * `@` 提及的落地（去重 / 知识库上限 / 写 `runtime.context`）：见
+ * `composables/useComposerBridge.ts` 的 `onMentionAdd`，已在上方解构。
  */
-const MENTION_CHIP_LABEL = computed<Record<string, string>>(() => ({
-  kb: t('knowledge.knowledge_base'), agent: 'Agent', skill: t('agent.skill'), plugin: t('common.plugin'),
-}))
-
-function onMentionAdd(p: { type: string; id: string; name: string }) {
-  if (contextChips.value.some(c => c.type === p.type && c.value === p.id)) return
-  // 知识库多选有上限（≤5）：每个库都是一次分钟级推理式检索，选到第 6 个时
-  // 该**当场拦住并说明**，而不是默默截断 —— 用户会以为第 6 个也生效了。
-  if (p.type === 'kb' && contextChips.value.filter(c => c.type === 'kb').length >= MAX_CONTEXT_KBS) {
-    notify.warning(t('knowledge.max_knowledge_bases_n', { n: MAX_CONTEXT_KBS }))
-    return
-  }
-  contextChips.value = [
-    ...contextChips.value,
-    {
-      type: p.type as ContextChip['type'],
-      label: `${MENTION_CHIP_LABEL.value[p.type] || p.type} ${p.name}`,
-      value: p.id,
-    },
-  ]
-  persistRuntime({ context: buildWorkbenchContext(contextChips.value) })
-}
 
 /** 模型切换：更新 llmModel ref + 写入运行时状态（会话级持久） */
 function onModelChange(m: string) {
@@ -1226,23 +1183,6 @@ async function applyRouteQuery() {
   }
   await initContextChips(q)
   void applyChatPrefill()
-}
-
-/**
- * 「在对话中继续」的落地端：Agent 会话 / 工作流结果经 sessionStorage 投递到这里，
- * 插入输入框（不自动发送）—— 用户可以先修改再发。
- */
-async function applyChatPrefill() {
-  const prefill = takeChatPrefill()
-  if (!prefill) return
-  const text = buildPrefillText(prefill)
-  await nextTick()
-  if (chatInputRef.value?.insertText) {
-    chatInputRef.value.insertText(text)
-  } else {
-    // 输入框还没挂载（首帧）：把投递放回去，别让用户的那一次点击被静默吞掉
-    setChatPrefill(prefill)
-  }
 }
 
 async function initContextChips(q: Record<string, unknown>) {
@@ -2860,32 +2800,13 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
     notify.error(t('errors.send_failed') + reason)
     // 落盘暂存：这条消息**没有**被服务端接收（POST 失败），刷新后 transcript 里不会有它。
     // 不回填输入框而是入队，是为了不打断"继续写草稿"的动作。
-    outbox.value = addToOutbox(sessionId, authStore.user?.id, { content: text, attachments })
+    queueFailedSend(sessionId, text, attachments)
     return false
   }
 }
 
-/** 重发暂存队列：逐条走正常发送路径，成功一条就从本地删一条；
- *  失败的只累加 retryCount（它本来就在队列里，不该再入队一次）。 */
-async function retryOutbox() {
-  const sid = activeSessionId.value
-  if (!sid) return
-  const uid = authStore.user?.id
-  for (const entry of readOutbox(sid, uid)) {
-    const ok = await sendMessage(entry.content, entry.attachments)
-    if (ok) removeFromOutbox(sid, uid, entry.id)
-    else bumpRetryCount(sid, uid, entry.id)
-  }
-  refreshOutbox()
-}
-
-/** 丢弃本会话全部暂存消息（用户明确放弃这几次发送）。 */
-function discardOutbox() {
-  const sid = activeSessionId.value
-  if (!sid) return
-  clearOutbox(sid, authStore.user?.id)
-  refreshOutbox()
-}
+/** 重发 / 丢弃暂存队列：见 `composables/useComposerBridge.ts`（已在上方解构）。
+ *  重发逐条走**正常发送路径**，成功一条就从本地删一条；失败的只累加 retryCount。 */
 
 // ── 失败消息标记 / 手动修复 ──
 // 实现见 `composables/useMessageFailure.ts`（已在文件上方解构）。这三个函数只写那条
