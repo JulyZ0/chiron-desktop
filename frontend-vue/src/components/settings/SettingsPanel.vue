@@ -21,6 +21,8 @@ import TwoFactorPanel from './TwoFactorPanel.vue'
 import AboutPanel from './AboutPanel.vue'
 import ShortcutSettingsPanel from './ShortcutSettingsPanel.vue'
 import LanguageSwitcher from '../common/LanguageSwitcher.vue'
+// 设置面板顶部的系统自检（P1-9）：与首页抽屉、欢迎引导共用同一组件与单例数据源
+import SelfCheckPanel from '../health/SelfCheckPanel.vue'
 import { useAuthStore } from '../../stores/auth'
 import { useThemeStore } from '../../stores/theme'
 import { useDeviceStore } from '../../stores/device'
@@ -91,6 +93,15 @@ onMounted(async () => {
 </script>
 
 <template>
+  <!-- 系统自检（P1-9）：设置的最上面一行 —— 改任何配置之前先看"现在哪些没生效"。
+       非 admin 在组件内部整体隐藏（且不发请求），所以这里只做角色闸门，
+       避免为一个必然 403 的面板付出挂载成本。 -->
+  <SelfCheckPanel
+    v-if="authStore.isAdmin"
+    class="settings-selfcheck"
+    data-testid="settings-selfcheck"
+  />
+
   <a-tabs v-model:active-key="activeTab">
     <!-- ── 通用设置 ── -->
     <a-tab-pane
@@ -365,6 +376,8 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+/* 顶部自检面板与第一个页签之间留一档间距（面板是独立卡片，不该贴住 Tabs 头部） */
+.settings-selfcheck { margin-bottom: var(--space-4); }
 /* 每个设置主题块之间用分隔线隔开，块内标题统一 */
 .setting-block { padding: 4px 0 20px; }
 .setting-block + .setting-block { border-top: var(--hairline-width) solid var(--border-card, var(--border)); padding-top: 20px; }

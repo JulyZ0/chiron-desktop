@@ -18,15 +18,17 @@
 import { computed, markRaw, onMounted, ref } from 'vue'
 import type { Component } from 'vue'
 import { useRouter } from 'vue-router'
-import { Button, Input } from 'ant-design-vue'
+import { Button, Drawer, Input } from 'ant-design-vue'
 import {
   MessageOutlined, UserOutlined, HistoryOutlined, BlockOutlined,
-  BookOutlined, ThunderboltOutlined, ArrowRightOutlined,
+  BookOutlined, ThunderboltOutlined, ArrowRightOutlined, SafetyCertificateOutlined,
 } from '@ant-design/icons-vue'
 import { api } from '../api'
 import { executeQuickCommand } from '../components/WorkstationNav.vue'
 import HomeScene3D from '../components/home/HomeScene3D.vue'
 import EmptyState from '../components/common/EmptyState.vue'
+// 系统自检（P1-9）：入口在右上角，内容是抽屉里的同一个面板组件（单例数据源）
+import SelfCheckPanel from '../components/health/SelfCheckPanel.vue'
 import { useAuthStore } from '../stores/auth'
 import { formatSmart } from '../utils/datetime'
 
@@ -37,6 +39,12 @@ const auth = useAuthStore()
 
 /** 最近会话只取一屏（更多交给「查看全部」） */
 const RECENT_LIMIT = 6
+
+/**
+ * 系统自检抽屉（P1-9）。面板**只在打开后才挂载**（`v-if`）：抽屉关着的时候
+ * 不该有一次"用户没在等"的探测，首页测试也不会因此多出三组请求。
+ */
+const selfCheckOpen = ref(false)
 
 // ── 快捷入口 ──
 // 图标必须 markRaw：图标是静态组件，被 Vue 响应式代理会破坏渲染。
@@ -174,6 +182,18 @@ onMounted(() => {
         aria-hidden
       />
       <HomeScene3D />
+      <!-- 系统自检入口：右上角常驻。非 admin 看不见（面板读的是 admin 端点，
+           给他一个点开必然 403 的按钮只是噪音）。 -->
+      <button
+        v-if="auth.isAdmin"
+        type="button"
+        class="hero-selfcheck"
+        data-testid="home-selfcheck-entry"
+        @click="selfCheckOpen = true"
+      >
+        <SafetyCertificateOutlined />
+        <span>{{ $t('health.entry') }}</span>
+      </button>
       <div class="hero-content">
         <span class="hero-badge">
           <span class="hero-badge-dot" />{{ $t('agent.chiron_self_hosted_ai_agent_console') }}
@@ -329,6 +349,23 @@ onMounted(() => {
       </span>
       <span class="home-footer-note">{{ $t('common.self_hosted_open_source_your_data_stays_on_your_machine') }}</span>
     </footer>
+
+    <!-- 系统自检抽屉：内容与设置页 / 欢迎页是**同一个** SelfCheckPanel →
+         同一个 useSelfCheck 单例，三处看到同一份读数与同一个时间戳。 -->
+    <Drawer
+      :open="selfCheckOpen"
+      :title="$t('health.title')"
+      placement="right"
+      :width="440"
+      data-testid="home-selfcheck-drawer"
+      @close="selfCheckOpen = false"
+    >
+      <SelfCheckPanel
+        v-if="selfCheckOpen"
+        variant="drawer"
+        :default-collapsed="false"
+      />
+    </Drawer>
   </div>
 </template>
 
@@ -386,6 +423,40 @@ onMounted(() => {
 .hero-badge-dot {
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--primary);
+}
+/* 系统自检入口：贴 Hero 右上角。inset-inline-end 在 RTL 下自动镜像到左侧。 */
+.hero-selfcheck {
+  position: absolute;
+  inset-block-start: var(--space-4);
+  inset-inline-end: var(--space-6);
+  z-index: var(--z-sticky);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border: var(--hairline-width) solid var(--border-default);
+  border-radius: var(--radius-full);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+}
+.hero-selfcheck:hover {
+  color: var(--text-primary);
+  border-color: var(--primary);
+}
+.hero-selfcheck:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+/* 窄屏：Hero 内容会顶到角落，入口缩小内边距免得压住标题 */
+@media (max-width: 560px) {
+  .hero-selfcheck {
+    inset-block-start: var(--space-2);
+    inset-inline-end: var(--space-2);
+  }
 }
 .hero-title {
   margin: 20px 0 12px;

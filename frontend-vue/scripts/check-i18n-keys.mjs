@@ -43,6 +43,9 @@ const DOMAIN_PREFIXES = [
   'notifications.',
   // 资源市场（/market）。按源分 tab，语义域 key 全是 `market.*`。
   'market.',
+  // 系统自检面板（P1-9）。同一组件在首页抽屉 / 设置顶部 / 欢迎引导复用，
+  // 含 {count} / {days} 等占位符 —— 缺键会让界面直接显示未插值的 key，故严格对齐。
+  'health.',
 ]
 
 const WRITE = process.argv.includes('--write-baseline')
