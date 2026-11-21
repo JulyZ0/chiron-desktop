@@ -1,0 +1,15 @@
+# WSL2 资源硬上限（放到 %UserProfile%\.wslconfig，改完 `wsl --shutdown` 生效）。
+#
+# 为什么必须显式设置：WSL2 默认最多拿宿主物理内存的 50%，且**不会**因为容器空闲
+# 自动归还。不设上限时，若干次 pip/镜像构建就可能让 ext4.vhdx 的内存占用长期居高。
+#
+# 下面按 32 GB 宿主（15 人场景）示例；100 人场景把 memory 提到 96–112GB、
+# processors 提到 24–32。
+[wsl2]
+memory=24GB
+processors=8
+swap=8GB
+
+# 单次构建/批量 git 操作可能瞬时抬高内存；上限是硬闸，触顶后由子系统自行回收。
+# 磁盘：ext4.vhdx 只增不缩，需在 Windows 侧监控文件大小，低峰期
+# `wsl --shutdown` 后用 Optimize-VHD 压缩。
