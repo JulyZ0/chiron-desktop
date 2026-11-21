@@ -44,15 +44,18 @@ const (
 	smMaxRootPathLen = 1024
 )
 
-// smForbiddenRoots 是拒绝绑定的系统目录（小写、Clean 后比较）。
+// smForbiddenRoots 是拒绝绑定的系统目录（小写、分隔符统一为 `/` 后比较）。
 //
 // 这些目录里放项目没有正当理由，却能让 agent 在后续阶段（P3 接通执行 cwd）
 // 获得对系统文件的可写视图。现在挡住比将来在沙箱层补救便宜。
+//
+// 用 `/` 而不是 `\`：网关可能跑在 Linux（团队模式），`filepath` 不把 `\`
+// 当分隔符，统一后再做前缀匹配，判据才不随宿主 OS 漂移。
 var smForbiddenRoots = []string{
-	`c:\windows`,
-	`c:\program files`,
-	`c:\program files (x86)`,
-	`c:\programdata\microsoft`,
+	`c:/windows`,
+	`c:/program files`,
+	`c:/program files (x86)`,
+	`c:/programdata/microsoft`,
 }
 
 // projectIsolationRoot 是团队模式下用户项目目录的根（见 config.ProjectsRoot）。
@@ -166,6 +169,27 @@ func ensureUserProjectDir(claims *auth.Claims, raw string) error {
 	return nil
 }
 
+// isWindowsAbsPath 判断是否为 Windows 盘符绝对路径（与宿主 OS 无关）。
+//
+// `filepath.IsAbs` 只认宿主平台：Linux 上的网关会把 `D:\repo` 当成相对路径，
+// 结果是"合法路径被拒、驱动器根报错文案不对"。root_path 由桌面客户端上报，
+// 判据必须按路径本身的形状来。
+func isWindowsAbsPath(p string) bool {
+	if len(p) < 3 || p[1] != ':' {
+		return false
+	}
+	c := p[0]
+	if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+		return false
+	}
+	return p[2] == '\\' || p[2] == '/'
+}
+
+// normalizePathSeparators 把 `\` 统一成 `/`，只用于**策略比较**，不用于文件系统访问。
+func normalizePathSeparators(p string) string {
+	return strings.ReplaceAll(p, `\`, "/")
+}
+
 // validateRootPath 校验并规范化项目根目录。
 //
 // 返回 (规范化路径, 错误说明)。错误说明为空表示通过。
@@ -178,10 +202,22 @@ func validateRootPath(raw string) (string, string) {
 	if len(p) > smMaxRootPathLen {
 		return "", "root_path is too long"
 	}
-	if !filepath.IsAbs(p) {
+	if !filepath.IsAbs(p) && !isWindowsAbsPath(p) {
 		return "", "root_path must be an absolute path"
 	}
 	cleaned := filepath.Clean(p)
+	// 策略检查放在 os.Stat 之前：驱动器根/系统目录即使在当前宿主上不存在，
+	// 也必须给出"策略拒绝"的明确文案，而不是"路径不存在"。
+	policy := strings.ToLower(normalizePathSeparators(cleaned))
+	// 驱动器根目录本身（`C:\`）不允许：整个盘当项目会让后续执行 cwd 无边界。
+	if len(policy) == 3 && policy[1] == ':' && policy[2] == '/' {
+		return "", "root_path cannot be a drive root"
+	}
+	for _, bad := range smForbiddenRoots {
+		if policy == bad || strings.HasPrefix(policy, bad+"/") {
+			return "", "root_path points to a protected system directory"
+		}
+	}
 	info, err := os.Stat(cleaned)
 	if err != nil {
 		// 不回显 err：它含底层路径信息，对前端排错没有增量价值。
@@ -189,16 +225,6 @@ func validateRootPath(raw string) (string, string) {
 	}
 	if !info.IsDir() {
 		return "", "root_path is not a directory"
-	}
-	lower := strings.ToLower(cleaned)
-	// 驱动器根目录本身（`C:\`）不允许：整个盘当项目会让后续执行 cwd 无边界。
-	if len(lower) == 3 && lower[1] == ':' && (lower[2] == '\\' || lower[2] == '/') {
-		return "", "root_path cannot be a drive root"
-	}
-	for _, bad := range smForbiddenRoots {
-		if lower == bad || strings.HasPrefix(lower, bad+`\`) {
-			return "", "root_path points to a protected system directory"
-		}
 	}
 	return cleaned, ""
 }
@@ -246,11 +272,17 @@ func rootPathTaken(ctx context.Context, tenant, userID, rootPath, excludeID stri
 //     各自建检查点，时间线互相污染。
 //   - **规范化后再比**：`filepath.Clean` 吃掉尾分隔符、`.`、以及 `..`。
 //     用户从系统对话框选出的路径与手输的路径常常在这些细节上不同。
+//
+// `filepath.Clean` 只认宿主 OS 的分隔符，而服务端可能跑在 Linux（团队模式），
+// 路径却来自 Windows 客户端。比较前先把 `\` 折叠成 `/`，判据才与宿主无关。
 func sameRootPath(a, b string) bool {
 	if a == "" || b == "" {
 		return false
 	}
-	return strings.EqualFold(filepath.Clean(a), filepath.Clean(b))
+	norm := func(p string) string {
+		return filepath.Clean(normalizePathSeparators(strings.TrimSpace(p)))
+	}
+	return strings.EqualFold(norm(a), norm(b))
 }
 
 // smTimeOf 把驱动返回的时间值渲染成 RFC3339；nil 给空串。

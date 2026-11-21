@@ -48,7 +48,7 @@ const router = useRouter()
   font-size: 24px;
   font-weight: var(--fw-semibold);
 }
-.password-entry { margin-left: auto; }
+.password-entry { margin-inline-start: auto; }
 
 @media (max-width: 640px) {
   .profile-container { padding: 16px 12px; }

@@ -53,7 +53,7 @@ SELECT id, task, profile_name, read_only, status, depth
 """
 
 
-class RerunRefused(Exception):
+class RerunRefusedError(Exception):
     """重跑被拒。
 
     ``status`` 是 HTTP 语义（工具层忽略它、只取 ``error``/``code``）：
@@ -110,10 +110,10 @@ async def load_rerun_target(
     """
     rid = (run_id or "").strip()
     if not rid:
-        raise RerunRefused(400, "run_id is required", "invalid")
+        raise RerunRefusedError(400, "run_id is required", "invalid")
     session_id = _session_id()
     if not session_id:
-        raise RerunRefused(
+        raise RerunRefusedError(
             409,
             "no active session context: a rerun must be dispatched into a session",
             "no_session",
@@ -122,21 +122,21 @@ async def load_rerun_target(
     user_id = _user_id()
     pool = pool if pool is not None else _pool()
     if pool is None:
-        raise RerunRefused(503, "database unavailable", "store_unavailable")
+        raise RerunRefusedError(503, "database unavailable", "store_unavailable")
 
     try:
         row = await pool.fetchrow(RERUN_RUN_SQL, rid, tenant_id, user_id, session_id)
     except Exception as exc:  # noqa: BLE001 - 表缺失 / 老库缺列
         logger.warning("rerun 查询失败（run=%s）: %s", rid, str(exc)[:200])
-        raise RerunRefused(
+        raise RerunRefusedError(
             503, "subagent run store unavailable (check migrations)", "store_unavailable"
         ) from exc
     if not row:
-        raise RerunRefused(404, f"subagent run not found: {rid}", "not_found")
+        raise RerunRefusedError(404, f"subagent run not found: {rid}", "not_found")
 
     status = str(row["status"] or "")
     if status not in RERUNNABLE:
-        raise RerunRefused(
+        raise RerunRefusedError(
             409,
             f"run {rid} is {status or 'unknown'}; only finished runs can be rerun "
             f"({', '.join(RERUNNABLE)}) — a running one already has an owner",
@@ -151,7 +151,7 @@ async def rerun_run(*, run_id: str, task_override: str = "") -> dict[str, Any]:
     派发走**同一个** ``subagent`` 工具路径（同一套工具面 / 预算 / 栅栏 / 落库），
     因此这里不复制任何派发细节。成功时返回 ``run_id``（新）/ ``rerun_of`` 等字段。
 
-    失败一律抛 :class:`RerunRefused`：调用方必须能区分"没派出去"与"派了但很慢"。
+    失败一律抛 :class:`RerunRefusedError`：调用方必须能区分"没派出去"与"派了但很慢"。
     """
     row = await load_rerun_target(run_id=run_id)
 
@@ -159,7 +159,7 @@ async def rerun_run(*, run_id: str, task_override: str = "") -> dict[str, Any]:
     task = (task_override or "").strip() or str(row.get("task") or "").strip()
     if not task:
         # 绝不"猜一个任务"：取不到就拒绝，由前端把任务放回输入框让用户确认。
-        raise RerunRefused(
+        raise RerunRefusedError(
             409,
             f"run {rid} has no stored task to rerun; resend the task from the composer",
             "task_missing",
@@ -168,7 +168,8 @@ async def rerun_run(*, run_id: str, task_override: str = "") -> dict[str, Any]:
     # 局部导入：工具模块之间不互相 import，避免注册期的循环依赖；`app.tools.context`
     # 同理由（见文件头的循环导入说明）。
     from app.tools.context import get_all, restore_context, set_tool_context
-    from app.tools.subagent import MAX_DEPTH, subagent as delegate
+    from app.tools.subagent import MAX_DEPTH
+    from app.tools.subagent import subagent as delegate
 
     # 深度：新 run 是原 run 的子节点（parent_run_id 指向它），因此取原深度 + 1。
     # 夹到 MAX_DEPTH-1 是**必要的**：否则重跑一条已经很深的 run 会被
@@ -189,25 +190,25 @@ async def rerun_run(*, run_id: str, task_override: str = "") -> dict[str, Any]:
             rerun_of=rid,
             parent_run_id=rid,
         )
-    except RerunRefused:
+    except RerunRefusedError:
         raise
     except Exception as exc:  # noqa: BLE001 - 派发失败要如实返回
         logger.warning("subagent rerun 派发失败（run=%s）: %s", rid, str(exc)[:200])
-        raise RerunRefused(503, f"rerun failed: {str(exc)[:160]}", "dispatch_failed") from exc
+        raise RerunRefusedError(503, f"rerun failed: {str(exc)[:160]}", "dispatch_failed") from exc
     finally:
         # 上下文是**共享**的（同一 task 里后续调用都会看见），必须精确还原，
         # 否则"重跑深度"会污染父 Agent 之后派的每一个子任务。
         restore_context(snapshot)
 
     if not isinstance(result, dict):
-        raise RerunRefused(503, "unexpected dispatch result", "dispatch_failed")
+        raise RerunRefusedError(503, "unexpected dispatch result", "dispatch_failed")
     if result.get("error"):
         # 配额拒绝 / 深度闸门等：这次**没有**派出作业，如实报错（不返回假 run_id）
-        raise RerunRefused(503, str(result["error"]), "dispatch_refused")
+        raise RerunRefusedError(503, str(result["error"]), "dispatch_refused")
 
     new_run_id = str(result.get("run_id") or "").strip()
     if not new_run_id:
-        raise RerunRefused(503, "dispatch returned no run_id", "dispatch_failed")
+        raise RerunRefusedError(503, "dispatch returned no run_id", "dispatch_failed")
 
     logger.info("subagent rerun launched: from=%s to=%s", rid, new_run_id)
     payload = {

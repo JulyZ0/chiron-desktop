@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
@@ -2044,7 +2045,7 @@ class AgentRuntime:
                 ),
                 timeout=knowledge_context_timeout(),
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning("kb context injection timed out (%s)", kb_ids)
             task.knowledge_context = (
                 f"【知识库检索】用户选中的知识库（{', '.join(kb_ids)}）检索超时"

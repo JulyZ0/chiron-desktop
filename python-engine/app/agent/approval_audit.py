@@ -41,7 +41,6 @@ def _audit_dir() -> Path:
     if AUDIT_DIR is not None:
         return AUDIT_DIR
     from app.config import settings
-
     from app.paths import log_dir
 
     return log_dir(

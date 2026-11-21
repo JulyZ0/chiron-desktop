@@ -243,7 +243,9 @@ type sourceFile struct {
 // 与 `internal/api/plugin_handler.go` 的 userPluginPath 同策略：只取 Base，
 // 且空/`.`/`..` 一律归为 unknown —— 绝不让 userID 决定目录上溯。
 func safeUserID(userID string) string {
-	safe := filepath.Base(filepath.Clean(userID))
+	// `filepath` 只把宿主 OS 的分隔符当分隔符：Linux 上 `..\..\windows` 会被整个
+	// 当成一个目录名落到磁盘上。先统一两种分隔符，再取 Base 只留最后一段。
+	safe := filepath.Base(filepath.Clean(strings.ReplaceAll(userID, `\`, "/")))
 	if safe == "." || safe == "" || safe == ".." || safe == string(filepath.Separator) {
 		return "unknown"
 	}

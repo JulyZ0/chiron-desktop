@@ -242,7 +242,7 @@ async def internal_subagent_rerun(
         lambda payload: _deliver_rerun_event(payload, runtime_cache, str(body.tenant_id))
     )
 
-    from app.subagent.rerun import RerunRefused, rerun_run
+    from app.subagent.rerun import RerunRefusedError, rerun_run
     from app.tools.context import get_all, restore_context, set_tool_context
 
     snapshot = get_all()
@@ -257,7 +257,7 @@ async def internal_subagent_rerun(
             unattended=True,
         )
         payload = await rerun_run(run_id=run_id)
-    except RerunRefused as exc:
+    except RerunRefusedError as exc:
         logger.info("internal subagent rerun refused (run=%s, code=%s)", run_id, exc.code)
         raise HTTPException(
             status_code=exc.status,

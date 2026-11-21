@@ -203,7 +203,7 @@ def fetch_from(url: str, dest: Path, timeout: float) -> None:
                 handle.write(chunk)
     got = dest.stat().st_size
     if expected is not None and str(got) != str(expected).strip():
-        raise IOError(f"长度不符：期望 {expected} 字节，实际 {got} 字节")
+        raise OSError(f"长度不符：期望 {expected} 字节，实际 {got} 字节")
 
 
 def download(asset: dict, dest: Path, expected_sha256: str) -> str:

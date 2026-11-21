@@ -390,7 +390,7 @@ class RetrievalTimer:
     def elapsed_ms(self) -> int:
         return max(0, int((time.monotonic() - self._start) * 1000))
 
-    def __enter__(self) -> "RetrievalTimer":
+    def __enter__(self) -> RetrievalTimer:
         self._start = time.monotonic()
         return self
 

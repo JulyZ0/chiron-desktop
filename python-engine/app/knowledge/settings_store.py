@@ -49,7 +49,7 @@ def default_provider() -> str:
     return PROVIDER_SELFHOSTED if builtin_service_url() else ""
 
 
-def effective_provider_name(stored: "UserKnowledgeSettings | None") -> str:
+def effective_provider_name(stored: UserKnowledgeSettings | None) -> str:
     """用户设置 → 实际生效的 provider 名（未选择时回落到 :func:`default_provider`）。"""
     if stored is not None and stored.provider:
         return stored.provider
@@ -293,7 +293,7 @@ async def save_kb_models(
         else:
             removals.append("chat_model")
     if not updates and not removals:
-        return kb_model_overrides((await _load_config(kb_id)))
+        return kb_model_overrides(await _load_config(kb_id))
 
     import json
 

@@ -65,6 +65,13 @@ func liveUser(t *testing.T, pool *pgxpool.Pool) string {
 		db.DefaultTenantID, "default"); err != nil {
 		t.Fatalf("确保默认租户存在失败: %v", err)
 	}
+	// 显式插入 id 不会推进 smallserial 序列；不校正的话，同包内走 nextval 建租户的
+	// 用例（如 sql_smoke_live_test 的 fixture）会撞上这个主键 —— 用例顺序一变就红。
+	if _, err := pool.Exec(context.Background(),
+		`SELECT setval(pg_get_serial_sequence('tenants', 'id'),
+		               GREATEST((SELECT COALESCE(MAX(id), 1) FROM tenants), 1))`); err != nil {
+		t.Fatalf("校正 tenants 序列失败: %v", err)
+	}
 	id := uuid.NewString()
 	// tenant_id 是 NOT NULL（迁移 0002 之后 users.tenant_id 指向 tenants.id）。
 	// 上面已确保默认租户存在，这里必须显式带上 —— 漏掉 CI 会报

@@ -21,7 +21,6 @@ from app.agent.prompt_sections import KNOWLEDGE, standalone_texts
 from app.agent.runtime_types import AgentTask
 from app.agent.workbench_context import MAX_CONTEXT_KBS, context_ids
 
-
 # ── kb_ids 解析（前端提交字段的引擎侧口径）──
 
 

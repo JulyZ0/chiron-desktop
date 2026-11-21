@@ -1,4 +1,4 @@
-﻿# run-local.ps1 —— Windows 本地集成档：不依赖 Docker，用应用自带的运行时跑关键链路。
+# run-local.ps1 —— Windows 本地集成档：不依赖 Docker，用应用自带的运行时跑关键链路。
 #
 # 与 scripts/integration/run.sh（容器档）的关系：
 #   * 容器档验的是"镜像里的整套服务"（PG/Redis/migrate/gateway/engine/pageindex/fake-LLM）；

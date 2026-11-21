@@ -784,18 +784,18 @@ describe('BillingView provider 回填（P1-7）', () => {
  *  - 必须真的触发一次 a[download] 点击，而不是只弹个成功提示。
  */
 describe('BillingView 明细 CSV 导出（P1-7）', () => {
-  let clicked: HTMLAnchorElement | null = null
+  const clickedAnchors: HTMLAnchorElement[] = []
   const createObjectURL = vi.fn(() => 'blob:chiron-usage')
   const revokeObjectURL = vi.fn()
 
   beforeEach(() => {
     vi.clearAllMocks()
-    clicked = null
+    clickedAnchors.length = 0
     // jsdom 没有 createObjectURL；不补这一层，点击导出会直接抛错
     ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = createObjectURL
     ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = revokeObjectURL
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
-      clicked = this
+      clickedAnchors.push(this)
     })
     stubApi()
   })
@@ -828,6 +828,7 @@ describe('BillingView 明细 CSV 导出（P1-7）', () => {
 
     // 真的点了 <a download>，且文件名以 .csv 结尾
     expect(createObjectURL).toHaveBeenCalledTimes(1)
+    const clicked = clickedAnchors.at(-1)
     expect(clicked).toBeTruthy()
     expect(clicked!.download.endsWith('.csv')).toBe(true)
     expect(clicked!.download).toContain('model')

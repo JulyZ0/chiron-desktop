@@ -10,8 +10,8 @@ from app.api.context import router as context_router
 from app.api.deps import router as deps_router
 from app.api.desktop_infer import router as desktop_infer_router
 from app.api.interactions import router as interactions_router
-from app.api.internal_diagnostics import router as internal_diagnostics_router
 from app.api.internal_checkpoints import router as internal_checkpoints_router
+from app.api.internal_diagnostics import router as internal_diagnostics_router
 from app.api.internal_knowledge import router as internal_knowledge_router
 from app.api.internal_market import router as internal_market_router
 from app.api.internal_subagent import router as internal_subagent_router

@@ -23,10 +23,10 @@ from typing import Any
 
 from app.config import settings
 from app.subagent.access import RUN_ACCESS_CLAUSE
+from app.subagent.rerun import RERUNNABLE
 from app.subagent.resume import build_resume_context
 from app.tools.context import get_session_id, get_tenant_id, get_user_id
 from app.tools.registry import registry
-from app.tools.subagent_rerun import RERUNNABLE
 
 logger = logging.getLogger(__name__)
 

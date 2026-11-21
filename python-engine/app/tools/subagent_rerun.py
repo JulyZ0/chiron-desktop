@@ -20,10 +20,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from app.subagent.rerun import (  # noqa: F401 - RUN_SQL / RERUNNABLE 供既有导入方复用
-    RERUNNABLE,
-    RERUN_RUN_SQL as RUN_SQL,
-    RerunRefused,
+from app.subagent.rerun import (
+    RerunRefusedError,
     rerun_run,
 )
 from app.tools.registry import registry
@@ -40,7 +38,7 @@ async def rerun_subagent(run_id: str, task_override: str = "") -> dict[str, Any]
     """
     try:
         payload = await rerun_run(run_id=run_id, task_override=task_override)
-    except RerunRefused as exc:
+    except RerunRefusedError as exc:
         # 工具层只能返回结构化错误（没有 HTTP 状态码可言），但**绝不**返回假 run_id
         return {"error": exc.error, "code": exc.code}
     except Exception as exc:  # noqa: BLE001 - 派发失败要如实返回

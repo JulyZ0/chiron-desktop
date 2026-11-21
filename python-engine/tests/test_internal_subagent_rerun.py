@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 import app.api.internal_subagent as internal_api
 from app.subagent import rerun as rerun_impl
-from app.subagent.rerun import RerunRefused
+from app.subagent.rerun import RerunRefusedError
 
 BODY = {"tenant_id": 1, "user_id": "u1", "session_id": "s1"}
 
@@ -122,7 +122,7 @@ async def test_refusals_map_to_http_codes(monkeypatch, code, status):
     """每种拒绝都必须落到它自己的状态码上（前端靠它区分"回退"与"稍后再试"）。"""
 
     async def _refuse(**_kwargs):
-        raise RerunRefused(status, f"refused:{code}", code)
+        raise RerunRefusedError(status, f"refused:{code}", code)
 
     monkeypatch.setattr(rerun_impl, "rerun_run", _refuse)
 
