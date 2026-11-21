@@ -775,6 +775,11 @@ func projectRootOf(r *http.Request, wsID string, claims *auth.Claims) (string, e
 		// 画布不是项目：它没有绑定本地文件夹，自然没有文件可列。
 		return "", errors.New("project has no root folder")
 	}
+	// 团队模式：绑定目录必须落在该用户自己的项目根内。旧数据（升级前绑到别处）
+	// 在这里显式拒绝，而不是继续读。
+	if !projectRootAllowed(smTenant(claims), claims.UserID, root) {
+		return "", errors.New("project root is outside your isolated project directory")
+	}
 	info, statErr := os.Stat(root)
 	if statErr != nil || !info.IsDir() {
 		return "", errRootUnavailable

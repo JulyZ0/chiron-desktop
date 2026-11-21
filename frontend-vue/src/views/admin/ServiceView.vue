@@ -16,7 +16,7 @@
  * 那些信息。
  */
 import { computed, onMounted, ref } from 'vue'
-import { Alert, Button, Card, Empty, Input, Radio, Spin, Tag, message } from 'ant-design-vue'
+import { Alert, Button, Card, Empty, Input, Radio, Spin, Switch, Tag, message } from 'ant-design-vue'
 import { CopyOutlined, ReloadOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
 import { getServiceInfo, saveServiceInfo, type AdminServiceInfo } from '@/api/admin'
@@ -30,7 +30,7 @@ const saving = ref(false)
 const info = ref<AdminServiceInfo | null>(null)
 
 /** 表单草稿：与「当前生效值」分开，才能显示「改了但还没保存」。 */
-const draft = ref({ bind_host: '', public_base_url: '' })
+const draft = ref({ bind_host: '', public_base_url: '', service_mode: false })
 
 /** 后端归一后的全网卡取值（见 internal/api/admin_service.go）。 */
 const BIND_ALL = '0.0.0.0'
@@ -54,6 +54,7 @@ const dirty = computed(() => {
   if (!info.value) return false
   return draft.value.bind_host.trim() !== info.value.saved_bind_host
     || draft.value.public_base_url.trim() !== info.value.saved_public_base_url
+    || draft.value.service_mode !== info.value.service_mode
 })
 
 /** 保存后仍未生效：已保存值与进程实际持有值不一致。 */
@@ -64,10 +65,14 @@ function pickScope(next: 'loopback' | 'lan') {
 }
 
 function adopt(next: AdminServiceInfo) {
+  // 老后端没有这个字段时按"关闭"处理，避免 draft=false 与 undefined 比较时
+  // 页面一打开就显示成"有未保存改动"。
+  next.service_mode = next.service_mode === true
   info.value = next
   draft.value = {
     bind_host: next.saved_bind_host,
     public_base_url: next.saved_public_base_url,
+    service_mode: next.service_mode,
   }
 }
 
@@ -87,12 +92,15 @@ async function save() {
   try {
     // 只提交用户真正改动过的字段：后端把"字段缺席"与"显式清空"区别对待，
     // 全量提交会把另一侧未改的值也当成一次写入。
-    const payload: { bind_host?: string; public_base_url?: string } = {}
+    const payload: { bind_host?: string; public_base_url?: string; service_mode?: boolean } = {}
     if (!info.value || draft.value.bind_host.trim() !== info.value.saved_bind_host) {
       payload.bind_host = draft.value.bind_host.trim()
     }
     if (!info.value || draft.value.public_base_url.trim() !== info.value.saved_public_base_url) {
       payload.public_base_url = draft.value.public_base_url.trim()
+    }
+    if (!info.value || draft.value.service_mode !== info.value.service_mode) {
+      payload.service_mode = draft.value.service_mode
     }
     // 没有改动就不发请求：按钮此时是禁用的，这里只是兜住回车/程序化调用。
     if (Object.keys(payload).length === 0) return
@@ -177,6 +185,27 @@ onMounted(load)
         :bordered="false"
         class="service-card"
       >
+        <section class="service-section">
+          <h3 class="section-title">
+            {{ $t('admin.service.service_mode_title') }}
+          </h3>
+          <div class="field">
+            <label class="field-label">{{ $t('admin.service.service_mode') }}</label>
+            <div class="field-static">
+              <Switch
+                v-model:checked="draft.service_mode"
+                data-test="service-mode"
+              />
+              <span class="field-hint field-hint--inline">
+                {{ $t('admin.service.service_mode_hint') }}
+              </span>
+            </div>
+          </div>
+          <p class="field-hint">
+            {{ $t('admin.service.service_mode_desc') }}
+          </p>
+        </section>
+
         <section class="service-section">
           <h3 class="section-title">
             {{ $t('admin.service.scope_title') }}

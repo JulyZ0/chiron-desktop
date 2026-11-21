@@ -74,10 +74,33 @@ export async function authGuard(
     }
   }
 
-  // 登录页已随云端模式删除：未认证不再跳 /login（那是条死路由），回首页即可。
-  // 本地模式下 isAuthenticated 恒真，这条分支实际只在云端残留态下兜底。
+  // 登录页：已登录则直接回到目标页（或首页），避免登录后点浏览器后退又停在表单上。
+  if (to.path === '/login') {
+    if (auth.isAuthenticated) {
+      const redirect = typeof to.query.redirect === 'string' ? to.query.redirect : '/'
+      next(redirect)
+      return
+    }
+    next()
+    return
+  }
+
+  // 首登/重置后强制改密：除改密页与个人信息页外一律拦回改密页。
+  // 后端 AuthMiddleware 同样会拦 API（403 password_change_required），这里只是
+  // 让用户看到可操作的一屏，而不是一堆失败的请求。
+  if (auth.mustChangePassword && to.path !== '/change-password' && to.path !== '/profile') {
+    next('/change-password')
+    return
+  }
+
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
-    next('/')
+    // 桌面本地模式没有登录页：身份由 OS 账户免口令下发，保持原行为回首页。
+    // 团队 Web 模式则送到登录页，并带上回跳地址。
+    if (localMode) {
+      next('/')
+      return
+    }
+    next({ path: '/login', query: { redirect: to.fullPath } })
     return
   }
 

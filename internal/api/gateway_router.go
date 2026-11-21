@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -254,7 +255,20 @@ func NewGatewayRouter(
 		)
 	}
 
+	// 项目目录隔离根：团队模式下每个用户只能把项目绑到自己的目录。
+	// 未显式配置时回落到 <StorageRoot>/projects —— "多人服务"不能允许 A 指向 B 的目录。
+	projectsRoot := strings.TrimSpace(cfg.ProjectsRoot)
+	if projectsRoot == "" && cfg.IsTeamMode() {
+		projectsRoot = filepath.Join(cfg.StorageRoot, "projects")
+	}
+	SetProjectIsolationRoot(projectsRoot)
+	if projectsRoot != "" {
+		slog.Info("project directory isolation enabled", "root", projectsRoot)
+	}
+
 	// Auth
+	// 服务模式：部署级 team 或后台保存的开关任一为真。注册 handler 实时读这个原子值。
+	serviceModeEnabled.Store(cfg.IsTeamMode())
 	authenticator := auth.NewAuthenticator(cfg.JWTSecret, cfg.JWTExpiration)
 	authHandler := NewAuthHandler(cfg)
 	authMW := AuthMiddleware(authenticator)
@@ -282,7 +296,7 @@ func NewGatewayRouter(
 	searchHandler := NewSearchHandler()
 
 	// Conversation
-	conversationHandler := NewConversationHandler(authenticator, sessionMgr)
+	conversationHandler := NewConversationHandler(authenticator, sessionMgr, pythonClient)
 	shareHandler := NewShareHandler(authenticator, sessionMgr, cfg)
 
 	// Tool (proxies to Python)

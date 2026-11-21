@@ -463,6 +463,9 @@ func applyDBSettingsAfterConnect(ctx context.Context, cfg *config.Config) {
 	// service：后台「服务」页（见 internal/api/admin_service.go）。
 	// 放在这里而不是热更路径：监听地址要绑套接字，只能启动时定。
 	apply("service", func(m map[string]interface{}) {
+		if v, ok := m["service_mode"].(bool); ok {
+			cfg.ServiceMode = v
+		}
 		if v, ok := m["bind_host"].(string); ok {
 			// 空串是合法值（= 全部网卡），所以这里不能沿用 `v != ""` 的过滤 ——
 			// 那会让"显式改成全网卡"在重启后静默无效。

@@ -16,6 +16,12 @@ type Claims struct {
 	Role     string   `json:"role"` // owner / admin / user
 	TenantID int16    `json:"tenant_id,omitempty"`
 	Perms    []string `json:"perms,omitempty"`
+	// MustChangePassword 表示"首登或管理员重置后必须改密"。
+	//
+	// 放进 claims 而不是每次请求查库：中间件只需一次判读就能拦住未改密会话，
+	// 没有额外的数据库往返。改密成功后会**重签**一枚 claims=false 的 token，
+	// 旧 token 由 `revokeUserSessions`（Redis 纪元）一并作废。
+	MustChangePassword bool `json:"mcp,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -37,13 +43,23 @@ func NewAuthenticator(secret string, expiration time.Duration) *Authenticator {
 
 // GenerateToken 签发 JWT。tenantID 必须由调用方从用户记录中传入（多租户隔离键）。
 func (a *Authenticator) GenerateToken(userID, email, role string, tenantID int16, perms []string) (string, error) {
+	return a.GenerateTokenWithState(userID, email, role, tenantID, perms, false)
+}
+
+// GenerateTokenWithState 在 GenerateToken 基础上携带"必须改密"状态。
+// 只有登录/建号/重置密码这类**明确知道用户状态**的调用方需要它；
+// 其余路径沿用 GenerateToken（must_change_password=false）。
+func (a *Authenticator) GenerateTokenWithState(
+	userID, email, role string, tenantID int16, perms []string, mustChangePassword bool,
+) (string, error) {
 	now := time.Now()
 	claims := &Claims{
-		UserID:   userID,
-		Email:    email,
-		Role:     role,
-		TenantID: tenantID,
-		Perms:    perms,
+		UserID:             userID,
+		Email:              email,
+		Role:               role,
+		TenantID:           tenantID,
+		Perms:              perms,
+		MustChangePassword: mustChangePassword,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(now.Add(a.expiration)),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -157,7 +173,9 @@ var (
 // RolePermissions maps roles to permission sets
 var RolePermissions = map[string][]string{
 	"owner": {PermChatWrite, PermChatRead, PermAdminRead, PermAdminWrite, PermToolsExec, PermUsersManage, PermAuditRead, PermEntManage, PermPolicyManage, PermMarketManage, PermSSOManage, PermBillingManage},
-	"admin": {PermChatWrite, PermChatRead, PermAdminRead, PermAdminWrite, PermToolsExec, PermAuditRead, PermEntManage, PermPolicyManage, PermMarketManage, PermSSOManage, PermBillingManage},
+	// admin 持有 users:manage：团队管理员要能建成员、重置密码、禁用离职账号。
+	// 对 owner 与自身账号的保护不在权限点里，而在 handler 的 ensureCanManage。
+	"admin": {PermChatWrite, PermChatRead, PermAdminRead, PermAdminWrite, PermUsersManage, PermToolsExec, PermAuditRead, PermEntManage, PermPolicyManage, PermMarketManage, PermSSOManage, PermBillingManage},
 	"user":  {PermChatWrite, PermChatRead, PermToolsExec},
 }
 

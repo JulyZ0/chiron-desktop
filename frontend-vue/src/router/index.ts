@@ -10,9 +10,24 @@ const routes = [
     name: 'Home',
     component: () => import('../views/HomeView.vue'),
   },
-  // 登录 / 注册 / 忘记密码 / 重置密码：**已随云端模式一并删除**。
-  // 本地模式没有账号密码这一步 —— 身份由网关按 OS 账户免口令下发
-  // （见 internal/api/auth_local_session.go），故不再有这四条路由。
+  // 登录页：团队服务模式（浏览器直连域名）的入口。
+  //
+  // 桌面本地模式不用它 —— 身份由网关按 OS 账户免口令下发；但同一套前端产物
+  // 也被网关托管给浏览器，必须保留一条可达的登录路由。`meta.public` 让守卫
+  // 不预先拉取身份，页面自己用 cookie 恢复会话并决定是否回跳。
+  {
+    path: '/login',
+    name: 'Login',
+    component: () => import('../views/LoginView.vue'),
+    meta: { public: true },
+  },
+  {
+    // 首登/管理员重置后的强制改密页。requiresAuth：没有会话就没有旧密码可验。
+    path: '/change-password',
+    name: 'ChangePassword',
+    component: () => import('../views/ChangePasswordView.vue'),
+    meta: { requiresAuth: true },
+  },
   {
     // 首次运行引导（P1-10）：配置模型 → 连通性 → 可选能力 → 第一条消息。
     // 与守卫的 `WELCOME_ENTRY_PATHS` 配合 —— 只有"/"与"/chat"会**自动**把人送来，
@@ -201,6 +216,13 @@ const routes = [
       {
         path: 'cache',
         redirect: { path: '/admin/monitor', query: { tab: 'cache' } },
+      },
+      {
+        // 用户管理：团队模式的后台建号入口（成员、角色、禁用、重置密码）。
+        path: 'users',
+        name: 'AdminUsers',
+        component: () => import('../views/admin/UsersView.vue'),
+        meta: { title: t('admin.userAdmin.page_title') },
       },
       {
         path: 'settings',

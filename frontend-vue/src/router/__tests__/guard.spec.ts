@@ -19,6 +19,7 @@ function makeStore(init: {
   const store = {
     user: init.role !== undefined ? { id: 'u1', email: 'a@b.c', name: 'A', role: init.role, tenant_id: 't1' } : null,
     isAuthenticated: init.isAuthenticated ?? !!init.role,
+    mustChangePassword: false,
     fetchProfile: mocks.fetchProfileMock,
     initToken: vi.fn().mockResolvedValue(undefined),
   }
@@ -42,11 +43,27 @@ describe('authGuard', () => {
     mocks.fetchProfileMock.mockResolvedValue(undefined)
   })
 
-  it('requiresAuth 路由无 user 时重定向首页（登录页已随云端模式删除）', async () => {
+  it('requiresAuth 路由无 user 时重定向登录页并带上回跳地址', async () => {
     makeStore({ role: null, isAuthenticated: false })
     const next = fakeNext()
     await authGuard(fakeRoute({ requiresAuth: true }), {} as RouteLocationNormalized, next)
-    expect(next).toHaveBeenCalledWith('/')
+    expect(next).toHaveBeenCalledWith({ path: '/login', query: { redirect: '/x' } })
+  })
+
+  it('首登必须改密：已登录但 mustChangePassword 时拦到改密页', async () => {
+    const store = makeStore({ role: 'user', isAuthenticated: true })
+    store.mustChangePassword = true
+    const next = fakeNext()
+    await authGuard(fakeRoute({ requiresAuth: true }), {} as RouteLocationNormalized, next)
+    expect(next).toHaveBeenCalledWith('/change-password')
+  })
+
+  it('改密页本身不被强制改密判定再次拦截', async () => {
+    const store = makeStore({ role: 'user', isAuthenticated: true })
+    store.mustChangePassword = true
+    const next = fakeNext()
+    await authGuard({ meta: { requiresAuth: true }, path: '/change-password', fullPath: '/change-password' } as unknown as RouteLocationNormalized, {} as RouteLocationNormalized, next)
+    expect(next).toHaveBeenCalledWith()
   })
 
   it('requiresAuth 路由有 user 时放行', async () => {
@@ -131,11 +148,11 @@ describe('authGuard', () => {
       expect(next).toHaveBeenCalledWith('/')
     })
 
-    it('未登录（无 user）重定向首页（登录页已随云端模式删除）', async () => {
+    it('未登录（无 user）重定向登录页并带上回跳地址', async () => {
       makeStore({ role: null, isAuthenticated: false })
       const next = fakeNext()
       await authGuard(fakeRoute({ requiresAuth: true, requiresAdmin: true }), {} as RouteLocationNormalized, next)
-      expect(next).toHaveBeenCalledWith('/')
+      expect(next).toHaveBeenCalledWith({ path: '/login', query: { redirect: '/x' } })
     })
 
     it('backend profile 拉取失败时按本地态降级(绝不误放行 admin)', async () => {

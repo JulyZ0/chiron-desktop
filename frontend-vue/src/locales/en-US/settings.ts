@@ -189,6 +189,10 @@ export default {
   isolation_floor_badge: "Floor",
   isolation_active_badge: "Active",
   isolation_pick: "Choose a tier",
+  isolation_reprobe: "Re-check local capabilities",
+  isolation_reprobe_done: "Re-checked local isolation capabilities.",
+  isolation_reprobe_failed: "Re-check failed.",
+  isolation_retry_unavailable: "This tier is currently unavailable. Enable the elevation helper or fix the missing mechanism first.",
 
   isolation_level_none: "No isolation",
   isolation_level_none_desc: "Tools run with the same privileges as the main process. **Provides no boundary at all**; for troubleshooting only.",

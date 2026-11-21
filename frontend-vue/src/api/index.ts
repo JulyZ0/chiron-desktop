@@ -646,7 +646,7 @@ api.interceptors.response.use(
         return Promise.reject(error)
       }
       if (alreadyNoticed) return Promise.reject(error)
-      // Cookie/token 过期：清本地登录态并回首页（登录页已随云端模式删除）
+      // Cookie/token 过期：清本地登录态并跳登录页（团队 Web 模式）。
       localStorage.removeItem('user')
       setAuthToken('')
       window.dispatchEvent(new CustomEvent('api:error', {
@@ -656,8 +656,14 @@ api.interceptors.response.use(
       // 桌面壳是 file:// + hash 路由：写 '/' 会变成 file:///X:/，整页导航会丢 SPA
       // 上下文。Hash 路由必须改 hash。
       setTimeout(() => {
-        if (window.location.protocol === 'file:') window.location.hash = '#/'
-        else window.location.href = '/'
+        if (window.location.protocol === 'file:') {
+          window.location.hash = '#/'
+          return
+        }
+        // 已经在登录页就不再跳，避免多个并发请求各跳一次造成循环。
+        if (window.location.pathname === '/login') return
+        const redirect = window.location.pathname + window.location.search
+        window.location.href = `/login?redirect=${encodeURIComponent(redirect)}`
       }, 500)
     } else if (error.response?.status >= 500) {
       // 触发全局错误事件，App.vue 中的监听器会显示提示。
@@ -1339,6 +1345,19 @@ export async function setIsolationLevel(
     reason,
     acknowledge_below_floor: acknowledgeBelowFloor,
   })
+  return toIsolationStatus(resp.data)
+}
+
+/**
+ * 强制重新探测本机档位能力（清掉引擎侧冒烟缓存后再查一次）。
+ *
+ * 为什么需要它：`selectable` 来自**端到端冒烟**（真的以受限令牌起一个子进程），
+ * 结果有进程内缓存。用户启用提权助手（或安全软件放行）之后，旧缓存仍可能把
+ * `restricted` 标成不可用 —— 界面表现为"档位永远灰着"，只能重启引擎。
+ * 这个入口让用户当场复测，而不是去猜。
+ */
+export async function probeIsolation(): Promise<IsolationStatus> {
+  const resp = await api.post('/v1/system/isolation/probe')
   return toIsolationStatus(resp.data)
 }
 

@@ -503,9 +503,32 @@ func AuthMiddleware(a *auth.Authenticator) func(http.Handler) http.Handler {
 				}
 			}
 
+			// ── 首登/重置后强制改密 ──
+			// 只放行改密、登出、profile 与刷新会话；其余业务端点一律 403。
+			// 只在前端拦截是不够的：拿到初始密码的人完全可以绕过页面直接调 API。
+			if claims.MustChangePassword && !allowBeforePasswordChange(r.URL.Path) {
+				JSONWithCode(w, http.StatusForbidden, "password_change_required", nil,
+					"password change required before using this service")
+				return
+			}
+
 			ctx := auth.WithClaims(r.Context(), claims)
 			next.ServeHTTP(w, r.WithContext(withTenantCtx(ctx, claims)))
 		})
+	}
+}
+
+// allowBeforePasswordChange 是"必须改密"状态下仍可访问的最小路径集。
+func allowBeforePasswordChange(path string) bool {
+	switch path {
+	case "/v1/auth/password",
+		"/v1/auth/logout",
+		"/v1/auth/profile",
+		"/v1/auth/session",
+		"/v1/auth/refresh":
+		return true
+	default:
+		return false
 	}
 }
 

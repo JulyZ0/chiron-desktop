@@ -132,9 +132,13 @@ func ensureLocalOwner(ctx context.Context) (UserResponse, error) {
 
 	var user UserResponse
 	err = tx.QueryRow(ctx,
-		`SELECT id, email, name, role FROM users WHERE tenant_id = $1 AND email = $2`,
+		`SELECT id, COALESCE(email, ''), COALESCE(username, ''), COALESCE(name, ''),
+		        COALESCE(NULLIF(nickname, ''), NULLIF(name, ''), email, ''),
+		        COALESCE(role, 'owner'), COALESCE(password_set, false)
+		   FROM users WHERE tenant_id = $1 AND email = $2`,
 		DefaultTenantID, localOwnerEmail,
-	).Scan(&user.ID, &user.Email, &user.Name, &user.Role)
+	).Scan(&user.ID, &user.Email, &user.Username, &user.Name, &user.Nickname,
+		&user.Role, &user.PasswordSet)
 	if err == nil {
 		// 已存在（第二次及以后启动）：不动 name/role，用户在管理后台里的改名与降权
 		// 必须活过重启 —— 本端点每次启动都会被调用，写成 UPSERT 会把改动抹掉。
@@ -164,7 +168,8 @@ func ensureLocalOwner(ctx context.Context) (UserResponse, error) {
 	if err != nil {
 		return zero, err
 	}
-	user.Email, user.Name, user.Role = localOwnerEmail, localOwnerName, "owner"
+	user.Email, user.Name, user.Nickname, user.Role = localOwnerEmail, localOwnerName, localOwnerName, "owner"
+	user.PasswordSet = false
 
 	if err := tx.Commit(ctx); err != nil {
 		return zero, err

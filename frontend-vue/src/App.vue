@@ -27,7 +27,8 @@ useTypographyStore()
 // 打一次 401（见 TakeoverOverlay 的挂载条件注释），而且落地页本来就该是干净的单页。
 // 因此 `meta.public` 与 Login/Register 一样走裸 `router-view`。
 const showLayout = computed(
-  () => !['Login', 'Register'].includes(route.name as string) && route.meta.public !== true,
+  // 登录页与强制改密页不套主布局：它们需要在没有可用会话时也能独立渲染。
+  () => !['Login', 'Register', 'ChangePassword'].includes(route.name as string) && route.meta.public !== true,
 )
 
 const themeConfig = computed(() => ({

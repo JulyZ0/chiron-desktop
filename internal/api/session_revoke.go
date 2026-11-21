@@ -49,6 +49,18 @@ func revokeUserSessions(ctx context.Context, userID string) error {
 		time.Now().Unix(), sessionEpochTTL).Err()
 }
 
+// tokenRevokedByEpoch 判断这枚 token 是否签发于最近一次批量撤销之前。
+//
+// Session / Refresh 这类**不在 authMW 后面**的入口必须自己调用：否则用旧 token
+// 刷新可以换到一枚新有效期的 token，把"改密/禁用后立即失效"整条链路绕过去。
+func tokenRevokedByEpoch(ctx context.Context, userID string, issuedAtUnix int64, hasIssuedAt bool) (bool, error) {
+	epoch, err := sessionEpoch(ctx, userID)
+	if err != nil {
+		return false, err
+	}
+	return hasIssuedAt && epoch > 0 && epoch > issuedAtUnix, nil
+}
+
 // sessionEpoch 读取用户的会话纪元；无记录（从未被撤销）返回 0。
 //
 // Redis 不可用时返回 error —— 调用方（authMW）按 **fail-close** 处理：拒绝请求，

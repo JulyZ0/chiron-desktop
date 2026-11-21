@@ -1025,9 +1025,9 @@ function pickSession(id: string) {
           :size="22"
           :style="{ backgroundColor: 'var(--primary)' }"
         >
-          {{ (authStore.user?.name || userName || 'U').charAt(0).toUpperCase() }}
+          {{ (authStore.user?.nickname || authStore.user?.name || userName || 'U').charAt(0).toUpperCase() }}
         </Avatar>
-        <span class="foot-name">{{ authStore.user?.name || userName || $t('admin.user_2') }}</span>
+        <span class="foot-name">{{ authStore.user?.nickname || authStore.user?.name || userName || $t('admin.user_2') }}</span>
         <ThemeSwitcher class="foot-theme" />
         <LanguageSwitcher compact />
         <Dropdown

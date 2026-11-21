@@ -89,6 +89,13 @@ func StartSettingsSubscriber(ctx context.Context, rdb db.RedisClient, limiter *D
 					SetCORSAllowOrigin(v)
 					slog.Info("cors allowlist hot-reloaded via settings broadcast", "origins", v)
 				}
+			case "service":
+				// 服务模式开关是运行态，必须跨副本一致：否则 A 副本关了注册、B 还开着。
+				if v, ok := ev.Config["service_mode"].(bool); ok {
+					serviceModeEnabled.Store(v)
+					slog.Info("service mode hot-reloaded via settings broadcast", "enabled", v)
+				}
+				// bind_host / public_base_url 只能重启生效，这里不做热切换。
 			case "storage":
 				// 从 DB 重载并热切换文件后端（与保存方同一事实源，副本间不会漂移）
 				applyStorageFromSettings(ctx, store, atomicStore)

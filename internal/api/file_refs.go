@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -503,6 +504,13 @@ func projectRootForSession(ctx context.Context, sessionID string) (string, bool)
 	}
 	root := stringOf(row["root_path"])
 	if root == "" {
+		return "", false
+	}
+	// 团队模式：项目根被改到用户隔离目录之外时，@ 引用一律不展开。
+	// 不报错 —— 这层不是"消息非法"，而是"这条上下文不可用"。
+	if !projectRootAllowed(smTenant(claims), claims.UserID, root) {
+		slog.Warn("project root outside user isolation; refs skipped",
+			"user_id", claims.UserID, "root_path", root)
 		return "", false
 	}
 	return root, true

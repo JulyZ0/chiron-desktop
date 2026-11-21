@@ -6,7 +6,11 @@
  * 同一份实现，两条入口不会各自漂移。
  */
 import { UserOutlined } from '@ant-design/icons-vue'
+import { Button } from 'ant-design-vue'
+import { useRouter } from 'vue-router'
 import SettingsPanel from '../components/settings/SettingsPanel.vue'
+
+const router = useRouter()
 </script>
 
 <template>
@@ -14,6 +18,12 @@ import SettingsPanel from '../components/settings/SettingsPanel.vue'
     <div class="profile-header">
       <UserOutlined style="font-size: 24px; color: var(--primary)" />
       <h1>{{ $t('admin.user_settings') }}</h1>
+      <Button
+        class="password-entry"
+        @click="router.push('/change-password')"
+      >
+        {{ $t('auth.change_password_entry') }}
+      </Button>
     </div>
     <SettingsPanel />
   </div>
@@ -38,6 +48,7 @@ import SettingsPanel from '../components/settings/SettingsPanel.vue'
   font-size: 24px;
   font-weight: var(--fw-semibold);
 }
+.password-entry { margin-left: auto; }
 
 @media (max-width: 640px) {
   .profile-container { padding: 16px 12px; }

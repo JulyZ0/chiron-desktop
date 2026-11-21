@@ -601,8 +601,16 @@ async function tryStartGoStack(options = {}) {
   }
 
   try {
+    // 团队服务模式（域名直连）要求网关端口**稳定**：反代/防火墙/证书都在指向它，
+    // 每次启动换号会让整站静默不可达。`CHIRON_GATEWAY_PORT` 显式钉死端口；
+    // 未设置时保持桌面默认的随机空闲端口。
+    const fixedPort = Number(process.env.CHIRON_GATEWAY_PORT || 0)
     const port =
-      Number(options.gatewayPort) > 0 ? Number(options.gatewayPort) : await components.pickFreePort()
+      Number(options.gatewayPort) > 0
+        ? Number(options.gatewayPort)
+        : fixedPort > 0
+          ? fixedPort
+          : await components.pickFreePort()
 
     // APP_SECRET 提前取好：知识库模型的网关回查要用它派生的 INTERNAL_TOKEN
     // （与网关 `deriveSubsecret` 同算法，见 local-stack.cjs）。

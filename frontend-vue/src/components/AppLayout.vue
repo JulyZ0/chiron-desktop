@@ -377,7 +377,7 @@ async function runQuickCommand() {
             :style="{ backgroundColor: 'var(--primary)' }"
             class="user-fab-avatar"
           >
-            {{ authStore.user.name?.charAt(0)?.toUpperCase() || 'U' }}
+            {{ (authStore.user.nickname || authStore.user.name)?.charAt(0)?.toUpperCase() || 'U' }}
           </Avatar>
           <template #overlay>
             <Menu

@@ -191,6 +191,10 @@ export default {
   isolation_floor_badge: "الحد",
   isolation_active_badge: "مطبَّق",
   isolation_pick: "اختر المستوى",
+  isolation_reprobe: "إعادة فحص قدرات الجهاز",
+  isolation_reprobe_done: "أُعيد فحص قدرات العزل المحلية.",
+  isolation_reprobe_failed: "فشلت إعادة الفحص.",
+  isolation_retry_unavailable: "هذا المستوى غير متاح حاليًا. فعّل مساعد الرفع أو أصلح الآلية الناقصة أولًا.",
 
   isolation_level_none: "بلا عزل",
   isolation_level_none_desc: "تعمل الأدوات بنفس صلاحيات العملية الرئيسية. **لا يوفّر أي حدّ**، للاستكشاف فقط.",

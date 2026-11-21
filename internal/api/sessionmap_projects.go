@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -52,6 +53,117 @@ var smForbiddenRoots = []string{
 	`c:\program files`,
 	`c:\program files (x86)`,
 	`c:\programdata\microsoft`,
+}
+
+// projectIsolationRoot 是团队模式下用户项目目录的根（见 config.ProjectsRoot）。
+//
+// 为空 = 桌面单机：用户本来就能选本机任意文件夹，不额外限制。
+// 非空 = 多用户服务：项目 root_path 必须落在 `<root>/<tenant>/<user>/` 内。
+var projectIsolationRoot string
+
+// SetProjectIsolationRoot 由路由器在启动时注入（团队模式未配时回落 StorageRoot/projects）。
+func SetProjectIsolationRoot(root string) {
+	projectIsolationRoot = strings.TrimSpace(root)
+}
+
+// projectPathSegment 把租户/用户标识收敛成安全的单段目录名。
+func projectPathSegment(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "default"
+	}
+	var b strings.Builder
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+func userProjectBase(tenant, userID string) string {
+	if projectIsolationRoot == "" || userID == "" {
+		return ""
+	}
+	return filepath.Join(projectIsolationRoot, projectPathSegment(tenant), projectPathSegment(userID))
+}
+
+// pathWithin 判断 target 是否位于 base 之内（含 base 本身）。
+// Windows 路径大小写不敏感，比较前统一小写；拒绝 `..` 逃逸。
+func pathWithin(base, target string) bool {
+	b, err := filepath.Abs(base)
+	if err != nil {
+		return false
+	}
+	t, err := filepath.Abs(target)
+	if err != nil {
+		return false
+	}
+	// 符号链接可能让词法路径在目录内、真实指向目录外：能解析就按解析后的路径比较。
+	if rb, err := filepath.EvalSymlinks(b); err == nil {
+		b = rb
+	}
+	if rt, err := filepath.EvalSymlinks(t); err == nil {
+		t = rt
+	}
+	if runtime.GOOS == "windows" {
+		b = strings.ToLower(b)
+		t = strings.ToLower(t)
+	}
+	rel, err := filepath.Rel(b, t)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// projectRootAllowed 判断某个项目根是否允许当前用户使用。
+func projectRootAllowed(tenant, userID, root string) bool {
+	base := userProjectBase(tenant, userID)
+	if base == "" {
+		return true
+	}
+	return pathWithin(base, root)
+}
+
+// ensureUserProjectDir 在团队模式下把项目根**限制并创建**在用户自己的目录内。
+//
+// 桌面模式（未配 PROJECTS_ROOT）直接通过；团队模式下：
+//   - 路径不在 `<root>/<tenant>/<user>/` 内 ⇒ 拒绝（防止指向别人的项目/系统目录）；
+//   - 路径不存在 ⇒ 创建（Web 用户没法像桌面那样浏览服务器目录，给一个可写落点）。
+func ensureUserProjectDir(claims *auth.Claims, raw string) error {
+	if projectIsolationRoot == "" {
+		return nil
+	}
+	if claims == nil {
+		return fmt.Errorf("not authenticated")
+	}
+	base := userProjectBase(smTenant(claims), claims.UserID)
+	if base == "" {
+		return nil
+	}
+	p := filepath.Clean(strings.TrimSpace(raw))
+	if p == "" || !filepath.IsAbs(p) {
+		return fmt.Errorf("root_path must be an absolute path")
+	}
+	if !pathWithin(base, p) {
+		return fmt.Errorf("root_path must be inside your own project directory")
+	}
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return fmt.Errorf("cannot create project directory: %w", err)
+	}
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		if err := os.MkdirAll(p, 0o700); err != nil {
+			return fmt.Errorf("cannot create project directory: %w", err)
+		}
+	}
+	return nil
 }
 
 // validateRootPath 校验并规范化项目根目录。
@@ -221,6 +333,12 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 		BadRequest(w, "invalid request")
 		return
 	}
+	// 团队模式：先把项目根限制/创建在 `<PROJECTS_ROOT>/<tenant>/<user>/` 内，
+	// 再做存在性等常规校验。
+	if err := ensureUserProjectDir(claims, body.RootPath); err != nil {
+		Forbidden(w, err.Error())
+		return
+	}
 	rootPath, why := validateRootPath(body.RootPath)
 	if why != "" {
 		JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})
@@ -314,6 +432,10 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 		sets = append(sets, "name = "+arg(n))
 	}
 	if body.RootPath != nil {
+		if err := ensureUserProjectDir(claims, *body.RootPath); err != nil {
+			Forbidden(w, err.Error())
+			return
+		}
 		rp, why := validateRootPath(*body.RootPath)
 		if why != "" {
 			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})

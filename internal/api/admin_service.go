@@ -32,10 +32,19 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/settings"
 )
+
+// serviceModeEnabled 是团队服务模式的**运行态**开关（启动时由 env/DB 初始化，
+// 后台保存后立即更新）。用 atomic 而不是写 cfg 字段：注册 handler 是并发读取方，
+// 直接改 cfg 会引入数据竞争。
+var serviceModeEnabled atomic.Bool
+
+// ServiceModeEnabled 供注册等运行时路径判定。
+func ServiceModeEnabled() bool { return serviceModeEnabled.Load() }
 
 // settingsCategoryService 是「服务」页配置所在的 system_settings 分组。
 const settingsCategoryService = "service"
@@ -61,6 +70,9 @@ type AdminServiceInfo struct {
 	BindHost string `json:"bind_host"`
 	// PublicBaseURL 是生效中的对外地址（空 = 未配置）。
 	PublicBaseURL string `json:"public_base_url"`
+	// ServiceMode 是团队服务模式开关：打开后关闭注册，前台使用账密登录。
+	// 它与监听地址不同，**保存即生效**，不需要重启。
+	ServiceMode bool `json:"service_mode"`
 	// CookieSecure 是当前 Cookie 是否带 Secure —— 由对外地址协议推导，
 	// 页面据此解释"登录了又像没登录"这类现象。
 	CookieSecure bool `json:"cookie_secure"`
@@ -98,6 +110,7 @@ func (h *AdminHandler) buildServiceInfo(r *http.Request, warning string) AdminSe
 		Port:           h.cfg.Port,
 		BindHost:       normalizeBindHost(h.cfg.BindHost),
 		PublicBaseURL:  strings.TrimSpace(h.cfg.PublicBaseURL),
+		ServiceMode:    serviceModeEnabled.Load(),
 		CookieSecure:   h.cfg.CookieSecure,
 		LocalAddresses: localIPv4Addrs(),
 		Warning:        warning,
@@ -164,6 +177,7 @@ func (h *AdminHandler) SaveServiceInfo(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		BindHost      *string `json:"bind_host"`
 		PublicBaseURL *string `json:"public_base_url"`
+		ServiceMode   *bool   `json:"service_mode"`
 	}
 	if err := DecodeJSON(w, r, &body); err != nil {
 		BadRequest(w, ErrInvalidReq)
@@ -187,8 +201,11 @@ func (h *AdminHandler) SaveServiceInfo(w http.ResponseWriter, r *http.Request) {
 		}
 		cfgMap["public_base_url"] = u
 	}
+	if body.ServiceMode != nil {
+		cfgMap["service_mode"] = *body.ServiceMode
+	}
 	if len(cfgMap) == 0 {
-		BadRequest(w, "nothing to save: provide bind_host and/or public_base_url")
+		BadRequest(w, "nothing to save: provide bind_host, public_base_url and/or service_mode")
 		return
 	}
 
@@ -221,6 +238,11 @@ func (h *AdminHandler) SaveServiceInfo(w http.ResponseWriter, r *http.Request) {
 		}
 		InternalError(w, "failed to save service settings")
 		return
+	}
+
+	// 持久化成功后才切换运行态：保存失败时页面会报错，运行态不能已经变了。
+	if body.ServiceMode != nil {
+		serviceModeEnabled.Store(*body.ServiceMode)
 	}
 
 	// 跨副本广播：监听地址不可能热换（见文件头），但保存仍需广播 ——

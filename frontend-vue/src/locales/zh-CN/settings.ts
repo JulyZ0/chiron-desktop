@@ -189,6 +189,10 @@ export default {
   isolation_floor_badge: "底线",
   isolation_active_badge: "生效中",
   isolation_pick: "选择档位",
+  isolation_reprobe: "重新检测本机能力",
+  isolation_reprobe_done: "已重新检测本机隔离能力。",
+  isolation_reprobe_failed: "重新检测失败。",
+  isolation_retry_unavailable: "该档位当前不可选，请先按提示启用提权助手或修复缺失机制。",
 
   isolation_level_none: "无隔离",
   isolation_level_none_desc: "工具与主进程同权限直跑。**不提供任何边界**，仅用于排障。",

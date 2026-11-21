@@ -39,9 +39,15 @@ func registerAdminRoutes(
 	mux.Handle("GET /v1/admin/metrics", authMW(rlMW(adminReadMW(adminStrip))))
 	mux.Handle("GET /v1/admin/users", authMW(rlMW(adminReadMW(adminStrip))))
 	mux.Handle("GET /v1/admin/users/{id}", authMW(rlMW(adminReadMW(adminStrip))))
-	// 用户写操作收紧为 PermUsersManage（仅 owner）
+	// 用户写操作：PermUsersManage（owner + 团队 admin）。
+	// admin 的目标/角色越权在 handler 内按"谁能管谁"的单一判定点拦截。
+	mux.Handle("POST /v1/admin/users", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("PUT /v1/admin/users/{id}", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("DELETE /v1/admin/users/{id}", authMW(rlMW(usersManageMW(adminStrip))))
+	mux.Handle("POST /v1/admin/users/{id}/password/reset", authMW(rlMW(usersManageMW(adminStrip))))
+	mux.Handle("POST /v1/admin/users/{id}/disable", authMW(rlMW(usersManageMW(adminStrip))))
+	mux.Handle("POST /v1/admin/users/{id}/enable", authMW(rlMW(usersManageMW(adminStrip))))
+	mux.Handle("POST /v1/admin/users/{id}/force-logout", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("GET /v1/admin/system", authMW(rlMW(adminReadMW(adminStrip))))
 	// D1：自诊断报告（只读）—— 权限口径与其它 admin 读端点一致。
 	mux.Handle("GET /v1/admin/diagnostics", authMW(rlMW(adminReadMW(adminStrip))))

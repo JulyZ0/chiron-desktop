@@ -9,9 +9,16 @@ import { applyServerLocale } from '../utils/localeSync'
 export interface User {
   id: string
   email: string
+  username?: string
   name: string
+  /** 展示名（欢迎语/个人信息页）；为空时回落到 name */
+  nickname?: string
   role: string
   tenant_id: number
+  /** 是否已由用户自己设置过密码；false = 本地 owner 首次设置 */
+  password_set?: boolean
+  /** 首登/管理员重置后必须改密（团队模式） */
+  must_change_password?: boolean
   /** 用户设置（换肤、朗读音色等）。由 GET /v1/auth/profile 下发、PUT 局部合并。 */
   settings?: Record<string, unknown>
 }
@@ -21,6 +28,7 @@ interface UserStored {
   id: string
   role: string
   name: string
+  nickname?: string
 }
 
 function loadUserFromStorage(): User | null {
@@ -29,7 +37,10 @@ function loadUserFromStorage(): User | null {
     if (!raw) return null
     const stored = JSON.parse(raw) as UserStored
     // 从存储恢复最小字段，其余字段由后端 profile 填充
-    return { id: stored.id, role: stored.role, name: stored.name, email: '', tenant_id: 0 }
+    return {
+      id: stored.id, role: stored.role, name: stored.name,
+      nickname: stored.nickname, email: '', tenant_id: 0,
+    }
   } catch {
     return null
   }
@@ -37,7 +48,7 @@ function loadUserFromStorage(): User | null {
 
 function persistUserToStorage(u: User | null) {
   if (u) {
-    const stored: UserStored = { id: u.id, role: u.role, name: u.name }
+    const stored: UserStored = { id: u.id, role: u.role, name: u.name, nickname: u.nickname }
     localStorage.setItem('user', JSON.stringify(stored))
   } else {
     localStorage.removeItem('user')
@@ -128,6 +139,9 @@ export const useAuthStore = defineStore('auth', () => {
           }
           return
         }
+        // Web：先尝试用 httpOnly cookie 恢复会话（刷新/新标签页）。
+        // 没有 cookie 时静默失败，由路由守卫送去登录页 —— 这里绝不能弹"登录过期"。
+        if (await bootstrapSession()) return
         const stored = await loadDesktopToken()
         if (stored) applyToken(stored)
       })()
@@ -234,15 +248,19 @@ export const useAuthStore = defineStore('auth', () => {
     isDevAuthBypassEnabled() || user.value?.role === 'admin' || user.value?.role === 'owner',
   )
 
-  async function login(email: string, password: string, captcha?: { token: string; randstr?: string }) {
+  /** 登录：`identifier` 可以是邮箱或用户名（团队模式两者都支持）。 */
+  async function login(identifier: string, password: string, captcha?: { token: string; randstr?: string }) {
     loading.value = true
     try {
+      // `__silent`：密码错误的 401 由登录页就地展示，不能被全局拦截器
+      // 当成"会话过期"再弹一次 toast / 跳转。
       const response = await api.post('/v1/auth/login', {
-        email,
+        identifier,
+        email: identifier,
         password,
         captcha_token: captcha?.token || '',
         captcha_randstr: captcha?.randstr || '',
-      })
+      }, { __silent: true })
       const d = response.data?.data
       if (!d) throw new Error('invalid login response')
       // Web 走 httpOnly cookie；桌面端 file:// 跨站拿不到 cookie，applyToken 同时
@@ -320,7 +338,9 @@ export const useAuthStore = defineStore('auth', () => {
   /** SSO 回跳引导：凭 httpOnly cookie 换取会话信息（SSO 登录后建立本地 user 态） */
   async function bootstrapSession(): Promise<boolean> {
     try {
-      const response = await api.get('/v1/auth/session', { withCredentials: true })
+      // `__silent`：匿名访客没有 cookie 时这里必然 401，静默失败即可，
+      // 由调用方决定去登录页还是继续。
+      const response = await api.get('/v1/auth/session', { withCredentials: true, __silent: true })
       const d = response.data?.data
       if (!d?.token) return false
       // 桌面端同样走 Bearer：SSO 回跳的 cookie 在 file:// 下也不会被带上
@@ -332,6 +352,29 @@ export const useAuthStore = defineStore('auth', () => {
       return false
     }
   }
+
+  /** 自助改密（含首登强制）。成功后服务端会重签 Cookie，旧会话全部失效。 */
+  async function changePassword(oldPassword: string, newPassword: string) {
+    loading.value = true
+    try {
+      const response = await api.post('/v1/auth/password', {
+        old_password: oldPassword,
+        new_password: newPassword,
+      }, { __silent: true })
+      const d = response.data?.data
+      if (d?.token) applyToken(d.token)
+      if (d?.user) {
+        user.value = d.user
+        persistUserToStorage(d.user)
+      }
+      return d
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /** 当前会话是否被要求先改密（团队模式首登/重置后）。 */
+  const mustChangePassword = computed(() => user.value?.must_change_password === true)
 
   /** 建立/覆盖本地会话（短信登录等直接拿到 {token, user} 的入口复用） */
   function applySession(t: string, u: User) {
@@ -357,7 +400,7 @@ export const useAuthStore = defineStore('auth', () => {
       return
     }
     try {
-      await api.post('/v1/auth/logout')
+      await api.post('/v1/auth/logout', undefined, { __silent: true })
     } catch {
       // 网络失败仍清理本地态
     }
@@ -398,6 +441,8 @@ export const useAuthStore = defineStore('auth', () => {
     ensureLocalSession,
     login,
     register,
+    changePassword,
+    mustChangePassword,
     fetchProfile,
     bootstrapSession,
     applySession,

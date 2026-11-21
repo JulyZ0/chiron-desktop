@@ -52,11 +52,12 @@ describe('auth store', () => {
       expect(JSON.parse(localStorage.getItem('user') || 'null')).toEqual(mockUserStored)
       // 请求体带 captcha 字段（空串兜底）
       expect(vi.mocked(api.post)).toHaveBeenCalledWith('/v1/auth/login', {
+        identifier: 'a@b.c',
         email: 'a@b.c',
         password: 'password',
         captcha_token: '',
         captcha_randstr: '',
-      })
+      }, { __silent: true })
     })
 
     it('携带验证码参数时透传到请求体', async () => {
@@ -64,11 +65,12 @@ describe('auth store', () => {
       const store = useAuthStore()
       await store.login('a@b.c', 'password', { token: 'cap-token', randstr: 'rnd' })
       expect(vi.mocked(api.post)).toHaveBeenCalledWith('/v1/auth/login', {
+        identifier: 'a@b.c',
         email: 'a@b.c',
         password: 'password',
         captcha_token: 'cap-token',
         captcha_randstr: 'rnd',
-      })
+      }, { __silent: true })
     })
 
     it('响应缺 data 时抛错且不写入状态', async () => {
@@ -179,7 +181,7 @@ describe('auth store', () => {
       expect(localStorage.getItem('token')).toBeNull()
       expect(JSON.parse(localStorage.getItem('user') || 'null')).toEqual(mockUserStored)
       // withCredentials: true（跨端口携带 httpOnly cookie）
-      expect(vi.mocked(api.get)).toHaveBeenCalledWith('/v1/auth/session', { withCredentials: true })
+      expect(vi.mocked(api.get)).toHaveBeenCalledWith('/v1/auth/session', { withCredentials: true, __silent: true })
     })
 
     it('响应无 token 时返回 false', async () => {
@@ -203,7 +205,7 @@ describe('auth store', () => {
       vi.mocked(api.post).mockResolvedValue({ data: {} })
       const store = useAuthStore()
       await store.logout()
-      expect(vi.mocked(api.post)).toHaveBeenCalledWith('/v1/auth/logout')
+      expect(vi.mocked(api.post)).toHaveBeenCalledWith('/v1/auth/logout', undefined, { __silent: true })
       expect(store.token).toBe('')
       expect(store.user).toBeNull()
       expect(localStorage.getItem('user')).toBeNull()

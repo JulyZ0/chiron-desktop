@@ -1048,6 +1048,69 @@ export async function updatePluginAllowlist(commands: string[]): Promise<PluginA
   return data?.data ?? { commands: [], file_commands: [], env_commands: [], configured: false }
 }
 
+// ── 用户管理（团队模式的后台建号入口）────────────────────────────────────
+//
+// 后端：internal/api/admin.go + auth_team.go。
+// 关键约束：初始/临时密码**只返回一次**；创建后 must_change_password=true，
+// 用户首次登录必须改密。
+
+export interface AdminManagedUser {
+  id: string
+  email: string
+  username?: string
+  name: string
+  nickname?: string
+  role: string
+  status: 'active' | 'disabled' | 'deleted' | string
+  last_login_at?: string
+  created_at: string
+  updated_at: string
+}
+
+export async function listAdminUsers(params: { page?: number; per_page?: number } = {}) {
+  const { data } = await api.get('/v1/admin/users', { params })
+  return data?.data as { users: AdminManagedUser[]; total: number; page: number; per_page: number }
+}
+
+export async function createAdminUser(payload: {
+  email: string
+  username?: string
+  nickname?: string
+  role: string
+  initial_password?: string
+}): Promise<{ user: AdminManagedUser; initial_password: string }> {
+  const { data } = await api.post('/v1/admin/users', payload)
+  return data?.data
+}
+
+export async function updateAdminUser(id: string, payload: {
+  email?: string
+  username?: string
+  name?: string
+  nickname?: string
+  role?: string
+}): Promise<void> {
+  await api.put(`/v1/admin/users/${encodeURIComponent(id)}`, payload)
+}
+
+export async function resetAdminUserPassword(id: string): Promise<{ temporary_password: string }> {
+  const { data } = await api.post(`/v1/admin/users/${encodeURIComponent(id)}/password/reset`)
+  return data?.data
+}
+
+export async function setAdminUserDisabled(id: string, disabled: boolean): Promise<void> {
+  const action = disabled ? 'disable' : 'enable'
+  await api.post(`/v1/admin/users/${encodeURIComponent(id)}/${action}`)
+}
+
+export async function forceLogoutAdminUser(id: string): Promise<void> {
+  await api.post(`/v1/admin/users/${encodeURIComponent(id)}/force-logout`)
+}
+
+export async function deleteAdminUser(id: string): Promise<void> {
+  await api.delete(`/v1/admin/users/${encodeURIComponent(id)}`)
+}
+
 // ── 「服务」页（局域网/广域网访问 + 对外域名）──────────────────────────
 //
 // 后端：GET/PUT /v1/admin/service（internal/api/admin_service.go）。
@@ -1063,6 +1126,8 @@ export interface AdminServiceInfo {
   bind_host: string
   /** 生效中的对外地址（空 = 未配置） */
   public_base_url: string
+  /** 团队服务模式：关闭注册、前台使用账密登录；保存即生效 */
+  service_mode: boolean
   /** Cookie 是否带 Secure（由对外地址协议推导） */
   cookie_secure: boolean
   /** 已保存的绑定地址与生效值不同 ⇒ 必须重启网关 */
@@ -1084,6 +1149,7 @@ export async function getServiceInfo(): Promise<AdminServiceInfo> {
 export async function saveServiceInfo(payload: {
   bind_host?: string
   public_base_url?: string
+  service_mode?: boolean
 }): Promise<AdminServiceInfo> {
   const { data } = await api.put('/v1/admin/service', payload)
   return data?.data

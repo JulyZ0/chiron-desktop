@@ -49,8 +49,8 @@ func maskPhone(phone string) string {
 const DefaultTenantID = db.DefaultTenantID
 
 type AuthHandler struct {
-	auth    *auth.Authenticator
-	cfg     *config.Config
+	auth *auth.Authenticator
+	cfg  *config.Config
 	// emailBloom 可选：注入后注册流程先用布隆过滤器快速否定"该邮箱未注册"，
 	// 从而跳过昂贵的 DB 判重。nil 表示未启用（始终回落 DB 查证）。
 	emailBloom *userEmailBloom
@@ -70,15 +70,38 @@ func (h *AuthHandler) SetEmailBloomHandler(b *userEmailBloom) {
 }
 
 type LoginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	// Email 保留旧字段名：老客户端仍按 email 提交；新前端可把邮箱或用户名
+	// 放进 identifier（也兼容直接放进 email）。
+	Email      string `json:"email"`
+	Identifier string `json:"identifier"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+}
+
+// loginIdentifier 返回本次登录用于查找账号的字符串（邮箱或用户名）。
+func (r LoginRequest) loginIdentifier() string {
+	for _, v := range []string{r.Identifier, r.Email, r.Username} {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 type UserResponse struct {
-	ID    string `json:"id"`
-	Email string `json:"email"`
-	Name  string `json:"name"`
-	Role  string `json:"role"`
+	ID       string `json:"id"`
+	Email    string `json:"email"`
+	Username string `json:"username,omitempty"`
+	Name     string `json:"name"`
+	// Nickname 是展示名（欢迎语/个人信息页）；为空时前端回落到 Name。
+	Nickname string `json:"nickname,omitempty"`
+	Role     string `json:"role"`
+	// PasswordSet 为 false 表示账号还没有用户自己设置的密码（本地 owner）。
+	// 此时允许"首次设置密码"而不校验旧密码。
+	PasswordSet bool `json:"password_set"`
+	// MustChangePassword：首登/重置后必须改密。前端据此跳改密页；
+	// 后端 AuthMiddleware 也按 claims 里同一标志拦截其它接口。
+	MustChangePassword bool `json:"must_change_password,omitempty"`
 }
 
 // SetTokenCookie sets the JWT as an HTTP-only secure cookie.
@@ -117,12 +140,13 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, ErrInvalidReq)
 		return
 	}
-	if req.Email == "" || req.Password == "" {
-		BadRequest(w, "email and password are required")
+	ident := req.loginIdentifier()
+	if ident == "" || req.Password == "" {
+		BadRequest(w, "email/username and password are required")
 		return
 	}
-	if len(req.Email) > 255 {
-		BadRequest(w, "email too long")
+	if len(ident) > 255 {
+		BadRequest(w, "email or username too long")
 		return
 	}
 	if len(req.Password) > 128 {
@@ -132,6 +156,13 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 
 	// No dev bypass — always validate against DB
 	ctx := r.Context()
+
+	// 失败锁定先于查库：锁定期内即使密码正确也拒绝，且不再消耗一次 bcrypt/DB 往返。
+	// Redis 不可用时返回 0（fail-open），登录本身不能被缓存故障拖死。
+	if remain := loginLockRemaining(ctx, ident); remain > 0 {
+		TooManyRequestsAfterSeconds(w, int(remain.Seconds()))
+		return
+	}
 
 	// 设置租户上下文以绕过 RLS
 	tx, err := db.GlobalDBManager.Begin(ctx)
@@ -149,28 +180,62 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var user UserResponse
-	var passwordHash string
+	var passwordHash, status string
 	var tenantID int16
 	// F2：不再用 `tenant_id = DefaultTenantID` 过滤 —— 经邀请码注册的用户属于别的
-	// 租户，硬过滤会让它们永远登不进来。改为按 email 取用户，并在同 email 跨租户
-	// 重名时优先默认租户（存量账号行为不变）。
+	// 租户，硬过滤会让它们永远登不进来。改为按邮箱**或用户名**取用户，并在跨租户
+	// 重名时优先默认租户（存量账号行为不变）。两种标识都大小写不敏感。
 	err = tx.QueryRow(ctx,
-		`SELECT id, email, name, role, tenant_id, password_hash
+		`SELECT id, COALESCE(email, ''), COALESCE(username, ''), COALESCE(name, ''),
+		        COALESCE(NULLIF(nickname, ''), NULLIF(name, ''), NULLIF(username, ''), email, ''),
+		        COALESCE(role, 'user'), tenant_id, COALESCE(password_hash, ''),
+		        COALESCE(status, 'active'), COALESCE(must_change_password, false),
+		        COALESCE(password_set, true)
 		   FROM users
-		  WHERE email = $1
+		  WHERE lower(COALESCE(email, '')) = lower($1)
+		     OR (COALESCE(username, '') <> '' AND lower(username) = lower($1))
 		  ORDER BY (tenant_id = $2) DESC, created_at ASC
 		  LIMIT 1`,
-		req.Email, DefaultTenantID,
-	).Scan(&user.ID, &user.Email, &user.Name, &user.Role, &tenantID, &passwordHash)
+		ident, DefaultTenantID,
+	).Scan(&user.ID, &user.Email, &user.Username, &user.Name, &user.Nickname,
+		&user.Role, &tenantID, &passwordHash,
+		&status, &user.MustChangePassword, &user.PasswordSet)
 	if err != nil {
-		slog.Warn("login failed", "email", req.Email, "error", err)
-		h.logLoginFailure(r.Context(), r, req.Email, DefaultTenantID, r.RemoteAddr)
+		slog.Warn("login failed", "identifier", maskEmail(ident), "error", err)
+		recordLoginFailure(ctx, ident)
+		h.logLoginFailure(r.Context(), r, ident, DefaultTenantID, r.RemoteAddr)
+		Unauthorized(w, "invalid email or password")
+		return
+	}
+
+	// 同一账号可能用邮箱或用户名登录：只按输入串计数会让"换个写法"绕过锁定。
+	// 找到用户后再按 canonical email 查一次。
+	if user.Email != ident {
+		if remain := loginLockRemaining(ctx, user.Email); remain > 0 {
+			TooManyRequestsAfterSeconds(w, int(remain.Seconds()))
+			return
+		}
+	}
+
+	// 禁用/删除的账号与"密码错误"返回同一句话：不泄露账号是否存在。
+	if userStatus(status) != userStatusActive {
+		slog.Info("login rejected: account not active", "user_id", user.ID, "status", status)
+		recordLoginFailure(ctx, ident)
+		h.logLoginFailure(r.Context(), r, ident, tenantID, r.RemoteAddr)
 		Unauthorized(w, "invalid email or password")
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password)); err != nil {
-		h.logLoginFailure(r.Context(), r, req.Email, tenantID, r.RemoteAddr)
+		locked := recordLoginFailure(ctx, ident)
+		if user.Email != "" && user.Email != ident {
+			recordLoginFailure(ctx, user.Email)
+		}
+		h.logLoginFailure(r.Context(), r, ident, tenantID, r.RemoteAddr)
+		if locked {
+			TooManyRequestsAfterSeconds(w, int(loginLockTTL.Seconds()))
+			return
+		}
 		Unauthorized(w, "invalid email or password")
 		return
 	}
@@ -182,16 +247,27 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		Unauthorized(w, "user has no tenant binding; contact admin")
 		return
 	}
+
+	clearLoginFailures(ctx, ident)
+	if user.Email != "" && user.Email != ident {
+		clearLoginFailures(ctx, user.Email)
+	}
+	// 最近登录是展示事实，写失败不影响登录本身。
+	if _, err := db.GlobalDBManager.Exec(ctx,
+		`UPDATE users SET last_login_at = NOW() WHERE id = $1`, user.ID); err != nil {
+		slog.Warn("update last_login_at failed", "user_id", user.ID, "error", err)
+	}
+
 	// C1-4：权限优先取 tenant_members（角色真相），查不到回退 auth.RolePermissions。
-	token, err := h.auth.GenerateToken(user.ID, user.Email, user.Role, tenantID,
-		resolveUserPermsDefault(r.Context(), user.ID, user.Role))
+	token, err := h.auth.GenerateTokenWithState(user.ID, user.Email, user.Role, tenantID,
+		resolveUserPermsDefault(r.Context(), user.ID, user.Role), user.MustChangePassword)
 	if err != nil {
 		InternalError(w, "authentication failed")
 		return
 	}
 
 	SetTokenCookie(w, token, int(h.cfg.JWTExpiration.Seconds()), h.cfg.CookieSecure)
-	db.AuditLog(r.Context(), user.ID, tenantID, "login_success", "/v1/auth/login", "email="+maskEmail(req.Email), r.RemoteAddr, nil)
+	db.AuditLog(r.Context(), user.ID, tenantID, "login_success", "/v1/auth/login", "identifier="+maskEmail(ident), r.RemoteAddr, nil)
 	OK(w, map[string]interface{}{
 		"token": token,
 		"user":  user,
@@ -205,7 +281,10 @@ type RegisterRequest struct {
 }
 
 func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.DisableRegistration {
+	// 注册关闭的三条来源：环境变量、部署级 team、后台服务模式开关（运行态）。
+	// 用运行时开关而不是只读启动配置，后台保存后立即生效，不必重启。
+	if h.cfg.DeployMode == config.DeployModeTeam ||
+		h.cfg.DisableRegistrationEnv || serviceModeEnabled.Load() {
 		Forbidden(w, "registration is disabled on this instance")
 		return
 	}
@@ -303,8 +382,9 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	// 使用 PostgreSQL 的 gen_random_uuid() 生成 UUID
 	var userID string
 	err = tx.QueryRow(ctx,
-		`INSERT INTO users (id, tenant_id, email, name, password_hash, role, created_at, updated_at)
-		 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, NOW(), NOW())
+		`INSERT INTO users (id, tenant_id, email, name, password_hash, password_set,
+		                    role, created_at, updated_at)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, true, $5, NOW(), NOW())
 		 RETURNING id`,
 		tenantID, req.Email, req.Name, string(hash), role,
 	).Scan(&userID)
@@ -384,16 +464,33 @@ func (h *AuthHandler) Profile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var settings map[string]interface{}
+	var name, nickname, username, status string
+	var mustChange, passwordSet bool
 	if err := db.GlobalDBManager.QueryRow(r.Context(),
-		`SELECT COALESCE(settings::jsonb, '{}'::jsonb) FROM users WHERE id = $1`, claims.UserID).Scan(&settings); err != nil {
+		`SELECT COALESCE(settings::jsonb, '{}'::jsonb), COALESCE(name, ''),
+		        COALESCE(nickname, ''), COALESCE(username, ''),
+		        COALESCE(status, 'active'), COALESCE(must_change_password, false),
+		        COALESCE(password_set, true)
+		   FROM users WHERE id = $1`, claims.UserID,
+	).Scan(&settings, &name, &nickname, &username, &status, &mustChange, &passwordSet); err != nil {
 		settings = map[string]interface{}{}
 	}
+	display := nickname
+	if display == "" {
+		display = name
+	}
 	OK(w, map[string]interface{}{
-		"user_id":  claims.UserID,
-		"email":    claims.Email,
-		"role":     claims.Role,
-		"perms":    claims.Perms,
-		"settings": settings,
+		"user_id":              claims.UserID,
+		"email":                claims.Email,
+		"username":             username,
+		"name":                 name,
+		"nickname":             display,
+		"role":                 claims.Role,
+		"perms":                claims.Perms,
+		"status":               userStatus(status),
+		"must_change_password": mustChange,
+		"password_set":         passwordSet,
+		"settings":             settings,
 	})
 }
 
@@ -408,14 +505,19 @@ func (h *AuthHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email    string                 `json:"email"`
 		Name     string                 `json:"name"`
-		Settings map[string]interface{} `json:"settings"` // 鑷畾涔夋崲鑲ょ瓑鐢ㄦ埛璁剧疆锛堝眬閮ㄥ悎骞讹級
+		Nickname string                 `json:"nickname"`
+		Settings map[string]interface{} `json:"settings"` // 自定义换肤等用户设置（局部合并）
 	}
 	if err := DecodeJSON(w, r, &body); err != nil {
 		BadRequest(w, ErrInvalidReq)
 		return
 	}
-	if body.Email == "" && body.Name == "" && body.Settings == nil {
+	if body.Email == "" && body.Name == "" && body.Nickname == "" && body.Settings == nil {
 		BadRequest(w, "no fields to update")
+		return
+	}
+	if len(body.Nickname) > 128 {
+		BadRequest(w, "nickname too long")
 		return
 	}
 
@@ -423,13 +525,18 @@ func (h *AuthHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	args := []interface{}{}
 	argIdx := 1
 	if body.Email != "" {
-		setClauses += fmt.Sprintf("email = $%d, ", argIdx)
-		args = append(args, body.Email)
+		setClauses += fmt.Sprintf("email = lower($%d), ", argIdx)
+		args = append(args, strings.TrimSpace(body.Email))
 		argIdx++
 	}
 	if body.Name != "" {
 		setClauses += fmt.Sprintf("name = $%d, ", argIdx)
 		args = append(args, body.Name)
+		argIdx++
+	}
+	if body.Nickname != "" {
+		setClauses += fmt.Sprintf("nickname = $%d, ", argIdx)
+		args = append(args, body.Nickname)
 		argIdx++
 	}
 	if body.Settings != nil {
@@ -449,6 +556,10 @@ func (h *AuthHandler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	if _, err := db.GlobalDBManager.Exec(r.Context(),
 		fmt.Sprintf("UPDATE users SET %s, updated_at = NOW() WHERE id = $%d", setClauses, argIdx),
 		args...); err != nil {
+		if isUniqueViolation(err) {
+			JSON(w, http.StatusConflict, APIResponse{Success: false, Error: "email already exists"})
+			return
+		}
 		logAndRespond(w, err, http.StatusInternalServerError, "update profile failed")
 		return
 	}
@@ -471,6 +582,19 @@ func (h *AuthHandler) Session(w http.ResponseWriter, r *http.Request) {
 	if err != nil || claims == nil {
 		Unauthorized(w, ErrAuthRequired)
 		return
+	}
+	// 与 authMW 同一口径：被批量撤销（改密/禁用/强制下线）的 token 不能再换出用户。
+	if claims.IssuedAt != nil {
+		if revoked, err := tokenRevokedByEpoch(r.Context(), claims.UserID, claims.IssuedAt.Unix(), true); err != nil || revoked {
+			Unauthorized(w, ErrAuthRequired)
+			return
+		}
+	}
+	if claims.ID != "" {
+		if blacklisted, err := checkJWTBlacklisted(r.Context(), claims.ID); err != nil || blacklisted {
+			Unauthorized(w, ErrAuthRequired)
+			return
+		}
 	}
 
 	ctx := r.Context()
@@ -496,10 +620,22 @@ func (h *AuthHandler) Session(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var user UserResponse
+	var status string
 	if err := tx.QueryRow(ctx,
-		`SELECT id, email, name, role FROM users WHERE id = $1 AND tenant_id = $2`,
+		`SELECT id, COALESCE(email, ''), COALESCE(username, ''), COALESCE(name, ''),
+		        COALESCE(NULLIF(nickname, ''), NULLIF(name, ''), NULLIF(username, ''), email, ''),
+		        COALESCE(role, 'user'), COALESCE(status, 'active'),
+		        COALESCE(must_change_password, false), COALESCE(password_set, true)
+		   FROM users WHERE id = $1 AND tenant_id = $2`,
 		claims.UserID, tenantID,
-	).Scan(&user.ID, &user.Email, &user.Name, &user.Role); err != nil {
+	).Scan(&user.ID, &user.Email, &user.Username, &user.Name, &user.Nickname,
+		&user.Role, &status, &user.MustChangePassword, &user.PasswordSet); err != nil {
+		Unauthorized(w, ErrAuthRequired)
+		return
+	}
+	// 禁用/删除后不再返回会话：浏览器刷新页面时应落回登录页，而不是带着
+	// 一个"看起来还在"的用户继续操作。
+	if userStatus(status) != userStatusActive {
 		Unauthorized(w, ErrAuthRequired)
 		return
 	}
@@ -529,18 +665,32 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 批量撤销（改密/禁用/强制下线）同样作用于刷新：否则旧 token 能换一枚新的，
+	// "立即失效"就形同虚设。
+	if oldClaims.IssuedAt != nil {
+		if revoked, err := tokenRevokedByEpoch(r.Context(), oldClaims.UserID, oldClaims.IssuedAt.Unix(), true); err != nil || revoked {
+			Unauthorized(w, "token revoked")
+			return
+		}
+	}
 
 	// 2) 校验用户仍然存在，并**重取最新角色/租户**。
 	//    此前直接 RefreshToken(旧 token) 会原样复制旧 claims 的 role/permissions，
 	//    于是管理员被降权后，只要在旧 token 有效期内刷新，权限就被「续期」——
 	//    降权不生效（P1）。这里改为从 users 表读当前 role 与 tenant_id 后重新签发。
-	var dbEmail, dbRole string
+	var dbEmail, dbRole, dbStatus string
 	var dbTenant int16
+	var dbMustChange bool
 	err = db.GlobalDBManager.QueryRow(r.Context(),
-		`SELECT COALESCE(email, ''), COALESCE(role, ''), COALESCE(tenant_id, 0)
+		`SELECT COALESCE(email, ''), COALESCE(role, ''), COALESCE(tenant_id, 0),
+		        COALESCE(status, 'active'), COALESCE(must_change_password, false)
 		   FROM users WHERE id = $1`,
-		oldClaims.UserID).Scan(&dbEmail, &dbRole, &dbTenant)
+		oldClaims.UserID).Scan(&dbEmail, &dbRole, &dbTenant, &dbStatus, &dbMustChange)
 	if err != nil {
+		Unauthorized(w, "user not found")
+		return
+	}
+	if userStatus(dbStatus) != userStatusActive {
 		Unauthorized(w, "user not found")
 		return
 	}
@@ -548,10 +698,11 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		dbTenant = DefaultTenantID
 	}
 
-	// 权限按**当前角色**重新计算，而非沿用旧 token 的快照。
-	newToken, err := h.auth.GenerateToken(
+	// 权限按**当前角色**重新计算，而非沿用旧 token 的快照；must_change_password
+	// 同样以库为准 —— 刷新不能把"必须改密"这个限制洗掉。
+	newToken, err := h.auth.GenerateTokenWithState(
 		oldClaims.UserID, dbEmail, dbRole, dbTenant,
-		resolveUserPermsDefault(r.Context(), oldClaims.UserID, dbRole))
+		resolveUserPermsDefault(r.Context(), oldClaims.UserID, dbRole), dbMustChange)
 	if err != nil {
 		Unauthorized(w, "session expired")
 		return

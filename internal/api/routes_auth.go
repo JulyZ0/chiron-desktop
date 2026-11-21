@@ -29,4 +29,8 @@ func registerAuthRoutes(mux *http.ServeMux, authHandler *AuthHandler, authMW, rl
 	}
 	mux.Handle("GET /v1/auth/profile", authMW(rlMW(http.HandlerFunc(authHandler.Profile))))
 	mux.Handle("PUT /v1/auth/profile", authMW(rlMW(http.HandlerFunc(authHandler.UpdateProfile))))
+	// 自助改密（含首登强制）：团队模式没有注册页，初始密码由管理员交付，
+	// 用户必须能在这里把它换掉。AuthMiddleware 在 must_change_password 时
+	// **只放行**本端点、登出、profile 与会话刷新。
+	mux.Handle("POST /v1/auth/password", authMW(rlMW(http.HandlerFunc(authHandler.ChangePassword))))
 }

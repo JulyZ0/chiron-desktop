@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -73,6 +74,26 @@ type Config struct {
 
 	// Registration
 	DisableRegistration bool
+	// DisableRegistrationEnv 是**环境变量层**的注册开关，与运行时的服务模式分开。
+	//
+	// 服务模式可以在后台开关里改；关掉它之后，注册是否恢复取决于这个值
+	//（以及 DeployMode 是否 team）。两者混成一个字段会导致"关掉服务模式后
+	// 注册也永久打不开，只能重启"。
+	DisableRegistrationEnv bool
+
+	// DeployMode 是部署形态：`desktop`（默认，单机/桌面壳）或 `team`
+	// （多人 Web 服务，无注册页、后台建号）。
+	//
+	// team 只强制关闭**注册**；本地回环免口令保留 —— owner 就是运行程序的
+	// 第一个 Windows 用户（团队服务模式是后台开关，不存在"首次部署另建 owner"）。
+	DeployMode string
+
+	// ServiceMode 是后台「服务」页保存的团队服务模式开关（启动时从 DB 读入）。
+	//
+	// 与 DeployMode 的关系：DeployMode=team 是部署级的强制口径（容器/公网），
+	// ServiceMode 是同一台机器上的运行级开关。任一为真都视为团队服务模式：
+	// 关闭注册、前台展示账密登录。
+	ServiceMode bool
 
 	// EmailBloom 是注册流程里"邮箱是否已存在"判重的布隆过滤器（按租户分片）。
 	// 它只做**快速否定**：命中"一定不存在"才跳过 DB 判重，真相源始终是
@@ -94,6 +115,15 @@ type Config struct {
 
 	// CORS
 	CORSOrigins string
+
+	// ProjectsRoot 是团队模式下**每个用户项目目录**的根。
+	//
+	// 为空：不限制（桌面单机，用户本来就能选本机任意文件夹）。
+	// 非空：项目 root_path 必须位于 `<ProjectsRoot>/<tenant>/<user>/` 之内；
+	// 网关在创建/改绑项目、解析项目文件、注入 agent 工作根三处统一校验。
+	// 团队模式下未显式配置时，路由器会回落到 `<StorageRoot>/projects` ——
+	// "多人服务"不能允许 A 把项目指向 B 的目录。
+	ProjectsRoot string
 
 	// Storage
 	StorageBackend string // "local" or "s3"
@@ -192,16 +222,16 @@ type Config struct {
 	//
 	// 外部源全部默认关闭 —— 初装即"只吃内置目录"是发布形态的默认语义，
 	// 打开外部源意味着本机开始访问第三方 URL，这必须由部署方或用户显式决定。
-	MarketRemoteEnabled bool     // MARKET_REMOTE_ENABLED：总开关，默认 false
-	MarketCatalogSources []string // MARKET_CATALOG_SOURCES：运维级源 URL（唯一信任入口）
-	MarketAllowUserSources bool  // MARKET_ALLOW_USER_SOURCES：是否允许用户自行加源，默认 false
-	MarketAllowRemoteMCP bool    // MARKET_ALLOW_REMOTE_MCP：外部源能否装 MCP，默认 false
+	MarketRemoteEnabled    bool     // MARKET_REMOTE_ENABLED：总开关，默认 false
+	MarketCatalogSources   []string // MARKET_CATALOG_SOURCES：运维级源 URL（唯一信任入口）
+	MarketAllowUserSources bool     // MARKET_ALLOW_USER_SOURCES：是否允许用户自行加源，默认 false
+	MarketAllowRemoteMCP   bool     // MARKET_ALLOW_REMOTE_MCP：外部源能否装 MCP，默认 false
 	// MarketMaxSources 是源总数上限，默认 20。
 	//
 	// **>20 会被 internal/market 截到 20**：上限若可配大就等于没有上限，
 	// 每个外部源都是一条能拖慢市场页的抓取链路。只允许往小配。
-	MarketMaxSources int // MARKET_MAX_SOURCES：源总数上限，默认 20，>20 会被截到 20
-	MarketCatalogTTL time.Duration // MARKET_CATALOG_TTL：目录缓存时长，默认 5m
+	MarketMaxSources   int           // MARKET_MAX_SOURCES：源总数上限，默认 20，>20 会被截到 20
+	MarketCatalogTTL   time.Duration // MARKET_CATALOG_TTL：目录缓存时长，默认 5m
 	MarketFetchTimeout time.Duration // MARKET_FETCH_TIMEOUT：单次抓取超时，默认 8s
 	// MarketTrustedKeys 是 key_id → base64 Ed25519 公钥（MARKET_TRUSTED_KEYS）。
 	//
@@ -216,6 +246,11 @@ type Config struct {
 
 func Load() (*Config, error) {
 	cfg := loadConfig()
+
+	if cfg.DeployMode != DeployModeDesktop && cfg.DeployMode != DeployModeTeam {
+		return nil, fmt.Errorf("CHIRON_DEPLOY_MODE must be %q or %q, got %q",
+			DeployModeDesktop, DeployModeTeam, cfg.DeployMode)
+	}
 
 	// APP_SECRET is required（部署级主密钥）。
 	if !cfg.ValidateAppSecret() {
@@ -275,6 +310,9 @@ func loadConfig() *Config {
 		JWTExpiration:             getDuration("JWT_EXPIRATION", 24*time.Hour),
 		InternalToken:             getSecret("INTERNAL_TOKEN", ""),
 		DisableRegistration:       isTruthy(getEnv("DISABLE_REGISTRATION", "")),
+		DisableRegistrationEnv:    isTruthy(getEnv("DISABLE_REGISTRATION", "")),
+		DeployMode:                normalizeDeployMode(getEnv("CHIRON_DEPLOY_MODE", "")),
+		ServiceMode:               isTruthy(getEnv("CHIRON_SERVICE_MODE", "")),
 		EmailBloomEnabled:         isTruthy(getEnv("EMAIL_BLOOM_FILTER_ENABLED", "true")),
 		EmailBloomCapacity:        uint64(getInt("EMAIL_BLOOM_CAPACITY", 100000)),
 		NotificationRetentionDays: getInt("NOTIFICATION_RETENTION_DAYS", 90),
@@ -282,6 +320,7 @@ func loadConfig() *Config {
 		// Cookie Secure：显式配置优先；未配置时**按部署协议推导**（见 cookieSecure()）。
 		CookieSecure:       cookieSecure(),
 		CORSOrigins:        getEnv("CORS_ORIGINS", ""),
+		ProjectsRoot:       getEnv("PROJECTS_ROOT", ""),
 		StorageBackend:     getEnv("STORAGE_BACKEND", "local"),
 		StorageRoot:        getEnv("STORAGE_ROOT", filepath.Join(GetDefaultDataDir(), "workspace")),
 		S3Endpoint:         getEnv("S3_ENDPOINT", ""),
@@ -340,19 +379,48 @@ func loadConfig() *Config {
 		PluginDataDir:     getEnv("PLUGIN_DATA_DIR", filepath.Join(GetDefaultDataDir(), "plugins")),
 		// 市场：外部源**默认全关**。初装只吃随包发布的内置目录，
 		// 打开外部源必须显式配置 MARKET_REMOTE_ENABLED=1。
-		MarketRemoteEnabled:   isTruthy(getEnv("MARKET_REMOTE_ENABLED", "")),
-		MarketCatalogSources:  getStringSlice("MARKET_CATALOG_SOURCES", []string{}),
+		MarketRemoteEnabled:    isTruthy(getEnv("MARKET_REMOTE_ENABLED", "")),
+		MarketCatalogSources:   getStringSlice("MARKET_CATALOG_SOURCES", []string{}),
 		MarketAllowUserSources: isTruthy(getEnv("MARKET_ALLOW_USER_SOURCES", "")),
-		MarketAllowRemoteMCP:  isTruthy(getEnv("MARKET_ALLOW_REMOTE_MCP", "")),
+		MarketAllowRemoteMCP:   isTruthy(getEnv("MARKET_ALLOW_REMOTE_MCP", "")),
 		// 默认 20；填更大也会被 internal/market 截到 20（见字段注释）。
-		MarketMaxSources:      getInt("MARKET_MAX_SOURCES", 20),
-		MarketCatalogTTL:      getDuration("MARKET_CATALOG_TTL", 5*time.Minute),
-		MarketFetchTimeout:    getDuration("MARKET_FETCH_TIMEOUT", 8*time.Second),
-		MarketTrustedKeys:     getStringMap("MARKET_TRUSTED_KEYS"),
-		DataDir:           getEnv("CHIRON_DATA_DIR", GetDefaultDataDir()),
+		MarketMaxSources:   getInt("MARKET_MAX_SOURCES", 20),
+		MarketCatalogTTL:   getDuration("MARKET_CATALOG_TTL", 5*time.Minute),
+		MarketFetchTimeout: getDuration("MARKET_FETCH_TIMEOUT", 8*time.Second),
+		MarketTrustedKeys:  getStringMap("MARKET_TRUSTED_KEYS"),
+		DataDir:            getEnv("CHIRON_DATA_DIR", GetDefaultDataDir()),
+	}
+
+	// 团队模式的硬约束：没有注册页。覆盖而不是"缺省"，这样
+	// `DISABLE_REGISTRATION=0` 之类的手滑不会把公开注册口重新打开。
+	//
+	// 本地回环免口令**不关**：owner 是运行程序的第一个 Windows 用户，
+	// 服务模式只是后台的高级开关；关掉它会让本机管理员也进不来。
+	if cfg.DeployMode == DeployModeTeam {
+		cfg.DisableRegistration = true
 	}
 
 	return cfg
+}
+
+const (
+	DeployModeDesktop = "desktop"
+	DeployModeTeam    = "team"
+)
+
+// normalizeDeployMode 归一化部署形态；空值回落 desktop（与引入本开关前一致）。
+// 非法值原样返回，由 Load 报错拒绝启动 —— 拼错时静默当 desktop 会留下注册口。
+func normalizeDeployMode(raw string) string {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		return DeployModeDesktop
+	}
+	return mode
+}
+
+// IsTeamMode 表示当前是否团队 Web 服务形态（部署级或后台开关任一为真）。
+func (c *Config) IsTeamMode() bool {
+	return c != nil && (c.DeployMode == DeployModeTeam || c.ServiceMode)
 }
 
 // GetDefaultDataDir returns the default data directory based on environment:

@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/athenavi/chiron/config"
@@ -49,9 +50,18 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	// 原有端点
 	r.HandleFunc("GET /metrics", h.Metrics)
 	r.HandleFunc("GET /users", h.ListUsers)
+	r.HandleFunc("POST /users", h.CreateUser)
 	r.HandleFunc("GET /users/{id}", h.GetUser)
 	r.HandleFunc("PUT /users/{id}", h.UpdateUser)
 	r.HandleFunc("DELETE /users/{id}", h.DeleteUser)
+	r.HandleFunc("POST /users/{id}/password/reset", h.ResetUserPassword)
+	r.HandleFunc("POST /users/{id}/disable", func(w http.ResponseWriter, req *http.Request) {
+		h.SetUserStatus(w, req, true)
+	})
+	r.HandleFunc("POST /users/{id}/enable", func(w http.ResponseWriter, req *http.Request) {
+		h.SetUserStatus(w, req, false)
+	})
+	r.HandleFunc("POST /users/{id}/force-logout", h.ForceLogout)
 	r.HandleFunc("GET /system", h.SystemInfo)
 	// D1："配了但不生效"的自诊断 —— 与部署审计同一条线，把配置陷阱与依赖断链变成可自答。
 	r.HandleFunc("GET /diagnostics", h.GetDiagnostics)
@@ -137,12 +147,17 @@ func (h *AdminHandler) Metrics(w http.ResponseWriter, r *http.Request) {
 }
 
 type AdminUser struct {
-	ID        string `json:"id"`
-	Email     string `json:"email"`
-	Name      string `json:"name"`
-	Role      string `json:"role"`
-	CreatedAt string `json:"created_at"`
-	UpdatedAt string `json:"updated_at"`
+	ID       string `json:"id"`
+	Email    string `json:"email"`
+	Username string `json:"username,omitempty"`
+	Name     string `json:"name"`
+	Nickname string `json:"nickname,omitempty"`
+	Role     string `json:"role"`
+	Status   string `json:"status"`
+	// LastLoginAt 为空表示从未登录（团队建号后还没交付/激活）。
+	LastLoginAt string `json:"last_login_at,omitempty"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
 func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +192,11 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.GlobalDBManager.Query(r.Context(),
-		`SELECT id, email, name, role, created_at, updated_at
+		`SELECT id, COALESCE(email, ''), COALESCE(username, ''), COALESCE(name, ''),
+		        COALESCE(NULLIF(nickname, ''), name, ''), COALESCE(role, 'user'),
+		        COALESCE(status, 'active'),
+		        COALESCE(to_char(last_login_at, 'YYYY-MM-DD HH24:MI'), ''),
+		        created_at, updated_at
 		 FROM users WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
 		tenantID, perPage, offset)
 	if err != nil {
@@ -190,7 +209,8 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var u AdminUser
 		var createdAt, updatedAt time.Time
-		if err := rows.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &createdAt, &updatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Email, &u.Username, &u.Name, &u.Nickname, &u.Role,
+			&u.Status, &u.LastLoginAt, &createdAt, &updatedAt); err != nil {
 			continue
 		}
 		u.CreatedAt = createdAt.Format(time.RFC3339)
@@ -225,9 +245,14 @@ func (h *AdminHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 	var u AdminUser
 	var createdAt, updatedAt time.Time
 	err := db.GlobalDBManager.QueryRow(r.Context(),
-		`SELECT id, email, name, role, created_at, updated_at
+		`SELECT id, COALESCE(email, ''), COALESCE(username, ''), COALESCE(name, ''),
+		        COALESCE(NULLIF(nickname, ''), name, ''), COALESCE(role, 'user'),
+		        COALESCE(status, 'active'),
+		        COALESCE(to_char(last_login_at, 'YYYY-MM-DD HH24:MI'), ''),
+		        created_at, updated_at
 		 FROM users WHERE id = $1 AND tenant_id = $2`, id, tenantID).
-		Scan(&u.ID, &u.Email, &u.Name, &u.Role, &createdAt, &updatedAt)
+		Scan(&u.ID, &u.Email, &u.Username, &u.Name, &u.Nickname, &u.Role,
+			&u.Status, &u.LastLoginAt, &createdAt, &updatedAt)
 	if err != nil {
 		NotFound(w, "user not found")
 		return
@@ -251,9 +276,11 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Email string `json:"email"`
-		Name  string `json:"name"`
-		Role  string `json:"role"`
+		Email    string `json:"email"`
+		Username string `json:"username"`
+		Name     string `json:"name"`
+		Nickname string `json:"nickname"`
+		Role     string `json:"role"`
 	}
 	if err := DecodeJSON(w, r, &body); err != nil {
 		BadRequest(w, ErrInvalidReq)
@@ -266,17 +293,53 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	claims := auth.GetClaims(r.Context())
-	if body.Role == "owner" && (claims == nil || claims.Role != "owner") {
-		BadRequest(w, "only owner can assign owner role")
+	if claims == nil {
+		Unauthorized(w, ErrAuthRequired)
+		return
+	}
+	target, err := loadManagedUser(r.Context(), tenantID, id)
+	if err != nil {
+		NotFound(w, "user not found")
+		return
+	}
+	if target.Role == "owner" && claims.Role != "owner" {
+		Forbidden(w, "only the platform owner can manage an owner")
+		return
+	}
+	if target.Role == "admin" && claims.Role != "owner" && target.ID != claims.UserID {
+		Forbidden(w, "only the platform owner can manage an admin")
+		return
+	}
+	if body.Role != "" {
+		if body.Role != "user" && claims.Role != "owner" {
+			Forbidden(w, "only the platform owner can assign admin or owner roles")
+			return
+		}
+		if target.ID == claims.UserID && body.Role != target.Role {
+			BadRequest(w, "cannot change your own role")
+			return
+		}
+		if target.Role == "owner" && body.Role != "owner" {
+			if err := ensureCanManage(r.Context(), claims, target, "update_role"); err != nil {
+				Forbidden(w, err.Error())
+				return
+			}
+		}
+	}
+	username := strings.ToLower(strings.TrimSpace(body.Username))
+	if username != "" && !usernameRe.MatchString(username) {
+		BadRequest(w, "username must be 3-64 chars of letters, digits, dot, underscore or hyphen")
 		return
 	}
 
 	// Build dynamic UPDATE with column name whitelist —— tenant_id 作为额外 WHERE 条件防越权
 	// S 安全修复：列名必须来自白名单，防止 SQL 注入
 	userColumnMap := map[string]string{
-		"email": "email",
-		"name":  "name",
-		"role":  "role",
+		"email":    "email",
+		"username": "username",
+		"name":     "name",
+		"nickname": "nickname",
+		"role":     "role",
 	}
 	setClauses := ""
 	args := []interface{}{}
@@ -286,8 +349,10 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		field string
 		value string
 	}{
-		{"email", body.Email},
+		{"email", strings.ToLower(strings.TrimSpace(body.Email))},
+		{"username", username},
 		{"name", body.Name},
+		{"nickname", body.Nickname},
 		{"role", body.Role},
 	}
 	for _, fv := range fieldValues {
@@ -313,6 +378,10 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	query := fmt.Sprintf("UPDATE users SET %s WHERE id = $%d AND tenant_id = $%d", setClauses, argIdx, argIdx+1)
 	result, err := db.GlobalDBManager.Exec(r.Context(), query, args...)
 	if err != nil {
+		if isUniqueViolation(err) {
+			JSON(w, http.StatusConflict, APIResponse{Success: false, Error: "email or username already exists"})
+			return
+		}
 		logAndRespond(w, err, http.StatusInternalServerError, "update user failed")
 		return
 	}
@@ -336,18 +405,36 @@ func (h *AdminHandler) DeleteUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Prevent deleting yourself
 	claims := auth.GetClaims(r.Context())
-	if claims != nil && claims.UserID == id {
-		BadRequest(w, "cannot delete your own account")
+	target, err := loadManagedUser(r.Context(), tenantID, id)
+	if err != nil {
+		NotFound(w, "user not found")
+		return
+	}
+	if err := ensureCanManage(r.Context(), claims, target, "delete"); err != nil {
+		Forbidden(w, err.Error())
 		return
 	}
 
-	_, err := db.GlobalDBManager.Exec(r.Context(),
-		`DELETE FROM users WHERE id = $1 AND tenant_id = $2`, id, tenantID)
-	if err != nil {
+	// 软删除：保留消息归属与审计。邮箱/用户名改写为按 id 唯一的值，
+	// 释放 (tenant_id, email) 与 (tenant_id, lower(username)) 的唯一约束。
+	if _, err := db.GlobalDBManager.Exec(r.Context(),
+		`UPDATE users
+		    SET status = 'deleted',
+		        email = 'deleted+' || id || '@invalid.local',
+		        username = 'deleted_' || id,
+		        updated_at = NOW()
+		  WHERE id = $1 AND tenant_id = $2`, id, tenantID); err != nil {
 		logAndRespond(w, err, http.StatusInternalServerError, "delete user failed")
 		return
+	}
+	// 删除后必须立刻失效：只标状态的话，已签发的 token 还能继续用。
+	if err := revokeUserSessions(r.Context(), id); err != nil {
+		slog.Warn("user deleted but session revoke failed", "user_id", id, "error", err)
+	}
+	if claims != nil {
+		db.AuditLog(r.Context(), claims.UserID, tenantID, "user_deleted",
+			"/v1/admin/users/"+id, "soft_delete email="+maskEmail(target.Email), r.RemoteAddr, nil)
 	}
 
 	OK(w, map[string]string{"status": "deleted"})
