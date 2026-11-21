@@ -41,7 +41,7 @@
           v-else-if="!loading"
           size="list"
           :description="$t('common.no_content_preview_yet')"
-          :hint="$t('errors.the_document_may_be_processing_or_its_format_is_not_previewable_yet')"
+          :hint="note || $t('errors.the_document_may_be_processing_or_its_format_is_not_previewable_yet')"
         />
 
         <!-- 失败信息 -->
@@ -97,6 +97,8 @@ const modalVisible = computed({
 
 const loading = ref(false)
 const content = ref('')
+/** 后端给出的"为什么没有内容"（扫描件 / 云端文档 / 格式不支持），比通用文案可执行 */
+const note = ref('')
 const error = ref('')
 const document = ref<Document | null>(null)
 const pageCount = ref(0)
@@ -119,6 +121,7 @@ async function loadPreview() {
   if (!props.documentId) return
   loading.value = true
   content.value = ''
+  note.value = ''
   error.value = ''
 
   try {
@@ -126,6 +129,7 @@ async function loadPreview() {
     const data = res.data?.data || res.data
     document.value = data
     content.value = data.content || ''
+    note.value = data.preview_note || ''
     pageCount.value = data.page_count || 0
   } catch (e) {
     const data = (e as { response?: { data?: { detail?: unknown; error?: unknown } } }).response?.data

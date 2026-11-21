@@ -158,6 +158,50 @@ func (m *Manager) ListSessions(ctx context.Context, userID string, page, perPage
 	return sessions, nil
 }
 
+// deletedSessionTTL 是「已删除会话」墓碑的存活时间。
+//
+// 必须覆盖"正在跑的回合结束后回写消息"的时间窗：删除接口返回后，后台 run 可能
+// 还有一轮没走完；它收尾时走 `ensureSessionOwnedWithTitle` 的 upsert，会把刚删掉的
+// sessions 行**重新建出来**（表现为"删掉的会话又回来了"）。墓碑让那条写入被拒绝。
+// 24h 远大于任何单轮上限，也不会永久占用 key 空间。
+const deletedSessionTTL = 24 * time.Hour
+
+// deletedSessionPrefix 与 `session:` 同源（REDIS_KEY_PREFIX 由 db.RedisKey 注入）。
+var deletedSessionPrefix = db.RedisKey("session:deleted:")
+
+func (m *Manager) sessionDeleted(ctx context.Context, id string) bool {
+	if m.rdb == nil || id == "" {
+		return false
+	}
+	// 短超时 + fail-open：墓碑是防复活的增强，Redis 抖动时不该把正常的消息写入挡掉。
+	wctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+	n, err := m.rdb.Exists(wctx, deletedSessionPrefix+id).Result()
+	return err == nil && n > 0
+}
+
+func (m *Manager) markSessionDeleted(ctx context.Context, id string) bool {
+	if m.rdb == nil || id == "" {
+		return false
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	if err := m.rdb.Set(wctx, deletedSessionPrefix+id, "1", deletedSessionTTL).Err(); err != nil {
+		slog.Warn("session deletion tombstone not written", "session", id, "error", err)
+		return false
+	}
+	return true
+}
+
+func (m *Manager) unmarkSessionDeleted(ctx context.Context, id string) {
+	if m.rdb == nil || id == "" {
+		return
+	}
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	_ = m.rdb.Del(wctx, deletedSessionPrefix+id).Err()
+}
+
 // DeleteSession removes a session from PG and Redis cache.
 // Evict cache first so a subsequent GetSession falls through to PG (source of truth)
 // even if Redis eviction fails silently.
@@ -166,15 +210,31 @@ func (m *Manager) ListSessions(ctx context.Context, userID string, page, perPage
 // 且基线未配置 ON DELETE CASCADE，直接 `DELETE FROM sessions` 会触发外键违反
 // → 接口 500 "服务器错误"。故在同一事务内按依赖顺序清理：先删引用行，再删会话本身。
 //
+// 运行期数据（agent_runs / subagent_runs / pending_interactions / project_checkpoints）
+// 只有 `session_id` 列、**没有**外键：不显式删就会留下孤儿行，reconciler 还会把
+// checkpointed 的 run 自动续跑 —— 用户看到的是"会话删了，后台还在干活"。
+// 表可能尚未迁移到基线（老库），所以先查 `to_regclass` 再决定要不要拼这条 DELETE。
+//
 // usage_events 不做处理：它是只读观测数据，保留会话 id 便于事后归因。
 func (m *Manager) DeleteSession(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("session id is required")
 	}
 
+	// 墓碑先于删除落地：删除提交与"在途回合回写消息"之间没有锁，
+	// 只有墓碑能保证回写被拒绝。删除失败时再撤掉，避免把仍存在的会话锁死。
+	marked := m.markSessionDeleted(ctx, id)
+	success := false
+	defer func() {
+		if marked && !success {
+			m.unmarkSessionDeleted(ctx, id)
+		}
+	}()
+
 	m.evictCache(ctx, id)
 
 	if m.pool == nil {
+		success = true
 		return nil
 	}
 
@@ -184,12 +244,26 @@ func (m *Manager) DeleteSession(ctx context.Context, id string) error {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	extras := m.sessionRuntimeTables(ctx)
 	stmts := []string{
 		`DELETE FROM turns WHERE session_id = $1`,
 		`DELETE FROM messages WHERE session_id = $1`,
 		`DELETE FROM tool_calls WHERE session_id = $1`,
-		`DELETE FROM sessions WHERE id = $1`,
 	}
+	if extras["agent_runs"] {
+		stmts = append(stmts, `DELETE FROM agent_runs WHERE session_id = $1`)
+	}
+	if extras["subagent_runs"] {
+		stmts = append(stmts, `DELETE FROM subagent_runs WHERE root_session_id = $1`)
+	}
+	if extras["pending_interactions"] {
+		stmts = append(stmts, `DELETE FROM pending_interactions WHERE session_id = $1`)
+	}
+	if extras["project_checkpoints"] {
+		// checkpoint_untracked 通过外键级联删除，不必单独处理。
+		stmts = append(stmts, `DELETE FROM project_checkpoints WHERE session_id = $1`)
+	}
+	stmts = append(stmts, `DELETE FROM sessions WHERE id = $1`)
 	for _, q := range stmts {
 		if _, err := tx.Exec(ctx, q, id); err != nil {
 			return fmt.Errorf("delete session: %w", err)
@@ -199,8 +273,39 @@ func (m *Manager) DeleteSession(ctx context.Context, id string) error {
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("delete session: commit: %w", err)
 	}
+	success = true
 
 	return nil
+}
+
+// sessionRuntimeTables 一次性判断四张运行期表是否存在。
+//
+// 为什么不直接 `DELETE` 再容忍 42P01：PG 中任一语句失败会让**整个事务**进入
+// aborted 状态，后续 DELETE 全部报 "current transaction is aborted" ——
+// 容错反而让删除整个失败。先查 `to_regclass` 能把"老库缺表"降级成跳过。
+func (m *Manager) sessionRuntimeTables(ctx context.Context) map[string]bool {
+	out := map[string]bool{}
+	if m.pool == nil {
+		return out
+	}
+	const q = `SELECT to_regclass('public.agent_runs') IS NOT NULL,
+	                  to_regclass('public.subagent_runs') IS NOT NULL,
+	                  to_regclass('public.pending_interactions') IS NOT NULL,
+	                  to_regclass('public.project_checkpoints') IS NOT NULL`
+	var agentRuns, subagentRuns, pending, checkpoints bool
+	if err := m.pool.QueryRow(ctx, q).Scan(&agentRuns, &subagentRuns, &pending, &checkpoints); err != nil {
+		// 查不到（权限/连接）时保守按"都存在"处理：缺表会在删除时报出来，
+		// 而漏删运行期数据会让后台任务继续跑 —— 后者更难被发现。
+		return map[string]bool{
+			"agent_runs": true, "subagent_runs": true,
+			"pending_interactions": true, "project_checkpoints": true,
+		}
+	}
+	out["agent_runs"] = agentRuns
+	out["subagent_runs"] = subagentRuns
+	out["pending_interactions"] = pending
+	out["project_checkpoints"] = checkpoints
+	return out
 }
 
 // SessionUpdate 描述一次会话属性更新：nil 表示不修改该字段。

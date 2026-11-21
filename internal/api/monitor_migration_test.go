@@ -88,9 +88,12 @@ func TestMonitorMigrationChainSingleHead(t *testing.T) {
 	if len(heads) != 1 {
 		t.Fatalf("迁移链有 %d 个 head（应为 1）: %v", len(heads), heads)
 	}
-	// 单链：0005 → 0006_price_backfill → 0007_metrics_rollup_instance。
-	if heads[0] != "0007_metrics_rollup_instance" {
-		t.Fatalf("链头应为 0007_metrics_rollup_instance，实际 %q", heads[0])
+	// 单链：0005 → 0006_price_backfill → 0007_metrics_rollup_instance → 0008_team_accounts。
+	if heads[0] != "0008_team_accounts" {
+		t.Fatalf("链头应为 0008_team_accounts，实际 %q", heads[0])
+	}
+	if migs["0008_team_accounts"].down != "0007_metrics_rollup_instance" {
+		t.Fatalf("0008 必须接在 0007_metrics_rollup_instance 之后，实际 %q", migs["0008_team_accounts"].down)
 	}
 	if migs["0006_price_backfill"].down != "0005_share_ops" {
 		t.Fatalf("0006_price_backfill 的 down_revision 应为 0005_share_ops，实际 %q", migs["0006_price_backfill"].down)
@@ -100,6 +103,37 @@ func TestMonitorMigrationChainSingleHead(t *testing.T) {
 	}
 	if migs["0007_metrics_rollup_instance"].down != "0006_price_backfill" {
 		t.Fatalf("0007 必须接在 0006_price_backfill 之后，实际 %q", migs["0007_metrics_rollup_instance"].down)
+	}
+}
+
+// TestTeamAccountsMigrationShape 钉住 0008：团队模式依赖的状态列必须真的在。
+//
+// 少任何一列，登录/禁用/首登改密都会在运行期报 "column ... does not exist"，
+// 而错误只会出现在日志里 —— 用户看到的是"登录失败"。
+func TestTeamAccountsMigrationShape(t *testing.T) {
+	migs := migrationFiles(t)
+	m, ok := migs["0008_team_accounts"]
+	if !ok {
+		t.Fatalf("缺少 0008_team_accounts 迁移")
+	}
+	body := m.body
+	for _, frag := range []string{
+		"ALTER TABLE public.users",
+		"username character varying(64)",
+		"nickname character varying(128)",
+		"ux_users_tenant_username",
+		"status character varying(16)",
+		"must_change_password boolean NOT NULL DEFAULT false",
+		"password_changed_at timestamp with time zone",
+		"last_login_at timestamp with time zone",
+		"ix_users_tenant_status",
+	} {
+		if !strings.Contains(body, frag) {
+			t.Fatalf("0008 upgrade 缺少 %q", frag)
+		}
+	}
+	if !strings.Contains(body, "DROP COLUMN IF EXISTS") {
+		t.Fatalf("0008 downgrade 必须可重复执行地删列")
 	}
 }
 
@@ -135,16 +169,20 @@ func TestMonitorMigrationRollupTableShape(t *testing.T) {
 	}
 }
 
-// TestMonitorMigrationRollupInstanceColumn 钉住 0006：instance 列存在、默认空串
+// TestMonitorMigrationRollupInstanceColumn 钉住 0007：instance 列存在、默认空串
 // （存量行不必回填），且 downgrade 可重复执行。
+//
+// 该迁移原编号 0006，与价格回填的 0006 撞号后重编号为 0007（见提交
+// "迁移 0006 重编号为 0007 保持单链"）。测试必须跟着 revision 走，
+// 否则链本身是对的、门禁却永远红着。
 //
 // 少这一列时 rollup 写入会在运行期报 "column instance does not exist" ——
 // 表现为监控历史永远为空，而错误只出现在日志里。
 func TestMonitorMigrationRollupInstanceColumn(t *testing.T) {
 	migs := migrationFiles(t)
-	m, ok := migs["0006_metrics_rollup_instance"]
+	m, ok := migs["0007_metrics_rollup_instance"]
 	if !ok {
-		t.Fatalf("缺少 0006_metrics_rollup_instance 迁移")
+		t.Fatalf("缺少 0007_metrics_rollup_instance 迁移")
 	}
 	body := m.body
 	for _, frag := range []string{
@@ -152,13 +190,13 @@ func TestMonitorMigrationRollupInstanceColumn(t *testing.T) {
 		"ADD COLUMN IF NOT EXISTS instance text NOT NULL DEFAULT ''",
 	} {
 		if !strings.Contains(body, frag) {
-			t.Fatalf("0006 upgrade 缺少 %q", frag)
+			t.Fatalf("0007 upgrade 缺少 %q", frag)
 		}
 	}
 	if !strings.Contains(body, "DROP COLUMN IF EXISTS instance") {
-		t.Fatalf("0006 downgrade 必须可重复执行地删列")
+		t.Fatalf("0007 downgrade 必须可重复执行地删列")
 	}
-	if !strings.Contains(body, `revision: str = "0006_metrics_rollup_instance"`) {
-		t.Fatalf("0006 的 revision 标识被改动了")
+	if !strings.Contains(body, `revision: str = "0007_metrics_rollup_instance"`) {
+		t.Fatalf("0007 的 revision 标识被改动了")
 	}
 }

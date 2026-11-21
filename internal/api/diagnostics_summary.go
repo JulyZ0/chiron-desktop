@@ -59,7 +59,10 @@ const (
 	// 否则我们会先超时、把"那台检索服务连不上"误报成"引擎不可达"——
 	// 两种结论的排查方向完全不同。
 	diagKnowledgeTimeout = 12 * time.Second
-	diagDepsTimeout      = 3 * time.Second
+	// 引擎侧 `/internal/deps/list` 可能要跑一次 uv/pip 列包，3s 在冷启动上
+	// 稳定超时、把"通道在、只是慢"误报成异常。放宽到 10s，仍远小于引擎侧 30s 的
+	// 内部上限 —— 超过它才说明真的没响应。
+	diagDepsTimeout = 10 * time.Second
 )
 
 // DiagSummaryCheck 是清单里的一行。字段是前后端的契约，五个都不能省：

@@ -47,8 +47,11 @@ router = APIRouter(prefix="/v1/kb", tags=["knowledge"])
 #: 没有上限的上传等于把对象存储与内存交给调用方。
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 
-#: 预览时按文本读取的扩展名（PDF 等二进制交给下载/引用，不做文本内联）
+#: 预览时按纯文本读取的扩展名
 _TEXT_PREVIEW_SUFFIXES = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".log"}
+
+#: 预览文本上限（字符）：够看清首页内容，又不至于把响应撑成整本书
+_PREVIEW_CHARS = 10000
 
 _ALLOWED_VISIBILITY = ("public", "private", "tenant")
 
@@ -800,8 +803,26 @@ async def build_knowledge_base(
             status_code=400, detail="cannot build knowledge base with no documents"
         )
     await _assert_provider_matches(user_id=str(user_id), kb_provider=str(kb["provider"]))
-    # 先确认 provider 真的可用，再投递：否则用户会等一个注定失败的长任务
-    await _resolve_provider_or_error(user_id=str(user_id))
+    # 先确认 provider 真的可用，再投递：否则用户会等一个注定失败的长任务。
+    #
+    # `_resolve_provider_or_error` 的 health 是**本地可判定部分**（地址/凭据是否齐备），
+    # 不触网（见 `RemoteProvider.health` 的注释）。内置检索服务没起来时，
+    # 地址仍可能非空、health 仍 ok —— 于是 build 返回"已投递"，库永久停在 indexing。
+    # 这里补一次**真实探测**，把"服务不可用"在投递前说清楚。
+    provider = await _resolve_provider_or_error(user_id=str(user_id))
+    probe = getattr(provider, "probe", None)
+    if probe is not None:
+        try:
+            health = await probe()
+        except Exception as exc:  # noqa: BLE001 — 探测异常等价于服务不可用
+            raise HTTPException(
+                status_code=503, detail=f"索引服务探测失败：{exc}"
+            ) from exc
+        if not getattr(health, "ok", True):
+            raise HTTPException(
+                status_code=503,
+                detail=f"索引服务不可用：{getattr(health, 'detail', '') or '未知原因'}",
+            )
 
     task_id = await _enqueue_kb_index(
         kb_id=kb_id, user_id=user_id, tenant_id=tenant_id, force=force
@@ -1157,16 +1178,70 @@ async def preview_document(
 
     doc = _serialize_doc(row)
     doc["content"] = ""
+    doc["preview_note"] = ""
+    doc["preview_truncated"] = False
     suffix = f".{(row['file_type'] or '').lower().lstrip('.')}"
-    if suffix in _TEXT_PREVIEW_SUFFIXES and row["storage_key"]:
-        try:
-            import asyncio
+    if not row["storage_key"]:
+        # 云端索引的文档只有元信息，原文不在本机对象存储里
+        doc["preview_note"] = "该文档没有本机原文副本，无法内联预览。"
+        return {"data": doc}
 
-            raw = await asyncio.to_thread(blob.get_blob_store().get, str(row["storage_key"]))
-            doc["content"] = raw[:10000].decode("utf-8", errors="replace")
-        except Exception as exc:  # noqa: BLE001 — 预览失败不该 500
-            logger.warning("knowledge preview: read failed doc=%s: %s", doc_id, exc)
+    try:
+        import asyncio
+
+        raw = await asyncio.to_thread(blob.get_blob_store().get, str(row["storage_key"]))
+    except Exception as exc:  # noqa: BLE001 — 预览失败不该 500
+        logger.warning("knowledge preview: read failed doc=%s: %s", doc_id, exc)
+        doc["preview_note"] = f"读取原文失败：{exc}"
+        return {"data": doc}
+
+    text, note = await asyncio.to_thread(_preview_text, suffix, raw)
+    doc["content"] = text
+    doc["preview_note"] = note
+    doc["preview_truncated"] = len(text) >= _PREVIEW_CHARS
     return {"data": doc}
+
+
+def _preview_text(suffix: str, raw: bytes) -> tuple[str, str]:
+    """把原文变成可内联的文本，返回 `(content, note)`。
+
+    自托管模式**只接受 PDF**（见 `RemoteProvider.supports`），而此前的预览只认
+    纯文本后缀 —— 能上传的类型恰好是唯一不能预览的类型，用户看到的是
+    "上传成功、索引成功、预览空白"。所以 PDF 必须走文本提取。
+
+    提取失败时返回**可读的原因**而不是空串：空内容会被界面渲染成
+    "文档可能还在处理"，把"扫描件无文本层"与"服务坏了"混成同一句话。
+    """
+    if suffix in _TEXT_PREVIEW_SUFFIXES:
+        return raw[:_PREVIEW_CHARS * 4].decode("utf-8", errors="replace")[:_PREVIEW_CHARS], ""
+
+    if suffix != ".pdf":
+        return "", f"该文件类型（{suffix.lstrip('.') or '未知'}）暂不支持文本预览，可下载查看。"
+
+    try:
+        import pymupdf
+
+        pdf: Any = pymupdf.open(stream=raw, filetype="pdf")
+        try:
+            chunks: list[str] = []
+            total = 0
+            for page in pdf.pages():
+                piece = str(page.get_text() or "")
+                if piece:
+                    chunks.append(piece)
+                    total += len(piece)
+                if total >= _PREVIEW_CHARS:
+                    break
+            text = "\n".join(chunks)[:_PREVIEW_CHARS]
+        finally:
+            pdf.close()
+    except Exception as exc:  # noqa: BLE001 — 解析失败按"提取不出"处理
+        logger.warning("knowledge preview: pdf extract failed: %s", exc)
+        return "", f"PDF 文本提取失败：{exc}"
+
+    if not text.strip():
+        return "", "PDF 未提取到文本（可能是扫描件，需要 OCR 才能预览）。"
+    return text, ""
 
 
 async def admin_list_knowledge_bases() -> dict[str, Any]:

@@ -26,6 +26,7 @@ import {
   clearIsolationLevel,
   getIsolationHelper,
   getIsolationStatus,
+  probeIsolation,
   revokeIsolationArtifacts,
   setIsolationLevel,
   startIsolationHelper,
@@ -43,6 +44,7 @@ const authStore = useAuthStore()
 const loading = ref(false)
 const saving = ref(false)
 const revoking = ref(false)
+const reprobing = ref(false)
 const status = ref<IsolationStatus | null>(null)
 /** 加载失败的原文；有值时展示重试入口而不是空白面板 */
 const loadError = ref('')
@@ -200,10 +202,36 @@ function acknowledgeBelowFloor(level: IsolationLevel): Promise<boolean> {
   })
 }
 
+function is401(err: unknown): boolean {
+  return (err as { response?: { status?: number } })?.response?.status === 401
+}
+
+/**
+ * 带本机会话自愈的请求：401 时补建会话再重试**一次**。
+ *
+ * 与 `load()` 里那段同因：本地分支的 `ensureLocalSession()` 是刻意不 await 的，
+ * 设置页可能比它先发请求。切档是写操作，失败不会有任何自动恢复 —— 用户只看到
+ * 「切换档位失败」，而真正原因是"令牌还没到"。所有隔离写操作都走这里。
+ */
+async function withLocalAuth<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn()
+  } catch (err) {
+    if (!is401(err)) throw err
+    const ready = await authStore.ensureLocalSession(true)
+    if (!ready) throw err
+    return await fn()
+  }
+}
+
 async function applyLevel(level: IsolationLevel) {
   if (!isSelectable(level) || saving.value) return
-  // 选的就是当前生效档位：不必往返一次
-  if (level === status.value?.runtime_override) return
+  // 只有"这个档位**已经真正生效**"才短路。
+  //
+  // 不能比 `runtime_override`：上一次请求被降级时（restricted → low_il），
+  // 后端仍把 runtime_override 记成 restricted。再点一次若按 override 判断，
+  // 就会静默 return —— 用户看到的是"点了完全没反应"，误以为功能坏了。
+  if (level === status.value?.effective) return
 
   // 低于安全底线且**完全没有边界**的档位（目前只有 `none`）要先明确点头。
   //
@@ -215,11 +243,11 @@ async function applyLevel(level: IsolationLevel) {
   saving.value = true
   pendingLevel.value = level
   try {
-    const next = await setIsolationLevel(
+    const next = await withLocalAuth(() => setIsolationLevel(
       level,
       t('settings.isolation_change_reason'),
       needsAcknowledge(level),
-    )
+    ))
     status.value = next
     message.success(t('settings.isolation_changed', { level: levelLabel(next.effective) }))
     // 请求值被抬到底线时，明确告诉用户"你要的没生效、实际是这个"
@@ -246,7 +274,7 @@ async function resetToConfig() {
   if (saving.value) return
   saving.value = true
   try {
-    const next = await clearIsolationLevel()
+    const next = await withLocalAuth(() => clearIsolationLevel())
     status.value = next
     message.success(
       next.cleared
@@ -257,6 +285,38 @@ async function resetToConfig() {
     message.error(serverErrorMessage(err, t('settings.isolation_reset_failed')))
   } finally {
     saving.value = false
+  }
+}
+
+/**
+ * 重试上一次被降级的请求。
+ *
+ * 降级后 `runtime_override` 仍是请求值，但 `effective` 没变 —— 用户再点同一个
+ * 档位现在可以重试（见 applyLevel 的判据）。这个入口只是把动作放到降级提示里，
+ * 不必让用户回去找那个档位卡片。
+ */
+async function retryRequested() {
+  const requested = status.value?.requested
+  if (!requested) return
+  if (!isSelectable(requested)) {
+    message.warning(t('settings.isolation_retry_unavailable'))
+    return
+  }
+  await applyLevel(requested)
+}
+
+/** 强制引擎重新实测本机能力（清冒烟缓存），用于"助手已启用但档位仍灰着"的滞留。 */
+async function reprobe() {
+  if (reprobing.value) return
+  reprobing.value = true
+  try {
+    status.value = await withLocalAuth(() => probeIsolation())
+    await loadHelper()
+    message.success(t('settings.isolation_reprobe_done'))
+  } catch (err) {
+    message.error(serverErrorMessage(err, t('settings.isolation_reprobe_failed')))
+  } finally {
+    reprobing.value = false
   }
 }
 
@@ -465,7 +525,18 @@ onMounted(load)
               ...(status.reasons || []),
             ].join(' ')
           "
-        />
+        >
+          <template #action>
+            <a-button
+              size="small"
+              :loading="saving"
+              :disabled="saving"
+              @click="retryRequested"
+            >
+              {{ $t('common.retry') }}
+            </a-button>
+          </template>
+        </a-alert>
         <a-alert
           v-if="status.below_floor"
           :type="status.user_selected ? 'warning' : 'error'"
@@ -491,7 +562,16 @@ onMounted(load)
       <!-- 档位选择 -->
       <div class="iso-picker">
         <div class="iso-picker-title">
-          {{ $t('settings.isolation_pick') }}
+          <span>{{ $t('settings.isolation_pick') }}</span>
+          <a-button
+            type="link"
+            size="small"
+            :loading="reprobing"
+            :disabled="reprobing || saving"
+            @click="reprobe"
+          >
+            {{ $t('settings.isolation_reprobe') }}
+          </a-button>
         </div>
         <div class="iso-levels">
           <button
@@ -669,7 +749,15 @@ onMounted(load)
 }
 
 .iso-picker { margin-bottom: 20px; }
-.iso-picker-title { font-weight: var(--fw-semibold); color: var(--text-primary); margin-bottom: 10px; }
+.iso-picker-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: var(--fw-semibold);
+  color: var(--text-primary);
+  margin-bottom: 10px;
+}
 .iso-levels { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 
 /* 用原生 button 而不是 a-radio：每个档位要带两行说明，radio 的排版撑不开 */

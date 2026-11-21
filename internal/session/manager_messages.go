@@ -94,6 +94,13 @@ func (m *Manager) ensureSessionOwnedWithTitle(ctx context.Context, sessionID, us
 	if sessionID == "" {
 		return errors.New("session id is required")
 	}
+	// 已删除会话的墓碑：拒绝一切"按 session_id 写入"的路径。
+	//
+	// 否则在途回合收尾时的 upsert 会把刚删掉的 sessions 行重新建出来 ——
+	// 用户删了会话、刷新后又看见它，且它带着一条后台补写的助手消息。
+	if m.sessionDeleted(ctx, sessionID) {
+		return fmt.Errorf("%w: %s (session deleted)", ErrSessionForbidden, sessionID)
+	}
 	var ensured string
 	err := m.pool.QueryRow(ctx,
 		`INSERT INTO sessions (id, tenant_id, user_id, title, created_at, updated_at)

@@ -16,6 +16,7 @@ from fastapi import HTTPException
 
 from app.api.knowledge import (
     _content_type,
+    _preview_text,
     _serialize_doc,
     _serialize_kb,
     build_knowledge_base,
@@ -206,6 +207,44 @@ async def test_upload_rejects_oversize_payload() -> None:
                 content=b"0" * (MAX_UPLOAD_BYTES + 1),
             )
     assert exc.value.status_code == 413
+
+
+# ── 预览 ──
+
+
+def test_preview_text_extracts_pdf_text() -> None:
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page()
+        page.insert_text((72, 72), "hello chiron")
+        raw = doc.tobytes()
+    finally:
+        doc.close()
+
+    text, note = _preview_text(".pdf", raw)
+    assert "hello chiron" in text
+    assert note == ""
+
+
+def test_preview_text_pdf_without_text_layer_explains_ocr() -> None:
+    pymupdf = pytest.importorskip("pymupdf")
+    doc = pymupdf.open()
+    try:
+        doc.new_page()
+        raw = doc.tobytes()
+    finally:
+        doc.close()
+
+    text, note = _preview_text(".pdf", raw)
+    assert text == ""
+    assert "OCR" in note
+
+
+def test_preview_text_unsupported_suffix_is_explicit() -> None:
+    text, note = _preview_text(".docx", b"whatever")
+    assert text == ""
+    assert "不支持" in note
 
 
 # ── 索引与查询 gate ──

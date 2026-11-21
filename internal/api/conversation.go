@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/athenavi/chiron/internal/auth"
+	"github.com/athenavi/chiron/internal/engine"
 	"github.com/athenavi/chiron/internal/id"
 	"github.com/athenavi/chiron/internal/session"
 )
@@ -20,10 +21,12 @@ import (
 type ConversationHandler struct {
 	authenticator *auth.Authenticator
 	sessionMgr    *session.Manager
+	// pythonClient 用于在删除会话时通知引擎停止在跑的回合（可能跨副本）。
+	pythonClient *engine.PythonClient
 }
 
-func NewConversationHandler(a *auth.Authenticator, sm *session.Manager) *ConversationHandler {
-	return &ConversationHandler{authenticator: a, sessionMgr: sm}
+func NewConversationHandler(a *auth.Authenticator, sm *session.Manager, pythonClient *engine.PythonClient) *ConversationHandler {
+	return &ConversationHandler{authenticator: a, sessionMgr: sm, pythonClient: pythonClient}
 }
 
 // Conversation is a chat session returned to the frontend.
@@ -435,6 +438,24 @@ func (h *ConversationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	// 先记下它出现在哪些画布 —— 删完之后 session_map_nodes 会被 CASCADE 清掉，查不到了。
 	mapWorkspaceIDs := sessionMapWorkspaceIDsForSession(r.Context(), id)
 
+	// 先停运行、再删库：只删库行不会让已经在跑的回合停下 ——
+	// 引擎继续烧 token、写文件，收尾时还会把会话行 upsert 回来（墓碑负责拒绝）。
+	// 三步各自独立兜底：任何一步失败都不该让"删除"这个用户动作失败。
+	stopCtx, stopCancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Second)
+	defer stopCancel()
+	if status, err := cancelSessionRun(stopCtx, h.sessionMgr, id, claims.UserID); err != nil {
+		slog.Warn("delete session: cancel run failed", "session_id", id, "error", err)
+	} else {
+		slog.Info("delete session: run cancelled", "session_id", id, "status", status)
+	}
+	// 子 Agent 跑在独立任务里，父回合取消不会连带它们 —— 删除时必须显式广播。
+	if err := BroadcastSubagentSessionCancel(stopCtx, id, "session"); err != nil {
+		slog.Warn("delete session: subagent cancel broadcast failed", "session_id", id, "error", err)
+	}
+	if err := h.interruptEngineSession(stopCtx, id, claims.UserID); err != nil {
+		slog.Warn("delete session: engine interrupt failed", "session_id", id, "error", err)
+	}
+
 	if err := h.sessionMgr.DeleteSession(r.Context(), id); err != nil {
 		logAndRespond(w, err, http.StatusInternalServerError, "delete session failed")
 		return
@@ -445,6 +466,23 @@ func (h *ConversationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	invalidateSessionMapWorkspaces(r.Context(), mapWorkspaceIDs)
 
 	OK(w, map[string]string{"status": "deleted"})
+}
+
+// interruptEngineSession 通知引擎"该会话已被删除，立即停止在跑的回合"。
+//
+// 复用 `/v1/agent/interrupt`：它会把中断信号写进本地与 Redis，跨副本的 run 也能读到。
+// 与 `cancelSessionRun` 的区别是覆盖面 —— 后者只作用于本实例的 SSE 任务，
+// 引擎侧的 run 可能已经脱离请求在后台继续。
+func (h *ConversationHandler) interruptEngineSession(ctx context.Context, sessionID, userID string) error {
+	if h.pythonClient == nil {
+		return nil
+	}
+	var out map[string]any
+	return h.pythonClient.PostJSON(ctx, "/v1/agent/interrupt", map[string]string{
+		"session_id": sessionID,
+		"user_id":    userID,
+		"reason":     "session deleted",
+	}, &out)
 }
 
 // Update updates a session's title / pinned flag / tag (session menu: 重命名/置顶/标签).

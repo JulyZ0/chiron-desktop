@@ -151,6 +151,24 @@ def _status_payload() -> dict[str, Any]:
     return iso.status()
 
 
+@router.post("/isolation/probe")
+async def reprobe_isolation(request: Request) -> dict[str, Any]:
+    """清掉档位探测缓存并**立刻重新实测**，返回最新状态。
+
+    `selectable` 是端到端冒烟结果（真的以受限令牌起子进程），结果缓存在进程内。
+    用户启用提权助手或安全软件放行之后，旧缓存仍可能把 `restricted` 标成不可用 ——
+    设置页看起来"永远灰着"，唯一的出路是重启引擎。这个端点就是那条出路：
+    它不改任何档位，只让下一次判定重新实测。
+    """
+    _verify_gateway_key(request)
+    await asyncio.to_thread(iso.reset_probes)
+    payload = await asyncio.to_thread(_status_payload)
+    payload["runtime_override"] = (
+        iso.runtime_override().value if iso.runtime_override() is not None else None
+    )
+    return payload
+
+
 @router.put("/isolation")
 async def set_isolation(body: LevelChange, request: Request) -> dict[str, Any]:
     """切换运行时隔离档位。

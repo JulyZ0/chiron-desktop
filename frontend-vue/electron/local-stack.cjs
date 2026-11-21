@@ -437,6 +437,21 @@ function buildGatewayEnv(info, options = {}) {
   const engineAddr = String(options.pythonEngineAddress || '').trim()
   if (engineAddr) env.PYTHON_ENGINE_ADDRESS = engineAddr
 
+  // 迁移目录：网管的「Schema 版本」自检要自己解析 `migrations/versions/*.py`。
+  //
+  // 打包态 exe 就在 resources 根，理论上能按 `<exe>/migrations/versions` 兜底找到；
+  // 但开发态、便携布局或换号重试后 cwd 不定的场景下，兜底会失败并以"未知"呈现。
+  // 资产根存在时显式下发，与引擎侧同一口径（引擎已经注入了 CHIRON_RESOURCES_DIR）。
+  // 只在目录真实存在时写，避免把一个残缺的资源根塞给网关、反而遮住正确的候选。
+  const resourcesDir = resolveResourcesDir(options)
+  const migrationsVersions = resourcesDir
+    ? path.join(resourcesDir, 'migrations', 'versions')
+    : ''
+  if (resourcesDir && fs.existsSync(migrationsVersions)) {
+    if (!env.CHIRON_RESOURCES_DIR) env.CHIRON_RESOURCES_DIR = resourcesDir
+    if (!env.MIGRATIONS_DIR) env.MIGRATIONS_DIR = migrationsVersions
+  }
+
   // 前端产物目录：让网关托管同一套 SPA，分享链接才有**别人也能打开**的宿主。
   //
   // 不注入的话，网关只提供 JSON 接口，`/share/<token>` 在任何 host 上都不存在 ——

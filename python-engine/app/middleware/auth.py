@@ -31,6 +31,10 @@ PUBLIC_PATHS = {"/healthz", "/readyz"}
 #
 # 未配置 `METRICS_TOKEN` 时**拒绝**（fail-closed）：没有凭据可验就不该放行，
 # 否则"配了才安全"会退化成"忘了配就敞开"。
+#
+# 第二条通道是 `X-Internal-Token`：Go 网关的运行时监控面板本来就调 `/info`，
+# 而它只持有内部 token。这条通道不降低暴露面 —— 能拿到内部 token 的进程
+# 本就能调用所有业务端点。
 METRICS_PATHS = {"/metrics", "/info"}
 
 # 弱密钥黑名单：与 Go 端 config.go ValidateJWTSecret 保持一致
@@ -183,12 +187,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def _metrics_endpoint(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        """观测端点的鉴权：与网关 `/metrics` 同口径（Bearer METRICS_TOKEN）。
+        """观测端点的鉴权：网关内部调用 **或** Prometheus 抓取。
 
-        * 配了 `METRICS_TOKEN` 且 `Authorization: Bearer <token>` 常量时间匹配 ⇒ 放行；
-        * 没配 `METRICS_TOKEN` ⇒ **拒绝**（fail-closed），并在日志里点明原因 ——
+        * 带合法 `X-Internal-Token` ⇒ 放行。Go 网关的运行时监控面板通过主路径
+          调 `/info`，它只持有内部 token、不持有 `METRICS_TOKEN`。此前这里只认
+          `Authorization`，于是 `/healthz` 正常、监控页却恒报"引擎不可达"（401）。
+          内部 token 与 `METRICS_TOKEN` 都是**发给可信服务**的凭据，不是公开凭据。
+        * 配了 `METRICS_TOKEN` 且 `Authorization: Bearer <token>` 常量时间匹配 ⇒ 放行
+          （Prometheus 抓取口径不变）；
+        * 两者都没有 ⇒ **拒绝**（fail-closed），并在日志里点明原因 ——
           否则运维只会看到 Prometheus 抓取失败，却不知道该配哪个变量。
         """
+        if self._is_internal_request(request):
+            return await call_next(request)
+
         from app.config import settings
 
         token = (settings.metrics_token or "").strip()

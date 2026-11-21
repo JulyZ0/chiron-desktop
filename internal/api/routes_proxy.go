@@ -341,6 +341,9 @@ func registerProxyRoutes(
 	mux.Handle("PUT /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation"))))))
 	mux.Handle("DELETE /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation"))))))
 	mux.Handle("POST /v1/system/isolation/revoke", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation/revoke"))))))
+	// 强制复测：清引擎侧冒烟缓存后重算 `selectable`。它**不改档位**，
+	// 只解决"助手启用成功但档位仍灰着"的缓存滞留，所以读权限即可。
+	mux.Handle("POST /v1/system/isolation/probe", authMW(rlMW(RequirePermission(auth.PermAdminRead)(isoP(pathFn("/v1/system/isolation/probe"))))))
 
 	// 提权助手（`restricted` 档的执行前置）：查询 / 启用（**会弹一次 UAC**）/ 停用。
 	//
