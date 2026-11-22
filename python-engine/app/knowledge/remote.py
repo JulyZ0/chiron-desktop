@@ -184,6 +184,16 @@ class RemoteProvider:
                     status if status in (STATUS_DISABLED, STATUS_ERROR) else STATUS_ERROR,
                     f"{detail or '检索服务自报不可用'}（{base}）",
                 )
+            # 本地/自托管索引的**执行者**是 pageindex-worker：服务活着不代表有人消费队列。
+            # 不拦这一条，build 会返回"已投递"，然后库永远停在 indexing。
+            # `worker_alive=None`（旧服务 / 查不到）不判死，保持向后兼容。
+            if self._mode != "cloud" and body.get("worker_alive") is False:
+                return HealthResult(
+                    False,
+                    STATUS_ERROR,
+                    "索引执行器未运行（pageindex-worker 没有心跳）：请重启知识库服务，"
+                    "或查看后台「服务/诊断」中的组件状态",
+                )
             return HealthResult(True, STATUS_READY, "")
         except Exception as exc:  # noqa: BLE001
             return HealthResult(False, STATUS_ERROR, f"检索服务不可达（{base}）：{exc}")

@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -238,3 +239,31 @@ def test_narration_on_renders_instructions() -> None:
     # 标题是 prompt_sections 拼装时依赖的锚点（见 app/agent/prompt_sections.py）。
     assert brief.startswith("## Progress narration")
     assert detailed.startswith("## Progress narration")
+
+
+# ── 监听任务本身：不能再因 `await hydrate()`（同步函数）当场死掉 ──
+
+
+def test_listen_for_changes_survives_startup(monkeypatch) -> None:
+    """回归网：监听任务必须能进入订阅循环，而不是启动即异常退出。
+
+    此前 `await hydrate()` 等的是同步函数，`TypeError: 'bool' object can't be
+    awaited` 直接杀掉任务 —— 引擎从此不订阅设置广播，后台六项配置全部不生效。
+    """
+
+    monkeypatch.setattr(runtime_config, "_hydrate_once", lambda: (True, False))
+
+    async def _redis_down():
+        raise RuntimeError("redis down (test)")
+
+    monkeypatch.setattr("app.redis_client.get_redis", _redis_down)
+
+    async def _run() -> None:
+        task = asyncio.create_task(runtime_config.listen_for_changes())
+        await asyncio.sleep(0.05)
+        assert not task.done(), "监听任务不应在启动阶段异常退出"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())

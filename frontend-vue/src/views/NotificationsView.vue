@@ -24,10 +24,12 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Button, Card, Empty, Segmented, Space, Spin, Tag, message } from 'ant-design-vue'
-import { BellOutlined, ReloadOutlined, CheckOutlined } from '@ant-design/icons-vue'
+import { Button, Card, Empty, Popconfirm, Segmented, Space, Spin, Tag, message } from 'ant-design-vue'
+import { BellOutlined, ReloadOutlined, CheckOutlined, DeleteOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
 import {
+  clearNotifications,
+  deleteNotification,
   listNotifications,
   markNotificationsRead,
   type NotificationItem,
@@ -46,6 +48,10 @@ const items = ref<NotificationItem[]>([])
 const unreadCount = ref(0)
 /** 行级 loading：只标一条时要能看出点的是哪一条 */
 const markingId = ref('')
+/** 行级删除 loading */
+const deletingId = ref('')
+/** 批量清理已读 loading */
+const clearing = ref(false)
 
 /** 空态文案随筛选变化：'暂无通知' 与 '没有未读通知' 是两件事。 */
 const emptyText = computed(() =>
@@ -179,6 +185,38 @@ async function markAll() {
   }
 }
 
+/** 行内删除一条（已读/未读都可删）。 */
+async function removeOne(item: NotificationItem) {
+  deletingId.value = item.id
+  try {
+    const deleted = await deleteNotification(item.id)
+    if (deleted > 0) {
+      items.value = items.value.filter(it => it.id !== item.id)
+      if (!item.read) unreadCount.value = Math.max(0, unreadCount.value - 1)
+      message.success(t('notifications.deleted'))
+    }
+  } catch (err) {
+    message.error(serverErrorMessage(err, t('notifications.delete_failed')))
+  } finally {
+    deletingId.value = ''
+  }
+}
+
+/** 批量清理已读 —— 通知中心长期只增不减的主要来源就是这些已读行。 */
+async function clearRead() {
+  clearing.value = true
+  try {
+    const deleted = await clearNotifications('read')
+    if (deleted > 0) message.success(t('notifications.cleared', { n: deleted }))
+    else message.info(t('notifications.nothing_to_delete'))
+    await load()
+  } catch (err) {
+    message.error(serverErrorMessage(err, t('notifications.delete_failed')))
+  } finally {
+    clearing.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -214,6 +252,15 @@ onMounted(load)
             <CheckOutlined />
           </template>
           {{ $t('notifications.mark_all_read') }}
+        </Button>
+        <Button
+          :loading="clearing"
+          @click="clearRead"
+        >
+          <template #icon>
+            <DeleteOutlined />
+          </template>
+          {{ $t('notifications.clear_read') }}
         </Button>
         <Button
           :loading="loading"
@@ -276,6 +323,23 @@ onMounted(load)
               >
                 {{ $t('notifications.mark_read') }}
               </Button>
+              <Popconfirm
+                :title="$t('notifications.delete_confirm')"
+                :ok-text="$t('common.delete')"
+                :cancel-text="$t('common.cancel')"
+                @confirm="removeOne(item)"
+              >
+                <Button
+                  size="small"
+                  danger
+                  :loading="deletingId === item.id"
+                >
+                  <template #icon>
+                    <DeleteOutlined />
+                  </template>
+                  {{ $t('common.delete') }}
+                </Button>
+              </Popconfirm>
             </Space>
           </li>
         </ul>

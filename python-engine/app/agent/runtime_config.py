@@ -242,21 +242,21 @@ def render_narration_suffix() -> str:
 # ── 下发通道 ────────────────────────────────────────────────────────────
 
 
-def hydrate() -> bool:
-    """从网关补拉一次 ``agent`` 分类配置（引擎启动 / 订阅重连时调用）。
+def _hydrate_once() -> tuple[bool, bool]:
+    """补拉一次配置：返回 ``(网关是否可达, 是否采纳了配置)``。
 
-    网关不可达、未配置 internal_token、或返回体不是 dict 时**返回 False 并保持现状** ——
-    沿用 env 兜底，绝不因为读不到配置而把策略重置成默认值（那等于"网关一抖，配置归零"）。
+    区分"可达但没配置"与"不可达"是启动补拉需要的信息：桌面态引擎先于网关启动，
+    不可达时应当继续重试；可达但没有记录则不必再试（配置本来就是空的）。
     """
     import json
     import urllib.request
 
     token = str(getattr(settings, "internal_token", "") or "")
     if not token:
-        return False
+        return False, False
     base = str(getattr(settings, "gateway_internal_url", "") or "").rstrip("/")
     if not base:
-        return False
+        return False, False
     url = f"{base}/v1/internal/agent-config"
     try:
         req = urllib.request.Request(url, headers={"X-Internal-Token": token})
@@ -264,67 +264,105 @@ def hydrate() -> bool:
             payload = json.loads(resp.read().decode())
     except Exception as exc:  # noqa: BLE001 - 拉不到就用 env 兜底，不阻断
         logger.debug("agent runtime config hydrate failed: %s", exc)
-        return False
+        return False, False
 
     data = payload.get("data", payload) if isinstance(payload, dict) else {}
     if not isinstance(data, dict) or not data:
-        return False
-    return apply(data)
+        return True, False
+    return True, apply(data)
+
+
+def hydrate() -> bool:
+    """从网关补拉一次 ``agent`` 分类配置（引擎启动 / 订阅重连时调用）。
+
+    网关不可达、未配置 internal_token、或返回体不是 dict 时**返回 False 并保持现状** ——
+    沿用 env 兜底，绝不因为读不到配置而把策略重置成默认值（那等于"网关一抖，配置归零"）。
+    """
+    return _hydrate_once()[1]
+
+
+async def _catch_up_until_reachable() -> None:
+    """网关可达之前持续补拉（桌面态引擎先于网关启动）。
+
+    此前的"启动补拉"只做一次且在网关起不来时必然失败，之后只订阅广播 ——
+    于是用户重启应用后，上一次保存的配置**不会**被重新拉取，行为退回默认值，
+    必须再进后台点一次保存才生效。
+    """
+    import asyncio
+
+    delay = 1.0
+    while True:
+        try:
+            reached, _ = await asyncio.to_thread(_hydrate_once)
+        except Exception as exc:  # noqa: BLE001 - 后台补拉失败只影响"恢复旧配置"
+            logger.debug("agent runtime config catch-up failed: %s", exc)
+            reached = False
+        if reached:
+            return
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, 15.0)
 
 
 async def listen_for_changes() -> None:
     """订阅设置变更广播：``agent`` 分类到达即热更行为配置。
 
-    **先 hydrate 再订阅**：订阅只对**新消息**生效，而引擎重启时「上一次保存的配置」
-    不会有新消息 —— 不主动拉一次，重启就退回 env 兜底，表现为"我明明在后台改过，
-    重启后自己变回去了"。顺序不能反：先订阅后 hydrate 会在两者之间丢一条消息。
+    启动补拉与订阅**并行**：订阅只对**新消息**生效，而"上次保存的配置"不会有新消息；
+    但引擎启动时网关往往还没起来（桌面态顺序：检索服务 → 引擎 → 网关），所以补拉
+    做成"网关可达前持续重试"，而不是失败一次就放弃。
     """
     import asyncio
     import json
 
-    await hydrate()
-
     from app.redis_keys import rkey
 
+    catch_up = asyncio.create_task(_catch_up_until_reachable())
     channel = rkey(SETTINGS_CHANGED_CHANNEL)
-    while True:
-        pubsub = None
-        try:
-            from app.redis_client import aclose_pubsub, get_redis
+    try:
+        while True:
+            pubsub = None
+            try:
+                from app.redis_client import aclose_pubsub, get_redis
 
-            redis = await get_redis()
-            if redis is None:
+                redis = await get_redis()
+                if redis is None:
+                    await asyncio.sleep(RECONNECT_DELAY_SECONDS)
+                    continue
+                pubsub = redis.pubsub()
+                await pubsub.subscribe(channel)
+                logger.info("agent runtime config listener subscribed: %s", channel)
+                # 断线重连期间可能错过一条广播：订阅成功后补拉一次（网关已在时立即收口）。
+                try:
+                    await asyncio.to_thread(_hydrate_once)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("agent runtime config rehydrate failed: %s", exc)
+                async for message in pubsub.listen():
+                    if message.get("type") != "message":
+                        continue
+                    raw = message.get("data")
+                    try:
+                        payload = json.loads(raw if isinstance(raw, str) else str(raw))
+                    except Exception:
+                        logger.warning("agent settings broadcast unmarshal failed")
+                        continue
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("category") != AGENT_CATEGORY:
+                        continue
+                    cfg = payload.get("config")
+                    apply(cfg if isinstance(cfg, dict) else None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 订阅断了要能自己回来
+                logger.warning("agent runtime config listener error, retrying: %s", exc)
                 await asyncio.sleep(RECONNECT_DELAY_SECONDS)
-                continue
-            pubsub = redis.pubsub()
-            await pubsub.subscribe(channel)
-            logger.info("agent runtime config listener subscribed: %s", channel)
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue
-                raw = message.get("data")
-                try:
-                    payload = json.loads(raw if isinstance(raw, str) else str(raw))
-                except Exception:
-                    logger.warning("agent settings broadcast unmarshal failed")
-                    continue
-                if not isinstance(payload, dict):
-                    continue
-                if payload.get("category") != AGENT_CATEGORY:
-                    continue
-                cfg = payload.get("config")
-                apply(cfg if isinstance(cfg, dict) else None)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - 订阅断了要能自己回来
-            logger.warning("agent runtime config listener error, retrying: %s", exc)
-            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
-        finally:
-            if pubsub is not None:
-                try:
-                    await aclose_pubsub(pubsub)
-                except Exception:  # noqa: BLE001 - 关连接失败不该盖住上面的异常
-                    pass
+            finally:
+                if pubsub is not None:
+                    try:
+                        await aclose_pubsub(pubsub)
+                    except Exception:  # noqa: BLE001 - 关连接失败不该盖住上面的异常
+                        pass
+    finally:
+        catch_up.cancel()
 
 
 __all__ = [

@@ -23,6 +23,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name) or default)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class Config:
     # ── 服务本身 ──
@@ -37,6 +44,9 @@ class Config:
     kb_delayed: str
     kb_stream_maxlen: int
     worker_concurrency: int
+    #: 单篇文档索引的超时（秒）。PageIndex 的 LLM 工具循环是同步阻塞的，
+    #: 没有上限时一次挂死会让库永久停在 indexing（worker 心跳仍在，外部看不出）。
+    doc_timeout_seconds: float
 
     # ── 数据库（worker 回写索引状态）──
     postgres_dsn: str
@@ -93,6 +103,7 @@ class Config:
             kb_delayed=rkey("engine:tasks:kb:delayed"),
             kb_stream_maxlen=100000,
             worker_concurrency=_env_int("PAGEINDEX_WORKER_CONCURRENCY", 2),
+            doc_timeout_seconds=_env_float("PAGEINDEX_DOC_TIMEOUT_SECONDS", 1800.0),
             postgres_dsn=_env("POSTGRES_DSN"),
             # 与引擎同一套口径：未配 KNOWLEDGE_* 时跟随 MEDIA_STORE_BACKEND
             blob_backend=(_env("KNOWLEDGE_BLOB_BACKEND") or _env("MEDIA_STORE_BACKEND") or "local").lower(),

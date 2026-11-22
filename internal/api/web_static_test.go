@@ -28,7 +28,7 @@ func newWebRootFixture(t *testing.T) string {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
-	write("index.html", "<!doctype html><html><body>spa-shell</body></html>")
+	write("index.html", `<!doctype html><html><head></head><body><script src="./assets/app.js"></script>spa-shell</body></html>`)
 	write(filepath.Join("assets", "app.js"), "console.log('app')")
 	write(".env", "SECRET=1")
 	// 目录外文件：路径穿越若被拦错，会把它当静态文件吐出去。
@@ -47,6 +47,17 @@ func serveSPA(t *testing.T, h http.Handler, method, target string) *httptest.Res
 }
 
 // 分享页路径 /share/<token> 必须回落 index.html —— 这是引入 SPA 托管的**唯一目的**。
+func TestSPAHandler_InjectsRootBaseForRelativeAssets(t *testing.T) {
+	h, err := newSPAHandler(newWebRootFixture(t))
+	if err != nil {
+		t.Fatalf("newSPAHandler: %v", err)
+	}
+	rec := serveSPA(t, h, http.MethodGet, "/s/oqum3iu4opa75c7l")
+	if got := rec.Body.String(); !strings.Contains(got, `<base href="/">`) {
+		t.Fatalf("托管 index.html 必须注入 <base href=\"/\">，否则 /s/<token> 下 ./assets/* 会 404: %q", got)
+	}
+}
+
 func TestSPAHandler_FallsBackToIndexForSharePage(t *testing.T) {
 	h, err := newSPAHandler(newWebRootFixture(t))
 	if err != nil {

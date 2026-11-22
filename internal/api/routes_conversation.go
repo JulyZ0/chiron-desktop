@@ -26,6 +26,11 @@ func registerConversationRoutes(
 	mux.Handle("PUT /v1/conversations/{id}", authMW(rlMW(http.HandlerFunc(conversationHandler.Update))))
 	mux.Handle("DELETE /v1/conversations/{id}", authMW(rlMW(http.HandlerFunc(conversationHandler.Delete))))
 
+	// 人格：对话内选择的只是**启用**条目；提示词由服务端在提交时按 id 解析，
+	// 前端不持有文案（见 personas.go 的文件头）。
+	personaHandler := NewPersonaHandler()
+	mux.Handle("GET /v1/personas", authMW(rlMW(http.HandlerFunc(personaHandler.ListForUser))))
+
 	// 工具调用 output 的按需分段读取。列表接口只给前 4096 字符预览，
 	// 全文由这里取（见 internal/api/tool_output.go 与 session.GetToolCallOutput）。
 	mux.Handle("GET /v1/chat/sessions/{id}/tool-calls/{tcID}/output",

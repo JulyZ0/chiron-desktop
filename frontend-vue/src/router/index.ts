@@ -225,6 +225,13 @@ const routes = [
         meta: { title: t('admin.userAdmin.page_title') },
       },
       {
+        // 人格管理：原用户设置里的「行为塑形」搬到后台，支持多人格与对话内选择。
+        path: 'personas',
+        name: 'AdminPersonas',
+        component: () => import('../views/admin/PersonasView.vue'),
+        meta: { title: t('admin.persona_title') },
+      },
+      {
         path: 'settings',
         name: 'AdminSettings',
         component: () => import('../views/admin/SettingsView.vue'),

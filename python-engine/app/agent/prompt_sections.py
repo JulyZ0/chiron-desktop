@@ -36,6 +36,9 @@ from dataclasses import dataclass, field
 
 #: 稳定前缀本体（系统提示 + 技能目录）。唯一带 `cache_breakpoint` 的那段。
 STABLE_PREFIX = "stable_prefix"
+#: **人格**（后台「人格管理」里选定/默认的那一条）。稳定前缀靠前位置：
+#: 它定义"你是谁"，应盖过后面的风格与流程段落；空 = 未选人格 ⇒ 逐字不变。
+PERSONA = "persona"
 #: 按**模型家族**追加的 harness suffix（`harness_profile`）。
 HARNESS_SUFFIX = "harness_suffix"
 #: 租户/用户级 harness 塑形（`harness_store`）。
@@ -69,6 +72,7 @@ TOOL_CHANGE_NOTICE = "tool_change_notice"
 #: 工具集有无，同一会话内几乎不变，所以 `cache_breakpoint` 命中的是这一整条。
 INLINE_ORDER: tuple[str, ...] = (
     STABLE_PREFIX,
+    PERSONA,
     HARNESS_SUFFIX,
     TENANT_SUFFIX,
     CONTROLS_SUFFIX,
@@ -163,6 +167,7 @@ __all__ = [
     "KNOWLEDGE",
     "MEMORY",
     "NARRATION_SUFFIX",
+    "PERSONA",
     "PLANNING_SUFFIX",
     "PromptSections",
     "REPORT",

@@ -10,6 +10,7 @@ import {
 import type { LlmModel, SSEHandle } from '../api'
 import { getSessionMetrics, getSessionRuntime, putSessionRuntime, type SessionRuntime } from '../api/sessionRuntime'
 import { getProjectVcs, initProjectVcs } from '../api/projectVcs'
+import { listPersonas, type Persona } from '../api/personas'
 import FloatingPanel from '../components/common/FloatingPanel.vue'
 import SubAgentPane from '../components/chat/SubAgentPane.vue'
 import {
@@ -77,7 +78,6 @@ import { splitThinking, stripUserInputTag, formatClock, formatSize, countItemsAf
 import { normalizeMeta } from '../components/chat/chat-history'
 import { describeApiError } from '../utils/apiError'
 import { buildWorkbenchContext, chipsFromWorkbenchContext, clampKbWeight, CONTEXT_QUERY_KEYS, DEFAULT_KB_WEIGHT, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
-import { currentProject } from '../composables/useProject'
 import type { ChatItem, ChatSession, ChatAttachment, TurnStatsItem, TextItem } from '../components/chat/chat-types'
 
 import { useI18n } from 'vue-i18n'
@@ -1135,6 +1135,41 @@ function onModeChange(m: string) {
 //   同名参数可重复（?kb=a&kb=b）=> 同类可多选
 //   ?mode=<auto|agent> 创建时模式
 const contextChips = ref<ContextChip[]>([])
+// 人格选择：只存 id（提示词由网关在提交时按租户解析并下发）。
+// localStorage 记忆的是"用户偏好的默认选择"，换会话也沿用；空 = 跟随后台默认人格。
+const CHAT_PERSONA_KEY = 'chiron.chat.persona'
+const personas = ref<Persona[]>([])
+const personaId = ref<string>((() => {
+  try {
+    return (localStorage.getItem(CHAT_PERSONA_KEY) || '').trim()
+  } catch {
+    return ''
+  }
+})())
+const personaOptions = computed(() =>
+  personas.value.map(p => ({ label: p.name, value: p.id })),
+)
+async function loadPersonas() {
+  try {
+    personas.value = await listPersonas()
+    // 选过的人格被删除/停用后静默回到默认，避免发送一个无效 id
+    if (personaId.value && !personas.value.some(p => p.id === personaId.value)) {
+      personaId.value = ''
+      localStorage.removeItem(CHAT_PERSONA_KEY)
+    }
+  } catch {
+    personas.value = []
+  }
+}
+function onPersonaChange(id: string) {
+  personaId.value = (id || '').trim()
+  try {
+    if (personaId.value) localStorage.setItem(CHAT_PERSONA_KEY, personaId.value)
+    else localStorage.removeItem(CHAT_PERSONA_KEY)
+  } catch {
+    /* 隐私模式：仅本次会话生效 */
+  }
+}
 const errorBanner = ref('')          // query.error 提示
 const unifiedSessionId = ref('')     // 统一任务会话 id（query.task）
 const unifiedSubmitMode = ref('auto') // 会话创建时的 mode（shared_context.mode 优先）
@@ -1303,12 +1338,12 @@ function buildContext(): Record<string, unknown> | undefined {  // 单值字段 
   // 全部丢失，用户选了 Agent 却发现"它不会用自己的工具"。把单一事实来源放回后端，
   // 两端就不会各自漂移。
   //
-  // C3：带上**当前项目** —— 引擎把它写进 tool context，agent 的 remember / recall /
-  // forget 因此落在同一个项目里（与记忆页选中的项目一致）。未选项目时不带该字段，
-  // 请求与 C3 之前逐字相同。
+  // C3：项目不再由前端拼装 —— 服务端按会话归属注入 `context.project`
+  //（session-map workspace id，记忆隔离的权威键）。前端传的任何值都会被它覆盖/清除，
+  // 避免"记忆页手填的项目串"把未归组会话的记忆写进别的项目。
   const ctx = buildWorkbenchContext(contextChips.value) || {}
-  const project = currentProject.value
-  if (project) ctx.project = project
+  // 人格：只传 id，提示词由服务端解析（见 personas.go 的文件头）。
+  if (personaId.value) ctx.persona_id = personaId.value
   return Object.keys(ctx).length ? ctx : undefined
 }
 
@@ -1726,6 +1761,7 @@ onMounted(async () => {
   // 互联互通：解析 /chat query（task / error / kb / agent / skill）
   await applyRouteQuery()
   await loadSessions()
+  void loadPersonas()
   // 统一任务模式不自动切换普通会话；其余保持原有行为
   if (!unifiedMode.value && sessions.value.length > 0) {
     await switchSession(sessions.value[0].id)
@@ -3421,6 +3457,8 @@ function continueGeneration() {
         :mode="mode"
         :mode-options="modeOptions"
         :model="llmModel"
+        :persona="personaId"
+        :persona-options="personaOptions"
         :session-id="unifiedMode ? unifiedSessionId : activeSessionId"
         :tools-mode="toolsMode"
         :output-style="outputStyle"
@@ -3433,6 +3471,7 @@ function continueGeneration() {
         @steer="onSteer"
         @update:mode="onModeChange"
         @model-change="onModelChange"
+        @persona-change="onPersonaChange"
         @command="onSlashCommand"
         @open-panel="openContextPanel"
         @mention-add="onMentionAdd"

@@ -8,9 +8,11 @@ package api
 // 管理员撤销）。让客户端 POST 造通知，只会造出一个没人写的公开入口 —— 谁都能给
 // 自己灌一条"支付成功"，那正是 SaaS 分支残留文案给人的错觉。所以：
 //
-//	GET  /v1/notifications          我的通知（?unread=1&limit=）
-//	GET  /v1/notifications/unread   未读数（角标）
-//	POST /v1/notifications/read     标已读（{ids:[...]} 或 {all:true}）
+//	GET    /v1/notifications          我的通知（?unread=1&limit=）
+//	GET    /v1/notifications/unread   未读数（角标）
+//	POST   /v1/notifications/read     标已读（{ids:[...]} 或 {all:true}）
+//	DELETE /v1/notifications/{id}     永久删除单条
+//	DELETE /v1/notifications?read=1   批量清理（默认只删已读；read=0 / all）
 //
 // 写入是包内函数 `insertNotification`，由 `subagent_events_relay.go`（子 Agent 终态）
 // 与 `admin_shares.go`（管理员撤销分享）调用。
@@ -289,6 +291,72 @@ func (h *NotificationHandler) MarkRead(w http.ResponseWriter, r *http.Request) {
 	OK(w, map[string]interface{}{"updated": tag.RowsAffected()})
 }
 
+// Delete DELETE /v1/notifications/{id}
+//
+// 永久删除单条通知。此前只有"标已读"，未读/已读都会一直堆在列表里 —— 用户没有
+// 任何手段把已经处理过的通知从通知中心清掉。删除按 user+tenant 过滤（与读取同口径），
+// 拿别人的 id 删不动。
+func (h *NotificationHandler) Delete(w http.ResponseWriter, r *http.Request) {
+	userID, tenantID, ok := notificationIdentity(w, r)
+	if !ok {
+		return
+	}
+	if db.GlobalDBManager == nil {
+		InternalError(w, ErrDBUnavailable)
+		return
+	}
+	id := strings.TrimSpace(r.PathValue("id"))
+	if id == "" {
+		BadRequest(w, "id is required")
+		return
+	}
+	tag, err := db.GlobalDBManager.Exec(r.Context(),
+		`DELETE FROM notifications WHERE id = $1 AND user_id = $2 AND tenant_id = $3`,
+		id, userID, tenantID)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "delete notification failed")
+		return
+	}
+	OK(w, map[string]interface{}{"deleted": tag.RowsAffected()})
+}
+
+// Clear DELETE /v1/notifications?read=1|0|all
+//
+// 批量清理：`read=1`（默认，最安全）只删已读；`read=0` 只删未读；`read=all` 清空。
+// 默认值刻意选"只删已读"—— 一次误触不该把还没看的通知一起丢掉。
+func (h *NotificationHandler) Clear(w http.ResponseWriter, r *http.Request) {
+	userID, tenantID, ok := notificationIdentity(w, r)
+	if !ok {
+		return
+	}
+	if db.GlobalDBManager == nil {
+		InternalError(w, ErrDBUnavailable)
+		return
+	}
+	scope := stringsToLowerTrim(r.URL.Query().Get("read"))
+	query := `DELETE FROM notifications WHERE user_id = $1 AND tenant_id = $2`
+	switch scope {
+	case "", "1", "read", "true":
+		query += ` AND read_at IS NOT NULL`
+	case "0", "unread", "false":
+		query += ` AND read_at IS NULL`
+	case "all":
+	default:
+		BadRequest(w, "read must be one of: 1, 0, all")
+		return
+	}
+	tag, err := db.GlobalDBManager.Exec(r.Context(), query, userID, tenantID)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "clear notifications failed")
+		return
+	}
+	OK(w, map[string]interface{}{"deleted": tag.RowsAffected()})
+}
+
+func stringsToLowerTrim(raw string) string {
+	return strings.ToLower(strings.TrimSpace(raw))
+}
+
 // NotificationHandler 三个端点的宿主。没有状态：身份取自请求，存储是全局 DB 管理器。
 type NotificationHandler struct{}
 
@@ -300,4 +368,6 @@ func (h *NotificationHandler) RegisterRoutes(mux *http.ServeMux, authMW, rlMW ro
 	mux.Handle("GET /v1/notifications", authMW(rlMW(http.HandlerFunc(h.List))))
 	mux.Handle("GET /v1/notifications/unread", authMW(rlMW(http.HandlerFunc(h.UnreadCount))))
 	mux.Handle("POST /v1/notifications/read", authMW(rlMW(http.HandlerFunc(h.MarkRead))))
+	mux.Handle("DELETE /v1/notifications/{id}", authMW(rlMW(http.HandlerFunc(h.Delete))))
+	mux.Handle("DELETE /v1/notifications", authMW(rlMW(http.HandlerFunc(h.Clear))))
 }

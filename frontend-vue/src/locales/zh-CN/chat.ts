@@ -486,4 +486,8 @@ export default {
   // 措辞用"在对照栏中查看"，与浮卡时期区分：它现在是布局里的一栏，不是弹窗。
   view_subagent_in_dock: "在对照栏中查看这个子 Agent",
   open_subagent_in_dock: "打开对照栏并定位到 {run}",
+  // ── 人格（后台「人格管理」的对话侧选择器）──
+  persona: "人格",
+  persona_default: "默认人格",
+  persona_title: "切换本次对话的人格（后台「人格管理」维护）",
 }

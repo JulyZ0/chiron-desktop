@@ -824,9 +824,29 @@ async def build_knowledge_base(
                 detail=f"索引服务不可用：{getattr(health, 'detail', '') or '未知原因'}",
             )
 
-    task_id = await _enqueue_kb_index(
-        kb_id=kb_id, user_id=user_id, tenant_id=tenant_id, force=force
+    # 先把库状态与 updated_at 推进到 indexing：进度聚合/看门狗都以它为"这次构建开始"的
+    # 时间锚点。此前首次构建不写库，worker 没取件时界面看到的是 disabled + pending，
+    # 用户会以为"点了没反应"。
+    previous_status = str(kb["status"] or "")
+    await pool.execute(
+        """UPDATE knowledge_bases
+              SET status = $2, error_message = NULL, updated_at = NOW()
+            WHERE id = $1""",
+        kb_id,
+        kb_status.STATUS_INDEXING,
     )
+    try:
+        task_id = await _enqueue_kb_index(
+            kb_id=kb_id, user_id=user_id, tenant_id=tenant_id, force=force
+        )
+    except Exception:
+        # 投递失败必须回滚状态，否则界面永远"索引中"（与 reindex 同一处置）。
+        await pool.execute(
+            "UPDATE knowledge_bases SET status = $2, updated_at = NOW() WHERE id = $1",
+            kb_id,
+            previous_status or kb_status.STATUS_ERROR,
+        )
+        raise
     return {
         # 用统一常量而不是字面量：这个值前端要拿来对齐轮询，写死在两处必然漂移
         "status": kb_status.STATUS_INDEXING,

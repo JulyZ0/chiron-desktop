@@ -479,6 +479,35 @@ func buildFileRefBlock(root, rel string) (string, bool) {
 	return b.String(), true
 }
 
+// projectIDForSession 查这个会话所属的 session-map 项目 id。
+//
+// 记忆隔离的唯一权威键：workspace id 稳定且唯一，改名不会让历史记忆失联。
+// 与 `projectRootForSession` 同一条关联链（会话 → 项目），但**不要求项目绑了目录** ——
+// 记忆隔离与项目文件是两件事：没绑目录的项目同样应该有独立的记忆范围。
+//
+// 返回 false 表示"会话没归入任何项目"（不是错误），调用方按全局范围处理。
+func projectIDForSession(ctx context.Context, sessionID string) (string, bool) {
+	if db.GlobalDBManager == nil || sessionID == "" {
+		return "", false
+	}
+	claims := auth.GetClaims(ctx)
+	if claims == nil {
+		return "", false
+	}
+	row, err := db.GlobalDBManager.FetchOne(ctx,
+		`SELECT w.id
+		   FROM session_map_nodes n
+		   JOIN session_map_workspaces w ON w.id = n.workspace_id
+		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
+		    AND w.tenant_id = $2 AND w.user_id = $3
+		  LIMIT 1`, sessionID, smTenant(claims), claims.UserID)
+	if err != nil || row == nil {
+		return "", false
+	}
+	id := stringOf(row["id"])
+	return id, id != ""
+}
+
 // projectRootForSession 查这个会话所属项目的根目录。
 //
 // 返回 false 的每一种情况都**不是错误**，而是"这条消息没有项目上下文"：

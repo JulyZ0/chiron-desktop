@@ -160,8 +160,9 @@ func ensureLocalOwner(ctx context.Context) (UserResponse, error) {
 	// id 必须显式给：users.id 是 varchar(36) NOT NULL 且无默认值（回归网见
 	// user_insert_id_test.go，漏这一列 ⇒ null value in column "id"）。
 	err = tx.QueryRow(ctx,
-		`INSERT INTO users (id, tenant_id, email, name, password_hash, role, password_set)
-		 VALUES (gen_random_uuid(), $1, $2, $3, $4, 'owner', FALSE)
+		`INSERT INTO users (id, tenant_id, email, name, password_hash, role, password_set,
+		                    created_at, updated_at)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, 'owner', FALSE, NOW(), NOW())
 		 RETURNING id`,
 		DefaultTenantID, localOwnerEmail, localOwnerName, string(passwordHash),
 	).Scan(&user.ID)

@@ -114,6 +114,8 @@ const menuGroups = computed(() => [
     children: [
       // 用户管理：团队账号的生命周期（建号、重置、禁用、强制下线）。
       { key: '/admin/users', label: t('admin.userAdmin.page_title'), icon: () => h(TeamOutlined) },
+      // 人格管理：对话里的可切换人设；与用户管理同属"谁能以什么身份出现"。
+      { key: '/admin/personas', label: t('admin.persona_title'), icon: () => h(IdcardOutlined) },
       { key: '/admin/api-keys', label: t('common.api_key_management'), icon: () => h(KeyOutlined) },
       // 分享管理：会话公开链接的运营处置面（谁分享了什么、一键掐断）。
       // 与 API Key 同属"访问安全"——都决定"外面能拿到什么"。

@@ -1054,7 +1054,22 @@ def _start_agent_config_watch() -> Any:
     """
     from app.agent.runtime_config import listen_for_changes as _listen_agent_config
 
-    return asyncio.create_task(_listen_agent_config())
+    task = asyncio.create_task(_listen_agent_config())
+    task.add_done_callback(_log_watcher_exit("agent-config"))
+    return task
+
+
+def _log_watcher_exit(label: str):
+    """配置监听任务的退出可见化：静默死掉的监听曾让"后台保存不生效"像玄学。"""
+
+    def _cb(task: "asyncio.Task[Any]") -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("%s watcher exited unexpectedly: %s", label, exc, exc_info=exc)
+
+    return _cb
 
 
 #: 密钥变更订阅断线后的重连间隔（与 harness / storage watcher 同一范式）。

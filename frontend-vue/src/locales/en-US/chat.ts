@@ -483,4 +483,8 @@ export default {
   // ── s23: subagent result → comparison dock ──
   view_subagent_in_dock: "View this subagent in the dock",
   open_subagent_in_dock: "Open the dock and focus {run}",
+  // Persona picker (managed in admin "Personas")
+  persona: "Persona",
+  persona_default: "Default persona",
+  persona_title: "Switch the persona for this conversation (managed in admin)",
 }

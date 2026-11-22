@@ -103,3 +103,20 @@ export async function markNotificationsRead(
   const n = data?.data?.updated
   return typeof n === 'number' ? n : 0
 }
+
+/** 永久删除单条通知。返回实际删除条数（0 = 已不存在 / 不属于我）。 */
+export async function deleteNotification(id: string): Promise<number> {
+  const { data } = await api.delete(`/v1/notifications/${encodeURIComponent(id)}`)
+  const n = data?.data?.deleted
+  return typeof n === 'number' ? n : 0
+}
+
+/**
+ * 批量清理。默认 `read` = 只删已读（一次误触不该把没看过的通知丢掉）。
+ * 返回实际删除条数。
+ */
+export async function clearNotifications(scope: 'read' | 'unread' | 'all' = 'read'): Promise<number> {
+  const { data } = await api.delete('/v1/notifications', { params: { read: scope } })
+  const n = data?.data?.deleted
+  return typeof n === 'number' ? n : 0
+}

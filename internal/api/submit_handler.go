@@ -691,26 +691,41 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		llmConfig["provider"] = agentCfg.provider.Value
 	}
 	pythonReq["llm_config"] = llmConfig
-	// 项目根注入：agent 的文件/git 工具必须作用在**用户选中的项目目录**上，
-	// 而不是沙箱副本。引擎侧读 `context.root_path` 设置工具工作根。
+	// 项目上下文注入（root_path + project）：
+	//   - root_path：文件/git 工具必须作用在**用户选中的项目目录**上，而不是沙箱副本；
+	//   - project：记忆隔离的权威键（session-map workspace id）。必须由服务端按会话
+	//     归属写入 —— 客户端传的 `project` 是记忆页手填的自由串，与真实项目无关；
+	//     若直接采信，未归组会话也会把记忆写进某个项目，造成串味。
 	//
-	// 查库复用 `file_refs.go` 的 `projectRootForSession` —— 与 `@路径` 展开用的是
-	// 同一条关联链（会话 → 项目 → root_path），两处各写一遍迟早会不一致。
-	//
-	// 必须**复制**再改：`workbenchCtx` 是调用方传入的 map，`HandleSubmit` 在续跑轮
-	// 会复用它 —— 就地写入会把上一轮的项目根带到下一轮。
-	//
-	// fail-soft：查不到（画布会话、DB 不可用、无 claims）就不注入，引擎回退到沙箱。
-	// 提交本身绝不能因为"找不到项目根"而失败。
-	// 注：目录是否存在不在这里判断 —— `file_refs.go` 的 `projectRootForSession` 只判空串。
-	// 路径可用性由引擎侧 `sandbox.project_root()` 复核（绝对路径 + 确实是目录），
-	// 因为那才是真正使用路径的地方。
-	if root, ok := projectRootForSession(ctx, sessionID); ok && root != "" {
-		wb := make(map[string]interface{}, len(workbenchCtx)+1)
+	// 两条都复用 `file_refs.go` 的同一关联链（会话 → 项目），不各写一份。
+	// 未归组会话显式清掉 `project` ⇒ 全局范围（与 C3 之前的行为一致）。
+	// 必须**复制**再改：`workbenchCtx` 是调用方传入的 map，续跑轮会复用它。
+	root, hasRoot := projectRootForSession(ctx, sessionID)
+	projectID, hasProject := projectIDForSession(ctx, sessionID)
+	// 人格：客户端只传 id（`persona_id`），文案由服务端按租户解析；未传则取默认人格。
+	// 解析结果以 `persona: {name, prompt}` 下发 —— 引擎不碰数据库，也不信任客户端文案。
+	personaID, _ := workbenchCtx["persona_id"].(string)
+	persona, hasPersona := personaForContext(ctx, tenantID, personaID)
+	if hasRoot && root != "" || hasProject || workbenchCtx["project"] != nil ||
+		hasPersona || workbenchCtx["persona_id"] != nil || workbenchCtx["persona"] != nil {
+		wb := make(map[string]interface{}, len(workbenchCtx)+2)
 		for k, v := range workbenchCtx {
 			wb[k] = v
 		}
-		wb["root_path"] = root
+		if hasRoot && root != "" {
+			wb["root_path"] = root
+		}
+		if hasProject {
+			wb["project"] = projectID
+		} else {
+			delete(wb, "project")
+		}
+		delete(wb, "persona_id")
+		if hasPersona {
+			wb["persona"] = persona
+		} else {
+			delete(wb, "persona")
+		}
 		workbenchCtx = wb
 	}
 	// 工作台上下文原样透传：引擎侧决定如何消费（RAG 注入、技能装配、Agent 覆盖）

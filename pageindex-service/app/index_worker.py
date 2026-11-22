@@ -153,12 +153,18 @@ async def handle_kb_index(
                 raise PageIndexError("文档缺少原文对象（storage_key 为空）")
             data = await asyncio.to_thread(reader.get, storage_key)
             await store.set_doc_indexing(doc_id)
-            result = await asyncio.to_thread(
-                adapter.submit_bytes,
-                ctx,
-                doc_id=doc_id,
-                filename=str(doc["name"] or f"{doc_id}.pdf"),
-                data=data,
+            # 单篇超时：PageIndex 的 LLM 工具循环是同步阻塞的，挂死时 worker 心跳仍正常，
+            # 外部只能看到库永久 indexing。到点按单篇失败处理（to_thread 无法真正取消，
+            # 但至少让库收口成 error 并可重试，而不是无限等待）。
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    adapter.submit_bytes,
+                    ctx,
+                    doc_id=doc_id,
+                    filename=str(doc["name"] or f"{doc_id}.pdf"),
+                    data=data,
+                ),
+                timeout=max(30.0, float(getattr(cfg, "doc_timeout_seconds", 1800.0))),
             )
             await store.set_doc_ready(doc_id, result.doc_id, result.page_count)
             indexed += 1
@@ -167,7 +173,7 @@ async def handle_kb_index(
                 # 否则锁过期后第二个 worker 会并发索引同一库（双倍 LLM 费用）。
                 await keepalive()
         except Exception as exc:  # noqa: BLE001 — 单文档失败不拖垮整库
-            message = str(exc)[:500]
+            message = (str(exc) or f"{type(exc).__name__}（单篇索引超时或异常）")[:500]
             errors.append(f"{doc['name']}: {message}")
             logger.warning("kb_index doc failed kb=%s doc=%s: %s", kb_id, doc_id, message)
             await store.set_doc_error(doc_id, message)
@@ -273,6 +279,12 @@ async def process_one(
         logger.info("kb_index acked kb=%s result=%s", kb_id, result)
     except Exception as exc:  # noqa: BLE001
         if retry + 1 >= MAX_RETRIES:
+            # 重试耗尽 = 这次索引**确定失败**：必须把库从 indexing 收口成 error，
+            # 否则 progress 聚合永远 active，界面停在「索引中」且没有任何原因可看。
+            try:
+                await store.set_kb_status(kb_id, "error", str(exc)[:500])
+            except Exception:  # noqa: BLE001 — 写状态失败不掩盖真正的失败原因
+                logger.warning("kb_index: mark kb error failed kb=%s", kb_id)
             await _to_dlq(redis, cfg, fields, str(exc))
             await redis.xack(cfg.kb_stream, cfg.kb_group, stream_id)
             logger.error("kb_index to DLQ kb=%s: %s", kb_id, exc)

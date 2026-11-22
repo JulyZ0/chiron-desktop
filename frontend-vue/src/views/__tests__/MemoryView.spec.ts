@@ -34,6 +34,11 @@ vi.mock('../../api/memory', async (importOriginal) => {
   }
 })
 
+// 项目选择器从 session-map 拉真实项目列表；测试里不需要它，返回空即可。
+vi.mock('../sessionmap/projectsApi', () => ({
+  listProjects: vi.fn(async () => []),
+}))
+
 import MemoryView from '../MemoryView.vue'
 import * as memoryApi from '../../api/memory'
 import { setProject } from '../../composables/useProject'
@@ -101,9 +106,12 @@ describe('项目选择器（C3）', () => {
     await flushPromises()
     const before = vi.mocked(memoryApi.listMemory).mock.calls.length
 
-    const input = wrapper.find('[data-test="project-input"]')
-    await input.setValue('proj-a')
-    await input.trigger('change')
+    const select = wrapper.find('[data-test="project-input"]')
+    // ant-design-vue 的 Select 把 class/data-test 落在选择器容器（DIV）上，
+    // setValue 只对原生 input 有效 —— 直接触发组件事件才是它真实的交互面。
+    await select.trigger('click')
+    const vm = wrapper.findComponent({ name: 'ASelect' })
+    vm.vm.$emit('change', 'proj-a')
     await flushPromises()
 
     expect(vi.mocked(memoryApi.listMemory).mock.calls.length).toBeGreaterThan(before)

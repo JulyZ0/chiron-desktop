@@ -51,4 +51,10 @@ export default {
     share_revoked_untitled: 'سُحب رابط مشاركة جلسة لك بواسطة مسؤول؛ ولم يعد الرابط القديم يعمل.',
     no_detail: 'لا مزيد من التفاصيل.',
   },
+  delete_confirm: 'حذف هذا الإشعار نهائيًا؟',
+  deleted: 'تم الحذف',
+  delete_failed: 'تعذّر حذف الإشعار',
+  clear_read: 'مسح المقروء',
+  cleared: 'تم مسح {n} إشعارًا',
+  nothing_to_delete: 'لا شيء لمسحه',
 }

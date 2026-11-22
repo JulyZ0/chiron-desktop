@@ -1265,14 +1265,12 @@ async function spawnKnowledgeServiceOnce(info, options = {}) {
     if (await probeHttp(baseUrl, KNOWLEDGE_SERVICE_HEALTH_PATH)) {
       // worker 失败**不算**服务失败：检索仍可用，界面会显示"索引未完成"，
       // 这比整个知识库 503 更接近事实。
-      const worker = (() => {
-        try {
-          return spawnTracked(launch.command, ['-m', 'app.index_worker'], { cwd: launch.cwd, env })
-        } catch {
-          return null
-        }
-      })()
-      state.knowledge.worker = worker
+      //
+      // 但 worker 必须**有监护**：它负责消费 engine:tasks:kb，一旦启动即退出（依赖/
+      // 连接问题）或运行中被杀，队列就再没有人消费 —— 界面表现为「索引一直中」。
+      // 此前只 spawn 一次、退出无人知晓；这里做有限重启，并把最后一次失败原因留在
+      // state.knowledge 上供健康面板/日志定位。
+      superviseKnowledgeWorker(launch, env)
       return { ok: true, port, baseUrl, address: `${DEFAULTS.DEFAULT_HOST}:${port}` }
     }
     await sleep(options.intervalMs || 500)
@@ -1284,6 +1282,37 @@ async function spawnKnowledgeServiceOnce(info, options = {}) {
     message: `知识库服务在 ${Math.round((options.timeoutMs || KNOWLEDGE_SERVICE_TIMEOUT_MS) / 1000)}s 内未开始监听`,
     stderrTail: service.stderrTail,
   }
+}
+
+/** 知识库 worker 的有限自动重启：它的存活直接决定索引队列有没有消费者。 */
+const KNOWLEDGE_WORKER_MAX_RESTARTS = 3
+const KNOWLEDGE_WORKER_RESTART_DELAY_MS = 5000
+
+function superviseKnowledgeWorker(launch, env, attempt = 0) {
+  const record = state.knowledge
+  if (!record) return
+  let worker
+  try {
+    worker = spawnTracked(launch.command, ['-m', 'app.index_worker'], { cwd: launch.cwd, env })
+  } catch (err) {
+    record.worker = null
+    record.workerError = (err && err.message) || 'worker spawn failed'
+    return
+  }
+  record.worker = worker
+  record.workerRestarts = attempt
+  worker.child.once('exit', (code) => {
+    // 停止流程 / 服务重建后不重启：只认"同一个 record 里、同一个 worker"的退出。
+    if (worker.stopping || state.knowledge !== record || record.worker !== worker) return
+    const tail = String(worker.stderrTail || '').trim()
+    record.workerError = `worker exited (code ${code})${tail ? ': ' + tail.slice(-400) : ''}`
+    record.worker = null
+    if (attempt >= KNOWLEDGE_WORKER_MAX_RESTARTS) return
+    setTimeout(() => {
+      if (state.knowledge !== record || record.worker !== null) return
+      superviseKnowledgeWorker(launch, env, attempt + 1)
+    }, KNOWLEDGE_WORKER_RESTART_DELAY_MS)
+  })
 }
 
 /** 停知识库服务与 worker。调用方通常在停引擎**之后**调它（引擎还在用时不能先断）。 */

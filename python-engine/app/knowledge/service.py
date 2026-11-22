@@ -26,7 +26,7 @@ from app.knowledge.providers.base import (
     AnswerResult,
     ProviderContext,
 )
-from app.knowledge.status import STATUS_INDEXING
+from app.knowledge.status import STATUS_ERROR, STATUS_INDEXING
 from app.tools.context import to_tenant_int
 
 logger = logging.getLogger(__name__)
@@ -230,7 +230,10 @@ async def index_status(*, kb_id: str) -> dict[str, Any]:
 
     pool = await _pool()
     kb = await pool.fetchrow(
-        "SELECT id, status, error_message FROM knowledge_bases WHERE id = $1", kb_id
+        """SELECT id, status, error_message, COALESCE(provider, '') AS provider,
+                  (NOW() - updated_at) > interval '120 seconds' AS stale
+             FROM knowledge_bases WHERE id = $1""",
+        kb_id,
     )
     if kb is None:
         raise KnowledgeError(f"knowledge base not found: {kb_id}")
@@ -241,9 +244,56 @@ async def index_status(*, kb_id: str) -> dict[str, Any]:
             ORDER BY created_at""",
         kb_id,
     )
-    return aggregate(
+    result = aggregate(
         kb_id=kb_id,
         kb_status=str(kb["status"] or ""),
         kb_error=str(kb["error_message"] or ""),
         documents=list(rows),
     )
+    # 看门狗：库在 indexing、但没有任何 pageindex-worker 心跳且这个状态已超过 2 分钟
+    # ⇒ 任务没人消费（worker 死了 / 队列没投递到）。不把这一态收口，前端会永远轮询，
+    # 用户只能看到「索引中」而没有任何原因。写成 error 才能停下轮询并给出重试入口。
+    # Cloud 模式的索引在远端执行，本地没有 worker 心跳是正常的 —— 不参与该判定。
+    if (
+        result.get("status") == STATUS_INDEXING
+        and str(kb["provider"] or "") != "cloud"
+        and kb["stale"]
+    ):
+        alive = await _kb_worker_alive()
+        if alive is False:
+            result["status"] = STATUS_ERROR
+            result["active"] = False
+            result["error_message"] = (
+                "索引执行器未运行（pageindex-worker 没有心跳），索引任务已中断；"
+                "请重启知识库服务后点「重试」。"
+            )
+    return result
+
+
+#: worker 心跳检查的短缓存：状态端点每 3s 被轮询一次，不值得每次都扫 Redis。
+_worker_alive_at: float = 0.0
+_worker_alive_value: bool | None = None
+
+
+async def _kb_worker_alive() -> bool | None:
+    """是否有存活的 pageindex-worker（Redis 心跳键，60s TTL）。``None`` = 查不了。"""
+    import time
+
+    global _worker_alive_at, _worker_alive_value
+
+    now = time.monotonic()
+    if now - _worker_alive_at < 10.0:
+        return _worker_alive_value
+    value: bool | None
+    try:
+        from app.redis_client import get_redis
+
+        redis = await get_redis()
+        value = False
+        async for _ in redis.scan_iter(match="*engine:kb:worker:hb:*", count=100):
+            value = True
+            break
+    except Exception:  # noqa: BLE001 — 状态端点的增强信息，查不到不判死
+        value = None
+    _worker_alive_at, _worker_alive_value = now, value
+    return value

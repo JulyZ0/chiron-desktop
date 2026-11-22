@@ -85,6 +85,12 @@ func newSPAHandler(root string) (http.Handler, error) {
 	if st, statErr := os.Stat(filepath.Join(abs, "index.html")); statErr == nil {
 		indexMod = st.ModTime()
 	}
+	// 桌面构建（`vite --mode desktop`）把 base 设为 `./`，index.html 里全是
+	// `./assets/...` 这类相对引用 —— 那是给 file:// 用的。但同一份 dist 也被网关在
+	// `/s/<token>` 下托管：浏览器会把 `./assets/x.js` 解析成 `/s/assets/x.js`，
+	// 资源 404 ⇒ 分享落地页白屏。注入 `<base href="/">` 后，相对引用一律回到站点根，
+	// file:// 侧不受影响（它不经过本 handler）。
+	index = withRootBase(index)
 
 	fsys := os.DirFS(abs)
 	// http.FileServerFS 负责 Content-Type / Range / If-Modified-Since 等细节；
@@ -120,6 +126,26 @@ func newSPAHandler(root string) (http.Handler, error) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		http.ServeContent(w, r, "index.html", indexMod, bytes.NewReader(index))
 	}), nil
+}
+
+// withRootBase 给 index.html 注入 `<base href="/">`（已有 base 时原样返回）。
+//
+// 只影响经 HTTP 托管的这份副本：桌面窗口用 file:// 读 asar 里的 dist，不经过这里。
+func withRootBase(index []byte) []byte {
+	lower := bytes.ToLower(index)
+	if bytes.Contains(lower, []byte("<base ")) {
+		return index
+	}
+	head := bytes.Index(lower, []byte("<head>"))
+	if head < 0 {
+		return index
+	}
+	insertAt := head + len("<head>")
+	out := make([]byte, 0, len(index)+len(`<base href="/">`))
+	out = append(out, index[:insertAt]...)
+	out = append(out, []byte(`<base href="/">`)...)
+	out = append(out, index[insertAt:]...)
+	return out
 }
 
 // isHiddenPath 拒绝任何一段以 "." 开头的路径（.env / .git 之类不该经静态托管外泄）。

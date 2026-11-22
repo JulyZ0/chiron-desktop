@@ -35,6 +35,12 @@ export default {
   view_detail: '查看会话',
   refresh: '刷新',
   unknown_title: '通知',
+  delete_confirm: '永久删除这条通知？',
+  deleted: '已删除',
+  delete_failed: '删除通知失败',
+  clear_read: '清理已读',
+  cleared: '已清理 {n} 条通知',
+  nothing_to_delete: '没有可清理的通知',
 
   // 事件类型：既是列表里的分类标签，也是筛选的依据。
   // 与后端 notifications.go 的 NotifSubagentFailed / NotifShareRevoked 一一对应。

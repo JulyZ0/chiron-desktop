@@ -35,6 +35,7 @@ import {
 import EmptyState from '../components/common/EmptyState.vue'
 import ConflictCard from '../components/memory/ConflictCard.vue'
 import { currentProject, setProject } from '../composables/useProject'
+import { listProjects } from './sessionmap/projectsApi'
 import {
   listMemory,
   upsertMemory,
@@ -364,9 +365,47 @@ async function runOrganize() {
 // （"隔离"看起来生效而其实串了）。
 const project = currentProject
 
-/** ant 的 `@change` 给的是原生 Event（这里用的是 `:value` + `@change` 的原生语义） */
-function onProjectChange(e: Event) {
-  setProject((e.target as HTMLInputElement).value)
+/**
+ * 真实项目列表（session-map workspaces）。
+ *
+ * 记忆的 `project` 维现在统一用 **workspace id**（对话侧由网关按会话归属注入同一个 id），
+ * 所以这里必须是选择器而不是自由输入 —— 手填的名字与 id 对不上，隔离看起来"配了却无效"。
+ * 旧数据里若存的是项目名，加载时按名字匹配一次迁移到 id；匹配不上就原样保留，
+ * 以免把用户的历史范围静默清空。
+ */
+const projects = ref<{ id: string; name: string; root_path: string }[]>([])
+
+const projectOptions = computed(() => {
+  const opts = projects.value.map((p) => ({
+    value: p.id,
+    label: p.name || p.root_path?.split(/[\\/]/).filter(Boolean).pop() || p.id,
+  }))
+  // 旧版存的自由串：仍允许查看，但只出现在它自己的选项里
+  const stored = (project.value || '').trim()
+  if (stored && !opts.some((o) => o.value === stored)) {
+    opts.push({ value: stored, label: stored })
+  }
+  return opts
+})
+
+async function loadProjects() {
+  try {
+    const list = await listProjects()
+    projects.value = list.map((p) => ({ id: p.id, name: p.name || '', root_path: p.root_path || '' }))
+    const stored = (project.value || '').trim()
+    if (stored && !projects.value.some((p) => p.id === stored)) {
+      const byName = projects.value.find((p) => p.name === stored)
+      if (byName) setProject(byName.id)
+    }
+  } catch {
+    // 项目列表不可用不阻断记忆浏览：保留手头已有的范围
+    projects.value = []
+  }
+}
+
+function onProjectSelect(value: unknown) {
+  const next = typeof value === 'string' || typeof value === 'number' ? String(value) : ''
+  setProject(next)
   void loadProfile()
   void loadConflicts()
 }
@@ -432,6 +471,7 @@ async function onArchivedChange(value: boolean | string | number) {
 }
 
 onMounted(() => {
+  void loadProjects()
   void loadProfile()
   void loadConflicts()
   void loadSummaries()
@@ -460,15 +500,17 @@ function pct(n: number): string {
         <span class="subtitle">{{ $t('knowledge.cross_session_retention_semantic_retrieval_auto_organization') }}</span>
       </div>
       <Space>
-        <Input
+        <Select
           :value="project"
+          :options="projectOptions"
           :placeholder="$t('memory.project_placeholder')"
           :title="$t('memory.project_hint')"
           allow-clear
-          style="width: 200px"
+          show-search
+          style="width: 220px"
           data-test="project-input"
-          @change="onProjectChange"
-        />
+          @change="onProjectSelect"
+        ></Select>
         <Switch
           :checked="includeArchived"
           :checked-children="$t('common.include_archived')"

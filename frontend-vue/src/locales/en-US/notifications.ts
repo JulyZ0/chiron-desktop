@@ -38,6 +38,12 @@ export default {
   view_detail: 'Open session',
   refresh: 'Refresh',
   unknown_title: 'Notification',
+  delete_confirm: 'Permanently delete this notification?',
+  deleted: 'Deleted',
+  delete_failed: 'Failed to delete notification',
+  clear_read: 'Clear read',
+  cleared: 'Cleared {n} notifications',
+  nothing_to_delete: 'Nothing to clear',
 
   // Event kinds: category labels in the list and the filter basis.
   // One-to-one with NotifSubagentFailed / NotifShareRevoked in notifications.go.

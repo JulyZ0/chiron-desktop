@@ -19,12 +19,17 @@ import os
 from pathlib import Path
 from typing import Any
 
-# ── Redis 键（与引擎 app/redis_keys.py 同规则：前缀 + 冒号）─────────────────
+# ── Redis 键（与引擎 app/redis_keys.py / Go internal/db/redis_key.go 同规则）──
+#
+# 前缀**直接拼接**、不再补冒号：两侧的 `REDIS_KEY_PREFIX` 约定本身就含尾冒号
+# （如 `dev:`）。此前这里写成 `f"{prefix}:{name}"`，一旦配置前缀就得到
+# `dev::engine:tasks:kb`，而引擎写的是 `dev:engine:tasks:kb` —— worker 永远
+# 消费不到任务，界面表现为"索引永远停在 indexing"。
 
 
 def rkey(name: str) -> str:
-    prefix = (os.getenv("REDIS_KEY_PREFIX") or "").strip()
-    return f"{prefix}:{name}" if prefix else name
+    prefix = os.getenv("REDIS_KEY_PREFIX") or ""
+    return f"{prefix}{name}"
 
 
 # ── 原文读取（S3 或共享卷；key 由引擎生成）──────────────────────────────

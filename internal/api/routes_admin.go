@@ -27,6 +27,7 @@ func registerAdminRoutes(
 	// P1-4: 用户管理路由（PUT/DELETE /v1/admin/users）必须 PermUsersManage，
 	// 该权限仅 owner 角色持有，普通 admin 不应能删/改用户。
 	adminReadMW := RequirePermission(auth.PermAdminRead)
+	adminWriteMW := RequirePermission(auth.PermAdminWrite)
 	// 平台级端点：`admin:write` 是租户 admin 就持有的权限，光靠它挡不住跨租户操作。
 	// 见 middleware.go 的 RequirePlatformOwner 注释（租户 admin 可读全库 / 删任意租户）。
 	platformReadMW := RequirePlatformOwner(auth.PermAdminRead)
@@ -90,6 +91,14 @@ func registerAdminRoutes(
 		r.Header.Set("X-User-Role", claims.Role)
 		pythonClient.ForwardRequest(w, r, "/v1/admin/kb?user_id="+url.QueryEscape(claims.UserID)+"&tenant_id="+url.QueryEscape(tenantStr(claims.TenantID)))
 	})))))
+
+	// 人格管理（原「行为塑形」的替代）：人格是租户级资源，租户 admin 可读可写。
+	// 对话内选择走用户侧 `GET /v1/personas`（只回启用的条目）。
+	mux.Handle("GET /v1/admin/personas", authMW(rlMW(adminReadMW(adminStrip))))
+	mux.Handle("POST /v1/admin/personas", authMW(rlMW(adminWriteMW(adminStrip))))
+	mux.Handle("PUT /v1/admin/personas/{id}", authMW(rlMW(adminWriteMW(adminStrip))))
+	mux.Handle("DELETE /v1/admin/personas/{id}", authMW(rlMW(adminWriteMW(adminStrip))))
+	mux.Handle("POST /v1/admin/personas/{id}/default", authMW(rlMW(adminWriteMW(adminStrip))))
 
 	// Storage admin routes
 	mux.Handle("GET /v1/admin/storage", authMW(rlMW(platformReadMW(adminStrip))))

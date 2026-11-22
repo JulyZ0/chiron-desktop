@@ -137,6 +137,25 @@ def ctx_mode(body: ContextBody) -> str:
     return body.mode
 
 
+async def _worker_alive() -> bool | None:
+    """是否有存活的 pageindex-worker（Redis 心跳键，60s TTL）。
+
+    ``None`` = 查不了（Redis 不可用），调用方不应据此判死。
+    """
+    async def _scan() -> bool:
+        client = await _redis()
+        async for _ in client.scan_iter(match="*engine:kb:worker:hb:*", count=100):
+            return True
+        return False
+
+    try:
+        # 整段（建连 + 扫描）一起限时：Redis 半死时 scan 也可能挂住，
+        # 健康检查不能被它拖成数秒。
+        return await asyncio.wait_for(_scan(), timeout=1.0)
+    except Exception:  # noqa: BLE001 — 指标/健康辅助信息，取不到 ≠ 服务挂了
+        return None
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
     """健康检查**不要求内部 token**（供容器探针使用），但也不泄露任何业务信息。
@@ -144,12 +163,20 @@ async def healthz() -> dict[str, Any]:
     模型的解析结果就是这里的判据：只在 env 里找不到时向网关要 `/models` 的配置，
     因此"管理员在 /models 配了模型"能立刻反映到 ready 上；真没有时会给出
     **可操作**说明（去 /models 配置），而不是笼统的"未配置自托管模型"。
+
+    ``worker_alive`` 单独暴露：检索服务活着 ≠ 索引执行器活着。引擎在投递索引任务前
+    会据此拦下"注定无人消费"的请求（见 ``knowledge/remote.py::probe``）。
     """
     from app import models as models_mod
 
     resolved = await models_mod.resolve(config())
     health = Adapter(mode="selfhosted", cfg=config(), models=resolved).health(resolved)
-    return {**health, "engine": sdk_version(), "service": "pageindex-search"}
+    return {
+        **health,
+        "worker_alive": await _worker_alive(),
+        "engine": sdk_version(),
+        "service": "pageindex-search",
+    }
 
 
 @app.get("/metrics")

@@ -13,7 +13,6 @@
 import { ref, onMounted } from 'vue'
 import { Button, message, Tag, Slider } from 'ant-design-vue'
 import EmptyState from '../common/EmptyState.vue'
-import HarnessProfilePanel from './HarnessProfilePanel.vue'
 import RunModePanel from './RunModePanel.vue'
 import IsolationPanel from './IsolationPanel.vue'
 import EngineEnvPanel from './EngineEnvPanel.vue'
@@ -319,14 +318,6 @@ onMounted(async () => {
           <p><strong>{{ $t('common.6_contact') }}</strong>{{ $t('admin.if_you_have_questions_about_this_policy_contact_us_via_the_channel_provided_by_the_deployer') }}</p>
         </div>
       </div>
-    </a-tab-pane>
-
-    <!-- ── 行为塑形（P1-④ 批 B）：会被追加到 system prompt 末尾，必须显著告知 ── -->
-    <a-tab-pane
-      key="harness"
-      :tab="$t('settings.harness_title')"
-    >
-      <HarnessProfilePanel scope="user" />
     </a-tab-pane>
 
     <!-- ── 运行模式：云端已废除，只剩本地；面板内提供「清空本机数据」 ── -->

@@ -29,6 +29,7 @@ from app.agent.prompt_sections import (
     KNOWLEDGE,
     MEMORY,
     NARRATION_SUFFIX,
+    PERSONA,
     PLANNING_SUFFIX,
     REPORT,
     STABLE_PREFIX,
@@ -71,6 +72,18 @@ def build_system_sections(
             str((task.llm_config or {}).get("model", "") or "")
         )
         inline[STABLE_PREFIX] = task.system_prompt
+        # 人格（后台「人格管理」）：服务端按 id/默认解析后随 context 下发。
+        # 空 = 未选人格 ⇒ 不产出该段，system 段与引入前逐字相同。
+        persona = (task.workbench_context or {}).get("persona")
+        if isinstance(persona, dict):
+            persona_prompt = str(persona.get("prompt") or "").strip()
+            if persona_prompt:
+                persona_name = str(persona.get("name") or "").strip()
+                inline[PERSONA] = (
+                    f"## 人格：{persona_name}\n\n{persona_prompt}"
+                    if persona_name
+                    else f"## 人格\n\n{persona_prompt}"
+                )
         if profile is not None and profile.system_prompt_suffix:
             inline[HARNESS_SUFFIX] = profile.system_prompt_suffix
         # P1-④：租户/用户级 harness 塑形 —— deepagents **没有**这一层（只有部署级注册）。

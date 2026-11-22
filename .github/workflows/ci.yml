@@ -93,9 +93,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          # 固定 3.12：与打包（python-runtime）和 pyproject 的 requires-python>=3.11 一致，
-          # 不再跟着 runner 上最新的 3.14 漂。
-          python-version: '3.12'
+          # 固定 3.14：与随包 python-runtime（runtime-install.cjs）和桌面工作流一致，
+          # pyproject 的 requires-python 仍是 >=3.11。
+          python-version: '3.14'
           cache: pip
           cache-dependency-path: python-engine/requirements-dev.txt
       - name: Install dependencies
@@ -591,8 +591,8 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # 与 engine job 同口径（3.12）
-          python-version: '3.12'
+          # 与 engine job 同口径（3.14）
+          python-version: '3.14'
           cache: pip
           cache-dependency-path: python-engine/requirements-dev.txt
 

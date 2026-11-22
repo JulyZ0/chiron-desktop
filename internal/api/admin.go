@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"github.com/athenavi/chiron/internal/monitor"
 	"github.com/athenavi/chiron/internal/settings"
 	"github.com/athenavi/chiron/internal/storage"
+	"github.com/jackc/pgx/v5"
 )
 
 var validDBName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
@@ -63,6 +65,13 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	})
 	r.HandleFunc("POST /users/{id}/force-logout", h.ForceLogout)
 	r.HandleFunc("GET /system", h.SystemInfo)
+	// 人格管理：原「行为塑形」的后台落点（见 personas.go 的文件头）。
+	personas := NewPersonaHandler()
+	r.HandleFunc("GET /personas", personas.ListAdmin)
+	r.HandleFunc("POST /personas", personas.Create)
+	r.HandleFunc("PUT /personas/{id}", personas.Update)
+	r.HandleFunc("DELETE /personas/{id}", personas.Delete)
+	r.HandleFunc("POST /personas/{id}/default", personas.SetDefault)
 	// D1："配了但不生效"的自诊断 —— 与部署审计同一条线，把配置陷阱与依赖断链变成可自答。
 	r.HandleFunc("GET /diagnostics", h.GetDiagnostics)
 	// P0-1：同一问题的**聚合清单**（schema / 必需表 / 知识库 / 检查点 / 依赖）。
@@ -160,6 +169,15 @@ type AdminUser struct {
 	UpdatedAt   string `json:"updated_at"`
 }
 
+// formatOptionalTime 把可空时间列格式化成 RFC3339；NULL 输出空串。
+// users.created_at/updated_at 在基线迁移里可空，本地引导建号曾不写这两列。
+func formatOptionalTime(t *time.Time) string {
+	if t == nil {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
 func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	tenantID := GetTenantID(r)
 	if tenantID == 0 {
@@ -208,13 +226,18 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	users := make([]AdminUser, 0)
 	for rows.Next() {
 		var u AdminUser
-		var createdAt, updatedAt time.Time
+		// 必须是**可空**的 *time.Time：本地免口令引导创建的 owner 不写
+		// created_at/updated_at（见 auth_local_session.go），而 pgx 把 NULL 扫进
+		// time.Time 会 fatal 整条结果集 —— 表现为「用户管理整页 500: failed to
+		// iterate users」。这里按可空读，缺值展示为空串。
+		var createdAt, updatedAt *time.Time
 		if err := rows.Scan(&u.ID, &u.Email, &u.Username, &u.Name, &u.Nickname, &u.Role,
 			&u.Status, &u.LastLoginAt, &createdAt, &updatedAt); err != nil {
-			continue
+			logAndRespond(w, err, http.StatusInternalServerError, "scan user row failed")
+			return
 		}
-		u.CreatedAt = createdAt.Format(time.RFC3339)
-		u.UpdatedAt = updatedAt.Format(time.RFC3339)
+		u.CreatedAt = formatOptionalTime(createdAt)
+		u.UpdatedAt = formatOptionalTime(updatedAt)
 		users = append(users, u)
 	}
 	if err := rows.Err(); err != nil {
@@ -243,7 +266,7 @@ func (h *AdminHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var u AdminUser
-	var createdAt, updatedAt time.Time
+	var createdAt, updatedAt *time.Time
 	err := db.GlobalDBManager.QueryRow(r.Context(),
 		`SELECT id, COALESCE(email, ''), COALESCE(username, ''), COALESCE(name, ''),
 		        COALESCE(NULLIF(nickname, ''), name, ''), COALESCE(role, 'user'),
@@ -254,11 +277,15 @@ func (h *AdminHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 		Scan(&u.ID, &u.Email, &u.Username, &u.Name, &u.Nickname, &u.Role,
 			&u.Status, &u.LastLoginAt, &createdAt, &updatedAt)
 	if err != nil {
-		NotFound(w, "user not found")
+		if errors.Is(err, pgx.ErrNoRows) {
+			NotFound(w, "user not found")
+			return
+		}
+		logAndRespond(w, err, http.StatusInternalServerError, "load user failed")
 		return
 	}
-	u.CreatedAt = createdAt.Format(time.RFC3339)
-	u.UpdatedAt = updatedAt.Format(time.RFC3339)
+	u.CreatedAt = formatOptionalTime(createdAt)
+	u.UpdatedAt = formatOptionalTime(updatedAt)
 
 	OK(w, u)
 }

@@ -65,7 +65,8 @@ UV_ASSETS_DIR = FRONTEND_VUE / "assets" / "uv"
 
 # 必须与 electron/runtime-install.cjs::RUNTIME_PYTHON_VERSION 保持一致。
 # 两处各自写死是有意的：构建脚本不该去解析 JS，而运行时不读本文件。
-RUNTIME_PYTHON_VERSION = "3.12"
+# 3.14：与 CI/桌面工作流验证口径一致；具体补丁版本由 uv 就位时选当前最新稳定版。
+RUNTIME_PYTHON_VERSION = "3.14"
 
 # 单步超时（秒）。解释器约 20MB，慢网络留足余量
 INSTALL_TIMEOUT = 600

@@ -29,6 +29,10 @@ const props = defineProps<{
   sessionId?: string
   /** 模型路由：当前会话 llm_config.model（空 = 后端默认路由） */
   model?: string
+  /** 当前人格 id（空 = 使用后台默认人格 / 不注入）。 */
+  persona?: string
+  /** 可选人格（后台「人格管理」里启用的条目；由父组件加载）。 */
+  personaOptions?: { label: string; value: string }[]
   /** 工具授权模式（ask/auto/yolo）：控制工具执行是否需要用户确认 */
   toolsMode?: string
   /** 输出风格（default/concise/detailed/teaching/code）：差距B，用户可见的输出控制 */
@@ -61,6 +65,8 @@ const emit = defineEmits<{
   (e: 'update:mode', mode: string): void
   /** 模型路由：用户选择了模型（空字符串 = 恢复后端默认） */
   (e: 'model-change', model: string): void
+  /** 人格切换（空字符串 = 跟随默认人格） */
+  (e: 'persona-change', personaId: string): void
   /** 工具授权模式：ask=写类需确认 / auto=仅危险 / yolo=全跳过 */
   (e: 'tools-mode-change', mode: string): void
   /** 输出风格（差距B）：default/concise/detailed/teaching/code */
@@ -1642,6 +1648,19 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
             :title="$t('chat.input.modelTitle', { model: modelValue || $t('chat.input.modelDefault') })"
             @update:value="onModelChange"
           />
+          <!-- 人格：来自后台「人格管理」，只列启用条目。空 = 跟随默认人格。
+               服务端按 id 解析提示词，这里只负责"选谁"。 -->
+          <template v-if="personaOptions?.length">
+            <span class="mode-label">{{ $t('chat.persona') }}</span>
+            <Select
+              class="model-select persona-select"
+              :model-value="persona || ''"
+              :options="[{ label: $t('chat.persona_default'), value: '' }, ...personaOptions]"
+              size="small"
+              :title="$t('chat.persona_title')"
+              @change="(v: any) => emit('persona-change', String(v ?? ''))"
+            />
+          </template>
           <!-- 差距B：提示精炼 —— 把当前输入改写成更明确的提示（点按触发，不自动应用）。
                常驻可见（而非收进设置弹层）：它作用的是"这一次输入"，属于即时动作。 -->
           <Button
@@ -1843,6 +1862,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
 /* 模型路由下拉（与模式切换器同排；窄屏收缩防溢出） */
 .model-select { width: 170px; }
 .model-select :deep(.ant-select-selector) { font-size: 12px; }
+.persona-select { width: 130px; }
 /* 上下文快捷按钮：展开侧栏（抽屉模式） */
 .context-btn { color: var(--text-tertiary); display: inline-flex; align-items: center; gap: 4px; border-radius: var(--input-card-inner-r, 8px); }
 .context-btn:hover { color: var(--primary) !important; background: var(--primary-bg) !important; }
