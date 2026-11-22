@@ -58,6 +58,9 @@ _READ_TOOLS: frozenset[str] = frozenset(
         # 不碰文件、不触外部 ⇒ read 级。放 write 会让模型每次整理都要人点确认，
         # 而它本就是"给上下文腾地方"的低风险动作。
         "compact_conversation",
+        # 图/工作流：与 Go 权威表同构（部分工具当前由工作流适配层按需注册，
+        # 名字必须先在镜像里挂号，否则未注册的调用会 fail-closed 到 write）。
+        "graph_templates",
         "read_subagent_result", "read_tool_result", "read_archive", "list_subagent_runs", "job_output", "stderr_drain",
         "requirement_validate", "task_decompose", "tech_design", "prd_generate",
         "vision_analyze", "speech_to_text", "video_analyze",
@@ -73,7 +76,8 @@ _WRITE_TOOLS: frozenset[str] = frozenset(
         "remember", "media_create",
         "image_generate", "text_to_speech", "skill_generate",
         # 委派类：它们内部会执行任意工具（子 Agent 有自己的栅栏），因此在父层至少要确认一次
-        "subagent",
+        "subagent", "workflow_run", "graph_run",
+        "graph_create",
         # 重跑也是"再派一个作业"（会消耗 token 并复用原来的写权限），与 subagent 同级
         "rerun_subagent",
         # R5(b)：续跑/分叉同理（再派作业 + 沿原 run 的写权限，只能收紧不能放宽）

@@ -1059,10 +1059,10 @@ def _start_agent_config_watch() -> Any:
     return task
 
 
-def _log_watcher_exit(label: str):
+def _log_watcher_exit(label: str) -> Any:
     """配置监听任务的退出可见化：静默死掉的监听曾让"后台保存不生效"像玄学。"""
 
-    def _cb(task: "asyncio.Task[Any]") -> None:
+    def _cb(task: asyncio.Task[Any]) -> None:
         if task.cancelled():
             return
         exc = task.exception()

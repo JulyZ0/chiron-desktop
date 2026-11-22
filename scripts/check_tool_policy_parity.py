@@ -50,8 +50,6 @@ GO_MODES_FILE = ROOT / "internal" / "api" / "session_runtime.go"
 PY_MODES_FILE = ROOT / "python-engine" / "app" / "agent" / "modes.py"
 GO_CATALOG_FILE = ROOT / "internal" / "api" / "llm_providers.go"
 PY_CATALOG_FILE = ROOT / "python-engine" / "app" / "providers" / "catalog.py"
-GO_CHAOS_FILE = ROOT / "internal" / "api" / "ent_chaos_handler.go"
-PY_CHAOS_FILE = ROOT / "python-engine" / "app" / "chaos" / "injector.py"
 GO_TOOLS_MODE_FILE = ROOT / "internal" / "api" / "mode.go"
 PY_TOOLS_MODE_FILE = ROOT / "python-engine" / "app" / "agent" / "guards.py"
 TS_TOOLS_MODE_FILE = ROOT / "frontend-vue" / "src" / "views" / "ChatView.vue"
@@ -73,28 +71,6 @@ PY_REPORT_FILE = ROOT / "python-engine" / "app" / "subagent" / "reporting.py"
 #:   只比裸字面量会被注释满足 ⇒ 改名照样漏过（2026-10-09 实测踩到）。
 #: * **必须容忍空白** —— Go 的 `const` 块是 gofmt 对齐的（`runRecordPrefix   = "..."`），
 #:   写死单空格的片段会假红（同日实测踩到）。
-#: M24 第八族：**跨语言共享的请求字段名**。
-#:
-#: 网关把计价口径写进 `llm_config`（`submit_handler.go` 的 `applyCostDefaults`），引擎按同名读
-#: （`runtime.py`）—— 两侧是**同一个契约的两半**，任一侧改名都会让 cost 轴**静默失效**
-#: （引擎读到 0 ⇒ 永不触发，而没有任何报错）。与第五族同形：比代码形态、先剥注释。
-SHARED_PAYLOAD_FIELDS: tuple[tuple[str, str, str, str, str], ...] = (
-    (
-        "cost_per_1k_input",
-        "internal/api/submit_handler.go",
-        r'"cost_per_1k_input"',
-        "python-engine/app/agent/runtime.py",
-        r'"cost_per_1k_input"',
-    ),
-    (
-        "cost_per_1k_output",
-        "internal/api/submit_handler.go",
-        r'"cost_per_1k_output"',
-        "python-engine/app/agent/runtime.py",
-        r'"cost_per_1k_output"',
-    ),
-)
-
 SHARED_REDIS_KEY_PREFIXES: tuple[tuple[str, str, str, str, str], ...] = (
     (
         "subagent:run:",
@@ -145,15 +121,6 @@ SHARED_CONSTANTS: tuple[tuple[str, str, str, str, str], ...] = (
         "internal/session/manager_branch.go",
         "MIN_COMPRESSIBLE_MESSAGES",
         "python-engine/app/context/branch_condense.py",
-    ),
-    (
-        # harness suffix 的长度上限：Go 侧校验写入、Python 侧读取时兜底截断，
-        # 两侧不一致等于"上限形同虚设"（P1-④ 批 B）
-        "MaxHarnessSuffixChars",
-        "2000",
-        "internal/api/harness_profiles.go",
-        "MAX_SUFFIX_CHARS",
-        "python-engine/app/agent/harness_store.py",
     ),
 )
 
@@ -414,30 +381,10 @@ def main() -> int:
             f"只在 Python {sorted(py_catalog - go_catalog) or '—'}"
         )
 
-    # 第四族：故障注入的**作用面与故障类型**（ent_chaos_handler.go 写着"必须一致"，
-    # 且失败模式很隐蔽：不一致 ⇒ 创建出的实验**永远不会生效**，即当初那个"假注入"）。
-    go_chaos_text = (
-        GO_CHAOS_FILE.read_text(encoding="utf-8") if GO_CHAOS_FILE.exists() else ""
-    )
-    py_chaos_text = (
-        PY_CHAOS_FILE.read_text(encoding="utf-8") if PY_CHAOS_FILE.exists() else ""
-    )
-    for label, go_name, py_name in (
-        ("TARGETS", "chaosSupportedTargets", "SUPPORTED_TARGETS"),
-        ("FAULTS", "chaosSupportedFaults", "MIDDLEWARE_FAULT_TYPES"),
-    ):
-        go_set = parse_go_bool_map(go_chaos_text, go_name)
-        py_set = parse_py_frozenset(py_chaos_text, py_name)
-        if not go_set or not py_set:
-            problems.append(
-                f"CHAOS {label}: 解析为空（Go {sorted(go_set) or '—'} / "
-                f"Python {sorted(py_set) or '—'}） —— 表名或文件位置变了"
-            )
-        elif go_set != py_set:
-            problems.append(
-                f"CHAOS {label}: 只在 Go {sorted(go_set - py_set) or '—'}；"
-                f"只在 Python {sorted(py_set - go_set) or '—'}"
-            )
+    # 已退役的检查（随 Go 侧实现一并删除，保留说明避免"为什么没有这一族"的疑问）：
+    #   - 混沌实验作用面/故障类型：Go 的 ent_chaos_handler.go 已不在本分支；
+    #   - 计价字段 cost_per_1k_*：Go 网关不再下发，Python 侧仅保留对旧载荷的兼容读取；
+    #   - MaxHarnessSuffixChars：harness_profiles 写入口已由「人格管理」取代。
 
     # 第五族：跨语言共享的 Redis 键前缀（比对**代码形态的正则**，且先剥注释）
     for literal, go_rel, go_pat, py_rel, py_pat in SHARED_REDIS_KEY_PREFIXES:
@@ -448,16 +395,6 @@ def main() -> int:
             problems.append(f"KEY {literal!r}: Go 侧 {go_rel} 匹配不到 /{go_pat}/（改名了？）")
         if not re.search(py_pat, py_text):
             problems.append(f"KEY {literal!r}: Python 侧 {py_rel} 匹配不到 /{py_pat}/（改名了？）")
-
-    # 第八族：跨语言共享的**请求字段名**（计价口径随 `llm_config` 下发，两侧同名是契约）
-    for literal, go_rel, go_pat, py_rel, py_pat in SHARED_PAYLOAD_FIELDS:
-        go_path, py_path = ROOT / go_rel, ROOT / py_rel
-        go_text = _code_lines(go_path.read_text(encoding="utf-8")) if go_path.exists() else ""
-        py_text = _code_lines(py_path.read_text(encoding="utf-8")) if py_path.exists() else ""
-        if not re.search(go_pat, go_text):
-            problems.append(f"FIELD {literal!r}: Go 侧 {go_rel} 匹配不到 /{go_pat}/（改名了？）")
-        if not re.search(py_pat, py_text):
-            problems.append(f"FIELD {literal!r}: Python 侧 {py_rel} 匹配不到 /{py_pat}/（改名了？）")
 
     # 第六族：跨语言共享的数值常量（同样：剥注释 + 容忍空白）
     for go_var, value, go_rel, py_var, py_rel in SHARED_CONSTANTS:
@@ -564,8 +501,6 @@ def main() -> int:
         f"OK: 两侧同构 —— read/write/delete/external 共 {total} 条，"
         f"命令类 {len(go_command)} 个，对话模式 {len(go_modes)} 个"
         f"（{'/'.join(sorted(go_modes))}），提供商目录 {len(go_catalog)} 条，"
-        f"故障注入 作用面 {len(parse_go_bool_map(go_chaos_text, 'chaosSupportedTargets'))} "
-        f"/ 类型 {len(parse_go_bool_map(go_chaos_text, 'chaosSupportedFaults'))}，"
         f"共享键前缀 {len(SHARED_REDIS_KEY_PREFIXES)} 个，共享常量 {len(SHARED_CONSTANTS)} 个，"
         f"工具授权模式 {len(go_tm)} 个（{'/'.join(sorted(go_tm))}，三语言一致），"
         f"子 Agent 终态 {len(go_term)} 个（{'/'.join(sorted(go_term))}）。"

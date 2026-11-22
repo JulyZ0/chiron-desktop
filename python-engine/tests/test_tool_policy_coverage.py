@@ -27,6 +27,12 @@ LEGACY_TOOL_NAMES: dict[str, str] = {
     "tool": "早期通用工具代理名（对应已删除的 app/tools/agent.py 的 AgentInfo）；read 兜底",
     "kb_delete": "旧版知识库删除工具名；**delete 兜底**",
     "execute_command": "旧版命令执行工具名（现为 shell_exec/persistent_shell）；命令类兜底",
+    # 图/工作流工具由 Go 侧权威分级保留（见 internal/api/tool_policy.go）；引擎当前没有
+    # 同名注册（工作流适配层按需注入），镜像必须同构，否则未注册调用会 fail-closed 到 write。
+    "graph_templates": "Go 权威表保留的只读图模板工具名；read 兜底",
+    "graph_create": "Go 权威表保留的图创建工具名；write 兜底",
+    "graph_run": "Go 权威表保留的图执行工具名；write 兜底",
+    "workflow_run": "Go 权威表保留的工作流执行工具名；write 兜底",
 }
 
 
