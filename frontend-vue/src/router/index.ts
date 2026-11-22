@@ -22,6 +22,13 @@ const routes = [
     meta: { public: true },
   },
   {
+    // 邀请链接落地页：受邀人用一次性 token 设置自己的密码（公开页）。
+    path: '/invite/:token',
+    name: 'InviteAccept',
+    component: () => import('../views/InviteAcceptView.vue'),
+    meta: { public: true },
+  },
+  {
     // 首登/管理员重置后的强制改密页。requiresAuth：没有会话就没有旧密码可验。
     path: '/change-password',
     name: 'ChangePassword',

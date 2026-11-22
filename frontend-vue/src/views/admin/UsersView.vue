@@ -14,6 +14,7 @@ import {
 import { useI18n } from 'vue-i18n'
 import {
   createAdminUser,
+  createAdminUserInvite,
   deleteAdminUser,
   forceLogoutAdminUser,
   listAdminUsers,
@@ -53,6 +54,9 @@ const editForm = reactive({ email: '', username: '', nickname: '', role: 'user' 
 
 const credentialsOpen = ref(false)
 const credentials = reactive({ title: '', account: '', password: '' })
+
+const inviteOpen = ref(false)
+const invite = reactive({ url: '', token: '', expiresAt: '' })
 
 const columns = computed(() => [
   { title: t('admin.userAdmin.col_account'), key: 'account' },
@@ -176,6 +180,30 @@ async function resetPassword(row: AdminManagedUser | Record<string, any>) {
   }
 }
 
+async function inviteUser(row: AdminManagedUser | Record<string, any>) {
+  const user = row as AdminManagedUser
+  try {
+    const result = await createAdminUserInvite(user.id)
+    invite.url = result.invite_url || ''
+    invite.token = result.token || ''
+    invite.expiresAt = result.expires_at || ''
+    inviteOpen.value = true
+  } catch (err) {
+    message.error(serverErrorMessage(err, t('admin.userAdmin.invite_failed')))
+  }
+}
+
+async function copyInvite() {
+  const text = invite.url || invite.token
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(t('common.copied'))
+  } catch {
+    message.warning(t('admin.userAdmin.invite_copy_failed'))
+  }
+}
+
 async function toggleDisabled(row: AdminManagedUser | Record<string, any>) {
   const user = row as AdminManagedUser
   try {
@@ -294,6 +322,13 @@ onMounted(load)
                 @click="openEdit(record)"
               >
                 {{ $t('common.edit') }}
+              </Button>
+              <Button
+                type="link"
+                size="small"
+                @click="inviteUser(record)"
+              >
+                {{ $t('admin.userAdmin.invite_button') }}
               </Button>
               <Popconfirm
                 :title="$t('admin.userAdmin.reset_confirm')"
@@ -444,6 +479,38 @@ onMounted(load)
         {{ $t('admin.userAdmin.credentials_share') }}
       </p>
     </Modal>
+
+    <Modal
+      v-model:open="inviteOpen"
+      :title="$t('admin.userAdmin.invite_modal_title')"
+      :footer="null"
+    >
+      <Alert
+        type="info"
+        show-icon
+        :message="$t('admin.userAdmin.invite_hint')"
+      />
+      <div class="credential-box">
+        <div class="credential-row">
+          <span class="credential-label">{{ $t('admin.userAdmin.invite_url') }}</span>
+          <code class="invite-text">{{ invite.url || invite.token }}</code>
+          <Button
+            type="link"
+            size="small"
+            @click="copyInvite"
+          >
+            {{ $t('common.copy') }}
+          </Button>
+        </div>
+        <div v-if="invite.expiresAt" class="credential-row">
+          <span class="credential-label">{{ $t('admin.userAdmin.invite_expires') }}</span>
+          <code>{{ invite.expiresAt }}</code>
+        </div>
+      </div>
+      <p v-if="!invite.url" class="credential-hint">
+        {{ $t('admin.userAdmin.invite_no_base_url') }}
+      </p>
+    </Modal>
   </div>
 </template>
 
@@ -473,4 +540,5 @@ onMounted(load)
 .credential-row { display: flex; align-items: center; gap: 10px; }
 .credential-label { font-size: 12px; color: var(--text-tertiary); min-width: 72px; }
 .credential-hint { margin: 12px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.invite-text { word-break: break-all; }
 </style>
