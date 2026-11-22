@@ -15,10 +15,12 @@ vi.mock('../../stores/auth', () => ({
 function makeStore(init: {
   role?: string | null
   isAuthenticated?: boolean
+  isApiKeySession?: boolean
 }) {
   const store = {
     user: init.role !== undefined ? { id: 'u1', email: 'a@b.c', name: 'A', role: init.role, tenant_id: 't1' } : null,
     isAuthenticated: init.isAuthenticated ?? !!init.role,
+    isApiKeySession: init.isApiKeySession ?? false,
     mustChangePassword: false,
     fetchProfile: mocks.fetchProfileMock,
     initToken: vi.fn().mockResolvedValue(undefined),
@@ -143,6 +145,13 @@ describe('authGuard', () => {
 
     it('普通用户（已登录）重定向首页 /', async () => {
       const store = makeStore({ role: 'user', isAuthenticated: true })
+      const next = fakeNext()
+      await authGuard(fakeRoute({ requiresAuth: true, requiresAdmin: true }), {} as RouteLocationNormalized, next)
+      expect(next).toHaveBeenCalledWith('/')
+    })
+
+    it('API Key 会话即使 role=owner 也不能进管理员页', async () => {
+      makeStore({ role: 'owner', isAuthenticated: true, isApiKeySession: true })
       const next = fakeNext()
       await authGuard(fakeRoute({ requiresAuth: true, requiresAdmin: true }), {} as RouteLocationNormalized, next)
       expect(next).toHaveBeenCalledWith('/')

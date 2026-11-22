@@ -372,10 +372,12 @@ def validate_schedule(
         elif once_at - now > MAX_ONCE_HORIZON_SECONDS:
             errors.append("once_at must be within 24 hours")
     elif kind == KIND_INTERVAL:
-        try:
-            interval = int(interval_seconds)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            interval = 0
+        interval = 0
+        if isinstance(interval_seconds, (int, float, str)):
+            try:
+                interval = int(interval_seconds)
+            except (TypeError, ValueError):
+                interval = 0
         if interval < MIN_INTERVAL_SECONDS:
             errors.append(f"interval_seconds must be >= {MIN_INTERVAL_SECONDS}")
     return errors

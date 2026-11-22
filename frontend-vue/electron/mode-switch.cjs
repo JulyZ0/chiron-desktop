@@ -211,7 +211,7 @@ async function switchMode(options = {}) {
     // 免得盘上留一个"切云端时要确认"的陈旧标记，和下次真正的切换混成一回事。
     // 判据不能是「地址为空」：保留旧 apiUrl 正是切模式的契约，而恰恰是这个保留下来的
     // 陈旧地址会把用户锁死 —— 后端不可达 ⇒ 登不了录 ⇒ 进不了设置页，改不了地址。
-    const confirmApiUrl = nextMode === 'cloud'
+    const confirmApiUrl = nextMode === 'cloud' && !options.skipApiUrlConfirm
     markApiUrlPending(confirmApiUrl)
     result.needsApiUrl = confirmApiUrl
   } catch (err) {

@@ -143,7 +143,11 @@ function handleMenuClick(info: { key: string | number }) {
 // 账号菜单项统一由 components/accountMenu.ts 构造：此前 AppLayout 与
 // chat/ChatSidePanel 各写一份并已漂移（聊天页那份缺 api-keys 与通知入口）。
 const userMenuItems = computed<AccountMenuItem[]>(() =>
-  buildAccountMenuItems((k) => tr(k), { isLocal: deviceStore.isLocal() }),
+  buildAccountMenuItems((k) => tr(k), {
+    isLocal: deviceStore.isLocal(),
+    // API Key 会话不能再管理 API Key（后端同样拒绝）：入口一并收起。
+    includeApiKeys: !authStore.isApiKeySession,
+  }),
 )
 
 // 设置弹窗与 /profile 页面共用 SettingsPanel，避免两套实现各自漂移
@@ -350,6 +354,16 @@ async function runQuickCommand() {
           </span>
         </button>
       </nav>
+
+      <!-- API Key 会话是**受限凭据**：管理面整体收起，这里给出可见说明，
+           否则用户只会觉得"管理菜单凭空消失了"。 -->
+      <span
+        v-if="authStore.isApiKeySession"
+        class="api-key-badge"
+        :title="$t('auth.api_key_limited_hint')"
+      >
+        {{ $t('auth.api_key_session') }}
+      </span>
     </header>
 
     <!-- 右上角用户胶囊（聊天页隐藏，理由见 isChatPage 的注释）。
@@ -460,6 +474,21 @@ async function runQuickCommand() {
      整块设 no-drag 会把标题栏左半截变成"死区"，那里既不能拖也不能点。
      真正要点击的按钮各自退出拖拽（见 .brand-btn / .dock-item）。 */
   -webkit-app-region: drag;
+}
+
+/* 受限会话标识：说明管理入口为何不可见，而不是让它们"凭空消失" */
+.api-key-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding-inline: 8px;
+  border-radius: var(--radius-md);
+  font-size: 11px;
+  font-weight: var(--fw-semibold);
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: var(--hairline-width) solid var(--border);
+  white-space: nowrap;
 }
 
 .brand-btn {

@@ -24,12 +24,10 @@ try {
 }
 
 /**
- * 运行模式：**只有本地模式**。
+ * 运行模式：本地模式（随包内置后端）与远程模式（连接指定 Chiron 服务）。
  *
- * 云端模式已废除 —— 当前版本与云端服务端不兼容，且桌面端的数据隔离方案
- * （绑定 OS 账户、数据留在本用户 appData）在云端形态下没有对应物。
- * `MODES` 保留为数组是为了让 `normalizeMode` 等既有校验逻辑继续工作，
- * 但取值域已收窄到一项：任何写入 'cloud' 的调用都会在写盘前被判非法。
+ * 远程模式下桌面端只负责界面：不启动 PG/Redis/引擎，所有请求打 `apiUrl`；
+ * 身份走账号密码或 API Key（见登录页）。模式与地址都持久化在 config.json。
  */
 const MODES = ['local', 'cloud']
 const MODE_LABELS = { local: '本地模式', cloud: '云端模式' }
@@ -319,14 +317,15 @@ function clearMode() {
  * 而不是让应用在一个已废除的模式下启动。
  */
 function resolveMode(settings = readDeviceSettings()) {
-  // 云端模式已废除：**运行模式恒为 local**。
-  //
-  // 收敛点放在这里而不是把 MODES 收窄，是因为旧配置、旧测试与迁移代码仍会
-  // 提到 'cloud' —— 让 normalizeMode 继续接受它是为了那些路径能干净走完
-  // （写盘、回滚、迁移），但真正决定"应用以什么模式跑"只有这一个函数。
-  // 于是：即使 config.json 里还留着 mode:"cloud"，进程也只会按本地模式启动。
-  void settings
-  return 'local'
+  // 环境变量优先（开发/排障）；否则以设备设置为准。
+  // 老配置里残留的未知值由 normalizeMode 拒绝，这里回落到 local。
+  const fromEnv = String(process.env.CHIRON_DESKTOP_MODE || '').trim().toLowerCase()
+  if (MODES.includes(fromEnv)) return fromEnv
+  try {
+    return normalizeMode(settings.mode)
+  } catch {
+    return NEW_INSTALL_MODE
+  }
 }
 
 /**
@@ -356,10 +355,15 @@ function readRuntimeDeviceSettings() {
  * 只有云端模式才用云端地址；本地模式的 baseUrl 由本地后端启动回调给出
  * （main.cjs 注入给渲染进程），这里返回空串表示「不要连远程服务」。
  */
-function resolveApiUrl() {
-  // 云端模式废除后不再有"远程服务地址"这回事：本地后端由 main.cjs 在建窗时
-  // 注入 `localBackend.baseUrl`。恒返回空串，让任何残留的 apiUrl 配置失效。
-  return ''
+function resolveApiUrl(settings = readDeviceSettings()) {
+  if (resolveMode(settings) !== 'cloud') return ''
+  const fromEnv = String(process.env.CHIRON_API_URL || '').trim()
+  try {
+    if (fromEnv) return normalizeApiUrl(fromEnv)
+    return normalizeApiUrl(settings.apiUrl)
+  } catch {
+    return ''
+  }
 }
 
 function saveApiUrl(raw) {

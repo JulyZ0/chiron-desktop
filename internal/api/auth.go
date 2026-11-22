@@ -479,6 +479,10 @@ func (h *AuthHandler) Profile(w http.ResponseWriter, r *http.Request) {
 	if display == "" {
 		display = name
 	}
+	authMethod := "session"
+	if claims.APIKey {
+		authMethod = "api_key"
+	}
 	OK(w, map[string]interface{}{
 		"user_id":              claims.UserID,
 		"email":                claims.Email,
@@ -487,6 +491,7 @@ func (h *AuthHandler) Profile(w http.ResponseWriter, r *http.Request) {
 		"nickname":             display,
 		"role":                 claims.Role,
 		"perms":                claims.Perms,
+		"auth_method":          authMethod,
 		"status":               userStatus(status),
 		"must_change_password": mustChange,
 		"password_set":         passwordSet,

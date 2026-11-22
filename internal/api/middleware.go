@@ -451,6 +451,7 @@ func AuthMiddleware(a *auth.Authenticator) func(http.Handler) http.Handler {
 							Role:     role,
 							TenantID: parseTenantID(tenantID),
 							Perms:    auth.APIKeyPermissions(role),
+							APIKey:   true,
 						}
 						ctx := auth.WithClaims(r.Context(), claims)
 						markAPIKeyUsed(keyID)

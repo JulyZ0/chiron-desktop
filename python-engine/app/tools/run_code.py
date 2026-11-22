@@ -230,13 +230,13 @@ class _RestrictedWorkerIO:
 
     @property
     def returncode(self) -> int | None:
-        return self._session.returncode
+        return cast(int | None, self._session.returncode)
 
     def kill(self) -> None:
         self._session.kill()
 
     def wait(self, timeout: float | None = None) -> int:
-        return self._session.wait_sync(timeout)
+        return cast(int, self._session.wait_sync(timeout))
 
 
 def _start_restricted_worker(cmd: list[str]) -> Any | None:
@@ -320,6 +320,9 @@ def _run_subprocess_sync(
         except Exception as e:  # noqa: BLE001 — 任何启动异常都降级
             logger.warning("subprocess start unexpected error, will fallback: %s", e)
             return None
+
+    # stdin 必须是管道：所有分支要么已显式 assert，要么这里是统一收窄点。
+    assert proc.stdin is not None
 
     # Windows：把子进程挂进 Job Object —— 内存/CPU 上限 + 退出即杀光子孙进程。
     # 必须持有 job 引用到进程结束（handle 一关 KILL_ON_JOB_CLOSE 立刻生效）。

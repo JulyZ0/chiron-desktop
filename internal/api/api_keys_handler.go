@@ -168,6 +168,18 @@ func (h *APIKeyHandler) RegisterRoutes(mux *http.ServeMux, authMW, rlMW routeMid
 	mux.Handle("DELETE /v1/api-keys/{id}", authMW(rlMW(http.HandlerFunc(h.Revoke))))
 }
 
+// rejectAPIKeyManagement 拒绝"用 API Key 管理 API Key"。
+//
+// 长期凭据一旦泄漏，若还能再签发新 key，撤销就被拖成一条追不清的派生链；
+// 管理凭据本身必须重新走交互式登录（密码 / SSO）。
+func rejectAPIKeyManagement(w http.ResponseWriter, claims *auth.Claims) bool {
+	if claims != nil && claims.APIKey {
+		Forbidden(w, "api key management requires interactive login")
+		return true
+	}
+	return false
+}
+
 // ── 纯函数（可直接单测）──
 
 // generateAPIKey 生成一对（明文, sha256 hex）。
@@ -246,6 +258,9 @@ func (h *APIKeyHandler) Create(w http.ResponseWriter, r *http.Request) {
 	claims := auth.GetClaims(r.Context())
 	if claims == nil {
 		Unauthorized(w, ErrAuthRequired)
+		return
+	}
+	if rejectAPIKeyManagement(w, claims) {
 		return
 	}
 
@@ -332,6 +347,9 @@ func (h *APIKeyHandler) Revoke(w http.ResponseWriter, r *http.Request) {
 	claims := auth.GetClaims(r.Context())
 	if claims == nil {
 		Unauthorized(w, ErrAuthRequired)
+		return
+	}
+	if rejectAPIKeyManagement(w, claims) {
 		return
 	}
 

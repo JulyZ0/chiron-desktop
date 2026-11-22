@@ -366,10 +366,8 @@ def _run_git(
     """跑一条 git 命令，返回原始 bytes（不解码 —— 文件名与二进制内容都要保真）。"""
     exe = git_bin()
     cmd = [exe, "-C", str(root), *args]
-    kwargs: dict[str, object] = {}
-    if os.name == "nt":
-        # 后台打包运行时不能弹黑框。
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # 后台打包运行时不能弹黑框；非 Windows 传 0 等价于不设。
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
         return subprocess.run(
             cmd,
@@ -377,8 +375,8 @@ def _run_git(
             input=stdin,
             env=dict(env) if env is not None else _git_env(),
             timeout=timeout,
+            creationflags=creationflags,
             check=False,
-            **kwargs,
         )
     except FileNotFoundError as exc:
         # ``subprocess`` 的原始异常是 ``[WinError 2] 系统找不到指定的文件``：

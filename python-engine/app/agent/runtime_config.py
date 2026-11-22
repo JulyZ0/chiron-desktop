@@ -99,8 +99,10 @@ def _coerce_bool(raw: object) -> bool | None:
 
 
 def _coerce_int(raw: object, *, lo: int, hi: int) -> int | None:
+    if not isinstance(raw, (str, int, float)):
+        return None
     try:
-        value = int(raw)  # type: ignore[arg-type]
+        value = int(raw)
     except (TypeError, ValueError):
         return None
     if value < lo or value > hi:

@@ -55,7 +55,7 @@ const emit = defineEmits<{
   (e: 'binding-changed'): void
 }>()
 
-const { t, locale } = useI18n()
+const { t } = useI18n()
 
 const loading = ref(false)
 const projects = ref<ProjectSummary[]>([])
@@ -306,14 +306,18 @@ defineExpose({ refresh })
               class="proj-act"
               :title="tr('chat.projects_open_canvas')"
               @click.stop="emit('open-canvas', p.id)"
-            >{{ tr('common.map') }}</Button>
+            >
+              {{ tr('common.map') }}
+            </Button>
             <Button
               type="text"
               size="small"
               class="proj-act is-danger"
               :title="tr('chat.projects_delete')"
               @click.stop="removeProject(p)"
-            >{{ tr('common.delete') }}</Button>
+            >
+              {{ tr('common.delete') }}
+            </Button>
           </div>
 
           <div
@@ -349,7 +353,9 @@ defineExpose({ refresh })
                 class="proj-act"
                 :title="tr('chat.projects_unbind')"
                 @click.stop="removeFromProject(p.id, s.id)"
-              >{{ tr('chat.projects_unbind_short') }}</Button>
+              >
+                {{ tr('chat.projects_unbind_short') }}
+              </Button>
             </div>
             <Button
               type="link"
@@ -403,7 +409,9 @@ defineExpose({ refresh })
                   v-for="p in projects"
                   :key="p.id"
                   :value="p.id"
-                >{{ p.name }}</option>
+                >
+                  {{ p.name }}
+                </option>
               </select>
             </div>
           </div>

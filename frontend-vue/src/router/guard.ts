@@ -86,9 +86,14 @@ export async function authGuard(
   }
 
   // 首登/重置后强制改密：除改密页与个人信息页外一律拦回改密页。
-  // 后端 AuthMiddleware 同样会拦 API（403 password_change_required），这里只是
-  // 让用户看到可操作的一屏，而不是一堆失败的请求。
-  if (auth.mustChangePassword && to.path !== '/change-password' && to.path !== '/profile') {
+  // **公开页例外**：分享落地页是匿名访客看的，与登录用户的改密状态无关；
+  // 把它也拦走会让"已登录但待改密"的访客打开分享链接时看到改密页。
+  if (
+    !to.meta.public &&
+    auth.mustChangePassword &&
+    to.path !== '/change-password' &&
+    to.path !== '/profile'
+  ) {
     next('/change-password')
     return
   }
@@ -108,7 +113,9 @@ export async function authGuard(
     const role = auth.user?.role
     // 开发环境绕过：无登录态时 role 恒为 undefined，admin 页会一律被弹回首页。
     // 该函数在生产构建里恒为 false（编译期 DCE），不构成线上后门。
-    if (role !== 'admin' && role !== 'owner' && !isDevAuthBypassEnabled()) {
+    // API Key 会话：后端已剔除全部管理权限（auth.APIKeyPermissions），
+    // 界面不能再按角色放行 —— 否则用户点进去只会连吃 403。
+    if (auth.isApiKeySession || (role !== 'admin' && role !== 'owner' && !isDevAuthBypassEnabled())) {
       next('/')
       return
     }
@@ -116,6 +123,9 @@ export async function authGuard(
 
   // 首次运行引导（P1-10）：有登录、当前没有任何可用模型、且本账号还没走完引导时，
   // 把**两个主入口**（"/" 与 "/chat"）的首次进入重定向到 /welcome。
+  //
+  // API Key 会话不走引导：它会把人送去 /models 配模型，而那条路由要求交互式登录 ——
+  // 结果是在 /welcome 与 /models/首页之间来回弹。
   //
   // 三个"不打扰"的边界（判定细节见 api/welcomeStatus.ts:shouldAutoEnterWelcome）：
   //   · 已有模型 → 不跳：能对话就说明不需要这一步；
@@ -125,7 +135,7 @@ export async function authGuard(
   // 只拦 entry paths 而非全部 requiresAuth 路由：/models、/knowledge、/admin/* 是
   // 用户在引导里被"去配置"送去的目标页，拦它们会形成"点去配置→弹回引导"的死循环。
   // 位置放在 requiresAdmin 之后：非管理员访问 admin 页应先被弹回首页，而不是被引导截走。
-  if (auth.user && WELCOME_ENTRY_PATHS.includes(to.path)) {
+  if (auth.user && !auth.isApiKeySession && WELCOME_ENTRY_PATHS.includes(to.path)) {
     try {
       if (await shouldAutoEnterWelcome(auth.user.id)) {
         next('/welcome')

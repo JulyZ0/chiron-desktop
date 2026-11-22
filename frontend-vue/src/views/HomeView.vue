@@ -17,7 +17,7 @@
 import { computed, markRaw, onMounted, ref } from 'vue'
 import type { Component } from 'vue'
 import { useRouter } from 'vue-router'
-import { Button, Drawer, Input } from 'ant-design-vue'
+import { Button, Drawer, Input, message } from 'ant-design-vue'
 import {
   MessageOutlined, UserOutlined, HistoryOutlined, BlockOutlined,
   BookOutlined, ThunderboltOutlined, ArrowRightOutlined, SafetyCertificateOutlined,
@@ -78,12 +78,22 @@ function fillPrompt(text: string) {
 async function runQuickCommand() {
   const command = quickInput.value.trim()
   if (!command || quickRunning.value) return
+  if (!auth.isAuthenticated) {
+    message.warning(t('errors.auth_required'))
+    return
+  }
   quickRunning.value = true
   try {
     await executeQuickCommand(command)
     quickInput.value = ''
-  } catch {
-    // 失败提示由 api 拦截器统一给出；保留输入内容让用户重试
+  } catch (error) {
+    // 引擎/网络失败必须当场给出提示：拦截器对 4xx 是静默的，
+    // 只保留输入内容会让用户以为"点了没反应"。
+    message.error(
+      error instanceof Error && error.message
+        ? error.message
+        : t('errors.request_failed'),
+    )
   } finally {
     quickRunning.value = false
   }
@@ -193,7 +203,7 @@ async function loadProjects() {
     const list = await listProjects()
     projects.value = list.slice(0, 6).map(p => ({
       id: p.id,
-      name: p.name || p.root_path.split(/[\/]/).filter(Boolean).pop() || p.id,
+      name: p.name || p.root_path.split('/').filter(Boolean).pop() || p.id,
       root_path: p.root_path,
       session_count: p.session_count,
     }))

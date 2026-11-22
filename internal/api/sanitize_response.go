@@ -23,6 +23,17 @@ var SensitiveFields = []string{
 	"access_key", "secret_key", "private_key", "api_key",
 }
 
+// sanitizeDeliveryFields 一次性交付凭据字段：它们**天生就是给调用方看的**。
+//
+// `isSensitiveField` 是子串匹配，所以 `temporary_password` / `initial_password` 会被
+// `password` 连带命中并打成 `********` —— 管理后台「重置密码」「建号」拿到的凭据于是
+// 永远是星号，用户根本没法把密码交给成员。这里按**完整字段名**放行，不影响
+// `password_hash`、`password_confirmed` 等真正的敏感字段（它们不在此名单里）。
+var sanitizeDeliveryFields = map[string]struct{}{
+	"temporary_password": {},
+	"initial_password":   {},
+}
+
 // sanitizeSensitivePaths 需要脱敏的路径前缀白名单。
 // 只有匹配这些前缀的响应才会被全量缓冲和脱敏，其他路径零开销透传。
 var sanitizeSensitivePaths = []string{
@@ -105,6 +116,9 @@ func sanitizeMap(data interface{}) {
 	switch v := data.(type) {
 	case map[string]interface{}:
 		for key, val := range v {
+			if _, deliver := sanitizeDeliveryFields[strings.ToLower(key)]; deliver {
+				continue
+			}
 			if isSensitiveField(key) {
 				if str, ok := val.(string); ok && str != "" {
 					v[key] = "********"

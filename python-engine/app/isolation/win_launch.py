@@ -29,7 +29,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from app.isolation import win, win_token
 
@@ -126,6 +126,15 @@ class LaunchResult:
     @property
     def started(self) -> bool:
         return self.spawn_error == ""
+
+
+class _LaunchMeta(TypedDict):
+    """`LaunchResult` 的 P0-1 身份字段（组装启动结果时整组展开）。"""
+
+    token_target: str
+    token_user_sid: str
+    token_elevated: bool
+    degrade_reason: str
 
 
 @dataclass
@@ -434,29 +443,6 @@ def ensure_desktop(extra_user_sid: str = "") -> tuple[bool, str]:
     logger.warning("ensure_desktop: %s", _desktop_error)
     return False, _desktop_error
 
-    base = win_token.DESKTOP_NAME
-    candidates = [base, f"{base}-{os.getpid()}"]
-    errors: list[str] = []
-    first_error = ""
-    for name in candidates:
-        handle, err = _create_or_open_desktop(name, sddl)
-        if handle:
-            _desktop_handle = handle
-            _desktop_name = name
-            if first_error:
-                logger.warning(
-                    "独立桌面 %s 不可用（%s），改用 %s", base, first_error, name
-                )
-            logger.info("独立桌面已就绪: %s", name)
-            return True, ""
-        errors.append(err)
-        if not first_error:
-            first_error = err
-
-    _desktop_error = "；".join(errors)
-    logger.warning("ensure_desktop: %s", _desktop_error)
-    return False, _desktop_error
-
 
 def desktop_name() -> str:
     """当前**实际**使用的桌面名（多实例时可能带 pid 后缀）。"""
@@ -583,9 +569,10 @@ def _via_helper(
     client = _helper_client()
     if client is None:
         return None
-    return client.helper_exec(
+    result = client.helper_exec(
         argv, cwd=cwd, env=env, timeout=timeout, max_output=max_output
     )
+    return cast(LaunchResult | None, result)
 
 
 def helper_available() -> tuple[bool, str]:
@@ -594,7 +581,7 @@ def helper_available() -> tuple[bool, str]:
     if client is None:
         return False, "helper 客户端不可用"
     try:
-        return client.available()
+        return cast(tuple[bool, str], client.available())
     except Exception as exc:  # noqa: BLE001 — 探测异常按"不可用"（fail-closed）
         return False, f"helper 探测异常: {type(exc).__name__}: {exc}"
 
@@ -787,7 +774,7 @@ def _launch_restricted_local(
         return LaunchResult(None, "", "", terr, degrade_reason=target.reason)
     token = target.token
     # 启动前的"身份打算"。进程起来之后会用子进程令牌的**实测值**覆盖（见下）。
-    meta = {
+    meta: _LaunchMeta = {
         "token_target": target.source,
         "token_user_sid": target.user_sid,
         "token_elevated": target.elevated,

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { copyTextOrThrow } from '../utils/clipboard'
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import MarkdownIt from 'markdown-it'
 import type { Token } from 'markdown-it'
@@ -33,6 +33,59 @@ const passwordRequired = ref(false)
 const password = ref('')
 const passwordError = ref('')
 const passwordSubmitting = ref(false)
+
+/**
+ * 访客侧的显示选项：只影响本页渲染，不改分享数据、也不写服务端。
+ *
+ * 为什么放在前端：分享链接是匿名只读页面，创建者无法预先知道访客的屏幕与偏好；
+ * 让访客自己调主题/版心/字号，比在创建时锁死一套排版更实用。选择存 localStorage，
+ * 同一浏览器下次打开保持。
+ */
+type ShareTheme = 'auto' | 'light' | 'dark'
+type ShareWidth = 'narrow' | 'wide'
+type ShareFont = 'small' | 'medium' | 'large'
+
+const DISPLAY_STORAGE_KEY = 'chiron.share.display'
+const display = ref<{ theme: ShareTheme; width: ShareWidth; font: ShareFont }>({
+  theme: 'auto',
+  width: 'narrow',
+  font: 'medium',
+})
+
+try {
+  const raw = localStorage.getItem(DISPLAY_STORAGE_KEY)
+  if (raw) {
+    const saved = JSON.parse(raw) as Partial<typeof display.value>
+    if (saved.theme === 'auto' || saved.theme === 'light' || saved.theme === 'dark') display.value.theme = saved.theme
+    if (saved.width === 'narrow' || saved.width === 'wide') display.value.width = saved.width
+    if (saved.font === 'small' || saved.font === 'medium' || saved.font === 'large') display.value.font = saved.font
+  }
+} catch {
+  /* 隐私模式 / 损坏的 JSON：用默认值，不影响阅读 */
+}
+
+watch(display, value => {
+  try {
+    localStorage.setItem(DISPLAY_STORAGE_KEY, JSON.stringify(value))
+  } catch {
+    /* 存不了只是下次要重选，不值得打断阅读 */
+  }
+}, { deep: true })
+
+const themeChoices = [
+  { value: 'auto', label: 'common.share_display_auto' },
+  { value: 'light', label: 'common.share_display_light' },
+  { value: 'dark', label: 'common.share_display_dark' },
+] as const
+const widthChoices = [
+  { value: 'narrow', label: 'common.share_display_narrow' },
+  { value: 'wide', label: 'common.share_display_wide' },
+] as const
+const fontChoices = [
+  { value: 'small', label: 'common.share_display_small' },
+  { value: 'medium', label: 'common.share_display_medium' },
+  { value: 'large', label: 'common.share_display_large' },
+] as const
 
 /**
  * 请求硬超时（与 `getPublicShare` 内部的 axios timeout 同一量级）。
@@ -212,11 +265,69 @@ function formatDate(iso: string): string {
 </script>
 
 <template>
-  <div class="share-page">
+  <div
+    class="share-page"
+    :data-theme="display.theme"
+    :data-width="display.width"
+    :data-font="display.font"
+  >
     <header class="share-header">
       <div class="share-brand">
         <span class="share-brand-mark">MC</span>
         <span>{{ $t('chat.chiron_conversation_share') }}</span>
+      </div>
+      <div class="share-display">
+        <div
+          class="share-display-group"
+          role="group"
+          :aria-label="$t('common.share_display_theme')"
+        >
+          <span class="share-display-label">{{ $t('common.share_display_theme') }}</span>
+          <button
+            v-for="opt in themeChoices"
+            :key="opt.value"
+            type="button"
+            :class="{ active: display.theme === opt.value }"
+            :aria-pressed="display.theme === opt.value"
+            @click="display.theme = opt.value"
+          >
+            {{ $t(opt.label) }}
+          </button>
+        </div>
+        <div
+          class="share-display-group"
+          role="group"
+          :aria-label="$t('common.share_display_width')"
+        >
+          <span class="share-display-label">{{ $t('common.share_display_width') }}</span>
+          <button
+            v-for="opt in widthChoices"
+            :key="opt.value"
+            type="button"
+            :class="{ active: display.width === opt.value }"
+            :aria-pressed="display.width === opt.value"
+            @click="display.width = opt.value"
+          >
+            {{ $t(opt.label) }}
+          </button>
+        </div>
+        <div
+          class="share-display-group"
+          role="group"
+          :aria-label="$t('common.share_display_font')"
+        >
+          <span class="share-display-label">{{ $t('common.share_display_font') }}</span>
+          <button
+            v-for="opt in fontChoices"
+            :key="opt.value"
+            type="button"
+            :class="{ active: display.font === opt.value }"
+            :aria-pressed="display.font === opt.value"
+            @click="display.font = opt.value"
+          >
+            {{ $t(opt.label) }}
+          </button>
+        </div>
       </div>
     </header>
 
@@ -342,7 +453,36 @@ function formatDate(iso: string): string {
 
 <style scoped>
 .share-page { min-height: var(--app-height); display: flex; flex-direction: column; background: var(--bg-page); color: var(--text-primary); }
-.share-header { height: 52px; display: flex; align-items: center; padding: 0 24px; border-bottom: var(--hairline-width) solid var(--border); background: var(--bg-card); }
+/* 访客侧显示选项：覆盖应用主题变量，只作用于本页 */
+.share-page[data-theme="light"] {
+  color-scheme: light;
+  --bg-page: #ffffff; --bg-card: #ffffff; --bg-secondary: #f6f8fa; --bg-hover: #eef1f4; --bg-code: #f6f8fa;
+  --text-primary: #1f2328; --text-secondary: #424a53; --text-tertiary: #6e7781; --text-muted: #6e7781;
+  --border: #d0d7de; --bubble-user: #0969da; --bubble-user-text: #ffffff;
+}
+.share-page[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-page: #0d1117; --bg-card: #161b22; --bg-secondary: #21262d; --bg-hover: #21262d; --bg-code: #0d1117;
+  --text-primary: #e6edf3; --text-secondary: #c9d1d9; --text-tertiary: #8b949e; --text-muted: #8b949e;
+  --border: #30363d; --bubble-user: #1f6feb; --bubble-user-text: #ffffff;
+}
+.share-page[data-width="wide"] .share-main { max-width: 1080px; }
+.share-page[data-font="small"] .share-msg-text { font-size: 15px; line-height: 25px; }
+.share-page[data-font="small"] .share-msg.user .share-msg-bubble { font-size: 14px; line-height: 22px; }
+.share-page[data-font="large"] .share-msg-text { font-size: 18px; line-height: 31px; }
+.share-page[data-font="large"] .share-msg.user .share-msg-bubble { font-size: 17px; line-height: 26px; }
+.share-header { height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 24px; border-bottom: var(--hairline-width) solid var(--border); background: var(--bg-card); }
+.share-display { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.share-display-group { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: var(--hairline-width) solid var(--border); border-radius: var(--radius-md); background: var(--bg-page); }
+.share-display-label { padding: 0 4px; font-size: 12px; color: var(--text-tertiary); }
+.share-display button {
+  min-height: 28px; padding: 4px 8px; cursor: pointer;
+  font-family: inherit; font-size: 12px; color: var(--text-secondary);
+  background: transparent; border: none; border-radius: calc(var(--radius-md) - 2px);
+}
+.share-display button:hover { background: var(--bg-hover); }
+.share-display button.active { background: var(--primary); color: var(--on-solid); }
+.share-display button:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 .share-brand { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); }
 .share-brand-mark { width: 22px; height: 22px; border-radius: var(--radius-md); background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: var(--on-solid); font-weight: var(--fw-bold); font-size: var(--fs-xs); display: inline-flex; align-items: center; justify-content: center; }
 .share-main { flex: 1; width: 100%; max-width: 748px; margin: 0 auto; padding: 32px 24px 60px; min-width: 0; }
@@ -417,7 +557,9 @@ function formatDate(iso: string): string {
 
 /* 移动端：小屏收紧 padding 和字号 */
 @media (max-width: 640px) {
-  .share-header { height: 48px; padding: 0 16px; }
+  .share-header { height: auto; min-height: 48px; padding: 8px 16px; flex-wrap: wrap; }
+  .share-display { justify-content: flex-start; }
+  .share-display-label { display: none; }
   .share-main { padding: 20px 16px 40px; }
   .share-title { font-size: 18px; line-height: 26px; }
   .share-msg.user .share-msg-bubble { font-size: 14px; line-height: 22px; padding: 8px 12px; }

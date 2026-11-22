@@ -1206,3 +1206,67 @@ export async function testKnowledgeService(serviceUrl: string): Promise<{
   const { data } = await api.post('/v1/admin/knowledge/test', { service_url: serviceUrl })
   return data?.data
 }
+
+// ── Audit logs（操作审计：分页查询 + CSV 导出）──
+
+export interface AuditLogRow {
+  id: string
+  user_id?: string
+  action?: string
+  resource_type?: string
+  resource_id?: string
+  details?: unknown
+  ip_address?: string
+  created_at?: string
+}
+
+export interface AuditLogQuery {
+  page?: number
+  per_page?: number
+  action?: string
+  user_id?: string
+  resource_type?: string
+  from?: string
+  to?: string
+}
+
+export interface AuditLogPage {
+  items: AuditLogRow[]
+  total: number
+  page: number
+  per_page: number
+}
+
+export async function listAuditLogs(query: AuditLogQuery = {}): Promise<AuditLogPage> {
+  const { data } = await api.get('/v1/admin/audit-logs', { params: query })
+  return data?.data
+}
+
+export async function downloadAuditLogs(query: AuditLogQuery = {}): Promise<void> {
+  const res = await api.get('/v1/admin/audit-logs/export.csv', {
+    params: query,
+    responseType: 'blob',
+  })
+  const blob = new Blob([res.data], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = 'chiron-audit.csv'
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// ── Invite link（一次性邀请链接，24h 有效）──
+
+export interface AdminUserInvite {
+  invite_url: string
+  token: string
+  expires_at: string
+}
+
+export async function createAdminUserInvite(id: string): Promise<AdminUserInvite> {
+  const { data } = await api.post(`/v1/admin/users/${encodeURIComponent(id)}/invite`)
+  return data?.data
+}

@@ -773,9 +773,9 @@ class UnifiedChatHandler:
             for item in merged:
                 kb_id = str(item.get("kb_id") or "")
                 title = str(item.get("kb_name") or kb_id)
-                for name, lines in sections:
+                for name, group_lines in sections:
                     if name == title:
-                        lines.append(str(item.get("text") or ""))
+                        group_lines.append(str(item.get("text") or ""))
                         break
                 else:
                     sections.append((title, [str(item.get("text") or "")]))
@@ -788,9 +788,9 @@ class UnifiedChatHandler:
             block = "【知识库引用】\n" + "\n".join(lines)
 
             for item in merged:
-                cite = item.get("citation")
-                if isinstance(cite, dict):
-                    citations_out.append(cite)
+                citation = item.get("citation")
+                if isinstance(citation, dict):
+                    citations_out.append(citation)
             return block, total_hits, citations_out
 
         except Exception as e:  # noqa: BLE001 — 检索失败不阻断主任务

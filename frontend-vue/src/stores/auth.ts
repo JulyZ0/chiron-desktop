@@ -21,6 +21,8 @@ export interface User {
   must_change_password?: boolean
   /** 用户设置（换肤、朗读音色等）。由 GET /v1/auth/profile 下发、PUT 局部合并。 */
   settings?: Record<string, unknown>
+  /** 权限清单（profile 下发）。API Key 会话只有剔除管理面后的业务权限。 */
+  perms?: string[]
 }
 
 // S 安全修复：仅持久化最小必要字段（id, role, name），不含 email/tenant_id 等敏感信息
@@ -55,6 +57,29 @@ function persistUserToStorage(u: User | null) {
   }
 }
 
+/** 本次会话的凭据形态：交互式登录 vs API Key。界面据此收起管理面。 */
+export type AuthMethod = 'session' | 'api_key'
+
+const AUTH_METHOD_KEY = 'chiron.auth_method'
+
+function loadAuthMethod(): AuthMethod | null {
+  try {
+    const raw = localStorage.getItem(AUTH_METHOD_KEY)
+    return raw === 'api_key' || raw === 'session' ? raw : null
+  } catch {
+    return null
+  }
+}
+
+function persistAuthMethod(method: AuthMethod | null) {
+  try {
+    if (method) localStorage.setItem(AUTH_METHOD_KEY, method)
+    else localStorage.removeItem(AUTH_METHOD_KEY)
+  } catch {
+    /* 存不了只影响刷新后的界面收敛，不影响本次会话 */
+  }
+}
+
 export const useAuthStore = defineStore('auth', () => {
   /**
    * 运行模式：本地模式没有登录流程（本地后端的第一批只给一个固定的本地用户），
@@ -64,6 +89,15 @@ export const useAuthStore = defineStore('auth', () => {
   const isLocalMode = () => device.mode === 'local'
 
   const user = ref<User | null>(loadUserFromStorage())
+  /** 凭据形态（session/api_key）；决定管理面是否可见 */
+  const authMethod = ref<AuthMethod | null>(loadAuthMethod())
+  /** API Key 会话：后端已剔除管理权限，界面也不应再给出那些入口 */
+  const isApiKeySession = computed(() => authMethod.value === 'api_key')
+
+  function setAuthMethod(method: AuthMethod | null) {
+    authMethod.value = method
+    persistAuthMethod(method)
+  }
   // S 安全：Web 端 token 不再持久化到 localStorage（XSS 偷不走），仅保留内存态；
   // 桌面端 file:// 跨站拿不到 SameSite=Lax cookie，必须持久化 token 走 Bearer。
   const token = ref<string>('')
@@ -143,7 +177,12 @@ export const useAuthStore = defineStore('auth', () => {
         // 没有 cookie 时静默失败，由路由守卫送去登录页 —— 这里绝不能弹"登录过期"。
         if (await bootstrapSession()) return
         const stored = await loadDesktopToken()
-        if (stored) applyToken(stored)
+        if (stored) {
+          applyToken(stored)
+          // 桌面端重启后从 safeStorage 恢复：`sk-` 前缀即 API Key 会话。
+          // 没有这个判定，界面会把一把受限凭据当成交互式登录，重新露出管理入口。
+          setAuthMethod(stored.startsWith('sk-') ? 'api_key' : 'session')
+        }
       })()
     }
     return tokenInit
@@ -174,6 +213,7 @@ export const useAuthStore = defineStore('auth', () => {
       const localToken = desktopDeviceToken() || d.token || ''
       if (!localToken) return false
       applyToken(localToken)
+      setAuthMethod('session')
       user.value = d.user
       persistUserToStorage(d.user)
       return true
@@ -245,7 +285,8 @@ export const useAuthStore = defineStore('auth', () => {
   // 开发环境绕过：没有登录态时 role 恒为 undefined，`/models`、审计等 admin 页
   // 会被守卫弹回首页。绕过标志位开启时视同 admin —— 它只在 DEV 构建里可能为 true。
   const isAdmin = computed(() =>
-    isDevAuthBypassEnabled() || user.value?.role === 'admin' || user.value?.role === 'owner',
+    !isApiKeySession.value &&
+    (isDevAuthBypassEnabled() || user.value?.role === 'admin' || user.value?.role === 'owner'),
   )
 
   /**
@@ -254,7 +295,7 @@ export const useAuthStore = defineStore('auth', () => {
    * tenant 判断就会让团队 owner 明明有权限却在界面上看不到自检。
    */
   const isPlatformOwner = computed(
-    () => isDevAuthBypassEnabled() || user.value?.role === 'owner',
+    () => !isApiKeySession.value && (isDevAuthBypassEnabled() || user.value?.role === 'owner'),
   )
 
   /** 登录：`identifier` 可以是邮箱或用户名（团队模式两者都支持）。 */
@@ -275,9 +316,47 @@ export const useAuthStore = defineStore('auth', () => {
       // Web 走 httpOnly cookie；桌面端 file:// 跨站拿不到 cookie，applyToken 同时
       // 把 token 交给请求层走 Bearer（仅桌面端持久化）。
       applyToken(d.token)
+      setAuthMethod('session')
       user.value = d.user
       persistUserToStorage(d.user)
       return d
+    } finally {
+      loading.value = false
+    }
+  }
+
+  /**
+   * API Key 登录（远程模式）。
+   *
+   * API Key 以 `Authorization: Bearer sk-...` 发出 —— Go 网关按前缀把它识别为
+   * API Key 通道（与 JWT 并列，见 internal/api/middleware.go）。这里先用 profile
+   * 验活，失败立刻清掉，避免把无效 key 持久化成"已登录"。
+   */
+  async function loginWithApiKey(rawKey: string) {
+    const key = rawKey.trim()
+    if (!key) throw new Error('api key is required')
+    loading.value = true
+    try {
+      applyToken(key)
+      const response = await api.get('/v1/auth/profile', { __silent: true })
+      const data = response.data?.data
+      if (!data || !data.user_id) throw new Error('invalid api key')
+      user.value = {
+        id: data.user_id,
+        email: data.email || '',
+        name: data.name || data.email || 'API Key',
+        role: data.role,
+        tenant_id: data.tenant_id || 0,
+        settings: data.settings,
+        perms: Array.isArray(data.perms) ? data.perms : undefined,
+      }
+      setAuthMethod('api_key')
+      persistUserToStorage(user.value)
+      return user.value
+    } catch (err) {
+      applyToken('')
+      setAuthMethod(null)
+      throw err
     } finally {
       loading.value = false
     }
@@ -332,7 +411,11 @@ export const useAuthStore = defineStore('auth', () => {
         role: data.role,
         tenant_id: data.tenant_id || 0,
         settings: data.settings,
+        perms: Array.isArray(data.perms) ? data.perms : undefined,
       }
+      // 以服务端为准：同一份 token 可能来自 API Key 或交互式登录，
+      // 前端不能只靠自己记忆的登录方式（刷新/恢复后尤其如此）。
+      setAuthMethod(data.auth_method === 'api_key' ? 'api_key' : 'session')
       persistUserToStorage(user.value)
       // 按服务端语言偏好对齐界面（仅在本机未显式选择过语言时生效）。
       // 服务端渲染的通知邮件只能读 users.settings.locale，这里同步是为了让
@@ -354,6 +437,7 @@ export const useAuthStore = defineStore('auth', () => {
       if (!d?.token) return false
       // 桌面端同样走 Bearer：SSO 回跳的 cookie 在 file:// 下也不会被带上
       applyToken(d.token)
+      setAuthMethod('session')
       user.value = d.user
       persistUserToStorage(d.user)
       return true
@@ -389,6 +473,7 @@ export const useAuthStore = defineStore('auth', () => {
   function applySession(t: string, u: User) {
     if (!t) throw new Error('invalid session: empty token')
     applyToken(t)
+    setAuthMethod('session')
     user.value = u
     persistUserToStorage(u)
   }
@@ -414,6 +499,7 @@ export const useAuthStore = defineStore('auth', () => {
       // 网络失败仍清理本地态
     }
     applyToken('')
+    setAuthMethod(null)
     user.value = null
     persistUserToStorage(null)
     // 私有数据（输入历史、会话缓存…）必须随登出清掉：localStorage 是浏览器级的，
@@ -447,9 +533,11 @@ export const useAuthStore = defineStore('auth', () => {
     isAuthenticated,
     isAdmin,
     isPlatformOwner,
+    isApiKeySession,
     initToken,
     ensureLocalSession,
     login,
+    loginWithApiKey,
     register,
     changePassword,
     mustChangePassword,

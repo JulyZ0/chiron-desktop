@@ -263,9 +263,14 @@ function pickDirectoryResult(result) {
  * 但只用一次 —— 云端模式下正常重开应用不该再被拦到配置页。
  */
 function resolveStartupWindow(options = {}) {
-  // 云端模式已废除：不再有「填服务地址」的分流，只剩本地后端就绪与否。
-  // apiUrl 入参保留但只用于兜底返回，实际地址由 localBackend.baseUrl 决定。
-  const { localBackend } = options
+  const { localBackend, mode, apiUrl, pendingApiUrl, forceSetup } = options
+  // 远程模式：地址缺失 / 刚切过来还没确认 / 主动进配置页 → 先给连接设置页。
+  // 其余情况直接进主界面，登录由前端路由守卫负责。
+  if (mode === 'cloud') {
+    const base = typeof apiUrl === 'string' ? apiUrl : ''
+    if (forceSetup || pendingApiUrl || !base) return { target: 'setup', apiUrl: base }
+    return { target: 'app', apiUrl: base }
+  }
   const backend = localBackend || {}
   // 本地后端没就绪：落到通用错误页并写清楚原因，而不是留给用户一个空白窗口
   if (backend.ok && backend.baseUrl) return { target: 'app', apiUrl: backend.baseUrl }

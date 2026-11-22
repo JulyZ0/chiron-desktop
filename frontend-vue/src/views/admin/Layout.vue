@@ -31,6 +31,7 @@ import {
   BookOutlined,
   ShareAltOutlined,
   ShopOutlined,
+  AuditOutlined,
   BarChartOutlined,
   IdcardOutlined,
   WalletOutlined,
@@ -117,6 +118,8 @@ const menuGroups = computed(() => [
       // 分享管理：会话公开链接的运营处置面（谁分享了什么、一键掐断）。
       // 与 API Key 同属"访问安全"——都决定"外面能拿到什么"。
       { key: '/admin/shares', label: t('admin.share_management'), icon: () => h(ShareAltOutlined) },
+      // 操作审计：谁在什么时候动了什么（只读追查面）。
+      { key: '/admin/audit', label: t('admin.operation_audit'), icon: () => h(AuditOutlined) },
     ],
   },
   {

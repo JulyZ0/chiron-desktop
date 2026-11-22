@@ -349,3 +349,12 @@ export function isValidEmail(email: string): boolean {
   const domain = e.slice(at + 1)
   return domain.includes('.') && !domain.startsWith('.') && !domain.endsWith('.') && !/\s/.test(e)
 }
+
+/** 接受邀请链接：用一次性 token 设置自己的密码（公开接口）。 */
+export async function acceptInvite(token: string, password: string): Promise<void> {
+  await api.post(
+    '/v1/auth/invite/accept',
+    { token, password },
+    { __silent: true },
+  )
+}

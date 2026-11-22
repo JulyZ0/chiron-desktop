@@ -742,16 +742,17 @@ def apply_resource_limits() -> None:
     超时兜底 —— 与 `app/plugins/plugin_runner.py` 的既有降级语义一致。施加失败同样
     只降级不阻断（记录到 stderr）。
     """
-    try:
-        import resource  # POSIX only
-    except ImportError:
-        return
-    try:
-        resource.setrlimit(resource.RLIMIT_AS, (MEM_LIMIT_BYTES, MEM_LIMIT_BYTES))
-        resource.setrlimit(resource.RLIMIT_CPU, (CPU_LIMIT_SECONDS, CPU_LIMIT_SECONDS))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (FILE_LIMIT_BYTES, FILE_LIMIT_BYTES))
-    except (ValueError, OSError) as exc:  # pragma: no cover - 平台相关
-        sys.stderr.write(f"[sandbox] setrlimit failed (relaxed): {exc}\n")
+    if sys.platform != "win32":
+        try:
+            import resource  # POSIX only
+        except ImportError:
+            return
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (MEM_LIMIT_BYTES, MEM_LIMIT_BYTES))
+            resource.setrlimit(resource.RLIMIT_CPU, (CPU_LIMIT_SECONDS, CPU_LIMIT_SECONDS))
+            resource.setrlimit(resource.RLIMIT_FSIZE, (FILE_LIMIT_BYTES, FILE_LIMIT_BYTES))
+        except (ValueError, OSError) as exc:  # pragma: no cover - 平台相关
+            sys.stderr.write(f"[sandbox] setrlimit failed (relaxed): {exc}\n")
 
 
 def _rlimit_kwargs() -> dict[str, Any]:
@@ -1002,11 +1003,11 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
     stderr_text, stderr_truncated, stderr_log = offload_execute_output(
         stderr.decode("utf-8", errors="replace"), "stderr"
     )
-    payload: dict[str, Any] = {
+    result_payload: dict[str, Any] = {
         "exit_code": proc.returncode,
         "stdout": stdout_text,
         "stderr": stderr_text,
         "truncated": stdout_truncated or stderr_truncated,
     }
-    _attach_log_paths(payload, stdout_log, stderr_log)
-    return payload
+    _attach_log_paths(result_payload, stdout_log, stderr_log)
+    return result_payload

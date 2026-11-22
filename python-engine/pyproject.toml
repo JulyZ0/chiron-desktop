@@ -142,13 +142,11 @@ markers = [
 
 [tool.mypy]
 python_version = "3.11"
-# 生产与 CI 都是 Linux（见 .github/workflows/ci.yml 的 ubuntu-latest），本机 Windows 只是
-# 开发环境。显式声明 platform 才能让 Unix-only 的模块（如 app/tools/_sandbox_worker.py 里的
-# resource.setrlimit/RLIMIT_*）被正确解析 —— 否则在 Windows 上会误报 "Module has no attribute"。
-platform = "linux"
-# strict 已接线但**按域分批**：CI 的 `Mypy (strict)` step 目前只检查已清零的模块，
-# 完整清单见 .github/workflows/ci.yml 里 `Mypy (strict)` step 的 files 列表。
-# app/ 存量错误清零后改为 `mypy app/`。
+# 目标平台只有 Windows（桌面端随包运行在 win32；CI runner 用 ubuntu 只是执行环境）。
+# 显式声明 platform 让 ctypes.WinDLL / get_last_error 等 Windows-only API 被正确解析；
+# POSIX-only 的分支（如 resource.setrlimit）按平台不可达处理，不再当作 Linux 代码检查。
+platform = "win32"
+# 全量门禁：mypy app/ acp_adapter/ 必须为 0（零 type: ignore、零新增豁免）。
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -164,9 +162,16 @@ warn_unused_configs = true
 module = ["asyncpg", "boto3.*", "botocore.*", "docx", "fitz", "jsonschema", "langchain.*", "markitdown", "openpyxl", "opentelemetry.*", "pdfplumber", "psutil", "pymilvus", "sentence_transformers", "unstructured.*", "uvicorn"]
 ignore_missing_imports = true
 
+# jsonschema 已在上面的 ignore_missing_imports 里，但发行版不带 py.typed：
+# 子模块（jsonschema.exceptions）按 import 检查时仍会报 import-untyped。
+# import-untyped 由**引用方**报告，所以落在调用文件的 override 上；不为它引入 types-jsonschema。
+[[tool.mypy.overrides]]
+module = ["app.tools.arg_validation"]
+disable_error_code = ["import-untyped"]
+
 # pymupdf **自带** py.typed（与上面那些不同），但 pymupdf.open / Document 等仍缺注解 ——
 # strict 的 disallow_untyped_calls 由**调用方**判定，因此豁免要落在调用它的文件上。
 # 这是 pymupdf 自身的标注缺口，不是本仓库代码的问题；该文件其余检查项照常。
 [[tool.mypy.overrides]]
-module = ["app.rag.parser", "app.main", "app.tools.media", "app.media.attachments"]
+module = ["app.rag.parser", "app.main", "app.tools.media", "app.media.attachments", "app.api.knowledge"]
 disallow_untyped_calls = false

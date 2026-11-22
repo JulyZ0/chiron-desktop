@@ -379,5 +379,5 @@ jobs:
           tag_name: ${{ github.ref_name }}
           body_path: changelog.md
           generate_release_notes: false # 用我们自己的说明，不要 GitHub 的 PR 摘要
-          draft: true # 先存为草稿，人工确认签名状况后再公开
+          draft: true # 先存为草稿；确认签名状况后执行 scripts/publish_release.py <tag> --yes 公开
           files: artifacts/**/*

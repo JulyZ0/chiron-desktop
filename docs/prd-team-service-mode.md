@@ -3,7 +3,7 @@
 - 状态：草案（待评审）
 - 目标版本：v0.x（服务模式首个可用版本）
 - 关联代码：`internal/api/routes_auth.go`、`internal/api/auth.go`、`internal/api/admin.go`、`internal/api/tenant.go`、`internal/auth/*`、`config/config.go`
-- 前置文档：`docs/db-migration-entry.md`
+- 前置文档：`docs/CONTRIBUTING.md` 的「数据库迁移」小节（`alembic upgrade head` 即迁移入口）
 
 ---
 

@@ -972,6 +972,23 @@ function pickFreePort() {
   })
 }
 
+/** 指定端口当前是否可绑定（用于复用上次的端口，让局域网地址保持稳定） */
+function isPortAvailable(port) {
+  return new Promise((resolve) => {
+    const candidate = Number(port)
+    if (!Number.isInteger(candidate) || candidate <= 0 || candidate > 65535) {
+      resolve(false)
+      return
+    }
+    const server = net.createServer()
+    server.unref()
+    server.once('error', () => resolve(false))
+    server.listen(candidate, '127.0.0.1', () => {
+      server.close(() => resolve(true))
+    })
+  })
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -1012,6 +1029,7 @@ module.exports = {
   isPortConflict: DEFAULTS.isPortConflict,
   killProcessTree,
   pickFreePort,
+  isPortAvailable,
   componentsRoot,
   componentDir,
   coreBinaryPath,

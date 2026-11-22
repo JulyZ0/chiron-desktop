@@ -1175,7 +1175,7 @@ def _apply_folds(
     # 校验 1：坐标完备。缺失时用 `covered_ids` 重建（D8），重建不了才放弃。
     if any(m.get("seq") is None for m in rest):
         rebuilt_rest, rebuilt_folds = _relabel_by_ids(rest, folds)
-        if rebuilt_rest is None:
+        if rebuilt_rest is None or rebuilt_folds is None:
             return None
         rest, folds = rebuilt_rest, rebuilt_folds
 

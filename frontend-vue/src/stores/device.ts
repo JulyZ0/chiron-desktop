@@ -48,7 +48,9 @@ export interface ChironDesktopHost {
   setMode?: (mode: ChironMode, opts?: { deleteLocalData?: boolean }) => Promise<void>
   restart?: () => Promise<void>
   /** 打开主进程的连接配置页（改服务地址）；老外壳没有这个成员 */
-  openSetup?: () => Promise<unknown>  /**
+  openSetup?: () => Promise<unknown>
+  /** 探测服务地址（主进程打 /health）；失败时 reject 可读 message */
+  testApiUrl?: (url: string) => Promise<unknown>  /**
    * 当前 OS 账户的 `DOMAIN\username`。
    *
    * 本地模式下它就是"应用用户"：一个 OS 账户 = 一个应用用户，数据目录由
@@ -481,8 +483,10 @@ export function resolveDeviceMode(): ChironMode {
   if (host && isChironMode(host.mode)) return host.mode
   const mirrored = readMirroredMode()
   if (mirrored) return mirrored
-  // 云端模式已废除：既不从 argv 拿到模式、也没有镜像时，应用只可能是本地形态。
-  // 曾经这里用「有 apiUrl 就当 cloud」兜底，那在只剩本地的版本里必然误判。
+  // 旧外壳没有 mode 字段时：已配置服务地址按远程模式（保持既有行为），
+  // 全新安装（无地址）按本地模式。
+  const legacyApiUrl = String((host as { apiUrl?: string } | null)?.apiUrl || '').trim()
+  if (legacyApiUrl) return 'cloud'
   return 'local'
 }
 
@@ -638,6 +642,15 @@ export const useDeviceStore = defineStore('device', () => {
     if (!host || !host.openSetup) return false
     await host.openSetup()
     return true
+  }
+
+  /** 测试服务地址连通性（远程模式设置页用）；不支持的外壳直接抛错 */
+  async function testServerUrl(url: string): Promise<void> {
+    const host = desktopHost()
+    if (!host || typeof host.testApiUrl !== 'function') {
+      throw new Error('desktop shell does not expose testApiUrl')
+    }
+    await host.testApiUrl(url)
   }
 
   /**
@@ -983,6 +996,7 @@ export const useDeviceStore = defineStore('device', () => {
     disableTwoFactor,
     regenerateRecoveryCodes,
     openConnectionSetup,
+    testServerUrl,
     restartLocalBackend,
     restartComponent,
     loadEngineEnvSettings,

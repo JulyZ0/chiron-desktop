@@ -525,6 +525,7 @@ class SkillStore:
         if not updates:
             return skill
 
+        carrier: Path | None = None
         if skill.scope != SCOPE_BUILTIN and skill.source_dir:
             carrier = Path(skill.source_dir) / META_FILE
             try:

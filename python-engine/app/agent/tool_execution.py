@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
 from app.agent.runtime_types import AgentEvent, AgentTask
 from app.tools.context import to_tenant_int
@@ -412,7 +412,7 @@ async def dispatch_tool(runtime: Any, tool_call: dict[Any, Any], task: AgentTask
     turn_span = str(get_tool_context("span_id", "") or "")
     tool_span = f"{turn_span}:tool:{call_id}" if turn_span else ""
     with tool_call_scope(call_id, span_id=tool_span):
-        return await runtime._dispatch_tool_inner(tool_call, task)
+        return cast(dict[Any, Any], await runtime._dispatch_tool_inner(tool_call, task))
 
 
 async def dispatch_tool_inner(runtime: Any, tool_call: dict[Any, Any], task: AgentTask) -> dict[Any, Any]:

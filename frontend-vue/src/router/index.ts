@@ -224,6 +224,13 @@ const routes = [
         meta: { title: t('admin.userAdmin.page_title') },
       },
       {
+        // 操作审计：按租户分页查询 + 过滤 + CSV 导出（只读）。
+        path: 'audit',
+        name: 'AdminAudit',
+        component: () => import('../views/admin/AuditView.vue'),
+        meta: { title: t('admin.operation_audit') },
+      },
+      {
         // 人格管理：原用户设置里的「行为塑形」搬到后台，支持多人格与对话内选择。
         path: 'personas',
         name: 'AdminPersonas',

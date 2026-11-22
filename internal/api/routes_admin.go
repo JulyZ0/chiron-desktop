@@ -33,6 +33,8 @@ func registerAdminRoutes(
 	platformReadMW := RequirePlatformOwner(auth.PermAdminRead)
 	platformWriteMW := RequirePlatformOwner(auth.PermAdminWrite)
 	usersManageMW := RequirePermission(auth.PermUsersManage)
+	// 审计读：owner 与租户 admin 都有 `audit:read`；API Key 会话已被剔除该权限。
+	auditReadMW := RequirePermission(auth.PermAuditRead)
 	adminMux := http.NewServeMux()
 	adminHandler.RegisterRoutes(adminMux)
 	// Strip the /v1/admin prefix so adminMux patterns (e.g. "GET /metrics") match correctly
@@ -46,12 +48,17 @@ func registerAdminRoutes(
 	mux.Handle("PUT /v1/admin/users/{id}", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("DELETE /v1/admin/users/{id}", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("POST /v1/admin/users/{id}/password/reset", authMW(rlMW(usersManageMW(adminStrip))))
+	// 邀请链接：与重置密码同一权限口径（不能给自己发、owner 保护照旧）。
+	mux.Handle("POST /v1/admin/users/{id}/invite", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("POST /v1/admin/users/{id}/disable", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("POST /v1/admin/users/{id}/enable", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("POST /v1/admin/users/{id}/force-logout", authMW(rlMW(usersManageMW(adminStrip))))
 	mux.Handle("GET /v1/admin/system", authMW(rlMW(adminReadMW(adminStrip))))
 	// D1：自诊断报告（只读）—— 权限口径与其它 admin 读端点一致。
 	mux.Handle("GET /v1/admin/diagnostics", authMW(rlMW(adminReadMW(adminStrip))))
+	// 操作审计（只读 + CSV 导出）：按租户收窄，管理台「访问安全 → 操作审计」使用。
+	mux.Handle("GET /v1/admin/audit-logs", authMW(rlMW(auditReadMW(adminStrip))))
+	mux.Handle("GET /v1/admin/audit-logs/export.csv", authMW(rlMW(auditReadMW(adminStrip))))
 	// P0-1：自诊断**聚合清单**。用 platformReadMW 而不是 adminReadMW：
 	// 它一次回全平台的 schema 版本、必需表、检查点健康（可能跨租户汇总）与引擎状态，
 	// 属平台级运行事实；租户 admin 的 `admin:read` 不该看到别家租户的检查点统计。

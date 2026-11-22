@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.agent.runtime_types import ApprovalDecision
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +132,7 @@ async def poll_remote_decision(
     timeout: float,
     user_id: str = "",
     interval: float = REMOTE_WAIT_POLL_INTERVAL_SECONDS,
-):
+) -> ApprovalDecision | None:
     """跨副本审批：等决策键出现并取走（hybrid 唤醒 + 兜底轮询，见 `take_key_with_wake`）。
 
     `user_id` 非空时校验决策载荷的归属：不匹配的载荷（他人写入同键或串键）一律丢弃

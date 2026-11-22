@@ -51,12 +51,15 @@ func NewAdminHandler(cfg *config.Config, a *auth.Authenticator, store *storage.A
 func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	// 原有端点
 	r.HandleFunc("GET /metrics", h.Metrics)
+	r.HandleFunc("GET /audit-logs", h.ListAuditLogs)
+	r.HandleFunc("GET /audit-logs/export.csv", h.ExportAuditLogs)
 	r.HandleFunc("GET /users", h.ListUsers)
 	r.HandleFunc("POST /users", h.CreateUser)
 	r.HandleFunc("GET /users/{id}", h.GetUser)
 	r.HandleFunc("PUT /users/{id}", h.UpdateUser)
 	r.HandleFunc("DELETE /users/{id}", h.DeleteUser)
 	r.HandleFunc("POST /users/{id}/password/reset", h.ResetUserPassword)
+	r.HandleFunc("POST /users/{id}/invite", h.CreateUserInvite)
 	r.HandleFunc("POST /users/{id}/disable", func(w http.ResponseWriter, req *http.Request) {
 		h.SetUserStatus(w, req, true)
 	})

@@ -265,19 +265,16 @@ test('配置页：仍然不可能"测了 A 却保存 B"—— 保存的就是输
 
 // ------------------------------------------------------------------ 主进程接线
 
-test('main.cjs：建窗走分流纯函数，且不再有云端地址确认环节', () => {
+test('main.cjs：建窗按运行模式分流，远程模式的待确认地址必须消费', () => {
   const body = functionBody(mainSource, 'function createWindow()')
   assert.match(body, /resolveStartupWindow\(/)
-  assert.doesNotMatch(
+  assert.match(
     body,
     /consumeApiUrlPending\(\)/,
-    '云端模式已废除：建窗不应再消费"待确认地址"标记',
+    '远程模式建窗必须消费"待确认地址"标记，否则陈旧地址会绕过配置页',
   )
-  assert.doesNotMatch(
-    body,
-    /target = !forceSetup && apiUrl/,
-    '又退回"地址非空就算配好"：陈旧地址会再次绕过配置页',
-  )
+  assert.match(body, /mode: currentMode/, '分流必须带上运行模式')
+  assert.match(body, /forceSetup/, '「连接设置」入口要能强制进配置页')
 })
 
 test('main.cjs：菜单之外还要有 IPC 入口，设置页与登录页才够得着配置页', () => {

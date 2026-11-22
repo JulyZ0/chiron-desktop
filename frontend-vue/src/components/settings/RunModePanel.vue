@@ -71,6 +71,35 @@ function closeWipe() {
   modalOpen.value = false
 }
 
+/** 打开连接设置页：填服务地址 = 切换/回到远程模式；页面里也能切回本地 */
+async function openConnection() {
+  const ok = await device.openConnectionSetup()
+  if (!ok) message.warning(t('settings.run_mode_setup_unsupported'))
+}
+
+/** 远程模式的服务地址（来自主进程注入的设备设置快照） */
+const serverAddress = computed(() => String(device.settings?.apiUrl || ''))
+const testing = ref(false)
+
+async function testConnection() {
+  if (testing.value) return
+  const url = serverAddress.value.trim()
+  if (!url) {
+    message.warning(t('settings.run_mode_no_address'))
+    return
+  }
+  testing.value = true
+  try {
+    await device.testServerUrl(url)
+    message.success(t('settings.run_mode_test_ok'))
+  } catch (err) {
+    const detail = err instanceof Error && err.message ? err.message : String(err)
+    message.error(t('settings.run_mode_test_failed', { error: detail }))
+  } finally {
+    testing.value = false
+  }
+}
+
 async function submit() {
   if (!confirmOk.value) return
   busy.value = true
@@ -121,19 +150,36 @@ onMounted(() => {
 
 <template>
   <div class="run-mode-panel">
-    <!-- ── 当前运行形态：只有本地，没有可切的东西 ── -->
+    <!-- ── 运行形态：本地随包后端，或连接远程服务 ── -->
     <div class="mode-block">
       <div class="mode-block-title">
         {{ $t('settings.run_mode') }}
       </div>
       <div class="mode-row">
-        <span class="mode-label">{{ $t('settings.run_mode_current', { mode: $t('settings.run_mode_local') }) }}</span>
-        <a-tag color="green">
-          {{ $t('settings.run_mode_local') }}
+        <span class="mode-label">{{ $t('settings.run_mode_current', { mode: device.mode === 'cloud' ? $t('settings.run_mode_cloud') : $t('settings.run_mode_local') }) }}</span>
+        <a-tag :color="device.mode === 'cloud' ? 'blue' : 'green'">
+          {{ device.mode === 'cloud' ? $t('settings.run_mode_cloud') : $t('settings.run_mode_local') }}
         </a-tag>
+        <a-button
+          :disabled="!device.isDesktop"
+          @click="openConnection"
+        >
+          {{ $t('settings.run_mode_open_setup') }}
+        </a-button>
+        <a-button
+          v-if="device.mode === 'cloud' && device.isDesktop"
+          :loading="testing"
+          @click="testConnection"
+        >
+          {{ $t('settings.run_mode_test_connection') }}
+        </a-button>
+      </div>
+      <div v-if="device.mode === 'cloud'" class="mode-row">
+        <span class="mode-hint">{{ $t('settings.run_mode_server_address') }}：</span>
+        <code class="mode-address">{{ serverAddress || '—' }}</code>
       </div>
       <p class="mode-hint mode-hint-block">
-        {{ $t('settings.run_mode_local_only_hint') }}
+        {{ device.mode === 'cloud' ? $t('settings.run_mode_cloud_hint') : $t('settings.run_mode_local_only_hint') }}
       </p>
     </div>
 
@@ -247,6 +293,7 @@ onMounted(() => {
 .mode-label { color: var(--text-primary); }
 .mode-hint { color: var(--text-secondary); font-size: 12px; }
 .mode-hint-block { margin: 0 0 12px; line-height: 1.6; }
+.mode-address { font-family: var(--font-mono); font-size: 12px; color: var(--text-primary); }
 .mode-danger-block .mode-block-title { color: var(--color-error, #cf1322); }
 .mode-wipe-alert { margin-bottom: 16px; }
 .mode-modal-line { margin: 0 0 10px; color: var(--text-primary); }

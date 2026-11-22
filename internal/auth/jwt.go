@@ -16,6 +16,12 @@ type Claims struct {
 	Role     string   `json:"role"` // owner / admin / user
 	TenantID int16    `json:"tenant_id,omitempty"`
 	Perms    []string `json:"perms,omitempty"`
+	// APIKey 标记本次请求用 API Key 认证（而非交互式登录）。
+	//
+	// 用途有两层：运行时据此拒绝"长期凭据代持管理动作"（如再建 API Key），
+	// 接口层则把它回给前端（`/v1/auth/profile` 的 `auth_method`），让界面把
+	// 管理员入口整体收起，而不是让用户点了才吃 403。
+	APIKey bool `json:"ak,omitempty"`
 	// MustChangePassword 表示"首登或管理员重置后必须改密"。
 	//
 	// 放进 claims 而不是每次请求查库：中间件只需一次判读就能拦住未改密会话，

@@ -971,9 +971,10 @@ class AgentRuntime:
         self._paused_for_user: bool = False
         # 任务预算与步数计数：由 run() 开头按环境变量重建（见 0.4b）
         self._budget: TaskBudget | None = None
-        #: 上一轮稳定前缀的指纹（`(system 段, 工具表)` 两个哈希）。runtime 是**每会话**的
+        #: 上一轮稳定前缀的指纹（`(system 段, 工具表, 模型)`）。runtime 是**每会话**的
         #: （`main.py` 的 `_ACTIVE_RUNTIMES[session_id]`），所以跨轮持有它就能发现前缀被打断。
-        self._last_prefix_fp: tuple[str, str] | None = None
+        #: 旧实例可能只有前两个元素，比较处按长度兜底（见 `_prefix_diagnostics`）。
+        self._last_prefix_fp: tuple[str, ...] | None = None
         #: G-P3：上一轮**实际下发**的工具名集合。与 `_last_prefix_fp` 同样靠"runtime 每会话
         #: 复用"来跨轮存活，也同样是 `None` 表示"本会话还没有基准"（首轮不声明变更）。
         #: 存名字而不是整份 schema：schema 变了名字没变时，新 schema 本来就在本轮请求里，
@@ -2558,7 +2559,8 @@ class AgentRuntime:
             from app.agent.planning_guidance import render_planning_guidance
 
             _tool_names = {
-                str(((t or {}).get("function") or {}).get("name") or "") for t in tools
+                str(((t or {}).get("function") or {}).get("name") or "")
+                for t in (tools or [])
             }
             # 差距 G-P3：**工具表变更声明**（详见 `_tool_change_notice`）。
             tool_change_notice = self._tool_change_notice(_tool_names)
@@ -3586,11 +3588,16 @@ class AgentRuntime:
                         ):
                             # revision 一并带出：前端据此丢弃乱序到达的旧事件
                             # （重连补发/多副本接力都会让事件不按产生顺序抵达）。
+                            raw_revision = tool_result.get("revision")
                             yield AgentEvent(
                                 type="todo_updated",
                                 content=json.dumps(tool_result["todos"], ensure_ascii=False),
                                 trace_id=trace_id,
-                                revision=int(tool_result.get("revision") or 0),
+                                revision=(
+                                    int(raw_revision)
+                                    if isinstance(raw_revision, (int, str))
+                                    else 0
+                                ),
                             )
 
                         # 记录工具 span (带租户隔离)

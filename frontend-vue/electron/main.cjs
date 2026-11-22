@@ -602,16 +602,25 @@ async function tryStartGoStack(options = {}) {
   }
 
   try {
-    // 团队服务模式（域名直连）要求网关端口**稳定**：反代/防火墙/证书都在指向它，
-    // 每次启动换号会让整站静默不可达。`CHIRON_GATEWAY_PORT` 显式钉死端口；
-    // 未设置时保持桌面默认的随机空闲端口。
+    // 端口稳定性是局域网访问的前提：反代/书签/防火墙规则都指向一个端口，
+    // 每次启动换号会让整站静默不可达。优先级：
+    //   显式 options.gatewayPort → CHIRON_GATEWAY_PORT → 上次使用的端口（仍空闲时）
+    //   → 随机空闲端口。
     const fixedPort = Number(process.env.CHIRON_GATEWAY_PORT || 0)
-    const port =
+    let port =
       Number(options.gatewayPort) > 0
         ? Number(options.gatewayPort)
         : fixedPort > 0
           ? fixedPort
-          : await components.pickFreePort()
+          : 0
+    if (!port) {
+      const preferred = readPreferredGatewayPort(dataDir)
+      if (preferred && (await components.isPortAvailable(preferred))) {
+        port = preferred
+      }
+    }
+    if (!port) port = await components.pickFreePort()
+    rememberGatewayPort(dataDir, port)
 
     // APP_SECRET 提前取好：知识库模型的网关回查要用它派生的 INTERNAL_TOKEN
     // （与网关 `deriveSubsecret` 同算法，见 local-stack.cjs）。
@@ -876,6 +885,31 @@ function ensureAppSecret(dataDir) {
  */
 function resolveLocalDataDir(explicit) {
   return explicit ? String(explicit) : path.join(app.getPath('userData'), 'local')
+}
+
+/** 上次成功使用的网关端口偏好（跨正常退出保留，供下次启动复用）。 */
+const GATEWAY_PORT_PREF_FILENAME = 'gateway-port.pref'
+
+function readPreferredGatewayPort(dataDir) {
+  try {
+    const raw = fs.readFileSync(path.join(String(dataDir || ''), GATEWAY_PORT_PREF_FILENAME), 'utf8').trim()
+    const port = Number(raw)
+    return Number.isInteger(port) && port > 0 && port < 65536 ? port : 0
+  } catch {
+    return 0
+  }
+}
+
+function rememberGatewayPort(dataDir, port) {
+  const value = Number(port)
+  if (!dataDir || !Number.isInteger(value) || value <= 0) return
+  const target = path.join(String(dataDir), GATEWAY_PORT_PREF_FILENAME)
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, String(value), { encoding: 'utf8', mode: 0o600 })
+  } catch {
+    /* 端口偏好只求"尽量稳定"，写不了不影响本次启动 */
+  }
 }
 
 async function startLocalBackend(options = {}) {
@@ -1269,11 +1303,28 @@ function configureSession(partition) {
  */
 async function askInitialMode(settings) {
   if (!settings.needsModeChoice) return false
-  // 云端模式废除后只剩本地一种运行方式，首启再弹「选本地还是云端」已无意义 ——
-  // 直接把唯一选项落盘，让配置文件离开「未选择」状态即可。
-  // 老配置里残留的 mode:"cloud" 也在这里被覆盖成 local。
-  saveMode('local')
-  logMain('info', `initial mode recorded: local (was ${settings.mode})`)
+  // 首启给出两条路：本机随包后端（免登录），或连接团队服务器（账密/API Key）。
+  // 选远程后把「确认服务地址」排到本次启动最前面，建窗直接落到 setup。
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    title: '选择运行模式',
+    message: '这台设备要如何运行 Chiron？',
+    detail:
+      '本地模式：数据与模型都在本机运行，免登录。\n' +
+      '连接服务器：使用团队 Chiron 服务，用账号密码或 API Key 登录。',
+    buttons: ['使用本地模式', '连接服务器'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  })
+  if (response === 1) {
+    saveMode('cloud')
+    markApiUrlPending(true)
+    logMain('info', `initial mode recorded: cloud (was ${settings.mode})`)
+  } else {
+    saveMode('local')
+    logMain('info', `initial mode recorded: local (was ${settings.mode})`)
+  }
   return true
 }
 
@@ -1323,6 +1374,7 @@ async function applyModeSwitch(mode, opts) {
   const result = await switchMode({
     nextMode: mode,
     deleteLocalData: Boolean(opts && opts.deleteLocalData),
+    skipApiUrlConfirm: Boolean(opts && opts.skipApiUrlConfirm),
     stopBackend: async () => {
       if (currentMode === 'local') {
         // 标记由 stopLocalBackend 自己置位；这里再置一次只会掩盖"到底停没停"
@@ -1688,6 +1740,10 @@ function createWindow() {
 
   const route = resolveStartupWindow({
     localBackend,
+    mode: currentMode,
+    apiUrl: currentMode === 'cloud' ? resolveApiUrl(settings) : '',
+    pendingApiUrl: currentMode === 'cloud' ? consumeApiUrlPending() : false,
+    forceSetup,
   })
   const apiUrl = route.apiUrl
   const target = route.target
@@ -1935,7 +1991,13 @@ async function httpsGetBuffer(url, _redirects = 5, timeoutMs = UPDATE_HTTP_TIMEO
       signal: controller.signal,
       headers: { 'User-Agent': `Chiron/${app.getVersion()}` },
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    if (!res.ok) {
+      const error = new Error(`HTTP ${res.status}`)
+      // 状态码要带出去：404 与其他网络失败对用户的含义完全不同
+      // （未发布 vs 网络不通），上层据此给可行动提示。
+      error.status = res.status
+      throw error
+    }
     return Buffer.from(await res.arrayBuffer())
   } finally {
     clearTimeout(timer)
@@ -2001,6 +2063,16 @@ async function checkAppUpdate() {
   try {
     text = (await httpsGetBuffer(UPDATE_MANIFEST_URL)).toString('utf8')
   } catch (err) {
+    if (err?.status === 404) {
+      // 发布任务把 Release 固定为草稿时，`releases/latest/download/latest.yml`
+      // 必然 404 —— 草稿不进入 latest。这不是网络故障，重试不会变好。
+      return {
+        ok: false,
+        reason: 'not-published',
+        message: `更新清单尚未发布（latest.yml 404）。当前 Release 可能仍是草稿，请到发布页手动下载：https://github.com/${UPDATE_REPO}/releases`,
+        current,
+      }
+    }
     return { ok: false, reason: 'network', message: err?.message || String(err), current }
   }
   const manifest = parseLatestYml(text)
@@ -2260,10 +2332,16 @@ if (!gotLock) {
       assertTrustedSender(event)
       return handleRuntimeMirrorRetry()
     })
-    ipcMain.handle('desktop:set-api-url', (event, url) => {
+    ipcMain.handle('desktop:set-api-url', async (event, url) => {
       assertTrustedSender(event)
       saveApiUrl(url)
-      relaunchIntoApp()
+      if (currentMode === 'cloud') {
+        relaunchIntoApp()
+        return true
+      }
+      // 本地模式下保存服务地址 = 用户要连远程服务：地址已在此刻确认过，
+      // 切模式时不再把配置页排到下次启动（skipApiUrlConfirm）。
+      await applyModeSwitch('cloud', { skipApiUrlConfirm: true })
       return true
     })
 

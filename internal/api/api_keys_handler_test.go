@@ -374,6 +374,33 @@ func TestAPIKeyCreate_RejectsEmptyName(t *testing.T) {
 	}
 }
 
+// API Key 会话不能"再生一把"：长期凭据泄漏后若还能签发新 key，
+// 撤销会被拖成一条追不清的派生链。管理凭据必须重新走交互式登录。
+func TestAPIKeyCreate_RejectsAPIKeySession(t *testing.T) {
+	h := &APIKeyHandler{store: &fakeAPIKeyStore{}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/api-keys", strings.NewReader(`{"name":"x"}`))
+	req = req.WithContext(auth.WithClaims(req.Context(), &auth.Claims{UserID: "u1", APIKey: true}))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestAPIKeyRevoke_RejectsAPIKeySession(t *testing.T) {
+	h := &APIKeyHandler{store: &fakeAPIKeyStore{}}
+	req := httptest.NewRequest(http.MethodDelete, "/v1/api-keys/k1", nil)
+	req.SetPathValue("id", "k1")
+	req = req.WithContext(auth.WithClaims(req.Context(), &auth.Claims{UserID: "u1", APIKey: true}))
+	rec := httptest.NewRecorder()
+	h.Revoke(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+}
+
 // tenant_id 为空的用户，middleware 会直接拒绝其 API Key 请求。若这里放行，
 // 用户会拿到一把"创建成功但永远 401"的 key —— 那种失败最难自查，必须在创建时就拦下。
 func TestAPIKeyCreate_RejectsUserWithoutTenant(t *testing.T) {

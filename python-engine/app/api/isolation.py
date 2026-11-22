@@ -140,9 +140,8 @@ async def get_isolation(request: Request) -> dict[str, Any]:
     """
     _verify_gateway_key(request)
     payload = await asyncio.to_thread(_status_payload)
-    payload["runtime_override"] = (
-        iso.runtime_override().value if iso.runtime_override() is not None else None
-    )
+    override = iso.runtime_override()
+    payload["runtime_override"] = override.value if override is not None else None
     return payload
 
 
@@ -163,9 +162,8 @@ async def reprobe_isolation(request: Request) -> dict[str, Any]:
     _verify_gateway_key(request)
     await asyncio.to_thread(iso.reset_probes)
     payload = await asyncio.to_thread(_status_payload)
-    payload["runtime_override"] = (
-        iso.runtime_override().value if iso.runtime_override() is not None else None
-    )
+    override = iso.runtime_override()
+    payload["runtime_override"] = override.value if override is not None else None
     return payload
 
 

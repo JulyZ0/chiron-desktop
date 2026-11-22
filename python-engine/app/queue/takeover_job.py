@@ -548,7 +548,7 @@ class _TokenTally:
             # 增量多于整轮合计：两份数据打架，不信归因，只保总额。
             return _single()
 
-        rows = [
+        rows: list[dict[str, Any]] = [
             {
                 "model": k,
                 "input_tokens": self._by_model[k][0],

@@ -546,7 +546,7 @@ class AnthropicProvider(LLMProvider):
                     }
                 )
             elif msg.role == "assistant" and msg.tool_calls:
-                content = []
+                content: list[dict[str, Any]] = []
                 # assistant 的 content 由 provider 产出（字符串）；这里加类型防御，
                 # 免得将来多模态 parts 误入此分支被拼成 {"type":"text","text":[...]}
                 if isinstance(msg.content, str) and msg.content:

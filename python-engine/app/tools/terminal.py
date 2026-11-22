@@ -71,7 +71,7 @@ class PersistentTerminal:
         try:
             from app.isolation import Level
 
-            return level.rank >= Level.LOW_IL.rank
+            return bool(level.rank >= Level.LOW_IL.rank)
         except Exception:  # noqa: BLE001 — 判不出来时退回旧判据，不阻断命令执行
             return key in self._sessions
 

@@ -262,8 +262,10 @@ def clamp_retention_days(value: object) -> int:
     ``0`` 是**合法**值（"不设保留期，未引用即删"），但不接受负数 —— 负数会让
     ``cutoff`` 落到未来，于是所有文件都被判成"还年轻"，GC 静默什么都不做。
     """
+    if not isinstance(value, (str, int, float)):
+        return _DEFAULT_RETENTION_DAYS
     try:
-        days = int(value)  # type: ignore[arg-type]
+        days = int(value)
     except (TypeError, ValueError):
         return _DEFAULT_RETENTION_DAYS
     if days < 0:

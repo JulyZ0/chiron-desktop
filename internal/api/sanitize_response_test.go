@@ -24,3 +24,31 @@ func TestSensitiveFieldsKeepsClientCredentials(t *testing.T) {
 		}
 	}
 }
+
+// 一次性交付凭据必须原样返回：后台「重置密码 / 建号」要把明文交给管理员。
+// 子串匹配曾让 temporary_password / initial_password 命中 "password" 被打成星号。
+func TestSanitizeKeepsOneTimeDeliveryPasswords(t *testing.T) {
+	data := map[string]interface{}{
+		"temporary_password": "Temp-pass-123",
+		"initial_password":   "Init-pass-456",
+		"password_hash":      "sha256:deadbeef",
+		"nested": map[string]interface{}{
+			"temporary_password": "Temp-pass-789",
+		},
+	}
+	sanitizeMap(data)
+
+	if got := data["temporary_password"]; got != "Temp-pass-123" {
+		t.Fatalf("temporary_password 必须原样返回，实际 %v", got)
+	}
+	if got := data["initial_password"]; got != "Init-pass-456" {
+		t.Fatalf("initial_password 必须原样返回，实际 %v", got)
+	}
+	if got := data["password_hash"]; got == "sha256:deadbeef" {
+		t.Fatal("password_hash 仍必须脱敏")
+	}
+	nested := data["nested"].(map[string]interface{})
+	if got := nested["temporary_password"]; got != "Temp-pass-789" {
+		t.Fatalf("嵌套的 temporary_password 也必须原样返回，实际 %v", got)
+	}
+}

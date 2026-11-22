@@ -12,20 +12,37 @@
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Alert, Button, Card, Input } from 'ant-design-vue'
+import { Alert, Button, Card, Input, Segmented } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import { useAuthStore } from '../stores/auth'
+import { useDeviceStore } from '../stores/device'
+import { API_URL } from '../api'
 import { serverErrorMessage } from '../utils/apiError'
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
+const device = useDeviceStore()
 
+/** 当前后端地址：远程模式下由主进程在建窗时注入 */
+const serverUrl = computed(() => API_URL || String(device.settings?.apiUrl || ''))
+
+async function openServerSetup() {
+  await device.openConnectionSetup()
+}
+
+const mode = ref<'password' | 'apikey'>('password')
 const identifier = ref('')
 const password = ref('')
+const apiKey = ref('')
 const error = ref('')
 const submitting = ref(false)
+
+const modeOptions = computed(() => [
+  { label: t('auth.login_with_password'), value: 'password' },
+  { label: t('auth.login_with_api_key'), value: 'apikey' },
+])
 
 /** 只接受站内绝对路径：`//evil.com` 与完整 URL 一律忽略。 */
 const redirect = computed(() => {
@@ -40,19 +57,31 @@ function goNext() {
 
 async function submit() {
   if (submitting.value) return
-  const ident = identifier.value.trim()
-  if (!ident || !password.value) {
-    error.value = t('auth.login_missing_fields')
-    return
-  }
   submitting.value = true
   error.value = ''
   try {
+    if (mode.value === 'apikey') {
+      const key = apiKey.value.trim()
+      if (!key) {
+        error.value = t('auth.api_key_required')
+        return
+      }
+      await auth.loginWithApiKey(key)
+      goNext()
+      return
+    }
+    const ident = identifier.value.trim()
+    if (!ident || !password.value) {
+      error.value = t('auth.login_missing_fields')
+      return
+    }
     await auth.login(ident, password.value)
     goNext()
   } catch (err) {
     const status = (err as { response?: { status?: number } })?.response?.status
-    if (status === 401) error.value = t('auth.login_invalid_credentials')
+    if (mode.value === 'apikey') {
+      error.value = status === 401 ? t('auth.api_key_invalid') : serverErrorMessage(err, t('auth.login_failed'))
+    } else if (status === 401) error.value = t('auth.login_invalid_credentials')
     else if (status === 429) error.value = t('auth.login_locked')
     else error.value = serverErrorMessage(err, t('auth.login_failed'))
   } finally {
@@ -81,27 +110,49 @@ onMounted(async () => {
         </p>
       </div>
 
+      <Segmented
+        v-model:value="mode"
+        :options="modeOptions"
+        block
+        class="login-mode"
+        @change="error = ''"
+      />
+
       <form
         class="login-form"
         @submit.prevent="submit"
       >
-        <label class="login-label">{{ t('auth.login_identifier') }}</label>
-        <Input
-          v-model:value="identifier"
-          size="large"
-          autocomplete="username"
-          :placeholder="t('auth.login_identifier_placeholder')"
-          data-test="login-identifier"
-        />
+        <template v-if="mode === 'password'">
+          <label class="login-label">{{ t('auth.login_identifier') }}</label>
+          <Input
+            v-model:value="identifier"
+            size="large"
+            autocomplete="username"
+            :placeholder="t('auth.login_identifier_placeholder')"
+            data-test="login-identifier"
+          />
 
-        <label class="login-label">{{ t('auth.password') }}</label>
-        <Input.Password
-          v-model:value="password"
-          size="large"
-          autocomplete="current-password"
-          data-test="login-password"
-          @press-enter="submit"
-        />
+          <label class="login-label">{{ t('auth.password') }}</label>
+          <Input.Password
+            v-model:value="password"
+            size="large"
+            autocomplete="current-password"
+            data-test="login-password"
+            @press-enter="submit"
+          />
+        </template>
+
+        <template v-else>
+          <label class="login-label">{{ t('auth.api_key') }}</label>
+          <Input.Password
+            v-model:value="apiKey"
+            size="large"
+            autocomplete="off"
+            :placeholder="t('auth.api_key_placeholder')"
+            data-test="login-api-key"
+            @press-enter="submit"
+          />
+        </template>
 
         <Alert
           v-if="error"
@@ -126,6 +177,18 @@ onMounted(async () => {
       <p class="login-hint">
         {{ t('auth.login_no_account_hint') }}
       </p>
+
+      <div v-if="device.mode === 'cloud'" class="login-server">
+        <span class="login-server-url">{{ t('auth.login_server', { url: serverUrl || '—' }) }}</span>
+        <Button
+          v-if="device.isDesktop"
+          type="link"
+          size="small"
+          @click="openServerSetup"
+        >
+          {{ t('auth.login_server_settings') }}
+        </Button>
+      </div>
     </Card>
   </div>
 </template>
@@ -170,6 +233,10 @@ onMounted(async () => {
   gap: 10px;
 }
 
+.login-mode {
+  margin-bottom: 18px;
+}
+
 .login-label {
   font-size: 13px;
   font-weight: var(--fw-medium);
@@ -185,5 +252,20 @@ onMounted(async () => {
   text-align: center;
   font-size: 12px;
   color: var(--text-tertiary);
+}
+
+.login-server {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.login-server-url {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  word-break: break-all;
+  text-align: center;
 }
 </style>

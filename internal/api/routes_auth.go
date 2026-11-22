@@ -14,6 +14,8 @@ func registerAuthRoutes(mux *http.ServeMux, authHandler *AuthHandler, authMW, rl
 	mux.Handle("POST /v1/auth/login", rlMW(http.HandlerFunc(authHandler.Login)))
 	mux.Handle("POST /v1/auth/register", rlMW(http.HandlerFunc(authHandler.Register)))
 	mux.Handle("POST /v1/auth/refresh", rlMW(http.HandlerFunc(authHandler.Refresh)))
+	// 邀请链接接受：公开（凭一次性 token 设密码），只需限流。
+	mux.Handle("POST /v1/auth/invite/accept", rlMW(http.HandlerFunc(AcceptInvite)))
 	// 登出必须经过 authMW：Logout 要用 claims 里的 jti 写吊销黑名单，
 	// 而 claims 只有 authMW 会注入。此前漏挂导致 GetClaims 恒为 nil，
 	// Logout 的函数体从不执行 —— "退出登录"实际是空操作，
