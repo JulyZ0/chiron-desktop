@@ -10,8 +10,13 @@ import {
   type AgentSettingsConfig,
 } from '@/api/admin'
 
+import EngineEnvPanel from '../../components/settings/EngineEnvPanel.vue'
+import { desktopHost } from '@/stores/device'
+
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
+/** 引擎功能开关只对桌面端有意义（改的是本机引擎进程环境）。 */
+const isDesktop = Boolean(desktopHost()?.isDesktop)
 const saving = ref(false)
 const loading = ref(false)
 
@@ -362,6 +367,14 @@ onMounted(async () => {
         </Card>
       </Col>
     </Row>
+
+    <!-- 引擎功能开关：原独立页签/独立后台页并入系统设置（仅桌面端）。 -->
+    <Card
+      v-if="isDesktop"
+      style="margin-top: 16px"
+    >
+      <EngineEnvPanel />
+    </Card>
   </div>
 </template>
 

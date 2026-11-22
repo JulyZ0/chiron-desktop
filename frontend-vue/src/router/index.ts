@@ -231,18 +231,13 @@ const routes = [
         meta: { title: t('admin.persona_title') },
       },
       {
-        // 引擎功能开关：只对桌面端有意义（改的是本机引擎进程环境）。
-        path: 'engine-env',
-        name: 'AdminEngineEnv',
-        component: () => import('../views/admin/EngineTogglesView.vue'),
-        meta: { title: t('settings.engine_env_title') },
-      },
-      {
         path: 'settings',
         name: 'AdminSettings',
         component: () => import('../views/admin/SettingsView.vue'),
         meta: { title: t('settings.system_settings') },
       },
+      // 引擎功能开关已并入系统设置；旧书签重定向。
+      { path: 'engine-env', redirect: { path: '/admin/settings' } },
       // ── 邮件发信（邮箱验证码登录 / 注册邮箱验证 / 密码重置 / 欢迎邮件）──
       // 发信服务器地址与凭据全部在此配置，代码中不含任何厂商默认地址。
       // ── 支付渠道配置（支付宝 / 微信支付 / PayPal）──

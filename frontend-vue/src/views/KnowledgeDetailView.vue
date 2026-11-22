@@ -18,7 +18,6 @@ import {
   isKbBuilding,
   isKbTerminal,
   reindexKnowledgeBase,
-  updateKnowledgeBase,
   type KbIndexStatus,
   type KbStats,
   type KnowledgeBase,
@@ -279,31 +278,6 @@ const pickedMedia = ref<Record<string, MediaFileItem>>({})
 
 const kbId = route.params.id as string
 
-// ── 逐库模型覆盖（P1-6） ──
-// 空串 = 沿用网关注入的默认模型。保存时**原样提交**空串（= 清除覆盖），
-// 而不是省略字段 —— 省略意味着"不改"，那样用户永远没法把覆盖清回默认。
-const indexModel = ref('')
-const chatModel = ref('')
-const savingModels = ref(false)
-
-async function saveModels() {
-  savingModels.value = true
-  try {
-    await updateKnowledgeBase(kbId, {
-      index_model: indexModel.value.trim(),
-      chat_model: chatModel.value.trim(),
-    })
-    message.success(t('knowledge.models_saved'))
-    // 索引模型变了必须重建索引才生效：不提示的话用户会以为"保存了就变了"，
-    // 然后拿着旧索引去问新模型，得到一堆答不上来的结果。
-    await loadKnowledgeBase()
-  } catch (err) {
-    message.error(kbErrorText(err, t('knowledge.models_save_failed')))
-  } finally {
-    savingModels.value = false
-  }
-}
-
 // ── 检索观测（P1-6） ──
 const stats = ref<KbStats | null>(null)
 const statsLoading = ref(false)
@@ -349,10 +323,6 @@ async function loadKnowledgeBase() {
   try {
     const res = await api.get(`/v1/kb/${kbId}`)
     kb.value = res.data?.data || res.data
-    // 回填模型覆盖：留空 = 跟随默认（见 api/knowledge.ts 的 KnowledgeBase.index_model）
-    const loaded = kb.value as KnowledgeBase | null
-    indexModel.value = loaded?.index_model || ''
-    chatModel.value = loaded?.chat_model || ''
   } catch {
     message.error(t('errors.failed_to_load_knowledge_base'))
     router.push('/knowledge')
@@ -1162,47 +1132,6 @@ function formatSize(bytes: number): string {
           </Spin>
         </Card>
 
-        <!-- 逐库模型覆盖（P1-6）：留空 = 沿用网关默认。 -->
-        <Card
-          :title="$t('knowledge.model_settings_title')"
-          style="margin-top: 16px"
-        >
-          <p class="kb-model-hint">
-            {{ $t('knowledge.model_settings_hint') }}
-          </p>
-          <div class="kb-model-form">
-            <div class="kb-model-field">
-              <span class="label">{{ $t('knowledge.index_model') }}</span>
-              <Input
-                v-model:value="indexModel"
-                :placeholder="$t('knowledge.index_model_placeholder')"
-                allow-clear
-              />
-            </div>
-            <div class="kb-model-field">
-              <span class="label">{{ $t('knowledge.chat_model') }}</span>
-              <Input
-                v-model:value="chatModel"
-                :placeholder="$t('knowledge.chat_model_placeholder')"
-                allow-clear
-              />
-            </div>
-            <Button
-              type="primary"
-              :loading="savingModels"
-              data-testid="kb-save-models"
-              @click="saveModels"
-            >
-              {{ $t('common.save') }}
-            </Button>
-          </div>
-          <p
-            v-if="indexModel"
-            class="kb-model-warn"
-          >
-            {{ $t('knowledge.models_need_reindex') }}
-          </p>
-        </Card>
 
         <!-- 文档列表 -->
         <Card

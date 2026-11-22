@@ -362,7 +362,7 @@ function openModels(): void {
               {{ t('welcome.next') }}
             </Button>
             <Button
-              v-if="auth.isAdmin"
+              v-if="auth.isPlatformOwner"
               data-testid="welcome-configure"
               @click="openModels"
             >
@@ -458,7 +458,7 @@ function openModels(): void {
               {{ t('welcome.next') }}
             </Button>
             <Button
-              v-if="auth.isAdmin"
+              v-if="auth.isPlatformOwner"
               data-testid="welcome-diagnostics"
               @click="router.push('/admin/diagnostics')"
             >

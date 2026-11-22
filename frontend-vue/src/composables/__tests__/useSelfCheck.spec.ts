@@ -11,7 +11,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
  *     且坏掉的一项只影响它自己，别的行照常出状态。
  */
 
-const authState = vi.hoisted(() => ({ isAdmin: true }))
+const authState = vi.hoisted(() => ({ isPlatformOwner: true }))
 
 vi.mock('../../stores/auth', () => ({
   useAuthStore: () => authState,
@@ -43,11 +43,11 @@ import type { DiagSummaryCheck } from '../../api/admin'
 
 /** 五项聚合清单的典型回包（schema/knowledge 各一种问题，覆盖四种状态） */
 const CHECKS: DiagSummaryCheck[] = [
-  { key: 'schema', title: 'Schema', status: 'ok', detail: 'v 12', fix: '' },
-  { key: 'tables', title: '必需表', status: 'warn', detail: '缺 1 张表', fix: '跑迁移' },
-  { key: 'knowledge', title: '知识库', status: 'error', detail: '服务未启动', fix: '' },
-  { key: 'checkpoints', title: '检查点', status: 'ok', detail: '已保护', fix: '' },
-  { key: 'deps', title: '依赖', status: 'unknown', detail: '读不到', fix: '' },
+  { id: 'schema', title: 'Schema', status: 'ok', detail: 'v 12', fix: '' },
+  { id: 'tables', title: '必需表', status: 'warn', detail: '缺 1 张表', fix: '跑迁移' },
+  { id: 'knowledge', title: '知识库', status: 'error', detail: '服务未启动', fix: '' },
+  { id: 'checkpoints', title: '检查点', status: 'ok', detail: '已保护', fix: '' },
+  { id: 'deps', title: '依赖', status: 'unknown', detail: '读不到', fix: '' },
 ]
 
 const MODELS = [
@@ -81,7 +81,7 @@ describe('useSelfCheck', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetSelfCheckForTest()
-    authState.isAdmin = true
+    authState.isPlatformOwner = true
     routeAll()
   })
 
@@ -120,7 +120,7 @@ describe('useSelfCheck', () => {
   })
 
   it('非 admin：不发任何请求，可用性为 false', async () => {
-    authState.isAdmin = false
+    authState.isPlatformOwner = false
     const selfCheck = useSelfCheck()
 
     expect(selfCheck.available.value).toBe(false)

@@ -48,6 +48,29 @@ class Store:
             user_id,
         )
 
+    async def stuck_indexing(self, limit: int = 20) -> list[Any]:
+        """库状态是 indexing、但仍有 pending/indexing 文档的库。
+
+        worker 启动时用它做一次**自愈**：任务消息可能因为旧的 socket 超时故障被丢在
+        队列外（或消费组建立前就过期），而文档仍在排队 —— 界面会永远停在「索引中」。
+        重新投递是幂等的（`handle_kb_index` 对已 ready 的库直接跳过）。
+        """
+        return list(
+            await self._pool.fetch(
+                """SELECT kb.id, kb.user_id
+                     FROM knowledge_bases kb
+                    WHERE kb.status = 'indexing'
+                      AND EXISTS (
+                          SELECT 1 FROM knowledge_documents d
+                           WHERE d.knowledge_base_id = kb.id
+                             AND d.status IN ('pending', 'indexing')
+                      )
+                    ORDER BY kb.updated_at
+                    LIMIT $1""",
+                limit,
+            )
+        )
+
     async def pending_docs(self, kb_id: str, *, force: bool = False) -> list[Any]:
         """待索引文档。
 

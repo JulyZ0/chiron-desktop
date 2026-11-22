@@ -248,6 +248,15 @@ export const useAuthStore = defineStore('auth', () => {
     isDevAuthBypassEnabled() || user.value?.role === 'admin' || user.value?.role === 'owner',
   )
 
+  /**
+   * 平台 owner：`/v1/admin/diagnostics/summary`、跨租户监控等端点只对它开放。
+   * 与 Go 的 `isPlatformOwner(claims)` 同口径（`role == "owner"`）—— 多写一条
+   * tenant 判断就会让团队 owner 明明有权限却在界面上看不到自检。
+   */
+  const isPlatformOwner = computed(
+    () => isDevAuthBypassEnabled() || user.value?.role === 'owner',
+  )
+
   /** 登录：`identifier` 可以是邮箱或用户名（团队模式两者都支持）。 */
   async function login(identifier: string, password: string, captcha?: { token: string; randstr?: string }) {
     loading.value = true
@@ -437,6 +446,7 @@ export const useAuthStore = defineStore('auth', () => {
     locked,
     isAuthenticated,
     isAdmin,
+    isPlatformOwner,
     initToken,
     ensureLocalSession,
     login,

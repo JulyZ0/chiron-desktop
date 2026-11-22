@@ -16,7 +16,7 @@ export default {
   login_title: '登录 Chiron',
   login_subtitle: '使用管理员分配的账号访问团队工作台。',
   login_identifier: '邮箱或用户名',
-  login_identifier_placeholder: 'name@company.com 或 username',
+  login_identifier_placeholder: "name{'@'}company.com 或 username",
   login_missing_fields: '请输入账号和密码。',
   login_invalid_credentials: '账号或密码错误。',
   login_locked: '尝试次数过多，请 15 分钟后再试。',

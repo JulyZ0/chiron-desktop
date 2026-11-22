@@ -845,8 +845,10 @@ export async function getDiagnostics(): Promise<DiagnosticsReport> {
 export type DiagSummaryStatus = 'ok' | 'warn' | 'error' | 'unknown'
 
 export interface DiagSummaryCheck {
-  /** schema / tables / knowledge / checkpoints / deps —— 决定标题与图标 */
-  key: string
+  /** schema / tables / knowledge / checkpoints / deps —— 决定标题与图标。
+   *  JSON 名是 `id` 而不是 `key`：全局响应脱敏会把任何含 `key` 的字段打成 `********`，
+   *  曾导致自检五项全部变成「未知」。 */
+  id: string
   /** 后端给的中文标题（缺少 i18n 键时的兜底） */
   title: string
   status: DiagSummaryStatus

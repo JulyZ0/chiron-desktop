@@ -187,7 +187,7 @@ export function buildSelfCheckItems(
   modelCount: { ok: boolean; count: number },
   coverage: PriceCoverageLite | null,
 ): SelfCheckItem[] {
-  const byKey = new Map(checks.map(c => [c.key, c]))
+  const byKey = new Map(checks.map(c => [c.id, c]))
   const out: SelfCheckItem[] = SELF_CHECK_SUMMARY_KEYS.map(key => {
     const hit = byKey.get(key)
     return {
@@ -295,7 +295,7 @@ export function useSelfCheck() {
   const available = computed(() => {
     // 身份是异步到达的：这里用 computed 跟随 store，角色一到就变成可读
     try {
-      return !!auth?.isAdmin
+      return !!auth?.isPlatformOwner
     } catch {
       return false
     }

@@ -368,10 +368,66 @@ async def _reclaim_loop(
             logger.warning("kb reclaim loop error: %s", exc)
 
 
-async def run() -> None:
-    """入口：``python -m app.index_worker``。"""
+
+def _redis_client(cfg: Any) -> Any:
+    """构造 worker 的 Redis 客户端。
+
+    `socket_timeout` 必须 **大于** XREADGROUP 的 block（5s）：redis-py 的阻塞读也受
+    客户端 socket 超时约束，二者相等时每次都会抛 "Timeout reading from ..."，被外层
+    `except` 当成瞬时错误吞掉 —— 表现为 worker 活着、心跳不写、队列永远没人消费，
+    界面就是「索引一直中」。
+    """
     import redis.asyncio as aioredis
 
+    return aioredis.from_url(
+        cfg.redis_url,
+        socket_timeout=30,
+        socket_connect_timeout=5,
+        health_check_interval=30,
+    )
+
+
+
+async def _recover_stuck(redis: Any, cfg: Any, store: Store) -> None:
+    """启动自愈：把「库在 indexing、文档却一直 pending」的库重新投递一次。
+
+    根因见 `_redis_client` 的说明：旧客户端的 socket 超时会让 worker 永远取不到消息，
+    但库状态已经在更早的 build 里写成 indexing。没有这一步，修复连接超时也救不回
+    已经卡住的库（消息早已不在 stream 里）。
+    """
+    import json
+    import time
+
+    try:
+        rows = await store.stuck_indexing()
+    except Exception as exc:  # noqa: BLE001 — 自愈失败不影响正常消费
+        logger.warning("stuck kb scan failed: %s", exc)
+        return
+    for row in rows:
+        kb_id = str(row["id"])
+        payload = json.dumps({"kb_id": kb_id, "user_id": str(row["user_id"] or ""), "force": False})
+        try:
+            await redis.xadd(
+                cfg.kb_stream,
+                {
+                    "task_id": f"recover-{kb_id[:8]}",
+                    "task_type": "kb_index",
+                    "tenant_id": "0",
+                    "payload": payload,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "retry_count": "0",
+                    "priority": "0",
+                    "idempotency_key": f"recover:{kb_id}",
+                },
+                maxlen=cfg.kb_stream_maxlen,
+            )
+            logger.info("stuck kb re-enqueued: %s", kb_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stuck kb re-enqueue failed kb=%s: %s", kb_id, exc)
+
+
+async def run() -> None:
+    """入口：``python -m app.index_worker``。"""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = Config.from_env()
     if not cfg.redis_url or not cfg.postgres_dsn:
@@ -381,8 +437,13 @@ async def run() -> None:
     await store.connect()
     reader = BlobReader(cfg)
 
-    redis = aioredis.from_url(cfg.redis_url)
+    # `socket_timeout` 必须 **大于** XREADGROUP 的 block（5s）：redis-py 的阻塞读
+    # 也受客户端 socket 超时约束，二者相等时每次都会抛 "Timeout reading from ..."，
+    # 被外层 `except` 当成瞬时错误吞掉 —— 表现为 worker 活着、心跳不写、队列永远没人消费，
+    # 界面就是「索引一直中」。这里给 30s，并把 block 之外的等待也留在可控范围。
+    redis = _redis_client(cfg)
     await _ensure_group(redis, cfg)
+    await _recover_stuck(redis, cfg, store)
     consumer = f"pi-worker-{socket.gethostname()}-{os.getpid()}"
     logger.info("pageindex worker started: consumer=%s stream=%s", consumer, cfg.kb_stream)
 

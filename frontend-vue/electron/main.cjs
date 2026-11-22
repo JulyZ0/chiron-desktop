@@ -32,6 +32,7 @@ const {
   nativeImage,
   clipboard,
   powerMonitor,
+  net,
 } = require('electron')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
@@ -1922,28 +1923,23 @@ const UPDATE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000
 /** 最近一次检查结果（下载阶段复用，避免信任渲染层回传的 URL）。 */
 let lastUpdate = null
 
-function httpsGetBuffer(url, redirects = 5, timeoutMs = UPDATE_HTTP_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const lib = url.startsWith('http://') ? require('node:http') : require('node:https')
-    const req = lib.get(url, { headers: { 'User-Agent': `Chiron/${app.getVersion()}` } }, res => {
-      const status = res.statusCode || 0
-      if (status >= 300 && status < 400 && res.headers.location && redirects > 0) {
-        res.resume()
-        resolve(httpsGetBuffer(new URL(res.headers.location, url).toString(), redirects - 1, timeoutMs))
-        return
-      }
-      if (status < 200 || status >= 300) {
-        res.resume()
-        reject(new Error(`HTTP ${status}`))
-        return
-      }
-      const chunks = []
-      res.on('data', c => chunks.push(c))
-      res.on('end', () => resolve(Buffer.concat(chunks)))
+async function httpsGetBuffer(url, _redirects = 5, timeoutMs = UPDATE_HTTP_TIMEOUT_MS) {
+  // 走 Electron 的 net（Chromium 网络栈）：它使用**系统证书库与系统代理**。
+  // Node 的 https 只信自带的 CA 包，在公司 MITM 代理/自签根证书环境里会报
+  // "unable to verify the first certificate" —— 在线升级在那种网络下永远不可用。
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await net.fetch(url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: { 'User-Agent': `Chiron/${app.getVersion()}` },
     })
-    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')))
-    req.on('error', reject)
-  })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return Buffer.from(await res.arrayBuffer())
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /** 极简 latest.yml 解析：只取 version / files[].url / files[].sha512 / path。 */

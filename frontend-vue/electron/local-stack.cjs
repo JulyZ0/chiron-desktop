@@ -227,10 +227,10 @@ const ENGINE_TIMEOUT_MS = 120_000
  * 知识库检索服务（pageindex-service）的健康检查路径与启动超时。
  *
  * 超时比引擎短得多：它只 import fastapi/uvicorn/pageindex，没有引擎那串重依赖；
- * 60s 内起不来说明是环境问题，多等没有意义。
+ * 120s 内起不来说明是环境问题，多等没有意义（3.14 + 杀软扫描冷启动实测可达数十秒）。
  */
 const KNOWLEDGE_SERVICE_HEALTH_PATH = '/healthz'
-const KNOWLEDGE_SERVICE_TIMEOUT_MS = 60_000
+const KNOWLEDGE_SERVICE_TIMEOUT_MS = 120_000
 
 /**
  * 端口冲突时最多尝试几次（含首次）。与 `components.cjs` 的 `CORE_PORT_ATTEMPTS` 一致。
@@ -1251,6 +1251,16 @@ async function spawnKnowledgeServiceOnce(info, options = {}) {
     return { ok: false, reason: 'spawn-failed', message: (err && err.message) || 'spawn 出错' }
   }
   state.knowledge = { service, worker: null, port, baseUrl }
+  const record = state.knowledge
+  // 检索服务自身也要监护：它死了以后搜索/索引全部不可用，而旧实现只把退出写进
+  // record（无人消费），界面表现为"一直索引中"。只做有限重启，避免崩溃循环。
+  service.child.once('exit', code => {
+    if (service.stopping || state.knowledge !== record) return
+    const tail = String(service.stderrTail || '').trim().slice(-400)
+    console.warn(`[knowledge] 检索服务退出（code ${code}）${tail ? `
+${tail}` : ''}`)
+    void restartKnowledgeService(info, options, 1)
+  })
 
   const deadline = Date.now() + (options.timeoutMs || KNOWLEDGE_SERVICE_TIMEOUT_MS)
   while (Date.now() < deadline) {
@@ -1282,6 +1292,24 @@ async function spawnKnowledgeServiceOnce(info, options = {}) {
     message: `知识库服务在 ${Math.round((options.timeoutMs || KNOWLEDGE_SERVICE_TIMEOUT_MS) / 1000)}s 内未开始监听`,
     stderrTail: service.stderrTail,
   }
+}
+
+/** 知识库检索服务的有限自动重启（服务死了，worker 也没有意义）。 */
+const KNOWLEDGE_SERVICE_MAX_RESTARTS = 3
+
+async function restartKnowledgeService(info, options, attempt) {
+  if (attempt > KNOWLEDGE_SERVICE_MAX_RESTARTS) return
+  await stopKnowledgeService()
+  await sleep(3000)
+  const result = await startKnowledgeService(info, options)
+  if (result.ok) return
+  const tail = String(result.stderrTail || '').trim().slice(-400)
+  console.warn(
+    `[knowledge] 重启失败（${attempt}/${KNOWLEDGE_SERVICE_MAX_RESTARTS}）：` +
+      `${result.message || result.reason || 'unknown'}${tail ? `
+${tail}` : ''}`,
+  )
+  await restartKnowledgeService(info, options, attempt + 1)
 }
 
 /** 知识库 worker 的有限自动重启：它的存活直接决定索引队列有没有消费者。 */
@@ -1845,6 +1873,16 @@ async function startLocalStack(options = {}) {
           gatewayPort,
         })
       : { ok: false, reason: 'not-installed' }
+    if (!knowledgeResult.ok) {
+      // 可选组件：不阻断本地栈，但**必须留痕** —— 否则"索引一直中"只能靠猜。
+      // stderr 尾部是区分"依赖没装好 / 端口冲突 / 导入就崩"的唯一证据。
+      const tail = String(knowledgeResult.stderrTail || '').trim().slice(-600)
+      console.warn(
+        `[knowledge] 检索服务未启动（${knowledgeResult.reason || 'unknown'}）：` +
+          `${knowledgeResult.message || ''}${tail ? `
+${tail}` : ''}`,
+      )
+    }
     const engineResult = await startEngine(launcherResult.info, {
       ...options,
       port: enginePort,

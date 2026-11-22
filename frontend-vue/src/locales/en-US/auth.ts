@@ -14,7 +14,7 @@ export default {
   login_title: 'Sign in to Chiron',
   login_subtitle: 'Use the account your administrator created for you.',
   login_identifier: 'Email or username',
-  login_identifier_placeholder: 'name@company.com or username',
+  login_identifier_placeholder: "name{'@'}company.com or username",
   login_missing_fields: 'Enter your account and password.',
   login_invalid_credentials: 'Incorrect account or password.',
   login_locked: 'Too many attempts. Try again in 15 minutes.',

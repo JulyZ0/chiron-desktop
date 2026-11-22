@@ -95,7 +95,7 @@ onMounted(async () => {
        非 admin 在组件内部整体隐藏（且不发请求），所以这里只做角色闸门，
        避免为一个必然 403 的面板付出挂载成本。 -->
   <SelfCheckPanel
-    v-if="authStore.isAdmin"
+    v-if="authStore.isPlatformOwner"
     class="settings-selfcheck"
     data-testid="settings-selfcheck"
   />

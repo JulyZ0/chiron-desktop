@@ -530,3 +530,18 @@ func TestDiagnosticsSchemaUnknownWhenMigrationsDirMissing(t *testing.T) {
 		}
 	}
 }
+
+// TestDiagSummaryCheckJSONFieldIsID 回归：`key` 会命中全局响应脱敏（SensitiveFields 含
+// "key"），把五项自检的 key 全打成 `********`，前端按 key 索引于是整页「未知」。
+func TestDiagSummaryCheckJSONFieldIsID(t *testing.T) {
+	raw, err := json.Marshal(DiagSummaryCheck{Key: "schema", Status: diagStateOK})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"id":"schema"`) {
+		t.Fatalf("诊断项必须以 id 下发（key 会被脱敏），got %s", raw)
+	}
+	if strings.Contains(string(raw), `"key"`) {
+		t.Fatalf("诊断项不应再下发 key 字段，got %s", raw)
+	}
+}

@@ -68,7 +68,7 @@ const (
 // DiagSummaryCheck 是清单里的一行。字段是前后端的契约，五个都不能省：
 // key 决定图标/跳转，status 决定徽标颜色，fix 是"我该做什么"。
 type DiagSummaryCheck struct {
-	Key    string `json:"key"`
+	Key    string `json:"id"`
 	Title  string `json:"title"`
 	Status string `json:"status"`
 	Detail string `json:"detail"`

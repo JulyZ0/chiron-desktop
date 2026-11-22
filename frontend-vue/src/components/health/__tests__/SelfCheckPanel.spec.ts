@@ -12,7 +12,7 @@ import { createMemoryHistory, createRouter, type Router } from 'vue-router'
  *  ④ 折叠默认收起、刷新无视 5 分钟缓存。
  */
 
-const authState = vi.hoisted(() => ({ isAdmin: true }))
+const authState = vi.hoisted(() => ({ isPlatformOwner: true }))
 
 vi.mock('../../../stores/auth', () => ({
   useAuthStore: () => authState,
@@ -37,11 +37,11 @@ import SelfCheckPanel from '../SelfCheckPanel.vue'
 import { resetSelfCheckForTest } from '../../../composables/useSelfCheck'
 
 const CHECKS = [
-  { key: 'schema', title: 'Schema', status: 'ok', detail: '迁移版本一致', fix: '' },
-  { key: 'tables', title: '必需表', status: 'warn', detail: '缺 1 张表', fix: '执行迁移' },
-  { key: 'knowledge', title: '知识库', status: 'error', detail: '服务未启动', fix: '检查服务' },
-  { key: 'checkpoints', title: '检查点', status: 'ok', detail: '已保护', fix: '' },
-  { key: 'deps', title: '依赖', status: 'unknown', detail: '', fix: '' },
+  { id: 'schema', title: 'Schema', status: 'ok', detail: '迁移版本一致', fix: '' },
+  { id: 'tables', title: '必需表', status: 'warn', detail: '缺 1 张表', fix: '执行迁移' },
+  { id: 'knowledge', title: '知识库', status: 'error', detail: '服务未启动', fix: '检查服务' },
+  { id: 'checkpoints', title: '检查点', status: 'ok', detail: '已保护', fix: '' },
+  { id: 'deps', title: '依赖', status: 'unknown', detail: '', fix: '' },
 ]
 
 const MODELS = [
@@ -74,7 +74,7 @@ function mountPanel(props: Record<string, unknown> = {}, router = makeRouter()) 
 beforeEach(() => {
   vi.clearAllMocks()
   resetSelfCheckForTest()
-  authState.isAdmin = true
+  authState.isPlatformOwner = true
   mocks.summary.mockResolvedValue({ generated_at: 1, status: 'error', counts: {}, checks: CHECKS })
   mocks.listModels.mockResolvedValue(MODELS)
   mocks.get.mockResolvedValue({ data: { data: COVERAGE } })
@@ -82,7 +82,7 @@ beforeEach(() => {
 
 describe('SelfCheckPanel', () => {
   it('非 admin：面板整体隐藏且不发请求', async () => {
-    authState.isAdmin = false
+    authState.isPlatformOwner = false
     const { wrapper } = mountPanel()
     await flushPromises()
 

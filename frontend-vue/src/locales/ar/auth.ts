@@ -14,7 +14,7 @@ export default {
   login_title: 'تسجيل الدخول إلى Chiron',
   login_subtitle: 'استخدم الحساب الذي أنشأه لك المسؤول.',
   login_identifier: 'البريد الإلكتروني أو اسم المستخدم',
-  login_identifier_placeholder: 'name@company.com أو username',
+  login_identifier_placeholder: "name{'@'}company.com أو username",
   login_missing_fields: 'أدخل الحساب وكلمة المرور.',
   login_invalid_credentials: 'الحساب أو كلمة المرور غير صحيحة.',
   login_locked: 'محاولات كثيرة. حاول بعد 15 دقيقة.',

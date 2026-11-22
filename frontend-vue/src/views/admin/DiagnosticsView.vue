@@ -46,7 +46,7 @@
         <div class="summary-grid">
           <div
             v-for="item in summaryChecks"
-            :key="item.key"
+            :key="item.id"
             class="summary-card"
             :class="`summary-card--${item.status}`"
             data-test="diag-summary-card"
@@ -306,7 +306,7 @@ function statusColor(s: DiagnosticStatus): string {
 
 /** 标题优先走 i18n（三语），缺键时回退后端的 title（那是最新事实，不该被旧翻译盖住）。 */
 function summaryTitle(item: DiagSummaryCheck): string {
-  const key = SUMMARY_KEY[item.key]
+  const key = SUMMARY_KEY[item.id]
   if (!key) return item.title
   const translated = t(key)
   return translated === key ? item.title : translated

@@ -153,9 +153,9 @@ describe('DiagnosticsView 的聚合清单', () => {
       status: 'error',
       counts: { ok: 1, warn: 0, error: 1, unknown: 0 },
       checks: [
-        { key: 'schema', title: 'Schema 版本', status: 'ok', detail: 'schema 版本 0002，与期望一致', fix: '' },
+        { id: 'schema', title: 'Schema 版本', status: 'ok', detail: 'schema 版本 0002，与期望一致', fix: '' },
         {
-          key: 'tables', title: '必需数据表', status: 'error',
+          id: 'tables', title: '必需数据表', status: 'error',
           detail: '缺少 1 张必需表：project_checkpoints',
           fix: '执行 alembic upgrade head',
         },
@@ -189,8 +189,8 @@ describe('DiagnosticsView 的聚合清单', () => {
       status: 'unknown',
       counts: { ok: 0, warn: 0, error: 0, unknown: 2 },
       checks: [
-        { key: 'tables', title: '必需数据表', status: 'unknown', detail: '引擎未启动', fix: '启动 Python 引擎后重试' },
-        { key: 'knowledge', title: '知识库服务', status: 'unknown', detail: '知识库服务未启动', fix: '启动 Python 引擎' },
+        { id: 'tables', title: '必需数据表', status: 'unknown', detail: '引擎未启动', fix: '启动 Python 引擎后重试' },
+        { id: 'knowledge', title: '知识库服务', status: 'unknown', detail: '知识库服务未启动', fix: '启动 Python 引擎' },
       ],
     })
 

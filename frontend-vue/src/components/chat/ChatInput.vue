@@ -1,24 +1,18 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, computed, nextTick, h } from 'vue'
-import { Input, Button, Select, Tooltip, Popover, Dropdown, Menu } from 'ant-design-vue'
-import type { MenuProps } from 'ant-design-vue'
-import { SendOutlined, StopOutlined, PaperClipOutlined, CloseOutlined, BranchesOutlined, AudioOutlined, FolderOpenOutlined, SettingOutlined, ThunderboltOutlined, MoreOutlined } from '@ant-design/icons-vue'
-import api, { uploadFile, listModels, getAudioAvailability, transcribeAudio } from '../../api'
+import { Input, Button, Select, Tooltip, Popover } from 'ant-design-vue'
+import { SendOutlined, StopOutlined, PaperClipOutlined, CloseOutlined, BranchesOutlined, FolderOpenOutlined, SettingOutlined } from '@ant-design/icons-vue'
+import api, { uploadFile, listModels } from '../../api'
 import type { LlmModel } from '../../api'
 import { serverErrorDetail } from '../../utils/apiError'
-import { currentLocale } from '../../i18n'
 import type { ChatAttachment } from './chat-types'
 import type { ContextChip } from './contextChips'
 import MediaPickerDialog from './MediaPickerDialog.vue'
-import ComposerTools from './ComposerTools.vue'
-import LanguageSwitcher from '../common/LanguageSwitcher.vue'
 import { useAuthStore } from '../../stores/auth'
 import { privateKey } from '../../utils/privateStorage'
 import { notify } from '../../utils/notify'
 import { TOUR_ANCHORS } from '../../composables/useOnboardingTour'
 import { classifyEnter } from './ime'
-import { MIC_BAND_COUNT, useMicBars } from './useMicBars'
-import { playUiSound } from '../../utils/uiSounds'
 import { fileTypeBadge } from '../../utils/fileName'
 
 import { useI18n } from 'vue-i18n'
@@ -36,8 +30,6 @@ const props = defineProps<{
   persona?: string
   /** 可选人格（后台「人格管理」里启用的条目；由父组件加载）。 */
   personaOptions?: { label: string; value: string }[]
-  /** 账户菜单（设置 / 通知 / 资料 / 锁定 / 退出）——聊天气泡底部的「更多」。 */
-  userMenuItems?: MenuProps['items']
   /** 工具授权模式（ask/auto/yolo）：控制工具执行是否需要用户确认 */
   toolsMode?: string
   /** 输出风格（default/concise/detailed/teaching/code）：差距B，用户可见的输出控制 */
@@ -72,8 +64,6 @@ const emit = defineEmits<{
   (e: 'model-change', model: string): void
   /** 人格切换（空字符串 = 跟随默认人格） */
   (e: 'persona-change', personaId: string): void
-  /** 账户菜单项被点击（key 与 AppLayout / 侧栏同一套） */
-  (e: 'user-menu', key: string): void
   /** 工具授权模式：ask=写类需确认 / auto=仅危险 / yolo=全跳过 */
   (e: 'tools-mode-change', mode: string): void
   /** 输出风格（差距B）：default/concise/detailed/teaching/code */
@@ -201,31 +191,6 @@ const THINK_LANGUAGE_META = [
 ] as const
 const thinkLanguageOptions = computed(() => THINK_LANGUAGE_META.map(o => ({ value: o.value, label: o.label })))
 
-// ── 提示精炼（差距B）：把粗糙输入改成更明确的提示 ──
-//
-// **不自动应用**：由用户点按触发，结果填回输入框（用户可继续改或撤销）。
-// 失败时**保持原输入不变**并提示 —— 精炼失败绝不能把用户写的话弄丢。
-const refining = ref(false)
-async function refineInput() {
-  const text = input.value.trim()
-  if (!text || refining.value) return
-  refining.value = true
-  try {
-    const res = await api.post('/v1/agent/refine', { content: text })
-    const data = res.data as { ok?: boolean; refined?: string; error?: string }
-    if (data?.ok && data.refined) {
-      input.value = data.refined
-      notify.success(tr('chat.refined'))
-    } else {
-      notify.warning(data?.error || tr('chat.refine_failed'))
-    }
-  } catch {
-    notify.warning(tr('chat.refine_failed'))
-  } finally {
-    refining.value = false
-  }
-}
-
 // ── 输入框 placeholder 多态 ──
 //
 // 对齐 reasonix 的 `composerPlaceholder`：placeholder 不是一句固定文案，而是**随状态**
@@ -263,22 +228,6 @@ watch(
 
 onUnmounted(() => {
   if (elapsedTimer !== undefined) clearInterval(elapsedTimer)
-  // 语音输入：组件被卸载（切会话/切路由）时把麦克风还回去。
-  // 不停的话录音轨会一直占着设备，用户下次点录音可能拿到静音轨。
-  //
-  // `disposed` 必须先于 `stop()` 置位：`stop()` 触发的 `onstop` 是异步的，
-  // 若不在入口拦住，切换会话会顺带把这段录音上传一次（见 `finishRecording`）。
-  disposed = true
-  if (recordingInterval) clearInterval(recordingInterval)
-  recordingInterval = null
-  micBars.stop()
-  const active = recorder
-  recorder = null
-  recChunks = []
-  if (active && active.state !== 'inactive') {
-    try { active.stop() } catch { /* 已停止 */ }
-  }
-  stopRecStream()
 })
 
 // 会话切换/恢复时同步（父组件回传 llm_config.model；空 = 后端默认）
@@ -287,9 +236,6 @@ watch(() => props.model, (v) => { modelValue.value = v || '' }, { immediate: tru
 // 挂载自动聚焦 + 加载可用模型
 onMounted(async () => {
   textareaRef.value?.focus?.()
-  // 语音输入能力探测：只查引擎侧依赖与开关（不加载模型），据此决定按钮是否可点。
-  // 不 await：它不该挡住输入框聚焦与模型列表，探测结果到达后再更新按钮态。
-  void probeVoiceAvailability()
   try {
     modelsLoading.value = true
     models.value = await listModels()
@@ -928,223 +874,6 @@ function removeAttachment(id: string) {
   if (idx >= 0) pendingAttachments.value.splice(idx, 1)
 }
 
-// ── 语音输入（本地离线转写） ──
-//
-// 录音走 `MediaRecorder`，转写走引擎里的 `faster-whisper`
-//（`POST /v1/audio/transcribe`，见 python-engine/app/api/audio.py）。
-//
-// 为什么不用浏览器的 `webkitSpeechRecognition`：它在 Chromium 里构造器存在，但
-// **识别后端是 Google 的在线语音服务**，Electron 官方构建不含该服务密钥 ——
-// 桌面包里 `start()` 看似成功、随后 `onerror` 报 `network`，用户看到的是
-// "进入录音态然后失败"。旧注释里"浏览器本地识别、不上传音频"那句话因此是错的：
-// 音频实际上被发去了第三方在线服务。
-//
-// 现在的取舍是**换成把音频发到本机引擎**：不出这台机器、不产生第三方费用，
-// 代价是首用要下载模型（数百 MB）与一次几秒的转写等待。
-const canRecordAudio =
-  typeof navigator !== 'undefined'
-  && !!navigator.mediaDevices?.getUserMedia
-  && typeof window.MediaRecorder !== 'undefined'
-
-const recording = ref(false)
-/** 录音已停、正在等引擎返回文本。与 `recording` 分开：此时不该再点按钮。 */
-const transcribing = ref(false)
-const recordingTimer = ref(0)
-/** 6 频段电平柱：`--level` 由 rAF 直接写 DOM（不走响应式，60fps 不该触发 Composer 重渲染） */
-const barEls = ref<HTMLElement[]>([])
-const micBars = useMicBars(levels => {
-  for (let i = 0; i < barEls.value.length; i++) {
-    barEls.value[i]?.style.setProperty('--level', String(levels[i] ?? 0))
-  }
-})
-let recordingInterval: ReturnType<typeof setInterval> | null = null
-/** 当前录音的媒体流。**与波形共用同一路** —— 各开一路会让部分驱动给录音静音轨。 */
-let recStream: MediaStream | null = null
-let recorder: MediaRecorder | null = null
-let recChunks: Blob[] = []
-/** 按下录音那一刻输入框的**原始**内容（用于判断录音期间用户有没有改过） */
-let speechBaseline = ''
-/**
- * 组件已卸载。卸载时会把录音 `stop()` 掉，而 `onstop` 是**异步**回调 ——
- * 不拦的话，切换会话/切路由会顺带把这段录音上传一遍（用户已经离开这一次录音，
- * 却还为它多走一趟网络），再把文本写进一个已销毁组件的 ref。
- */
-let disposed = false
-/** 转写结果要接在它之后（已把结尾空白归一成单个空格） */
-let speechPrefix = ''
-/**
- * 本机能否转写。`null` = 尚未探测完 —— 此时**不禁用**按钮：
- * 禁用态先闪一下再恢复，比"按钮灰着等一秒"更让人困惑。
- */
-const voiceAvailable = ref<boolean | null>(null)
-/** 不可用原因（引擎/网关给的可读说明），用于按钮 title 与点击时的提示 */
-const voiceUnavailableReason = ref('')
-
-/** 录音按容器能力挑一个编码；都不支持（极旧内核）就让浏览器自己决定。 */
-function pickAudioMimeType(): string | undefined {
-  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
-  for (const type of candidates) {
-    try {
-      if (MediaRecorder.isTypeSupported?.(type)) return type
-    } catch { /* 探测本身失败：继续试下一个 */ }
-  }
-  return undefined
-}
-
-/**
- * 交给引擎的语言码：界面语言的主语言部分（`zh-CN` → `zh`）。
- *
- * 不传空串而是尽量给提示，是因为**短句**（"好的"、"开会")在自动语种判定下很容易
- * 被判成别的语言，然后转出一串无关文字。引擎侧接受空串 = 自动判定。
- */
-function speechLanguage(): string {
-  const base = currentLocale().split('-')[0]?.toLowerCase() ?? ''
-  return base === 'zh' || base === 'en' || base === 'ar' ? base : ''
-}
-
-function stopRecStream() {
-  recStream?.getTracks().forEach(track => track.stop())
-  recStream = null
-}
-
-/** 挂载时探测一次"本机能不能转写"，据此决定按钮是否可点与提示文案。 */
-async function probeVoiceAvailability() {
-  if (!canRecordAudio) {
-    voiceAvailable.value = false
-    voiceUnavailableReason.value = tr('chat.this_environment_has_no_microphone_recording_support')
-    return
-  }
-  const a = await getAudioAvailability()
-  voiceAvailable.value = a.available
-  voiceUnavailableReason.value = a.reason
-}
-
-async function startRecording() {
-  if (recording.value || transcribing.value) return
-  if (!canRecordAudio) {
-    notify.warning(tr('chat.this_environment_has_no_microphone_recording_support'))
-    return
-  }
-  if (voiceAvailable.value === false) {
-    // 按钮在不可用时已置灰，这里只是兜底（探测之后能力又被关掉的情况）
-    notify.warning(voiceUnavailableReason.value || tr('chat.voice_input_is_unavailable_on_this_machine'))
-    return
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-    recStream = stream
-    recChunks = []
-    const mimeType = pickAudioMimeType()
-    recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
-    recorder.ondataavailable = (e: BlobEvent) => { if (e.data?.size) recChunks.push(e.data) }
-    recorder.onstop = () => { void finishRecording() }
-    // 记下"按下录音那一刻"的内容：录音期间用户仍可编辑，转写结果不该覆盖它
-    speechBaseline = input.value
-    speechPrefix = input.value ? input.value.replace(/\s*$/, ' ') : ''
-    recorder.start()
-
-    recording.value = true
-    recordingTimer.value = 0
-    recordingInterval = setInterval(() => { recordingTimer.value++ }, 1000)
-    // 波形复用录音这一路流：各开一路会让两个消费者抢设备，部分驱动下录音轨静音
-    void micBars.start(stream)
-    playUiSound('voice-enter')
-  } catch (error) {
-    stopRecStream()
-    recorder = null
-    const name = (error as { name?: string } | null)?.name || ''
-    // NotAllowedError / SecurityError：用户拒了权限或非安全上下文
-    notify.error(
-      name === 'NotAllowedError' || name === 'SecurityError'
-        ? tr('errors.microphone_permission_denied_please_allow_it_in_your_browser_settings_and_retry')
-        : tr('errors.unable_to_start_speech_transcription_please_check_microphone_permission'),
-    )
-  }
-}
-
-/** 收尾：停表、停流、把已录到的数据交给引擎。 */
-async function finishRecording() {
-  recorder = null
-  const chunks = recChunks
-  recChunks = []
-  stopRecStream()
-
-  // 已卸载（切会话/切路由）：这段录音本来就没打算发出去，
-  // 别为一个用户已经离开的输入框多跑一趟网络，也别再写它的 ref。
-  if (disposed) return
-
-  const type = chunks[0]?.type || 'audio/webm'
-  const blob = new Blob(chunks, { type })
-  if (!blob.size) {
-    transcribing.value = false
-    return
-  }
-  try {
-    const { text } = await transcribeAudio(blob, speechLanguage())
-    if (text) {
-      // 录音期间用户可能还在打字：此时**追加**而不是覆盖。
-      // 用 `speechBaseline`（按下录音那一刻的原文）判断"用户改过没有" ——
-      // 按长度比会在"删掉几个字又重新输入"时误判成没改过，然后吞掉他写的内容。
-      const current = input.value
-      const untouched = current === speechBaseline || current === speechPrefix
-      input.value = untouched ? speechPrefix + text : `${current.replace(/\s*$/, ' ')}${text}`
-      historyCursor.value = null
-      saveDraft()
-      nextTick(() => textareaRef.value?.focus?.())
-    } else {
-      // 静音/没听清不是错误：明确说"没识别到"，而不是把空串悄悄吞掉
-      notify.info(tr('chat.no_speech_was_detected_please_speak_closer_to_the_microphone'))
-    }
-  } catch (error) {
-    const status = (error as { response?: { status?: number } } | null)?.response?.status
-    const detail = serverErrorDetail(error, '')
-    if (status === 503) {
-      // 本机缺 faster-whisper 或开关关了：把引擎给的可操作说明原样呈现，
-      // 并同步按钮态（否则用户会一直点一个必然失败的按钮）
-      voiceAvailable.value = false
-      voiceUnavailableReason.value = detail
-      notify.warning(detail || tr('chat.voice_input_is_unavailable_on_this_machine'))
-    } else if (status === 413) {
-      notify.warning(tr('chat.recording_is_too_long_please_shorten_it_and_try_again'))
-    } else {
-      notify.error(`${tr('errors.speech_transcription_failed')}${detail ? `: ${detail}` : ''}`)
-    }
-  } finally {
-    transcribing.value = false
-  }
-}
-
-function stopRecording() {
-  if (!recording.value) return
-  recording.value = false
-  micBars.stop()
-  if (recordingInterval) {
-    clearInterval(recordingInterval)
-    recordingInterval = null
-  }
-  playUiSound('voice-exit')
-  const active = recorder
-  if (active && active.state !== 'inactive') {
-    // 先亮"转写中"，再让 onstop 接管：中间不能有一段"按钮可点但什么都不会发生"
-    transcribing.value = true
-    try {
-      active.stop()
-    } catch {
-      transcribing.value = false
-      stopRecStream()
-      recorder = null
-    }
-  } else {
-    stopRecStream()
-  }
-}
-
-function formatRecordingTime(seconds: number): string {
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
-  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`
-}
-
 // ── 斜杠命令 ──
 // 用 computed 而非常量数组：desc 是用户可见文案，常量在模块加载时求值一次，
 // 语言切换后会一直停在旧语言。
@@ -1512,8 +1241,6 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
               <PaperClipOutlined />
             </template>
           </Button>
-          <!-- 可用工具：从右侧栏搬来，放在"这一轮怎么跑"的功能带里 -->
-          <ComposerTools />
           <Button
             type="text"
             size="small"
@@ -1524,47 +1251,6 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
             <template #icon>
               <FolderOpenOutlined />
             </template>
-          </Button>
-          <Button
-            type="text"
-            size="small"
-            class="record-btn"
-            :class="{ recording: recording, transcribing: transcribing }"
-            :disabled="voiceAvailable === false || transcribing"
-            :title="recording
-              ? $t('common.click_to_stop_voice_input')
-              : transcribing
-                ? $t('chat.transcribing_voice_input')
-                : (voiceAvailable === false
-                  ? (voiceUnavailableReason || $t('chat.voice_input_is_unavailable_on_this_machine'))
-                  : $t('media.voice_input_transcribed_locally_by_the_engine_audio_never_leaves_this_machine'))"
-            @click="recording ? stopRecording() : startRecording()"
-          >
-            <template #icon>
-              <AudioOutlined />
-            </template>
-            <span
-              v-if="recording"
-              class="mic-bars"
-              aria-hidden
-            >
-              <span
-                v-for="i in MIC_BAND_COUNT"
-                :key="i"
-                ref="barEls"
-                class="mic-bar"
-              />
-            </span>
-            <span
-              v-if="recording"
-              class="recording-timer"
-            >{{ formatRecordingTime(recordingTimer) }}</span>
-            <!-- 转写中：录音已停、正在等引擎返回文本。给一个明确的进行态，
-                 否则用户会以为"按了没反应"然后再点一次。 -->
-            <span
-              v-if="transcribing"
-              class="recording-timer"
-            >{{ $t('chat.transcribing') }}</span>
           </Button>
           <!-- 模式 + 工具授权收进一个 popover：两者都是"偶发调整"的设置项，
                常驻会让底栏拥挤且与模型抢注意力；模型是高频切换项，仍留在底栏。
@@ -1670,47 +1356,6 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
               @change="(v: any) => emit('persona-change', String(v ?? ''))"
             />
           </template>
-          <!-- 差距B：提示精炼 —— 把当前输入改写成更明确的提示（点按触发，不自动应用）。
-               常驻可见（而非收进设置弹层）：它作用的是"这一次输入"，属于即时动作。 -->
-          <Button
-            type="text"
-            size="small"
-            class="context-btn refine-btn"
-            :loading="refining"
-            :disabled="!input.trim()"
-            :title="$t('chat.refine_prompt_tooltip')"
-            @click="refineInput"
-          >
-            <template #icon>
-              <ThunderboltOutlined />
-            </template>
-            <span class="context-label">{{ $t('chat.refine') }}</span>
-          </Button>
-          <span class="input-divider" />
-          <!-- 语言切换与「更多」账户菜单：从顶栏 / 侧栏底部搬进 composer 功能带。 -->
-          <LanguageSwitcher compact />
-          <Dropdown
-            v-if="userMenuItems?.length"
-            trigger="click"
-            placement="topRight"
-          >
-            <Button
-              type="text"
-              size="small"
-              class="context-btn"
-              :title="$t('admin.user_menu')"
-            >
-              <template #icon>
-                <MoreOutlined />
-              </template>
-            </Button>
-            <template #overlay>
-              <Menu
-                :items="userMenuItems"
-                @click="(info: { key: string | number }) => emit('user-menu', String(info.key))"
-              />
-            </template>
-          </Dropdown>
 <!--          <Button-->
 <!--            type="text"-->
 <!--            size="small"-->
@@ -1997,27 +1642,6 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
 .input-field.is-manual-height { height: var(--manual-h) !important; }
 .attach-btn { color: var(--text-tertiary); display: inline-flex; align-items: center; justify-content: center; }
 .attach-btn:hover { color: var(--primary); }
-/* 录音按钮 */
-.record-btn { color: var(--text-tertiary); display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
-.record-btn:hover { color: var(--primary); }
-.record-btn.recording { color: var(--error); animation: pulse-rec var(--dur-pulse) ease-in-out infinite; }
-/* 转写中：录音已停、在等引擎返回。用中性色 + 无动画 —— 这不是"正在录音"，
-   红色脉冲会让人以为麦克风还开着。 */
-.record-btn.transcribing { color: var(--text-secondary); }
-.record-btn:disabled { color: var(--text-disabled, var(--text-tertiary)); opacity: 0.5; cursor: not-allowed; }
-@keyframes pulse-rec {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-/* 录音电平柱（CDS v1 §5.1.3）：6 频段、4–24px，高度由 --level(0..1) 驱动。
-   刻意**不加 transition**：rAF 每帧直接写值已经足够平滑，加过渡反而滞后于音量。 */
-.mic-bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 24px; }
-.mic-bar {
-  width: 3px; height: calc(4px + 20px * var(--level, 0));
-  border-radius: var(--radius-full);
-  background: currentColor;
-}
-.recording-timer { font-size: 12px; font-variant-numeric: tabular-nums; min-width: 32px; }
 /* 拖拽态：边框主色 + 背景淡色 */
 /* 拖拽态：雷厉风行 —— 进出都不做过渡（避免拖入/拖出时"慢半拍"） */
 .input-card.drag-active {
