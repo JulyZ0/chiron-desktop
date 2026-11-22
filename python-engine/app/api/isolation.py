@@ -212,6 +212,15 @@ def _switch_level(
     before = iso.status()
 
     iso.set_runtime_level(level, acknowledge_below_floor=acknowledge)
+    # 受限令牌：探活缓存可能是"助手启动前"的负结果（引擎启动门禁先探过一次）。
+    # 用户点切档时若助手现在可用，必须重探一次再判定 —— 否则会把一次成功切换
+    # 报成 requested=restricted / effective=low_il。
+    if level is iso.Level.RESTRICTED:
+        from app.isolation import win_launch
+
+        helper_ok, _helper_reason = win_launch.helper_available()
+        if helper_ok:
+            iso.reset_probes()
     state = iso.status()
     decision = iso.resolve_level()
 

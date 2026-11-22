@@ -15,9 +15,8 @@ import { Button, message, Tag, Slider } from 'ant-design-vue'
 import EmptyState from '../common/EmptyState.vue'
 import RunModePanel from './RunModePanel.vue'
 import IsolationPanel from './IsolationPanel.vue'
-import EngineEnvPanel from './EngineEnvPanel.vue'
 import TwoFactorPanel from './TwoFactorPanel.vue'
-import AboutPanel from './AboutPanel.vue'
+import VersionPanel from './VersionPanel.vue'
 import ShortcutSettingsPanel from './ShortcutSettingsPanel.vue'
 import LanguageSwitcher from '../common/LanguageSwitcher.vue'
 // 设置面板顶部的系统自检（P1-9）：与首页抽屉、欢迎引导共用同一组件与单例数据源
@@ -338,15 +337,6 @@ onMounted(async () => {
       <IsolationPanel />
     </a-tab-pane>
 
-    <!-- ── 引擎功能开关：只认进程环境变量，桌面端没有 shell，只能在这里配 ── -->
-    <a-tab-pane
-      v-if="deviceStore.isDesktop"
-      key="engine-env"
-      :tab="$t('settings.engine_env_title')"
-    >
-      <EngineEnvPanel />
-    </a-tab-pane>
-
     <!-- ── 两步验证（可选）：解锁时的第二因素。仅桌面端 —— Web 端没有"本机解锁"这回事 ── -->
     <a-tab-pane
       v-if="deviceStore.isDesktop"
@@ -356,12 +346,12 @@ onMounted(async () => {
       <TwoFactorPanel />
     </a-tab-pane>
 
-    <!-- ── 关于：产品定位与源码仓库。纯静态信息，桌面端与 Web 端都展示 ── -->
+    <!-- ── 版本：当前版本 + 在线升级（桌面端；Web 端说明不支持） ── -->
     <a-tab-pane
-      key="about"
-      :tab="$t('settings.about_tab')"
+      key="version"
+      :tab="$t('settings.version_tab')"
     >
-      <AboutPanel />
+      <VersionPanel />
     </a-tab-pane>
   </a-tabs>
 </template>

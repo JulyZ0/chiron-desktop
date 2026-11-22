@@ -183,13 +183,12 @@ const routes = [
     children: [
       {
         path: '',
-        redirect: '/admin/dashboard',
+        redirect: { path: '/admin/monitor', query: { tab: 'overview' } },
       },
       {
+        // 仪表盘已并入「运行时监控」的总览 Tab；保留旧路径重定向，书签不会 404。
         path: 'dashboard',
-        name: 'AdminDashboard',
-        component: () => import('../views/admin/DashboardView.vue'),
-        meta: { title: t('common.dashboard') },
+        redirect: { path: '/admin/monitor', query: { tab: 'overview' } },
       },
       {
         path: 'api-keys',
@@ -230,6 +229,13 @@ const routes = [
         name: 'AdminPersonas',
         component: () => import('../views/admin/PersonasView.vue'),
         meta: { title: t('admin.persona_title') },
+      },
+      {
+        // 引擎功能开关：只对桌面端有意义（改的是本机引擎进程环境）。
+        path: 'engine-env',
+        name: 'AdminEngineEnv',
+        component: () => import('../views/admin/EngineTogglesView.vue'),
+        meta: { title: t('settings.engine_env_title') },
       },
       {
         path: 'settings',

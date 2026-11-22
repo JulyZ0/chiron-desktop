@@ -37,10 +37,14 @@ logger = logging.getLogger(__name__)
 
 #: 探测结果的缓存。`:data:`None` 表示"还没探测过"。
 #:
-#: 只缓存**成功**：helper 是外部进程，随时可能消失，把失败也缓存住会让一次
-#: 瞬时故障变成永久降级。
+#: 只缓存**成功**一段时间：helper 是外部进程，随时可能消失（父进程守护退出、
+#: 安全软件杀掉、用户注销），把成功永久缓存会让 `restricted` 一直显示可用，
+#: 实际执行却撞死端口 —— 正是"助手显示运行中、档位却灰/不生效"的现场。
 _ready: bool | None = None
 _ready_reason = ""
+#: 成功缓存的过期时刻（monotonic）。超过后重新 ping 一次，成本是回环 HTTP。
+_ready_until = 0.0
+_READY_TTL_SECONDS = 10.0
 _lock = threading.Lock()
 
 #: 最近一次 ping 得到的 helper 协议版本（`None` = 还没探测到）。
@@ -58,11 +62,12 @@ def helper_protocol() -> int | None:
 
 def reset_probe() -> None:
     """清缓存，供档位切换后重新探测（与 `win_launch.reset_probe` 同语义）。"""
-    global _ready, _ready_reason, _helper_protocol
+    global _ready, _ready_reason, _helper_protocol, _ready_until
     with _lock:
         _ready = None
         _ready_reason = ""
         _helper_protocol = None
+        _ready_until = 0.0
 
 
 # ── 共享密钥 ─────────────────────────────────────────────
@@ -134,10 +139,12 @@ def _ping(port: int, key: bytes, timeout: float) -> tuple[bool, bool, str]:
 
 def available() -> tuple[bool, str]:
     """helper 是否可用于 `restricted` 执行。返回 `(ok, 原因)`。"""
-    global _ready, _ready_reason
+    global _ready, _ready_reason, _ready_until
     if not win.IS_WINDOWS:
         return False, "非 Windows 平台"
-    if _ready:
+    import time
+
+    if _ready and time.monotonic() < _ready_until:
         return True, ""
 
     key, _warn = ensure_key()
@@ -148,15 +155,20 @@ def available() -> tuple[bool, str]:
     if not port:
         reason = "提权 helper 未启动（缺少端口文件）"
         with _lock:
+            _ready = False
+            _ready_until = 0.0
             _ready_reason = reason
         return False, reason
 
     ok, elevated, detail = _ping(port, key, proto.PING_TIMEOUT_SECONDS)
     if not ok:
-        # 端口文件可能是上一次运行残留的，清掉以免每次都白试。
-        _clear_port_file()
+        # 只删**这一份**残留端口文件：新 helper 可能刚好重写了它，无条件删除
+        # 会把活的助手变成"缺少端口文件"（随后 20s 永远等不就绪）。
+        _clear_port_file(port)
         reason = f"提权 helper 无响应（{detail}）"
         with _lock:
+            _ready = False
+            _ready_until = 0.0
             _ready_reason = reason
         return False, reason
     if not elevated:
@@ -164,12 +176,15 @@ def available() -> tuple[bool, str]:
         # 如实报告，不要让用户以为"helper 起了就等于好了"。
         reason = "提权 helper 已启动但未获得管理员权限（UAC 未同意）"
         with _lock:
+            _ready = False
+            _ready_until = 0.0
             _ready_reason = reason
         return False, reason
 
     with _lock:
         _ready = True
         _ready_reason = ""
+        _ready_until = time.monotonic() + _READY_TTL_SECONDS
     return True, ""
 
 
@@ -179,9 +194,23 @@ def unavailable_reason() -> str:
     return "" if ok else (reason or _ready_reason or "提权 helper 不可用")
 
 
-def _clear_port_file() -> None:
+def _clear_port_file(expected_port: int | None = None) -> None:
+    """删除端口文件。给了 ``expected_port`` 时只在内容仍是它时才删。
+
+    竞态：旧 helper 退出后留下端口文件；用户点启用 → 新 helper 刚写入新端口，
+    而旧的一次失败探测若仍按"无条件删"执行，就会把**新**文件删掉 —— 之后
+    wait_ready 恒报"缺少端口文件"，用户看到"授权成功但用不了"。
+    """
     try:
-        proto.port_path().unlink(missing_ok=True)
+        path = proto.port_path()
+        if expected_port is not None:
+            try:
+                current = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                return
+            if current != str(expected_port):
+                return
+        path.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -427,6 +456,17 @@ def spawn_elevated(parent_pid: int | None = None) -> tuple[bool, str, bool]:
     """
     if not win.IS_WINDOWS:
         return False, "非 Windows 平台", False
+    # 已在运行就直接复用：重复点「启用」不该再弹一次 UAC，更不该起多个 helper
+    # 抢同一个端口文件（旧进程会覆盖新进程写的端口，导致"起了但永远不就绪"）。
+    already, _why = available()
+    if already:
+        return True, "", False
+    # 清掉上一次异常退出留下的端口文件：否则 wait_ready 会先读到旧端口、ping 失败，
+    # 再删除文件（与本次 helper 的写入竞争），最终报一个误导性的"缺少端口文件"。
+    try:
+        proto.port_path().unlink(missing_ok=True)
+    except OSError:
+        pass
     pid = parent_pid if parent_pid is not None else os.getpid()
     key, warn = ensure_key()
     if not key:

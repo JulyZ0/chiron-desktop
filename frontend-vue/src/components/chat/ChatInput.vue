@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch, computed, nextTick, h } from 'vue'
-import { Input, Button, Select, Tooltip, Popover } from 'ant-design-vue'
-import { SendOutlined, StopOutlined, PaperClipOutlined, CloseOutlined, BranchesOutlined, AudioOutlined, FolderOpenOutlined, SettingOutlined, ThunderboltOutlined } from '@ant-design/icons-vue'
+import { Input, Button, Select, Tooltip, Popover, Dropdown, Menu } from 'ant-design-vue'
+import type { MenuProps } from 'ant-design-vue'
+import { SendOutlined, StopOutlined, PaperClipOutlined, CloseOutlined, BranchesOutlined, AudioOutlined, FolderOpenOutlined, SettingOutlined, ThunderboltOutlined, MoreOutlined } from '@ant-design/icons-vue'
 import api, { uploadFile, listModels, getAudioAvailability, transcribeAudio } from '../../api'
 import type { LlmModel } from '../../api'
 import { serverErrorDetail } from '../../utils/apiError'
@@ -9,6 +10,8 @@ import { currentLocale } from '../../i18n'
 import type { ChatAttachment } from './chat-types'
 import type { ContextChip } from './contextChips'
 import MediaPickerDialog from './MediaPickerDialog.vue'
+import ComposerTools from './ComposerTools.vue'
+import LanguageSwitcher from '../common/LanguageSwitcher.vue'
 import { useAuthStore } from '../../stores/auth'
 import { privateKey } from '../../utils/privateStorage'
 import { notify } from '../../utils/notify'
@@ -33,6 +36,8 @@ const props = defineProps<{
   persona?: string
   /** 可选人格（后台「人格管理」里启用的条目；由父组件加载）。 */
   personaOptions?: { label: string; value: string }[]
+  /** 账户菜单（设置 / 通知 / 资料 / 锁定 / 退出）——聊天气泡底部的「更多」。 */
+  userMenuItems?: MenuProps['items']
   /** 工具授权模式（ask/auto/yolo）：控制工具执行是否需要用户确认 */
   toolsMode?: string
   /** 输出风格（default/concise/detailed/teaching/code）：差距B，用户可见的输出控制 */
@@ -67,6 +72,8 @@ const emit = defineEmits<{
   (e: 'model-change', model: string): void
   /** 人格切换（空字符串 = 跟随默认人格） */
   (e: 'persona-change', personaId: string): void
+  /** 账户菜单项被点击（key 与 AppLayout / 侧栏同一套） */
+  (e: 'user-menu', key: string): void
   /** 工具授权模式：ask=写类需确认 / auto=仅危险 / yolo=全跳过 */
   (e: 'tools-mode-change', mode: string): void
   /** 输出风格（差距B）：default/concise/detailed/teaching/code */
@@ -1505,6 +1512,8 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
               <PaperClipOutlined />
             </template>
           </Button>
+          <!-- 可用工具：从右侧栏搬来，放在"这一轮怎么跑"的功能带里 -->
+          <ComposerTools />
           <Button
             type="text"
             size="small"
@@ -1677,6 +1686,31 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
             </template>
             <span class="context-label">{{ $t('chat.refine') }}</span>
           </Button>
+          <span class="input-divider" />
+          <!-- 语言切换与「更多」账户菜单：从顶栏 / 侧栏底部搬进 composer 功能带。 -->
+          <LanguageSwitcher compact />
+          <Dropdown
+            v-if="userMenuItems?.length"
+            trigger="click"
+            placement="topRight"
+          >
+            <Button
+              type="text"
+              size="small"
+              class="context-btn"
+              :title="$t('admin.user_menu')"
+            >
+              <template #icon>
+                <MoreOutlined />
+              </template>
+            </Button>
+            <template #overlay>
+              <Menu
+                :items="userMenuItems"
+                @click="(info: { key: string | number }) => emit('user-menu', String(info.key))"
+              />
+            </template>
+          </Dropdown>
 <!--          <Button-->
 <!--            type="text"-->
 <!--            size="small"-->

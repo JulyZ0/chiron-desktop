@@ -955,6 +955,18 @@ def status() -> dict[str, Any]:
     caps = win.capability_report()
     want = configured_level()
     decision = resolve_level(want)
+    # 受限令牌的探活缓存可能是负结果（引擎启动时 helper 还没起）。若请求 restricted
+    # 却降级、而 helper 现在可用，重探一次再出结论 —— 否则用户"启用助手成功"后
+    # 面板会一直显示档位不可选，直到某次端点恰好清了缓存。
+    if want is Level.RESTRICTED and decision.effective is not Level.RESTRICTED:
+        try:
+            from app.isolation import win_launch
+
+            if win_launch.helper_available()[0]:
+                reset_probes()
+                decision = resolve_level(want)
+        except Exception as exc:  # noqa: BLE001 — 重探失败沿用原结论
+            logger.warning("isolation restricted re-probe skipped: %s", exc)
     # 只列**本机真能做到**的档位。低于安全底线的档位也列出来 —— 它们现在
     # 可以在设置页被显式选择（`job` 直接生效，`none` 需二次确认）；
     # 挡在墙外会让"关掉隔离"变成一个只能改代码才可达的选项。

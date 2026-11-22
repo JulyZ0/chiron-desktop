@@ -1,15 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
-import { Button, Avatar, Dropdown, Menu, MenuItem, MenuDivider, SubMenu, Modal, Input } from 'ant-design-vue'
+import { computed, ref, watch } from 'vue'
+import { Button, Dropdown, Menu, MenuItem, MenuDivider, SubMenu, Modal, Input } from 'ant-design-vue'
 import {
   SearchOutlined, CloseOutlined, LeftOutlined, DownOutlined,
   PlusOutlined, EllipsisOutlined, EditOutlined, PushpinOutlined,
-  ShareAltOutlined, DeleteOutlined, TagOutlined, ReloadOutlined,
+  ShareAltOutlined, DeleteOutlined, TagOutlined,
   ApartmentOutlined, BarChartOutlined,
 } from '@ant-design/icons-vue'
-import { useRouter } from 'vue-router'
-import { api, listTools } from '../../api'
-import type { ToolInfo } from '../../utils/toolList'
 import type { ContextChip } from './contextChips'
 import { DEFAULT_KB_WEIGHT, KB_WEIGHT_MAX, KB_WEIGHT_MIN, clampKbWeight } from './contextChips'
 import { formatRelativeTime } from './chat-types'
@@ -17,69 +14,10 @@ import type { ChatItem, ChatSession } from './chat-types'
 import { mergeTagOptions, normalizeTag, TAG_MAX_LEN } from './sessionTags'
 import SessionStatsPanel from './SessionStatsPanel.vue'
 import ProjectSidebar from '../../views/sessionmap/ProjectSidebar.vue'
-import ThemeSwitcher from '../ThemeSwitcher.vue'
-import LanguageSwitcher from '../common/LanguageSwitcher.vue'
-import SettingsPanel from '../settings/SettingsPanel.vue'
-import { useAuthStore } from '../../stores/auth'
-import { useDeviceStore } from '../../stores/device'
-import { buildAccountMenuItems, accountMenuRoute, type AccountMenuItem } from '../accountMenu'
 
 import { useI18n } from 'vue-i18n'
 const { t: tr } = useI18n()
 
-/**
- * 侧栏底部的主题 / 用户入口。
- *
- * 为什么在这里而不是沿用页面右上角：那里是**固定定位**的胶囊
- * （AppLayout 的 .topbar-actions，top:12 / right:12 / 落在 --z-drawer 层）。
- * 侧栏在右侧时消息区变窄、两者不重叠；一旦交换布局把侧栏移到左侧，
- * 消息区变宽、工具栏右端顶到页面右边缘，就会被它盖住「更多操作」。
- * 所以聊天页改由这里承载（AppLayout 在该页隐藏了那个胶囊）。
- * 菜单项与 AppLayout 保持一致，避免两条入口行为漂移。
- * 注：引用下方的 router / authStore 均在函数体或 computed getter 内，惰性求值，无 TDZ 问题。
- */
-const authStore = useAuthStore()
-const settingsOpen = ref(false)
-
-/** 用户菜单项：icon 是渲染函数（ant-design-vue 的 Menu item 契约），不是组件实例。
- *
- * 内容由 `components/accountMenu.ts` 统一构造 —— 此前本组件与 AppLayout 各写一份
- * 并已漂移：这份只有 settings/profile/logout，而聊天页**隐藏了顶栏**
- * （AppLayout 的 isChatPage），于是聊天过程中的用户点不到通知中心与用户级 API Key。
- * 通知最常见的场景正是"对话时收到支付成功 / 套餐到期提醒"。
- */
-const userMenuItems = computed<AccountMenuItem[]>(() =>
-  buildAccountMenuItems((k) => tr(k), {
-    isLocal: useDeviceStore().isLocal(),
-    // 聊天页不展示 API Key 管理：它是账号凭证，与对话工作区的心智距离最远。
-    // 这是**显式**的差异，而不是靠两份实现各自漂移出来的。
-    includeApiKeys: false,
-  }),
-)
-
-async function handleUserMenuClick(info: { key: string | number }) {
-  const key = String(info.key)
-  if (key === 'lock') {
-    // 显式锁定（本地模式）。此后解锁要过 OS 密码 + 已启用时的 TOTP。
-    authStore.lock()
-    return
-  }
-  if (key === 'logout') {
-    await authStore.logout()
-    // 本地模式：logout 是锁定，不跳路由（解锁后停在原会话上）。见 stores/auth.ts。
-    if (authStore.locked) return
-    void router.push('/')
-    return
-  }
-  if (key === 'settings') {
-    settingsOpen.value = true
-    return
-  }
-  const target = accountMenuRoute(key)
-  if (target) {
-    void router.push(target)
-  }
-}
 const props = withDefaults(defineProps<{
   items: ChatItem[]
   selectedIndex: number | null
@@ -88,7 +26,6 @@ const props = withDefaults(defineProps<{
   view: 'trajectory' | 'sessions' | 'agents' | 'stats' | 'map'
   sessions: ChatSession[]
   activeSessionId: string
-  userName?: string
   /** 当前会话上下文芯片（知识库/Agent/技能/工作流，可移除） */
   contextChips?: ContextChip[]
   /** 正在流式运行的会话 id 集合：在侧栏会话行上显示呼吸心跳点 */
@@ -122,7 +59,6 @@ const emit = defineEmits<{
   (e: 'binding-changed'): void
 }>()
 
-const router = useRouter()
 const trajectoryQuery = ref('')
 const sessionQuery = ref('')
 const hoveredIndex = ref<number | null>(null)
@@ -203,117 +139,6 @@ function onWeightInput(chip: ContextChip, event: Event) {
   const raw = (event.target as HTMLInputElement).value
   emit('kb-weight', chip.value, clampKbWeight(raw))
 }
-
-// ── 可用工具（/v1/tools：含 MCP/插件注入的代理工具，source='mcp'）──
-// 懒加载：展开时才请求，避免每次打开面板都打一次接口
-const availableTools = ref<ToolInfo[]>([])
-const toolsLoading = ref(false)
-const toolsError = ref(false)
-const toolsExpanded = ref(false)
-let toolsLoaded = false
-
-const mcpToolCount = computed(() => availableTools.value.filter(t => t.source === 'mcp').length)
-
-/** 标题右侧摘要：直接列出 MCP 工具名 —— 只报数字等于没说清"到底激活了哪些能力" */
-const toolsSummary = computed(() => {
-  if (toolsError.value) return tr('errors.failed_to_load')
-  if (toolsLoading.value) return '…'
-  const total = availableTools.value.length
-  if (!total) return tr('common.none')
-  const mcpNames = availableTools.value.filter(isMcpTool).map(t => t.name).slice(0, 3)
-  if (mcpNames.length) {
-    const more = mcpToolCount.value > mcpNames.length ? ` +${mcpToolCount.value - mcpNames.length}` : ''
-    return tr('agent.n_mcp_mcp_more', { n: total, mcp: mcpNames.join(', '), more })
-  }
-  return tr('common.n', { n: total })
-})
-
-function isMcpTool(t: ToolInfo): boolean {
-  return t.source === 'mcp'
-}
-
-async function loadTools() {
-  if (toolsLoading.value || toolsLoaded) return
-  toolsLoading.value = true
-  toolsError.value = false
-  try {
-    availableTools.value = await listTools()
-    toolsLoaded = true
-  } catch {
-    // 失败不自动重试：收起再展开即可重来（toolsLoaded 仍为 false）
-    toolsError.value = true
-  } finally {
-    toolsLoading.value = false
-  }
-}
-
-function toggleTools() {
-  toolsExpanded.value = !toolsExpanded.value
-  if (toolsExpanded.value) void loadTools()
-}
-
-// ── 最近活动（/v1/activities，30s 轮询；点击跳转）──
-interface ActivityItem {
-  id: string
-  title: string
-  route: string
-  status: string
-  timestamp: string | number
-}
-/** `/v1/activities` 的原始行（各字段都可能缺，映射时逐项兜底） */
-interface ActivityRow {
-  id?: string
-  workstation?: string
-  timestamp?: string | number
-  title?: string
-  route?: string
-  status?: string
-}
-const recentActivities = ref<ActivityItem[]>([])
-const activitiesLoading = ref(false)
-let activityTimer: ReturnType<typeof setInterval> | null = null
-
-async function loadActivities() {
-  if (!props.open) return
-  activitiesLoading.value = true
-  try {
-    const res = await api.get('/v1/activities?limit=8')
-    const list: ActivityRow[] = res.data?.activities || []
-    recentActivities.value = list.map((a, i) => ({
-      id: a.id || `${a.workstation || 'act'}_${a.timestamp || i}`,
-      title: a.title || tr('common.no_title_yet'),
-      route: a.route || '/chat',
-      status: a.status || '',
-      timestamp: a.timestamp || 0,
-    }))
-  } catch {
-    /* 拉取失败保留上次列表 */
-  } finally {
-    activitiesLoading.value = false
-  }
-}
-
-function actTime(ts: string | number): string {
-  if (!ts) return ''
-  const d = new Date(ts)
-  return Number.isNaN(d.getTime()) ? '' : formatRelativeTime(d.toISOString(), tr)
-}
-
-function goActivity(a: ActivityItem) {
-  void router.push(a.route || '/chat')
-}
-
-// 面板打开时立即刷新一次（常驻挂载，onMounted 只跑一次）
-watch(() => props.open, (v) => { if (v) void loadActivities() })
-
-onMounted(() => {
-  void loadActivities()
-  activityTimer = setInterval(() => { void loadActivities() }, 30000)
-})
-
-onUnmounted(() => {
-  if (activityTimer) { clearInterval(activityTimer); activityTimer = null }
-})
 
 // ── 主视图：当前会话轨迹（仅用户提问作为锚点） ──
 const userIndexes = computed(() =>
@@ -592,61 +417,6 @@ function pickSession(id: string) {
       </div>
     </div>
 
-    <!-- 中部：可用工具（/v1/tools）——把 MCP/插件注入的工具从"看不见"变成"看得见"。
-         默认收起：内置工具数十个，展开会挤掉下面的轨迹与活动区 -->
-    <div class="panel-tools">
-      <button
-        type="button"
-        class="tools-head"
-        :title="toolsExpanded ? $t('agent.collapse_tool_list') : $t('agent.show_tool_list')"
-        @click="toggleTools"
-      >
-        <span class="tools-title">{{ $t('agent.available_tools') }}</span>
-        <span class="tools-count">{{ toolsSummary }}</span>
-        <DownOutlined
-          class="tools-arrow"
-          :class="{ expanded: toolsExpanded }"
-        />
-      </button>
-      <div
-        v-if="toolsExpanded"
-        class="tools-body"
-      >
-        <div
-          v-if="toolsLoading"
-          class="tools-empty"
-        >
-          {{ $t('common.loading') }}
-        </div>
-        <div
-          v-else-if="toolsError"
-          class="tools-empty"
-        >
-          {{ $t('errors.failed_to_load_tools') }}
-        </div>
-        <div
-          v-else-if="!availableTools.length"
-          class="tools-empty"
-        >
-          {{ $t('agent.no_available_tools') }}
-        </div>
-        <template v-else>
-          <div
-            v-for="t in availableTools"
-            :key="t.name"
-            class="tool-row"
-            :title="t.description || t.name"
-          >
-            <span class="tool-name">{{ t.name }}</span>
-            <span
-              v-if="isMcpTool(t)"
-              class="tool-badge"
-            >MCP</span>
-          </div>
-        </template>
-      </div>
-    </div>
-
     <!-- 主视图：当前会话轨迹（搜索 + 时间线 + 提问锚点） -->
     <template v-if="view === 'trajectory'">
       <div class="panel-search">
@@ -727,54 +497,6 @@ function pickSession(id: string) {
         </div>
       </div>
 
-      <!-- 底部：最近活动（/v1/activities，30s 轮询，点击跳转） -->
-      <div class="panel-activities">
-        <div class="act-head">
-          <span class="act-title">{{ $t('common.recent_activity') }}</span>
-          <span
-            class="act-refresh"
-            role="button"
-            tabindex="0"
-            :title="$t('common.refresh')"
-            :aria-label="$t('common.refresh')"
-            @click="loadActivities"
-            @keydown.enter.prevent="loadActivities"
-            @keydown.space.prevent="loadActivities"
-          ><ReloadOutlined /></span>
-        </div>
-        <div
-          v-if="activitiesLoading && !recentActivities.length"
-          class="act-empty"
-        >
-          {{ $t('common.loading') }}
-        </div>
-        <div
-          v-else-if="!recentActivities.length"
-          class="act-empty"
-        >
-          {{ $t('common.no_activity_yet') }}
-        </div>
-        <div
-          v-else
-          class="act-list"
-        >
-          <button
-            v-for="a in recentActivities"
-            :key="a.id"
-            type="button"
-            class="act-row"
-            :title="a.title"
-            @click="goActivity(a)"
-          >
-            <span
-              class="act-dot"
-              :class="a.status || ''"
-            />
-            <span class="act-text">{{ a.title }}</span>
-            <span class="act-time">{{ actTime(a.timestamp) }}</span>
-          </button>
-        </div>
-      </div>
     </template>
 
     <!-- 从视图：项目（主）+ 全部会话（次） -->
@@ -968,100 +690,7 @@ function pickSession(id: string) {
         </template>
       </div>
 
-      <!-- 底部：最近活动（/v1/activities，30s 轮询，点击跳转） -->
-      <div class="panel-activities">
-        <div class="act-head">
-          <span class="act-title">{{ $t('common.recent_activity') }}</span>
-          <span
-            class="act-refresh"
-            role="button"
-            tabindex="0"
-            :title="$t('common.refresh')"
-            :aria-label="$t('common.refresh')"
-            @click="loadActivities"
-            @keydown.enter.prevent="loadActivities"
-            @keydown.space.prevent="loadActivities"
-          ><ReloadOutlined /></span>
-        </div>
-        <div
-          v-if="activitiesLoading && !recentActivities.length"
-          class="act-empty"
-        >
-          {{ $t('common.loading') }}
-        </div>
-        <div
-          v-else-if="!recentActivities.length"
-          class="act-empty"
-        >
-          {{ $t('common.no_activity_yet') }}
-        </div>
-        <div
-          v-else
-          class="act-list"
-        >
-          <button
-            v-for="a in recentActivities"
-            :key="a.id"
-            type="button"
-            class="act-row"
-            :title="a.title"
-            @click="goActivity(a)"
-          >
-            <span
-              class="act-dot"
-              :class="a.status || ''"
-            />
-            <span class="act-text">{{ a.title }}</span>
-            <span class="act-time">{{ actTime(a.timestamp) }}</span>
-          </button>
-        </div>
-      </div>
 
-      <!-- 底部：主题切换 + 用户入口。
-           原先只是静态头像；现在承载 AppLayout 在聊天页隐藏掉的那两个入口，
-           否则交换布局后右上角的固定胶囊会盖住消息区工具栏的「更多操作」。 -->
-      <div class="panel-foot">
-        <Avatar
-          :size="22"
-          :style="{ backgroundColor: 'var(--primary)' }"
-        >
-          {{ (authStore.user?.nickname || authStore.user?.name || userName || 'U').charAt(0).toUpperCase() }}
-        </Avatar>
-        <span class="foot-name">{{ authStore.user?.nickname || authStore.user?.name || userName || $t('admin.user_2') }}</span>
-        <ThemeSwitcher class="foot-theme" />
-        <LanguageSwitcher compact />
-        <Dropdown
-          v-if="authStore.user"
-          trigger="click"
-          placement="topRight"
-        >
-          <button
-            type="button"
-            class="foot-user-btn"
-            :title="tr('admin.user_menu')"
-            @click.stop
-          >
-            <EllipsisOutlined />
-          </button>
-          <template #overlay>
-            <Menu
-              :items="userMenuItems"
-              @click="handleUserMenuClick"
-            />
-          </template>
-        </Dropdown>
-      </div>
-
-      <!-- 设置弹窗：与 AppLayout / /profile 共用同一份实现 -->
-      <Modal
-        v-model:open="settingsOpen"
-        :title="tr('settings.settings')"
-        :footer="null"
-        :width="720"
-        destroy-on-close
-      >
-        <SettingsPanel />
-      </Modal>
       <!-- 自定义标签：此前设置菜单里只有四个写死的标签（用户报告"标签恒定、无法自定义"）-->
       <Modal
         :open="!!customTagTarget"
@@ -1123,7 +752,6 @@ function pickSession(id: string) {
   .session-more-btn { width: 36px; height: 36px; }
   .anchor-row { min-height: 36px; }
   .tag-chip { min-height: 32px; }
-  .panel-foot { padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
 }
 @media (max-width: 576px) { .side-panel { width: 100%; } }
 /* 触屏无 hover：行操作按钮常驻可点 */
@@ -1184,30 +812,6 @@ function pickSession(id: string) {
 .weight-name { flex: 0 1 40%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .weight-slider { flex: 1 1 auto; min-width: 0; accent-color: var(--primary); }
 .weight-value { flex: none; font-variant-numeric: tabular-nums; color: var(--text-tertiary); }
-
-/* ── 可用工具：让 MCP/插件注入的工具在对话页可见（默认收起）── */
-.panel-tools { flex: none; border-bottom: var(--hairline-width) solid var(--border); }
-.tools-head {
-  display: flex; align-items: center; gap: 6px; width: 100%;
-  padding: 8px 12px; border: none; background: none;
-  color: var(--text-tertiary); font-size: var(--fs-xs); text-align: start; cursor: pointer;
-  transition: color var(--dur-fast) ease;
-}
-.tools-head:hover { color: var(--primary); }
-.tools-title { flex: none; }
-.tools-count { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tools-arrow { flex: none; font-size: var(--fs-xs); transition: transform var(--dur-fast) ease; }
-.tools-arrow.expanded { transform: rotate(180deg); }
-.tools-body { max-height: 200px; overflow-y: auto; padding: 0 6px 6px; scrollbar-width: thin; scrollbar-color: var(--text-disabled) transparent; }
-.tools-empty { padding: 10px 8px; text-align: center; color: var(--text-muted); font-size: 12px; }
-.tool-row { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: var(--sig-radius-button); }
-.tool-row:hover { background: var(--bg-hover); }
-.tool-name { flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tool-badge {
-  flex: none; padding: 0 6px; border-radius: var(--sig-radius-card);
-  background: var(--primary-bg); color: var(--primary);
-  font-size: var(--fs-xs); line-height: 16px; font-weight: var(--fw-semibold);
-}
 
 /* 搜索框（轨迹 / 会话通用） */
 .panel-search { flex: none; display: flex; align-items: center; gap: 4px; margin: 8px 12px 0; padding: 0 8px; height: 28px; background: var(--bg-secondary); border-radius: var(--sig-radius-button); }
@@ -1334,47 +938,4 @@ function pickSession(id: string) {
 .session-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: var(--session-menu-inner-r, var(--sig-radius-button)); }
 .menu-icon { font-size: 14px; }
 
-/* ── 最近活动（/v1/activities，30s 轮询）── */
-.panel-activities {
-  flex: none; display: flex; flex-direction: column;
-  border-top: var(--hairline-width) solid var(--border);
-  max-height: 220px;
-}
-.act-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px 4px; }
-.act-title { font-size: var(--fs-xs); color: var(--text-tertiary); }
-.act-refresh { font-size: var(--fs-xs); color: var(--text-tertiary); cursor: pointer; padding: 2px; border-radius: var(--radius-sm); transition: color var(--dur-fast) ease; }
-.act-refresh:hover { color: var(--primary); }
-.act-list { overflow-y: auto; padding: 0 6px 6px; scrollbar-width: thin; scrollbar-color: var(--text-disabled) transparent; }
-.act-row {
-  display: flex; align-items: center; gap: 8px; width: 100%;
-  padding: 6px 8px; border: none; border-radius: var(--sig-radius-button);
-  background: transparent; color: var(--text-secondary);
-  font-size: 12px; text-align: start; cursor: pointer;
-  transition: background var(--dur-fast) ease;
-}
-.act-row:hover { background: var(--bg-hover); }
-.act-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--text-disabled); }
-.act-dot.completed, .act-dot.success { background: var(--success); }
-.act-dot.running, .act-dot.pending { background: var(--primary); }
-.act-dot.failed, .act-dot.error { background: var(--danger, var(--error)); }
-.act-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.act-time { flex: none; font-size: var(--fs-xs); color: var(--text-muted); }
-.act-empty { padding: 10px 12px; font-size: var(--fs-xs); color: var(--text-muted); }
-
-/* 底部用户信息 */
-.panel-foot {
-  flex: none; display: flex; align-items: center; gap: 8px;
-  padding: 10px 14px; border-top: var(--hairline-width) solid var(--border);
-}
-.foot-name { font-size: 13px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 主题切换与用户菜单推到最右，与左侧头像/名字分开 */
-.foot-theme { margin-inline-start: auto; flex: none; }
-.foot-user-btn {
-  flex: none; display: inline-flex; align-items: center; justify-content: center;
-  width: 22px; height: 22px; padding: 0;
-  border: none; border-radius: var(--radius-sm, 4px);
-  background: transparent; color: var(--text-tertiary); cursor: pointer;
-  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
-}
-.foot-user-btn:hover { color: var(--text-primary); background: var(--bg-hover); }
 </style>

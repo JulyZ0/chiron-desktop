@@ -1900,44 +1900,150 @@ function relaunchIntoSetup() {
 }
 
 /**
- * 打包后才检查更新：开发环境没有 app-update.yml，也没有签名产物。
- * 更新源在 electron-builder.yml 的 publish 段（GitHub Releases）。
+ * 在线升级（不依赖 electron-updater）。
+ *
+ * ## 为什么不直接用 electron-updater
+ *
+ * 安装包刻意排除了 `node_modules`（asar 体积从 863MB 降到可用量级），
+ * electron-updater 及其依赖链因此不在包里。这里改用**官方发布清单** `latest.yml`：检查版本、展示更新、下载并
+ * 校验 SHA-512 后拉起安装器。链路短、无额外依赖，也与 CI 的上传资产一一对应。
+ *
+ * ## 安全边界
+ *
+ * - 只从固定仓库（`UPDATE_REPO`）取清单与安装包，不接受渲染层传入的 URL；
+ * - 安装包必须与清单里的 `sha512` 一致才会被执行；
+ * - 安装是**用户显式点击**的动作，不做静默升级。
  */
-function setupAutoUpdater() {
-  if (!app.isPackaged) return
-  let autoUpdater
-  try {
-    ;({ autoUpdater } = require('electron-updater'))
-  } catch (err) {
-    logMain('warn', `electron-updater unavailable: ${err.message}`)
-    return
-  }
-  autoUpdater.autoDownload = true
-  autoUpdater.autoInstallOnAppQuit = true
-  autoUpdater.on('error', err => logMain('warn', `update error: ${err?.message || err}`))
-  autoUpdater.on('update-available', info => logMain('info', `update available: ${info?.version || ''}`))
-  autoUpdater.on('update-not-available', () => logMain('info', 'update not available'))
-  autoUpdater.on('update-downloaded', info => {
-    logMain('info', `update downloaded: ${info?.version || ''}`)
-    void dialog
-      .showMessageBox({
-        type: 'info',
-        title: '更新已下载',
-        message: `Chiron ${info?.version || '新版本'} 已准备好，重启后生效。`,
-        buttons: ['立即重启', '稍后'],
-        defaultId: 0,
-        cancelId: 1,
-      })
-      .then(({ response }) => {
-        if (response === 0) autoUpdater.quitAndInstall()
-      })
-  })
-  // 延迟到首屏之后再检查，避免和首页资源抢带宽
-  setTimeout(() => {
-    autoUpdater.checkForUpdatesAndNotify().catch(err => {
-      logMain('warn', `update check failed: ${err?.message || err}`)
+const UPDATE_REPO = process.env.CHIRON_UPDATE_REPO || 'JulyZ0/chiron-desktop'
+const UPDATE_MANIFEST_URL = `https://github.com/${UPDATE_REPO}/releases/latest/download/latest.yml`
+const UPDATE_HTTP_TIMEOUT_MS = 15000
+const UPDATE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000
+
+/** 最近一次检查结果（下载阶段复用，避免信任渲染层回传的 URL）。 */
+let lastUpdate = null
+
+function httpsGetBuffer(url, redirects = 5, timeoutMs = UPDATE_HTTP_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith('http://') ? require('node:http') : require('node:https')
+    const req = lib.get(url, { headers: { 'User-Agent': `Chiron/${app.getVersion()}` } }, res => {
+      const status = res.statusCode || 0
+      if (status >= 300 && status < 400 && res.headers.location && redirects > 0) {
+        res.resume()
+        resolve(httpsGetBuffer(new URL(res.headers.location, url).toString(), redirects - 1, timeoutMs))
+        return
+      }
+      if (status < 200 || status >= 300) {
+        res.resume()
+        reject(new Error(`HTTP ${status}`))
+        return
+      }
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => resolve(Buffer.concat(chunks)))
     })
-  }, 8000)
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')))
+    req.on('error', reject)
+  })
+}
+
+/** 极简 latest.yml 解析：只取 version / files[].url / files[].sha512 / path。 */
+function parseLatestYml(text) {
+  const lines = String(text || '').split(/\r?\n/)
+  let version = ''
+  let path = ''
+  const files = []
+  let current = null
+  for (const raw of lines) {
+    const line = raw.trimEnd()
+    const top = line.match(/^([A-Za-z0-9_]+):\s*(.*)$/)
+    if (top) {
+      const key = top[1]
+      let value = top[2].trim().replace(/^['"]|['"]$/g, '')
+      if (key === 'version') version = value
+      if (key === 'path') path = value
+      if (key === 'files') current = null
+      continue
+    }
+    const item = line.match(/^\s*-\s*url:\s*(.*)$/)
+    if (item) {
+      current = { url: item[1].trim().replace(/^['"]|['"]$/g, '') }
+      files.push(current)
+      continue
+    }
+    const field = line.match(/^\s+(sha512|size):\s*(.*)$/)
+    if (field && current) {
+      current[field[1]] = field[2].trim().replace(/^['"]|['"]$/g, '')
+    }
+  }
+  const installers = files.filter(f => f.url && /\.(exe|msi)$/i.test(f.url))
+  const chosen = installers.find(f => /x64/i.test(f.url)) || installers[0] || null
+  if (!chosen && path) {
+    return { version, file: { url: path, sha512: '' } }
+  }
+  return { version, file: chosen }
+}
+
+/** 语义化版本比较（够用即可：只处理数字段与预发布后缀）。 */
+function compareVersions(a, b) {
+  const norm = v => String(v || '').trim().replace(/^v/i, '').split(/[+-]/)[0].split('.').map(n => parseInt(n, 10) || 0)
+  const x = norm(a)
+  const y = norm(b)
+  const len = Math.max(x.length, y.length)
+  for (let i = 0; i < len; i += 1) {
+    const d = (x[i] || 0) - (y[i] || 0)
+    if (d !== 0) return d > 0 ? 1 : -1
+  }
+  return 0
+}
+
+async function checkAppUpdate() {
+  const current = app.getVersion()
+  if (!app.isPackaged) {
+    return { ok: false, reason: 'unpackaged', message: '开发模式不检查更新', current }
+  }
+  let text = ''
+  try {
+    text = (await httpsGetBuffer(UPDATE_MANIFEST_URL)).toString('utf8')
+  } catch (err) {
+    return { ok: false, reason: 'network', message: err?.message || String(err), current }
+  }
+  const manifest = parseLatestYml(text)
+  if (!manifest.version || !manifest.file?.url) {
+    return { ok: false, reason: 'manifest', message: '更新清单缺少版本或安装包地址', current }
+  }
+  const hasUpdate = compareVersions(manifest.version, current) > 0
+  lastUpdate = hasUpdate ? manifest : null
+  return {
+    ok: true,
+    current,
+    latest: manifest.version,
+    hasUpdate,
+    releaseUrl: `https://github.com/${UPDATE_REPO}/releases/latest`,
+  }
+}
+
+async function downloadAndOpenUpdate() {
+  if (!lastUpdate) return { ok: false, reason: 'no-update', message: '请先检查更新' }
+  const url = `https://github.com/${UPDATE_REPO}/releases/latest/download/${encodeURIComponent(lastUpdate.file.url)}`
+  let buf
+  try {
+    buf = await httpsGetBuffer(url, 5, UPDATE_DOWNLOAD_TIMEOUT_MS)
+  } catch (err) {
+    return { ok: false, reason: 'download', message: err?.message || String(err) }
+  }
+  if (lastUpdate.file.sha512) {
+    const actual = crypto.createHash('sha512').update(buf).digest('base64')
+    if (actual !== lastUpdate.file.sha512) {
+      return { ok: false, reason: 'checksum', message: '安装包校验失败（SHA-512 不一致），已拒绝执行' }
+    }
+  }
+  const dir = path.join(app.getPath('temp'), 'chiron-update')
+  await fs.promises.mkdir(dir, { recursive: true })
+  const target = path.join(dir, path.basename(lastUpdate.file.url))
+  await fs.promises.writeFile(target, buf)
+  const failure = await shell.openPath(target)
+  if (failure) return { ok: false, reason: 'launch', message: failure, path: target }
+  return { ok: true, version: lastUpdate.version, path: target }
 }
 
 // userData 根必须在这里定下来，**早于单实例锁与 whenReady**：
@@ -2818,11 +2924,29 @@ if (!gotLock) {
       return { ok: true }
     })
 
+    // 版本与在线升级（手动清单方案，见 UPDATE_MANIFEST_URL 上方说明）。
+    ipcMain.handle('desktop:get-app-info', event => {
+      assertTrustedSender(event)
+      return {
+        version: app.getVersion(),
+        electron: process.versions.electron,
+        chrome: process.versions.chrome,
+        packaged: app.isPackaged,
+      }
+    })
+    ipcMain.handle('desktop:check-update', async event => {
+      assertTrustedSender(event)
+      return checkAppUpdate()
+    })
+    ipcMain.handle('desktop:install-update', async event => {
+      assertTrustedSender(event)
+      return downloadAndOpenUpdate()
+    })
+
     createWindow()
     // 主窗口已建出来，启动流程到此结束。此后 window-all-closed 才代表"用户真的关了窗口"；
     // 之前没有窗口只是启动期的正常中间态（见 window-all-closed 里的说明）。
     startupComplete = true
-    setupAutoUpdater()
 
     // macOS：点 Dock 图标且没有窗口时重开
     app.on('activate', () => {

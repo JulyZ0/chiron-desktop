@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { Alert, Button, Card, InputNumber, RadioButton, RadioGroup, Switch, Tag } from 'ant-design-vue'
 
 import AdminTabbedView from '@/components/admin/AdminTabbedView.vue'
+import DashboardView from './DashboardView.vue'
 import Sparkline from '@/components/admin/Sparkline.vue'
 import PerformancePanel from '@/components/admin/monitor/PerformancePanel.vue'
 import QueuePanel from '@/components/admin/monitor/QueuePanel.vue'
@@ -43,6 +44,10 @@ const {
 } = useMonitorOverview()
 
 const tabs = [
+  // 原「仪表盘」与「运行时监控」合并为一个入口：总览是"现在怎么样"，
+  // 三个面板是"慢/堵/缓存"的细分视图。放在同一页的 Tabs 里，避免两个菜单项
+  // 各自轮询同一批事实（连接数 / 队列 / 缓存 / 延迟）。
+  { key: 'overview', label: t('common.dashboard'), comp: DashboardView },
   { key: 'performance', label: t('admin.performance'), comp: PerformancePanel },
   { key: 'queue', label: t('admin.queue'), comp: QueuePanel },
   { key: 'cache', label: t('admin.cache'), comp: CachePanel },

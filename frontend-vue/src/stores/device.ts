@@ -121,6 +121,10 @@ export interface ChironDesktopHost {
    */
   getEngineEnvSettings?: () => Promise<EngineEnvSettingsResult>
   saveEngineEnvSettings?: (toggles: Record<string, boolean>) => Promise<EngineEnvSaveResult>
+  /** 版本信息与在线升级（桌面端；Web 端没有这些成员）。 */
+  getAppInfo?: () => Promise<AppInfo>
+  checkUpdate?: () => Promise<UpdateCheckResult>
+  installUpdate?: () => Promise<UpdateInstallResult>
   /**
    * 只重启本地后端（引擎 + 网关），不重启整个应用。
    *
@@ -205,6 +209,34 @@ export interface EngineEnvSettingsResult {
 export interface EngineEnvSaveResult {
   ok: boolean
   values?: Record<string, boolean>
+  reason?: string
+  message?: string
+}
+
+/** 桌面端版本信息（`desktop:get-app-info`）。 */
+export interface AppInfo {
+  version: string
+  electron: string
+  chrome: string
+  packaged: boolean
+}
+
+/** 检查更新结果。`ok=false` 时 `reason` 区分未打包 / 网络 / 清单异常。 */
+export interface UpdateCheckResult {
+  ok: boolean
+  current: string
+  latest?: string
+  hasUpdate?: boolean
+  releaseUrl?: string
+  reason?: string
+  message?: string
+}
+
+/** 下载并拉起安装器的结果（安装包已做 SHA-512 校验）。 */
+export interface UpdateInstallResult {
+  ok: boolean
+  version?: string
+  path?: string
   reason?: string
   message?: string
 }
@@ -795,6 +827,53 @@ export const useDeviceStore = defineStore('device', () => {
 
 
   /**
+   * 版本与在线升级。
+   *
+   * Web 端没有这些 IPC：返回 `null` / `unsupported`，页面据此显示"仅桌面端支持"，
+   * 而不是弹一个永远失败的按钮。
+   */
+  async function getAppInfo(): Promise<AppInfo | null> {
+    const host = desktopHost()
+    if (!host || typeof host.getAppInfo !== 'function') return null
+    try {
+      const info = await host.getAppInfo()
+      return info && typeof info === 'object' ? (info as AppInfo) : null
+    } catch {
+      return null
+    }
+  }
+
+  async function checkUpdate(): Promise<UpdateCheckResult> {
+    const host = desktopHost()
+    if (!host || typeof host.checkUpdate !== 'function') {
+      return { ok: false, current: '', reason: 'unsupported', message: 'online update is not supported in this environment' }
+    }
+    try {
+      const result = await host.checkUpdate()
+      return result && typeof result === 'object'
+        ? (result as UpdateCheckResult)
+        : { ok: false, current: '', reason: 'unexpected-response' }
+    } catch (err) {
+      return { ok: false, current: '', reason: 'error', message: (err as Error)?.message || String(err) }
+    }
+  }
+
+  async function installUpdate(): Promise<UpdateInstallResult> {
+    const host = desktopHost()
+    if (!host || typeof host.installUpdate !== 'function') {
+      return { ok: false, reason: 'unsupported', message: 'online update is not supported in this environment' }
+    }
+    try {
+      const result = await host.installUpdate()
+      return result && typeof result === 'object'
+        ? (result as UpdateInstallResult)
+        : { ok: false, reason: 'unexpected-response' }
+    } catch (err) {
+      return { ok: false, reason: 'error', message: (err as Error)?.message || String(err) }
+    }
+  }
+
+  /**
    * 重启本地后端（不改开关、只让已保存的配置生效）。
    *
    * 与 `restart()` 不同：那个重启整个应用。改引擎 env 只需要重启后端进程，
@@ -908,5 +987,8 @@ export const useDeviceStore = defineStore('device', () => {
     restartComponent,
     loadEngineEnvSettings,
     saveEngineEnvSettings,
+    getAppInfo,
+    checkUpdate,
+    installUpdate,
   }
 })

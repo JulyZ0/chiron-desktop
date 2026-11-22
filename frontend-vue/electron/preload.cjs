@@ -233,6 +233,11 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   saveEngineEnvSettings: toggles =>
     ipcRenderer.invoke('desktop:save-engine-env-settings', toggles || {}),
 
+  /** 版本信息与在线升级：检查 GitHub 发布清单、下载并校验安装包（见主进程 UPDATE_REPO）。 */
+  getAppInfo: () => ipcRenderer.invoke('desktop:get-app-info'),
+  checkUpdate: () => ipcRenderer.invoke('desktop:check-update'),
+  installUpdate: () => ipcRenderer.invoke('desktop:install-update'),
+
   /**
    * 复制文本（主进程通道，`utils/clipboard.ts` 的降级路径）。
    *

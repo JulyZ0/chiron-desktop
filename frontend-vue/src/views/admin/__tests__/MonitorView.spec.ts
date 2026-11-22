@@ -245,7 +245,14 @@ async function mountView() {
   const router = makeRouter()
   await router.push('/admin/monitor')
   await router.isReady()
-  const wrapper = mount(MonitorView, { global: { plugins: [router] } })
+  const wrapper = mount(MonitorView, {
+    global: {
+      plugins: [router],
+      // 总览 Tab 复用原仪表盘组件（依赖 echarts/pinia 与另一组接口）；
+      // 本文件验证的是「运行时监控」的三个面板与轮询口径，故桩掉它。
+      stubs: { DashboardView: true },
+    },
+  })
   await flushPromises()
   return wrapper
 }
@@ -273,13 +280,14 @@ describe('MonitorView 的运行时监控仪表盘', () => {
     expect(wrapper.find('[data-test="performance-panel"]').exists()).toBe(true)
 
     const tabs = tabButtons(wrapper)
-    expect(tabs.length).toBe(3)
+    // 总览（原仪表盘）+ 性能 / 队列 / 缓存
+    expect(tabs.length).toBe(4)
 
-    await tabs[1].trigger('click')
+    await tabs[2].trigger('click')
     await flushPromises()
     expect(wrapper.find('[data-test="queue-panel"]').exists()).toBe(true)
 
-    await tabButtons(wrapper)[2].trigger('click')
+    await tabButtons(wrapper)[3].trigger('click')
     await flushPromises()
     expect(wrapper.find('[data-test="cache-panel"]').exists()).toBe(true)
 
@@ -365,13 +373,13 @@ describe('MonitorView 的运行时监控仪表盘', () => {
     apiMocks.getMonitorOverview.mockResolvedValue(data)
 
     const wrapper = await mountView()
-    await tabButtons(wrapper)[1].trigger('click')
+    await tabButtons(wrapper)[2].trigger('click')
     await flushPromises()
     expect(wrapper.find('[data-test="kpi-queue-depth"]').text()).toBe('—')
     expect(wrapper.find('[data-test="kpi-active-runs"]').text()).toBe('—')
     expect(wrapper.text()).toContain('redis')
 
-    await tabButtons(wrapper)[2].trigger('click')
+    await tabButtons(wrapper)[3].trigger('click')
     await flushPromises()
     expect(wrapper.find('[data-test="kpi-redis-hit"]').text()).toBe('—')
     expect(wrapper.find('[data-test="kpi-llm-hit"]').text()).toBe('—')
@@ -457,7 +465,7 @@ describe('MonitorView 的运行时监控仪表盘', () => {
     apiMocks.getMonitorOverview.mockResolvedValue(data)
 
     const wrapper = await mountView()
-    await tabButtons(wrapper)[1].trigger('click')
+    await tabButtons(wrapper)[2].trigger('click')
     await flushPromises()
 
     const empty = wrapper.find('[data-test="stream-xack-engine"]')

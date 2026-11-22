@@ -3,6 +3,7 @@ import { ref, computed, h, watch, onBeforeUnmount } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '../../stores/auth'
 import { useThemeStore } from '../../stores/theme'
+import { useDeviceStore } from '../../stores/device'
 import {
   Layout,
   LayoutSider,
@@ -17,7 +18,6 @@ import {
   Dropdown,
 } from 'ant-design-vue'
 import {
-  DashboardOutlined,
   KeyOutlined,
   DatabaseOutlined,
   ThunderboltOutlined,
@@ -53,6 +53,7 @@ const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 const themeStore = useThemeStore()
+const deviceStore = useDeviceStore()
 
 // 折叠态：桌面端用 v-model，移动端用抽屉。
 // 折叠选择要**记住**：刷新后回到用户上次的状态，而不是每次重新展开。
@@ -104,8 +105,7 @@ const menuGroups = computed(() => [
   {
     key: 'g-monitor', label: t('admin.overview_monitoring'),
     children: [
-      { key: '/admin/dashboard', label: t('common.dashboard'), icon: () => h(DashboardOutlined) },
-      // 原「性能监控 / 队列监控 / 缓存监控」三页已合并为运行时监控（Tabs）
+      // 仪表盘与运行时监控已合并为一页（总览 / 性能 / 队列 / 缓存 Tabs）。
       { key: '/admin/monitor', label: t('admin.runtime_monitoring'), icon: () => h(ThunderboltOutlined) },
     ],
   },
@@ -126,6 +126,10 @@ const menuGroups = computed(() => [
     key: 'g-system', label: t('common.system'),
     children: [
       { key: '/admin/settings', label: t('settings.system_settings'), icon: () => h(SettingOutlined) },
+      // 引擎功能开关：只对桌面端有意义（改的是本机引擎进程环境）。
+      ...(deviceStore.isDesktop
+        ? [{ key: '/admin/engine-env', label: t('settings.engine_env_title'), icon: () => h(ControlOutlined) }]
+        : []),
       // 原「Redis 管理 + 数据库管理」合并为数据存储（Tabs）
       { key: '/admin/datastores', label: t('common.data_storage'), icon: () => h(DatabaseOutlined) },
       // D1：自诊断 —— 与设置/数据存储同属"系统"类：都是"让部署正确运转"的操作面。

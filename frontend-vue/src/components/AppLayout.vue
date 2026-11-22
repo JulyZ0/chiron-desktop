@@ -34,8 +34,6 @@ import {
 } from '@ant-design/icons-vue'
 import CommandPalette from './CommandPalette.vue'
 import BrandMark from './shell/BrandMark.vue'
-import ThemeSwitcher from './ThemeSwitcher.vue'
-import LanguageSwitcher from './common/LanguageSwitcher.vue'
 import SettingsPanel from './settings/SettingsPanel.vue'
 import { buildAccountMenuItems, accountMenuRoute, type AccountMenuItem } from './accountMenu'
 import { executeQuickCommand } from "@/components/WorkstationNav.vue"
@@ -354,13 +352,13 @@ async function runQuickCommand() {
       </nav>
     </header>
 
-    <!-- 右上角用户胶囊（聊天页隐藏，理由见 isChatPage 的注释） -->
+    <!-- 右上角用户胶囊（聊天页隐藏，理由见 isChatPage 的注释）。
+         语言 / 主题切换已移到首页的顶部操作区：顶栏只保留"我是谁"，
+         常驻一排开关会让每个页面看起来都像设置页。 -->
     <div
       v-if="!isChatPage"
       class="topbar-actions"
     >
-      <LanguageSwitcher />
-      <ThemeSwitcher />
       <div
         v-if="authStore.user"
         class="user-fab"

@@ -1453,7 +1453,9 @@ export async function getIsolationHelper(): Promise<IsolationHelperStatus> {
  * 前端要能把"你取消了"和"起不来"分开说。
  */
 export async function startIsolationHelper(): Promise<IsolationHelperResult> {
-  const resp = await api.post('/v1/system/isolation/helper')
+  // UAC 等待（最多 20s）+ 启动后的端到端探测（又可能 20s）会超过默认 30s；
+  // 前端先超时会把一次成功的启用报成失败。
+  const resp = await api.post('/v1/system/isolation/helper', undefined, { timeout: 60_000 })
   const raw = (resp.data?.data ?? resp.data) as IsolationHelperResult
   return {
     ...toIsolationStatus(raw),
@@ -1469,7 +1471,7 @@ export async function startIsolationHelper(): Promise<IsolationHelperResult> {
 
 /** 停用提权助手。幂等：本来没在跑也算成功。 */
 export async function stopIsolationHelper(): Promise<IsolationHelperResult> {
-  const resp = await api.delete('/v1/system/isolation/helper')
+  const resp = await api.delete('/v1/system/isolation/helper', { timeout: 30_000 })
   const raw = (resp.data?.data ?? resp.data) as IsolationHelperResult
   return {
     ...toIsolationStatus(raw),

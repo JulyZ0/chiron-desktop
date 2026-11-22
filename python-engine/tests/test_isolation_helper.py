@@ -144,13 +144,14 @@ def test_unresponsive_helper_clears_the_stale_port_file(fresh_probe, monkeypatch
     cleared: list[int] = []
     monkeypatch.setattr(client, "_read_port", lambda: 45678)
     monkeypatch.setattr(client, "_ping", lambda port, key, timeout: (False, False, "ConnectionRefused"))
-    monkeypatch.setattr(client, "_clear_port_file", lambda: cleared.append(1))
+    # 只允许删除**刚才探测到的那个端口**的残留文件：新 helper 可能已写入新端口。
+    monkeypatch.setattr(client, "_clear_port_file", lambda expected=None: cleared.append(expected))
 
     ok, reason = client.available()
 
     assert ok is False
     assert "无响应" in reason
-    assert cleared == [1]
+    assert cleared == [45678]
 
 
 @pytest.mark.skipif(not win.IS_WINDOWS, reason="helper 只在 Windows 上有意义")

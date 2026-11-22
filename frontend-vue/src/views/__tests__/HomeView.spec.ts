@@ -105,7 +105,13 @@ function mountView() {
   setActivePinia(pinia)
   // 直接写 store 的 ref：不进登录流程，避免多打一次接口
   useAuthStore().user = { id: 'u-1', email: '', name: 'me', role: 'user', tenant_id: 1 }
-  return mount(HomeView, { global: { plugins: [router, pinia] } })
+  return mount(HomeView, {
+    global: {
+      plugins: [router, pinia],
+      // 语言 / 主题切换依赖各自的 store 与 matchMedia；首页测试只验内容与数据口径。
+      stubs: { LanguageSwitcher: true, ThemeSwitcher: true },
+    },
+  })
 }
 
 describe('HomeView（工作台仪表盘）', () => {

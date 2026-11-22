@@ -26,6 +26,8 @@ import {
 import { api } from '../api'
 import { executeQuickCommand } from '../components/WorkstationNav.vue'
 import EmptyState from '../components/common/EmptyState.vue'
+import LanguageSwitcher from '../components/common/LanguageSwitcher.vue'
+import ThemeSwitcher from '../components/ThemeSwitcher.vue'
 import SelfCheckPanel from '../components/health/SelfCheckPanel.vue'
 import { useAuthStore } from '../stores/auth'
 import { formatSmart } from '../utils/datetime'
@@ -189,16 +191,21 @@ onMounted(() => {
           <h1 class="greeting-title">{{ $t('common.home_title') }}</h1>
           <p class="greeting-sub">{{ $t('common.home_subtitle') }}</p>
         </div>
-        <button
-          v-if="auth.isAdmin"
-          type="button"
-          class="selfcheck-btn"
-          data-testid="home-selfcheck-entry"
-          @click="selfCheckOpen = true"
-        >
-          <SafetyCertificateOutlined />
-          <span>{{ $t('health.entry') }}</span>
-        </button>
+        <div class="home-head-actions">
+          <!-- 语言 / 主题：从窗口顶栏移到这里（顶栏不再常驻一排开关）。 -->
+          <LanguageSwitcher />
+          <ThemeSwitcher />
+          <button
+            v-if="auth.isAdmin"
+            type="button"
+            class="selfcheck-btn"
+            data-testid="home-selfcheck-entry"
+            @click="selfCheckOpen = true"
+          >
+            <SafetyCertificateOutlined />
+            <span>{{ $t('health.entry') }}</span>
+          </button>
+        </div>
       </header>
 
       <!-- 主操作：一句话开工 -->
@@ -387,6 +394,7 @@ onMounted(() => {
   justify-content: space-between;
   gap: 16px;
 }
+.home-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .home-greeting { display: flex; flex-direction: column; gap: 6px; }
 .greeting-line { font-size: 13px; color: var(--text-secondary); letter-spacing: 0.02em; }
 .greeting-title { font-size: 28px; line-height: 1.2; margin: 0; font-weight: var(--fw-semibold); }

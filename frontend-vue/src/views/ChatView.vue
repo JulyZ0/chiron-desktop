@@ -25,6 +25,9 @@ import ChatHealthPanel from '../components/chat/ChatHealthPanel.vue'
 import { fetchComponentsHealth, isComponentUp, type ComponentsHealth } from '../api/systemHealth'
 import SessionPreviewPane from '../components/chat/SessionPreviewPane.vue'
 import { useAuthStore } from '../stores/auth'
+import { currentDeviceMode } from '../stores/device'
+import SettingsPanel from '../components/settings/SettingsPanel.vue'
+import { buildAccountMenuItems, accountMenuRoute, type AccountMenuItem } from '../components/accountMenu'
 import { privateKey } from '../utils/privateStorage'
 import { playUiSound } from '../utils/uiSounds'
 import { notify } from '../utils/notify'
@@ -86,6 +89,34 @@ const authStore = useAuthStore()
 const themeStore = useThemeStore()
 const route = useRoute()
 const router = useRouter()
+
+// 账户菜单：聊天页顶栏隐藏、侧栏底部已移除，入口统一收进 composer 的「更多」。
+const settingsOpen = ref(false)
+const userMenuItems = computed<AccountMenuItem[]>(() =>
+  buildAccountMenuItems((k) => t(k), {
+    isLocal: currentDeviceMode() === 'local',
+    includeApiKeys: false,
+  }),
+)
+
+async function handleUserMenu(key: string) {
+  if (key === 'lock') {
+    authStore.lock()
+    return
+  }
+  if (key === 'logout') {
+    await authStore.logout()
+    if (authStore.locked) return
+    void router.push('/')
+    return
+  }
+  if (key === 'settings') {
+    settingsOpen.value = true
+    return
+  }
+  const target = accountMenuRoute(key)
+  if (target) void router.push(target)
+}
 
 // 工具条低频操作（导出/主题）收进溢出菜单：条上只留「会话/轨迹」两个高频入口。
 // 菜单项在渲染时求值，故与 themeStore 的初始化顺序无关。
@@ -3472,6 +3503,8 @@ function continueGeneration() {
         @update:mode="onModeChange"
         @model-change="onModelChange"
         @persona-change="onPersonaChange"
+        @user-menu="handleUserMenu"
+        :user-menu-items="userMenuItems"
         @command="onSlashCommand"
         @open-panel="openContextPanel"
         @mention-add="onMentionAdd"
@@ -3604,7 +3637,6 @@ function continueGeneration() {
       :selected-index="trajectoryFocus"
       :sessions="sessions"
       :active-session-id="activeSessionId"
-      :user-name="authStore.user?.name"
       :context-chips="contextChips"
       :running-session-ids="sidebarRunningIds"
       @update:view="(v: 'trajectory' | 'sessions' | 'agents' | 'stats') => (panelView = v)"
@@ -3766,6 +3798,17 @@ function continueGeneration() {
           </Button>
         </div>
       </template>
+    </Modal>
+
+    <!-- 设置弹窗：账户菜单从 composer 打开；与 AppLayout / 侧栏共用同一份实现 -->
+    <Modal
+      v-model:open="settingsOpen"
+      :title="t('settings.settings')"
+      :footer="null"
+      :width="720"
+      destroy-on-close
+    >
+      <SettingsPanel />
     </Modal>
   </div>
 </template>
