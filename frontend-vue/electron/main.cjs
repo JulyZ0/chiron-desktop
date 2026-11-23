@@ -85,6 +85,7 @@ const { readToken, writeToken, clearToken } = require('./token-store.cjs')
 const { switchMode } = require('./mode-switch.cjs')
 const { wipeLocalData, relaunchAfterWipe } = require('./wipe-data.cjs')
 const { createDeviceFSBridge } = require('./device-fs.cjs')
+const { createMountDeps } = require('./mount-deps.cjs')
 const {
   parseLatestYml,
   compareVersions,
@@ -128,6 +129,9 @@ let currentMode = 'local'
 
 /** 设备文件桥（仅 cloud 模式）：桌面端主动外连远端网关，供 ProjectFS 读本机项目。 */
 let deviceBridge = null
+
+/** 团队挂载依赖管理器（rclone/WinFsp，按需下载校验；不随安装包）。 */
+let mountDeps = null
 /**
  * 本地后端状态：`{ ok, baseUrl, token, dataDir, via, reason, message }`，由 startLocalBackend 填充。
  * 本地模式下设备 token 由 Go 网关注入，这里留空（见 tryStartGoStack 的返回值）。
@@ -2408,6 +2412,15 @@ if (!gotLock) {
       assertTrustedSender(event)
       return deviceBridge ? deviceBridge.status() : null
     })
+    // 团队挂载依赖：只允许受信页面查询/触发；下载地址与校验值由主进程固定。
+    ipcMain.handle('desktop:mount-deps-status', event => {
+      assertTrustedSender(event)
+      return mountDeps ? mountDeps.status() : null
+    })
+    ipcMain.handle('desktop:install-mount-dep', (event, name) => {
+      assertTrustedSender(event)
+      return mountDeps ? mountDeps.install(String(name || '')) : { ok: false, reason: 'unsupported' }
+    })
 
     // 设备设置与模式：真相在主进程的 config.json（契约 §1），渲染进程读到的只是它。
     //
@@ -3061,6 +3074,9 @@ if (!gotLock) {
     // 设备文件桥：只在 cloud 模式启动（local 模式本机即执行端，不需要隧道）。
     if (!deviceBridge) {
       deviceBridge = createDeviceFSBridge({ app, readToken, log: logMain })
+    }
+    if (!mountDeps) {
+      mountDeps = createMountDeps({ app, net, shell, log: logMain })
     }
     createWindow()
     // 主窗口已建出来，启动流程到此结束。此后 window-all-closed 才代表"用户真的关了窗口"；

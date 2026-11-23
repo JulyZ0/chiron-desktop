@@ -31,6 +31,9 @@ const deviceStoreMock = vi.hoisted(() => ({
   // 让 TS 从首个返回值推断会把它锁成窄类型，后续用例再赋值就报错。
   wipeLocalData: vi.fn(async (): Promise<Record<string, unknown>> => ({ ok: true, relaunched: true })),
   checkHelloAvailability: vi.fn(async () => true),
+  // 挂载依赖块：桌面壳不支持时返回 null（本组用例不渲染该块）
+  getMountDepsStatus: vi.fn(async () => null),
+  installMountDep: vi.fn(async () => ({ ok: true })),
 }))
 
 vi.mock('../../../stores/device', () => ({

@@ -79,9 +79,12 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 | `AGENT_MAX_CONCURRENCY` | 20 | 全局同时运行回合 |
 | `AGENT_MAX_CONCURRENCY_PER_USER` | 2 | 每用户同时运行回合（0=不限） |
 | `AGENT_RUN_MAX_TOKENS` | 400000 | 单 run token 预算 |
+| `CHIRON_DEVICE_WRITE_ENABLED` | 1 | 租户级写回总闸；0/false/off 时所有 client 项目只读 |
 | `CHIRON_MIRROR_ROOT` | 临时目录 | client 项目镜像根 |
 
 部署：新构建自动 `alembic upgrade head`；源码团队主机先手动执行。team 模式要求 HTTPS、强 `APP_SECRET/JWT_SECRET`、精确 CORS。
+
+**已定部署决策**：团队主机继续**随桌面程序启动**（不做 headless 服务）；团队主机若使用挂载，依赖（rclone/WinFsp）由管理员在应用内按需安装。
 
 ## 8. 实现状态
 
@@ -116,14 +119,17 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 | rclone mount + WinFsp：fs/git/run_code 可用；rename/delete 生效 | 团队主机实测 |
 | 单文件读/写 P95 ≤50/150ms；10 分钟稳定；批量小文件不打满网关 | 团队主机实测 |
 
+**决策（已定）**：团队主机实测通过后**切换挂载并删除镜像**；实测前保留镜像为默认。
+
 ### 9.2.1 依赖获取（已定：不进安装包）
 
 rclone / WinFsp 只装在**服务端**（运行网关+引擎的主机），不随应用安装包分发，也不要求客户端安装。团队模式启用挂载时按需管理：
 
-- 存放：`<data>/deps/rclone/<version>`、`<data>/deps/winfsp/<version>`；版本与 SHA256 **钉死**在代码/发布清单里，取不到校验值就不下载。
-- **rclone**：固定版本 zip，由服务端管理员触发「检测 → 下载 → 校验 → 解压」；支持离线放置同版本文件。
-- **WinFsp**：内核驱动/安装器，**必须管理员确认**（UAC），不做静默安装；也可由管理员用 winget/choco 预装，我们只检测与校验版本。
-- 下载失败 / 校验失败 / 版本不满足：挂载功能明确不可用并报可行动错误，**回退按回合镜像**；绝不执行未经校验的二进制。
+- 已钉版本：rclone **v1.76.0**（windows-amd64 zip，SHA256 `8b4fd2…a1dc`）、WinFsp **v2.2.26323**（msi，SHA256 `36ce01…7e19`）；升级必须同时更新版本与校验值。
+- 存放：`<userData>/deps/rclone/<version>`、`<userData>/deps/winfsp/<version>`；取不到校验值就不下载。
+- **rclone**：管理员在「设置 → 运行模式 → 挂载依赖」点击后下载 → 校验 → 解压；支持离线放置同版本文件。
+- **WinFsp**：内核驱动/安装器，**必须管理员确认**（UAC），不做静默安装；也可用 winget/choco 预装，我们只检测版本。
+- 下载失败 / 校验失败 / 版本不满足：挂载明确不可用并报错，**回退镜像**；绝不执行未经校验的二进制。
 - 内网可配置镜像基址（同一套 SHA256 校验），默认官方 releases。
 
 ### 9.3 P1
@@ -144,7 +150,8 @@ rclone / WinFsp 只装在**服务端**（运行网关+引擎的主机），不�
 - 文件桥 v1 是否允许客户端 `git`（建议先只做读写/补丁）。
 - 项目换设备：重新授权（当前）还是内容同步。
 - chiron-server 走 BFF（建议）还是直连。
-- 团队主机是否允许 headless 部署。
+
+（已定：团队主机随桌面程序启动；rclone/WinFsp 服务端按需获取；R2 实测后切换挂载；R5 项目级租约 + 租户总闸。）
 
 ## 11. 参考
 

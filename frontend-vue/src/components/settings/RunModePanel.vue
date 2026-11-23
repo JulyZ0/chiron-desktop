@@ -30,6 +30,7 @@ import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import { useDeviceStore } from '../../stores/device'
+import type { MountDepName, MountDepsStatus } from '../../stores/device'
 import { useAuthStore } from '../../stores/auth'
 import { api, API_URL } from '../../api'
 import { isComponentUp, type ComponentsHealth } from '../../api/systemHealth'
@@ -122,6 +123,31 @@ const statusError = ref('')
 const statusCheckedAt = ref<Date | null>(null)
 const components = ref<ComponentsHealth | null>(null)
 const modelCount = ref<number | null>(null)
+
+// ── 团队挂载依赖（rclone/WinFsp，仅服务端主机按需安装）──
+const depsStatus = ref<MountDepsStatus | null>(null)
+const depsBusy = ref<MountDepName | ''>('')
+
+async function loadMountDeps() {
+  depsStatus.value = await device.getMountDepsStatus()
+}
+
+async function installMountDep(name: MountDepName) {
+  if (depsBusy.value) return
+  depsBusy.value = name
+  try {
+    const res = await device.installMountDep(name)
+    if (!res.ok) {
+      message.error(res.message || t('settings.mount_deps_failed'))
+      return
+    }
+    if (res.launched) message.info(t('settings.mount_deps_winfsp_launched'))
+    else message.success(t('settings.mount_deps_done'))
+    await loadMountDeps()
+  } finally {
+    depsBusy.value = ''
+  }
+}
 
 /** 当前模式实际使用的服务地址：远程取配置，本地取注入的本机基址 */
 const activeEndpoint = computed(() => {
@@ -282,6 +308,7 @@ async function submit() {
 onMounted(() => {
   void device.ensureReady()
   void refreshStatus()
+  if (device.isDesktop) void loadMountDeps()
 })
 </script>
 
@@ -385,6 +412,54 @@ onMounted(() => {
       <p class="mode-hint mode-hint-block">
         {{ $t('settings.run_status_exec_note') }}
       </p>
+    </div>
+
+    <!-- ── 团队挂载依赖：只装在服务端主机，按需下载并校验 ── -->
+    <div v-if="device.isDesktop && depsStatus" class="mode-block">
+      <div class="mode-block-title status-title">
+        <span>{{ $t('settings.mount_deps_title') }}</span>
+        <a-button size="small" @click="loadMountDeps">
+          {{ $t('settings.mount_deps_refresh') }}
+        </a-button>
+      </div>
+      <p class="mode-hint mode-hint-block">
+        {{ $t('settings.mount_deps_hint') }}
+      </p>
+      <div v-if="!depsStatus.supported" class="mode-row">
+        <span class="mode-hint">{{ $t('settings.mount_deps_unsupported') }}</span>
+      </div>
+      <template v-else>
+        <div class="mode-row deps-row">
+          <span class="deps-name">rclone</span>
+          <a-tag :color="depsStatus.rclone.installed ? 'green' : 'default'">
+            {{ depsStatus.rclone.installed ? $t('settings.mount_deps_installed') : $t('settings.mount_deps_missing') }}
+          </a-tag>
+          <span class="mode-hint">{{ depsStatus.rclone.installed ? depsStatus.rclone.path : depsStatus.rclone.version }}</span>
+          <a-button
+            v-if="!depsStatus.rclone.installed"
+            size="small"
+            :loading="depsBusy === 'rclone'"
+            @click="installMountDep('rclone')"
+          >
+            {{ depsBusy === 'rclone' ? $t('settings.mount_deps_installing') : $t('settings.mount_deps_install') }}
+          </a-button>
+        </div>
+        <div class="mode-row deps-row">
+          <span class="deps-name">WinFsp</span>
+          <a-tag :color="depsStatus.winfsp.installed ? 'green' : 'default'">
+            {{ depsStatus.winfsp.installed ? $t('settings.mount_deps_installed') : $t('settings.mount_deps_missing') }}
+          </a-tag>
+          <span class="mode-hint">{{ depsStatus.winfsp.installed ? (depsStatus.winfsp.installedVersion || depsStatus.winfsp.version) : depsStatus.winfsp.version }}</span>
+          <a-button
+            v-if="!depsStatus.winfsp.installed"
+            size="small"
+            :loading="depsBusy === 'winfsp'"
+            @click="installMountDep('winfsp')"
+          >
+            {{ depsBusy === 'winfsp' ? $t('settings.mount_deps_installing') : $t('settings.mount_deps_winfsp_install') }}
+          </a-button>
+        </div>
+      </template>
     </div>
 
     <!-- ── 清空本机数据：唯一的破坏性动作 ── -->
@@ -573,4 +648,6 @@ onMounted(() => {
   overflow-wrap: anywhere;
 }
 .status-code { font-family: var(--font-mono, monospace); direction: ltr; }
+.deps-row { margin-bottom: 8px; }
+.deps-name { width: 64px; font-weight: var(--fw-medium); }
 </style>

@@ -191,6 +191,9 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   /** 设备文件桥：稳定设备 id（项目归属用）与连接状态（设置页展示） */
   getDeviceId: () => ipcRenderer.invoke('desktop:get-device-id'),
   getDeviceBridgeStatus: () => ipcRenderer.invoke('desktop:get-device-bridge-status'),
+  /** 团队挂载依赖（rclone/WinFsp）：状态与按需安装（仅服务端主机） */
+  getMountDepsStatus: () => ipcRenderer.invoke('desktop:mount-deps-status'),
+  installMountDep: name => ipcRenderer.invoke('desktop:install-mount-dep', name),
 
   /**
    * 用系统默认程序打开本地路径，或在文件管理器里定位（`reveal: true`）。

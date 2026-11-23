@@ -10,17 +10,27 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
 )
 
+// deviceWriteTenantEnabled 是租户级总闸（部署层）：0/false/off 时任何项目都不能写回。
+func deviceWriteTenantEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("CHIRON_DEVICE_WRITE_ENABLED")))
+	return v != "0" && v != "false" && v != "off"
+}
+
 func deviceWriteLeaseKey(projectID string) string {
 	return db.RedisKey("device:write:lease:") + strings.TrimSpace(projectID)
 }
 
 func deviceWriteAllowed(ctx context.Context, projectID string) bool {
+	if !deviceWriteTenantEnabled() {
+		return false
+	}
 	if db.Redis == nil || strings.TrimSpace(projectID) == "" {
 		return false
 	}
@@ -91,6 +101,11 @@ func (h *SessionMapHandler) SetDeviceWriteLease(w http.ResponseWriter, r *http.R
 	}
 	if err := DecodeJSON(w, r, &body); err != nil || body.Allow == nil {
 		BadRequest(w, "allow is required")
+		return
+	}
+	if !deviceWriteTenantEnabled() {
+		JSONWithCode(w, http.StatusForbidden, "device_write_disabled", nil,
+			"device write-back is disabled for this deployment")
 		return
 	}
 	if err := setDeviceWriteLease(r.Context(), id, *body.Allow); err != nil {

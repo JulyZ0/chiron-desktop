@@ -127,6 +127,9 @@ export interface ChironDesktopHost {
   getAppInfo?: () => Promise<AppInfo>
   checkUpdate?: () => Promise<UpdateCheckResult>
   installUpdate?: () => Promise<UpdateInstallResult>
+  /** 团队挂载依赖（rclone/WinFsp）状态与按需安装；仅桌面主进程支持。 */
+  getMountDepsStatus?: () => Promise<MountDepsStatus>
+  installMountDep?: (name: MountDepName) => Promise<MountDepInstallResult>
   /**
    * 只重启本地后端（引擎 + 网关），不重启整个应用。
    *
@@ -238,6 +241,36 @@ export interface UpdateCheckResult {
 export interface UpdateInstallResult {
   ok: boolean
   version?: string
+  path?: string
+  reason?: string
+  message?: string
+}
+
+/** 团队挂载依赖（rclone / WinFsp）：只装在服务端主机，按需下载并校验。 */
+export type MountDepName = 'rclone' | 'winfsp'
+
+export interface MountDepComponentStatus {
+  installed: boolean
+  version: string
+  /** WinFsp 实际安装版本（registry） */
+  installedVersion?: string
+  /** rclone 可执行文件路径 */
+  path?: string
+}
+
+export interface MountDepsStatus {
+  platform: string
+  arch: string
+  supported: boolean
+  depsRoot: string
+  rclone: MountDepComponentStatus
+  winfsp: MountDepComponentStatus
+}
+
+export interface MountDepInstallResult {
+  ok: boolean
+  already?: boolean
+  launched?: boolean
   path?: string
   reason?: string
   message?: string
@@ -853,6 +886,32 @@ export const useDeviceStore = defineStore('device', () => {
     }
   }
 
+  async function getMountDepsStatus(): Promise<MountDepsStatus | null> {
+    const host = desktopHost()
+    if (!host || typeof host.getMountDepsStatus !== 'function') return null
+    try {
+      const result = await host.getMountDepsStatus()
+      return result && typeof result === 'object' ? (result as MountDepsStatus) : null
+    } catch {
+      return null
+    }
+  }
+
+  async function installMountDep(name: MountDepName): Promise<MountDepInstallResult> {
+    const host = desktopHost()
+    if (!host || typeof host.installMountDep !== 'function') {
+      return { ok: false, reason: 'unsupported', message: 'desktop shell does not support dependency install' }
+    }
+    try {
+      const result = await host.installMountDep(name)
+      return result && typeof result === 'object'
+        ? (result as MountDepInstallResult)
+        : { ok: false, reason: 'unexpected-response' }
+    } catch (err) {
+      return { ok: false, reason: 'error', message: (err as Error)?.message || String(err) }
+    }
+  }
+
   async function checkUpdate(): Promise<UpdateCheckResult> {
     const host = desktopHost()
     if (!host || typeof host.checkUpdate !== 'function') {
@@ -1001,5 +1060,7 @@ export const useDeviceStore = defineStore('device', () => {
     getAppInfo,
     checkUpdate,
     installUpdate,
+    getMountDepsStatus,
+    installMountDep,
   }
 })
