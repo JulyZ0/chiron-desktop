@@ -317,6 +317,9 @@ func syncProjectMirrorForSession(ctx context.Context, sessionID string) {
 	if !ok || loc.Provider != smProviderClient {
 		return
 	}
+	if !deviceWriteAllowed(ctx, loc.ID) {
+		return // R5：未授权写回时统一链路也不回写
+	}
 	// 请求 ctx 可能已随响应结束；回写用独立超时，不阻塞收尾太久。
 	tctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

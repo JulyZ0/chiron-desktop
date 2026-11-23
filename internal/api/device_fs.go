@@ -7,7 +7,7 @@ package api
 //
 //	远端 ProjectFS ──► deviceHub ──► /ws/device-fs ──► Electron 主进程 ──► 本机磁盘
 //
-// 设计约束（与 docs/prd-remote-execution-architecture.md §4 对齐）：
+// 设计约束（与 docs/prd-remote-team.md §4 对齐）：
 //   - 只读：v1 只有 canonicalize/stat/list/read；写与 git 在 S2。
 //   - 身份：复用登录 token（与 /ws/rpa 同一口径），device_id 由客户端上报并只在该
 //     用户/租户内生效；跨用户不可见。

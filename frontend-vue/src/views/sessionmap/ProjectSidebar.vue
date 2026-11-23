@@ -36,6 +36,7 @@ import {
   listProjectSessions,
   listProjects,
   listUnassignedSessions,
+  setDeviceWriteLease,
 } from './projectsApi'
 import type { ProjectSessionSummary, ProjectSummary } from './types'
 
@@ -245,6 +246,51 @@ function removeProject(project: ProjectSummary) {
   })
 }
 
+/** 设备写租约（R5）：client 项目默认只读，用户在这里显式授予/收回。 */
+async function toggleDeviceWrite(project: ProjectSummary) {
+  if (project.provider !== 'client') return
+  if (!project.write_allowed) {
+    Modal.confirm({
+      title: tr('chat.projects_write_title', { name: project.name }),
+      content: tr('chat.projects_write_body'),
+      okText: tr('chat.projects_write_allow'),
+      cancelText: tr('common.cancel'),
+      onOk: async () => {
+        try {
+          const allowed = await setDeviceWriteLease(project.id, true)
+          applyWriteAllowed(project.id, allowed)
+          message.success(tr('chat.projects_write_done'))
+        } catch (err) {
+          message.error(describeApiError(err, tr('chat.projects_write_failed')))
+          throw err
+        }
+      },
+    })
+    return
+  }
+  Modal.confirm({
+    title: tr('chat.projects_write_revoke'),
+    content: tr('chat.projects_write_revoke_body'),
+    okText: tr('chat.projects_write_revoke'),
+    okType: 'danger',
+    cancelText: tr('common.cancel'),
+    onOk: async () => {
+      try {
+        const allowed = await setDeviceWriteLease(project.id, false)
+        applyWriteAllowed(project.id, allowed)
+        message.success(tr('chat.projects_write_revoked'))
+      } catch (err) {
+        message.error(describeApiError(err, tr('chat.projects_write_failed')))
+        throw err
+      }
+    },
+  })
+}
+
+function applyWriteAllowed(id: string, allowed: boolean) {
+  projects.value = projects.value.map(p => (p.id === id ? { ...p, write_allowed: allowed } : p))
+}
+
 /** 时间显示走共享的相对时间函数：三个语言包的相对时间规则只有一份。 */
 function relative(iso: string) {
   return iso ? formatRelativeTime(iso, (k: string, p?: Record<string, unknown>) => t(k, p ?? {})) : ''
@@ -327,6 +373,16 @@ defineExpose({ refresh })
               @click.stop="emit('open-canvas', p.id)"
             >
               {{ tr('common.map') }}
+            </Button>
+            <Button
+              v-if="p.provider === 'client'"
+              type="text"
+              size="small"
+              class="proj-act"
+              :title="p.write_allowed ? tr('chat.projects_write_revoke_body') : tr('chat.projects_write_allow')"
+              @click.stop="toggleDeviceWrite(p)"
+            >
+              {{ p.write_allowed ? tr('chat.projects_write_writable') : tr('chat.projects_write_readonly') }}
             </Button>
             <Button
               type="text"

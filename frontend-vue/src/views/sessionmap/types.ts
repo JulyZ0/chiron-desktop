@@ -189,6 +189,8 @@ export interface ProjectSummary {
   provider?: 'server' | 'client'
   /** client 项目所属设备；server 项目为空 */
   device_id?: string
+  /** client 项目是否已授予设备写权限（默认只读） */
+  write_allowed?: boolean
 }
 
 /** 项目内的一条会话（`GET /v1/session-map/projects/{id}/sessions` 的元素）。 */

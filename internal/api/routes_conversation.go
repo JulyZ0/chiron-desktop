@@ -54,6 +54,9 @@ func registerConversationRoutes(
 	mux.Handle("GET /v1/session-map/projects", authMW(rlMW(http.HandlerFunc(smHandler.ListProjects))))
 	mux.Handle("POST /v1/session-map/projects", authMW(rlMW(http.HandlerFunc(smHandler.CreateProject))))
 	mux.Handle("PATCH /v1/session-map/projects/{id}", authMW(rlMW(http.HandlerFunc(smHandler.PatchProject))))
+	// 设备写租约（R5）：client 项目默认只读，用户显式授予后镜像差异才回写设备。
+	mux.Handle("GET /v1/session-map/projects/{id}/device-write", authMW(rlMW(http.HandlerFunc(smHandler.GetDeviceWriteLease))))
+	mux.Handle("POST /v1/session-map/projects/{id}/device-write", authMW(rlMW(http.HandlerFunc(smHandler.SetDeviceWriteLease))))
 	// 删除项目直接复用 DeleteWorkspace：项目就是 workspace，删它只级联清掉
 	// session_map_nodes（含归属记录），sessions 本身完好（I5）。单独实现一遍只会
 	// 多出一份缓存清理逻辑，两处早晚不一致。

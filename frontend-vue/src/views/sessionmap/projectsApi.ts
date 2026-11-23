@@ -32,6 +32,7 @@ function normalizeProject(raw: unknown): ProjectSummary {
     updated_at: typeof p.updated_at === 'string' ? p.updated_at : '',
     provider: p.provider === 'client' ? 'client' : 'server',
     device_id: typeof p.device_id === 'string' ? p.device_id : '',
+    write_allowed: p.write_allowed === true,
   }
 }
 
@@ -69,6 +70,17 @@ export async function createProject(draft: ProjectDraft & { root_path: string })
 /** 局部更新项目。只提交要改的字段（见 `ProjectDraft` 的注释）。 */
 export async function patchProject(id: string, draft: ProjectDraft): Promise<void> {
   await api.patch(`/v1/session-map/projects/${encodeURIComponent(id)}`, draft)
+}
+
+/** 设备写租约（R5）：client 项目默认只读，授予后镜像差异才回写本机。 */
+export async function getDeviceWriteLease(id: string): Promise<boolean> {
+  const { data } = await api.get(`/v1/session-map/projects/${encodeURIComponent(id)}/device-write`)
+  return Boolean(data?.data?.allowed)
+}
+
+export async function setDeviceWriteLease(id: string, allow: boolean): Promise<boolean> {
+  const { data } = await api.post(`/v1/session-map/projects/${encodeURIComponent(id)}/device-write`, { allow })
+  return Boolean(data?.data?.allowed)
 }
 
 /** 删除项目。会话本身不会被删除（I5）。 */

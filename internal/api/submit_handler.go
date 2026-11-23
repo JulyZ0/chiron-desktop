@@ -726,13 +726,24 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		}
 		root = mirror
 		hasRoot = true
-		defer func() {
-			tctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			defer cancel()
-			if err := syncProjectMirrorBack(tctx, smTenant(projectClaims), projectClaims.UserID, loc); err != nil {
-				slog.Warn("project mirror sync failed", "session", sessionID, "error", err)
-			}
-		}()
+		if deviceWriteAllowed(ctx, loc.ID) {
+			defer func() {
+				tctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				if err := syncProjectMirrorBack(tctx, smTenant(projectClaims), projectClaims.UserID, loc); err != nil {
+					slog.Warn("project mirror sync failed", "session", sessionID, "error", err)
+				}
+			}()
+		} else {
+			// R5：未授权写回时回合照常执行（可读/可分析），但明确告知修改不会保存。
+			h.eventHub.Publish(broadcast.Event{
+				Type: "text", SessionID: sessionID,
+				Data: engine.PythonEvent{
+					Type:    "text",
+					Content: "【只读项目】尚未授权写回设备，本轮的修改不会保存。请在项目侧栏点击「允许修改」后再试。",
+				},
+			})
+		}
 	}
 	// 人格：客户端只传 id（`persona_id`），文案由服务端按租户解析；未传则取默认人格。
 	// 解析结果以 `persona: {name, prompt}` 下发 —— 引擎不碰数据库，也不信任客户端文案。

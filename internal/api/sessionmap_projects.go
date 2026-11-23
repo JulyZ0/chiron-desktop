@@ -457,12 +457,22 @@ func (h *SessionMapHandler) ListProjects(w http.ResponseWriter, r *http.Request)
 			slog.Error("list projects failed", "error", err)
 		} else {
 			for _, row := range rows {
+				id := stringOf(row["id"])
+				provider := stringOf(row["provider"])
+				if provider == "" {
+					provider = smProviderServer
+				}
+				allowed := false
+				if provider == smProviderClient {
+					allowed = deviceWriteAllowed(r.Context(), id)
+				}
 				out = append(out, map[string]interface{}{
-					"id":             stringOf(row["id"]),
+					"id":             id,
 					"name":           stringOf(row["name"]),
 					"root_path":      stringOf(row["root_path"]),
-					"provider":       stringOf(row["provider"]),
+					"provider":       provider,
 					"device_id":      stringOf(row["device_id"]),
+					"write_allowed":  allowed,
 					"sort_index":     intOf(row["sort_index"]),
 					"session_count":  intOf(row["session_count"]),
 					"last_active_at": smTimeOf(row["last_active_at"]),
