@@ -472,8 +472,9 @@ export function setActiveMode(mode: ChironMode | null): void {
  *   2. Web 端没有桌面外壳 ⇒ 一律 `cloud`（本地模式是桌面独有能力，Web 构建不含本地后端）；
  *   3. preload 暴露的 `mode`（真相）；
  *   4. localStorage 镜像；
- *   5. 兼容降级：外壳尚无 `mode` 字段时，已配置服务地址按 `cloud`（保持既有行为），
- *      全新安装（无地址）按契约默认 `local`。
+ *   5. 兜底 `local`：云端模式已废除（preload 无 mode 时自身也回落 local），
+ *      **不**再按 `apiUrl` 猜 cloud —— 否则残留地址的老用户会被误判成云端，
+ *      去等一个不存在的远端后端。
  */
 export function resolveDeviceMode(): ChironMode {
   if (activeMode) return activeMode
@@ -483,10 +484,6 @@ export function resolveDeviceMode(): ChironMode {
   if (host && isChironMode(host.mode)) return host.mode
   const mirrored = readMirroredMode()
   if (mirrored) return mirrored
-  // 旧外壳没有 mode 字段时：已配置服务地址按远程模式（保持既有行为），
-  // 全新安装（无地址）按本地模式。
-  const legacyApiUrl = String((host as { apiUrl?: string } | null)?.apiUrl || '').trim()
-  if (legacyApiUrl) return 'cloud'
   return 'local'
 }
 
