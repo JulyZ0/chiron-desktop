@@ -171,8 +171,13 @@ func mountSPA(mux *http.ServeMux, root string) bool {
 			"web_root", root, "error", err)
 		return false
 	}
-	// "GET /" 同时匹配 HEAD；更具体的 API 路由由 ServeMux 优先匹配，不受影响。
-	mux.Handle("GET /", h)
+	// 注册为**无方法限定**的 "/"，而不是 "GET /"。
+	//
+	// Go 1.22 的 ServeMux 会判定模式冲突：`GET /`（方法更窄、路径更宽）与
+	// `/v1/device-webdav/`（方法不限定、路径更窄）互不包含，注册时直接 panic。
+	// 改成 "/" 后两者在所有方法上可比，更具体的 WebDAV 路由照常优先；
+	// 非 GET/HEAD 由 handler 首行的 backstop 返回 404，不会接管 API 写路径。
+	mux.Handle("/", h)
 	slog.Info("SPA hosting enabled", "web_root", root)
 	return true
 }

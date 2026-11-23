@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/athenavi/chiron/internal/auth"
+	"github.com/athenavi/chiron/internal/monitor"
 	"go.opentelemetry.io/otel/propagation"
 )
 
@@ -238,6 +239,12 @@ func (c *PythonClient) SetInternalToken(token string) {
 func (c *PythonClient) injectInternalToken(req *http.Request) {
 	if c.internalToken != "" {
 		req.Header.Set("X-Internal-Token", c.internalToken)
+	}
+	// 端口内 trace 贯通（R9）：网关进程内的 Span 与 OTel 是两套实现，
+	// 没有配置 OTLP 时 traceparent 不会出现；这里额外带一个稳定的请求 id，
+	// 引擎把它当作自己的 trace_id，日志/SSE/工具审计就能与网关日志对上。
+	if traceID := monitor.TraceIDFromContext(req.Context()); traceID != "" {
+		req.Header.Set("X-Chiron-Trace-Id", traceID)
 	}
 }
 

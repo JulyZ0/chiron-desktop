@@ -18,6 +18,7 @@ const apiMocks = vi.hoisted(() => ({
   getSettings: vi.fn(),
   getAgentSettings: vi.fn(),
   saveAgentSettings: vi.fn(),
+  getMailConfig: vi.fn(),
 }))
 
 // 只 mock 网络函数，常量与归一化用真实实现 —— 测试要钉的正是那份默认值。
@@ -29,6 +30,7 @@ vi.mock('@/api/admin', async () => {
     getSettings: apiMocks.getSettings,
     getAgentSettings: apiMocks.getAgentSettings,
     saveAgentSettings: apiMocks.saveAgentSettings,
+    getMailConfig: apiMocks.getMailConfig,
   }
 })
 
@@ -68,6 +70,11 @@ describe('SettingsView 的「Agent 运行配置」', () => {
     vi.clearAllMocks()
     apiMocks.getSettings.mockResolvedValue({})
     apiMocks.getAgentSettings.mockResolvedValue({ ...AGENT_SETTINGS_DEFAULTS })
+    apiMocks.getMailConfig.mockResolvedValue({
+      provider: 'smtp', host: '', port: 587, username: '', security: 'starttls',
+      from: '', from_name: 'Chiron', reply_to: '', base_url: '', timeout_seconds: 30,
+      has_password: false, has_api_key: false, ready: false, problem: 'from address is missing or invalid',
+    })
   })
 
   it('初装显示引擎实际在用的默认值，而不是留空', async () => {

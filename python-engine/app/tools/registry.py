@@ -18,12 +18,20 @@ MCP 工具（无 owner），只按 owner 判断会漏标。前端据此把"看�
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.observability.tool_spans import finish_tool_span, start_tool_span
 from app.tools.arg_validation import format_errors, prepare_params
+from app.tools.context import get_tenant_id_int, get_user_id
 from app.tools.file_queue import serialized
+from app.tools.sandbox_slot import (
+    SANDBOX_TOOL_NAMES,
+    acquire_sandbox_slot,
+    sandbox_slot_held,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,26 +206,52 @@ class ToolRegistry:
                 "invalid_arguments": errors,
             }
 
+        # R7：租户级沙箱并发槽。只在"当前没有持有槽位"时获取 —— run_code 内部再调
+        # shell_exec 时沿用外层槽位，避免把配额变成"限制嵌套次数"。Redis 故障时
+        # acquire 返回空租约（放行），不让配额组件拖垮代码执行。
+        lease = None
+        if name in SANDBOX_TOOL_NAMES and not sandbox_slot_held():
+            lease = await acquire_sandbox_slot()
+            if lease is None:
+                return {
+                    "error": "sandbox concurrency limit reached for this tenant; "
+                    "wait for a running execution to finish and retry",
+                    "code": "sandbox_concurrency_limited",
+                }
+
+        span = None
+        started = 0.0
+        error_text = ""
         try:
-            # G-T3：**按 realpath 的执行期串行队列**。写类工具在同一个文件上排队，
-            # 无论这次调用来自哪个入口 —— 主循环、`run_code` 的嵌套调用
-            # （`_safe_tool_call` → 本函数）、`use_capability` 代理、`multi_agent`、
-            # 还是 `api/tools.py` 的直连。`tool.handler` 在生产路径上**只有这一个**
-            # 调用点，所以放在这里就等于覆盖了全部写入口。
-            #
-            # 为什么不能只靠 `write_claim`：那是**租约**（TTL + owner），它能让后到的
-            # 写者**被拒**，不能让它们**排队** —— 模型收到一条 error 只好重试，重试时
-            # 仍是同一个竞态。也不能只靠 `_split_tool_batch`：那是**事前静态判定**，
-            # 只看得见同一批里的重复路径，看不见批外的并发。
-            #
-            # 非写工具（绝大多数）`mutation_key` 为空 ⇒ 直通，零开销。
-            async with serialized(name, prepared):
-                result = await tool.handler(**prepared)
+            async def _invoke() -> Any:
+                async with serialized(name, prepared):
+                    return await tool.handler(**prepared)
+
+            span = start_tool_span(
+                name=name,
+                source=tool.source,
+                tenant_id=get_tenant_id_int(),
+                user_id=user_id,
+            )
+            started = time.monotonic()
+            if lease is not None:
+                with lease.hold():
+                    result = await _invoke()
+            else:
+                result = await _invoke()
             if isinstance(result, dict):
+                if result.get("error"):
+                    error_text = str(result.get("error"))
                 return result
             return {"output": result}
         except Exception as e:
+            error_text = str(e)
             return {"error": str(e)}
+        finally:
+            if span is not None:
+                finish_tool_span(span, started_at=started, error=error_text)
+            if lease is not None:
+                await lease.release()
 
 
 # 全局注册表（进程内单例）

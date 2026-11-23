@@ -29,28 +29,34 @@ class TenantRateLimiter:
         redis: aioredis.Redis,
         requests_per_minute: int = 60,
         requests_per_second: int = 10,
+        key_prefix: str = "ratelimit",
     ):
         self._redis = redis
         self.rpm = requests_per_minute
         self.rps = requests_per_second
+        # 调用方给不同链路用不同前缀（HTTP 请求 vs 模型调用），否则一次回合里的
+        # 十几次模型调用会和用户的 HTTP 请求抢同一个桶，表现为"聊天一开就 429"。
+        self._prefix = key_prefix.strip().strip(":") or "ratelimit"
 
-    async def allow(self, tenant_id: int) -> bool:
-        """检查是否允许请求通过"""
+    async def allow(self, tenant_id: int | str) -> bool:
+        """检查是否允许请求通过。限额 <=0 表示该维度关闭（不计数）。"""
         if not tenant_id:
             return True
 
         now = time.time()
 
-        # 检查每秒限流
-        if not await self._check_window(rkey(f"ratelimit:{tenant_id}:s"), now, 1.0, self.rps):
+        # 每秒限流
+        if self.rps > 0 and not await self._check_window(
+            rkey(f"{self._prefix}:{tenant_id}:s"), now, 1.0, self.rps
+        ):
             logger.warning(
                 "Rate limit exceeded: tenant=%s (rps=%d)", tenant_id, self.rps
             )
             return False
 
-        # 检查每分钟限流
-        if not await self._check_window(
-            rkey(f"ratelimit:{tenant_id}:m"), now, 60.0, self.rpm
+        # 每分钟限流
+        if self.rpm > 0 and not await self._check_window(
+            rkey(f"{self._prefix}:{tenant_id}:m"), now, 60.0, self.rpm
         ):
             logger.warning(
                 "Rate limit exceeded: tenant=%s (rpm=%d)", tenant_id, self.rpm
@@ -128,28 +134,30 @@ class LocalTenantRateLimiter:
         self.rpm = requests_per_minute
         self.rps = requests_per_second
         self._lock = asyncio.Lock()
-        self._seconds: dict[int, list[float]] = {}
-        self._minutes: dict[int, list[float]] = {}
+        self._seconds: dict[Any, list[float]] = {}
+        self._minutes: dict[Any, list[float]] = {}
 
     @staticmethod
     def _prune(bucket: list[float], now: float, window: float) -> int:
         bucket[:] = [t for t in bucket if t > now - window]
         return len(bucket)
 
-    async def allow(self, tenant_id: int) -> bool:
-        """检查是否允许请求通过（进程内，单实例语义）"""
+    async def allow(self, tenant_id: int | str) -> bool:
+        """检查是否允许请求通过（进程内，单实例语义）。限额 <=0 关闭该维度。"""
         if not tenant_id:
             return True
         now = time.time()
         async with self._lock:
             s = self._seconds.setdefault(tenant_id, [])
-            if self._prune(s, now, 1.0) >= self.rps:
+            if self.rps > 0 and self._prune(s, now, 1.0) >= self.rps:
                 return False
             m = self._minutes.setdefault(tenant_id, [])
-            if self._prune(m, now, 60.0) >= self.rpm:
+            if self.rpm > 0 and self._prune(m, now, 60.0) >= self.rpm:
                 return False
-            s.append(now)
-            m.append(now)
+            if self.rps > 0:
+                s.append(now)
+            if self.rpm > 0:
+                m.append(now)
             return True
 
     async def get_remaining(self, tenant_id: int) -> dict[str, Any]:

@@ -26,6 +26,12 @@ from app.gateway.model_compat import (
     provider_supports_model,
 )
 from app.gateway.provider import ChatMessage, ChatResponse, EmbeddingResponse, LLMProvider
+from app.observability.genai import (
+    end_model_span,
+    record_model_error,
+    record_model_usage,
+    start_model_span,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +125,9 @@ class GatewayRouter:
         providers: dict[str, LLMProvider],
         cache: SemanticCache | None = None,
         budget: TokenBudget | None = None,
+        rate_limiter: Any | None = None,
+        user_rate_limiter: Any | None = None,
+        token_quota: Any | None = None,
         weights: dict[str, float] | None = None,
         gateway_url: str = "",
         internal_token: str = "",
@@ -148,6 +157,11 @@ class GatewayRouter:
         }  # moving avg ms
         self._cache = cache
         self._budget = budget
+        # 模型调用限流（租户级）：与 HTTP 请求限流分开计数，只在真正要打 provider 时消耗。
+        # 未配置（None）时完全跳过；Redis 异常按放行处理，不让限流组件故障拖垮推理。
+        self._rate_limiter = rate_limiter
+        self._user_rate_limiter = user_rate_limiter
+        self._token_quota = token_quota
         # 路由权重: cost / latency / quality
         self._weights = weights or {"cost": 0.3, "latency": 0.3, "quality": 0.4}
         # 租户路由配置（从 Go 网关同步）
@@ -217,6 +231,59 @@ class GatewayRouter:
                 )
             return added
 
+    @staticmethod
+    def _runtime_user_id() -> str:
+        try:
+            from app.tools.context import get_user_id
+
+            return get_user_id()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _model_rate_reason(self, tenant_id: int) -> str:
+        """返回超限层级（tenant/user）；空串表示放行。
+
+        用户身份取运行时已设置的 contextvar（`app.tools.context`），不新增调用参数：
+        模型调用点有二十多处，逐个透传 user_id 既易漏也容易在子 Agent 里传丢。
+        队列任务/后台摘要没有用户上下文时只受租户级约束。
+        限流组件异常一律放行（fail-open），不让配额组件故障变成推理故障。
+        """
+        limiter = self._rate_limiter
+        if limiter is not None and tenant_id:
+            try:
+                if not await limiter.allow(tenant_id):
+                    return "tenant"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("model rate limiter failed; allowing call: %s", exc)
+
+        user_id = self._runtime_user_id()
+        user_limiter = self._user_rate_limiter
+        if user_limiter is not None and user_id:
+            try:
+                if not await user_limiter.allow(user_id):
+                    return "user"
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("user model rate limiter failed; allowing call: %s", exc)
+
+        quota = self._token_quota
+        if quota is not None:
+            try:
+                scope = await quota.exceeded(tenant_id, user_id)
+                if scope:
+                    return scope
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("token quota check failed; allowing call: %s", exc)
+        return ""
+
+    async def _record_model_tokens(self, tenant_id: int, tokens: int) -> None:
+        quota = self._token_quota
+        if quota is None or tokens <= 0:
+            return
+        try:
+            await quota.add(tenant_id, self._runtime_user_id(), tokens)
+        except Exception as exc:  # noqa: BLE001 - 记账失败不影响已完成的调用
+            logger.warning("token quota add failed: %s", exc)
+
     async def chat_stream(
         self,
         messages: list[Any],
@@ -242,6 +309,18 @@ class GatewayRouter:
                 logger.info("Stream cache HIT for model=%s", model)
                 yield cached
                 return
+
+        rate_scope = await self._model_rate_reason(tenant_id)
+        if rate_scope:
+            yield ChatResponse(
+                content="",
+                finish_reason="error",
+                provider="none",
+                model=model,
+                error_code="rate_limited",
+                message=f"model calls rate limited for this {rate_scope}",
+            )
+            return
 
         provider = await self._select(model, provider_hint, tenant_id=tenant_id)
         if not provider:
@@ -271,6 +350,9 @@ class GatewayRouter:
                 return
 
         start = time.monotonic()
+        span = start_model_span(
+            model=model, provider=provider.name, tenant_id=tenant_id, stream=True
+        )
         full_content = ""
         full_tool_calls = []
         finish_reason = ""
@@ -341,6 +423,7 @@ class GatewayRouter:
                 self._breakers[provider.name].record_failure()
                 logger.error("Provider %s chat_stream failed: %s", provider.name, e)
             note_last_error(provider.name, e)
+            record_model_error(span, e)
             # 不要将原始异常文本当作 assistant 回复内容发送（会显示成
             # "Connection error." 之类的假回复）；发 error chunk，
             # 由上层 AgentRuntime 转成 error 事件（message 携带真实原因）。
@@ -369,6 +452,16 @@ class GatewayRouter:
             self._latencies[provider.name] = (
                 self._latencies[provider.name] * 0.8 + elapsed * 0.2
             )
+            record_model_usage(
+                span,
+                input_tokens=total_input,
+                output_tokens=total_output,
+                finish_reason=finish_reason,
+                response_model=model,
+            )
+            end_model_span(span)
+            if not isinstance(_exc, GeneratorExit):
+                await self._record_model_tokens(tenant_id, total_input + total_output)
 
     async def chat(
         self,
@@ -393,6 +486,17 @@ class GatewayRouter:
             if cached:
                 logger.info("Cache hit for model=%s", model)
                 return cached
+
+        rate_scope = await self._model_rate_reason(tenant_id)
+        if rate_scope:
+            return ChatResponse(
+                content="",
+                finish_reason="error",
+                provider="none",
+                model=model,
+                error_code="rate_limited",
+                message=f"model calls rate limited for this {rate_scope}",
+            )
 
         provider = await self._select(model, provider_hint, tenant_id=tenant_id)
         if not provider:
@@ -420,6 +524,9 @@ class GatewayRouter:
                 )
 
         start = time.monotonic()
+        span = start_model_span(
+            model=model, provider=provider.name, tenant_id=tenant_id, stream=False
+        )
         # 结构化输出：provider 不支持时置空（见辅助方法）
         extra_kwargs = self._provider_extra_kwargs(provider, response_format)
         try:
@@ -433,6 +540,17 @@ class GatewayRouter:
             )
             resp.provider = provider.name
             resp.model = model
+            record_model_usage(
+                span,
+                input_tokens=resp.input_tokens,
+                output_tokens=resp.output_tokens,
+                cached_tokens=resp.cached_tokens,
+                finish_reason=resp.finish_reason,
+                response_model=model,
+            )
+            await self._record_model_tokens(
+                tenant_id, resp.input_tokens + resp.output_tokens
+            )
 
             self._breakers[provider.name].record_success()
 
@@ -471,6 +589,7 @@ class GatewayRouter:
                 self._breakers[provider.name].record_failure()
                 logger.error("Provider %s chat failed: %s", provider.name, e)
             note_last_error(provider.name, e)
+            record_model_error(span, e)
             return ChatResponse(
                 content="",
                 finish_reason="error",
@@ -483,6 +602,7 @@ class GatewayRouter:
             self._latencies[provider.name] = (
                 self._latencies[provider.name] * 0.8 + elapsed * 0.2
             )
+            end_model_span(span)
 
     def _provider_extra_kwargs(
         self, provider: LLMProvider, response_format: dict[str, Any] | None

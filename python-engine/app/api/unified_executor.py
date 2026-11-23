@@ -223,7 +223,11 @@ class UnifiedChatHandler:
         import uuid
 
         if not trace_id:
-            trace_id = uuid.uuid4().hex[:12]
+            # R9：优先复用网关传下来的 trace id（X-Chiron-Trace-Id → contextvar），
+            # 否则才自行生成；两条链路的日志/事件因此可对齐。
+            from app.observability.trace_context import current_trace_id
+
+            trace_id = current_trace_id() or uuid.uuid4().hex[:12]
 
         context = context or {}
         ctx_agent = (

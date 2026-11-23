@@ -188,6 +188,11 @@ async function inviteUser(row: AdminManagedUser | Record<string, any>) {
     invite.token = result.token || ''
     invite.expiresAt = result.expires_at || ''
     inviteOpen.value = true
+    if (result.email_sent) {
+      message.success(t('admin.userAdmin.invite_email_sent', { email: user.email || user.username }))
+    } else if (result.email_note && result.email_note !== 'mail_not_configured') {
+      message.warning(t('admin.userAdmin.invite_email_failed'))
+    }
   } catch (err) {
     message.error(serverErrorMessage(err, t('admin.userAdmin.invite_failed')))
   }

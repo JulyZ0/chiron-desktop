@@ -156,6 +156,10 @@ class Settings(BaseSettings):
     #: （见 `runtime._split_tool_batch`）；写/删/外部类与审批始终串行。
     #: 设为 1 即等价于"完全串行"（回滚开关）。
     tool_concurrency_limit: int = 4
+    #: 每租户同时执行的沙箱/代码工具上限（R7）：run_code / execute_python /
+    #: shell_exec / persistent_shell。0 = 不限；run_code 内嵌调用沿用外层槽位。
+    #: 计数在 Redis（多副本共享），Redis 故障时放行。
+    sandbox_max_concurrency_per_tenant: int = 0
 
     # ── P2：LLM 安全评审（guardian）──
     #: 工具被判「需要用户确认」时，先用一个**独立、无工具、有界**的 LLM 会话评审，
@@ -342,6 +346,18 @@ class Settings(BaseSettings):
     # ── 限流 ──
     rate_limit_rpm: int = 60  # requests per minute per tenant
     rate_limit_rps: int = 10  # requests per second per tenant
+    # 模型调用限流（R7）：每次 LLM 调用计数，与上面的 HTTP 请求桶分开。0=关闭。
+    # 后台「系统设置 → python」分类保存后写入；引擎只在启动/重启时拉取，保存后需重启引擎生效。
+    gateway_model_rpm: int = 0
+    gateway_model_rps: int = 0
+    # 按用户的模型调用限流（R7，B2）：0/0 = 关闭。用户身份取运行上下文，
+    # 队列任务/后台摘要没有用户上下文时只受租户级约束。
+    gateway_model_user_rpm: int = 0
+    gateway_model_user_rps: int = 0
+    # 按分钟的 token 配额（TPM）：调用前判"已用是否达上限"，调用后按实际 token 累计。
+    # 0 = 关闭；后台任务没有用户上下文时只受租户级约束。
+    gateway_model_tpm: int = 0
+    gateway_model_user_tpm: int = 0
 
     # ── 队列 ──
     queue_worker_concurrency: int = 10

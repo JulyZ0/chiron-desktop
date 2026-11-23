@@ -482,6 +482,12 @@ var settingsCategories = []string{
 	// retention：数据保留期（usage_days / share_days / checkpoint_days）。
 	// 由后台每小时一轮的清理任务读取（见 internal/api/retention.go）。
 	"retention",
+	// mail：邀请邮件 / 测试邮件的发信配置（SMTP 或晴辰云邮）。
+	// 敏感键 password / api_key 由 settings.Store 加密落库。
+	"mail",
+	// quota：日费用熔断上限（tenant_daily_cost_cents / user_daily_cost_cents）。
+	// 由 submit 与 OpenAI 兼容入口在启动昂贵链路前读取（见 cost_guard.go）。
+	"quota",
 }
 
 func validSettingsCategory(c string) bool {

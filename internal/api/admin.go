@@ -104,6 +104,12 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	r.HandleFunc("GET /monitor/overview", h.GetMonitorOverview)
 	// 引擎池存活快照（R6）：逐实例 URL / 在途任务 / RSS / CPU，来自自注册心跳。
 	r.HandleFunc("GET /engines", h.ListEngines)
+	// 邮件通道配置与测试发信（邀请邮件的数据源，见 mail_config.go）。
+	r.HandleFunc("GET /mail", h.GetMailConfig)
+	r.HandleFunc("PUT /mail", h.SaveMailConfig)
+	r.HandleFunc("POST /mail/test", h.TestMail)
+	// 租户数据导出（R10）：ZIP + 每表 NDJSON，流式输出；不含秘密与二进制原文。
+	r.HandleFunc("GET /export", h.ExportTenantData)
 	// P2：历史趋势（最近 N 小时，来自 metrics_rollup_minute；跨副本、跨重启）。
 	r.HandleFunc("GET /monitor/history", h.GetMonitorHistory)
 

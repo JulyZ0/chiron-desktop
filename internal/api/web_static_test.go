@@ -205,3 +205,32 @@ func TestMountSPA_DoesNotShadowAPIRoutes(t *testing.T) {
 		t.Fatalf("分享页未回落到 SPA: %q", rec.Body.String())
 	}
 }
+
+// 回归：方法不限定的具体路由（设备 WebDAV）与 SPA 兜底同时注册不得 panic。
+// 历史实现用 "GET /"，Go 1.22 会在启动时直接报
+// "GET / matches fewer methods than /v1/device-webdav/, but has a more general path pattern"。
+func TestMountSPA_CompatibleWithMethodlessWebDAV(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.Handle("/v1/device-webdav/", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("dav"))
+	}))
+	if !mountSPA(mux, newWebRootFixture(t)) {
+		t.Fatal("合法目录应挂载成功")
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/device-webdav/p1/", nil))
+	if rec.Body.String() != "dav" {
+		t.Fatalf("WebDAV 路由被 SPA 覆盖: %q", rec.Body.String())
+	}
+
+	// 非 GET/HEAD 不再落到 SPA handler（backstop 返回 404），避免普通 POST 拿到 index.html。
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/not-a-route", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("未匹配的 POST 应为 404, got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "spa-shell") {
+		t.Fatalf("SPA 不应响应非读取方法: %q", rec.Body.String())
+	}
+}

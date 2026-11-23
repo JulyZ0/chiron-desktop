@@ -58,6 +58,9 @@ class ChatResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""  # "stop" | "tool_calls" | "length" | "error"
     message: str = ""  # finish_reason="error" 时的真实原因（可诊断）
+    #: 机器可读的错误分类（如 `rate_limited`）。调用方据此决定 HTTP 状态码；
+    #: 为空时保持历史行为（一律按上游 502 处理）。
+    error_code: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
     #: 命中提示词缓存（prompt cache）的输入 token 数 —— 会话统计里「缓存命中率」的分子。

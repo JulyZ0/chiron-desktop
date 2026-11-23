@@ -33,6 +33,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -136,6 +137,13 @@ func OpenAICompletionsHandler(pythonClient *engine.PythonClient) http.HandlerFun
 		if claims == nil || claims.UserID == "" || claims.TenantID == 0 {
 			writeOpenAIError(w, http.StatusUnauthorized,
 				"missing tenant context", "invalid_request_error", "unauthenticated")
+			return
+		}
+		// 日费用熔断（R7）：API Key 直连同样受租户/用户日预算约束。
+		if scope, used, limit := costBreakerExceeded(r.Context(), claims.TenantID, claims.UserID); scope != "" {
+			writeOpenAIError(w, http.StatusTooManyRequests,
+				fmt.Sprintf("daily cost budget exceeded for this %s (today: %d / %d cents)", scope, used, limit),
+				"rate_limit_error", "daily_cost_limit_exceeded")
 			return
 		}
 		if pythonClient == nil {

@@ -594,6 +594,7 @@ async def _start_gateway() -> Any:
     from app.gateway.budget import TokenBudget
     from app.gateway.cache import SemanticCache
     from app.gateway.provider import LLMProvider
+    from app.gateway.ratelimit import TenantRateLimiter
     from app.gateway.router import GatewayRouter
 
     providers: dict[str, LLMProvider] = {}
@@ -808,6 +809,39 @@ async def _start_gateway() -> Any:
         cache = None
         budget = None
 
+    # R7：模型调用限流（租户级）。默认关闭（0/0）；只有显式配置才建桶，
+    # 且与 HTTP 请求限流分开计数（key 前缀不同），避免一次回合的多次模型调用
+    # 把用户的普通请求额度吃光。
+    model_limiter: Any = None
+    if _redis is not None and (settings.gateway_model_rpm > 0 or settings.gateway_model_rps > 0):
+        model_limiter = TenantRateLimiter(
+            redis=_redis,
+            requests_per_minute=max(0, settings.gateway_model_rpm),
+            requests_per_second=max(0, settings.gateway_model_rps),
+            key_prefix="ratelimit:llm",
+        )
+    user_model_limiter: Any = None
+    if _redis is not None and (
+        settings.gateway_model_user_rpm > 0 or settings.gateway_model_user_rps > 0
+    ):
+        user_model_limiter = TenantRateLimiter(
+            redis=_redis,
+            requests_per_minute=max(0, settings.gateway_model_user_rpm),
+            requests_per_second=max(0, settings.gateway_model_user_rps),
+            key_prefix="ratelimit:llm:user",
+        )
+    token_quota: Any = None
+    if _redis is not None and (
+        settings.gateway_model_tpm > 0 or settings.gateway_model_user_tpm > 0
+    ):
+        from app.gateway.token_quota import TokenQuota
+
+        token_quota = TokenQuota(
+            _redis,
+            tenant_tpm=settings.gateway_model_tpm,
+            user_tpm=settings.gateway_model_user_tpm,
+        )
+
     # router **先于** provider 注册构造：往路由表里加 provider 的唯一入口是
     # `router.register_provider`（它同时补熔断/延迟/目录三张表，见其注释）。
     # 这样同一份 `_register_missing_providers()` 既是启动首跑，也是运行期的补注册回调 ——
@@ -816,6 +850,9 @@ async def _start_gateway() -> Any:
         providers=providers,
         cache=cache,
         budget=budget,
+        rate_limiter=model_limiter,
+        user_rate_limiter=user_model_limiter,
+        token_quota=token_quota,
         gateway_url=settings.gateway_internal_url,
         internal_token=settings.internal_token,
         provider_catalog=_catalog,
@@ -1710,6 +1747,9 @@ def _setup_middleware(app: FastAPI, redis: aioredis.Redis, limiter: Any) -> None
         internal_token=settings.internal_token,
     )
     app.add_middleware(RequestContextMiddleware)
+    from app.observability.trace_context import TraceHeaderMiddleware
+
+    app.add_middleware(TraceHeaderMiddleware)
     # 空闲回收（S3）：只记录业务请求；健康探针不算活动。放最后注册 = 最外层执行。
     from app.idle_shutdown import IdleTrackingMiddleware
 
@@ -2871,6 +2911,10 @@ def _setup_middleware_early(app: FastAPI) -> None:
         jwt_secret=_settings.jwt_secret,
     )
     app.add_middleware(RequestContextMiddleware)
+    # R9：把网关传入的 X-Chiron-Trace-Id 放进 contextvar（供 submit/日志复用）。
+    from app.observability.trace_context import TraceHeaderMiddleware
+
+    app.add_middleware(TraceHeaderMiddleware)
     app.add_middleware(PrivacyModeMiddleware)
 
     # 混沌工程注入（默认关闭，见 settings.chaos_enabled）。

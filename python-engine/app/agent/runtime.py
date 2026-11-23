@@ -2174,7 +2174,11 @@ class AgentRuntime:
         total_cache_write_tokens = 0
 
         # ── 0.5 生成 trace_id (跨实例链路追踪) ───────────────────────────
-        trace_id = uuid_mod.uuid4().hex[:12]
+        # R9：优先沿用网关传入的 trace id（contextvar），让网关日志、引擎事件、
+        # 工具审计与执行图使用同一个 id；直接调用引擎（无网关）时才自行生成。
+        from app.observability.trace_context import current_trace_id
+
+        trace_id = current_trace_id() or uuid_mod.uuid4().hex[:12]
         # 差距C（执行图）：run 是根 span，turn 是它的子节点，llm / tool 调用又是 turn 的子节点。
         # 用**确定性 id**（`{trace}:run` / `{trace}:turn:N`）而非随机 id —— 父指针在写 span 时
         # 无需共享状态即可算出，补写/重放也不会产生重影节点。

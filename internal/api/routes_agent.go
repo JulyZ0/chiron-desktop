@@ -130,6 +130,10 @@ func registerAgentRoutes(
 			return
 		}
 		userID := claims.UserID
+		// 日费用熔断（R7）：在拿会话锁/信号量之前判，超限直接 429，不启动昂贵链路。
+		if rejectIfOverDailyBudget(w, r, claims.TenantID, userID) {
+			return
+		}
 
 		// ── 会话归属校验（fail-closed）──
 		//

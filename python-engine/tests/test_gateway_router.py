@@ -97,3 +97,127 @@ class TestChatStreamBudget:
 
         assert chunks[-1].finish_reason == "error"
         budget.deduct.assert_not_called()
+
+
+class _DenyLimiter:
+    async def allow(self, tenant_id: int) -> bool:  # noqa: ARG002
+        return False
+
+
+class _BrokenLimiter:
+    async def allow(self, tenant_id: int) -> bool:  # noqa: ARG002
+        raise RuntimeError("redis down")
+
+
+class TestModelRateLimit:
+    """R7：模型调用限流只拦 provider 调用；缓存命中/限流故障都不该被误伤。"""
+
+    @pytest.mark.asyncio
+    async def test_chat_returns_rate_limited_without_provider(self):
+        router = GatewayRouter({}, rate_limiter=_DenyLimiter())
+        resp = await router.chat([{"role": "user", "content": "hi"}], "m", tenant_id=1)
+        assert resp.finish_reason == "error"
+        assert resp.error_code == "rate_limited"
+        assert "rate limited" in resp.message
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_yields_rate_limited(self):
+        router = GatewayRouter({}, rate_limiter=_DenyLimiter())
+        chunks = [
+            c
+            async for c in router.chat_stream(
+                [{"role": "user", "content": "hi"}], "m", tenant_id=1
+            )
+        ]
+        assert len(chunks) == 1
+        assert chunks[0].error_code == "rate_limited"
+
+    @pytest.mark.asyncio
+    async def test_limiter_failure_fails_open(self):
+        router = GatewayRouter({}, rate_limiter=_BrokenLimiter())
+        resp = await router.chat([{"role": "user", "content": "hi"}], "m", tenant_id=1)
+        # 放行后走正常的"没有可用 provider"分支，而不是被限流拦下。
+        assert resp.finish_reason == "error"
+        assert resp.error_code != "rate_limited"
+
+    @pytest.mark.asyncio
+    async def test_disabled_windows_do_not_touch_redis(self):
+        from app.gateway.ratelimit import LocalTenantRateLimiter, TenantRateLimiter
+
+        # 0/0 = 关闭：不连 Redis、不计数，必须恒放行。
+        assert await TenantRateLimiter(None, 0, 0).allow(1) is True  # type: ignore[arg-type]
+        local = LocalTenantRateLimiter(0, 0)
+        for _ in range(100):
+            assert await local.allow(1) is True
+
+
+class _AllowLimiter:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    async def allow(self, key: object) -> bool:
+        self.calls.append(key)
+        return True
+
+
+class _RecordingDenyLimiter:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    async def allow(self, key: object) -> bool:
+        self.calls.append(key)
+        return False
+
+
+class TestUserModelRateLimit:
+    @pytest.mark.asyncio
+    async def test_user_limit_uses_runtime_user_context(self):
+        from app.tools.context import set_tool_context
+
+        tenant = _AllowLimiter()
+        user = _RecordingDenyLimiter()
+        router = GatewayRouter({}, rate_limiter=tenant, user_rate_limiter=user)
+        set_tool_context(user_id="u-42")
+        try:
+            resp = await router.chat([{"role": "user", "content": "hi"}], "m", tenant_id=1)
+        finally:
+            set_tool_context(user_id="")
+
+        assert resp.error_code == "rate_limited"
+        assert "user" in resp.message
+        assert user.calls == ["u-42"], "用户身份应来自运行时上下文，而不是调用参数"
+
+    @pytest.mark.asyncio
+    async def test_user_limit_skipped_without_context(self):
+        from app.tools.context import set_tool_context
+
+        user = _RecordingDenyLimiter()
+        router = GatewayRouter({}, user_rate_limiter=user)
+        set_tool_context(user_id="")
+        resp = await router.chat([{"role": "user", "content": "hi"}], "m", tenant_id=1)
+
+        assert resp.error_code != "rate_limited"
+        assert user.calls == [], "没有用户上下文时不该用空 key 计数"
+
+
+class _QuotaDeny:
+    async def exceeded(self, tenant_id: int, user_id: str) -> str:
+        return "user" if user_id else "tenant"
+
+    async def add(self, tenant_id: int, user_id: str, tokens: int) -> None:
+        return None
+
+
+class TestTokenQuotaGate:
+    @pytest.mark.asyncio
+    async def test_tpm_blocks_before_provider(self):
+        from app.tools.context import set_tool_context
+
+        router = GatewayRouter({}, token_quota=_QuotaDeny())
+        set_tool_context(user_id="u-1")
+        try:
+            resp = await router.chat([{"role": "user", "content": "hi"}], "m", tenant_id=1)
+        finally:
+            set_tool_context(user_id="")
+        assert resp.error_code == "rate_limited"
+        assert "user" in resp.message

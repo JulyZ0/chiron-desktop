@@ -58,6 +58,12 @@ func registerAdminRoutes(
 	mux.Handle("GET /v1/admin/diagnostics", authMW(rlMW(adminReadMW(adminStrip))))
 	// 引擎池快照是**全平台**运行事实（跨租户共享 Redis 注册表）：platformReadMW。
 	mux.Handle("GET /v1/admin/engines", authMW(rlMW(platformReadMW(adminStrip))))
+	// 邮件配置含 SMTP 密码/API Key，且发信影响全平台：只给平台 owner 读写。
+	mux.Handle("GET /v1/admin/mail", authMW(rlMW(platformReadMW(adminStrip))))
+	mux.Handle("PUT /v1/admin/mail", authMW(rlMW(platformWriteMW(adminStrip))))
+	mux.Handle("POST /v1/admin/mail/test", authMW(rlMW(platformWriteMW(adminStrip))))
+	// 数据导出包含全租户消息/审计/项目元数据：平台 owner 只读，且响应 no-store。
+	mux.Handle("GET /v1/admin/export", authMW(rlMW(platformReadMW(adminStrip))))
 	// 操作审计（只读 + CSV 导出）：按租户收窄，管理台「访问安全 → 操作审计」使用。
 	mux.Handle("GET /v1/admin/audit-logs", authMW(rlMW(auditReadMW(adminStrip))))
 	mux.Handle("GET /v1/admin/audit-logs/export.csv", authMW(rlMW(auditReadMW(adminStrip))))

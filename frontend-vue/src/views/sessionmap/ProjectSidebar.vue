@@ -27,6 +27,7 @@ import {
 } from '@ant-design/icons-vue'
 
 import { describeApiError } from '../../utils/apiError'
+import { useAuthStore } from '../../stores/auth'
 import { currentDeviceMode } from '../../stores/device'
 import { formatRelativeTime } from '../../components/chat/chat-types'
 import {
@@ -58,6 +59,10 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+
+// R5 企业权限：授予/收回用户磁盘写权限只对 owner/admin 开放（后端同口径）。
+const auth = useAuthStore()
+const canManageDeviceWrite = computed(() => auth.isAdmin)
 
 const loading = ref(false)
 const projects = ref<ProjectSummary[]>([])
@@ -248,7 +253,7 @@ function removeProject(project: ProjectSummary) {
 
 /** 设备写租约（R5）：client 项目默认只读，用户在这里显式授予/收回。 */
 async function toggleDeviceWrite(project: ProjectSummary) {
-  if (project.provider !== 'client') return
+  if (project.provider !== 'client' || !canManageDeviceWrite.value) return
   if (!project.write_allowed) {
     Modal.confirm({
       title: tr('chat.projects_write_title', { name: project.name }),
@@ -375,7 +380,7 @@ defineExpose({ refresh })
               {{ tr('common.map') }}
             </Button>
             <Button
-              v-if="p.provider === 'client'"
+              v-if="p.provider === 'client' && canManageDeviceWrite"
               type="text"
               size="small"
               class="proj-act"

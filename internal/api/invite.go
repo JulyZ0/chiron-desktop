@@ -72,12 +72,30 @@ func (h *AdminHandler) CreateUserInvite(w http.ResponseWriter, r *http.Request) 
 	if base := publicBaseURL(h.cfg, r); base != "" {
 		inviteURL = base + "/invite/" + raw
 	}
+	// 邮件投递是"有则更好"：未配置/发送失败不撤销邀请，链接仍由管理员复制。
+	// email_note 只给稳定的原因码，不含服务商原始错误（可能带收件人/凭据片段）。
+	emailSent := false
+	emailNote := ""
+	if inviteURL == "" {
+		emailNote = "public_base_url_missing"
+	} else if !auth.ValidateMailAddress(target.Email) {
+		emailNote = "invalid_recipient"
+	} else if cfg := readMailRuntimeConfig(r.Context(), h.ensureSettingsStore()); cfg.validate() != nil {
+		emailNote = "mail_not_configured"
+	} else if err := sendInviteEmail(r.Context(), mailSenderFactory(), cfg, target.Email, inviteURL, expiresAt); err != nil {
+		slog.Warn("invite email send failed", "user_id", target.ID, "error", err)
+		emailNote = "mail_send_failed"
+	} else {
+		emailSent = true
+	}
 	db.AuditLog(r.Context(), claims.UserID, tenantID, "invite_created",
 		"/v1/admin/users/"+target.ID+"/invite", "email="+maskEmail(target.Email), r.RemoteAddr, nil)
 	OK(w, map[string]interface{}{
-		"invite_url": inviteURL,
-		"token":      raw,
-		"expires_at": expiresAt.UTC().Format(time.RFC3339),
+		"invite_url":  inviteURL,
+		"token":       raw,
+		"expires_at":  expiresAt.UTC().Format(time.RFC3339),
+		"email_sent":  emailSent,
+		"email_note":  emailNote,
 	})
 }
 

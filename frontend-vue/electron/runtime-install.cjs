@@ -137,7 +137,41 @@ function runtimeRoot(userDataPath, target = 'core') {
   return path.join(userDataPath, 'local', resolveTarget(target).rootName)
 }
 
+/**
+ * venv 指针文件：正常情况下不需要它，`venv` 目录就是唯一位置。
+ *
+ * 只有一种例外：旧 `venv` 被外部进程（安全软件扫描、上次没退干净的进程）锁住，
+ * 连重命名都失败。此时删不掉又不能复用，继续报"请重启电脑"等于把用户挡在门外；
+ * 这里改为**换一个版本化目录**继续安装，并把指针落盘。所有读取方都经 `venvDir()`
+ * 解析，因此只需改这一处。
+ */
+const VENV_POINTER_FILE = 'venv.current'
+
+function venvPointerPath(userDataPath, target = 'core') {
+  return path.join(runtimeRoot(userDataPath, target), VENV_POINTER_FILE)
+}
+
+function readVenvPointer(userDataPath, target = 'core') {
+  try {
+    const raw = fs.readFileSync(venvPointerPath(userDataPath, target), 'utf8').trim()
+    if (!raw) return ''
+    return path.isAbsolute(raw) ? raw : path.join(runtimeRoot(userDataPath, target), raw)
+  } catch {
+    return ''
+  }
+}
+
+function writeVenvPointer(userDataPath, target, dir) {
+  const file = venvPointerPath(userDataPath, target)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const staging = `${file}.tmp`
+  fs.writeFileSync(staging, `${path.basename(dir)}\n`, 'utf8')
+  fs.renameSync(staging, file)
+}
+
 function venvDir(userDataPath, target = 'core') {
+  const pointed = readVenvPointer(userDataPath, target)
+  if (pointed) return pointed
   return path.join(runtimeRoot(userDataPath, target), 'venv')
 }
 
@@ -769,19 +803,74 @@ function uvEnv(userDataPath, target = 'core') {
   return { UV_PYTHON_INSTALL_DIR: path.join(runtimeRoot(userDataPath, target), 'python') }
 }
 
-/** 删掉旧 venv。半损坏的目录留着会让 uv 复用坏状态，重建等于没修 */
-function removeVenv(userDataPath, target = 'core') {
-  const id = resolveTarget(target)
-  const dir = venvDir(userDataPath, id.id)
-  if (!fs.existsSync(dir)) return
+function sleepSync(ms) {
+  if (!ms || ms <= 0) return
+  const wait = new Int32Array(new SharedArrayBuffer(4))
+  Atomics.wait(wait, 0, 0, ms)
+}
+
+/**
+ * 删掉旧 venv（必要时换目录）。返回**清理后实际应使用的 venv 目录**。
+ *
+ * 现实里最难受的一种情况是旧 venv 被外部进程锁住（安全软件扫描 `python.exe`、
+ * 上次没退干净的子进程），`rm` 与 `rename` 都会 EPERM/EBUSY。继续抛出"请重启电脑"
+ * 会让用户完全用不了本地功能；而 uv 又不能复用一个半损坏的环境。
+ *
+ * 顺序：
+ *   1. 退避重试 rm（句柄常常几百毫秒内释放）；
+ *   2. 仍失败则 rename 到 `venv.stale-*` —— 默认路径被腾出，安装照旧；
+ *   3. 连 rename 都失败，换一个 `venv-<timestamp>-<rand>` 目录并写指针。
+ * 第 3 步之后旧目录还会占着，但它在重启后可清理，不再阻塞启动。
+ *
+ * `options.rm/rename/retryDelayMs` 仅供测试注入：真机上锁是外部进程造成的，
+ * 测试里无法可靠复现文件句柄。
+ */
+function removeVenv(userDataPath, target = 'core', options = {}) {
+  const spec = resolveTarget(target)
+  const dir = venvDir(userDataPath, spec.id)
+  if (!fs.existsSync(dir)) return dir
+  const rm = options.rm || (p => fs.rmSync(p, { recursive: true, force: true }))
+  const rename = options.rename || fs.renameSync
+  const retries = options.retries === undefined ? 5 : options.retries
+  const delay = options.retryDelayMs === undefined ? 400 : options.retryDelayMs
+  let lastErr = null
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      rm(dir)
+      return dir
+    } catch (err) {
+      lastErr = err
+      sleepSync(delay)
+    }
+  }
+
+  const stamp = `${Date.now()}-${crypto.randomBytes(3).toString('hex')}`
+  const stale = `${dir}.stale-${stamp}`
   try {
-    fs.rmSync(dir, { recursive: true, force: true })
+    rename(dir, stale)
+    if (typeof options.onFallback === 'function') {
+      options.onFallback({ from: dir, to: dir, moved: stale })
+    }
+    return dir
+  } catch (renameErr) {
+    lastErr = renameErr
+  }
+
+  const fallback = path.join(runtimeRoot(userDataPath, spec.id), `venv-${stamp}`)
+  try {
+    writeVenvPointer(userDataPath, spec.id, fallback)
   } catch (err) {
     throw new Error(
-      `无法清理旧的${id.label}环境（${dir}）：${err && err.message ? err.message : err}\n` +
-        '通常是它有进程还在运行（例如上次没退干净的 core 或引擎），请重启电脑后再试。',
+      `无法清理旧的${spec.label}环境（${dir}）：${lastErr && lastErr.message ? lastErr.message : lastErr}\n` +
+        `也无法切换到新目录（${fallback}）：${err && err.message ? err.message : err}\n` +
+        '通常是某个进程仍在占用该目录（安全软件扫描、上次没退干净的 core/引擎）。' +
+        '请关闭占用该目录的程序或在安全软件中放行它后重试；重启电脑也能解决。',
     )
   }
+  if (typeof options.onFallback === 'function') {
+    options.onFallback({ from: dir, to: fallback, moved: '' })
+  }
+  return fallback
 }
 
 /**
@@ -811,7 +900,7 @@ async function ensureRuntime(options = {}) {
   }
 
   const onStage = typeof options.onStage === 'function' ? options.onStage : () => {}
-  const vpython = venvPython(userDataPath, target.id)
+  let vpython = venvPython(userDataPath, target.id)
   const indexUrl = String(options.indexUrl || process.env.CHIRON_PIP_INDEX_URL || '').trim()
   const fingerprint = dependencyFingerprint(sources, target.id)
 
@@ -983,7 +1072,27 @@ async function ensureRuntime(options = {}) {
   }
 
   // —— 路径 3：全量重建 ——
-  removeVenv(userDataPath, target.id)
+  // 旧目录被外部进程锁住时，这里可能切换到带时间戳的新目录（见 removeVenv）。
+  // 因此解释器路径必须重新解析，不能用进入函数时算出的那份。
+  const activeVenv = removeVenv(userDataPath, target.id, {
+    onFallback: info => {
+      notice(
+        `[runtime] 旧${target.label}环境无法删除（${info.from}），` +
+          (info.moved
+            ? `已移动到 ${info.moved}`
+            : `已切换到新目录 ${info.to}；旧目录会在重启后可清理`),
+      )
+    },
+  })
+  if (activeVenv !== venvDir(userDataPath, target.id)) {
+    // 理论上 removeVenv 已写好指针；这里只是防御，避免后续 uv 与探针各走一边。
+    try {
+      writeVenvPointer(userDataPath, target.id, activeVenv)
+    } catch {
+      /* 指针写不进去时 removeVenv 已经抛过更具体的错误 */
+    }
+  }
+  vpython = venvPython(userDataPath, target.id)
 
   // 解释器：**随包那份**（`resources/python-runtime/<platform>/cpython-*/`），
   // 引导器与 python-engine 共用它。传绝对路径给 uv，uv 因此不会联网取解释器。
@@ -1057,6 +1166,10 @@ module.exports = {
   resolveTarget,
   runtimeRoot,
   venvDir,
+  venvPointerPath,
+  readVenvPointer,
+  writeVenvPointer,
+  removeVenv,
   venvPython,
   manifestPath,
   dependencyFingerprint,

@@ -1218,3 +1218,75 @@ test('ensureRuntime：首个镜像失败时自动换下一个源，而不是直�
   assert.ok(pipIndexes.length >= 2, '第一个源失败后要换下一个源重试')
   assert.notEqual(pipIndexes[1], PIP_INDEX_MIRRORS[0].url, '重试不能原地重打同一个源')
 })
+
+test('venvDir 跟随 venv.current 指针（旧目录被占用时的切换落盘）', t => {
+  const userData = makeUserData(t)
+  const custom = path.join(installer.runtimeRoot(userData, 'core'), 'venv-20260101-abcd')
+  fs.mkdirSync(custom, { recursive: true })
+  installer.writeVenvPointer(userData, 'core', custom)
+
+  assert.equal(installer.venvDir(userData, 'core'), custom)
+  assert.ok(installer.venvPython(userData, 'core').startsWith(custom))
+  const raw = fs.readFileSync(installer.venvPointerPath(userData, 'core'), 'utf8').trim()
+  assert.equal(raw, 'venv-20260101-abcd', '指针应写相对目录名，换安装位置/搬 userData 后仍可用')
+
+  // 指针必须可覆盖（再次切换时不能因为目标文件已存在而失败）。
+  const next = path.join(installer.runtimeRoot(userData, 'core'), 'venv-20260102-ef01')
+  fs.mkdirSync(next, { recursive: true })
+  installer.writeVenvPointer(userData, 'core', next)
+  assert.equal(installer.venvDir(userData, 'core'), next)
+})
+
+test('removeVenv：rm 与 rename 都被占用时切换到新目录并写指针', t => {
+  const userData = makeUserData(t)
+  const old = installer.venvDir(userData, 'core')
+  fs.mkdirSync(old, { recursive: true })
+  fs.writeFileSync(path.join(old, 'marker'), 'keep')
+  const busy = () => {
+    const err = new Error('EPERM: operation not permitted')
+    err.code = 'EPERM'
+    return err
+  }
+  const fallbacks = []
+
+  const active = installer.removeVenv(userData, 'core', {
+    rm: () => { throw busy() },
+    rename: () => { throw busy() },
+    retries: 2,
+    retryDelayMs: 0,
+    onFallback: info => fallbacks.push(info),
+  })
+
+  assert.notEqual(active, old, '锁死的旧目录不能继续用')
+  assert.match(path.basename(active), /^venv-\d+-[0-9a-f]{6}$/)
+  assert.equal(installer.venvDir(userData, 'core'), active, '后续安装必须走新目录')
+  assert.ok(fs.existsSync(path.join(old, 'marker')), '旧的被占用目录保持原样，不假装已删除')
+  assert.equal(fallbacks.length, 1)
+  assert.equal(fallbacks[0].from, old)
+  assert.equal(fallbacks[0].to, active)
+})
+
+test('removeVenv：删除失败但可改名时腾出默认路径，不写指针', t => {
+  const userData = makeUserData(t)
+  const old = installer.venvDir(userData, 'core')
+  fs.mkdirSync(old, { recursive: true })
+  fs.writeFileSync(path.join(old, 'marker'), 'keep')
+
+  const active = installer.removeVenv(userData, 'core', {
+    rm: () => {
+      const err = new Error('EBUSY: resource busy')
+      err.code = 'EBUSY'
+      throw err
+    },
+    retries: 1,
+    retryDelayMs: 0,
+  })
+
+  assert.equal(active, old, '改名成功后继续使用原路径')
+  assert.equal(fs.existsSync(old), false)
+  assert.equal(installer.readVenvPointer(userData, 'core'), '', '不需要指针')
+  const stale = fs
+    .readdirSync(installer.runtimeRoot(userData, 'core'))
+    .find(name => name.startsWith('venv.stale-'))
+  assert.ok(stale, '旧目录应被改名保留，供重启后清理')
+})

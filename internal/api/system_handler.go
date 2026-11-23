@@ -119,6 +119,28 @@ func (h *SystemHandler) PrometheusMetrics(w http.ResponseWriter, r *http.Request
 	for _, g := range gauges {
 		fmt.Fprintf(w, "# HELP chiron_%s %s\n# TYPE chiron_%s gauge\nchiron_%s %v\n", g[0], g[1], g[0], g[0], s[g[0]])
 	}
+
+	// 引擎池（R6）：逐实例负载来自自注册心跳；Redis 不可用时静默省略这组指标，
+	// 不能把"采集失败"写成 0（那会被告警读成"池空了"）。
+	if instances, err := engine.ListLiveInstances(r.Context(), db.Redis); err == nil {
+		fmt.Fprint(w, "# HELP chiron_engine_instances Live engine instances (self-registered heartbeats)\n")
+		fmt.Fprint(w, "# TYPE chiron_engine_instances gauge\n")
+		fmt.Fprintf(w, "chiron_engine_instances %d\n", len(instances))
+		fmt.Fprint(w, "# HELP chiron_engine_instance_active_tasks In-flight runs per engine instance\n")
+		fmt.Fprint(w, "# TYPE chiron_engine_instance_active_tasks gauge\n")
+		fmt.Fprint(w, "# HELP chiron_engine_instance_memory_mb Engine process RSS in MB\n")
+		fmt.Fprint(w, "# TYPE chiron_engine_instance_memory_mb gauge\n")
+		fmt.Fprint(w, "# HELP chiron_engine_instance_cpu_percent Engine process CPU percent\n")
+		fmt.Fprint(w, "# TYPE chiron_engine_instance_cpu_percent gauge\n")
+		for _, inst := range instances {
+			fmt.Fprintf(w, "chiron_engine_instance_active_tasks{instance=%q,url=%q} %d\n",
+				inst.ID, inst.URL, inst.ActiveTasks)
+			fmt.Fprintf(w, "chiron_engine_instance_memory_mb{instance=%q,url=%q} %.2f\n",
+				inst.ID, inst.URL, inst.MemoryMB)
+			fmt.Fprintf(w, "chiron_engine_instance_cpu_percent{instance=%q,url=%q} %.2f\n",
+				inst.ID, inst.URL, inst.CPUPercent)
+		}
+	}
 }
 
 // Spans returns completed tracing spans for debugging.

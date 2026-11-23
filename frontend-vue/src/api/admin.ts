@@ -621,6 +621,67 @@ export async function getSettings(category: string): Promise<Record<string, unkn
   return data?.data?.config ?? {}
 }
 
+// ── 邮件通道（邀请邮件 / 测试发信）──────────────────────────────────────
+//
+// 密钥（password/api_key）只回 "是否已设置"；PUT 时字段缺省表示保持原值。
+export interface AdminMailConfig {
+  provider: 'smtp' | 'qingchen'
+  host: string
+  port: number
+  username: string
+  security: 'none' | 'starttls' | 'ssl'
+  from: string
+  from_name: string
+  reply_to: string
+  base_url: string
+  timeout_seconds: number
+  has_password: boolean
+  has_api_key: boolean
+  ready: boolean
+  problem?: string
+}
+
+export async function getMailConfig(): Promise<AdminMailConfig> {
+  const { data } = await api.get('/v1/admin/mail')
+  return data?.data
+}
+
+export interface MailConfigPatch {
+  provider?: string
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  security?: string
+  from?: string
+  from_name?: string
+  reply_to?: string
+  base_url?: string
+  api_key?: string
+  timeout_seconds?: number
+  clear_password?: boolean
+  clear_api_key?: boolean
+}
+
+export async function saveMailConfig(patch: MailConfigPatch): Promise<AdminMailConfig> {
+  const { data } = await api.put('/v1/admin/mail', patch)
+  return data?.data
+}
+
+export async function testMailConfig(to?: string): Promise<{ sent: boolean; to: string }> {
+  const { data } = await api.post('/v1/admin/mail/test', to ? { to } : {})
+  return data?.data
+}
+
+// ── 数据导出（R10）────────────────────────────────────────────────────
+//
+// 服务端流式返回 ZIP（manifest + 每表 NDJSON）。这里必须用 blob：
+// axios 默认按 JSON 解析，二进制会在拦截器里被当坏包。
+export async function exportTenantData(): Promise<Blob> {
+  const res = await api.get('/v1/admin/export', { responseType: 'blob' })
+  return res.data
+}
+
 // ── Agent 运行配置（system_settings 的 agent 分类）──────────────────────
 //
 // 与 market 同一套理由（见上）：键名是**后端契约**，写错不报错、只是静默不生效。
@@ -1281,6 +1342,10 @@ export interface AdminUserInvite {
   invite_url: string
   token: string
   expires_at: string
+  /** 邮件是否已投递；未配置邮件时仍可用链接/令牌手动交付。 */
+  email_sent?: boolean
+  /** 未投递时的稳定原因码：mail_not_configured / mail_send_failed / public_base_url_missing / invalid_recipient。 */
+  email_note?: string
 }
 
 export async function createAdminUserInvite(id: string): Promise<AdminUserInvite> {

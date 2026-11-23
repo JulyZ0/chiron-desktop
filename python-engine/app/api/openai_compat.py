@@ -248,6 +248,10 @@ async def _complete(
             resp.provider or "-",
             resp.message or "-",
         )
+        if resp.error_code == "rate_limited":
+            raise HTTPException(
+                status_code=429, detail=resp.message or "model rate limit exceeded"
+            )
         raise _upstream_error()
 
     message: dict[str, Any] = {"role": "assistant", "content": resp.content or ""}
@@ -351,12 +355,13 @@ def _stream(
                     logger.warning(
                         "openai compat: stream provider error: %s", chunk.message or "-"
                     )
+                    rate_limited = chunk.error_code == "rate_limited"
                     yield _sse(
                         {
                             "error": {
                                 "message": chunk.message or "upstream inference failed",
-                                "type": "upstream_error",
-                                "code": "upstream_failed",
+                                "type": "rate_limit_error" if rate_limited else "upstream_error",
+                                "code": "rate_limited" if rate_limited else "upstream_failed",
                             }
                         }
                     )

@@ -1,10 +1,13 @@
 #!/usr/bin/env python
 """团队服务模式冒烟：账密登录 + 建号 + 重置 + 禁用 + 强制下线 + 软删除。
 
+可选 `--sse` 追加：创建会话 → 提交一轮 → 首 token 与 turn_done（需要可用的模型配置）。
+
 只依赖标准库，适合在部署主机或任意能访问域名的机器上跑：
 
     set CHIRON_OWNER_PASSWORD=你的密码
     python scripts/team_smoke.py --base-url https://chiron.example.com --email owner@company.com
+    python scripts/team_smoke.py --base-url https://... --email ... --sse
 
 安全约定：
 * 密码只从环境变量读取，不放进命令行参数（避免进 shell 历史/进程列表）；
@@ -20,6 +23,7 @@ import json
 import os
 import secrets
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -68,6 +72,12 @@ def main() -> int:
     parser.add_argument("--base-url", required=True, help="例如 https://chiron.example.com")
     parser.add_argument("--email", required=True, help="owner 邮箱或用户名")
     parser.add_argument("--admin", action="store_true", help="用 admin 账号跑（默认 owner）")
+    parser.add_argument(
+        "--sse",
+        action="store_true",
+        help="额外验证 SSE：创建会话 → 提交一轮 → 首 token 与 turn_done（需要服务端已配置可用模型）",
+    )
+    parser.add_argument("--sse-timeout", type=int, default=120, help="SSE 等待秒数")
     args = parser.parse_args()
 
     password = os.environ.get("CHIRON_OWNER_PASSWORD", "")
@@ -118,6 +128,58 @@ def main() -> int:
     expect("首次改密", code == 200, f"HTTP {code}")
     code, _ = member.call("GET", "/v1/conversations?page=1&per_page=1")
     expect("改密后业务接口可用", code == 200, f"HTTP {code}")
+
+    if args.sse:
+        code, body = member.call("POST", "/v1/conversations", {"title": "smoke-sse"})
+        sid = ((body.get("data") or {}).get("id") or "") if code == 200 else ""
+        expect("创建 SSE 测试会话", bool(sid), f"HTTP {code}")
+
+        sse_url = (
+            args.base_url.rstrip("/")
+            + f"/v1/events?session_id={sid}&client_id=smoke-{secrets.token_hex(4)}"
+        )
+        sse_req = urllib.request.Request(
+            sse_url, headers={"Accept": "text/event-stream"}
+        )
+        first_ms = None
+        done = False
+        try:
+            with member.opener.open(sse_req, timeout=args.sse_timeout) as stream:
+                started = time.monotonic()
+                code, _ = member.call(
+                    "POST",
+                    "/v1/agent/submit",
+                    {"session_id": sid, "content": "Reply with the single word: pong"},
+                )
+                expect("提交 SSE 回合", code in (200, 202), f"HTTP {code}")
+                deadline = time.monotonic() + args.sse_timeout
+                while time.monotonic() < deadline:
+                    raw = stream.readline()
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", "ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        payload = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    etype = payload.get("type") or payload.get("event") or ""
+                    if etype == "text" and first_ms is None:
+                        first_ms = (time.monotonic() - started) * 1000
+                    if etype in ("turn_done", "done") and first_ms is not None:
+                        done = True
+                        break
+        except Exception as exc:  # noqa: BLE001 - 超时/断流都按验收失败处理
+            print(f"  NOTE SSE 读取异常：{type(exc).__name__}: {exc}")
+        expect(
+            "SSE 首 token 到达",
+            first_ms is not None,
+            "未收到 text 事件（模型未配置/不可用，或 SSE 被代理缓冲）",
+        )
+        if first_ms is not None:
+            print(f"  info 首 token ≈ {int(first_ms)} ms")
+        expect("SSE 回合完成", done, "未收到 turn_done")
 
     # ── 邀请闭环：建号 → 一次性邀请 → 受邀人自设密码 → 登录可用 ──
     invitee_email = f"smoke-inv-{suffix}@invalid.local"

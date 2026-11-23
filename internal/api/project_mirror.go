@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/athenavi/chiron/internal/auth"
+	"github.com/athenavi/chiron/internal/db"
 )
 
 const (
@@ -295,6 +296,12 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 	}
 	if changed > 0 {
 		slog.Info("project mirror synced", "project", loc.ID, "files", changed)
+	}
+	// R5 读写审计：写入/删除的**数量**与冲突数留痕；路径属于用户数据，不进审计。
+	if changed > 0 || len(conflicts) > 0 {
+		db.AuditLog(ctx, user, parseTenantID(tenant), "device_write_synced",
+			"/v1/session-map/projects/"+loc.ID+"/device-write",
+			fmt.Sprintf("files=%d conflicts=%d", changed, len(conflicts)), "", nil)
 	}
 	if len(conflicts) > 0 {
 		return fmt.Errorf("project_mirror_conflict: %s", strings.Join(conflicts, ", "))
