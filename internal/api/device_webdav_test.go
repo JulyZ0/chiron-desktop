@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/athenavi/chiron/internal/auth"
 	"github.com/gorilla/websocket"
 	"golang.org/x/net/webdav"
 )
@@ -121,6 +122,13 @@ func startFakeWebDAVDevice(t *testing.T, tenant, user, device, root string, st *
 				sort.Strings(keys)
 				for _, k := range keys {
 					resp.Entries = append(resp.Entries, names[k])
+				}
+			case "walk":
+				resp.OK = true
+				for name := range st.files {
+					if name != "" {
+						resp.Entries = append(resp.Entries, deviceEntry{Name: name, Size: int64(len(st.files[name]))})
+					}
 				}
 			case "read":
 				content := st.files[rel]
@@ -256,4 +264,46 @@ func TestDeviceWebDAVPermissionAndProtocol(t *testing.T) {
 		t.Logf("status=%s", resp2.Status)
 	}
 	_ = path.Base("/")
+}
+
+func TestClientProjectFileAPIs(t *testing.T) {
+	st := &fakeWebDAVDevice{
+		files: map[string]string{"a.txt": "line1\nline2\n", "sub/b.txt": "bee"},
+		dirs:  map[string]bool{"": true, "sub": true},
+	}
+	startFakeWebDAVDevice(t, "1", "usr", "dev-files", `/srv/files`, st)
+	loc := projectLocator{ID: "p-files", Provider: smProviderClient, DeviceID: "dev-files", RootPath: `/srv/files`}
+
+	req := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/v1/session-map/projects/p-files/files", nil)
+		return r.WithContext(auth.WithClaims(r.Context(), &auth.Claims{UserID: "usr", TenantID: 1}))
+	}
+
+	// list
+	rec := httptest.NewRecorder()
+	clientListProjectFiles(rec, req(), loc, "", false)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "a.txt") || !strings.Contains(rec.Body.String(), `"dir"`) {
+		t.Fatalf("list = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// read window
+	rec = httptest.NewRecorder()
+	clientReadProjectFile(rec, req(), loc, "a.txt", 0, 10)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "line1") {
+		t.Fatalf("read = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// search
+	rec = httptest.NewRecorder()
+	clientSearchProjectFiles(rec, req(), loc, "b.txt", 0)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "sub/b.txt") {
+		t.Fatalf("search = %d %s", rec.Code, rec.Body.String())
+	}
+
+	// raw
+	rec = httptest.NewRecorder()
+	clientRawProjectFile(rec, req(), loc, "a.txt")
+	if rec.Code != http.StatusOK || rec.Body.String() != "line1\nline2\n" {
+		t.Fatalf("raw = %d %q", rec.Code, rec.Body.String())
+	}
 }

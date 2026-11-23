@@ -30,6 +30,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"mime"
@@ -723,84 +724,81 @@ func looksBinary(head []byte) bool {
 //
 // ok 为 false 时响应已经写出，调用方直接 return。把这段重复三次的流程收在一处，
 // 是为了让"谁能读这个项目"只有一个答案 —— 分散后早晚有一个分支漏掉归属校验。
-func (h *SessionMapHandler) requireProject(w http.ResponseWriter, r *http.Request) (root string, ok bool) {
+func (h *SessionMapHandler) requireProject(w http.ResponseWriter, r *http.Request) (loc projectLocator, ok bool) {
 	claims := auth.GetClaims(r.Context())
 	if claims == nil {
 		Unauthorized(w, ErrAuthRequired)
-		return "", false
+		return projectLocator{}, false
 	}
 	wsID := strings.TrimSpace(r.PathValue("id"))
 	if wsID == "" {
 		BadRequest(w, "project id is required")
-		return "", false
+		return projectLocator{}, false
 	}
 	if !smOwnsWorkspace(r, wsID, claims) {
 		JSONWithCode(w, http.StatusNotFound, CodeNotFound, nil, "project not found")
-		return "", false
+		return projectLocator{}, false
 	}
-	root, why := projectRootOf(r, wsID, claims)
+	loc, why := projectLocatorOf(r, wsID, claims)
 	if why != nil {
-		if errors.Is(why, errClientProviderPending) {
-			// S1：client 项目的文件浏览器尚未接入（@引用已可经设备桥读取）。
-			// 明确 501，而不是让 os.Stat 把它报成"目录不存在"。
-			JSONWithCode(w, http.StatusNotImplemented, "project_files_client_pending", nil,
-				"project file browsing for device-backed projects is not enabled yet")
-			return "", false
-		}
 		code := CodeNotFound
 		status := http.StatusNotFound
 		if errors.Is(why, errRootUnavailable) {
 			code, status = CodeProjectRootUnavailable, http.StatusConflict
 		}
 		JSONWithCode(w, status, code, nil, why.Error())
-		return "", false
+		return projectLocator{}, false
 	}
-	return root, true
+	return loc, true
 }
 
-// errClientProviderPending 表示项目绑定在用户设备上，服务端本地文件 API 不适用。
-var errClientProviderPending = errors.New("project is device-backed")
+// projectLocatorOf 取项目身份与根；server 项目额外要求根目录此刻可用。
+func projectLocatorOf(r *http.Request, wsID string, claims *auth.Claims) (projectLocator, error) {
+	if db.GlobalDBManager == nil {
+		return projectLocator{}, errors.New("database unavailable")
+	}
+	row, err := db.GlobalDBManager.FetchOne(r.Context(),
+		`SELECT id, COALESCE(root_path,'') AS root_path,
+		        COALESCE(provider,'server') AS provider, COALESCE(device_id,'') AS device_id,
+		        COALESCE(root_key,'') AS root_key
+		   FROM session_map_workspaces
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
+		wsID, smTenant(claims), claims.UserID)
+	if err != nil || row == nil {
+		return projectLocator{}, errors.New("project not found")
+	}
+	loc := projectLocator{
+		ID:       stringOf(row["id"]),
+		Provider: stringOf(row["provider"]),
+		DeviceID: stringOf(row["device_id"]),
+		RootPath: stringOf(row["root_path"]),
+		RootKey:  stringOf(row["root_key"]),
+	}
+	if loc.Provider == "" {
+		loc.Provider = smProviderServer
+	}
+	if loc.RootPath == "" {
+		return projectLocator{}, errors.New("project has no root folder")
+	}
+	if loc.Provider == smProviderClient {
+		return loc, nil // 设备侧可用性由设备桥在每次操作时判定
+	}
+	// 团队模式：绑定目录必须落在该用户自己的项目根内。旧数据（升级前绑到别处）
+	// 在这里显式拒绝，而不是继续读。
+	if !projectRootAllowed(smTenant(claims), claims.UserID, loc.RootPath) {
+		return projectLocator{}, errors.New("project root is outside your isolated project directory")
+	}
+	info, statErr := os.Stat(loc.RootPath)
+	if statErr != nil || !info.IsDir() {
+		return projectLocator{}, errRootUnavailable
+	}
+	return loc, nil
+}
 
 // requireProject 的取值来源：项目根此刻是否仍然可用。
 //
 // 项目创建时校验过路径，但目录可能之后被删、改名、或换了挂载点。这种情况必须明确
 // 报错：返回空列表会让用户以为"项目是空的"，然后去找 agent 为什么看不到文件。
-func projectRootOf(r *http.Request, wsID string, claims *auth.Claims) (string, error) {
-	if db.GlobalDBManager == nil {
-		return "", errors.New("database unavailable")
-	}
-	row, err := db.GlobalDBManager.FetchOne(r.Context(),
-		// **必须写 AS root_path**：FetchOne 用**列名**建 map，而 `COALESCE(x,'')`
-		// 不带别名时 Postgres 给的列名就是 `coalesce`。少了别名，下面
-		// `row["root_path"]` 永远取不到值 → 每个项目都被判成"没有绑定文件夹" →
-		// 工作台一直显示「无法加载项目文件列表」。
-		`SELECT COALESCE(root_path,'') AS root_path, COALESCE(provider,'server') AS provider
-		   FROM session_map_workspaces
-		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-		wsID, smTenant(claims), claims.UserID)
-	if err != nil || row == nil {
-		return "", errors.New("project not found")
-	}
-	if stringOf(row["provider"]) == smProviderClient {
-		return "", errClientProviderPending
-	}
-	root := stringOf(row["root_path"])
-	if root == "" {
-		// 画布不是项目：它没有绑定本地文件夹，自然没有文件可列。
-		return "", errors.New("project has no root folder")
-	}
-	// 团队模式：绑定目录必须落在该用户自己的项目根内。旧数据（升级前绑到别处）
-	// 在这里显式拒绝，而不是继续读。
-	if !projectRootAllowed(smTenant(claims), claims.UserID, root) {
-		return "", errors.New("project root is outside your isolated project directory")
-	}
-	info, statErr := os.Stat(root)
-	if statErr != nil || !info.IsDir() {
-		return "", errRootUnavailable
-	}
-	return root, nil
-}
-
 // respondFileError 把纯函数的失败映射成状态码 + 稳定错误码。
 //
 // 映射表就是"前端能做什么"的清单：路径越界与 404 的区别在于**用户该改请求还是改
@@ -841,13 +839,18 @@ func respondFileError(w http.ResponseWriter, err error, rel string) {
 //
 // query: path（相对路径，缺省为根）、hidden（"1"/"true" 时包含点开头的条目）
 func (h *SessionMapHandler) ListProjectFiles(w http.ResponseWriter, r *http.Request) {
-	root, ok := h.requireProject(w, r)
+	loc, ok := h.requireProject(w, r)
 	if !ok {
 		return
 	}
 	rel := r.URL.Query().Get("path")
 	hidden := r.URL.Query().Get("hidden")
 	showHidden := hidden == "1" || strings.EqualFold(hidden, "true")
+	if loc.Provider == smProviderClient {
+		clientListProjectFiles(w, r, loc, rel, showHidden)
+		return
+	}
+	root := loc.RootPath
 
 	listing, err := listProjectDir(root, rel, showHidden)
 	if err != nil {
@@ -867,7 +870,7 @@ func (h *SessionMapHandler) ListProjectFiles(w http.ResponseWriter, r *http.Requ
 //
 // query: q（关键词，可为空）、limit（条数上限，默认/封顶 maxSearchResults）
 func (h *SessionMapHandler) SearchProjectFiles(w http.ResponseWriter, r *http.Request) {
-	root, ok := h.requireProject(w, r)
+	loc, ok := h.requireProject(w, r)
 	if !ok {
 		return
 	}
@@ -878,6 +881,11 @@ func (h *SessionMapHandler) SearchProjectFiles(w http.ResponseWriter, r *http.Re
 			limit = n
 		}
 	}
+	if loc.Provider == smProviderClient {
+		clientSearchProjectFiles(w, r, loc, q, limit)
+		return
+	}
+	root := loc.RootPath
 	hits, truncated, err := searchProjectFiles(r.Context(), root, q, limit)
 	if err != nil {
 		respondFileError(w, err, "")
@@ -898,7 +906,7 @@ func (h *SessionMapHandler) SearchProjectFiles(w http.ResponseWriter, r *http.Re
 // 为什么带 offset/limit：大文件不能靠"把上限抬高"来打开 —— 那只是把一次拒绝换成
 // 一次卡死。窗口让用户先看到第一屏，再按 offset 接着读，代价与服务端内存都恒定。
 func (h *SessionMapHandler) ReadProjectFile(w http.ResponseWriter, r *http.Request) {
-	root, ok := h.requireProject(w, r)
+	loc, ok := h.requireProject(w, r)
 	if !ok {
 		return
 	}
@@ -909,8 +917,6 @@ func (h *SessionMapHandler) ReadProjectFile(w http.ResponseWriter, r *http.Reque
 	}
 	offset := 0
 	if raw := r.URL.Query().Get("offset"); raw != "" {
-		// 非法数字按 0 处理而不是报错：offset 只影响"从哪开始看"，
-		// 为一个笔误让整个预览失败没有道理。
 		if n, convErr := strconv.Atoi(raw); convErr == nil && n > 0 {
 			offset = n
 		}
@@ -921,6 +927,11 @@ func (h *SessionMapHandler) ReadProjectFile(w http.ResponseWriter, r *http.Reque
 			limit = n
 		}
 	}
+	if loc.Provider == smProviderClient {
+		clientReadProjectFile(w, r, loc, rel, offset, limit)
+		return
+	}
+	root := loc.RootPath
 	file, err := readProjectTextWindow(root, rel, offset, limit)
 	if err != nil {
 		respondFileError(w, err, rel)
@@ -935,7 +946,7 @@ func (h *SessionMapHandler) ReadProjectFile(w http.ResponseWriter, r *http.Reque
 // （JSON vs 字节流），合成一条路径会让 Content-Type 在两条分支里各写一遍，
 // 而浏览器与 <img> 只认后者。
 func (h *SessionMapHandler) RawProjectFile(w http.ResponseWriter, r *http.Request) {
-	root, ok := h.requireProject(w, r)
+	loc, ok := h.requireProject(w, r)
 	if !ok {
 		return
 	}
@@ -944,6 +955,11 @@ func (h *SessionMapHandler) RawProjectFile(w http.ResponseWriter, r *http.Reques
 		BadRequest(w, "path is required")
 		return
 	}
+	if loc.Provider == smProviderClient {
+		clientRawProjectFile(w, r, loc, rel)
+		return
+	}
+	root := loc.RootPath
 	f, info, err := openProjectFile(root, rel, maxProjectRawBytes, errFileTooLargeRaw)
 	if err != nil {
 		respondFileError(w, err, rel)
@@ -965,4 +981,234 @@ func (h *SessionMapHandler) RawProjectFile(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	// 响应头已发出，这里出错只能记日志。
 	_, _ = io.Copy(w, f)
+}
+
+// ── client provider：经设备桥读取（R1）──
+//
+// 这些端点与 server 项目返回**同一套 JSON**，前端不需要分支；区别只在文件来源。
+
+func clientCall(r *http.Request, loc projectLocator, req deviceOpRequest) (deviceOpResponse, error) {
+	claims := auth.GetClaims(r.Context())
+	if claims == nil {
+		return deviceOpResponse{}, errors.New("missing auth context")
+	}
+	req.Root = loc.RootPath
+	return deviceHubSingleton.Call(r.Context(), smTenant(claims), claims.UserID, loc.DeviceID, req)
+}
+
+func clientRelPath(rel string) string {
+	rel = strings.TrimSpace(strings.ReplaceAll(rel, `\`, "/"))
+	return strings.TrimPrefix(rel, "/")
+}
+
+func clientBaseName(rel string) string {
+	if i := strings.LastIndex(rel, "/"); i >= 0 {
+		return rel[i+1:]
+	}
+	return rel
+}
+
+func clientListProjectFiles(w http.ResponseWriter, r *http.Request, loc projectLocator, rel string, showHidden bool) {
+	rel = clientRelPath(rel)
+	abs, ok := joinClientPath(loc.RootPath, rel)
+	if !ok {
+		BadRequest(w, "invalid path")
+		return
+	}
+	resp, err := clientCall(r, loc, deviceOpRequest{Op: "list", Path: abs})
+	if err != nil {
+		if isDeviceNotFound(err) {
+			JSONWithCode(w, http.StatusNotFound, CodeNotFound, map[string]interface{}{"path": rel}, "file not found")
+			return
+		}
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, map[string]interface{}{"reason": err.Error()}, "device read failed")
+		return
+	}
+	entries := make([]ProjectFileEntry, 0, len(resp.Entries))
+	truncated := resp.Truncated
+	for _, e := range resp.Entries {
+		if !showHidden && strings.HasPrefix(e.Name, ".") {
+			continue
+		}
+		childRel := e.Name
+		if rel != "" {
+			childRel = rel + "/" + e.Name
+		}
+		typ := "file"
+		if e.IsDir {
+			typ = "dir"
+		}
+		entries = append(entries, ProjectFileEntry{Name: e.Name, Path: childRel, Type: typ, Size: e.Size})
+		if len(entries) >= maxProjectListEntries {
+			truncated = true
+			break
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	OK(w, map[string]interface{}{
+		"root":      loc.RootPath,
+		"path":      rel,
+		"entries":   entries,
+		"truncated": truncated,
+	})
+}
+
+func clientSearchProjectFiles(w http.ResponseWriter, r *http.Request, loc projectLocator, q string, limit int) {
+	if limit <= 0 || limit > maxSearchResults {
+		limit = maxSearchResults
+	}
+	resp, err := clientCall(r, loc, deviceOpRequest{Op: "walk", Path: loc.RootPath})
+	if err != nil {
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, map[string]interface{}{"reason": err.Error()}, "device walk failed")
+		return
+	}
+	needle := strings.ToLower(strings.TrimSpace(q))
+	hits := make([]ProjectFileEntry, 0, limit)
+	truncated := resp.Truncated
+	for _, e := range resp.Entries {
+		if e.IsDir {
+			continue
+		}
+		rel := clientRelPath(e.Name)
+		if needle != "" && !strings.Contains(strings.ToLower(rel), needle) {
+			continue
+		}
+		hits = append(hits, ProjectFileEntry{Name: clientBaseName(rel), Path: rel, Type: "file", Size: e.Size})
+		if len(hits) >= limit {
+			truncated = true
+			break
+		}
+	}
+	OK(w, map[string]interface{}{"root": loc.RootPath, "files": hits, "truncated": truncated})
+}
+
+func clientReadProjectFile(w http.ResponseWriter, r *http.Request, loc projectLocator, rel string, offset, limit int) {
+	rel = clientRelPath(rel)
+	abs, ok := joinClientPath(loc.RootPath, rel)
+	if !ok {
+		BadRequest(w, "invalid path")
+		return
+	}
+	statResp, err := clientCall(r, loc, deviceOpRequest{Op: "stat", Path: abs})
+	if err != nil {
+		if isDeviceNotFound(err) {
+			respondFileError(w, errFileNotFound, rel)
+			return
+		}
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, map[string]interface{}{"reason": err.Error()}, "device read failed")
+		return
+	}
+	if statResp.Stat == nil || statResp.Stat.IsDir {
+		respondFileError(w, errNotADirectory, rel)
+		return
+	}
+	if statResp.Stat.Size > maxProjectRawBytes {
+		respondFileError(w, errFileTooLargeRaw, rel)
+		return
+	}
+	readResp, err := clientCall(r, loc, deviceOpRequest{
+		Op: "read", Path: abs, MaxBytes: statResp.Stat.Size + 1,
+	})
+	if err != nil {
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, map[string]interface{}{"reason": err.Error()}, "device read failed")
+		return
+	}
+	data, decErr := base64.StdEncoding.DecodeString(readResp.DataB64)
+	if decErr != nil {
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, nil, "invalid device response")
+		return
+	}
+	out := &ProjectFile{Path: rel, Size: statResp.Stat.Size}
+	head := data
+	if len(head) > binarySniffBytes {
+		head = head[:binarySniffBytes]
+	}
+	if looksBinary(head) || !utf8.Valid(data) {
+		out.Binary = true
+		OK(w, out)
+		return
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = maxProjectWindowLines
+	}
+	lines := strings.Split(string(data), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	out.TotalLines = len(lines)
+	out.Offset = offset
+	if offset >= len(lines) {
+		out.Content = ""
+		OK(w, out)
+		return
+	}
+	end := offset + limit
+	if end > len(lines) {
+		end = len(lines)
+	}
+	var b strings.Builder
+	bytesBudget := 0
+	for i := offset; i < end; i++ {
+		line := lines[i]
+		if bytesBudget > 0 && bytesBudget+len(line)+1 > maxProjectWindowBytes {
+			out.Truncated = true
+			break
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+		bytesBudget += len(line) + 1
+	}
+	out.Content = b.String()
+	if end < len(lines) {
+		out.Truncated = true
+	}
+	OK(w, out)
+}
+
+func clientRawProjectFile(w http.ResponseWriter, r *http.Request, loc projectLocator, rel string) {
+	rel = clientRelPath(rel)
+	abs, ok := joinClientPath(loc.RootPath, rel)
+	if !ok {
+		BadRequest(w, "invalid path")
+		return
+	}
+	statResp, err := clientCall(r, loc, deviceOpRequest{Op: "stat", Path: abs})
+	if err != nil {
+		if isDeviceNotFound(err) {
+			respondFileError(w, errFileNotFound, rel)
+			return
+		}
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, map[string]interface{}{"reason": err.Error()}, "device read failed")
+		return
+	}
+	if statResp.Stat == nil || statResp.Stat.IsDir {
+		respondFileError(w, errNotADirectory, rel)
+		return
+	}
+	if statResp.Stat.Size > 8<<20 {
+		respondFileError(w, errFileTooLargeRaw, rel)
+		return
+	}
+	readResp, err := clientCall(r, loc, deviceOpRequest{Op: "read", Path: abs, MaxBytes: 8 << 20})
+	if err != nil {
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, map[string]interface{}{"reason": err.Error()}, "device read failed")
+		return
+	}
+	data, decErr := base64.StdEncoding.DecodeString(readResp.DataB64)
+	if decErr != nil {
+		JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed, nil, "invalid device response")
+		return
+	}
+	ctype := mime.TypeByExtension(strings.ToLower(filepath.Ext(rel)))
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, _ = w.Write(data)
 }

@@ -572,10 +572,16 @@ func collectProjectChanges(ctx context.Context, root string) (ProjectChanges, er
 // 没有版本控制、没有装 git 都是**正常结果**（`repo: false`），不是错误：
 // 普通文件夹当项目用是允许的，把它报成 4xx 会让前端天天弹红条。
 func (h *SessionMapHandler) ListProjectChanges(w http.ResponseWriter, r *http.Request) {
-	root, ok := h.requireProject(w, r)
+	loc, ok := h.requireProject(w, r)
 	if !ok {
 		return
 	}
+	if loc.Provider == smProviderClient {
+		JSONWithCode(w, http.StatusNotImplemented, "project_vcs_client_pending", nil,
+			"git operations for device-backed projects are not enabled yet")
+		return
+	}
+	root := loc.RootPath
 	result, err := collectProjectChanges(r.Context(), root)
 	if err != nil {
 		if errors.Is(err, errGitMissing) {

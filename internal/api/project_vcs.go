@@ -117,11 +117,16 @@ func runProjectGit(ctx context.Context, root string, args ...string) (string, er
 
 // GetProjectVCS 返回项目根的版本控制状态（只读）。
 func (h *SessionMapHandler) GetProjectVCS(w http.ResponseWriter, r *http.Request) {
-	root, ok := h.requireProject(w, r)
+	loc, ok := h.requireProject(w, r)
 	if !ok {
 		return
 	}
-	OK(w, projectVCS(r.Context(), root))
+	if loc.Provider == smProviderClient {
+		JSONWithCode(w, http.StatusNotImplemented, "project_vcs_client_pending", nil,
+			"git operations for device-backed projects are not enabled yet")
+		return
+	}
+	OK(w, projectVCS(r.Context(), loc.RootPath))
 }
 
 // InitProjectVCS 在项目根执行 `git init`（**写操作**，必须由用户明确同意后才调用）。
@@ -129,10 +134,16 @@ func (h *SessionMapHandler) GetProjectVCS(w http.ResponseWriter, r *http.Request
 // 只创建 `.git` 目录，不暂存、不提交 —— 见文件头对"不做提交"的说明。
 // 幂等：已在仓库内直接返回现状。
 func (h *SessionMapHandler) InitProjectVCS(w http.ResponseWriter, r *http.Request) {
-	root, ok := h.requireProject(w, r)
+	loc, ok := h.requireProject(w, r)
 	if !ok {
 		return
 	}
+	if loc.Provider == smProviderClient {
+		JSONWithCode(w, http.StatusNotImplemented, "project_vcs_client_pending", nil,
+			"git operations for device-backed projects are not enabled yet")
+		return
+	}
+	root := loc.RootPath
 	state, err := initProjectRepo(r.Context(), root)
 	if err != nil {
 		if errors.Is(err, errGitMissing) {
