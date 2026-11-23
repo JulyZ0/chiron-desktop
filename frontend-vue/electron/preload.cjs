@@ -244,6 +244,7 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   getAppInfo: () => ipcRenderer.invoke('desktop:get-app-info'),
   checkUpdate: () => ipcRenderer.invoke('desktop:check-update'),
   installUpdate: () => ipcRenderer.invoke('desktop:install-update'),
+  getUpdateStatus: () => ipcRenderer.invoke('desktop:update-status'),
 
   /**
    * 复制文本（主进程通道，`utils/clipboard.ts` 的降级路径）。

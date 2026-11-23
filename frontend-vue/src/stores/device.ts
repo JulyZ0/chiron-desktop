@@ -127,6 +127,7 @@ export interface ChironDesktopHost {
   getAppInfo?: () => Promise<AppInfo>
   checkUpdate?: () => Promise<UpdateCheckResult>
   installUpdate?: () => Promise<UpdateInstallResult>
+  getUpdateStatus?: () => Promise<UpdateJobStatus>
   /** 团队挂载依赖（rclone/WinFsp）状态与按需安装；仅桌面主进程支持。 */
   getMountDepsStatus?: () => Promise<MountDepsStatus>
   installMountDep?: (name: MountDepName) => Promise<MountDepInstallResult>
@@ -240,10 +241,33 @@ export interface UpdateCheckResult {
 /** 下载并拉起安装器的结果（安装包已做 SHA-512 校验）。 */
 export interface UpdateInstallResult {
   ok: boolean
+  started?: boolean
   version?: string
   path?: string
   reason?: string
   message?: string
+  status?: UpdateJobStatus
+}
+
+/** 主进程后台升级任务的状态（与设置页生命周期解耦，可重复读取）。 */
+export type UpdateJobState =
+  | 'idle'
+  | 'downloading'
+  | 'paused'
+  | 'verifying'
+  | 'launching'
+  | 'ready'
+  | 'error'
+
+export interface UpdateJobStatus {
+  state: UpdateJobState
+  version?: string
+  asset?: string
+  url?: string
+  total?: number
+  downloaded?: number
+  message?: string
+  reason?: string
 }
 
 /** 团队挂载依赖（rclone / WinFsp）：只装在服务端主机，按需下载并校验。 */
@@ -942,6 +966,17 @@ export const useDeviceStore = defineStore('device', () => {
     }
   }
 
+  async function getUpdateStatus(): Promise<UpdateJobStatus | null> {
+    const host = desktopHost()
+    if (!host || typeof host.getUpdateStatus !== 'function') return null
+    try {
+      const result = await host.getUpdateStatus()
+      return result && typeof result === 'object' ? (result as UpdateJobStatus) : null
+    } catch {
+      return null
+    }
+  }
+
   /**
    * 重启本地后端（不改开关、只让已保存的配置生效）。
    *
@@ -1060,6 +1095,7 @@ export const useDeviceStore = defineStore('device', () => {
     getAppInfo,
     checkUpdate,
     installUpdate,
+    getUpdateStatus,
     getMountDepsStatus,
     installMountDep,
   }

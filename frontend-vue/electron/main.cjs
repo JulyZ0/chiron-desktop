@@ -2008,10 +2008,14 @@ function relaunchIntoSetup() {
 const UPDATE_REPO = process.env.CHIRON_UPDATE_REPO || 'JulyZ0/chiron-desktop'
 const UPDATE_MANIFEST_URL = `https://github.com/${UPDATE_REPO}/releases/latest/download/latest.yml`
 const UPDATE_HTTP_TIMEOUT_MS = 15000
-const UPDATE_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000
+const UPDATE_DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000
 
 /** 最近一次检查结果（下载阶段复用，避免信任渲染层回传的 URL）。 */
 let lastUpdate = null
+/** 后台升级任务（见 startUpdateInstall）；状态持久化到 userData/updates/state.json。 */
+let updateJob = null
+let updateTask = null
+let updateJobSavedAt = 0
 
 async function httpsGetBuffer(url, _redirects = 5, timeoutMs = UPDATE_HTTP_TIMEOUT_MS) {
   // 走 Electron 的 net（Chromium 网络栈）：它使用**系统证书库与系统代理**。
@@ -2120,29 +2124,236 @@ async function checkAppUpdate() {
   return buildUpdateCheckResult(current, parseLatestYml(text), null)
 }
 
-async function downloadAndOpenUpdate() {
-  if (!lastUpdate) return { ok: false, reason: 'no-update', message: '请先检查更新' }
-  // 有 tag 时走该 tag 的固定路径：预发布版本不在 /releases/latest 之下。
-  const url = installerUrlForTag(UPDATE_REPO, lastUpdate.tag || '', lastUpdate.file.url)
-  let buf
+/**
+ * 在线升级任务（主进程后台执行）。
+ *
+ * 旧实现把"下载 → 校验 → 拉起"整个 Promise 交给渲染层 await：关闭设置页/重开窗口后
+ * 没人再持有它，用户看到的就是"升级中断"；再次点击又从 0 开始下载（整包几百 MB）。
+ * 现在改成主进程任务：
+ *   - 下载/校验/拉起与渲染层生命周期解耦，关页面不影响；
+ *   - `.part` 文件 + state.json 落盘，重新检查后按 HTTP Range 续传；
+ *   - 渲染层通过 `desktop:update-status` 订阅进度，重开设置页能看到"已暂停/继续下载"。
+ */
+function updateRootDir() {
+  return path.join(app.getPath('userData'), 'updates')
+}
+
+function updateStatePath() {
+  return path.join(updateRootDir(), 'state.json')
+}
+
+function updateJobSnapshot() {
+  if (!updateJob) return { state: 'idle' }
+  return { ...updateJob }
+}
+
+/** 持久化任务进度（约 1s 一次，避免每个 chunk 都写盘）。 */
+async function persistUpdateJob(force = false) {
+  if (!updateJob) return
+  const now = Date.now()
+  if (!force && now - updateJobSavedAt < 1000) return
+  updateJobSavedAt = now
   try {
-    buf = await httpsGetBuffer(url, 5, UPDATE_DOWNLOAD_TIMEOUT_MS)
+    await fs.promises.mkdir(updateRootDir(), { recursive: true })
+    const tmp = `${updateStatePath()}.tmp`
+    await fs.promises.writeFile(tmp, JSON.stringify(updateJob), 'utf8')
+    await fs.promises.rename(tmp, updateStatePath())
   } catch (err) {
-    return { ok: false, reason: 'download', message: err?.message || String(err) }
+    logMain('warn', `update state persist failed: ${err?.message || err}`)
   }
-  if (lastUpdate.file.sha512) {
-    const actual = crypto.createHash('sha512').update(buf).digest('base64')
-    if (actual !== lastUpdate.file.sha512) {
-      return { ok: false, reason: 'checksum', message: '安装包校验失败（SHA-512 不一致），已拒绝执行' }
+}
+
+async function loadUpdateJob() {
+  if (updateJob) return
+  try {
+    const raw = await fs.promises.readFile(updateStatePath(), 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!validUpdateJob(parsed)) return
+    // 上次退出时还在下载：恢复到"已暂停"，由用户点击继续（或重新安装按钮）续传。
+    if (parsed.state === 'downloading' || parsed.state === 'verifying' || parsed.state === 'launching') {
+      parsed.state = 'paused'
     }
+    updateJob = parsed
+  } catch {
+    /* 没有历史任务 */
   }
-  const dir = path.join(app.getPath('temp'), 'chiron-update')
+}
+
+/** 只接受本仓库 release 下的安装包，防 state.json 被改写成本地任意程序。 */
+function validUpdateJob(job) {
+  if (!job || typeof job !== 'object') return false
+  if (!job.version || !job.asset || !job.url) return false
+  if (!/\.(exe|msi)$/i.test(job.asset)) return false
+  if (!String(job.url).startsWith(`https://github.com/${UPDATE_REPO}/releases/download/`)) return false
+  return true
+}
+
+function newUpdateJobFromLatest() {
+  const file = lastUpdate.file
+  return {
+    state: 'downloading',
+    version: lastUpdate.version,
+    url: installerUrlForTag(UPDATE_REPO, lastUpdate.tag || '', file.url),
+    asset: path.basename(file.url),
+    sha512: file.sha512 || '',
+    total: 0,
+    downloaded: 0,
+    message: '',
+  }
+}
+
+async function sha512File(file) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha512')
+    const s = fs.createReadStream(file)
+    s.on('data', c => h.update(c))
+    s.on('error', reject)
+    s.on('end', () => resolve(h.digest('base64')))
+  })
+}
+
+async function runUpdateJob() {
+  const job = updateJob
+  const dir = path.join(updateRootDir(), job.version)
   await fs.promises.mkdir(dir, { recursive: true })
-  const target = path.join(dir, path.basename(lastUpdate.file.url))
-  await fs.promises.writeFile(target, buf)
-  const failure = await shell.openPath(target)
-  if (failure) return { ok: false, reason: 'launch', message: failure, path: target }
-  return { ok: true, version: lastUpdate.version, path: target }
+  const part = path.join(dir, `${job.asset}.part`)
+  const final = path.join(dir, job.asset)
+
+  const openInstaller = async () => {
+    const failure = await shell.openPath(final)
+    if (failure) {
+      job.state = 'error'
+      job.message = failure
+      await persistUpdateJob(true)
+      return
+    }
+    job.state = 'ready'
+    job.message = ''
+    await persistUpdateJob(true)
+  }
+
+  // 已经下载并校验过的包：直接再次拉起（升级 UAC 取消后用户重试）。
+  if (fs.existsSync(final)) {
+    if (!job.sha512 || (await sha512File(final)) === job.sha512) {
+      job.downloaded = job.total || fs.statSync(final).size
+      await openInstaller()
+      return
+    }
+    await fs.promises.rm(final, { force: true }).catch(() => {})
+  }
+
+  let start = 0
+  try {
+    start = (await fs.promises.stat(part)).size
+  } catch {
+    start = 0
+  }
+  job.downloaded = start
+  job.state = 'downloading'
+  await persistUpdateJob(true)
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), UPDATE_DOWNLOAD_TIMEOUT_MS)
+  let handle = null
+  try {
+    const headers = { 'User-Agent': `Chiron/${app.getVersion()}` }
+    if (start > 0) headers.Range = `bytes=${start}-`
+    const res = await net.fetch(job.url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers,
+    })
+    if (!res.ok && res.status !== 416) {
+      const err = new Error(`HTTP ${res.status}`)
+      err.status = res.status
+      throw err
+    }
+
+    if (res.status === 416 && start > 0) {
+      // 服务端认为偏移已到头：按已下载完成处理，走校验。
+      job.downloaded = start
+      job.total = start
+    } else {
+      const append = res.status === 206 && start > 0
+      if (!append) {
+        start = 0
+        job.downloaded = 0
+      }
+      const range = res.headers.get('content-range') || ''
+      const rangeTotal = Number((range.match(/\/(\d+)$/) || [])[1] || 0)
+      const len = Number(res.headers.get('content-length') || 0)
+      job.total = rangeTotal || (len > 0 ? start + len : 0)
+      handle = await fs.promises.open(part, append ? 'a' : 'w')
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('download stream unavailable')
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value && value.byteLength) {
+          await handle.write(value)
+          job.downloaded += value.byteLength
+          await persistUpdateJob()
+        }
+      }
+    }
+    if (handle) {
+      await handle.close()
+      handle = null
+    }
+
+    job.state = 'verifying'
+    await persistUpdateJob(true)
+    if (job.sha512) {
+      const actual = await sha512File(part)
+      if (actual !== job.sha512) {
+        // 校验失败不能保留坏包，否则下次续传只会再次失败。
+        await fs.promises.rm(part, { force: true }).catch(() => {})
+        job.downloaded = 0
+        job.total = 0
+        throw Object.assign(new Error('安装包校验失败（SHA-512 不一致），已删除并拒绝执行'), {
+          reason: 'checksum',
+        })
+      }
+    }
+    await fs.promises.rename(part, final)
+    job.state = 'launching'
+    await persistUpdateJob(true)
+    await openInstaller()
+  } catch (err) {
+    if (handle) await handle.close().catch(() => {})
+    job.state = 'error'
+    job.message = err?.message || String(err)
+    job.reason = err?.reason || 'download'
+    await persistUpdateJob(true)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function startUpdateInstall() {
+  await loadUpdateJob()
+  if (updateTask) return { ok: true, started: true, status: updateJobSnapshot() }
+  if (lastUpdate) {
+    const fresh = newUpdateJobFromLatest()
+    if (!updateJob || updateJob.version !== fresh.version) updateJob = fresh
+  }
+  if (!updateJob || !validUpdateJob(updateJob)) {
+    return { ok: false, reason: 'no-update', message: '请先检查更新' }
+  }
+  if (updateJob.state === 'ready') {
+    // 已下载并校验过：直接再次拉起安装器，不重复下载。
+    updateTask = runUpdateJob().finally(() => {
+      updateTask = null
+    })
+    return { ok: true, started: true, status: updateJobSnapshot() }
+  }
+  updateJob.state = 'downloading'
+  updateJob.message = ''
+  await persistUpdateJob(true)
+  updateTask = runUpdateJob().finally(() => {
+    updateTask = null
+  })
+  return { ok: true, started: true, status: updateJobSnapshot() }
 }
 
 // userData 根必须在这里定下来，**早于单实例锁与 whenReady**：
@@ -3068,7 +3279,12 @@ if (!gotLock) {
     })
     ipcMain.handle('desktop:install-update', async event => {
       assertTrustedSender(event)
-      return downloadAndOpenUpdate()
+      return startUpdateInstall()
+    })
+    ipcMain.handle('desktop:update-status', async event => {
+      assertTrustedSender(event)
+      await loadUpdateJob()
+      return updateJobSnapshot()
     })
 
     // 设备文件桥：只在 cloud 模式启动（local 模式本机即执行端，不需要隧道）。
