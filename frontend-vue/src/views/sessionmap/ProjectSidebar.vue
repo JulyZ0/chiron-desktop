@@ -77,6 +77,12 @@ const createOpen = ref(false)
 
 const hasAnything = computed(() => projects.value.length > 0 || unassigned.value.length > 0)
 
+// 团队 Web 没有桌面桥：不能选本机文件夹，改为由服务端在用户项目根下创建托管目录。
+const folderPickerAvailable =
+  typeof (
+    globalThis as { chironDesktop?: { pickDirectory?: unknown } }
+  ).chironDesktop?.pickDirectory === 'function'
+
 const tr = (key: string, params?: Record<string, unknown>) => t(key, params ?? {})
 
 async function refresh() {
@@ -121,6 +127,35 @@ async function toggle(projectId: string) {
 function openCreate() {
   newName.value = ''
   createOpen.value = true
+}
+
+/** 新建成功后统一收口：展开、补空会话列表、关闭弹窗。 */
+function afterCreated(project: ProjectSummary) {
+  createOpen.value = false
+  projects.value = [...projects.value, project]
+  // 新建后直接展开：用户刚建完就想归会话，让他少点一次。
+  expanded.value = new Set([...expanded.value, project.id])
+  sessionsByProject.value = { ...sessionsByProject.value, [project.id]: [] }
+}
+
+/** Web / 无桌面桥：服务端托管目录，只需项目名。 */
+async function createManagedProject() {
+  creating.value = true
+  try {
+    const project = await createProject({
+      name: newName.value.trim() || tr('chat.projects_default_name'),
+      root_path: '',
+    })
+    afterCreated(project)
+  } catch (err) {
+    message.error(describeApiError(err, tr('chat.projects_create_failed')))
+  } finally {
+    creating.value = false
+  }
+}
+
+function submitCreate() {
+  return folderPickerAvailable ? pickAndCreate() : createManagedProject()
 }
 
 /**
@@ -171,11 +206,7 @@ async function pickAndCreate() {
       name: newName.value.trim() || picked.name,
       ...(remote ? { provider: 'client' as const, device_id: deviceId } : {}),
     })
-    createOpen.value = false
-    projects.value = [...projects.value, project]
-    // 新建后直接展开：用户刚建完就想归会话，让他少点一次。
-    expanded.value = new Set([...expanded.value, project.id])
-    sessionsByProject.value = { ...sessionsByProject.value, [project.id]: [] }
+    afterCreated(project)
   } catch (err) {
     // 后端的 `invalid_root_path` / `forbidden_root_path` 都带具体原因，
     // 直接展示原文比"创建失败"有用得多。
@@ -503,10 +534,10 @@ defineExpose({ refresh })
     <Modal
       v-model:open="createOpen"
       :title="tr('chat.projects_new')"
-      :ok-text="tr('chat.projects_pick_folder')"
+      :ok-text="folderPickerAvailable ? tr('chat.projects_pick_folder') : tr('common.create')"
       :cancel-text="tr('common.cancel')"
       :confirm-loading="creating"
-      @ok="pickAndCreate"
+      @ok="submitCreate"
     >
       <Input
         v-model:value="newName"
@@ -514,7 +545,7 @@ defineExpose({ refresh })
         :aria-label="tr('chat.projects_name_placeholder')"
       />
       <p class="proj-hint">
-        {{ tr('chat.projects_pick_hint') }}
+        {{ folderPickerAvailable ? tr('chat.projects_pick_hint') : tr('chat.projects_managed_hint') }}
       </p>
     </Modal>
   </div>

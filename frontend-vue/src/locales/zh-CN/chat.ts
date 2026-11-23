@@ -229,6 +229,8 @@ export default {
   projects_pick_folder: "选择文件夹",
   projects_name_placeholder: "项目名称（留空取文件夹名）",
   projects_pick_hint: "项目绑定本地文件夹，路径会显示在侧边栏。",
+  projects_managed_hint: "服务端会为该项目创建独立目录，项目文件保存在服务端。",
+  projects_default_name: "新项目",
   all_sessions: "全部会话",
   open_context_panel_session_trace_context: "打开上下文面板（会话/轨迹/上下文）",
   messages_pending_confirmation: "待确认消息",

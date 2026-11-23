@@ -33,6 +33,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
@@ -101,6 +102,60 @@ func userProjectBase(tenant, userID string) string {
 		return ""
 	}
 	return filepath.Join(projectIsolationRoot, projectPathSegment(tenant), projectPathSegment(userID))
+}
+
+// projectDirSlug 把项目名收敛成可安全用作单段目录名的形式：
+// 保留字母/数字（含中文），空白与其它符号折成 '-'，去掉首尾 '-'/'.'，最长 40。
+func projectDirSlug(name string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range strings.TrimSpace(name) {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash && b.Len() > 0 {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+		if b.Len() >= 40 {
+			break
+		}
+	}
+	slug := strings.Trim(b.String(), "-.")
+	if slug == "" {
+		slug = "project"
+	}
+	return slug
+}
+
+// createManagedProjectDir 为团队 Web 用户创建 `<PROJECTS_ROOT>/<tenant>/<user>/<slug>`
+// 目录。重名时追加序号，用户不需要理解服务器目录结构。
+func createManagedProjectDir(claims *auth.Claims, name string) (string, error) {
+	base := userProjectBase(smTenant(claims), claims.UserID)
+	if base == "" {
+		return "", errors.New("project workspace is unavailable")
+	}
+	slug := projectDirSlug(name)
+	for i := 1; i <= 50; i++ {
+		dirName := slug
+		if i > 1 {
+			dirName = fmt.Sprintf("%s-%d", slug, i)
+		}
+		candidate := filepath.Join(base, dirName)
+		if _, err := os.Stat(candidate); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		if err := os.MkdirAll(candidate, 0o700); err != nil {
+			return "", err
+		}
+		return candidate, nil
+	}
+	return "", errors.New("cannot allocate project directory")
 }
 
 // pathWithin 判断 target 是否位于 base 之内（含 base 本身）。
@@ -530,6 +585,20 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 		BadRequest(w, "unsupported project provider")
 		return
 	}
+	// 团队 Web 没有桌面选目录能力：未给 root_path 时在用户自己的项目根下创建
+	// 托管目录（PROJECTS_ROOT 已启用才允许；桌面单机仍要求显式选文件夹）。
+	if provider == smProviderServer && strings.TrimSpace(body.RootPath) == "" {
+		if projectIsolationRoot == "" {
+			BadRequest(w, "root_path is required")
+			return
+		}
+		managed, err := createManagedProjectDir(claims, body.Name)
+		if err != nil {
+			logAndRespond(w, err, http.StatusInternalServerError, "cannot create project directory")
+			return
+		}
+		body.RootPath = managed
+	}
 	var rootPath, rootKey string
 	if provider == smProviderClient {
 		// client provider：路径在用户设备上，服务端**不能** os.Stat / 不能套
@@ -544,7 +613,8 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 		})
 		if err != nil {
 			if errors.Is(err, errDeviceOffline) {
-				JSON(w, http.StatusConflict, APIResponse{Success: false, Error: "device_offline"})
+				JSONWithCode(w, http.StatusConflict, "device_offline", nil,
+					"the device running Chiron is offline; open the app on that computer and retry")
 				return
 			}
 			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: err.Error()})

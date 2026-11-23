@@ -228,6 +228,8 @@ export default {
   projects_pick_folder: "اختر مجلدًا",
   projects_name_placeholder: "اسم المشروع (اتركه فارغًا لاستخدام اسم المجلد)",
   projects_pick_hint: "يرتبط المشروع بمجلد محلي، ويظهر مساره في الشريط الجانبي.",
+  projects_managed_hint: "سينشئ الخادم مجلدًا مستقلًا لهذا المشروع؛ تبقى الملفات على الخادم.",
+  projects_default_name: "مشروع جديد",
   all_sessions: "كل الجلسات",
   open_context_panel_session_trace_context: "فتح لوحة السياق (جلسة/أثر/سياق)",
   messages_pending_confirmation: "رسائل بانتظار التأكيد",

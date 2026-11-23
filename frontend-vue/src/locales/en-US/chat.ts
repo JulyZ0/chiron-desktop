@@ -223,6 +223,8 @@ export default {
   projects_pick_folder: "Choose folder",
   projects_name_placeholder: "Project name (leave empty to use folder name)",
   projects_pick_hint: "A project is bound to a local folder; its path shows in the sidebar.",
+  projects_managed_hint: "The server will create a dedicated directory for this project; files stay on the server.",
+  projects_default_name: "New project",
   all_sessions: "All sessions",
   open_context_panel_session_trace_context: "Open context panel (session/trace/context)",
   messages_pending_confirmation: "Messages pending confirmation",

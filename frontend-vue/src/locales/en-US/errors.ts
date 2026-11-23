@@ -7,6 +7,7 @@ export default {
   auth_required: 'Your session has expired. Please sign in again.',
   forbidden: 'You do not have permission to perform this action.',
   project_root_forbidden_in: 'The project path must be inside your project directory: {base}',
+  device_offline: 'The device running Chiron is offline; open the app on that computer and retry.',
   // Request
   invalid_request: 'The request was rejected. Please review and try again.',
   session_busy: 'The previous turn is still in progress. Wait for it to finish, or repair the session and retry.',

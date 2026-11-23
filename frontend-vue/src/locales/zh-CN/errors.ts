@@ -12,6 +12,7 @@ export default {
   auth_required: '登录状态已失效，请重新登录',
   forbidden: '没有权限执行该操作',
   project_root_forbidden_in: '项目路径必须位于你的项目目录内：{base}',
+  device_offline: '运行 Chiron 的设备当前离线；请在该电脑上打开应用后重试。',
   // 请求
   invalid_request: '请求内容不被接受，请检查后重试',
   session_busy: '上一条回复仍在进行中。可以等它结束，或修复会话后重试',
