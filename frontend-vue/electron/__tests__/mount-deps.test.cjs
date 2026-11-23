@@ -55,3 +55,17 @@ test('install：未知依赖直接拒绝', async t => {
   assert.equal(res.ok, false)
   assert.equal(res.reason, 'unknown-dependency')
 })
+
+test('WinFsp 检测：GUID 卸载键 + DisplayName 校验', () => {
+  const { parseWinFspUninstall } = require('../mount-deps.cjs')
+  const real = String.raw`HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{6C5B526B-1884-4388-B46B-5349A211BDD4}
+    DisplayName    REG_SZ    WinFsp 2026
+    DisplayVersion    REG_SZ    2.2.26323
+    InstallSource    REG_SZ    C:\Users\x\deps\winfsp\2.2.26323`
+  assert.deepEqual(parseWinFspUninstall(real), { name: 'WinFsp 2026', version: '2.2.26323' })
+
+  // 搜索可能命中"某产品描述里提到 WinFsp"，DisplayName 不是 WinFsp 的必须忽略。
+  const unrelated = '    DisplayName    REG_SZ    Foo (WinFsp bridge)\r\n    DisplayVersion    REG_SZ    1.0'
+  assert.equal(parseWinFspUninstall(unrelated), null)
+  assert.equal(parseWinFspUninstall(''), null)
+})

@@ -26,7 +26,7 @@
  * 所有清理（停后端 → 清分区存储 → 清 token → 删 userData/local → 重启）
  * 都在主进程的 `wipe-data.cjs` 里，这里只收集用户的确认。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import { useDeviceStore } from '../../stores/device'
@@ -132,6 +132,28 @@ async function loadMountDeps() {
   depsStatus.value = await device.getMountDepsStatus()
 }
 
+// WinFsp 是"启动 MSI 后由用户在 UAC/安装向导里完成"的：启动瞬间查一次必然是未安装。
+// 安装期间轮询状态，装完自动变成已安装；窗口重新获得焦点时也刷新一次（覆盖手动安装）。
+let depsPoll: ReturnType<typeof setInterval> | null = null
+function stopDepsPoll() {
+  if (depsPoll) {
+    clearInterval(depsPoll)
+    depsPoll = null
+  }
+}
+function pollWinfspInstalled(timeoutMs = 180000) {
+  stopDepsPoll()
+  const started = Date.now()
+  depsPoll = setInterval(async () => {
+    await loadMountDeps()
+    if (depsStatus.value?.winfsp.installed || Date.now() - started >= timeoutMs) stopDepsPoll()
+  }, 3000)
+}
+
+function refreshDepsOnFocus() {
+  if (device.isDesktop) void loadMountDeps()
+}
+
 async function installMountDep(name: MountDepName) {
   if (depsBusy.value) return
   depsBusy.value = name
@@ -141,8 +163,12 @@ async function installMountDep(name: MountDepName) {
       message.error(res.message || t('settings.mount_deps_failed'))
       return
     }
-    if (res.launched) message.info(t('settings.mount_deps_winfsp_launched'))
-    else message.success(t('settings.mount_deps_done'))
+    if (res.launched) {
+      message.info(t('settings.mount_deps_winfsp_launched'))
+      pollWinfspInstalled()
+    } else {
+      message.success(t('settings.mount_deps_done'))
+    }
     await loadMountDeps()
   } finally {
     depsBusy.value = ''
@@ -308,7 +334,15 @@ async function submit() {
 onMounted(() => {
   void device.ensureReady()
   void refreshStatus()
-  if (device.isDesktop) void loadMountDeps()
+  if (device.isDesktop) {
+    void loadMountDeps()
+    window.addEventListener('focus', refreshDepsOnFocus)
+  }
+})
+
+onUnmounted(() => {
+  stopDepsPoll()
+  window.removeEventListener('focus', refreshDepsOnFocus)
 })
 </script>
 

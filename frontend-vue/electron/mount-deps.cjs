@@ -56,14 +56,46 @@ function run(cmd, args, timeoutMs = 120000) {
   })
 }
 
-function winfspInstalledVersion() {
-  // WinFsp 的卸载项在 WOW6432Node（x64 安装器也写这里）；读不到就按未安装。
-  return run('reg', ['query', 'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WinFsp', '/v', 'DisplayVersion'], 5000)
-    .then(r => {
-      if (!r.ok) return ''
-      const m = r.stdout.match(/DisplayVersion\s+REG_\w+\s+([^\r\n]+)/i)
-      return m ? m[1].trim() : ''
-    })
+// WinFsp 的 MSI 卸载项键名是 **GUID**（实测 `{6C5B526B-...}`，DisplayName
+// "WinFsp 2026"），并不存在固定的 `...\Uninstall\WinFsp`。此前按固定键名查
+// DisplayVersion，安装成功后仍永远判"未安装"。
+// 两个 hive 都要看：x64 安装器写 WOW6432Node，某些版本/策略可能写原生视图。
+const UNINSTALL_ROOTS = [
+  'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+]
+
+/** 从 `reg query <key>` 的输出里取（DisplayName, DisplayVersion）。 */
+function parseWinFspUninstall(stdout) {
+  const name = String(stdout || '').match(/^\s*DisplayName\s+REG_\w+\s+(.+?)\s*$/im)
+  if (!name || !/^WinFsp/i.test(name[1].trim())) return null
+  const ver = String(stdout || '').match(/^\s*DisplayVersion\s+REG_\w+\s+(.+?)\s*$/im)
+  return { name: name[1].trim(), version: ver ? ver[1].trim() : '' }
+}
+
+/** 在卸载根下按"数据里含 WinFsp"找候选键（可能命中多个，逐个校验 DisplayName）。 */
+async function findWinFspCandidateKeys() {
+  const keys = []
+  for (const root of UNINSTALL_ROOTS) {
+    const r = await run('reg', ['query', root, '/s', '/f', 'WinFsp', '/d'], 8000)
+    if (!r.ok) continue
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const text = line.trim()
+      if (text.toUpperCase().startsWith('HKEY_') && !keys.includes(text)) keys.push(text)
+    }
+  }
+  return keys
+}
+
+async function winfspInstalledVersion() {
+  const keys = await findWinFspCandidateKeys()
+  for (const key of keys) {
+    const r = await run('reg', ['query', key], 5000)
+    if (!r.ok) continue
+    const found = parseWinFspUninstall(r.stdout)
+    if (found && found.version) return found.version
+  }
+  return ''
 }
 
 function createMountDeps({ app, net, shell, log = () => {}, platform = process.platform, arch = process.arch }) {
@@ -200,4 +232,4 @@ function createMountDeps({ app, net, shell, log = () => {}, platform = process.p
   return { status, install, manifest: MANIFEST }
 }
 
-module.exports = { createMountDeps, MANIFEST }
+module.exports = { createMountDeps, MANIFEST, parseWinFspUninstall }
