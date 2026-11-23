@@ -88,10 +88,15 @@ func TestMonitorMigrationChainSingleHead(t *testing.T) {
 	if len(heads) != 1 {
 		t.Fatalf("迁移链有 %d 个 head（应为 1）: %v", len(heads), heads)
 	}
-	// 单链：0005 → 0006_price_backfill → 0007_metrics_rollup_instance → 0008_team_accounts
-	// → 0009_personas。
-	if heads[0] != "0009_personas" {
-		t.Fatalf("链头应为 0009_personas，实际 %q", heads[0])
+	// 单链：… → 0008_team_accounts → 0009_personas → 0010_user_invites → 0011_project_locator。
+	if heads[0] != "0011_project_locator" {
+		t.Fatalf("链头应为 0011_project_locator，实际 %q", heads[0])
+	}
+	if migs["0011_project_locator"].down != "0010_user_invites" {
+		t.Fatalf("0011 必须接在 0010_user_invites 之后，实际 %q", migs["0011_project_locator"].down)
+	}
+	if migs["0010_user_invites"].down != "0009_personas" {
+		t.Fatalf("0010 必须接在 0009_personas 之后，实际 %q", migs["0010_user_invites"].down)
 	}
 	if migs["0009_personas"].down != "0008_team_accounts" {
 		t.Fatalf("0009 必须接在 0008_team_accounts 之后，实际 %q", migs["0009_personas"].down)

@@ -76,6 +76,28 @@ test('越界读取被拒绝', async t => {
   )
 })
 
+test('git：参数与 cwd 边界', async t => {
+  const root = tempProject(t)
+  await assert.rejects(() => handleDeviceOp({ op: 'git', root, path: root, args: [] }), /invalid git args/)
+  await assert.rejects(
+    () => handleDeviceOp({ op: 'git', root, path: root, args: Array(65).fill('status') }),
+    /invalid git args/,
+  )
+  await assert.rejects(
+    () => handleDeviceOp({ op: 'git', root, path: path.join(root, '..'), args: ['status'] }),
+    /outside project root/,
+  )
+})
+
+test('git：非仓库返回非零 code 而不是抛错', async t => {
+  const root = tempProject(t)
+  const res = await handleDeviceOp({ op: 'git', root, path: root, args: ['rev-parse', '--is-inside-work-tree'] })
+  assert.equal(typeof res.code, 'number')
+  assert.equal(typeof res.stdout, 'string')
+  // 没装 git 时是 127；装了但目录不是仓库时是非零 —— 两者都必须走结果而不是异常。
+  assert.notEqual(res.code, 0)
+})
+
 test('toWsUrl：http→ws、https→wss，并保留 host', () => {
   assert.equal(toWsUrl('http://127.0.0.1:8080').toString(), 'ws://127.0.0.1:8080/ws/device-fs')
   assert.equal(toWsUrl('https://chiron.example.com').toString(), 'wss://chiron.example.com/ws/device-fs')

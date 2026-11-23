@@ -35,10 +35,9 @@ const checkpointStatsWindowDays = 30
 
 // checkpointGcDefaultRetentionDays 是回收默认保留期。
 //
-// 30 天：刚被删掉的检查点，其 blob 还要留一段时间，因为用户可能在时间线上
-// 翻旧点、或者某次上报失败后补救。保留期只影响"垃圾什么时候消失"，不影响
-// 任何可回滚的点 —— 被引用的分片永远不删。
-const checkpointGcDefaultRetentionDays = 30
+// 90 天：软删除之后数据还要留一段时间，给恢复/审计留出窗口。保留期只影响
+// "垃圾什么时候消失"，不影响任何可回滚的点 —— 被引用的分片永远不删。
+const checkpointGcDefaultRetentionDays = 90
 
 // checkpointScaleStats 汇总"检查点有多大"。
 //
@@ -223,7 +222,7 @@ func mergeEngineScaleStats(stats checkpointScaleStats, result map[string]interfa
 
 // checkpointGcBody 是 POST /v1/admin/checkpoints/gc 的请求体。
 type checkpointGcBody struct {
-	// RetentionDays 保留期（天），缺省 30；0 表示"未引用即删"。
+	// RetentionDays 保留期（天），缺省 90；0 表示"未引用即删"。
 	RetentionDays int `json:"retention_days"`
 	// DryRun 用指针接：缺省必须是 **true**（安全侧），只有显式 false 才真删。
 	// 用 bool 时"字段缺失"与"显式 false"无法区分 —— 一个手滑的 {} 请求会直接删文件。
@@ -244,7 +243,7 @@ func resolveGcDryRun(v *bool) bool {
 	return *v
 }
 
-// resolveGcRetention 返回实际保留期（天）：缺省 / 非法一律落到 30，上限 3650。
+// resolveGcRetention 返回实际保留期（天）：缺省 / 非法一律落到 90，上限 3650。
 func resolveGcRetention(days int) int {
 	if days <= 0 {
 		return checkpointGcDefaultRetentionDays

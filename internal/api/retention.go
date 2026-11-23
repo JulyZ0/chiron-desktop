@@ -51,7 +51,7 @@ const (
 	// retentionIntervalDefault 改为 1 小时：三张表都是分钟级增长的量，
 	// 6 小时一轮意味着单轮删除量更大、峰值锁持有更久。
 	retentionIntervalDefault = time.Hour
-	turnRetentionDaysDefault = 30
+	turnRetentionDaysDefault = 90
 	// retentionTimeout 要覆盖「三张表批量删 + 引擎 GC」的总时长，比原来的
 	// 单表 30s 放大到 2 分钟；引擎 GC 自身有超时，这里的 ctx 只是兜底。
 	retentionTimeout = 2 * time.Minute
@@ -63,7 +63,7 @@ const (
 
 	retentionUsageDaysDefault      = 180
 	retentionShareDaysDefault      = 90
-	retentionCheckpointDaysDefault = 30
+	retentionCheckpointDaysDefault = 90
 
 	// retentionBatchLimit 是单批删除行数。5000 行在常见 PG 上是毫秒级，
 	// 又足以让十万行数据在 20 轮内清完。
@@ -538,7 +538,7 @@ func retentionInterval() time.Duration {
 	return retentionIntervalDefault
 }
 
-// turnRetentionDays 允许 TURN_RETENTION_DAYS 覆盖（默认 30）。
+// turnRetentionDays 允许 TURN_RETENTION_DAYS 覆盖（默认 90）。
 func turnRetentionDays() int {
 	if v := os.Getenv("TURN_RETENTION_DAYS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {

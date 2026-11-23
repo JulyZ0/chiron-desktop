@@ -30,14 +30,19 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 ### 3.1 设备桥
 
 - 桌面主动外连 `/ws/device-fs?token=…&device_id=…`；连接归属写 Redis `device:fs:owner:*`（TTL + 心跳），多网关副本经 `req/resp` 路由。
-- 原语：`canonicalize/stat/list/read/walk/hash/write/mkdir/remove/rename`。
-- 边界：每 op 带 root，设备侧 realpath+词法包含校验；单文件读 8MiB、walk 5000 文件/200MiB、回写 4MiB；写带 `expected_hash`。
-- client 项目文件浏览 `List/Search/Read/Raw` 已接设备桥，返回与 server 同一套 JSON；git 视图暂 501。
+- 原语：`canonicalize/stat/list/read/walk/hash/write/mkdir/remove/rename/git`。
+- 边界：每 op 带 root，设备侧 realpath+词法包含校验；单文件读 8MiB、walk 5000 文件/200MiB、回写 4MiB；写带 `expected_hash`；git 参数由服务端构造（数量 ≤64、单项 ≤2048 字节），输出 8MiB、超时 30s，非零退出码按结果返回而非传输错误。
+- client 项目文件浏览 `List/Search/Read/Raw` 已接设备桥，返回与 server 同一套 JSON。
+- **client git 完全允许**：`vcs`/`changes`/`vcs/init` 经设备桥执行；读不要求租约，`git init` 等写操作要求项目写租约（R5）。行数统计（insertions/deletions）对 client 项目留空。
 
 ### 3.2 引擎访问 client 项目
 
 **当前默认（S2 过渡）**：按回合镜像到服务端临时目录，回合后按差异回写（冲突不覆盖；删除前校验设备哈希仍为基线）。
 **R2 方向**：网关 WebDAV facade（已实现）+ rclone/WinFsp 挂载成普通目录，Python 零改动；决策门见 §9.2。
+
+镜像**不包含 `.git`**（walk 跳过点文件与噪音目录）。因此：
+- 界面侧 git（状态/改动/init）经设备桥 RPC 直接跑在用户机器上，完整可用；
+- **引擎内**的 git 工具在镜像上只能看到工作区、看不到历史与索引；需要 agent 执行 git 时以 R2 挂载为正式方案，切换挂载前该能力明确不可用（不做半真半假的兜底）。
 
 ## 4. 多用户执行与配额
 
@@ -100,13 +105,14 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 | R4 | 多副本设备路由（Redis） | `37b9b7f` |
 | R2 | WebDAV facade | 已实现（`6fe881d`）；rclone/WinFsp 实测待团队主机 |
 | R5 | 设备写租约（默认只读 + 项目侧栏授予） | 已实现 |
+| client git | 设备桥 `git` 原语；vcs/changes/init 走设备 RPC；写操作受租约门控 | 已实现 |
 | 团队模式 | 登录/建号/改密/禁用/会话吊销/Web 登录/邀请 | 已落地；浏览器 E2E 待验 |
 
 ## 9. 剩余任务
 
 ### 9.1 P0
 
-1. **R5 设备写授权（已实现）**：client 项目默认**只读**；项目侧栏「只读/可写」显式授予/收回租约（Redis `device:write:lease:*`，Redis 丢失即回到只读）。未授权时回合照常执行但差异不回写，并提示本轮修改不保存。企业权限上限与读写审计仍待补。
+1. **R5 设备写授权（已实现）**：client 项目默认**只读**；项目侧栏「只读/可写」显式授予/收回租约（Redis `device:write:lease:*`，Redis 丢失即回到只读）。未授权时回合照常执行但差异不回写，并提示本轮修改不保存；`git init` 同样被租约拦下。企业权限上限与读写审计仍待补。
 2. **R2 实测定案**：团队主机安装 rclone+WinFsp，按 §9.2 跑性能/稳定性；通过则删除镜像、`root_path` 指向挂载点；否则用 cgofuse 重试或保留镜像。
 3. **团队 Web E2E**：真实域名/反代/TLS 下从登录到 SSE、首登改密、强制下线、分享页的端到端验收（部署手册 + `scripts/team_smoke.py`）。
 
@@ -140,18 +146,16 @@ rclone / WinFsp 只装在**服务端**（运行网关+引擎的主机），不�
 
 ### 9.4 P2
 
-7. **S5 chiron-server BFF spike**：`/v1`→`/api/v1` 映射，限时 2 周，go/no-go。
+7. **S5 chiron-server BFF spike**：**暂缓**（不排期；现有 `/v1` 直连方案继续用，重启需重新评估）。
 8. **R9 可观测性**：OTel GenAI 语义 + Langfuse（OTLP），统一 action/trace id，不自建 UI。
-9. **R10 数据生命周期**：租户导出/删除/保留期；client 文件默认不落服务端。
+9. **R10 数据生命周期**：租户导出/删除；**软删除 + 默认保留 90 天**（回合表 `TURN_RETENTION_DAYS`、检查点 GC `retention_days` 已改 90）；client 文件默认不落服务端。
 10. **MCP/工具沙箱**：MXC/gVisor/agent-sandbox；Casbin/OpenFGA 暂不引入。
 
 ## 10. 未决
 
-- 文件桥 v1 是否允许客户端 `git`（建议先只做读写/补丁）。
-- 项目换设备：重新授权（当前）还是内容同步。
-- chiron-server 走 BFF（建议）还是直连。
+- 文件桥 v1 是否允许客户端 `git`（**已定：完全允许**，见 §3.1）。
 
-（已定：团队主机随桌面程序启动；rclone/WinFsp 服务端按需获取；R2 实测后切换挂载；R5 项目级租约 + 租户总闸。）
+（已定：团队主机随桌面程序启动；rclone/WinFsp 服务端按需获取；R2 实测后切换挂载；R5 项目级租约 + 租户总闸；client git 完全允许；项目换设备重新授权而非内容同步；S5 暂缓；数据软删 + 90 天保留。）
 
 ## 11. 参考
 

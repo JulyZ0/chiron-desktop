@@ -95,7 +95,7 @@ async def test_gc_dry_run_defaults_to_true(tmp_path, monkeypatch) -> None:
     assert out["deleted"] == 1
     assert out["referenced"] == 1
     assert out["freed_bytes"] == 9
-    assert out["retention_days"] == 30
+    assert out["retention_days"] == 90
     assert (store / ("c" * 2) / ("c" * 62)).exists(), "预演不得删文件"
 
 

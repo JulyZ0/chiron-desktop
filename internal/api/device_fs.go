@@ -58,14 +58,18 @@ type deviceEntry struct {
 
 type deviceOpRequest struct {
 	ID           string `json:"id"`
-	Op           string `json:"op"` // canonicalize | stat | list | read | walk | hash | write
+	Op           string `json:"op"` // canonicalize | stat | list | read | walk | hash | write | mkdir | remove | rename | git
 	Root         string `json:"root,omitempty"`
 	Path         string `json:"path,omitempty"`
+	To           string `json:"to,omitempty"`
 	MaxBytes     int64  `json:"max_bytes,omitempty"`
 	Offset       int64  `json:"offset,omitempty"`
-	To           string `json:"to,omitempty"`
 	DataB64      string `json:"data_b64,omitempty"`
 	ExpectedHash string `json:"expected_hash,omitempty"`
+	// Args 只用于 git op：由服务端构造，设备端不解释其语义，只负责在项目根内执行。
+	Args []string `json:"args,omitempty"`
+	// TimeoutMS 是 git op 的执行上限（毫秒）；缺省/越界时设备端用自己的默认值。
+	TimeoutMS int `json:"timeout_ms,omitempty"`
 }
 
 type deviceOpResponse struct {
@@ -82,6 +86,10 @@ type deviceOpResponse struct {
 	Truncated bool          `json:"truncated,omitempty"`
 	Entries   []deviceEntry `json:"entries,omitempty"`
 	Hash      string        `json:"hash,omitempty"`
+	// git op 的结果：非零 Code 不是传输错误（"不是仓库"等语义由调用方解释）。
+	Code   int    `json:"code,omitempty"`
+	Stdout string `json:"stdout,omitempty"`
+	Stderr string `json:"stderr,omitempty"`
 }
 
 type deviceConn struct {
@@ -232,7 +240,7 @@ func (h *deviceHub) handleRoutedRequest(ctx context.Context, payload string) {
 	if !ok {
 		resp.Error = errDeviceOffline.Error()
 	} else {
-		rctx, cancel := context.WithTimeout(ctx, deviceOpTimeout)
+		rctx, cancel := context.WithTimeout(ctx, deviceCallTimeout(req.Req))
 		defer cancel()
 		out, err := h.callConn(rctx, conn, req.Req)
 		resp.Resp = out
@@ -336,6 +344,20 @@ func newDeviceOpID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// deviceCallTimeout 是单次 op 的等待上限。
+//
+// 缺省 15s 够文件读写用；git 可能跑得更久（大仓库 status），请求里带 TimeoutMS 时
+// 在它之上留 2s 余量，否则设备还在跑、网关已经放弃，回包会被当成超时丢弃。
+func deviceCallTimeout(req deviceOpRequest) time.Duration {
+	d := deviceOpTimeout
+	if req.TimeoutMS > 0 {
+		if want := time.Duration(req.TimeoutMS)*time.Millisecond + 2*time.Second; want > d {
+			d = want
+		}
+	}
+	return d
+}
+
 // Call 向指定设备发送一次操作；本实例没有连接时经 Redis 转给持有连接的副本。
 func (h *deviceHub) Call(ctx context.Context, tenant, user, device string, req deviceOpRequest) (deviceOpResponse, error) {
 	if conn, ok := h.lookup(tenant, user, device); ok {
@@ -370,7 +392,7 @@ func (h *deviceHub) callConn(ctx context.Context, conn *deviceConn, req deviceOp
 		return deviceOpResponse{}, errDeviceOffline
 	}
 
-	timer := time.NewTimer(deviceOpTimeout)
+	timer := time.NewTimer(deviceCallTimeout(req))
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -421,7 +443,7 @@ func (h *deviceHub) callRemote(ctx context.Context, tenant, user, device string,
 	if err := h.rdb.Publish(ctx, db.RedisKey("device:fs:req:")+owner, payload).Err(); err != nil {
 		return deviceOpResponse{}, errDeviceOffline
 	}
-	timer := time.NewTimer(deviceOpTimeout)
+	timer := time.NewTimer(deviceCallTimeout(req))
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():

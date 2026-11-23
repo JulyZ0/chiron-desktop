@@ -41,7 +41,7 @@ import (
 const (
 	// checkpointGcIntervalDefault 缺省周期：一天一次。
 	//
-	// 24h 的依据：分片的保留期默认 30 天，而"该不该删"由保留期 + 引用集合决定，
+	// 24h 的依据：分片的保留期默认 90 天，而"该不该删"由保留期 + 引用集合决定，
 	// 周期只影响垃圾多留多久。一天一次既能及时释放磁盘，又不会让引擎被无谓唤醒。
 	checkpointGcIntervalDefault = 24 * time.Hour
 	// checkpointGcTimeout 单轮总超时：引擎侧要扫 CAS 分片目录，项目根多时会更慢，

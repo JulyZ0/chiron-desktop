@@ -17,11 +17,14 @@ const fs = require('node:fs')
 const fsp = fs.promises
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { spawn } = require('node:child_process')
 
 const MAX_READ_BYTES = 8 << 20
 const MAX_LIST_ENTRIES = 500
 const MAX_MIRROR_FILES = 5000
 const MAX_MIRROR_BYTES = 200 * 1024 * 1024
+const MAX_GIT_OUTPUT = 8 << 20
+const GIT_TIMEOUT_MS = 30000
 const RECONNECT_MS = 3000
 const NOISE_DIRS = new Set([
   'node_modules', 'dist', 'build', 'target', '__pycache__', 'vendor', '.next', 'coverage',
@@ -175,6 +178,16 @@ async function handleDeviceOp(msg) {
     return {}
   }
 
+  // git：完整允许（含写操作）。参数由服务端构造，渲染层无法直接下发。
+  // 安全边界：cwd 必须在项目根内；参数数量/长度受限；输出限 8MB、超时 30s。
+  if (op === 'git') {
+    const args = Array.isArray(msg.args) ? msg.args.map(String) : []
+    if (args.length === 0 || args.length > 64) throw new Error('invalid git args')
+    if (args.some(a => a.length > 2048 || a.includes('\u0000'))) throw new Error('invalid git args')
+    const timeout = Math.max(1000, Math.min(Number(msg.timeout_ms) || GIT_TIMEOUT_MS, 120000))
+    return await runDeviceGit(abs, args, timeout)
+  }
+
   if (op === 'hash') {
     return { hash: await sha256File(abs) }
   }
@@ -259,6 +272,74 @@ async function sha256File(abs) {
     stream.on('data', chunk => h.update(chunk))
     stream.on('error', reject)
     stream.on('end', () => resolve(h.digest('hex')))
+  })
+}
+
+/**
+ * 在项目根内执行 git 子命令。
+ *
+ * 非零退出码不是错误：git 的 "not a git repository" 等语义靠 code/stderr 表达，
+ * 由服务端解释。只有 git 缺失（ENOENT）才用 127 标记，避免和普通失败混淆。
+ * 输出截断时仍返回已有内容并置 truncated，服务端据此拒绝解析。
+ */
+function runDeviceGit(cwd, args, timeoutMs) {
+  return new Promise(resolve => {
+    let child
+    try {
+      child = spawn('git', args, {
+        cwd,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: '0',
+          GIT_PAGER: 'cat',
+          GIT_OPTIONAL_LOCKS: '0',
+          LC_ALL: 'C',
+        },
+      })
+    } catch (err) {
+      resolve({ code: 127, stdout: '', stderr: String(err.message || err), truncated: false })
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    let truncated = false
+    let done = false
+    let timer = null
+    const finish = payload => {
+      if (done) return
+      done = true
+      if (timer) clearTimeout(timer)
+      resolve(payload)
+    }
+    timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {
+        /* 已退出 */
+      }
+      finish({ code: -1, stdout, stderr: `${stderr}\ngit timeout after ${timeoutMs}ms`.trim(), truncated })
+    }, timeoutMs)
+    child.stdout.on('data', chunk => {
+      if (stdout.length >= MAX_GIT_OUTPUT) {
+        truncated = true
+        return
+      }
+      stdout += chunk.toString('utf8')
+      if (stdout.length > MAX_GIT_OUTPUT) {
+        stdout = stdout.slice(0, MAX_GIT_OUTPUT)
+        truncated = true
+      }
+    })
+    child.stderr.on('data', chunk => {
+      if (stderr.length < 64 * 1024) stderr += chunk.toString('utf8')
+    })
+    child.on('error', err => {
+      const missing = err && err.code === 'ENOENT'
+      finish({ code: missing ? 127 : -1, stdout, stderr: missing ? 'git not found' : String(err.message || err), truncated })
+    })
+    child.on('close', code => finish({ code: code == null ? -1 : code, stdout, stderr, truncated }))
   })
 }
 

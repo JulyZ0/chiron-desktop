@@ -252,12 +252,12 @@ def preview_diff(
 #: 分片文件名的形状：``<2 位 hex>/<62 位 hex>``，也就是 sha256 的十六进制。
 _DIGEST_RE = re.compile(r"^[0-9a-f]{2}/[0-9a-f]{62}$")
 
-_DEFAULT_RETENTION_DAYS = 30
+_DEFAULT_RETENTION_DAYS = 90
 _MAX_RETENTION_DAYS = 3650
 
 
 def clamp_retention_days(value: object) -> int:
-    """保留期（天）：默认 30，范围 0..3650。
+    """保留期（天）：默认 90，范围 0..3650。
 
     ``0`` 是**合法**值（"不设保留期，未引用即删"），但不接受负数 —— 负数会让
     ``cutoff`` 落到未来，于是所有文件都被判成"还年轻"，GC 静默什么都不做。

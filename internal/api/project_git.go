@@ -577,8 +577,12 @@ func (h *SessionMapHandler) ListProjectChanges(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if loc.Provider == smProviderClient {
-		JSONWithCode(w, http.StatusNotImplemented, "project_vcs_client_pending", nil,
-			"git operations for device-backed projects are not enabled yet")
+		result, err := clientProjectChanges(r, loc)
+		if err != nil {
+			respondClientGitError(w, err)
+			return
+		}
+		OK(w, result)
 		return
 	}
 	root := loc.RootPath

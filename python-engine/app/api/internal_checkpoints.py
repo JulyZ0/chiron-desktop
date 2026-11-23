@@ -58,7 +58,7 @@ class GcRequest(BaseModel):
     #: 单个根（兼容旧调用方）；``roots`` 为空时才用它。
     root: str = Field("", max_length=4096)
     roots: list[str] = Field(default_factory=list)
-    retention_days: int = Field(30, description="保留期（天）；0 = 未引用即删")
+    retention_days: int = Field(90, description="保留期（天）；0 = 未引用即删")
     dry_run: bool = Field(True, description="默认只预演，不删文件")
 
 

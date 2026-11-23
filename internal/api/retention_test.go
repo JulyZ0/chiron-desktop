@@ -74,10 +74,10 @@ func (f *fakeRetentionTable) DeleteBatchBefore(_ context.Context, cutoff time.Ti
 	return int64(len(idx)), nil
 }
 
-func TestRetentionDefaultsAre180_90_30(t *testing.T) {
+func TestRetentionDefaultsAre180_90_90(t *testing.T) {
 	cfg := defaultRetentionConfig()
-	if cfg.UsageDays != 180 || cfg.ShareDays != 90 || cfg.CheckpointDays != 30 {
-		t.Fatalf("默认保留期必须是 180/90/30，实际 %#v", cfg)
+	if cfg.UsageDays != 180 || cfg.ShareDays != 90 || cfg.CheckpointDays != 90 {
+		t.Fatalf("默认保留期必须是 180/90/90，实际 %#v", cfg)
 	}
 	// 未配置（零值）经 normalize 必须回落到默认，而不是被当成"保留 0 天 = 全删"。
 	if got := (retentionConfig{}).normalize(); got != cfg {

@@ -122,8 +122,12 @@ func (h *SessionMapHandler) GetProjectVCS(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if loc.Provider == smProviderClient {
-		JSONWithCode(w, http.StatusNotImplemented, "project_vcs_client_pending", nil,
-			"git operations for device-backed projects are not enabled yet")
+		state, err := clientProjectVCS(r, loc)
+		if err != nil {
+			respondClientGitError(w, err)
+			return
+		}
+		OK(w, state)
 		return
 	}
 	OK(w, projectVCS(r.Context(), loc.RootPath))
@@ -139,8 +143,31 @@ func (h *SessionMapHandler) InitProjectVCS(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if loc.Provider == smProviderClient {
-		JSONWithCode(w, http.StatusNotImplemented, "project_vcs_client_pending", nil,
-			"git operations for device-backed projects are not enabled yet")
+		// 建 `.git` 是写操作：与镜像回写共用同一条项目级写租约，默认只读时拒绝。
+		if !deviceWriteAllowed(r.Context(), loc.ID) {
+			JSONWithCode(w, http.StatusForbidden, "device_write_required", nil,
+				"grant write access to this project before enabling version control")
+			return
+		}
+		state, err := clientInitProjectRepo(r, loc)
+		if err != nil {
+			if errors.Is(err, errGitMissing) {
+				JSONWithCode(w, http.StatusConflict, CodeServiceUnavailable, nil, "git is not installed")
+				return
+			}
+			if errors.Is(err, errGitFailed) {
+				logAndRespond(w, err, http.StatusInternalServerError, "could not initialize version control")
+				return
+			}
+			respondClientGitError(w, err)
+			return
+		}
+		if !state.Repo {
+			logAndRespond(w, errors.New("git init reported success but directory is still not a work tree"),
+				http.StatusInternalServerError, "could not initialize version control")
+			return
+		}
+		OK(w, state)
 		return
 	}
 	root := loc.RootPath

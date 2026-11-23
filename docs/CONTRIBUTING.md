@@ -39,7 +39,8 @@ python run.py start              # 网关 :8080 + 引擎 :8000 + MCP Broker :800
 | `POSTGRES_DSN`、`REDIS_ADDR`（引擎用 `REDIS_URL`） | 基础设施连接串 |
 | `SANDBOX_BACKEND` | `service`（默认，下沉独立容器）或 `local`（进程内，仅本机开发） |
 | `DEGRADED_MODE` | 默认 `false`：Redis 不可用时网关与引擎**拒绝启动**；仅本机开发设 `true` |
-| `TURN_RETENTION_DAYS` / `TASK_IDEMPOTENCY_RETENTION_DAYS` | 保留策略天数（默认 30），防长期运行表膨胀 |
+| `TURN_RETENTION_DAYS` | 回合表保留天数（默认 90），防长期运行表膨胀 |
+| `TASK_IDEMPOTENCY_RETENTION_DAYS` | 幂等键保留天数（默认 30） |
 | `ALLOW_SCHEMA_DRIFT` | 默认 `false`：启动时校验数据库迁移版本，不一致**拒绝启动** |
 
 ## 常用命令
