@@ -109,6 +109,7 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 | S4 | 每用户并发配额、故障恢复 | `7511f1b` |
 | S5 | chiron-server BFF 评估 | 未开始 |
 | R1 | client 文件浏览（list/search/read/raw）经设备桥 | 已实现 |
+| R3 | 删除/重命名：设备桥原语 + 镜像删除校验 | 已实现 |
 
 ## 8. 接下来的任务
 
@@ -116,7 +117,7 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 
 1. **R2 WebDAV+rclone spike（先行）**：网关用 `golang.org/x/net/webdav` 把 client 项目暴露为本机 WebDAV；rclone mount（Windows 走 WinFsp）挂成普通目录，Python 工具零改动。决策门见 §8.2。
 2. **R1 client 项目文件浏览（已实现）**：`List/Search/Read/Raw` 已接设备桥，返回与 server 项目同一套 JSON；git 视图对 client 项目暂 501（走挂载后自然可用）。
-3. **R3 删除/重命名与二进制**：走挂载则免费获得；若保留 RPC 则设备桥补 `remove/rename` 并让 sync-back 支持删除。
+3. **R3 删除/重命名（已实现）**：设备桥支持 `remove/rename`；镜像回写对“本地消失”的文件先校验设备哈希仍等于基线再删除，外部已修改则报 conflict；重命名等价于删+建。
 4. **R4 多副本设备注册表**：当前在进程内；多网关副本时改 Redis pub/sub 路由，避免请求落到不持连接的实例。
 
 ### 8.2 R2 spike：WebDAV + rclone 决策门

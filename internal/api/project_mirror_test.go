@@ -133,6 +133,19 @@ func fakeProjectDevice(t *testing.T, tenant, user, device string, files map[stri
 				sum := sha256.Sum256(data)
 				resp.OK = true
 				resp.Hash = hex.EncodeToString(sum[:])
+			case "hash":
+				rel := strings.TrimPrefix(strings.ReplaceAll(req.Path, `\`, "/"), "D:/proj/")
+				content, ok := files[rel]
+				if !ok {
+					resp.Error = "not found"
+					break
+				}
+				sum := sha256.Sum256([]byte(content))
+				resp.OK, resp.Hash = true, hex.EncodeToString(sum[:])
+			case "remove":
+				rel := strings.TrimPrefix(strings.ReplaceAll(req.Path, `\`, "/"), "D:/proj/")
+				delete(files, rel)
+				resp.OK = true
 			default:
 				resp.Error = "unsupported"
 			}
@@ -187,5 +200,17 @@ func TestProjectMirrorEnsureAndSyncBack(t *testing.T) {
 	}
 	if files["a.txt"] != "device-edit" {
 		t.Fatalf("冲突时不得覆盖设备文件，得到 %q", files["a.txt"])
+	}
+
+	// 设备侧改回基线内容后，删除镜像文件 → 设备也应删除
+	files["a.txt"] = "changed"
+	if err := os.Remove(filepath.Join(root, "a.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncProjectMirrorBack(context.Background(), "ten", "usr", loc); err != nil {
+		t.Fatalf("delete sync: %v", err)
+	}
+	if _, ok := files["a.txt"]; ok {
+		t.Fatal("镜像删除后设备文件应被删除")
 	}
 }

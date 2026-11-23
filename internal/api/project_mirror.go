@@ -207,6 +207,7 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 	}
 	var conflicts []string
 	changed := 0
+	seen := map[string]bool{}
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -226,6 +227,7 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 		if !safeMirrorRelOk(rel) {
 			return nil
 		}
+		seen[rel] = true
 		sum, err := fileSHA256(path)
 		if err != nil {
 			return nil
@@ -259,6 +261,34 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 		changed++
 		return nil
 	})
+	// 删除同步：镜像里消失、且设备侧内容仍是基线 ⇒ 删除；设备侧已变 ⇒ conflict。
+	for rel, base := range manifest {
+		if seen[rel] {
+			continue
+		}
+		abs := filepath.Join(loc.RootPath, filepath.FromSlash(rel))
+		hashResp, hashErr := deviceHubSingleton.Call(ctx, tenant, user, loc.DeviceID, deviceOpRequest{
+			Op: "hash", Root: loc.RootPath, Path: abs,
+		})
+		if hashErr != nil {
+			if !strings.Contains(strings.ToLower(hashErr.Error()), "not found") {
+				slog.Warn("mirror delete check failed", "project", loc.ID, "path", rel, "error", hashErr)
+			}
+			continue
+		}
+		if base != "" && hashResp.Hash != "" && hashResp.Hash != base {
+			conflicts = append(conflicts, rel)
+			continue
+		}
+		if _, delErr := deviceHubSingleton.Call(ctx, tenant, user, loc.DeviceID, deviceOpRequest{
+			Op: "remove", Root: loc.RootPath, Path: abs,
+		}); delErr != nil {
+			slog.Warn("mirror delete failed", "project", loc.ID, "path", rel, "error", delErr)
+			continue
+		}
+		delete(manifest, rel)
+		changed++
+	}
 	_ = saveMirrorManifest(manifestPath, manifest)
 	if walkErr != nil {
 		slog.Warn("mirror scan failed", "project", loc.ID, "error", walkErr)
