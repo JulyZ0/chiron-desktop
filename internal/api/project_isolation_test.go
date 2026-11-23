@@ -74,3 +74,20 @@ func TestProjectIsolationDisabledAllowsAnyPath(t *testing.T) {
 		t.Fatalf("桌面模式不应创建/限制: %v", err)
 	}
 }
+
+// 桌面本地模式以 owner 身份运行：PROJECTS_ROOT 只约束团队里的普通成员，
+// 否则本机用户选任意文件夹都会被 403（真实回归：开启"服务模式"后无法新建项目）。
+func TestEnsureUserProjectDirOwnerBypassesIsolation(t *testing.T) {
+	root := t.TempDir()
+	withProjectIsolationRoot(t, root)
+	owner := &auth.Claims{UserID: "u1", TenantID: 1, Role: "owner"}
+	outside := filepath.Join(t.TempDir(), "my-code")
+	if err := ensureUserProjectDir(owner, outside); err != nil {
+		t.Fatalf("owner 不应被 PROJECTS_ROOT 限制: %v", err)
+	}
+
+	member := &auth.Claims{UserID: "u1", TenantID: 1, Role: "user"}
+	if err := ensureUserProjectDir(member, outside); err == nil {
+		t.Fatal("普通成员仍必须限制在自有目录内")
+	}
+}

@@ -120,3 +120,16 @@ describe('describeApiError（params 插值）', () => {
     expect(text).toContain('充值')
   })
 })
+
+describe('项目根越界的错误文案', () => {
+  it('给出允许的项目目录，而不是"请求失败"', () => {
+    const text = describeApiError({
+      response: {
+        status: 403,
+        data: { code: 'project_root_forbidden', params: { base: '/srv/projects/1/u1' } },
+      },
+    })
+    expect(text).toContain('/srv/projects/1/u1')
+    expect(text).not.toBe('请求失败，请稍后重试')
+  })
+})

@@ -149,12 +149,28 @@ func projectRootAllowed(tenant, userID, root string) bool {
 // 桌面模式（未配 PROJECTS_ROOT）直接通过；团队模式下：
 //   - 路径不在 `<root>/<tenant>/<user>/` 内 ⇒ 拒绝（防止指向别人的项目/系统目录）；
 //   - 路径不存在 ⇒ 创建（Web 用户没法像桌面那样浏览服务器目录，给一个可写落点）。
+// projectRootNotAllowedError 表示路径越出了该用户被允许的项目目录。
+// 单独成类型是为了让 handler 返回可本地化的 code 与允许根，而不是一句通用 403。
+type projectRootNotAllowedError struct {
+	Base string
+}
+
+func (e *projectRootNotAllowedError) Error() string {
+	return "root_path must be inside your own project directory: " + e.Base
+}
+
+// 桌面本地模式（Electron + 本机 owner）允许选择本机任意文件夹：
+// PROJECTS_ROOT 的隔离语义只针对**多人服务**下的非 owner。owner 是部署负责人，
+// 在团队 Web 里同样有平台级运维权限，限制其项目根只会把本地桌面用户挡在门外。
 func ensureUserProjectDir(claims *auth.Claims, raw string) error {
 	if projectIsolationRoot == "" {
 		return nil
 	}
 	if claims == nil {
 		return fmt.Errorf("not authenticated")
+	}
+	if claims.Role == "owner" {
+		return nil
 	}
 	base := userProjectBase(smTenant(claims), claims.UserID)
 	if base == "" {
@@ -165,7 +181,7 @@ func ensureUserProjectDir(claims *auth.Claims, raw string) error {
 		return fmt.Errorf("root_path must be an absolute path")
 	}
 	if !pathWithin(base, p) {
-		return fmt.Errorf("root_path must be inside your own project directory")
+		return &projectRootNotAllowedError{Base: base}
 	}
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return fmt.Errorf("cannot create project directory: %w", err)
@@ -551,6 +567,13 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 		// 团队模式：先把项目根限制/创建在 `<PROJECTS_ROOT>/<tenant>/<user>/` 内，
 		// 再做存在性等常规校验。
 		if err := ensureUserProjectDir(claims, body.RootPath); err != nil {
+			var denied *projectRootNotAllowedError
+			if errors.As(err, &denied) {
+				JSONWithCode(w, http.StatusForbidden, "project_root_forbidden",
+					map[string]interface{}{"base": denied.Base},
+					"root_path must be inside your own project directory")
+				return
+			}
 			Forbidden(w, err.Error())
 			return
 		}
