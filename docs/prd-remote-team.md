@@ -50,7 +50,7 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 | 风险层 | 隔离/授权 | 性能策略 | 失败默认 |
 |---|---|---|---|
 | 项目读 | 项目只读租约、根白名单 | 元数据缓存、按需分块 | 明确报错 |
-| 项目写 | 写租约 + hash 冲突 + 设备哈希校验；仅 owner/admin 可变更；租户可写项目数上限 | 批处理、乐观并发、异步审计 | 冲突不覆盖 |
+| 项目写 | 写租约 + hash 冲突 + 设备哈希校验；项目所有者可授予/收回；租户总闸与可写项目数上限 | 批处理、乐观并发、异步审计 | 冲突不覆盖 |
 | 代码执行 | 服务端沙箱（Windows 低完整性/Job Object；Linux bwrap/gVisor）+ 租户并发槽 | 暖池/会话复用、CPU/内存/时长硬限 | 超时杀进程 |
 | 网络/安装 | 默认拒绝 + 域名白名单代理 + 凭证注入 | 连接复用 | 拒绝并给申请路径 |
 | MCP/插件 | 独立沙箱、固定版本、默认无网 | 常驻连接 | 单工具失败隔离 |
@@ -88,7 +88,7 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 ## 7. 已定决策
 
 - rclone/WinFsp 只在服务端按需获取（固定版本+SHA256），不进安装包；R2 实测通过后切换挂载并删除镜像。
-- R5：项目级租约 + 租户总闸 + owner/admin 门控 + 租户可写项目数上限。
+- R5：项目级租约（项目所有者授予/收回）+ 租户总闸 + 租户可写项目数上限（后台仅平台 owner 配置）。
 - client git 完全允许；项目换设备重新授权，不做内容迁移。
 - 数据软删除 + 默认保留 90 天；client 文件默认不落服务端。
 - LiteLLM 暂不引入；Langfuse 暂缓实接（需要时经 OTel Collector）；S5 暂缓；租户删除暂缓。

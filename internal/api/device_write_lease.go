@@ -132,12 +132,9 @@ func (h *SessionMapHandler) SetDeviceWriteLease(w http.ResponseWriter, r *http.R
 		Unauthorized(w, ErrAuthRequired)
 		return
 	}
-	// R5 企业权限：授予/收回用户磁盘写权限只允许 owner/admin 操作。
-	if claims.Role != "owner" && claims.Role != "admin" {
-		JSONWithCode(w, http.StatusForbidden, "device_write_role_required", nil,
-			"only owner or admin can change device write access")
-		return
-	}
+	// 写租约是**项目所有者对自己设备**的授权：团队成员必须能为自己的 client 项目
+	// 开启写回，否则 agent 的修改永远落不到他的本机。企业级约束走租户总闸与
+	// quota.device_write_max_projects（由平台 owner 在后台配置），不在这里按角色拦截。
 	id, ok := writableClientProject(r, claims)
 	if !ok {
 		JSONWithCode(w, http.StatusNotFound, CodeNotFound, nil, "project not found")
