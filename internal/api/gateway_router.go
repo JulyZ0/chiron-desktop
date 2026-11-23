@@ -287,6 +287,10 @@ func NewGatewayRouter(
 	agentSem := NewSharedSemaphore(atomicRedis, "agent", cfg.AgentMaxConcurrency)
 	// 每用户并发上限（S4）：挡"一个用户占满全局槽位"。
 	userSem := NewUserSemaphorePool(atomicRedis, cfg.AgentMaxConcurrencyPerUser)
+	// 设备文件桥跨副本路由（R4）：本实例没连接时经 Redis 转给持有连接的副本。
+	if atomicRedis != nil {
+		StartDeviceFSRouting(lifecycleCtx, atomicRedis)
+	}
 
 	// Submit handler (proxies to Python)
 	submitHandler := NewSubmitHandler(pythonClient, sessionMgr, eventHub, cfg)

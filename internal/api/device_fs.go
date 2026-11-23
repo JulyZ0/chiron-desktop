@@ -21,12 +21,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/athenavi/chiron/internal/auth"
+	"github.com/athenavi/chiron/internal/db"
 	"github.com/gorilla/websocket"
 )
 
@@ -110,14 +114,171 @@ func (c *deviceConn) close() {
 type deviceHub struct {
 	mu    sync.Mutex
 	conns map[string]*deviceConn
+
+	// 多副本路由（R4）：连接在哪个网关实例上，请求就经 Redis 转给那个实例。
+	rdb        db.RedisClient
+	instanceID string
+	routeOnce  sync.Once
+	pendMu     sync.Mutex
+	pending    map[string]chan routedResponse
+}
+
+type routedRequest struct {
+	ID     string          `json:"id"`
+	From   string          `json:"from"`
+	Tenant string          `json:"tenant"`
+	User   string          `json:"user"`
+	Device string          `json:"device"`
+	Req    deviceOpRequest `json:"req"`
+}
+
+type routedResponse struct {
+	ID    string           `json:"id"`
+	Resp  deviceOpResponse `json:"resp"`
+	Error string           `json:"error,omitempty"`
 }
 
 func newDeviceHub() *deviceHub {
-	return &deviceHub{conns: map[string]*deviceConn{}}
+	return &deviceHub{conns: map[string]*deviceConn{}, pending: map[string]chan routedResponse{}}
 }
 
 // deviceHubSingleton 进程内共享：项目创建/@引用与 WS 处理必须看到同一张连接表。
 var deviceHubSingleton = newDeviceHub()
+
+const deviceOwnerTTL = 5 * time.Minute
+
+func deviceOwnerKey(tenant, user, device string) string {
+	return db.RedisKey("device:fs:owner:") + deviceKey(tenant, user, device)
+}
+
+func deviceInstanceID() string {
+	host, _ := os.Hostname()
+	return fmt.Sprintf("%s-%d", strings.NewReplacer(":", "-", " ", "-").Replace(host), os.Getpid())
+}
+
+// StartDeviceFSRouting 启用跨网关副本的设备路由（R4）。
+//
+// 连接只在持有它的实例上；其它实例发请求时用 Redis：
+//
+//	owner 键记录连接归属；req:<owner> 转发；resp:<from> 回包。
+//
+// 没有 Redis 时保持单实例行为。
+func StartDeviceFSRouting(ctx context.Context, rdb db.RedisClient) {
+	h := deviceHubSingleton
+	if rdb == nil {
+		return
+	}
+	h.rdb = rdb
+	h.instanceID = deviceInstanceID()
+	h.routeOnce.Do(func() {
+		go h.subscribeRequests(ctx)
+		go h.subscribeResponses(ctx)
+	})
+}
+
+func (h *deviceHub) subscribeRequests(ctx context.Context) {
+	ch := db.RedisKey("device:fs:req:") + h.instanceID
+	ps := h.rdb.Subscribe(ctx, ch)
+	defer ps.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-ps.Channel():
+			if !ok {
+				return
+			}
+			h.handleRoutedRequest(ctx, msg.Payload)
+		}
+	}
+}
+
+func (h *deviceHub) subscribeResponses(ctx context.Context) {
+	ch := db.RedisKey("device:fs:resp:") + h.instanceID
+	ps := h.rdb.Subscribe(ctx, ch)
+	defer ps.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-ps.Channel():
+			if !ok {
+				return
+			}
+			var resp routedResponse
+			if json.Unmarshal([]byte(msg.Payload), &resp) != nil {
+				continue
+			}
+			h.pendMu.Lock()
+			pending := h.pending[resp.ID]
+			delete(h.pending, resp.ID)
+			h.pendMu.Unlock()
+			if pending != nil {
+				pending <- resp
+				close(pending)
+			}
+		}
+	}
+}
+
+func (h *deviceHub) handleRoutedRequest(ctx context.Context, payload string) {
+	var req routedRequest
+	if json.Unmarshal([]byte(payload), &req) != nil || req.From == "" || req.ID == "" {
+		return
+	}
+	conn, ok := h.lookup(req.Tenant, req.User, req.Device)
+	var resp routedResponse
+	resp.ID = req.ID
+	if !ok {
+		resp.Error = errDeviceOffline.Error()
+	} else {
+		rctx, cancel := context.WithTimeout(ctx, deviceOpTimeout)
+		defer cancel()
+		out, err := h.callConn(rctx, conn, req.Req)
+		resp.Resp = out
+		if err != nil {
+			resp.Error = err.Error()
+		}
+	}
+	raw, _ := json.Marshal(resp)
+	_ = h.rdb.Publish(ctx, db.RedisKey("device:fs:resp:")+req.From, raw)
+}
+
+func (h *deviceHub) claimOwner(conn *deviceConn) {
+	if h.rdb == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.rdb.Set(ctx, deviceOwnerKey(conn.tenant, conn.user, conn.device), h.instanceID, deviceOwnerTTL).Err(); err != nil {
+		slog.Warn("device fs owner claim failed", "error", err)
+	}
+}
+
+func (h *deviceHub) refreshOwner(conn *deviceConn) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-conn.closed:
+			return
+		case <-ticker.C:
+			h.claimOwner(conn)
+		}
+	}
+}
+
+func (h *deviceHub) releaseOwner(conn *deviceConn) {
+	if h.rdb == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	key := deviceOwnerKey(conn.tenant, conn.user, conn.device)
+	if owner, err := h.rdb.Get(ctx, key).Result(); err == nil && owner == h.instanceID {
+		_ = h.rdb.Del(ctx, key).Err()
+	}
+}
 
 func deviceKey(tenant, user, device string) string {
 	return tenant + "\x00" + user + "\x00" + device
@@ -134,16 +295,24 @@ func (h *deviceHub) register(conn *deviceConn) {
 		slog.Info("device fs: replacing existing connection", "user", conn.user, "device", conn.device)
 		old.close()
 	}
+	h.claimOwner(conn)
+	go h.refreshOwner(conn)
 }
 
 func (h *deviceHub) unregister(conn *deviceConn) {
 	key := deviceKey(conn.tenant, conn.user, conn.device)
 	h.mu.Lock()
-	if h.conns[key] == conn {
+	current := h.conns[key] == conn
+	if current {
 		delete(h.conns, key)
 	}
 	h.mu.Unlock()
 	conn.close()
+	// 只释放自己拥有的 owner 键：重连时新连接可能已经抢先写入，
+	// 老连接的收尾不能把新归属删掉。
+	if current {
+		h.releaseOwner(conn)
+	}
 }
 
 func (h *deviceHub) lookup(tenant, user, device string) (*deviceConn, bool) {
@@ -167,12 +336,15 @@ func newDeviceOpID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Call 向指定设备发送一次只读操作，等待响应或超时。
+// Call 向指定设备发送一次操作；本实例没有连接时经 Redis 转给持有连接的副本。
 func (h *deviceHub) Call(ctx context.Context, tenant, user, device string, req deviceOpRequest) (deviceOpResponse, error) {
-	conn, ok := h.lookup(tenant, user, device)
-	if !ok {
-		return deviceOpResponse{}, errDeviceOffline
+	if conn, ok := h.lookup(tenant, user, device); ok {
+		return h.callConn(ctx, conn, req)
 	}
+	return h.callRemote(ctx, tenant, user, device, req)
+}
+
+func (h *deviceHub) callConn(ctx context.Context, conn *deviceConn, req deviceOpRequest) (deviceOpResponse, error) {
 	if req.ID == "" {
 		req.ID = newDeviceOpID()
 	}
@@ -215,6 +387,52 @@ func (h *deviceHub) Call(ctx context.Context, tenant, user, device string, req d
 			return resp, errors.New(resp.Error)
 		}
 		return resp, nil
+	}
+}
+
+// callRemote 把 op 发给持有设备连接的网关副本，并等待它的回包。
+//
+// 连接归属由 `device:fs:owner:*` 记录；请求走 `req:<owner>`，回包走 `resp:<本实例>`。
+// Redis 不可用/归属缺失时按离线处理 —— 不猜、不重试到别的实例。
+func (h *deviceHub) callRemote(ctx context.Context, tenant, user, device string, req deviceOpRequest) (deviceOpResponse, error) {
+	if h.rdb == nil || h.instanceID == "" {
+		return deviceOpResponse{}, errDeviceOffline
+	}
+	owner, err := h.rdb.Get(ctx, deviceOwnerKey(tenant, user, device)).Result()
+	if err != nil || owner == "" || owner == h.instanceID {
+		return deviceOpResponse{}, errDeviceOffline
+	}
+	if req.ID == "" {
+		req.ID = newDeviceOpID()
+	}
+	ch := make(chan routedResponse, 1)
+	h.pendMu.Lock()
+	h.pending[req.ID] = ch
+	h.pendMu.Unlock()
+	defer func() {
+		h.pendMu.Lock()
+		delete(h.pending, req.ID)
+		h.pendMu.Unlock()
+	}()
+
+	payload, _ := json.Marshal(routedRequest{
+		ID: req.ID, From: h.instanceID, Tenant: tenant, User: user, Device: device, Req: req,
+	})
+	if err := h.rdb.Publish(ctx, db.RedisKey("device:fs:req:")+owner, payload).Err(); err != nil {
+		return deviceOpResponse{}, errDeviceOffline
+	}
+	timer := time.NewTimer(deviceOpTimeout)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return deviceOpResponse{}, ctx.Err()
+	case <-timer.C:
+		return deviceOpResponse{}, errors.New("device_fs_timeout")
+	case resp := <-ch:
+		if resp.Error != "" {
+			return resp.Resp, errors.New(resp.Error)
+		}
+		return resp.Resp, nil
 	}
 }
 
