@@ -3,7 +3,10 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/athenavi/chiron/internal/db"
@@ -25,11 +28,73 @@ const (
 )
 
 // engineInstanceRecord 与 python-engine/app/engine_registry.py 写入的 JSON 对应。
+//
+// 后四个字段是 R6 的池观测补充：实例 id、启动时间、在途任务与进程资源。
+// 旧引擎不写它们时为零值 —— 展示层按"未知"处理，不猜测。
 type engineInstanceRecord struct {
-	URL      string `json:"url"`
-	Version  string `json:"version,omitempty"`
-	LastSeen string `json:"last_seen,omitempty"`
+	URL         string  `json:"url"`
+	Version     string  `json:"version,omitempty"`
+	LastSeen    string  `json:"last_seen,omitempty"`
+	InstanceID  string  `json:"instance_id,omitempty"`
+	StartedAt   int64   `json:"started_at,omitempty"`
+	ActiveTasks int     `json:"active_tasks,omitempty"`
+	CPUPercent  float64 `json:"cpu_percent,omitempty"`
+	MemoryMB    float64 `json:"memory_mb,omitempty"`
 }
+
+// EngineInstance 是管理端看到的存活引擎快照。
+type EngineInstance struct {
+	// ID 是注册键的后缀（进程级实例标识），URL 可能因 --scale 重复。
+	ID          string  `json:"id"`
+	URL         string  `json:"url"`
+	Version     string  `json:"version,omitempty"`
+	LastSeen    string  `json:"last_seen,omitempty"`
+	StartedAt   int64   `json:"started_at,omitempty"`
+	ActiveTasks int     `json:"active_tasks"`
+	CPUPercent  float64 `json:"cpu_percent"`
+	MemoryMB    float64 `json:"memory_mb"`
+}
+
+// ListLiveInstances 读取 Redis 注册表里的存活引擎（TTL 由引擎心跳维持）。
+//
+// 不做 HTTP 探测：心跳本身就是"存活"的判据，且管理页不应因某个引擎卡住而被拖慢。
+// Redis 不可用返回错误而不是空列表 —— 两者在管理端的含义完全不同。
+func ListLiveInstances(ctx context.Context, rdb db.RedisClient) ([]EngineInstance, error) {
+	if rdb == nil {
+		return nil, errEngineRegistryUnavailable
+	}
+	prefix := db.RedisKey("engine:instance:")
+	keys, err := rdb.ScanAll(ctx, prefix+"*", 200)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EngineInstance, 0, len(keys))
+	for _, key := range keys {
+		data, err := rdb.Get(ctx, key).Bytes()
+		if err != nil {
+			continue // 扫描与读取之间过期
+		}
+		var rec engineInstanceRecord
+		if json.Unmarshal(data, &rec) != nil || rec.URL == "" {
+			continue
+		}
+		out = append(out, EngineInstance{
+			ID:          strings.TrimPrefix(key, prefix),
+			URL:         rec.URL,
+			Version:     rec.Version,
+			LastSeen:    rec.LastSeen,
+			StartedAt:   rec.StartedAt,
+			ActiveTasks: rec.ActiveTasks,
+			CPUPercent:  rec.CPUPercent,
+			MemoryMB:    rec.MemoryMB,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+var errEngineRegistryUnavailable = errors.New("engine registry unavailable")
+
 
 // StartEngineDiscovery 启动引擎发现循环（每网关实例一次；Redis/client 为空则跳过）。
 func StartEngineDiscovery(ctx context.Context, rdb db.RedisClient, client *PythonClient) {

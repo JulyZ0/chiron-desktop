@@ -19,6 +19,7 @@ const apiMocks = vi.hoisted(() => ({
   getMonitorOverview: vi.fn(),
   getMonitorHistory: vi.fn(),
   getRetention: vi.fn(),
+  getEngines: vi.fn(),
   saveSettings: vi.fn(),
 }))
 
@@ -26,8 +27,10 @@ vi.mock('@/api/admin', () => ({
   getMonitorOverview: apiMocks.getMonitorOverview,
   getMonitorHistory: apiMocks.getMonitorHistory,
   getRetention: apiMocks.getRetention,
+  getEngines: apiMocks.getEngines,
   saveSettings: apiMocks.saveSettings,
 }))
+apiMocks.getEngines.mockResolvedValue([])
 
 import MonitorView from '../MonitorView.vue'
 

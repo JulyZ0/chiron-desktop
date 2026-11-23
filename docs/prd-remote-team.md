@@ -46,7 +46,7 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 
 ## 4. 多用户执行与配额
 
-- **引擎池**：`CHIRON_ENGINE_POOL_SIZE`（1–4）；引擎自注册 `engine:instance:*`，网关发现；同 session 一致性哈希/run 归属；池副本空闲自停（退出码 75）。
+- **引擎池**：`CHIRON_ENGINE_POOL_SIZE`（1–4）；引擎自注册 `engine:instance:*`，网关发现；同 session 一致性哈希/run 归属；池副本空闲自停（退出码 75）。心跳携带逐实例 `active_tasks/cpu_percent/memory_mb`，管理端 `GET /v1/admin/engines` 与「运行时 → 性能」引擎池表可见。
 - **故障恢复**：primary 监督器重拉、池副本原端口自愈、会话锁心跳/TTL、SSE 重放。
 - **配额**：全局 `AGENT_MAX_CONCURRENCY`；每用户 `AGENT_MAX_CONCURRENCY_PER_USER`（默认 2，429）；run token 预算 `AGENT_RUN_MAX_TOKENS`（默认 400k）。
 - 空载基线（2026-11-23）：引擎 262MB、网关 40MB、launcher 60MB、pageindex ~123MB、PG ~150MB、Redis 15MB。
@@ -140,7 +140,7 @@ rclone / WinFsp 只装在**服务端**（运行网关+引擎的主机），不�
 
 ### 9.3 P1
 
-4. **R6 引擎池实测/自动扩缩**：P=2/4 压测、P95 首 token、逐引擎 RSS、空闲回收；`shirou/gopsutil` + Prometheus。
+4. **R6 引擎池实测/自动扩缩**：逐实例心跳（在途任务/RSS/CPU）与 `GET /v1/admin/engines` 已落地；剩余为团队主机上 P=2/4 压测、P95 首 token 与空闲回收验证；Prometheus 导出待接。
 5. **R7 分层配额**：模型 RPM/TPM（`go-redis/redis_rate`）、工具/沙箱并发、费用熔断；模型预算/多 Key 用 LiteLLM。
 6. **团队管理增强**：用户列表分页、审计导出、邀请链接/邮件交付（邀请已落地，邮件为 P1）。
 

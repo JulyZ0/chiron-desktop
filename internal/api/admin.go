@@ -102,6 +102,8 @@ func (h *AdminHandler) RegisterRoutes(r *http.ServeMux) {
 	r.HandleFunc("GET /performance", h.GetPerformance)
 	// 运行时监控统一数据源：性能 / 队列 / 缓存三个面板一次取全（见 admin_monitor_overview.go）。
 	r.HandleFunc("GET /monitor/overview", h.GetMonitorOverview)
+	// 引擎池存活快照（R6）：逐实例 URL / 在途任务 / RSS / CPU，来自自注册心跳。
+	r.HandleFunc("GET /engines", h.ListEngines)
 	// P2：历史趋势（最近 N 小时，来自 metrics_rollup_minute；跨副本、跨重启）。
 	r.HandleFunc("GET /monitor/history", h.GetMonitorHistory)
 

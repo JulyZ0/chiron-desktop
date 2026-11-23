@@ -39,6 +39,7 @@ class EngineRegistry:
         self._advertise_url = advertise_url.strip().rstrip("/")
         self._version = version
         self._task: asyncio.Task[None] | None = None
+        self._started_at = time.time()
 
     @property
     def enabled(self) -> bool:
@@ -88,8 +89,32 @@ class EngineRegistry:
             "url": self._advertise_url,
             "version": self._version,
             "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "instance_id": self._instance_id,
+            "started_at": int(self._started_at),
         }
+        try:
+            payload.update(self._runtime_stats())
+        except Exception:  # noqa: BLE001 - 观测失败不得中断注册
+            logger.debug("engine registry runtime stats failed", exc_info=True)
         try:
             await self._redis.set(key, json.dumps(payload), ex=REG_TTL_SECONDS)
         except Exception as exc:  # noqa: BLE001
             logger.debug("engine registry heartbeat failed: %s", exc)
+
+    def _runtime_stats(self) -> dict[str, Any]:
+        """心跳里带逐引擎负载/资源，供管理端做池观测（R6）。
+
+        懒加载 observability：避免主模块与注册器之间的循环导入；psutil 不可用
+        时只少这几个字段，不影响注册与发现。
+        """
+        try:
+            from app.observability.metrics import get_active_requests, get_process_resources
+
+            cpu, memory_mb = get_process_resources()
+            return {
+                "active_tasks": int(get_active_requests()),
+                "cpu_percent": round(float(cpu), 2),
+                "memory_mb": round(float(memory_mb), 2),
+            }
+        except Exception:  # noqa: BLE001
+            return {}

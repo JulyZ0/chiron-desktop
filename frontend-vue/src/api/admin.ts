@@ -252,6 +252,23 @@ export async function getPerformance(): Promise<PerformanceStats> {
   return data.data
 }
 
+/** 引擎池存活快照（R6）：数据来自引擎自注册心跳，不是逐实例 HTTP 探测。 */
+export interface EngineInstance {
+  id: string
+  url: string
+  version?: string
+  last_seen?: string
+  started_at?: number
+  active_tasks: number
+  cpu_percent: number
+  memory_mb: number
+}
+
+export async function getEngines(): Promise<EngineInstance[]> {
+  const { data } = await api.get('/v1/admin/engines')
+  return data.data?.instances ?? []
+}
+
 // ── 运行时监控（性能 / 队列 / 缓存统一数据源）──
 
 /**

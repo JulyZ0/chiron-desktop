@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { Card, Descriptions, DescriptionsItem, Spin, Tag } from 'ant-design-vue'
 
 import Sparkline from '@/components/admin/Sparkline.vue'
 import SectionStatus from './SectionStatus.vue'
 import { useMonitorOverview } from '@/composables/useMonitorOverview'
+import { getEngines, type EngineInstance } from '@/api/admin'
 import { UNKNOWN, fmtDuration, fmtMB, fmtMs, fmtNum, fmtPct, seriesOf } from './format'
 
 /**
@@ -32,6 +33,21 @@ const sampleNote = computed(() => {
 
 const engine = computed(() => perf.value?.engine ?? null)
 const pool = computed(() => perf.value?.db_pool ?? null)
+
+// 引擎池逐实例快照：与 overview 分开取（Redis 注册表，采集失败只影响这张表）。
+const engines = ref<EngineInstance[]>([])
+async function loadEngines() {
+  try {
+    engines.value = (await getEngines()) ?? []
+  } catch {
+    // 注册表不可用与"没有存活实例"不同，但都退化成空表 + 文案，不打断整个面板。
+    engines.value = []
+  }
+}
+watch(overview, v => {
+  if (v) void loadEngines()
+})
+onMounted(loadEngines)
 </script>
 
 <template>
@@ -224,6 +240,48 @@ const pool = computed(() => perf.value?.db_pool ?? null)
             </div>
           </Card>
 
+          <Card :title="t('admin.monitor_engines_title')">
+            <div
+              v-if="!engines.length"
+              class="monitor-panel__hint"
+              data-test="engine-pool-empty"
+            >
+              {{ t('admin.monitor_engines_empty') }}
+            </div>
+            <table
+              v-else
+              class="engine-table"
+              data-test="engine-table"
+            >
+              <thead>
+                <tr>
+                  <th>{{ t('admin.monitor_engine_url') }}</th>
+                  <th>{{ t('common.version') }}</th>
+                  <th>{{ t('admin.monitor_engine_active_tasks') }}</th>
+                  <th>{{ t('admin.monitor_engine_rss') }}</th>
+                  <th>{{ t('common.cpu_usage') }}</th>
+                  <th>{{ t('admin.monitor_engine_heartbeat') }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="e in engines"
+                  :key="e.id"
+                >
+                  <td class="engine-table__url">
+                    {{ e.url }}
+                    <span class="monitor-panel__hint">{{ e.id }}</span>
+                  </td>
+                  <td>{{ e.version || UNKNOWN }}</td>
+                  <td>{{ fmtNum(e.active_tasks) }}</td>
+                  <td>{{ e.memory_mb > 0 ? fmtMB(e.memory_mb) : UNKNOWN }}</td>
+                  <td>{{ e.memory_mb > 0 ? fmtPct(e.cpu_percent) : UNKNOWN }}</td>
+                  <td>{{ e.last_seen || UNKNOWN }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </Card>
+
           <Card :title="t('admin.monitor_db_pool')">
             <template v-if="pool">
               <Descriptions
@@ -335,6 +393,33 @@ const pool = computed(() => perf.value?.db_pool ?? null)
 
 .monitor-panel__hint {
   font-size: var(--fs-xs, 12px);
+  overflow-wrap: anywhere;
+}
+
+.engine-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm, 13px);
+  font-variant-numeric: tabular-nums;
+}
+
+.engine-table th,
+.engine-table td {
+  padding: 6px 8px;
+  text-align: start;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.engine-table th {
+  color: var(--text-tertiary);
+  font-weight: var(--fw-medium);
+  font-size: var(--fs-xs, 12px);
+}
+
+.engine-table__url {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   overflow-wrap: anywhere;
 }
 </style>
