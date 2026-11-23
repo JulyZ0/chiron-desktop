@@ -37,6 +37,7 @@ func submitOnce(t *testing.T, sid string) *httptest.ResponseRecorder {
 		mux, injectClaims, passthrough, passthrough, passthrough,
 		nil, // submitHandler：被拒路径用不到；放行路径由其 goroutine 触发 panic 并被 recover 吞掉
 		NewSharedSemaphore(db.Redis, "pytest-submit-gate", 10),
+		NewUserSemaphorePool(nil, 0),
 		nil, nil, nil, nil, // eventHub / sessionMgr / authenticator / rpaHub
 		"pytest-internal-token", time.Second,
 		nil, // pythonClient（输出控制/精炼的透传端点用；本用例只测 submit 网关）

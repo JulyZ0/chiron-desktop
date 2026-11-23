@@ -691,29 +691,72 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 		llmConfig["provider"] = agentCfg.provider.Value
 	}
 	pythonReq["llm_config"] = llmConfig
-	// 项目上下文注入（root_path + project）：
+	// 项目上下文注入（root_path + project + project_locator）：
 	//   - root_path：文件/git 工具必须作用在**用户选中的项目目录**上，而不是沙箱副本；
 	//   - project：记忆隔离的权威键（session-map workspace id）。必须由服务端按会话
 	//     归属写入 —— 客户端传的 `project` 是记忆页手填的自由串，与真实项目无关；
-	//     若直接采信，未归组会话也会把记忆写进某个项目，造成串味。
+	//     若直接采信，未归组会话也会把记忆写进某个项目，造成串味；
+	//   - project_locator：项目身份快照（S0）。引擎只需按它识别"哪个项目"，
+	//     不把 root_path 当跨设备通用身份；root 为空表示该路径当前不可用。
 	//
-	// 两条都复用 `file_refs.go` 的同一关联链（会话 → 项目），不各写一份。
+	// 三者复用 `file_refs.go` 的同一条关联链（会话 → 项目），不各写一份。
 	// 未归组会话显式清掉 `project` ⇒ 全局范围（与 C3 之前的行为一致）。
 	// 必须**复制**再改：`workbenchCtx` 是调用方传入的 map，续跑轮会复用它。
-	root, hasRoot := projectRootForSession(ctx, sessionID)
-	projectID, hasProject := projectIDForSession(ctx, sessionID)
+	projectClaims := auth.GetClaims(ctx)
+	loc, hasLocatorRow := projectLocatorForSession(ctx, sessionID)
+	root, hasRoot := projectRootFromLocator(projectClaims, loc, hasLocatorRow)
+	projectID, hasProject := "", false
+	if hasLocatorRow && loc.ID != "" {
+		projectID, hasProject = loc.ID, true
+	}
+	hasLocator := hasLocatorRow && (loc.ID != "" || loc.RootPath != "")
+	// client 项目：引擎工具只认本地路径，回合前把设备项目镜像到服务端临时目录，
+	// root_path 指向镜像；回合结束回写差异（expected_hash=设备基线，冲突不覆盖）。
+	if hasLocator && loc.Provider == smProviderClient && projectClaims != nil {
+		mirror, mirrErr := ensureProjectMirror(ctx, smTenant(projectClaims), projectClaims.UserID, loc)
+		if mirrErr != nil {
+			h.eventHub.Publish(broadcast.Event{
+				Type: "text", SessionID: sessionID,
+				Data: engine.PythonEvent{
+					Type:    "text",
+					Content: "无法读取设备上的项目文件：" + mirrErr.Error(),
+				},
+			})
+			return nil
+		}
+		root = mirror
+		hasRoot = true
+		defer func() {
+			tctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			if err := syncProjectMirrorBack(tctx, smTenant(projectClaims), projectClaims.UserID, loc); err != nil {
+				slog.Warn("project mirror sync failed", "session", sessionID, "error", err)
+			}
+		}()
+	}
 	// 人格：客户端只传 id（`persona_id`），文案由服务端按租户解析；未传则取默认人格。
 	// 解析结果以 `persona: {name, prompt}` 下发 —— 引擎不碰数据库，也不信任客户端文案。
 	personaID, _ := workbenchCtx["persona_id"].(string)
 	persona, hasPersona := personaForContext(ctx, tenantID, personaID)
-	if hasRoot && root != "" || hasProject || workbenchCtx["project"] != nil ||
+	if hasRoot && root != "" || hasProject || hasLocator || workbenchCtx["project"] != nil ||
 		hasPersona || workbenchCtx["persona_id"] != nil || workbenchCtx["persona"] != nil {
-		wb := make(map[string]interface{}, len(workbenchCtx)+2)
+		wb := make(map[string]interface{}, len(workbenchCtx)+3)
 		for k, v := range workbenchCtx {
 			wb[k] = v
 		}
 		if hasRoot && root != "" {
 			wb["root_path"] = root
+		}
+		if hasLocator {
+			// root 只在通过隔离校验时下发；判重/身份所需的 id/provider/device/root_key
+			// 与路径可用性无关，照常带上（S0 引擎尚未消费）。
+			wb["project_locator"] = map[string]interface{}{
+				"id":        loc.ID,
+				"provider":  loc.Provider,
+				"device_id": loc.DeviceID,
+				"root":      root,
+				"root_key":  loc.RootKey,
+			}
 		}
 		if hasProject {
 			wb["project"] = projectID

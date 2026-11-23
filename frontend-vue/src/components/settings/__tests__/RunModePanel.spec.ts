@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
 
 /**
- * 「运行模式」面板：云端已废除，只剩「本机数据」这一个破坏性动作。
+ * 「运行模式」面板：本地/远程两种形态 + 「清空本机数据」这个唯一的破坏性动作。
+ * 改服务地址走「打开连接设置」，本地模式下也必须是可达入口。
  *
  * 这里钉的是**确认链**：勾选、手打确认词、然后才放行。三道确认里前两道在渲染进程
  * （防误触），Windows Hello 在主进程（防冒用）—— 主进程那道不在这里测（见
@@ -16,9 +17,16 @@ type FakeStore = Record<string, unknown>
 const deviceStoreMock = vi.hoisted(() => ({
   isDesktop: true,
   wiping: false,
+  mode: 'local',
+  settings: { apiUrl: '', local: { dataDir: '' } } as {
+    apiUrl: string
+    local?: { dataDir?: string }
+  },
   isLocal: () => true,
   isCloud: () => false,
   ensureReady: vi.fn(async () => {}),
+  // 本地模式改连局域网/公网服务的唯一入口（主进程建窗分流见 shared.cjs）
+  openConnectionSetup: vi.fn(async () => true),
   // 返回类型显式放宽：成功与各失败分支的形状不同（失败只有 reason/message），
   // 让 TS 从首个返回值推断会把它锁成窄类型，后续用例再赋值就报错。
   wipeLocalData: vi.fn(async (): Promise<Record<string, unknown>> => ({ ok: true, relaunched: true })),
@@ -27,6 +35,37 @@ const deviceStoreMock = vi.hoisted(() => ({
 
 vi.mock('../../../stores/device', () => ({
   useDeviceStore: () => deviceStoreMock as unknown as FakeStore,
+}))
+
+vi.mock('../../../stores/auth', () => ({
+  useAuthStore: () => ({ user: { email: 'me@example.com', role: 'user' } }),
+}))
+
+// 运行状态面板会在挂载时探测 /v1/system/components 与 /v1/models
+const apiMock = vi.hoisted(() => ({
+  get: vi.fn(async (url: string) => {
+    if (url === '/v1/system/components') {
+      return {
+        data: {
+          data: {
+            gateway: { available: true },
+            engine: { healthy: true },
+            postgres: { available: true },
+            redis: { available: true },
+          },
+        },
+      }
+    }
+    if (url === '/v1/models') {
+      return { data: { data: { models: [{ name: 'deepseek-v4.1-flash', provider: 'opencode-go' }] } } }
+    }
+    return { data: { data: {} } }
+  }),
+}))
+
+vi.mock('../../../api', () => ({
+  API_URL: 'http://127.0.0.1:12345',
+  api: apiMock,
 }))
 
 const messageMock = vi.hoisted(() => ({
@@ -70,6 +109,10 @@ function mountPanel() {
 beforeEach(() => {
   deviceStoreMock.isDesktop = true
   deviceStoreMock.wiping = false
+  deviceStoreMock.mode = 'local'
+  deviceStoreMock.settings = { apiUrl: '', local: { dataDir: 'C:\\data\\chiron' } }
+  deviceStoreMock.openConnectionSetup.mockClear()
+  apiMock.get.mockClear()
   deviceStoreMock.wipeLocalData = vi.fn(async (): Promise<Record<string, unknown>> => ({ ok: true, relaunched: true }))
   messageMock.success.mockClear()
   messageMock.warning.mockClear()
@@ -77,13 +120,44 @@ beforeEach(() => {
 })
 
 describe('RunModePanel', () => {
-  it('不再提供「切换模式」：云端已废除，只剩本地形态', async () => {
+  it('不再提供「切换模式」：改地址走「打开连接设置」', async () => {
     const wrapper = mountPanel()
     await flushPromises()
 
     expect(wrapper.text()).not.toContain('切换模式')
     expect(wrapper.text()).not.toContain('切换到')
     expect(wrapper.text()).toContain('本地')
+  })
+
+  it('本地模式下也能打开连接设置（改连局域网/公网服务）', async () => {
+    deviceStoreMock.mode = 'local'
+    deviceStoreMock.openConnectionSetup.mockClear()
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    const button = wrapper.findAll('button').find(b => b.text().includes('打开连接设置'))
+    expect(button, '本地模式是连接远程服务的起点，入口不能缺失').toBeTruthy()
+    await button!.trigger('click')
+    await flushPromises()
+
+    expect(deviceStoreMock.openConnectionSetup).toHaveBeenCalledTimes(1)
+  })
+
+  it('远程模式：状态面板说明谁在跑 agent、工具与文件在哪、数据在哪', async () => {
+    deviceStoreMock.mode = 'cloud'
+    deviceStoreMock.settings = { apiUrl: 'https://chiron.example.com', local: { dataDir: '' } }
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    const text = wrapper.text()
+    expect(text).toContain('运行状态')
+    expect(text).toContain('Agent 循环')
+    expect(text).toContain('服务地址主机上的 Python 引擎')
+    expect(text).toContain('服务端沙箱 / 服务端项目目录')
+    expect(text).toContain('只渲染界面并转发请求')
+    expect(text).toContain('服务端主机')
+    expect(text).toContain('https://chiron.example.com')
+    expect(apiMock.get).toHaveBeenCalledWith('/v1/system/components', expect.anything())
   })
 
   it('提供「清空本机数据」入口，并说明不可恢复', async () => {

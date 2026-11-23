@@ -2,8 +2,11 @@
 /**
  * 运行模式 / 本机数据 —— 设置页「运行模式」标签页的内容。
  *
- * 云端模式已废除，应用只有本地一种形态（契约 docs/desktop-local/contracts.md §1），
- * 所以这里**不再有「切换模式」**。取而代之的是唯一一个破坏性动作：**清空本机数据**。
+ * 两种形态（契约 docs/desktop-local/contracts.md §1）：
+ *   · 本地：内置数据库、网关与引擎随桌面壳在本机运行；
+ *   · 远程：桌面壳只运行界面，全部 `/v1` 请求发往服务地址，业务在服务端执行。
+ * 切换入口是「打开连接设置」——在本地模式下它同样必须是可用的（见 shared.cjs
+ * resolveStartupWindow 的 forceSetup）。
  *
  * ## 清空数据为什么要三重确认
  *
@@ -27,9 +30,14 @@ import { computed, onMounted, ref } from 'vue'
 import { message } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import { useDeviceStore } from '../../stores/device'
+import { useAuthStore } from '../../stores/auth'
+import { api, API_URL } from '../../api'
+import { isComponentUp, type ComponentsHealth } from '../../api/systemHealth'
+import { serverErrorMessage } from '../../utils/apiError'
 
 const { t } = useI18n()
 const device = useDeviceStore()
+const auth = useAuthStore()
 
 /** 确认词：与「切换模式」时代同一个思路 —— 要手打，不是点两下 */
 const CONFIRM_WORD = 'DELETE'
@@ -100,6 +108,134 @@ async function testConnection() {
   }
 }
 
+// ── 当前运行状态：远程模式下到底谁在干活、现在通不通 ──
+//
+// 用户报"远程服务时不清楚应用的工作状态"：只给一段说明文字不够，必须把
+// **真实探测结果**摆出来 —— 连接是否可用、服务端各组件的健康态、本机只运行
+// 界面、数据在哪、以谁的身份登录。全部取自当前模式实际使用的 API，不另造数据源。
+type StatusKind = 'idle' | 'checking' | 'ok' | 'fail'
+
+const isRemote = computed(() => device.mode === 'cloud')
+const statusKind = ref<StatusKind>('idle')
+const statusLatencyMs = ref<number | null>(null)
+const statusError = ref('')
+const statusCheckedAt = ref<Date | null>(null)
+const components = ref<ComponentsHealth | null>(null)
+const modelCount = ref<number | null>(null)
+
+/** 当前模式实际使用的服务地址：远程取配置，本地取注入的本机基址 */
+const activeEndpoint = computed(() => {
+  const remote = serverAddress.value.trim()
+  if (isRemote.value) return remote
+  return API_URL || remote
+})
+
+const identity = computed(
+  () => auth.user?.email || auth.user?.nickname || auth.user?.name || '—',
+)
+
+const dataDir = computed(() => String(device.settings?.local?.dataDir || ''))
+
+const componentRows = computed(() => {
+  const c = components.value
+  const state = (key: 'gateway' | 'engine' | 'postgres' | 'redis') => {
+    if (!c) return 'unknown' as const
+    return isComponentUp(c[key]) ? ('up' as const) : ('down' as const)
+  }
+  return [
+    { key: 'gateway', label: t('settings.run_status_component_gateway'), state: state('gateway') },
+    { key: 'engine', label: t('settings.run_status_component_engine'), state: state('engine') },
+    { key: 'postgres', label: t('settings.run_status_component_postgres'), state: state('postgres') },
+    { key: 'redis', label: t('settings.run_status_component_redis'), state: state('redis') },
+  ]
+})
+
+/**
+ * 执行位置：回答"agent 循环、工具、文件到底在哪跑"。
+ *
+ * 这不是推测，而是由运行模式决定的硬事实：远程模式不启动本机后端，引擎与
+ * 工具都在服务地址那台主机上；桌面端只渲染界面并转发请求。
+ */
+const execRows = computed(() => [
+  {
+    label: t('settings.run_status_agent_loop'),
+    value: isRemote.value
+      ? t('settings.run_status_on_server_engine')
+      : t('settings.run_status_on_local_engine'),
+  },
+  {
+    label: t('settings.run_status_tool_calls'),
+    value: isRemote.value
+      ? t('settings.run_status_server_sandbox')
+      : t('settings.run_status_local_sandbox'),
+  },
+  {
+    label: t('settings.run_status_file_access'),
+    value: isRemote.value
+      ? t('settings.run_status_server_files')
+      : t('settings.run_status_local_files'),
+  },
+  {
+    label: t('settings.run_status_desktop_role'),
+    value: t('settings.run_status_desktop_ui_only'),
+  },
+])
+
+const statusTag = computed(() => {
+  if (statusKind.value === 'checking') {
+    return { color: 'processing', text: t('settings.run_status_checking') }
+  }
+  if (statusKind.value === 'ok') return { color: 'green', text: t('settings.run_status_connected') }
+  if (statusKind.value === 'fail') return { color: 'red', text: t('settings.run_status_failed') }
+  return { color: 'default', text: t('settings.run_status_unknown') }
+})
+
+const checkedAtLabel = computed(() =>
+  statusCheckedAt.value ? statusCheckedAt.value.toLocaleTimeString() : '',
+)
+
+/**
+ * 探一次当前模式的真实状态。
+ *
+ * 用 `/v1/system/components` 而不是只 ping `/health`：它同时证明「网络通、
+ * 鉴权过、依赖在」，并直接回 PG/Redis/引擎/网关 的逐项健康态。远程模式下
+ * 这些值描述的是服务地址那台主机；本地模式下就是本机内置栈。
+ */
+async function refreshStatus() {
+  if (statusKind.value === 'checking') return
+  statusKind.value = 'checking'
+  statusError.value = ''
+  const started = performance.now()
+  try {
+    const res = await api.get('/v1/system/components', { timeout: 8000 })
+    const data = res?.data?.data ?? res?.data
+    components.value = data && typeof data === 'object' ? (data as ComponentsHealth) : null
+    statusKind.value = 'ok'
+    statusLatencyMs.value = Math.round(performance.now() - started)
+    void loadModelCount()
+  } catch (err) {
+    components.value = null
+    statusLatencyMs.value = null
+    statusKind.value = 'fail'
+    const fallback = (err as Error)?.message || String(err)
+    statusError.value = serverErrorMessage(err, fallback)
+  } finally {
+    statusCheckedAt.value = new Date()
+  }
+}
+
+/** 模型数是"能不能干活"的直接证据；取不到就显示 —，不猜。 */
+async function loadModelCount() {
+  try {
+    const { data } = await api.get('/v1/models', { timeout: 6000 })
+    const list = Array.isArray(data?.data?.models) ? data.data.models : []
+    modelCount.value = list.length
+  } catch {
+    modelCount.value = null
+  }
+}
+
+
 async function submit() {
   if (!confirmOk.value) return
   busy.value = true
@@ -145,6 +281,7 @@ async function submit() {
 
 onMounted(() => {
   void device.ensureReady()
+  void refreshStatus()
 })
 </script>
 
@@ -179,7 +316,74 @@ onMounted(() => {
         <code class="mode-address">{{ serverAddress || '—' }}</code>
       </div>
       <p class="mode-hint mode-hint-block">
-        {{ device.mode === 'cloud' ? $t('settings.run_mode_cloud_hint') : $t('settings.run_mode_local_only_hint') }}
+        {{ device.mode === 'cloud' ? $t('settings.run_mode_cloud_hint') : $t('settings.run_mode_local_hint') }}
+      </p>
+    </div>
+
+    <!-- ── 运行状态：谁在跑 agent、工具与文件在哪、现在通不通 ── -->
+    <div class="mode-block">
+      <div class="mode-block-title status-title">
+        <span>{{ $t('settings.run_status_title') }}</span>
+        <a-button
+          size="small"
+          :loading="statusKind === 'checking'"
+          @click="refreshStatus"
+        >
+          {{ $t('settings.run_status_refresh') }}
+        </a-button>
+      </div>
+
+      <div class="mode-row status-row">
+        <a-tag :color="statusTag.color">{{ statusTag.text }}</a-tag>
+        <span v-if="statusLatencyMs !== null" class="mode-hint">{{ statusLatencyMs }} ms</span>
+        <span v-if="checkedAtLabel" class="mode-hint">
+          {{ $t('settings.run_status_last_checked', { time: checkedAtLabel }) }}
+        </span>
+      </div>
+      <p v-if="statusKind === 'fail'" class="mode-hint mode-hint-block status-error">
+        {{ statusError }}
+      </p>
+
+      <div class="status-components">
+        <span
+          v-for="c in componentRows"
+          :key="c.key"
+          class="status-component"
+          :class="`is-${c.state}`"
+        >
+          <span class="status-dot" aria-hidden />{{ c.label }}
+        </span>
+      </div>
+
+      <dl class="status-list">
+        <div v-for="row in execRows" :key="row.label" class="status-item">
+          <dt>{{ row.label }}</dt>
+          <dd>{{ row.value }}</dd>
+        </div>
+        <div class="status-item">
+          <dt>{{ $t('settings.run_status_endpoint') }}</dt>
+          <dd class="status-code">{{ activeEndpoint || '—' }}</dd>
+        </div>
+        <div class="status-item">
+          <dt>{{ $t('settings.run_status_data') }}</dt>
+          <dd>
+            {{ isRemote ? $t('settings.run_status_data_server') : (dataDir || $t('settings.run_status_data_local')) }}
+          </dd>
+        </div>
+        <div class="status-item">
+          <dt>{{ $t('settings.run_status_identity') }}</dt>
+          <dd>{{ identity }}</dd>
+        </div>
+        <div class="status-item">
+          <dt>{{ $t('settings.run_status_models') }}</dt>
+          <dd>
+            {{ modelCount === null ? '—' : $t('settings.run_status_models_count', { count: modelCount }) }}
+          </dd>
+        </div>
+      </dl>
+
+      <p class="mode-hint mode-hint-block">
+        {{ $t('settings.run_status_exec_note') }}
       </p>
     </div>
 
@@ -312,4 +516,61 @@ onMounted(() => {
   overflow-wrap: anywhere;
   color: var(--text-primary);
 }
+
+/* ── 运行状态 ── */
+.status-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.status-row { margin-bottom: 8px; }
+.status-error { color: var(--color-error, #cf1322); }
+.status-components {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.status-component {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: var(--hairline-width) solid var(--border-card, var(--border));
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+.status-component.is-up .status-dot { background: var(--color-success, #2f855a); }
+.status-component.is-down .status-dot { background: var(--color-error, #cf1322); }
+.status-component.is-up { color: var(--text-primary); }
+.status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.status-item { display: flex; gap: 12px; align-items: baseline; }
+.status-item dt {
+  flex: none;
+  width: 76px;
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+.status-item dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.status-code { font-family: var(--font-mono, monospace); direction: ltr; }
 </style>

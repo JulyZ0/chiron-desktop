@@ -33,6 +33,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -304,10 +305,16 @@ func readRefContent(root, rel string) (refContent, error) {
 	if truncated {
 		data = data[:maxFileRefBytes]
 	}
+	return formatRefBytes(info.Size(), data, truncated), nil
+}
+
+// formatRefBytes 把已读到的字节转成"给模型看的内容"：二进制/非 UTF-8 只给说明，
+// 截断点回退到完整 rune，避免把正常中文误判成非 UTF-8。
+// server 本地读与 client 设备桥读共用这一处，保证两条链路的呈现口径一致。
+func formatRefBytes(size int64, data []byte, truncated bool) refContent {
 	// NUL 只在前 8KB 里找：与 project_files.go 的 looksBinary 同一判据。
-	// 先切片再扫 —— 为一个普通二进制文件多扫 64KB 没有意义。
 	if bytes.IndexByte(data[:min(len(data), binarySniffBytes)], 0) >= 0 {
-		return refContent{text: fmt.Sprintf("[binary file, %d bytes — not inlined]", info.Size())}, nil
+		return refContent{text: fmt.Sprintf("[binary file, %d bytes — not inlined]", size)}
 	}
 	if truncated {
 		// 截断点可能落在多字节字符中间。回退到最后一个完整 rune 的起点，
@@ -317,12 +324,12 @@ func readRefContent(root, rel string) (refContent, error) {
 		}
 	}
 	if !utf8.Valid(data) {
-		return refContent{text: fmt.Sprintf("[non-UTF-8 file, %d bytes — not inlined]", info.Size())}, nil
+		return refContent{text: fmt.Sprintf("[non-UTF-8 file, %d bytes — not inlined]", size)}
 	}
 	if truncated {
-		return refContent{text: string(data) + fmt.Sprintf("\n…[truncated; file is %d bytes]…", info.Size())}, nil
+		return refContent{text: string(data) + fmt.Sprintf("\n…[truncated; file is %d bytes]…", size)}
 	}
-	return refContent{text: string(data)}, nil
+	return refContent{text: string(data)}
 }
 
 // listRefDirAt 列出一层目录条目（不递归）。
@@ -385,6 +392,11 @@ func listRefDirAt(abs string) string {
 		names = names[:maxRefDirEntries]
 		truncated = true
 	}
+	return formatRefDirNames(names, truncated, reason)
+}
+
+// formatRefDirNames 输出"目录清单"文本。server 本地读与 client 设备桥读共用。
+func formatRefDirNames(names []string, truncated bool, reason string) string {
 	var b strings.Builder
 	b.Grow(len(names) * 24)
 	b.WriteString(fmt.Sprintf("[directory listing, %d entries; file contents are not inlined — mention a listed path to read it]\n", len(names)))
@@ -453,6 +465,11 @@ func buildFileRefBlock(root, rel string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
+	return wrapRefBlock(rel, content), true
+}
+
+// wrapRefBlock 把读取结果包成注入块。server/client 两条读取链路共用。
+func wrapRefBlock(rel string, content refContent) string {
 	tag := "file"
 	if content.isDir {
 		tag = "dir"
@@ -466,8 +483,6 @@ func buildFileRefBlock(root, rel string) (string, bool) {
 	b.Grow(len(body) + len(rel) + 48)
 	b.WriteString("<" + tag + " path=\"" + name.String() + "\"")
 	if content.withheld != "" {
-		// withheld 是给模看的**事实**，不是错误：让它在被追问时能说
-		// "这个文件我拿不到内容"，而不是假装文件是空的。
 		b.WriteString(" withheld=\"" + content.withheld + "\"")
 	}
 	b.WriteString(">\n")
@@ -476,7 +491,159 @@ func buildFileRefBlock(root, rel string) (string, bool) {
 		b.WriteString("\n")
 	}
 	b.WriteString("</" + tag + ">\n")
-	return b.String(), true
+	return b.String()
+}
+
+// joinClientPath 把项目内的相对引用拼成客户端绝对路径。
+//
+// 拒绝 `..` 段：设备侧仍会做最终包含校验，但服务端先把明显的越界挡掉，
+// 避免把可疑路径发给用户设备。
+func joinClientPath(root, rel string) (string, bool) {
+	rel = strings.TrimSpace(rel)
+	for _, seg := range strings.Split(strings.ReplaceAll(rel, `\`, "/"), "/") {
+		if seg == ".." {
+			return "", false
+		}
+	}
+	cleaned := path.Clean("/" + strings.ReplaceAll(rel, `\`, "/"))
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	sep := "/"
+	if strings.Contains(root, `\`) {
+		sep = `\`
+	}
+	root = strings.TrimRight(strings.TrimSpace(root), `/\`)
+	if root == "" {
+		return "", false
+	}
+	if cleaned == "" {
+		return root, true
+	}
+	return root + sep + strings.ReplaceAll(cleaned, "/", sep), true
+}
+
+// buildClientFileRefBlock 经设备桥读取一个引用（S1 只读）。
+func buildClientFileRefBlock(ctx context.Context, claims *auth.Claims, loc projectLocator, rel string) (string, bool) {
+	content, err := readClientRefContent(ctx, claims, loc, rel)
+	if err != nil {
+		slog.Warn("client file ref read failed", "project", loc.ID, "ref", rel, "error", err)
+		return "", false
+	}
+	return wrapRefBlock(rel, content), true
+}
+
+func readClientRefContent(ctx context.Context, claims *auth.Claims, loc projectLocator, rel string) (refContent, error) {
+	if reason := sensitiveRefReason(rel); reason != "" {
+		return refContent{withheld: reason}, nil
+	}
+	abs, ok := joinClientPath(loc.RootPath, rel)
+	if !ok {
+		return refContent{}, errors.New("invalid ref path")
+	}
+	statResp, err := deviceHubSingleton.Call(ctx, smTenant(claims), claims.UserID, loc.DeviceID, deviceOpRequest{
+		Op: "stat", Root: loc.RootPath, Path: abs,
+	})
+	if err != nil {
+		return refContent{}, err
+	}
+	if statResp.Stat == nil {
+		return refContent{}, errors.New("device returned no stat")
+	}
+	if statResp.Stat.IsDir {
+		listResp, err := deviceHubSingleton.Call(ctx, smTenant(claims), claims.UserID, loc.DeviceID, deviceOpRequest{
+			Op: "list", Root: loc.RootPath, Path: abs,
+		})
+		if err != nil {
+			return refContent{}, err
+		}
+		names := make([]string, 0, len(listResp.Entries))
+		for _, e := range listResp.Entries {
+			name := e.Name
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			if e.IsDir {
+				if isNoiseRefDir(name) {
+					continue
+				}
+				name += "/"
+			}
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		truncated := false
+		if len(names) > maxRefDirEntries {
+			names = names[:maxRefDirEntries]
+			truncated = true
+		}
+		return refContent{text: formatRefDirNames(names, truncated, ""), isDir: true}, nil
+	}
+	mode := strings.ToLower(statResp.Stat.Mode)
+	if mode != "" && !strings.Contains(mode, "regular") {
+		return refContent{text: "[not a regular file — not inlined]"}, nil
+	}
+	readResp, err := deviceHubSingleton.Call(ctx, smTenant(claims), claims.UserID, loc.DeviceID, deviceOpRequest{
+		Op: "read", Root: loc.RootPath, Path: abs, MaxBytes: maxFileRefBytes + 1,
+	})
+	if err != nil {
+		return refContent{}, err
+	}
+	data, decErr := base64.StdEncoding.DecodeString(readResp.DataB64)
+	if decErr != nil {
+		return refContent{}, decErr
+	}
+	truncated := readResp.Truncated || len(data) > maxFileRefBytes
+	if len(data) > maxFileRefBytes {
+		data = data[:maxFileRefBytes]
+	}
+	return formatRefBytes(statResp.Stat.Size, data, truncated), nil
+}
+
+// projectLocator 是会话所属项目的身份快照（S0：仍只有 server provider）。
+//
+// RootPath 是执行端路径，RootKey 是判重键。引擎未来只应依赖 ID/RootKey，
+// 不再把 RootPath 当成跨设备通用的身份。
+type projectLocator struct {
+	ID       string
+	Provider string
+	DeviceID string
+	RootPath string
+	RootKey  string
+}
+
+// projectLocatorForSession 查这个会话所属项目的 locator。
+//
+// 与 `projectRootForSession` / `projectIDForSession` 共用同一条关联链
+// （会话 → 项目），只是把一行的所有字段一次取回，避免三处各写一份 JOIN。
+func projectLocatorForSession(ctx context.Context, sessionID string) (projectLocator, bool) {
+	if db.GlobalDBManager == nil || sessionID == "" {
+		return projectLocator{}, false
+	}
+	claims := auth.GetClaims(ctx)
+	if claims == nil {
+		return projectLocator{}, false
+	}
+	row, err := db.GlobalDBManager.FetchOne(ctx,
+		`SELECT w.id,
+		        COALESCE(w.provider,'server') AS provider,
+		        COALESCE(w.device_id,'') AS device_id,
+		        COALESCE(w.root_path,'') AS root_path,
+		        COALESCE(w.root_key,'') AS root_key
+		   FROM session_map_nodes n
+		   JOIN session_map_workspaces w ON w.id = n.workspace_id
+		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
+		    AND w.tenant_id = $2 AND w.user_id = $3
+		  LIMIT 1`, sessionID, smTenant(claims), claims.UserID)
+	if err != nil || row == nil {
+		return projectLocator{}, false
+	}
+	loc := projectLocator{
+		ID:       stringOf(row["id"]),
+		Provider: stringOf(row["provider"]),
+		DeviceID: stringOf(row["device_id"]),
+		RootPath: stringOf(row["root_path"]),
+		RootKey:  stringOf(row["root_key"]),
+	}
+	return loc, loc.ID != ""
 }
 
 // projectIDForSession 查这个会话所属的 session-map 项目 id。
@@ -487,62 +654,43 @@ func buildFileRefBlock(root, rel string) (string, bool) {
 //
 // 返回 false 表示"会话没归入任何项目"（不是错误），调用方按全局范围处理。
 func projectIDForSession(ctx context.Context, sessionID string) (string, bool) {
-	if db.GlobalDBManager == nil || sessionID == "" {
+	loc, ok := projectLocatorForSession(ctx, sessionID)
+	if !ok || loc.ID == "" {
 		return "", false
 	}
-	claims := auth.GetClaims(ctx)
-	if claims == nil {
-		return "", false
-	}
-	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT w.id
-		   FROM session_map_nodes n
-		   JOIN session_map_workspaces w ON w.id = n.workspace_id
-		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
-		    AND w.tenant_id = $2 AND w.user_id = $3
-		  LIMIT 1`, sessionID, smTenant(claims), claims.UserID)
-	if err != nil || row == nil {
-		return "", false
-	}
-	id := stringOf(row["id"])
-	return id, id != ""
+	return loc.ID, true
 }
 
-// projectRootForSession 查这个会话所属项目的根目录。
+// projectRootFromLocator 从 locator 取可用的项目根，并执行团队模式隔离校验。
 //
-// 返回 false 的每一种情况都**不是错误**，而是"这条消息没有项目上下文"：
-// 会话没绑项目、项目没绑目录、数据库不可用。此时 `@` 只是普通文本（可能是邮箱、
-// 可能是别人的名字），不该因此让消息发不出去。
-func projectRootForSession(ctx context.Context, sessionID string) (string, bool) {
-	if db.GlobalDBManager == nil || sessionID == "" {
+// 返回 false 的每一种情况都**不是错误**：没归项目、项目没绑目录、路径越界。
+func projectRootFromLocator(claims *auth.Claims, loc projectLocator, ok bool) (string, bool) {
+	if !ok || claims == nil || strings.TrimSpace(loc.RootPath) == "" {
 		return "", false
 	}
-	claims := auth.GetClaims(ctx)
-	if claims == nil {
-		return "", false
-	}
-	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT COALESCE(w.root_path,'') AS root_path
-		   FROM session_map_nodes n
-		   JOIN session_map_workspaces w ON w.id = n.workspace_id
-		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
-		    AND w.tenant_id = $2 AND w.user_id = $3
-		  LIMIT 1`, sessionID, smTenant(claims), claims.UserID)
-	if err != nil || row == nil {
-		return "", false
-	}
-	root := stringOf(row["root_path"])
-	if root == "" {
-		return "", false
+	// client 项目：路径在用户设备上，PROJECTS_ROOT 是服务端目录策略，不适用。
+	// 边界由设备授权与设备侧包含校验负责（见 device_fs.go）。
+	if loc.Provider == smProviderClient {
+		return loc.RootPath, true
 	}
 	// 团队模式：项目根被改到用户隔离目录之外时，@ 引用一律不展开。
 	// 不报错 —— 这层不是"消息非法"，而是"这条上下文不可用"。
-	if !projectRootAllowed(smTenant(claims), claims.UserID, root) {
+	if !projectRootAllowed(smTenant(claims), claims.UserID, loc.RootPath) {
 		slog.Warn("project root outside user isolation; refs skipped",
-			"user_id", claims.UserID, "root_path", root)
+			"user_id", claims.UserID, "root_path", loc.RootPath)
 		return "", false
 	}
-	return root, true
+	return loc.RootPath, true
+}
+
+// projectRootForSession 查这个会话所属项目的根目录。
+func projectRootForSession(ctx context.Context, sessionID string) (string, bool) {
+	claims := auth.GetClaims(ctx)
+	if claims == nil {
+		return "", false
+	}
+	loc, ok := projectLocatorForSession(ctx, sessionID)
+	return projectRootFromLocator(claims, loc, ok)
 }
 
 // expandFileRefs 把正文里的 `@路径` 展开成一串注入块，追加在原文之后。
@@ -561,14 +709,27 @@ func expandFileRefs(ctx context.Context, sessionID, text string) string {
 	if len(tokens) == 0 {
 		return text
 	}
-	root, ok := projectRootForSession(ctx, sessionID)
-	if !ok {
+	claims := auth.GetClaims(ctx)
+	if claims == nil {
+		return text
+	}
+	loc, hasLoc := projectLocatorForSession(ctx, sessionID)
+	if !hasLoc {
+		return text
+	}
+	root, hasRoot := projectRootFromLocator(claims, loc, hasLoc)
+	if !hasRoot {
 		return text
 	}
 	// 数量与字节两种预算都交给 renderRefBlocks：它同时负责把被省略的路径
 	// 列进 `<refs-omitted>`。在这里先裁剪等于把超出的引用静默丢掉 —— 模型会
 	// 把"没看到"当成"文件不存在"，这正是那个函数存在的理由。
-	body := renderRefBlocks(ctx, root, tokens)
+	var body string
+	if loc.Provider == smProviderClient {
+		body = renderRefBlocksClient(ctx, claims, loc, tokens)
+	} else {
+		body = renderRefBlocks(ctx, root, tokens)
+	}
 	if body == "" {
 		return text
 	}
@@ -590,6 +751,20 @@ func expandFileRefs(ctx context.Context, sessionID, text string) string {
 // （`maxRefsTotalBytes`）。调用方不得先自行裁剪数量 —— 那样超出的引用既没有内容、
 // 也不在名单里，正是上面这段话说不能发生的事。
 func renderRefBlocks(ctx context.Context, root string, tokens []string) string {
+	return renderRefBlocksWith(ctx, tokens, func(tok string) (string, bool) {
+		return buildFileRefBlock(root, tok)
+	})
+}
+
+// renderRefBlocksClient 是 client provider 的版本：单文件读取经设备桥完成。
+func renderRefBlocksClient(ctx context.Context, claims *auth.Claims, loc projectLocator, tokens []string) string {
+	return renderRefBlocksWith(ctx, tokens, func(tok string) (string, bool) {
+		return buildClientFileRefBlock(ctx, claims, loc, tok)
+	})
+}
+
+// renderRefBlocksWith 执行**总量**预算并渲染注入块，读取方式由 build 决定。
+func renderRefBlocksWith(ctx context.Context, tokens []string, build func(string) (string, bool)) string {
 	var b strings.Builder
 	b.Grow(4096)
 	total := 0
@@ -605,15 +780,6 @@ func renderRefBlocks(ctx context.Context, root string, tokens []string) string {
 			break
 		}
 		if added >= maxRefsPerMessage {
-			// 到这里剩下的引用**一个都不会内联**，因此也不能再碰文件系统。
-			//
-			// 这不是省事：正文上限 1MB，一条消息可以打上万个 `@`。早先这里对每个
-			// 超出项调一次 stat 确认存在性，实测 5000 条会让一次提交卡住 10 秒
-			// 以上 —— 而它们本来一条都不会进上下文。逐个探测是纯亏。
-			//
-			// 代价是名单里可能出现并不存在的路径。那是可以接受的：这段的 reason
-			// 写的是"引用数超限"，语义是"你打了这些引用、它们没被处理"，不是
-			// "这些文件存在"。真要确认存在性，用户可以少打几个再发。
 			omittedCount = len(tokens) - i
 			for _, rest := range tokens[i:] {
 				if len(omittedSample) >= maxOmittedListed {
@@ -623,12 +789,11 @@ func renderRefBlocks(ctx context.Context, root string, tokens []string) string {
 			}
 			break
 		}
-		block, ok := buildFileRefBlock(root, tok)
+		block, ok := build(tok)
 		if !ok {
 			continue
 		}
 		// 第一条永远放行：预算是为了"别把半个仓库推给外部模型"，不是让 `@` 失效。
-		// （单条最大也就 64KB + 包装，仍在总预算之内。）
 		if added > 0 && total+len(block) > maxRefsTotalBytes {
 			omittedBytes = append(omittedBytes, tok)
 			continue

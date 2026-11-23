@@ -21,10 +21,14 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -42,6 +46,11 @@ const (
 	// smMaxRootPathLen 与迁移里 `root_path varchar(1024)` 对齐。
 	// 在 API 层拒绝超长，而不是让 DB 隐式截断 —— 截断会产生一个指向错误目录的项目。
 	smMaxRootPathLen = 1024
+	// 项目身份键的最大长度，与迁移里 `root_key varchar(2048)` 对齐。
+	smMaxRootKeyLen = 2048
+	// provider：当前只有 server；client（设备文件桥）在后续切片接入。
+	smProviderServer = "server"
+	smProviderClient = "client"
 )
 
 // smForbiddenRoots 是拒绝绑定的系统目录（小写、分隔符统一为 `/` 后比较）。
@@ -229,24 +238,123 @@ func validateRootPath(raw string) (string, string) {
 	return cleaned, ""
 }
 
-// rootPathTaken 判断当前用户是否已有一个绑定同一目录的项目。
+// lexicalRootKey 只做**词法**规范化：清洗分隔符/`.`/`..`，按路径形状决定大小写。
 //
-// **为什么必须由服务端拒绝**：前端的路径选择器只做即时提示，而 `/projects`
-// 与 `/projects/{id}` 两个端点都能被直接调用。判据集中在这一处，两个入口都调它，
-// 才不会出现"新建拦住了、改名漏了"。
+// 为什么不在这里 EvalSymlinks：这个函数要能被"路径已不存在"的历史行调用。
+// 物理解析放在 serverRootKey 里，失败时回退到这里。
+func lexicalRootKey(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	win := isWindowsAbsPath(p) || strings.HasPrefix(p, `\\`) || strings.HasPrefix(p, "//")
+	if win {
+		q := path.Clean(strings.ReplaceAll(p, `\`, "/"))
+		// path.Clean 会把开头的 `//` 折叠成 `/`；UNC 必须保留双斜杠，
+		// 否则 `\\server\share\x` 会与 POSIX 的 `/server/share/x` 撞成同一个键。
+		if !strings.HasPrefix(q, "//") && (strings.HasPrefix(p, `\\`) || strings.HasPrefix(p, "//")) {
+			q = "/" + q
+		}
+		return strings.ToLower(q)
+	}
+	q := filepath.ToSlash(filepath.Clean(p))
+	if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+		q = strings.ToLower(q)
+	}
+	return q
+}
+
+// stripWindowsVerbatim 去掉 Windows 扩展长度前缀（`\\?\`、`\\.\`、`\\?\UNC\`）。
 //
-// **为什么把比对放在 Go 侧而不是 SQL 的 `lower(root_path) = lower($3)`**：
-// Postgres 的 `lower()` 依赖数据库 locale，对非 ASCII 字符的行为可能与文件系统
-// 不一致；而 `sameRootPath` 是可单测的纯函数，判据只有一处、且能直接断言。
-// 代价是把该用户的项目读出来（个数级个位），开销可忽略。
+// EvalSymlinks 在 Windows 上可能带回这些前缀；不剥掉的话同一个目录会算出
+// `//?/c:/...` 与 `c:/...` 两个键，判重失效。
+func stripWindowsVerbatim(p string) string {
+	switch {
+	case strings.HasPrefix(p, `\\?\UNC\`):
+		return `\\` + p[len(`\\?\UNC\`):]
+	case strings.HasPrefix(p, `\\?\`), strings.HasPrefix(p, `\\.\`):
+		return p[4:]
+	default:
+		return p
+	}
+}
+
+// serverRootKey 计算 server provider 的身份键：优先解析 symlink/junction，
+// 解析失败（路径被移动/删除）时退回词法结果 —— 判重不能因为目录暂时不在就失效。
+func serverRootKey(p string) string {
+	raw := strings.TrimSpace(p)
+	if raw == "" {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(raw); err == nil && resolved != "" {
+		return lexicalRootKey(stripWindowsVerbatim(resolved))
+	}
+	return lexicalRootKey(raw)
+}
+
+// projectRootKeyOf 取一行的身份键；历史行 root_key 为空时按 provider 现算。
 //
-// excludeID 传自身的 id（改名场景），使"只改名字、路径不动"不会被自己挡住。
-func rootPathTaken(ctx context.Context, tenant, userID, rootPath, excludeID string) (bool, error) {
-	if db.GlobalDBManager == nil || rootPath == "" {
+// provider 为空按 server 处理（迁移前的全部项目）。
+func projectRootKeyOf(provider, deviceID, rootKey, rootPath string) string {
+	if rootKey != "" {
+		return rootKey
+	}
+	if strings.TrimSpace(rootPath) == "" {
+		return ""
+	}
+	if strings.TrimSpace(provider) == "" {
+		provider = smProviderServer
+	}
+	// client 的 root_key 必须由设备侧计算（路径语义属于客户端）；缺失时不能
+	// 用服务端规则猜，返回空表示"暂不可判重"，由设备桥重新授权时补齐。
+	if provider != smProviderServer {
+		return ""
+	}
+	return serverRootKey(rootPath)
+}
+
+// truncateRootKey 防止超长路径把唯一索引写失败（列宽 2048）。
+func truncateRootKey(key string) string {
+	if len(key) <= smMaxRootKeyLen {
+		return key
+	}
+	return key[:smMaxRootKeyLen]
+}
+
+// rootKeyHash 是唯一索引实际使用的列。
+//
+// 为什么不直接把 root_key 放进索引：Postgres btree 单行索引项约 2704 字节上限，
+// 2048 字符的中文路径（UTF-8 每字 3 字节）会超限，建索引和插入都会失败。
+// sha256 十六进制固定 64 字节，碰撞概率可忽略。
+func rootKeyHash(key string) string {
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+// projectLocatorTaken 判断当前用户是否已有绑定同一 **locator** 的项目。
+//
+// 判据是 `(provider, device_id, root_key)`，不是 `root_path` 字符串：
+// 两台设备上的 `C:\work\app` 是两个不同项目；同一设备上的 `D:\Repo` 与
+// `d:\repo` 仍要判重。历史行 root_key 为空时按行内 root_path 现算，并顺手回填。
+//
+// excludeID 传自身（改名/改路径场景），使"路径不动"不会被自己挡住。
+func projectLocatorTaken(ctx context.Context, tenant, userID, provider, deviceID, rootKey, excludeID string) (bool, error) {
+	if db.GlobalDBManager == nil || rootKey == "" {
 		return false, nil
 	}
+	if provider == "" {
+		provider = smProviderServer
+	}
+	targetHash := rootKeyHash(rootKey)
 	rows, err := db.GlobalDBManager.FetchAll(ctx,
-		`SELECT id, COALESCE(root_path,'') AS root_path
+		`SELECT id, COALESCE(provider,'server') AS provider,
+		        COALESCE(device_id,'') AS device_id,
+		        COALESCE(root_key,'') AS root_key,
+		        COALESCE(root_key_hash,'') AS root_key_hash,
+		        COALESCE(root_path,'') AS root_path
 		   FROM session_map_workspaces
 		  WHERE tenant_id = $1 AND user_id = $2 AND COALESCE(root_path,'') <> ''`,
 		tenant, userID)
@@ -254,10 +362,27 @@ func rootPathTaken(ctx context.Context, tenant, userID, rootPath, excludeID stri
 		return false, err
 	}
 	for _, row := range rows {
-		if stringOf(row["id"]) == excludeID {
+		id := stringOf(row["id"])
+		rowProvider := stringOf(row["provider"])
+		if rowProvider == "" {
+			rowProvider = smProviderServer
+		}
+		rowKey := projectRootKeyOf(rowProvider, stringOf(row["device_id"]), stringOf(row["root_key"]), stringOf(row["root_path"]))
+		rowHash := stringOf(row["root_key_hash"])
+		// 惰性回填：历史行第一次参与判重时补上身份键与哈希，唯一索引随后才覆盖它们。
+		if rowKey != "" && (rowHash == "" || stringOf(row["root_key"]) == "") {
+			rowKey = truncateRootKey(rowKey)
+			rowHash = rootKeyHash(rowKey)
+			if _, err := db.GlobalDBManager.Exec(ctx,
+				`UPDATE session_map_workspaces SET root_key = $1, root_key_hash = $2 WHERE id = $3`,
+				rowKey, rowHash, id); err != nil {
+				slog.Warn("backfill project root_key failed", "workspace_id", id, "error", err)
+			}
+		}
+		if id == excludeID {
 			continue
 		}
-		if sameRootPath(stringOf(row["root_path"]), rootPath) {
+		if rowProvider == provider && stringOf(row["device_id"]) == deviceID && rowHash != "" && rowHash == targetHash {
 			return true, nil
 		}
 	}
@@ -316,6 +441,7 @@ func (h *SessionMapHandler) ListProjects(w http.ResponseWriter, r *http.Request)
 			// 每个 COALESCE 都带 AS 别名：FetchOne/FetchAll 用列名建 map，
 			// 无别名时列名是 `coalesce`，多个同名列会互相覆盖（见 SessionProject 的注释）。
 			`SELECT w.id, COALESCE(w.name,'') AS name, COALESCE(w.root_path,'') AS root_path,
+			        COALESCE(w.provider,'server') AS provider, COALESCE(w.device_id,'') AS device_id,
 			        COALESCE(w.sort_index,0) AS sort_index, w.updated_at,
 			        (SELECT COUNT(DISTINCT n.session_id) FROM session_map_nodes n
 			          WHERE n.workspace_id = w.id AND n.edge_kind = 'project'
@@ -335,6 +461,8 @@ func (h *SessionMapHandler) ListProjects(w http.ResponseWriter, r *http.Request)
 					"id":             stringOf(row["id"]),
 					"name":           stringOf(row["name"]),
 					"root_path":      stringOf(row["root_path"]),
+					"provider":       stringOf(row["provider"]),
+					"device_id":      stringOf(row["device_id"]),
 					"sort_index":     intOf(row["sort_index"]),
 					"session_count":  intOf(row["session_count"]),
 					"last_active_at": smTimeOf(row["last_active_at"]),
@@ -360,28 +488,73 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 	var body struct {
 		Name     string `json:"name"`
 		RootPath string `json:"root_path"`
+		Provider string `json:"provider"`
+		DeviceID string `json:"device_id"`
 	}
 	if err := DecodeJSON(w, r, &body); err != nil {
 		BadRequest(w, "invalid request")
 		return
 	}
-	// 团队模式：先把项目根限制/创建在 `<PROJECTS_ROOT>/<tenant>/<user>/` 内，
-	// 再做存在性等常规校验。
-	if err := ensureUserProjectDir(claims, body.RootPath); err != nil {
-		Forbidden(w, err.Error())
+	provider := strings.TrimSpace(strings.ToLower(body.Provider))
+	if provider == "" {
+		provider = smProviderServer
+	}
+	deviceID := strings.TrimSpace(body.DeviceID)
+	if provider != smProviderServer && provider != smProviderClient {
+		BadRequest(w, "unsupported project provider")
 		return
 	}
-	rootPath, why := validateRootPath(body.RootPath)
-	if why != "" {
-		JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})
-		return
+	var rootPath, rootKey string
+	if provider == smProviderClient {
+		// client provider：路径在用户设备上，服务端**不能** os.Stat / 不能套
+		// PROJECTS_ROOT。由设备桥做规范化与存在性检查，并返回客户端 OS 语义的 root_key。
+		if deviceID == "" {
+			BadRequest(w, "device_id is required for client projects")
+			return
+		}
+		resp, err := deviceHubSingleton.Call(r.Context(), smTenant(claims), claims.UserID, deviceID, deviceOpRequest{
+			Op:   "canonicalize",
+			Path: strings.TrimSpace(body.RootPath),
+		})
+		if err != nil {
+			if errors.Is(err, errDeviceOffline) {
+				JSON(w, http.StatusConflict, APIResponse{Success: false, Error: "device_offline"})
+				return
+			}
+			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: err.Error()})
+			return
+		}
+		if !resp.Exists || !resp.IsDir {
+			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: "root_path does not exist or is not a directory on the device"})
+			return
+		}
+		if resp.RootKey == "" {
+			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: "device did not return a project root key"})
+			return
+		}
+		rootPath = strings.TrimSpace(resp.CleanPath)
+		if rootPath == "" {
+			rootPath = strings.TrimSpace(body.RootPath)
+		}
+		rootKey = truncateRootKey(resp.RootKey)
+	} else {
+		// 团队模式：先把项目根限制/创建在 `<PROJECTS_ROOT>/<tenant>/<user>/` 内，
+		// 再做存在性等常规校验。
+		if err := ensureUserProjectDir(claims, body.RootPath); err != nil {
+			Forbidden(w, err.Error())
+			return
+		}
+		var why string
+		rootPath, why = validateRootPath(body.RootPath)
+		if why != "" {
+			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})
+			return
+		}
+		rootKey = truncateRootKey(serverRootKey(rootPath))
 	}
-	// 同一目录只允许建一个项目。两个项目绑定同一 `.git` 会各自建检查点，
-	// 时间线互相污染，回滚时看到的是对方的快照。
-	//
-	// 查重失败时**拒绝**而不是放行：放行会重新引入"重复项目"，
-	// 而这正是要修的问题；代价只是用户重试一次。
-	taken, err := rootPathTaken(r.Context(), smTenant(claims), claims.UserID, rootPath, "")
+	// 同一目录只允许建一个项目。判重对象是 locator：
+	// `(provider, device_id, root_key)` —— 不同设备上的同路径互不冲突。
+	taken, err := projectLocatorTaken(r.Context(), smTenant(claims), claims.UserID, provider, deviceID, rootKey, "")
 	if err != nil {
 		slog.Error("check duplicate project root failed", "error", err)
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "create failed"})
@@ -395,7 +568,8 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 	}
 	name := strings.TrimSpace(body.Name)
 	if name == "" {
-		name = filepath.Base(rootPath)
+		// 客户端路径可能是 Windows 写法；服务端在 Linux 上时 filepath.Base 不认反斜杠。
+		name = path.Base(strings.ReplaceAll(rootPath, `\`, "/"))
 	}
 	wsID, err := id.UUID()
 	if err != nil {
@@ -404,9 +578,17 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 	}
 	if _, err := db.GlobalDBManager.Exec(r.Context(),
 		`INSERT INTO session_map_workspaces
-		   (id, tenant_id, user_id, name, root_path, sort_index, viewport, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, 0, '{}'::jsonb, NOW(), NOW())`,
-		wsID, smTenant(claims), claims.UserID, name, rootPath); err != nil {
+		   (id, tenant_id, user_id, name, root_path, provider, device_id, root_key, root_key_hash, sort_index, viewport, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, '{}'::jsonb, NOW(), NOW())`,
+		wsID, smTenant(claims), claims.UserID, name, rootPath, provider, deviceID, rootKey, rootKeyHash(rootKey)); err != nil {
+		// 唯一索引是并发下的最后一道防线：两个请求同时通过上面的判重时，
+		// 后到的 INSERT 会撞 23505，同样按"重复项目"返回，而不是 500。
+		if isUniqueViolation(err) {
+			JSON(w, http.StatusConflict, APIResponse{
+				Success: false, Error: "a project already uses this folder",
+			})
+			return
+		}
 		slog.Error("create project failed", "error", err)
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "create failed"})
 		return
@@ -418,6 +600,7 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 	})
 	JSON(w, http.StatusCreated, APIResponse{Success: true, Data: map[string]interface{}{
 		"id": wsID, "name": name, "root_path": rootPath, "sort_index": 0,
+		"provider": provider, "device_id": deviceID,
 	}})
 }
 
@@ -464,18 +647,66 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 		sets = append(sets, "name = "+arg(n))
 	}
 	if body.RootPath != nil {
-		if err := ensureUserProjectDir(claims, *body.RootPath); err != nil {
-			Forbidden(w, err.Error())
+		// 路径归属决定校验方：client 项目必须由设备桥校验，不能在服务端 os.Stat。
+		var provider, deviceID string
+		row, rowErr := db.GlobalDBManager.FetchOne(r.Context(),
+			`SELECT COALESCE(provider,'server') AS provider, COALESCE(device_id,'') AS device_id
+			   FROM session_map_workspaces
+			  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
+			wsID, smTenant(claims), claims.UserID)
+		if rowErr != nil || row == nil {
+			JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "project not found"})
 			return
 		}
-		rp, why := validateRootPath(*body.RootPath)
-		if why != "" {
-			JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})
-			return
+		provider = stringOf(row["provider"])
+		if provider == "" {
+			provider = smProviderServer
+		}
+		deviceID = stringOf(row["device_id"])
+
+		var rp, rootKey string
+		if provider == smProviderClient {
+			if deviceID == "" {
+				BadRequest(w, "client project is missing device_id")
+				return
+			}
+			resp, err := deviceHubSingleton.Call(r.Context(), smTenant(claims), claims.UserID, deviceID, deviceOpRequest{
+				Op:   "canonicalize",
+				Path: strings.TrimSpace(*body.RootPath),
+			})
+			if err != nil {
+				if errors.Is(err, errDeviceOffline) {
+					JSON(w, http.StatusConflict, APIResponse{Success: false, Error: "device_offline"})
+					return
+				}
+				JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: err.Error()})
+				return
+			}
+			if !resp.Exists || !resp.IsDir || resp.RootKey == "" {
+				JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: "root_path does not exist or is not a directory on the device"})
+				return
+			}
+			rp = strings.TrimSpace(resp.CleanPath)
+			if rp == "" {
+				rp = strings.TrimSpace(*body.RootPath)
+			}
+			rootKey = truncateRootKey(resp.RootKey)
+		} else {
+			if err := ensureUserProjectDir(claims, *body.RootPath); err != nil {
+				Forbidden(w, err.Error())
+				return
+			}
+			var why string
+			rp, why = validateRootPath(*body.RootPath)
+			if why != "" {
+				JSON(w, http.StatusBadRequest, APIResponse{Success: false, Error: why})
+				return
+			}
+			rootKey = truncateRootKey(serverRootKey(rp))
 		}
 		// 与 CreateProject 同一条判据：把项目改指到另一个项目已在用的目录同样要拒。
 		// excludeID 传自身，否则「只改名字、路径不动」会被自己挡住。
-		taken, err := rootPathTaken(r.Context(), smTenant(claims), claims.UserID, rp, wsID)
+		taken, err := projectLocatorTaken(r.Context(), smTenant(claims), claims.UserID, provider, deviceID, rootKey, wsID)
 		if err != nil {
 			slog.Error("check duplicate project root failed", "error", err)
 			JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "update failed"})
@@ -488,6 +719,8 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		sets = append(sets, "root_path = "+arg(rp))
+		sets = append(sets, "root_key = "+arg(rootKey))
+		sets = append(sets, "root_key_hash = "+arg(rootKeyHash(rootKey)))
 	}
 	if body.SortIndex != nil {
 		sets = append(sets, "sort_index = "+arg(*body.SortIndex))
@@ -500,6 +733,12 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 		`UPDATE session_map_workspaces SET `+strings.Join(sets, ", ")+
 			` WHERE id = $1 AND tenant_id = $2 AND user_id = $3`, args...)
 	if err != nil {
+		if isUniqueViolation(err) {
+			JSON(w, http.StatusConflict, APIResponse{
+				Success: false, Error: "a project already uses this folder",
+			})
+			return
+		}
 		slog.Error("patch project failed", "error", err)
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "update failed"})
 		return

@@ -324,7 +324,7 @@ func TestInteractionRoutesAreRegisteredBehindAuthMiddleware(t *testing.T) {
 	registerAgentRoutes(
 		mux, authProbe.reject(http.StatusUnauthorized), rlProbe.passthrough,
 		authProbe.passthrough, authProbe.passthrough,
-		nil, nil, nil, nil, nil, nil,
+		nil, nil, nil, nil, nil, nil, nil,
 		"pytest-internal-token", time.Second,
 		engine.NewPythonClient("http://127.0.0.1:1"),
 	)

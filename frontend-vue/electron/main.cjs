@@ -84,6 +84,14 @@ const DEVICE_TOKEN_ARG_PREFIX = shared.DEVICE_TOKEN_ARG_PREFIX || '--chiron-devi
 const { readToken, writeToken, clearToken } = require('./token-store.cjs')
 const { switchMode } = require('./mode-switch.cjs')
 const { wipeLocalData, relaunchAfterWipe } = require('./wipe-data.cjs')
+const { createDeviceFSBridge } = require('./device-fs.cjs')
+const {
+  parseLatestYml,
+  compareVersions,
+  pickLatestRelease,
+  manifestUrlForTag,
+  installerUrlForTag,
+} = require('./update-check.cjs')
 
 /** 开发模式：`electron . --dev` 时连 Vite dev server，否则加载 dist/ */
 const isDev = process.argv.includes('--dev')
@@ -118,6 +126,8 @@ let forceSetup = false
 /** 本次运行的运行模式（whenReady 时定一次；切换模式一律走重启） */
 let currentMode = 'local'
 
+/** 设备文件桥（仅 cloud 模式）：桌面端主动外连远端网关，供 ProjectFS 读本机项目。 */
+let deviceBridge = null
 /**
  * 本地后端状态：`{ ok, baseUrl, token, dataDir, via, reason, message }`，由 startLocalBackend 填充。
  * 本地模式下设备 token 由 Go 网关注入，这里留空（见 tryStartGoStack 的返回值）。
@@ -1926,6 +1936,23 @@ function createWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null
   })
+
+  syncDeviceBridge()
+}
+
+/**
+ * 让设备文件桥跟随当前模式：cloud 且有服务地址时连接，其余情况断开。
+ * 在每次建窗后调用 —— 建窗是 currentMode / currentApiUrl 唯一同时就绪的位置。
+ */
+function syncDeviceBridge() {
+  if (!deviceBridge) return
+  if (currentMode === 'cloud' && currentApiUrl) {
+    deviceBridge.start(currentApiUrl).catch(err => {
+      logMain('warn', `device fs bridge start failed: ${err?.message || err}`)
+    })
+  } else {
+    deviceBridge.stop()
+  }
 }
 
 /** 保存地址后重建窗口：尺寸、preload 注入的地址、加载目标都要换 */
@@ -1951,8 +1978,11 @@ function relaunchIntoSetup() {
     // createWindow 会重新读配置：此时若已有地址，会直接进主界面 —— 所以这里
     // 先把窗口配置成"强制 setup"模式，避免用户点了"连接设置"却又弹回主界面。
     forceSetup = true
-    createWindow()
-    forceSetup = false
+    try {
+      createWindow()
+    } finally {
+      forceSetup = false
+    }
   })
 }
 
@@ -2004,54 +2034,67 @@ async function httpsGetBuffer(url, _redirects = 5, timeoutMs = UPDATE_HTTP_TIMEO
   }
 }
 
-/** 极简 latest.yml 解析：只取 version / files[].url / files[].sha512 / path。 */
-function parseLatestYml(text) {
-  const lines = String(text || '').split(/\r?\n/)
-  let version = ''
-  let path = ''
-  const files = []
-  let current = null
-  for (const raw of lines) {
-    const line = raw.trimEnd()
-    const top = line.match(/^([A-Za-z0-9_]+):\s*(.*)$/)
-    if (top) {
-      const key = top[1]
-      let value = top[2].trim().replace(/^['"]|['"]$/g, '')
-      if (key === 'version') version = value
-      if (key === 'path') path = value
-      if (key === 'files') current = null
-      continue
-    }
-    const item = line.match(/^\s*-\s*url:\s*(.*)$/)
-    if (item) {
-      current = { url: item[1].trim().replace(/^['"]|['"]$/g, '') }
-      files.push(current)
-      continue
-    }
-    const field = line.match(/^\s+(sha512|size):\s*(.*)$/)
-    if (field && current) {
-      current[field[1]] = field[2].trim().replace(/^['"]|['"]$/g, '')
-    }
+/** 把清单转成对渲染层的检查结果；下载地址用的 tag 随结果一起存进 lastUpdate。 */
+function buildUpdateCheckResult(current, manifest, release) {
+  if (!manifest.version || !manifest.file?.url) {
+    return { ok: false, reason: 'manifest', message: '更新清单缺少版本或安装包地址', current }
   }
-  const installers = files.filter(f => f.url && /\.(exe|msi)$/i.test(f.url))
-  const chosen = installers.find(f => /x64/i.test(f.url)) || installers[0] || null
-  if (!chosen && path) {
-    return { version, file: { url: path, sha512: '' } }
+  const hasUpdate = compareVersions(manifest.version, current) > 0
+  lastUpdate = hasUpdate
+    ? (release ? { ...manifest, tag: release.tag } : manifest)
+    : null
+  return {
+    ok: true,
+    current,
+    latest: manifest.version,
+    hasUpdate,
+    releaseUrl: release?.htmlUrl || `https://github.com/${UPDATE_REPO}/releases/latest`,
   }
-  return { version, file: chosen }
 }
 
-/** 语义化版本比较（够用即可：只处理数字段与预发布后缀）。 */
-function compareVersions(a, b) {
-  const norm = v => String(v || '').trim().replace(/^v/i, '').split(/[+-]/)[0].split('.').map(n => parseInt(n, 10) || 0)
-  const x = norm(a)
-  const y = norm(b)
-  const len = Math.max(x.length, y.length)
-  for (let i = 0; i < len; i += 1) {
-    const d = (x[i] || 0) - (y[i] || 0)
-    if (d !== 0) return d > 0 ? 1 : -1
+/**
+ * `releases/latest` 404 时的回退：从公开的发布列表里自己挑最新版。
+ *
+ * 本仓的发布全部标成 pre-release（未签名，不进入 GitHub 的 "latest" 语义），
+ * 所以 `/releases/latest/download/latest.yml` 对**每一个**版本都 404。
+ * 这时真正的判据是发布列表：排除草稿，按 tag 的版本号取最大的那个，
+ * 再从该 tag 固定路径取清单 —— 预发布版本同样能得到更新。
+ */
+async function checkUpdateViaReleaseList(current) {
+  const listUrl = `https://api.github.com/repos/${UPDATE_REPO}/releases?per_page=30`
+  let release = null
+  try {
+    const raw = await httpsGetBuffer(listUrl)
+    release = pickLatestRelease(JSON.parse(raw.toString('utf8')))
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'not-published',
+      message: `更新清单不可用（latest.yml 404），读取发布列表也失败：${err?.message || String(err)}。请到发布页手动下载：https://github.com/${UPDATE_REPO}/releases`,
+      current,
+    }
   }
-  return 0
+  if (!release) {
+    return {
+      ok: false,
+      reason: 'not-published',
+      message: `没有找到公开的安装包（Release 可能仍是草稿）。请到发布页手动下载：https://github.com/${UPDATE_REPO}/releases`,
+      current,
+    }
+  }
+  let manifest
+  try {
+    const text = (await httpsGetBuffer(manifestUrlForTag(UPDATE_REPO, release.tag))).toString('utf8')
+    manifest = parseLatestYml(text)
+  } catch (err) {
+    return {
+      ok: false,
+      reason: 'not-published',
+      message: `公开版本 ${release.tag} 的更新清单不可用（${err?.message || String(err)}）。请到发布页手动下载：${release.htmlUrl || `https://github.com/${UPDATE_REPO}/releases`}`,
+      current,
+    }
+  }
+  return buildUpdateCheckResult(current, manifest, release)
 }
 
 async function checkAppUpdate() {
@@ -2064,35 +2107,19 @@ async function checkAppUpdate() {
     text = (await httpsGetBuffer(UPDATE_MANIFEST_URL)).toString('utf8')
   } catch (err) {
     if (err?.status === 404) {
-      // 发布任务把 Release 固定为草稿时，`releases/latest/download/latest.yml`
-      // 必然 404 —— 草稿不进入 latest。这不是网络故障，重试不会变好。
-      return {
-        ok: false,
-        reason: 'not-published',
-        message: `更新清单尚未发布（latest.yml 404）。当前 Release 可能仍是草稿，请到发布页手动下载：https://github.com/${UPDATE_REPO}/releases`,
-        current,
-      }
+      // `releases/latest` 只认**稳定版**：预发布（本仓常态）或草稿都会 404。
+      // 这不是网络故障，改走发布列表挑选真正最新的安装包。
+      return checkUpdateViaReleaseList(current)
     }
     return { ok: false, reason: 'network', message: err?.message || String(err), current }
   }
-  const manifest = parseLatestYml(text)
-  if (!manifest.version || !manifest.file?.url) {
-    return { ok: false, reason: 'manifest', message: '更新清单缺少版本或安装包地址', current }
-  }
-  const hasUpdate = compareVersions(manifest.version, current) > 0
-  lastUpdate = hasUpdate ? manifest : null
-  return {
-    ok: true,
-    current,
-    latest: manifest.version,
-    hasUpdate,
-    releaseUrl: `https://github.com/${UPDATE_REPO}/releases/latest`,
-  }
+  return buildUpdateCheckResult(current, parseLatestYml(text), null)
 }
 
 async function downloadAndOpenUpdate() {
   if (!lastUpdate) return { ok: false, reason: 'no-update', message: '请先检查更新' }
-  const url = `https://github.com/${UPDATE_REPO}/releases/latest/download/${encodeURIComponent(lastUpdate.file.url)}`
+  // 有 tag 时走该 tag 的固定路径：预发布版本不在 /releases/latest 之下。
+  const url = installerUrlForTag(UPDATE_REPO, lastUpdate.tag || '', lastUpdate.file.url)
   let buf
   try {
     buf = await httpsGetBuffer(url, 5, UPDATE_DOWNLOAD_TIMEOUT_MS)
@@ -2361,11 +2388,25 @@ if (!gotLock) {
     })
     ipcMain.handle('desktop:save-token', (event, token) => {
       assertTrustedSender(event)
-      return writeToken(String(token || ''))
+      const ok = writeToken(String(token || ''))
+      // 登录后 token 才可用：立即让设备桥重连，远程模式下项目文件才能马上读。
+      deviceBridge?.notifyTokenChanged()
+      return ok
     })
     ipcMain.handle('desktop:clear-token', event => {
       assertTrustedSender(event)
-      return clearToken()
+      const ok = clearToken()
+      deviceBridge?.notifyTokenChanged()
+      return ok
+    })
+    // 设备身份与桥状态（项目创建需要 device_id；设置页可展示连接状态）
+    ipcMain.handle('desktop:get-device-id', event => {
+      assertTrustedSender(event)
+      return deviceBridge ? deviceBridge.ensureDeviceId() : null
+    })
+    ipcMain.handle('desktop:get-device-bridge-status', event => {
+      assertTrustedSender(event)
+      return deviceBridge ? deviceBridge.status() : null
     })
 
     // 设备设置与模式：真相在主进程的 config.json（契约 §1），渲染进程读到的只是它。
@@ -3017,6 +3058,10 @@ if (!gotLock) {
       return downloadAndOpenUpdate()
     })
 
+    // 设备文件桥：只在 cloud 模式启动（local 模式本机即执行端，不需要隧道）。
+    if (!deviceBridge) {
+      deviceBridge = createDeviceFSBridge({ app, readToken, log: logMain })
+    }
     createWindow()
     // 主窗口已建出来，启动流程到此结束。此后 window-all-closed 才代表"用户真的关了窗口"；
     // 之前没有窗口只是启动期的正常中间态（见 window-all-closed 里的说明）。
@@ -3056,6 +3101,7 @@ if (!gotLock) {
     // 必须先立标志：紧接着派发的 close 若还看到 isQuitting=false，
     // 就会把它当成"用户关窗"拦下来 —— 系统关机也会被卡住。
     isQuitting = true
+    deviceBridge?.stop()
     // Windows 上不销毁托盘图标会在通知区留下一个点不动的幽灵图标，
     // 直到用户把鼠标划过去才消失。这里先摘掉，再走后面的停后端流程。
     if (tray) {

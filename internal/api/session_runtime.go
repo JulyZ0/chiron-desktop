@@ -356,7 +356,7 @@ func ResolveSessionAgentConfig(
 // 于是前端在 `llm_config` 里带的 mode/model 被引擎侧（`unified_executor.submit_chat`
 // 只读 message/mode/context）静默丢弃 —— 这正是"统一链路下切模型/模式无效"的根因。
 // 此处在转发前把解析结果写回 body，使两条链路行为一致。
-func InjectSessionRuntime(r *http.Request, body map[string]interface{}) bool {
+func InjectSessionRuntime(w http.ResponseWriter, r *http.Request, body map[string]interface{}) bool {
 	claims := auth.GetClaims(r.Context())
 	if claims == nil {
 		return true // 鉴权由上游中间件负责
@@ -367,6 +367,37 @@ func InjectSessionRuntime(r *http.Request, body map[string]interface{}) bool {
 	}
 	if sessionID == "" {
 		return true // 无会话上下文：交给引擎按默认处理，不阻断
+	}
+	// 项目上下文：统一链路与 SSE 链路必须同一口径。
+	//   - server 项目：服务端路径，经隔离校验后直接下发；
+	//   - client 项目：按需镜像到服务端临时目录，root_path 指向镜像（工具可用），
+	//     project_locator 仍保留设备身份。镜像失败要**明确拒绝**本轮，不能让工具
+	//     静默退回沙箱后"改了个假项目"。
+	if loc, ok := projectLocatorForSession(r.Context(), sessionID); ok {
+		root, hasRoot := projectRootFromLocator(claims, loc, ok)
+		if hasRoot {
+			if loc.Provider == smProviderClient {
+				mirror, err := ensureProjectMirror(r.Context(), smTenant(claims), claims.UserID, loc)
+				if err != nil {
+					JSONWithCode(w, http.StatusServiceUnavailable, "project_mirror_unavailable", nil, err.Error())
+					return false
+				}
+				root = mirror
+			}
+			ctxMap, _ := body["context"].(map[string]interface{})
+			if ctxMap == nil {
+				ctxMap = map[string]interface{}{}
+			}
+			ctxMap["root_path"] = root
+			ctxMap["project_locator"] = map[string]interface{}{
+				"id":        loc.ID,
+				"provider":  loc.Provider,
+				"device_id": loc.DeviceID,
+				"root":      loc.RootPath,
+				"root_key":  loc.RootKey,
+			}
+			body["context"] = ctxMap
+		}
 	}
 	tenant := claims.TenantID
 	if tenant == 0 {

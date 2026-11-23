@@ -30,6 +30,8 @@ function normalizeProject(raw: unknown): ProjectSummary {
     session_count: typeof p.session_count === 'number' ? p.session_count : 0,
     last_active_at: typeof p.last_active_at === 'string' ? p.last_active_at : '',
     updated_at: typeof p.updated_at === 'string' ? p.updated_at : '',
+    provider: p.provider === 'client' ? 'client' : 'server',
+    device_id: typeof p.device_id === 'string' ? p.device_id : '',
   }
 }
 

@@ -198,6 +198,8 @@ export default {
   projects_load_failed: "加载项目失败",
   projects_sessions_load_failed: "加载项目会话失败",
   projects_desktop_only: "选择文件夹需要在桌面端使用",
+  projects_remote_path_hint: "远程模式：这里选的是本机路径，服务端必须能访问同一路径；跨机器请改用附件上传。",
+  projects_device_not_ready: "设备文件桥未就绪：请确认已登录且本机代理已连接。",
   projects_create_failed: "创建项目失败",
   projects_bind_failed: "归入项目失败",
   projects_move_title: "该会话已属于其他项目",

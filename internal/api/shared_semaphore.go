@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
+	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
 )
 
@@ -98,6 +100,63 @@ func NewSharedSemaphore(rdb db.RedisClient, name string, limit int) *SharedSemap
 		local: make(chan struct{}, localCap),
 		rdb:   rdb,
 	}
+}
+
+// ── 每用户并发配额（S4）──
+//
+// 全局 agent 信号量只能防"整机过载"，挡不住一个用户开十个回合把别人的槽位吃光。
+// 这里按 (tenant, user) 再分一层：同一个 Redis Lua 计数，键名带用户哈希，
+// 每人独立上限；Redis 不可用时每个用户各自回退进程内信号量。
+type UserSemaphorePool struct {
+	mu    sync.Mutex
+	rdb   db.RedisClient
+	limit int
+	sems  map[string]*SharedSemaphore
+}
+
+func NewUserSemaphorePool(rdb db.RedisClient, limit int) *UserSemaphorePool {
+	return &UserSemaphorePool{rdb: rdb, limit: limit, sems: map[string]*SharedSemaphore{}}
+}
+
+func (p *UserSemaphorePool) semFor(key string) *SharedSemaphore {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := p.sems[key]
+	if s == nil {
+		s = NewSharedSemaphore(p.rdb, "user:"+key, p.limit)
+		p.sems[key] = s
+	}
+	return s
+}
+
+// TryAcquire 按 (tenant,user) 获取一个回合槽位；limit=0 表示不限制。
+func (p *UserSemaphorePool) TryAcquire(ctx context.Context, tenant, user string) (release func(), ok bool) {
+	if p == nil || p.limit == 0 {
+		return func() {}, true
+	}
+	return p.semFor(tenant + "\x00" + user).TryAcquire(ctx)
+}
+
+// userConcurrencyMW 把每用户并发上限套在一条提交链路上。
+// 与全局信号量是两层：这里挡住"单个用户占满"，全局挡住"整机过载"。
+func userConcurrencyMW(pool *UserSemaphorePool, next http.Handler) http.Handler {
+	if pool == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := auth.GetClaims(r.Context())
+		if claims == nil {
+			next.ServeHTTP(w, r) // 鉴权由上游中间件负责
+			return
+		}
+		release, ok := pool.TryAcquire(r.Context(), smTenant(claims), claims.UserID)
+		if !ok {
+			TooManyRequests(w)
+			return
+		}
+		defer release()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // TryAcquire 非阻塞获取。返回的 release 必须调用；未获取时返回 ok=false。

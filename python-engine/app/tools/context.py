@@ -82,6 +82,20 @@ def get_project() -> str:
     return str(get_tool_context("project", ""))
 
 
+def get_project_locator() -> dict[str, str]:
+    """当前项目的身份快照（S0：id/provider/device_id/root/root_key）。
+
+    与 `get_project()` 的区别：`project` 是**记忆隔离键**（字符串 workspace id），
+    这里描述的是**文件身份**（哪个 provider、哪台设备、规范化路径键）。远程/多设备
+    模型下工具应依赖它，而不是把 `project_root` 当成跨机器通用路径。
+    形状不对或未设置时返回空 dict，调用方按"无项目身份"处理。
+    """
+    raw = get_tool_context("project_locator", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in raw.items() if isinstance(v, str) and v}
+
+
 def get_plugin_names() -> list[str]:
     """本次对话选中的插件名（MCP server 名）；未选时为**空列表**。
 

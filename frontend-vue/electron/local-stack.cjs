@@ -222,6 +222,8 @@ const ENGINE_HEALTH_PATH = '/healthz'
  * 杀软扫描会更慢；给 120s，但不参与"整栈失败"判定（见 startLocalStack）。
  */
 const ENGINE_TIMEOUT_MS = 120_000
+/** 池副本空闲自停的退出码（与 python-engine/app/idle_shutdown.py 一致）。 */
+const IDLE_EXIT_CODE = 75
 
 /**
  * 知识库检索服务（pageindex-service）的健康检查路径与启动超时。
@@ -267,6 +269,10 @@ const state = {
   launcher: null,
   /** python-engine 进程记录 */
   engine: null,
+  /** 池里的额外引擎记录（CHIRON_ENGINE_POOL_SIZE>1 时；不含 primary） */
+  extraEngines: [],
+  /** 正在停止：退出期间禁止额外引擎的自愈重拉 */
+  stopping: false,
   /** 知识库检索服务（pageindex-service）进程记录；可为空（组件未装） */
   knowledge: null,
   /** Go 网关进程记录 */
@@ -313,6 +319,8 @@ function _resetState() {
   }
   state.launcher = null
   state.engine = null
+  state.extraEngines = []
+  state.stopping = false
   state.engineFailure = null
   state.knowledge = null
   state.gateway = null
@@ -955,6 +963,11 @@ function buildEngineEnv(info, options = {}) {
   applyLocalModeSecrets(env, appSecret)
   env.HTTP_HOST = '127.0.0.1'
   env.HTTP_PORT = String(port)
+  // 多实例发现：引擎把自己可达地址写进 Redis `engine:instance:*`，网关每 15s 扫描。
+  // 单实例也写（网关据此拿到 run 归属所需的实例地址）；ops 可用 options.env 覆盖。
+  if ((options.env || {}).ENGINE_ADVERTISE_URL === undefined) {
+    env.ENGINE_ADVERTISE_URL = String(options.advertiseUrl || `http://127.0.0.1:${port}`)
+  }
   // 单机模式：放行沙箱门禁，并让 Redis 从"必需"降为"可选"
   env.DEGRADED_MODE = 'true'
 
@@ -1407,9 +1420,85 @@ async function startEngine(info, options = {}) {
   return { ...last, attempts: tried }
 }
 
+/**
+ * 引擎池规模：`CHIRON_ENGINE_POOL_SIZE`（默认 1，上限 4）。
+ *
+ * 多实例由**引擎自注册 + 网关发现**完成（engine:instance:*），启动器只负责多起进程；
+ * 会话亲和/故障漂移在网关侧（WithSession 一致性哈希 + run 归属）。
+ */
+function enginePoolSize() {
+  const n = Number.parseInt(String(process.env.CHIRON_ENGINE_POOL_SIZE || '1'), 10)
+  if (!Number.isFinite(n)) return 1
+  return Math.max(1, Math.min(4, n))
+}
+
+/** 起额外引擎（后台，不阻塞启动）。单个失败只记日志：primary 仍可用。 */
+function startExtraEngines(info, options, ports) {
+  if (!ports.length) return
+  state.extraEngines = []
+  for (const port of ports) {
+    void spawnExtraEngine(info, options, port)
+  }
+}
+
+async function spawnExtraEngine(info, options, port) {
+  const idleSeconds = Math.max(
+    60,
+    Number.parseInt(String(process.env.CHIRON_ENGINE_IDLE_SECONDS || '1800'), 10) || 1800,
+  )
+  const record = await startEngine(info, {
+    ...options,
+    port,
+    advertiseUrl: `http://127.0.0.1:${port}`,
+    trackAsPrimary: false,
+    retryPortConflict: false,
+    env: {
+      ...(options.env || {}),
+      ENGINE_REPLICA: 'true',
+      ENGINE_IDLE_SHUTDOWN_SECONDS: String(idleSeconds),
+    },
+  })
+  if (!record.ok) {
+    console.warn(`[engine-pool] 额外引擎 :${port} 启动失败（${record.reason || 'unknown'}）：${record.message || ''}`)
+    return
+  }
+  state.extraEngines = [...(state.extraEngines || []), record]
+  const child = record.child
+  if (!child) return
+  child.once('exit', code => {
+    if (record.stopping || state.stopping) return
+    if (code === IDLE_EXIT_CODE) {
+      // 空闲缩容：从池里摘掉，不重拉；后续请求由网关一致性哈希落回存活实例。
+      state.extraEngines = (state.extraEngines || []).filter(r => r !== record)
+      return
+    }
+    if (!state.extraEngines) return
+    // 与 primary 的自愈不同，这里不共享监督器退避预算：池实例是幂等副本，
+    // 2s 后原端口重拉；反复失败只会在日志里刷，不影响主对话。
+    setTimeout(() => {
+      if (state.stopping || !state.extraEngines) return
+      void spawnExtraEngine(info, options, port)
+    }, 2000)
+  })
+}
+
+async function stopExtraEngines() {
+  const records = state.extraEngines || []
+  state.extraEngines = []
+  for (const record of records) {
+    if (!record || !record.child || record.exited) continue
+    record.stopping = true
+    try {
+      record.child.kill('SIGTERM')
+    } catch {
+      /* 已消失 */
+    }
+    await waitExit(record.child, 5000)
+  }
+}
+
 /** 单次尝试：换号重试与最终判定由 `startEngine` 负责。 */
-async function spawnEngineOnce(info, options = {}) {
-  const { spawn: spawnImpl } = runtime()
+async function spawnEngineOnce(info, options = {}) {  const { spawn: spawnImpl } = runtime()
   const launch = options.engine
   const port = Number(options.port)
   const env = buildEngineEnv(info, { ...options, port })
@@ -1437,7 +1526,10 @@ async function spawnEngineOnce(info, options = {}) {
     exitCode: null,
     startedAt: new Date().toISOString(),
   }
-  state.engine = record
+  // 池里的额外实例不覆盖 primary record（stopEngine/状态上报都以它为准）。
+  if (options.trackAsPrimary !== false) {
+    state.engine = record
+  }
 
   if (child.stdout) {
     child.stdout.on('data', chunk => {
@@ -1828,6 +1920,7 @@ async function stopEngine() {
  */
 async function startLocalStack(options = {}) {
   const dataDir = String(options.dataDir || '')
+  state.stopping = false
 
   // **接管已有实例**：同一用户、同一 dataDir 下若已有一套健康栈在跑，就直接复用它。
   // 这条路径覆盖 Electron 单实例锁管不到的情况：手动起的 CLI 引导器、上次被强杀后
@@ -1855,6 +1948,13 @@ async function startLocalStack(options = {}) {
     // 引擎先于网关：网关启动时会读 PYTHON_ENGINE_ADDRESS 建客户端，地址得在它起来前就定好。
     // 没有引擎启动信息时不必挑端口（挑端口会真的 listen 一次）。
     const enginePort = options.engine ? options.enginePort || (await components.pickFreePort()) : 0
+    // 引擎池：额外实例由引擎自注册到 Redis，网关发现后按会话一致性哈希分流。
+    const extraEnginePorts = []
+    if (options.engine) {
+      for (let i = 1; i < enginePoolSize(); i += 1) {
+        extraEnginePorts.push(await components.pickFreePort())
+      }
+    }
     // 反方向同理，而且更硬：引擎回调网关用的 `GATEWAY_INTERNAL_URL` 只能在 spawn 时给全，
     // 所以网关端口必须在这里就定下来，不能等 `startGateway` 自己去挑。
     const gatewayPort = isValidPort(options.port) ? Number(options.port) : await components.pickFreePort()
@@ -1950,10 +2050,17 @@ ${tail}` : ''}`,
 
     // 记录本次运行占用的端口，供下一个实例接管（见 runtime-state.cjs）。
     // 不写 DSN：里面有密码，接管方只要有端口就能重建。
+    // 额外引擎后台拉起：不阻塞首窗；单实例失败只影响并发容量，不影响可用性。
+    startExtraEngines(launcherResult.info, {
+      ...options,
+      gatewayPort,
+      knowledgeServicePort: knowledgeResult.ok ? knowledgeResult.port : 0,
+    }, extraEnginePorts)
     if (dataDir) {
       runtimeState.writeRuntimeState(dataDir, {
         gatewayPort: gatewayResult.port,
         enginePort: engineResult.port,
+        enginePorts: [engineResult.port, ...extraEnginePorts],
         pgPort: launcherResult.info && launcherResult.info.pgPort,
         redisPort: launcherResult.info && launcherResult.info.redisPort,
         pgBackend: launcherResult.info && launcherResult.info.pgBackend,
@@ -2002,6 +2109,8 @@ async function stopLocalStack() {
     state.supervisor = null
   }
   state.restartCtx = null
+  state.stopping = true
+  await stopExtraEngines()
 
   // 与启动相反：先网关，再引擎（它还在用知识库服务），最后数据栈
   const gatewayStopped = await stopGateway()

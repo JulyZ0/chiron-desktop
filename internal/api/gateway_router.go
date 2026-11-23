@@ -285,6 +285,8 @@ func NewGatewayRouter(
 
 	// Agent execution semaphore — global concurrency limit
 	agentSem := NewSharedSemaphore(atomicRedis, "agent", cfg.AgentMaxConcurrency)
+	// 每用户并发上限（S4）：挡"一个用户占满全局槽位"。
+	userSem := NewUserSemaphorePool(atomicRedis, cfg.AgentMaxConcurrencyPerUser)
 
 	// Submit handler (proxies to Python)
 	submitHandler := NewSubmitHandler(pythonClient, sessionMgr, eventHub, cfg)
@@ -367,7 +369,7 @@ func NewGatewayRouter(
 	// ── Route registration by functional domain ──
 
 	registerPublicEndpoints(mux, authMW, rlMW, publicMW, searchHandler, shareHandler, systemHandler, mediaHandler, cfg, fileStore)
-	registerAgentRoutes(mux, authMW, rlMW, publicMW, sanitizeMW, submitHandler, agentSem, eventHub, sessionMgr, authenticator, rpaHub, cfg.InternalToken, cfg.AgentSubmitTimeout, pythonClient)
+	registerAgentRoutes(mux, authMW, rlMW, publicMW, sanitizeMW, submitHandler, agentSem, userSem, eventHub, sessionMgr, authenticator, rpaHub, cfg.InternalToken, cfg.AgentSubmitTimeout, pythonClient)
 
 	// 会话分叉：地图"按真实分支连线"的前提（见 session_fork.go）。
 	// 放这里而不是 registerAgentRoutes：那个函数的作用域里没有 sessionMgr。
@@ -392,7 +394,7 @@ func NewGatewayRouter(
 	onboardingHandler.RegisterRoutes(mux, authMW, rlMW)
 	// 用户级 API Key 自助（P1-3）：普通用户路由，越权靠 SQL 的 user_id 条件挡住。
 	apiKeyHandler.RegisterRoutes(mux, authMW, rlMW)
-	registerProxyRoutes(mux, authMW, rlMW, kbRateMW, pythonClient)
+	registerProxyRoutes(mux, authMW, rlMW, kbRateMW, pythonClient, userSem)
 	// 桌面端云端片段推理（POST /v1/desktop/infer，用户 JWT + 限流，见 routes_desktop.go）
 	registerDesktopRoutes(mux, authMW, rlMW, pythonClient)
 	// 本地语音转写（POST /v1/audio/transcribe）：音频字节透传给引擎，

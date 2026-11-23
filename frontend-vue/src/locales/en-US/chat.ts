@@ -192,6 +192,8 @@ export default {
   projects_load_failed: "Failed to load projects",
   projects_sessions_load_failed: "Failed to load project sessions",
   projects_desktop_only: "Picking a folder requires the desktop app",
+  projects_remote_path_hint: "Remote mode: you are picking a path on this machine, and the server must be able to see the same path. Across machines, upload the files as attachments instead.",
+  projects_device_not_ready: "The device file bridge is not ready: make sure you are signed in and the local agent is connected.",
   projects_create_failed: "Failed to create project",
   projects_bind_failed: "Failed to add to project",
   projects_move_title: "Session belongs to another project",

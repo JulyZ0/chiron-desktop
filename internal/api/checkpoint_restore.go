@@ -55,7 +55,7 @@ func CheckpointRestoreHandler(python *engine.PythonClient) http.HandlerFunc {
 		// 任何"创建时没有 user_id"的检查点都会被判成不存在 —— 用户看到的是
 		// "还原点列得出来，但点了回滚报 not found"。
 		owned, err := db.GlobalDBManager.FetchOne(r.Context(),
-			`SELECT id, state FROM project_checkpoints
+			`SELECT id, state, COALESCE(session_id,'') AS session_id FROM project_checkpoints
 			  WHERE id = $1 AND tenant_id = $2 AND COALESCE(user_id,'') = $3`,
 			cid, smTenant(claims), claims.UserID)
 		if err != nil {
@@ -98,6 +98,11 @@ func CheckpointRestoreHandler(python *engine.PythonClient) http.HandlerFunc {
 				Code:    CodeRequestFailed,
 			})
 			return
+		}
+		// client 项目：引擎回滚写的是服务端镜像；回滚成功后必须立刻把差异回写设备，
+		// 否则用户看到"回滚成功"，本机文件却没变（下一次回合才同步）。
+		if sid := stringOf(owned["session_id"]); sid != "" {
+			syncProjectMirrorForSession(r.Context(), sid)
 		}
 		OK(w, result)
 	}

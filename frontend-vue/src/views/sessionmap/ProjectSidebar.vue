@@ -27,6 +27,7 @@ import {
 } from '@ant-design/icons-vue'
 
 import { describeApiError } from '../../utils/apiError'
+import { currentDeviceMode } from '../../stores/device'
 import { formatRelativeTime } from '../../components/chat/chat-types'
 import {
   bindConflictOwner,
@@ -131,12 +132,29 @@ function openCreate() {
 async function pickAndCreate() {
   const bridge = (
     globalThis as {
-      chironDesktop?: { pickDirectory?: () => Promise<{ path: string; name: string } | null> }
+      chironDesktop?: {
+        pickDirectory?: () => Promise<{ path: string; name: string } | null>
+        getDeviceId?: () => Promise<string | null>
+      }
     }
   ).chironDesktop
   if (!bridge?.pickDirectory) {
     message.info(tr('chat.projects_desktop_only'))
     return
+  }
+  // 远程模式下项目根是**执行端**（服务端）的路径：桌面选的是本机目录，跨机器时
+  // 服务端根本看不到。先讲清楚，避免用户反复"选完却提示路径不存在"。
+  const remote = currentDeviceMode() === 'cloud'
+  if (remote) {
+    message.warning(tr('chat.projects_remote_path_hint'))
+  }
+  let deviceId = ''
+  if (remote) {
+    deviceId = String((await bridge.getDeviceId?.().catch(() => '')) || '')
+    if (!deviceId) {
+      message.error(tr('chat.projects_device_not_ready'))
+      return
+    }
   }
   const picked = await bridge.pickDirectory()
   if (!picked) return
@@ -145,6 +163,7 @@ async function pickAndCreate() {
     const project = await createProject({
       root_path: picked.path,
       name: newName.value.trim() || picked.name,
+      ...(remote ? { provider: 'client' as const, device_id: deviceId } : {}),
     })
     createOpen.value = false
     projects.value = [...projects.value, project]

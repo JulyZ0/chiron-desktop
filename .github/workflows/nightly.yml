@@ -45,11 +45,11 @@ jobs:
       run:
         working-directory: frontend-vue
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -70,7 +70,7 @@ jobs:
         run: npx vite build
       - name: Upload vitest report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-vitest-report
           path: frontend-vue/vitest-report.json
@@ -99,8 +99,8 @@ jobs:
       run:
         working-directory: python-engine
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           # 3.14 与 ci.yml 的 engine job 同口径（打包运行时 runtime-install.cjs 也钉这个版本）
           python-version: '3.14'
@@ -119,7 +119,7 @@ jobs:
           --junitxml=pytest-junit.xml
       - name: Upload junit report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-pytest-junit
           path: python-engine/pytest-junit.xml
@@ -129,11 +129,11 @@ jobs:
     name: Frontend stability
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -164,7 +164,7 @@ jobs:
       - name: Upload stability report
         # 失败要报告；仅 flaky 时任务本身是绿的，但报告正是需要人看的那份
         if: failure() || steps.stability.outputs.flaky == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-test-stability
           path: .artifacts/test-stability

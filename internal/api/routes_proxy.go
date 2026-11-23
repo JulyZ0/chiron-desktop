@@ -66,6 +66,7 @@ func registerProxyRoutes(
 	mux *http.ServeMux,
 	authMW, rlMW, kbRateMW routeMiddleware,
 	pythonClient *engine.PythonClient,
+	userSem *UserSemaphorePool,
 ) {
 	// pythonProxy is a factory for reverse-proxy handlers to the Python engine.
 	// All routes using this factory are wrapped with authMW, so claims are
@@ -75,7 +76,7 @@ func registerProxyRoutes(
 		logTag  string
 		// mutateBody 在把请求体转发给引擎前改写它（P1-c：统一链路注入会话运行时解析结果，
 		// 见 docs/session-runtime-spec.md §5）。返回 false 表示已自行写出响应、代理应中止。
-		mutateBody func(r *http.Request, body map[string]interface{}) bool
+		mutateBody func(w http.ResponseWriter, r *http.Request, body map[string]interface{}) bool
 		// guardBody 在 mutateBody **之后**执行准入校验（P2-2b：模型可用范围）。
 		//
 		// 顺序不能反：mutateBody 会把会话运行时解析出的最终 model 写回 body，
@@ -148,20 +149,26 @@ func registerProxyRoutes(
 					if !ok {
 						return
 					}
-					if opt.mutateBody != nil && !opt.mutateBody(r, body) {
+					if opt.mutateBody != nil && !opt.mutateBody(w, r, body) {
 						return
 					}
 					if opt.guardBody != nil && !opt.guardBody(w, r, body) {
 						return
 					}
 					reqBody = body
-					err = pythonClient.PostJSON(r.Context(), proxiedPath, body, &resp)
+					// 统一链路也要按会话粘滞：同一 session 的请求落同一引擎，
+					// 否则多实例下上下文/热缓存在实例间漂移。
+					reqCtx := r.Context()
+					if sid, _ := body["session_id"].(string); sid != "" {
+						reqCtx = engine.WithSession(reqCtx, sid)
+					}
+					err = pythonClient.PostJSON(reqCtx, proxiedPath, body, &resp)
 				case "PUT":
 					body, ok := decodeOptionalJSON(w, r)
 					if !ok {
 						return
 					}
-					if opt.mutateBody != nil && !opt.mutateBody(r, body) {
+					if opt.mutateBody != nil && !opt.mutateBody(w, r, body) {
 						return
 					}
 					if opt.guardBody != nil && !opt.guardBody(w, r, body) {
@@ -289,12 +296,15 @@ func registerProxyRoutes(
 		mutateBody: InjectSessionRuntime,
 		afterResponse: func(r *http.Request, reqBody map[string]interface{}, resp map[string]interface{}) {
 			recordUnifiedUsageFromResponse(r, auth.GetClaims(r.Context()), reqBody, resp)
+			if sid, _ := reqBody["session_id"].(string); sid != "" {
+				syncProjectMirrorForSession(r.Context(), sid)
+			}
 		},
 	})
-	mux.Handle("POST /v1/chat/submit", authMW(rlMW(chatP(pathFn("/v1/chat/submit")))))
+	mux.Handle("POST /v1/chat/submit", authMW(rlMW(userConcurrencyMW(userSem, chatP(pathFn("/v1/chat/submit"))))))
 	mux.Handle("GET /v1/chat/sessions/{id}/messages", authMW(rlMW(chatP(pathParamSuffix("/v1/chat/sessions", "/messages")))))
 	// quick-execute 为 chat/submit 的语义别名（前端快捷执行入口）
-	mux.Handle("POST /v1/quick-execute", authMW(rlMW(chatP(pathFn("/v1/chat/submit")))))
+	mux.Handle("POST /v1/quick-execute", authMW(rlMW(userConcurrencyMW(userSem, chatP(pathFn("/v1/chat/submit"))))))
 
 	// Capabilities discovery (能力注册中心: 六大工作台能力发现)
 	capP := newProxy("", proxyOpt{logTag: "capabilities"})

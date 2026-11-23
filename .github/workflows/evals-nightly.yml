@@ -71,7 +71,7 @@ jobs:
       # 评测框架不替部署者选模型。
       LLM_API_KEY: ${{ secrets.CHIRON_EVAL_LLM_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ── 没有 secret 就**明确跳过**，而不是红 ─────────────────────────────
       # 评测需要真实模型；没有密钥时让它红，等于把"部署者没配 secrets"报成"代码退化"。
@@ -85,13 +85,13 @@ jobs:
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         if: steps.secrets.outputs.ready == 'true'
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: steps.secrets.outputs.ready == 'true'
         with:
           python-version: '3.14'
@@ -173,7 +173,7 @@ jobs:
 
       - name: Upload report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: evals-full-report
           path: python-engine/evals-full-report.json

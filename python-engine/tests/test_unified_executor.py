@@ -236,6 +236,84 @@ async def test_executor_error_status_must_not_become_success():
     assert "boom from router" in res["error"]
 
 
+async def test_all_subtasks_failed_must_not_become_success():
+    """子任务全部失败时,聚合层的 status=completed 不得被当成成功。
+
+    现场: 首页指挥台的 quick-execute 拿到 success=true + subtasks_failed 的 JSON,
+    界面把它当正常回答展示 —— 用户看到"点了执行只跳过去一坨 JSON"。
+    """
+    handler = UnifiedChatHandler()
+
+    async def _all_failed(**kwargs):
+        return {
+            "task_id": "task_failed",
+            "status": "completed",
+            "total_duration_ms": 3,
+            "subtasks": [
+                {
+                    "subtask_id": "sub_0_default",
+                    "capability_id": "agent:general_chat",
+                    "status": "failed",
+                    "duration_ms": 3,
+                }
+            ],
+            "output": {
+                "subtasks_completed": 0,
+                "subtasks_failed": 1,
+                "outputs": [
+                    {
+                        "subtask_id": "sub_0_default",
+                        "error": "LLM capability returned empty response (model=deepseek-chat)",
+                    }
+                ],
+            },
+            "usage": {
+                "model": "deepseek-chat",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cached_tokens": 0,
+            },
+        }
+
+    handler.router.route_task = _all_failed  # type: ignore[method-assign]
+
+    res = await handler.submit_task(user_input="只回复两个字：正常", tenant_id=TENANT)
+
+    assert res["success"] is False
+    assert "empty response" in res["error"]
+    # 失败前真实花掉的用量仍要带回，不能因为失败就整笔丢掉
+    assert res["usage"]["model"] == "deepseek-chat"
+    last = handler.sessions[res["session_id"]].messages[-1]
+    assert last["role"] == "assistant"
+    assert "执行失败" in last["content"]
+
+
+async def test_partial_subtask_success_keeps_result():
+    """有成功子任务时保留部分结果，不能把整轮判成失败。"""
+    handler = UnifiedChatHandler()
+
+    async def _partial(**kwargs):
+        return {
+            "task_id": "task_partial",
+            "status": "completed",
+            "total_duration_ms": 4,
+            "subtasks": [
+                {"subtask_id": "a", "capability_id": "agent:general_chat", "status": "completed"},
+                {"subtask_id": "b", "capability_id": "agent:general_chat", "status": "failed"},
+            ],
+            "output": {
+                "subtasks_completed": 1,
+                "subtasks_failed": 1,
+                "outputs": [{"subtask_id": "a", "output": {"result": "ok"}}],
+            },
+        }
+
+    handler.router.route_task = _partial  # type: ignore[method-assign]
+
+    res = await handler.submit_task(user_input="并行跑两个任务", tenant_id=TENANT)
+    assert res["success"] is True
+
+
 # ── agent 模式 (SubAgent.run,已实现) ────────────────────────────────
 
 

@@ -197,6 +197,8 @@ export default {
   projects_load_failed: "فشل تحميل المشاريع",
   projects_sessions_load_failed: "فشل تحميل جلسات المشروع",
   projects_desktop_only: "اختيار مجلد يتطلب تطبيق سطح المكتب",
+  projects_remote_path_hint: "الوضع البعيد: تختار مسارًا على هذا الجهاز، ويجب أن يستطيع الخادم الوصول إلى المسار نفسه. عبر الأجهزة المختلفة، ارفع الملفات كمرفقات بدلًا من ذلك.",
+  projects_device_not_ready: "جسر ملفات الجهاز غير جاهز: تأكد من تسجيل الدخول واتصال الوكيل المحلي.",
   projects_create_failed: "فشل إنشاء المشروع",
   projects_bind_failed: "فشل الإضافة إلى المشروع",
   projects_move_title: "الجلسة تنتمي إلى مشروع آخر",

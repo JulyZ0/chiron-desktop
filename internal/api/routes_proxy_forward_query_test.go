@@ -40,7 +40,7 @@ func TestProxyForwardsWhitelistedQueryOnly(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL))
+	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL), NewUserSemaphorePool(nil, 0))
 
 	req := httptest.NewRequest(
 		http.MethodGet,

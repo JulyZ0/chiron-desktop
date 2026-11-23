@@ -32,8 +32,8 @@ jobs:
     name: Go gateway
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -90,8 +90,8 @@ jobs:
       run:
         working-directory: python-engine
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           # 固定 3.14：与随包 python-runtime（runtime-install.cjs）和桌面工作流一致，
           # pyproject 的 requires-python 仍是 >=3.11。
@@ -150,8 +150,8 @@ jobs:
       run:
         working-directory: python-engine
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - name: Smoke suite (scripted provider)
@@ -160,7 +160,7 @@ jobs:
       - name: Upload report
         # 失败时也要拿到报告（否则只能看日志里的摘要）
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: evals-smoke-report
           path: python-engine/evals-report.json
@@ -174,11 +174,11 @@ jobs:
       run:
         working-directory: frontend-vue
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
@@ -231,7 +231,7 @@ jobs:
         # `if-no-files-found: warn` —— 收集阶段就崩（配置写错）时报告文件不会生成，
         # 此时不让"上传"这一步再叠一个红，掩盖真正的错误。
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: vitest-report
           path: frontend-vue/vitest-report.json
@@ -282,13 +282,13 @@ jobs:
       run:
         working-directory: desktop-local
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
           cache: pip
           cache-dependency-path: desktop-local/pyproject.toml
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       - name: Install dependencies
@@ -315,8 +315,8 @@ jobs:
     name: Migration chain
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
           cache: pip
@@ -350,10 +350,10 @@ jobs:
     steps:
       # fetch-depth: 0 是注释卫生守卫的前提：它按"本次改动的行"判定，
       # 浅克隆（默认只取 1 层）拿不到 base 提交，diff 会失败。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       # U+FFFD / 非法 UTF-8 是**字节已损坏**的信号，不是排版问题：
@@ -467,14 +467,14 @@ jobs:
       JWT_SECRET: ci-integration-jwt-secret-0123456789abcdef
       INTERNAL_TOKEN: ci-integration-internal-token-0123456789
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
           cache: pip
@@ -568,24 +568,24 @@ jobs:
       startsWith(github.ref, 'refs/tags/V') ||
       github.event.inputs.release == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: pnpm
           cache-dependency-path: frontend-vue/pnpm-lock.yaml
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # 与 engine job 同口径（3.14）
           python-version: '3.14'

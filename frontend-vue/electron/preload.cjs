@@ -188,6 +188,10 @@ contextBridge.exposeInMainWorld('chironDesktop', {
    */
   pickDirectory: () => ipcRenderer.invoke('desktop:pick-directory'),
 
+  /** 设备文件桥：稳定设备 id（项目归属用）与连接状态（设置页展示） */
+  getDeviceId: () => ipcRenderer.invoke('desktop:get-device-id'),
+  getDeviceBridgeStatus: () => ipcRenderer.invoke('desktop:get-device-bridge-status'),
+
   /**
    * 用系统默认程序打开本地路径，或在文件管理器里定位（`reveal: true`）。
    *

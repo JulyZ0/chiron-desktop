@@ -264,11 +264,18 @@ function pickDirectoryResult(result) {
  */
 function resolveStartupWindow(options = {}) {
   const { localBackend, mode, apiUrl, pendingApiUrl, forceSetup } = options
-  // 远程模式：地址缺失 / 刚切过来还没确认 / 主动进配置页 → 先给连接设置页。
+  const base = typeof apiUrl === 'string' ? apiUrl : ''
+  // 用户**显式**要求打开配置页（设置页/登录页的「打开连接配置」、菜单「连接设置…」）时，
+  // 无论当前哪种模式都进配置页。本地模式同样需要：填上服务地址就是切到局域网/公网
+  // 服务，而忽略这个标志会让按钮点了"没反应"——窗口被重建后又回到主界面。
+  //
+  // `pendingApiUrl` **不**享受这个优先级：它可能只是盘上一枚陈旧的「切云端待确认」
+  // 标记，本地用户不该被它挡到一张"连接云服务"的卡片前（见下方本地分支）。
+  if (forceSetup) return { target: 'setup', apiUrl: mode === 'cloud' ? base : '' }
+  // 远程模式：地址缺失 / 刚切过来还没确认 → 先给连接设置页。
   // 其余情况直接进主界面，登录由前端路由守卫负责。
   if (mode === 'cloud') {
-    const base = typeof apiUrl === 'string' ? apiUrl : ''
-    if (forceSetup || pendingApiUrl || !base) return { target: 'setup', apiUrl: base }
+    if (pendingApiUrl || !base) return { target: 'setup', apiUrl: base }
     return { target: 'app', apiUrl: base }
   }
   const backend = localBackend || {}

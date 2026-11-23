@@ -103,9 +103,22 @@ test('★ 分流：待确认标记只属于云端语义，绝不能把本地模�
     apiUrl: '',
     localBackend: { ok: true, baseUrl: 'http://127.0.0.1:1' },
     pendingApiUrl: true,
-    forceSetup: true,
   })
   assert.equal(route.target, 'app')
+})
+
+test('★ 分流：用户显式打开连接配置时，本地模式也必须进配置页', () => {
+  // 设置页的「打开连接配置」是本地模式改连局域网/公网服务的**唯一**入口。
+  // 主进程重建窗口时带 forceSetup；若本地分支忽略它，窗口会悄悄回到主界面，
+  // 用户看到的就是"点了没反应"。
+  const route = resolveStartupWindow({
+    mode: 'local',
+    apiUrl: '',
+    localBackend: { ok: true, baseUrl: 'http://127.0.0.1:1' },
+    forceSetup: true,
+  })
+  assert.equal(route.target, 'setup')
+  assert.equal(route.apiUrl, '')
 })
 
 // ------------------------------------------------------------------ 落盘标记

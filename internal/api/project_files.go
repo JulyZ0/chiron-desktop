@@ -740,6 +740,13 @@ func (h *SessionMapHandler) requireProject(w http.ResponseWriter, r *http.Reques
 	}
 	root, why := projectRootOf(r, wsID, claims)
 	if why != nil {
+		if errors.Is(why, errClientProviderPending) {
+			// S1：client 项目的文件浏览器尚未接入（@引用已可经设备桥读取）。
+			// 明确 501，而不是让 os.Stat 把它报成"目录不存在"。
+			JSONWithCode(w, http.StatusNotImplemented, "project_files_client_pending", nil,
+				"project file browsing for device-backed projects is not enabled yet")
+			return "", false
+		}
 		code := CodeNotFound
 		status := http.StatusNotFound
 		if errors.Is(why, errRootUnavailable) {
@@ -750,6 +757,9 @@ func (h *SessionMapHandler) requireProject(w http.ResponseWriter, r *http.Reques
 	}
 	return root, true
 }
+
+// errClientProviderPending 表示项目绑定在用户设备上，服务端本地文件 API 不适用。
+var errClientProviderPending = errors.New("project is device-backed")
 
 // requireProject 的取值来源：项目根此刻是否仍然可用。
 //
@@ -764,11 +774,15 @@ func projectRootOf(r *http.Request, wsID string, claims *auth.Claims) (string, e
 		// 不带别名时 Postgres 给的列名就是 `coalesce`。少了别名，下面
 		// `row["root_path"]` 永远取不到值 → 每个项目都被判成"没有绑定文件夹" →
 		// 工作台一直显示「无法加载项目文件列表」。
-		`SELECT COALESCE(root_path,'') AS root_path FROM session_map_workspaces
+		`SELECT COALESCE(root_path,'') AS root_path, COALESCE(provider,'server') AS provider
+		   FROM session_map_workspaces
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
 		wsID, smTenant(claims), claims.UserID)
 	if err != nil || row == nil {
 		return "", errors.New("project not found")
+	}
+	if stringOf(row["provider"]) == smProviderClient {
+		return "", errClientProviderPending
 	}
 	root := stringOf(row["root_path"])
 	if root == "" {

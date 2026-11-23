@@ -244,6 +244,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 续跑的执行体是模块级的 `_auto_resume_runner`（无人值守回合，见其注释）。
     _reconciler_task = await _start_run_reconciler()
 
+    # ── 8c. 池副本空闲自停（S3 空闲回收）──
+    # 只对启动器拉起的额外副本生效：连续 idle 秒没有业务请求 → SIGTERM。
+    # primary（ENGINE_REPLICA 未开）永不自停。
+    _idle_task: Any = None
+    if settings.engine_replica and settings.engine_idle_shutdown_seconds > 0:
+        from app.idle_shutdown import idle_shutdown_watch
+
+        _idle_task = asyncio.create_task(
+            idle_shutdown_watch(settings.engine_idle_shutdown_seconds)
+        )
+
     logger.info("=" * 60)
     logger.info("Ready. HTTP port: %d", settings.http_port)
     logger.info("=" * 60)
@@ -252,6 +263,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield  # ── 应用运行中 ──
 
     # ── 关闭 ──
+    if _idle_task is not None:
+        _idle_task.cancel()
     # 句柄显式传递（不用 `'x' in locals()` 探测）：见 内部文档 §2.3
     await _shutdown_lifespan(
         reconciler_task=_reconciler_task,
@@ -1697,6 +1710,10 @@ def _setup_middleware(app: FastAPI, redis: aioredis.Redis, limiter: Any) -> None
         internal_token=settings.internal_token,
     )
     app.add_middleware(RequestContextMiddleware)
+    # 空闲回收（S3）：只记录业务请求；健康探针不算活动。放最后注册 = 最外层执行。
+    from app.idle_shutdown import IdleTrackingMiddleware
+
+    app.add_middleware(IdleTrackingMiddleware)
 
 
 def _setup_routes(app: FastAPI) -> None:

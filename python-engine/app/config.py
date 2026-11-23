@@ -566,6 +566,10 @@ class Settings(BaseSettings):
     # ── 实例标识（K8s 注入）──
     pod_name: str = ""
     instance_id: str = ""
+    # 池里的额外引擎副本：空闲超过 `engine_idle_shutdown_seconds` 后自停（退出码 75），
+    # 启动器据此缩容且不再重拉。primary 不开（默认 False / 0）。
+    engine_replica: bool = False
+    engine_idle_shutdown_seconds: int = 0
     # 引擎对外可达地址（批 E1 动态发现）：如 http://engine-0:8000;
     # ── 人工介入（无人值守的收场保证）──
     # 等一次人工答复（审批 / ask_user）的上限，秒。到点即**挂起**：把这一步留在

@@ -36,6 +36,7 @@ func registerAgentRoutes(
 	authMW, rlMW, publicMW, sanitizeMW routeMiddleware,
 	submitHandler *SubmitHandler,
 	agentSem *SharedSemaphore,
+	userSem *UserSemaphorePool,
 	eventHub *broadcast.Hub,
 	sessionMgr *session.Manager,
 	authenticator *auth.Authenticator,
@@ -212,6 +213,17 @@ func registerAgentRoutes(
 			TooManyRequests(w)
 			return
 		}
+		releaseUser, userOK := userSem.TryAcquire(r.Context(), smTenant(claims), userID)
+		if !userOK {
+			releaseSem()
+			if releaseRun != nil {
+				releaseRun()
+			}
+			sessionCancels.Delete(body.SessionID)
+			cancel()
+			TooManyRequests(w)
+			return
+		}
 
 		// 批 E2：run 锁心跳续期（60s/次，TTL=5min）。统一走 session_coord 的同一份实现
 		// （与 /v1/agent/followup 共用），避免两处各写一份又漂移。
@@ -229,6 +241,7 @@ func registerAgentRoutes(
 
 		Accepted(w, map[string]string{"status": "accepted", "session_id": body.SessionID})
 		go func() {
+			defer releaseUser()
 			if releaseRun != nil {
 				defer releaseRun()
 			}
@@ -269,6 +282,10 @@ func registerAgentRoutes(
 	mux.Handle("GET /events", authMW(rlMW(sseHandler)))
 	mux.Handle("GET /v1/events", authMW(rlMW(sseHandler)))
 	mux.HandleFunc("GET /ws/rpa", RPAWebSocketHandler(rpaHub, authenticator))
+	// 设备文件桥（S1，只读）：桌面端主动外连，供远程模式读写本机项目文件。
+	// 与 /ws/rpa 同一鉴权口径（query token + device_id），不做浏览器来源限制以外
+	// 的额外放行：checkWebSocketOrigin 仍是显式白名单。
+	mux.HandleFunc("GET /ws/device-fs", DeviceFSHandler(deviceHubSingleton, authenticator))
 	// 浏览器 RPA 桥（Python engine → 网关 → 插件；仅共享 internal token 可调）
 	mux.Handle("POST /v1/rpa/exec", rlMW(http.HandlerFunc(RPAExecHandler(rpaHub, internalToken))))
 	mux.Handle("GET /v1/rpa/clients", rlMW(http.HandlerFunc(RPAClientsHandler(rpaHub, internalToken))))

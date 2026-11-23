@@ -45,7 +45,7 @@ jobs:
             goarch: amd64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 从 tag 推出版本号；手动触发时留空，保持 package.json 原值
       - name: Derive version from tag
@@ -61,11 +61,11 @@ jobs:
             echo "version=" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -74,7 +74,7 @@ jobs:
       # Go **只用来建随包的网关**（`resources/chiron(.exe)`，本地模式的唯一业务入口）。
       # 版本由 go.mod 决定，与 ci.yml 的 go job 同一口径；产物本身与 runner 无关，
       # 因为下面显式传 GOOS/GOARCH（见 matrix 的 goos/goarch）。
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -94,7 +94,7 @@ jobs:
       # runner 上的 Python 只用于跑构建脚本（prepare_*.py / pytest）；用户机那份是
       # 随包 CPython（`resources/python-runtime/`），由 prepare_python.py 就位，
       # 与 runner 版本无关（那个版本由 runtime-install.cjs 决定）。
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
 
@@ -334,7 +334,7 @@ jobs:
           exit "$fail"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: chiron-desktop-${{ matrix.platform }}
           if-no-files-found: error
@@ -354,11 +354,11 @@ jobs:
     steps:
       # 必须 fetch-depth: 0 —— checkout 默认只拉 1 个 commit，
       # 读不到 prevTag..curTag 之间的提交，变更说明就会是空的。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -373,7 +373,7 @@ jobs:
           echo '--- changelog preview ---'
           cat changelog.md
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           name: Chiron ${{ github.ref_name }}
           tag_name: ${{ github.ref_name }}

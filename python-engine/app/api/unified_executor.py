@@ -23,7 +23,7 @@ from app.agent.workbench_context import (
     merge_by_quota,
 )
 from app.core.context_bus import publish_result
-from app.core.task_router import TaskPriority, TaskRouter
+from app.core.task_router import TaskPriority, TaskRouter, TaskStatus
 from app.db import get_pool
 
 logger = logging.getLogger(__name__)
@@ -383,6 +383,34 @@ class UnifiedChatHandler:
                 # auto 链路失败前的调用也是真实花掉的：把 TaskRouter 汇总的用量
                 # 挂在异常上带到回包（与 `_execute_via_agent` 的失败路径同口径）。
                 err = RuntimeError(str(error_msg))
+                if isinstance(result.get("usage"), dict):
+                    err.usage = result.get("usage")  # type: ignore[attr-defined]
+                raise err
+
+            # 聚合层只看"跑完没跑完"，全部子任务失败时仍会给出 status=completed。
+            # 对调用方这必须是一次失败：否则首页快捷执行拿到的是 success=true +
+            # 一段 subtasks_failed 的 JSON，界面把它当正常回答展示 —— 用户看到的就是
+            # "点了执行，跳过去一堆 JSON / 像卡死了"。有成功子任务时保留部分结果。
+            subtasks = result.get("subtasks") or []
+            failed = [
+                s
+                for s in subtasks
+                if str(s.get("status") or "") == TaskStatus.FAILED.value
+            ]
+            completed = [
+                s
+                for s in subtasks
+                if str(s.get("status") or "") == TaskStatus.COMPLETED.value
+            ]
+            if failed and not completed:
+                first_error = ""
+                aggregated = result.get("output")
+                if isinstance(aggregated, dict):
+                    for item in aggregated.get("outputs") or []:
+                        if isinstance(item, dict) and item.get("error"):
+                            first_error = str(item["error"])
+                            break
+                err = RuntimeError(first_error or "所有子任务执行失败")
                 if isinstance(result.get("usage"), dict):
                     err.usage = result.get("usage")  # type: ignore[attr-defined]
                 raise err

@@ -438,8 +438,10 @@ def _llm_executor(system_prompt: str) -> Any:
         ]
         # 模型名是网关的**价格查询键**：请求里没带就用网关默认口径（gpt-4o-mini），
         # 不能留空 —— 空模型会让 cost_cents 恒为 NULL（"花费永远是 0"）。
-        attr_model = str(kwargs.get("model") or "") or "gpt-4o-mini"
+        req_model = str(kwargs.get("model") or "")
+        attr_model = req_model or "gpt-4o-mini"
         attr_provider = ""
+        stream_error = ""
         tok_in = tok_out = tok_cached = 0
         async for chunk in gateway.chat_stream(
             messages=messages,
@@ -455,9 +457,19 @@ def _llm_executor(system_prompt: str) -> Any:
                 attr_model = chunk.model
             if getattr(chunk, "provider", ""):
                 attr_provider = chunk.provider
+            # provider 以 finish_reason="error" 收尾时，真实原因在 message 里
+            # （见 app/gateway/provider.py）。不留下它，上层只能报"空响应"。
+            if getattr(chunk, "finish_reason", "") == "error":
+                stream_error = str(getattr(chunk, "message", "") or "") or stream_error
         if not response_text:
+            # 带上模型/provider：空响应多数不是"模型不想答"，而是该模型
+            # 在当前 provider/套餐下不可用或网关错误被吞。只报"empty response"
+            # 会让用户无从下手（现场实测：首页快捷执行只看到一句无信息的失败）。
+            detail = f": {stream_error}" if stream_error else ""
             raise RuntimeError(
-                f"LLM capability returned empty response (task: {task[:80]})"
+                "LLM capability returned empty response "
+                f"(model={attr_model or 'default'}, "
+                f"provider={attr_provider or 'auto'}, task: {task[:80]}){detail}"
             )
         return {
             "result": response_text,

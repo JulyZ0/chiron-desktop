@@ -177,7 +177,7 @@ export interface BranchResult {
 export interface ProjectSummary {
   id: string
   name: string
-  /** 项目绑定的本地文件夹，绝对路径 */
+  /** 项目绑定的文件夹，绝对路径（server=服务端，client=设备本机） */
   root_path: string
   sort_index: number
   /** 项目内会话数（`edge_kind='project'` 去重计数） */
@@ -185,6 +185,10 @@ export interface ProjectSummary {
   /** 项目内最近活跃会话的更新时间；无会话时为空串 */
   last_active_at: string
   updated_at: string
+  /** 路径归属：server（默认）| client（设备文件桥） */
+  provider?: 'server' | 'client'
+  /** client 项目所属设备；server 项目为空 */
+  device_id?: string
 }
 
 /** 项目内的一条会话（`GET /v1/session-map/projects/{id}/sessions` 的元素）。 */
@@ -208,6 +212,9 @@ export interface ProjectDraft {
   name?: string
   root_path?: string
   sort_index?: number
+  /** client：路径在用户设备上，创建时由设备桥校验；缺省 server */
+  provider?: 'server' | 'client'
+  device_id?: string
 }
 
 /**

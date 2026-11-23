@@ -47,6 +47,9 @@ func registerPublicEndpoints(
 	mux.Handle("GET /ready", http.HandlerFunc(handleReadiness))
 	// 引擎配置下发（X-Internal-Token 保护，Python 引擎启动拉取）
 	mux.Handle("GET /v1/internal/engine-config", rlMW(internalTokenMW(cfg, EngineConfig(cfg))))
+	// 设备项目 WebDAV facade（R2 spike）：rclone mount/WinFsp 在本机把 client 项目挂成目录。
+	// 仅内部令牌可访问；路由本身不暴露给浏览器。
+	mux.Handle("/v1/device-webdav/", internalTokenMW(cfg, DeviceWebDAVHandler()))
 
 	// 知识库检索服务的**模型来源**（权威层 = llm_models + llm_provider_keys）。
 	// 启动器（run.py / Electron local-stack）在拉起 pageindex-service 之前调它，

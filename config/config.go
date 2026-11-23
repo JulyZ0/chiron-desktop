@@ -188,6 +188,9 @@ type Config struct {
 	// run 全程的 token 上限在**引擎**侧（`AGENT_RUN_MAX_TOKENS`，默认 400k）。
 	AgentMaxOutputTokens int
 	AgentMaxConcurrency  int // max concurrent agent runs (default 20)
+	// AgentMaxConcurrencyPerUser 单用户同时运行的回合上限（S4）。0 = 不限制。
+	// 全局信号量挡"整机过载"，这一层挡"一个用户占满所有槽位"。
+	AgentMaxConcurrencyPerUser int
 	// AgentSubmitTimeout 单次提交（一条 SSE 回合）在网关侧的后台执行上限。
 	// 必须 >= api.DefaultAgentTimeout（300s）：曾经硬编码 180s，比它短，
 	// 长回合（多轮工具调用）必然被提前取消，表现为"思考/工具调用做一半就断"。
@@ -353,9 +356,10 @@ func loadConfig() *Config {
 		WechatMchPrivateKey:   getEnv("WXPAY_MCH_PRIVATE_KEY", ""),
 		// 与 api.DefaultMaxTurns 同值（40）。网关每次提交都显式下发它，所以这里才是
 		// 实际生效的默认值；引擎侧 `settings.max_turns` 只是兜底。
-		AgentDefaultMaxTurns: getInt("AGENT_DEFAULT_MAX_TURNS", 40),
-		AgentMaxOutputTokens: getInt("AGENT_MAX_OUTPUT_TOKENS", 8192),
-		AgentMaxConcurrency:  getInt("AGENT_MAX_CONCURRENCY", 20),
+		AgentDefaultMaxTurns:       getInt("AGENT_DEFAULT_MAX_TURNS", 40),
+		AgentMaxOutputTokens:       getInt("AGENT_MAX_OUTPUT_TOKENS", 8192),
+		AgentMaxConcurrency:        getInt("AGENT_MAX_CONCURRENCY", 20),
+		AgentMaxConcurrencyPerUser: getInt("AGENT_MAX_CONCURRENCY_PER_USER", 2),
 		// 默认 5 分钟：这是**单轮**上限（一次"读文件 → 改 → 跑测试"的预算），
 		// 不是整条长任务的预算。轮次上限按**单个小目标**计 20 轮（见
 		// agentgoal.DefaultGoalRounds），整条长任务由链级预算

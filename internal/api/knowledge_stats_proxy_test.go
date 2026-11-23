@@ -32,7 +32,7 @@ func TestKnowledgeStatsRoutesForwarded(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL))
+	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL), NewUserSemaphorePool(nil, 0))
 
 	for _, path := range []string{"/v1/kb/kb-1/stats", "/v1/knowledge/kb-1/stats"} {
 		rec := httptest.NewRecorder()

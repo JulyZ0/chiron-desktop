@@ -421,6 +421,26 @@ def _project_root_of(workbench_context: dict[Any, Any] | None) -> str:
     return raw.strip()
 
 
+def _project_locator_of(workbench_context: dict[Any, Any] | None) -> dict[str, str]:
+    """读本次对话的项目身份快照（Go 网关注入的 ``context.project_locator``）。
+
+    S0 只登记不消费：工具仍按 ``root_path`` 工作，避免行为变化；后续切片把
+    ``workspace_dir()`` 换成按 locator 解析的 ProjectFs 时，这里就是唯一入口。
+    只收非空字符串，形状不对时返回空 dict（而不是把半截结构传给工具层）。
+    """
+    if not isinstance(workbench_context, dict):
+        return {}
+    raw = workbench_context.get("project_locator")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in ("id", "provider", "device_id", "root", "root_key"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+    return out
+
+
 def _plugin_names_of(workbench_context: dict[Any, Any] | None) -> list[str]:
     """读本次对话选中的插件名（MCP server 名）；未选或形状不对时返回空。"""
     if not isinstance(workbench_context, dict):
@@ -2122,6 +2142,7 @@ class AgentRuntime:
             user_id=task.user_id,
             tenant_id=task.tenant_id,
             project_root=_project_root_of(task.workbench_context),
+            project_locator=_project_locator_of(task.workbench_context),
         )
 
         # 回合起点检查点（fail-open）：钩子内部吞掉所有异常，未绑定项目时直接跳过。
@@ -2306,6 +2327,9 @@ class AgentRuntime:
                 activated_tools=acts,
                 # C3：工作台选中的项目 → 工具侧（记住 / 召回 / 遗忘）按它隔离记忆
                 project=(task.workbench_context or {}).get("project") or "",
+                # S0：项目身份快照（id/provider/device_id/root/root_key）。当前只登记，
+                # 工具仍按 project_root 工作；后续切 ProjectFs 时从这里取。
+                project_locator=_project_locator_of(task.workbench_context),
                 # 本次对话选中的插件（MCP server）。MCP 工具是**隐藏来源**，不进可见
                 # 工具清单，所以上面那句 `_restrict_tools_to_plugins` 筛不到它们 ——
                 # 真正生效的地方是 `use_capability` 代理（它从这里读）。不传的话，

@@ -33,7 +33,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    view = run_gh("release", "view", args.tag, "--json", "isDraft,assets,url")
+    view = run_gh("release", "view", args.tag, "--json", "isDraft,isPrerelease,assets,url")
     if view.returncode != 0:
         sys.stderr.write(view.stderr or view.stdout)
         return 1
@@ -44,6 +44,14 @@ def main() -> int:
         # 客户端在线升级读的是 releases/latest/download/latest.yml；缺了它，
         # 即使 Release 公开，升级检查仍会 404。
         print("警告：该 Release 没有 latest.yml —— 客户端在线检查仍会 404。")
+    if data.get("isPrerelease"):
+        # GitHub 的 /releases/latest 只认稳定版：预发布版本会让所有客户端
+        # （包括还不会回退到发布列表的旧版本）读 latest.yml 时 404。
+        print(
+            "警告：该 Release 仍是 pre-release —— /releases/latest 不会指向它，"
+            "旧客户端检查更新会报 404。"
+        )
+        print(f"  如需让它成为“最新版”：gh release edit {args.tag} --prerelease=false --latest")
 
     if not data.get("isDraft"):
         print(f"{args.tag} 已是公开状态：{data.get('url') or ''}")

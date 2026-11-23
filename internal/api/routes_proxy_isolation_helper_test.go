@@ -48,7 +48,7 @@ func TestIsolationHelperRoutesForwardToEngine(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL))
+	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL), NewUserSemaphorePool(nil, 0))
 
 	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
 		req := httptest.NewRequest(method, "/v1/system/isolation/helper", nil)
@@ -110,7 +110,7 @@ func TestIsolationHelperFailureReasonIsPassedThrough(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL))
+	registerProxyRoutes(mux, withClaims, withClaims, withClaims, engine.NewPythonClient(srv.URL), NewUserSemaphorePool(nil, 0))
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/system/isolation/helper", strings.NewReader(""))
 	rec := httptest.NewRecorder()
