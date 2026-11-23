@@ -116,6 +116,16 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 | rclone mount + WinFsp：fs/git/run_code 可用；rename/delete 生效 | 团队主机实测 |
 | 单文件读/写 P95 ≤50/150ms；10 分钟稳定；批量小文件不打满网关 | 团队主机实测 |
 
+### 9.2.1 依赖获取（已定：不进安装包）
+
+rclone / WinFsp 只装在**服务端**（运行网关+引擎的主机），不随应用安装包分发，也不要求客户端安装。团队模式启用挂载时按需管理：
+
+- 存放：`<data>/deps/rclone/<version>`、`<data>/deps/winfsp/<version>`；版本与 SHA256 **钉死**在代码/发布清单里，取不到校验值就不下载。
+- **rclone**：固定版本 zip，由服务端管理员触发「检测 → 下载 → 校验 → 解压」；支持离线放置同版本文件。
+- **WinFsp**：内核驱动/安装器，**必须管理员确认**（UAC），不做静默安装；也可由管理员用 winget/choco 预装，我们只检测与校验版本。
+- 下载失败 / 校验失败 / 版本不满足：挂载功能明确不可用并报可行动错误，**回退按回合镜像**；绝不执行未经校验的二进制。
+- 内网可配置镜像基址（同一套 SHA256 校验），默认官方 releases。
+
 ### 9.3 P1
 
 4. **R6 引擎池实测/自动扩缩**：P=2/4 压测、P95 首 token、逐引擎 RSS、空闲回收；`shirou/gopsutil` + Prometheus。
