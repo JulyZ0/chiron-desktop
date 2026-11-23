@@ -119,6 +119,49 @@ def main() -> int:
     code, _ = member.call("GET", "/v1/conversations?page=1&per_page=1")
     expect("改密后业务接口可用", code == 200, f"HTTP {code}")
 
+    # ── 邀请闭环：建号 → 一次性邀请 → 受邀人自设密码 → 登录可用 ──
+    invitee_email = f"smoke-inv-{suffix}@invalid.local"
+    code, body = client.call(
+        "POST",
+        "/v1/admin/users",
+        {"email": invitee_email, "username": f"inv{suffix}", "nickname": "Smoke Invite", "role": "user"},
+    )
+    invitee = (body.get("data") or {}).get("user") or {}
+    invitee_id = invitee.get("id") or ""
+    expect("创建受邀用户", (code == 201 or code == 200) and bool(invitee_id), f"HTTP {code}")
+
+    code, body = client.call("POST", f"/v1/admin/users/{invitee_id}/invite")
+    data = body.get("data") or {}
+    token = data.get("token") or ""
+    expect("生成一次性邀请", code == 200 and bool(token), f"HTTP {code}")
+    expect(
+        "邀请链接带 token",
+        (not data.get("invite_url")) or (token in data["invite_url"]),
+        str(data.get("invite_url")),
+    )
+
+    invite_password = f"Invite!{suffix}Aa1"
+    guest = Client(args.base_url)
+    code, _ = guest.call("POST", "/v1/auth/invite/accept", {"token": token, "password": invite_password})
+    expect("受邀人设置密码", code == 200, f"HTTP {code}")
+    code, _ = guest.call("POST", "/v1/auth/invite/accept", {"token": token, "password": invite_password})
+    expect("邀请只能用一次", code == 400, f"HTTP {code}")
+
+    invited = Client(args.base_url)
+    code, body = invited.call(
+        "POST",
+        "/v1/auth/login",
+        {"identifier": invitee_email, "email": invitee_email, "password": invite_password},
+    )
+    expect("受邀人登录", code == 200, f"HTTP {code}")
+    user = (body.get("data") or {}).get("user") or {}
+    expect("受邀人无需再改密", user.get("must_change_password") is not True, str(user))
+    code, _ = invited.call("GET", "/v1/conversations?page=1&per_page=1")
+    expect("受邀人业务接口可用", code == 200, f"HTTP {code}")
+
+    code, _ = client.call("DELETE", f"/v1/admin/users/{invitee_id}")
+    expect("软删除受邀用户", code == 200, f"HTTP {code}")
+
     code, _ = client.call("POST", f"/v1/admin/users/{uid}/password/reset")
     expect("管理员重置密码", code == 200, f"HTTP {code}")
 

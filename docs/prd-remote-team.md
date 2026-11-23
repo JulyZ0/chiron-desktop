@@ -114,7 +114,7 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 
 1. **R5 设备写授权（已实现）**：client 项目默认**只读**；项目侧栏「只读/可写」显式授予/收回租约（Redis `device:write:lease:*`，Redis 丢失即回到只读）。未授权时回合照常执行但差异不回写，并提示本轮修改不保存；`git init` 同样被租约拦下。企业权限上限与读写审计仍待补。
 2. **R2 实测定案**：团队主机安装 rclone+WinFsp，按 §9.2 跑性能/稳定性；通过则删除镜像、`root_path` 指向挂载点；否则用 cgofuse 重试或保留镜像。
-3. **团队 Web E2E**：真实域名/反代/TLS 下从登录到 SSE、首登改密、强制下线、分享页的端到端验收（部署手册 + `scripts/team_smoke.py`）。
+3. **团队 Web E2E**：真实域名/反代/TLS 下从登录到 SSE、首登改密、强制下线、分享页的端到端验收（部署手册 + `scripts/team_smoke.py`；脚本已覆盖账密登录、建号、首登改密、邀请闭环、禁用/启用、强制下线、软删除，SSE 与分享页需人工/浏览器复核）。
 
 ### 9.2 R2 决策门
 
