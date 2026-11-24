@@ -244,7 +244,11 @@ func registerAgentRoutes(
 		resolveAgentContext(r.Context(), body.Context, claims.TenantID, userID)
 
 		Accepted(w, map[string]string{"status": "accepted", "session_id": body.SessionID})
+		// H12：登记这一轮。它是 detached goroutine —— `http.Server.Shutdown` 看不见它，
+		// 不登记的话停机时会被直接掐断，而客户端早就收到 202"已受理"了。
+		runDone := InFlight().Track()
 		go func() {
+			defer runDone()
 			defer releaseUser()
 			if releaseRun != nil {
 				defer releaseRun()

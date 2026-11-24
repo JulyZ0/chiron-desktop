@@ -22,21 +22,30 @@ import (
 	"github.com/athenavi/chiron/internal/storage"
 )
 
+// fatalExit 记录致命错误并**以非零退出码结束进程**（H12）。
+//
+// 为什么不能只 `slog.Error(...); return`：`main` 正常返回 = 退出码 0。于是"配置非法、
+// 进程没起来"在 systemd / docker / k8s / 打包器眼里是**成功退出**，重启策略不会触发，
+// 监控看不到崩溃，值班的人只会收到"服务没响应"。认证/数据库/迁移头这类关键配置出错
+// 必须让调用方按失败处理。
+func fatalExit(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
+}
+
 func main() {
 	// 严格加载：APP_SECRET 是部署级主密钥（派生 JWT_SECRET / INTERNAL_TOKEN、加密后台
 	// 敏感配置），缺失或强度不足时直接拒绝启动；用 `python scripts/init.py` 生成并写入 .env。
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("FATAL: invalid configuration - refusing to start (run `python scripts/init.py`)", "error", err)
-		return
+		fatalExit("FATAL: invalid configuration - refusing to start (run `python scripts/init.py`)", "error", err)
 	}
 	// M20：Agent 预算变量的破坏性改名。旧名（AGENT_MAX_TOKENS / AGENT_MAX_TURNS /
 	// AGENT_CONTEXT_LIMIT）不再被任何一侧读取 —— 它们曾是"同名不同义"的源头
 	// （网关的单次输出上限 vs 引擎的 run 全程预算）。这里显式拒绝启动，
 	// 而不是让一份"看起来设了"的旧配置静默失效。
 	if err := config.ValidateRenamedAgentEnv(); err != nil {
-		slog.Error("FATAL: deprecated agent budget environment variables - refusing to start", "error", err)
-		return
+		fatalExit("FATAL: deprecated agent budget environment variables - refusing to start", "error", err)
 	}
 
 	// Logger
@@ -91,8 +100,7 @@ func main() {
 		// No read replicas or router failed — fall back to single pool
 		if err := db.ConnectPostgres(ctx, cfg.PostgresDSN, cfg.PostgresMaxConn, cfg.PostgresMinConn); err != nil {
 			// 依赖门禁：PostgreSQL 是必需依赖，不可达时拒绝启动（连接串由 scripts/init.py 生成）
-			slog.Error("FATAL: PostgreSQL is required but unavailable — refusing to start (check POSTGRES_DSN)", "error", err)
-			return
+			fatalExit("FATAL: PostgreSQL is required but unavailable — refusing to start (check POSTGRES_DSN)", "error", err)
 		}
 		pgConnected = true
 		defer db.ClosePostgres()
@@ -105,8 +113,7 @@ func main() {
 	}
 
 	if !pgConnected {
-		slog.Error("FATAL: no PostgreSQL connection was established — refusing to start (check POSTGRES_DSN)")
-		return
+		fatalExit("FATAL: no PostgreSQL connection was established — refusing to start (check POSTGRES_DSN)")
 	}
 
 	// schema 漂移：业务路由一条都不能挂（PG/Redis/引擎的初始化都假定 schema 正确），
@@ -114,7 +121,9 @@ func main() {
 	// 这里只起一个**最小** HTTP 服务，日志仍保留 FATAL 语义（见 verifySchemaVersion）。
 	if drift != nil {
 		serveSchemaMismatchAndWait(cfg, *drift)
-		return
+		// 诊断服务退出（等到了信号或端口失败）—— 这不是"正常停机"，而是"带着不匹配的
+		// schema 无法提供服务"。退出码必须非零，否则编排层会把一次失败升级当成成功（H12）。
+		os.Exit(1)
 	}
 
 	// 幂等播种市场目录示例（技能/Agent/MCP；目录非空则跳过）
@@ -143,10 +152,9 @@ func main() {
 		// 依赖门禁：Redis 是必需依赖，未显式 DEGRADED_MODE=true 时直接拒绝启动——
 		// 进程内降级会让多副本看到不同的限流/会话/事件（限流被按副本放大、run 锁退化为本地锁）。
 		if !cfg.DegradedMode {
-			slog.Error("FATAL: Redis is required but unavailable — refusing to start "+
+			fatalExit("FATAL: Redis is required but unavailable — refusing to start "+
 				"(fix REDIS_ADDR/REDIS_PASSWORD, or set DEGRADED_MODE=true for single-instance development)",
 				"error", redisErr)
-			return
 		}
 		slog.Warn("Redis unavailable — degraded mode (no distributed rate limit / session cache / broadcast / audit stream)", "error", redisErr)
 	} else {
@@ -195,8 +203,7 @@ func main() {
 	}
 	auth.InitJWTAuth()
 	if !config.ValidateJWTSecret(cfg.JWTSecret) {
-		slog.Error("FATAL: JWT_SECRET is weak or not set. Generate a strong secret (32+ chars) and set JWT_SECRET env var")
-		return
+		fatalExit("FATAL: JWT_SECRET is weak or not set. Generate a strong secret (32+ chars) and set JWT_SECRET env var")
 	}
 	slog.Info("auth initialized", "jwt_secret_set", cfg.JWTSecret != "")
 
@@ -234,8 +241,8 @@ func main() {
 			pythonClient = engine.NewPythonClientWithTimeout(cfg.PythonEngineTimeout, addrs...)
 			pythonClient.SetInternalToken(cfg.InternalToken)
 			if cfg.InternalToken == "" {
-				slog.Error("INTERNAL_TOKEN not set but python engine is configured — refusing to start (set INTERNAL_TOKEN env var or remove PYTHON_ENGINE_ADDRESS)")
-				return
+				fatalExit("FATAL: INTERNAL_TOKEN not set but python engine is configured — refusing to start " +
+					"(set INTERNAL_TOKEN env var or remove PYTHON_ENGINE_ADDRESS)")
 			}
 			// 批 E1：引擎 Redis 动态发现——注册表非空则动态优先，为空/Redis 不可用回退静态地址
 			if db.Redis != nil {
@@ -257,8 +264,7 @@ func main() {
 	// ── Storage ──
 	fileStore, err := storage.NewStore(cfg.StorageBackend, cfg.StorageRoot, cfg.S3Endpoint, cfg.S3Bucket, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3UseSSL)
 	if err != nil {
-		slog.Error("file store init", "error", err)
-		return
+		fatalExit("FATAL: file store init failed — refusing to start", "error", err)
 	}
 	atomicStore := storage.NewAtomicStore(fileStore)
 	if cfg.StorageBackend == "local" {
@@ -358,6 +364,18 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("shutdown error", "error", err)
 	}
+
+	// ── H12：已回 202 的回合在 detached goroutine 里跑，Shutdown 看不到它们 ──
+	//
+	// 顺序刻意放在 `srv.Shutdown` 之后：先停接入（不再有新 run 进来），再等在跑的。
+	// 宽限还是同一个 10s 预算（shutdownCtx 已被 Shutdown 消耗一部分，这里另起一份，
+	// 但总时长有上界，不会把"停机"变成"挂住"）。
+	// 没等完时由 DrainInFlightRuns 打出**明确的恢复口径**（checkpoint + run 租约 TTL），
+	// 而不是静默丢一轮。
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer drainCancel()
+	api.DrainInFlightRuns(drainCtx)
+
 	slog.Info("server stopped")
 }
 
