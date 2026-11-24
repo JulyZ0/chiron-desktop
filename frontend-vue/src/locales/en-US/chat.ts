@@ -471,6 +471,10 @@ export default {
   checkpoint_gc_done: "Reclaimed {n} shards, freed {size}",
   checkpoint_gc_result: "Reclaimed {n} shards, freed {size}; {kept} still referenced",
   checkpoint_gc_dry: " (dry run, nothing deleted)",
+  // Preview plan vs execution target mismatch (PRD H73)
+  checkpoint_gc_target_changed: "The project changed, so this reclaim confirmation is no longer valid. Preview again and confirm.",
+  checkpoint_gc_plan_mismatch: "The reclaim plan does not match the current target; execution was cancelled (nothing deleted)",
+  checkpoint_gc_not_executed: "The gateway did not run the reclaim (it still returned a dry run); nothing was deleted",
   workbench_agent_only: "The agent changed this file, but git has no record of it (it may be ignored)",
   workbench_change_deleted: "This file was deleted, so there is nothing to preview",
   refine_prompt_tooltip: "Rewrite the current input into a clearer prompt (it is not sent automatically)",
