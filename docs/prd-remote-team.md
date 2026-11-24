@@ -1,7 +1,8 @@
 # PRD：Chiron 远程执行与团队服务模式
 
 - 状态：S0–S4、R1/R3/R4/R5 已实现；R6/R7 的观测与配额、R9 span/trace、R10 导出已落地。
-- 新增加固：H1–H86 为 2026-11-24 后端全覆盖与前端/桌面壳复核后的原始问题编号，按 P0–P3 排序；已完整验收的条目从待办表删除并保留编号空洞，不重排其它问题。H48/H65/H70/H71/H72/H76 仅完成局部修复与回归测试，未满足整项验收条件，详见 9.11。
+- 新增加固：H1–H86 为 2026-11-24 后端全覆盖与前端/桌面壳复核后的原始问题编号，按 P0–P3 排序；已完整验收的条目从待办表删除并保留编号空洞，不重排其它问题。
+- 2026-11-24 第二轮加固：**H1/H3/H8/H23/H26–H35/H37/H39/H40/H58/H63/H66/H68/H74 已完整验收并从待办表移除**，证据与回归口径见 9.12；H73 仅完成前端绑定（服务端计划校验未做），仍留在表里。H48/H65/H70/H71/H72/H76 仍是局部修复，详见 9.11。
 - 待团队主机：R2 实测切换、R6 压测、Web E2E。
 - 暂缓：LiteLLM、Langfuse 实接、R10 租户删除、S5；ACP 完整协议见 H19，按产品目标排期。
 - 关联：`internal/api/device_fs.go`、`project_mirror.go`、`sessionmap_projects.go`、`frontend-vue/electron/device-fs.cjs`、`docs/desktop-local/contracts.md`、`docs/team-domain-deployment.md`。
@@ -139,9 +140,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | ID | 需求 | 现状/证据 | 验收标准 |
 |---|---|---|---|
-| H1 | **统一工具执行入口** | `POST /v1/tools/execute` 绕过 ToolGuard/Broker/审批；Python 直接 `registry.execute`。证据：`internal/api/routes_system.go:25`、`internal/api/tool_handler.go:68`、`python-engine/app/api/tools.py:29` | 删除公共执行入口，或使其走与 Agent 完全相同的 guard/broker/approval/hook 链；低权限用户直接调用危险工具必须拒绝或产生待审批记录，不能静默执行。 |
 | H2 | **Linux 内核级执行隔离** | 非 Windows 当前直接 `Level.NONE`，实际仅 `RLIMIT_*`；独立 sandbox service 复用同一实现。证据：`python-engine/app/isolation/__init__.py:297`、`python-engine/app/tools/sandbox.py:738` | 默认无网络；工作区外文件系统只读；不能读取引擎凭证；进程树可回收；bwrap/gVisor/容器机制不可用时拒绝执行，不能降级为裸 `setrlimit`。 |
-| H3 | **Shell/Python 命令真解析与风险分类** | 安全前缀把复合命令降级为 `write`；auto 模式不确认 write；分段不拆单个 `&`。证据：`python-engine/app/agent/tool_policy.py:112`、`python-engine/app/tools/sandbox.py:470` | 覆盖 `&`、`;`、`&&`、`||`、管道、重定向、子 shell、环境赋值和解释器 `-c`；无法证明安全时升级审批；禁止仅凭 `echo/ls/cat` 前缀自动放行。 |
 | H4 | **`run_code` 嵌套工具能力收口** | 子进程注入全部 registry tools，并直接 `registry.execute`，绕过逐工具授权。证据：`python-engine/app/tools/run_code.py:538`、`:682` | 仅注入显式 scoped capabilities；嵌套调用重新 authorization 或由独立 Broker 执行；越权调用必须拒绝并留审计事件。 |
 | H5 | **市场安装完整性与信任链** | 外部清单只校验形状，未 fetch/digest/验签；skill inline 分支直接保存。证据：`internal/market/external.go:525`、`internal/api/market_install.go:769`、`python-engine/app/api/skills.py:136` | 外部 source 默认关闭；启用前必须支持 manifest fetch、SHA256 强校验、Ed25519 信任链和原子安装/更新；digest 或签名不匹配不得落盘。 |
 | H6 | **WebSocket 撤销一致性** | RPA/device-fs WS 只验 token，不检查 epoch/blacklist/must-change-password。证据：`internal/api/rpa_ws.go:513`、`internal/api/device_fs.go:550` | WS 与 HTTP 使用同一撤销语义；登出、改密、禁用、撤销、强制下线后不能建立新连接，已有连接在重验或撤销事件后断开。 |
@@ -151,7 +150,6 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | ID | 需求 | 现状/证据 | 验收标准 |
 |---|---|---|---|
 | H7 | **队列 exclusive claim 与 attempt fencing** | `running` 可被再次 claim，complete/fail 不按 attempt 隔离，XADD/XACK 非原子。证据：`python-engine/app/queue/idempotency.py:27`、`worker.py:602` | 同一任务并发 claim 仅一个成功；旧 attempt 的 complete/fail/ack 不生效；重复投递副作用幂等；retry 保留 idempotency key、deadline、trace、priority 等元数据。 |
-| H8 | **run 所有权令牌围栏** | heartbeat 无条件 SET；checkpoint、interrupt、subagent owner release 不校验 expected run token。证据：`run_registry.py:139`、`agent/checkpoint.py:250`、`agent/interrupt.py:109`、`subagent/affinity.py:299` | `run_token + generation` 贯穿 claim、heartbeat、checkpoint、interrupt、owner release 和 shutdown；stale worker 的一切写操作必须被拒绝。 |
 | H9 | **取消传播到当前调用** | interrupt/steer 主要在 turn boundary 检查，当前工具可能继续运行。证据：`python-engine/app/agent/runtime.py:2956` | 取消传递到 model request、tool call、subprocess 和 subagent；有明确最长收敛时间；已产生外部副作用时返回“结果未知”而不是伪装成功。 |
 | H10 | **审批票据绑定规范化参数** | edit-and-approve 检查等级升级，但同等级参数编辑未重新 Broker authorization。证据：`python-engine/app/agent/runtime.py:4898` | 票据绑定工具名、调用者、资源范围和规范化参数摘要；任何参数变化都重新授权；禁止仅凭风险等级不变复用批准。 |
 | H11 | **Provider clean-attempt 与终态校验** | malformed SSE 可跳过；流结束无 completed/tool calls 时可能无终态；partial content 可掩盖 error。证据：`python-engine/app/providers/responses.py:248`、`agent/runtime.py:3196` | 每个 attempt 有身份与合法终态；截断/取消/失败不得提交为 clean turn；partial attempt 不执行后续工具；重试分类且有上限、可观测。 |
@@ -181,9 +179,9 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | 里程碑 | 范围 | 退出条件 |
 |---|---|---|
-| M-H0 对外安全门禁 | H1–H6、H23–H30、H45–H46、H76–H79 | P0 自动化测试全部通过；外部市场在 H5 完成前保持关闭；Linux 无隔离时明确拒绝执行；跨用户资源访问、技能路径穿越、插件/Git 执行绕过、更新真实性、设备桥越权与凭据跨源复用均有回归测试。 |
-| M-H1 故障接管门禁 | H7–H13、H31–H41、H47–H48、H50–H52、H58–H59、H65–H68、H73 | 故障注入下无双重副作用；stale worker 无写权；取消可收敛；预算、审批、队列、SSRF、提权 helper、renderer 权限、附件/重试/账户切换与交付链失败语义通过测试。 |
-| M-H2 契约与工程门禁 | H14–H18、H42–H44、H49、H53–H56、H60–H63、H69–H72、H74–H75、H82–H83、H86 | 状态一致性测试、schema conformance、MCP 并发测试、跨平台 CI 通过；ACP、运维验收、数据生命周期、流恢复、缓存/取消、验证码部署、管理权限呈现与构建可复现性证据不得假成功。 |
+| M-H0 对外安全门禁 | H2、H4–H6、H24–H25、H45–H46、H76–H79 | P0 自动化测试全部通过；外部市场在 H5 完成前保持关闭；Linux 无隔离时明确拒绝执行；跨用户资源访问、技能路径穿越、插件/Git 执行绕过、更新真实性、设备桥越权与凭据跨源复用均有回归测试。 |
+| M-H1 故障接管门禁 | H7、H9–H13、H36、H38、H41、H47–H48、H50–H52、H59、H65、H67、H73 | 故障注入下无双重副作用；stale worker 无写权；取消可收敛；预算、审批、队列、提权 helper、renderer 权限、附件/重试/账户切换与交付链失败语义通过测试。 |
+| M-H2 契约与工程门禁 | H14–H18、H42–H44、H49、H53–H56、H60–H62、H69–H72、H75、H82–H83、H86 | 状态一致性测试、schema conformance、MCP 并发测试、跨平台 CI 通过；ACP、运维验收、数据生命周期、流恢复、缓存/取消、管理权限呈现与构建可复现性证据不得假成功。 |
 | M-H3 产品化增强 | H19–H22、H57、H64 | 按确认后的产品目标逐项验收；非目标项保持显式暂缓。 |
 
 ### 9.6 待确认决策
@@ -202,24 +200,10 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | ID | 优先级 | 需求 | 现状/证据 | 验收标准 |
 |---|---|---|---|---|
-| H23 | P0 | **代码守卫与插件 runner 防再导出绕过** | `asyncio` 在安全 import 白名单中，静态检查只识别 `Name.attr(...)`；`asyncio.base_events.os.system(...)` 可逃逸，插件 runner 复用同一守卫。证据：`python-engine/app/tools/code_guard.py:150`、`:221`、`plugin_runner.py:65` | 白名单模块不得暴露 `os/sys/subprocess/socket/importlib` 等危险对象；AST 与运行时 capability 双重校验；无害逃逸探针必须被拒绝，插件 runner 同步生效。 |
 | H24 | P0 | **插件配置与执行授权一致** | Go 仅在 `/test` 检查 `commands_enabled + approved`；Python `active_servers()` 只看 `status=active`，`read_only=true` 直连并启动命令；broker 加载全部配置，Go 授权入口只做通用工具分级。证据：`internal/api/plugin_validation.go:129`、`internal/api/plugin_handler.go:329`、`:334`、`:411`、`python-engine/app/plugins/store.py:96`、`plugins/pool.py:360`、`:395`、`python-engine/mcp_broker.py:111`、`internal/api/tool_broker.go:114` | 任一执行路径都验证用户总开关、每插件授权和规范化配置摘要；改 Args/Env/ReadOnly 使旧授权失效；未经授权的 active 配置不得启动进程、建立连接、注册工具或经 broker 调用；撤销授权立即断开既有连接。 |
 | H25 | P0 | **Git 仓库配置不得执行程序** | Python Git 工具直接运行 `git status/diff/commit`，未覆盖 `core.fsmonitor`、filter、hooks、pager；恶意仓库可在只读操作中执行命令。证据：`python-engine/app/tools/git_tools.py:36`、`:50`、`:140` | 所有 Git 入口使用固定安全 flags、动态 filter 覆盖和禁用 hooks/外部 helper；仓库配置探测失败时拒绝执行；设备端与引擎端口径一致。 |
-| H26 | P0 | **会话写入强制 owner 校验** | `_db_get_session` 只按 session ID 查询，`submit_task` 恢复后不比较调用者 tenant/user，随后追加消息并更新 shared_context。证据：`python-engine/app/api/unified_executor.py:101`、`:273`、`:303`、`:321` | submit/quick-execute/load 均以 `(tenant_id,user_id,session_id)` 为所有权键；跨租户或跨用户会话返回 404/403，且不得写入任何消息或上下文。 |
-| H27 | P0 | **子 Agent、trace 与后台任务按用户隔离** | 子 Agent 详情/events/artifacts/cancel 只校验 tenant；trace stream 只按 tenant；job 结果/取消只凭 job_id。证据：`internal/api/subagent_handler.go:280`、`:306`、`internal/api/subagent_cancel.go:157`、`internal/api/trace_handler.go:256`、`python-engine/app/tools/jobs.py:126`、`:175` | 所有读取、取消和副作用操作同时校验 tenant/user/root session；任务结果键包含 owner scope；未知与越权统一返回 404。 |
-| H28 | P0 | **记忆冲突裁决绑定 scope** | conflict ID 为时间戳 + 4 位 hash，resolve/delete 不接收也不比较当前 tenant/user，可直接修改他人记忆。证据：`python-engine/app/memory/conflict_manager.py:224`、`:346`、`:413`、`memory/service.py:1208` | 冲突 ID 使用不可预测随机值；读取、裁决、删除均以记录内 scope 与当前调用者双重校验；审计记录操作者而非仅记录所有者。 |
-| H29 | P0 | **媒体对象键与内容类型强校验** | CompleteUpload 对本地存储只校验 `/media/` 前缀，对 S3 只比较 scheme/host；签名下载从自有资产行的 `file_url` 推导路径，下载端点又直接重定向该 URL，可代理读取同桶或本机其他对象；文本 Create 未统一拦截 HTML/SVG。证据：`internal/api/media_upload.go:250`、`:289`、`internal/api/media_sign.go:145`、`:158`、`:200`、`:229`、`internal/api/media_share.go:25`、`internal/api/media_crud.go:166` | 服务端从 upload session 推导对象键并验证 tenant 前缀；签名下载重新校验对象归属；可执行/HTML/SVG 内容默认 attachment + nosniff；私有媒体使用 private/no-store 缓存策略；禁止客户端任意 `file_url` 入库，同 host/scheme 不作为对象所有权证明。 |
-| H30 | P1 | **语义缓存按用户与完整上下文隔离** | L3 只取最近 6 条消息，key 仅含量化 embedding、tenant、model、response_format；同租户不同用户或更早私有上下文可能命中。证据：`python-engine/app/gateway/cache.py:113`、`:135` | 缓存域包含 tenant/user、完整上下文 digest、工具/策略与模型 lineage；私有会话默认禁用语义缓存；提供明确 TTL 与删除接口。 |
-| H31 | P1 | **S3 fallback 消除自死锁** | `_save()` 与写入路径嵌套获取同一个 `threading.Lock`，S3 后端写入永久阻塞。证据：`python-engine/app/media/s3_store.py:53`、`:72`、`:141` | 保存路径单次持锁或使用可重入锁且无嵌套 IO；并发写入/重启恢复测试通过；故障时返回明确错误而非挂起。 |
-| H32 | P1 | **迁移 DSN 安全与显式配置优先** | Alembic `load_dotenv(..., override=True)` 覆盖显式 `DATABASE_DSN`，并可能打印含密码的 DSN；已编码密码可能再次编码。证据：`migrations/env.py:56`、`:120`、`:137` | 显式环境变量优先；默认不输出 DSN；密码只经 URL 编码一次；迁移前打印脱敏目标与 migration head，错误不泄露凭据。 |
-| H33 | P1 | **租户、幂等与邮箱唯一性一致** | 新会话硬编码 `DefaultTenantID`；幂等键全局主键；email 唯一索引大小写敏感而登录使用 `lower(email)`。证据：`internal/session/manager_crud.go:101`、`internal/api/conversation.go:377`、`migrations/versions/0001_authoritative_baseline.py:779`、`:942` | 会话写入使用 claims tenant；幂等唯一键包含 tenant；邮箱规范化与唯一索引一致；提供数据迁移与冲突处理方案。 |
-| H34 | P1 | **队列保留策略不删除未完成任务** | 主队列 `XADD maxlen=100000` 可能删除仍在 PEL、未 ACK 的任务且不进 DLQ。证据：`python-engine/app/queue/streams.py:33`、`queue/producer.py:114` | 使用近似裁剪且保留未处理项，或改为独立保留/归档策略；满载时拒绝或降级而非静默丢任务；DLQ 与指标可核对。 |
-| H35 | P1 | **发现与配置广播最小信任/最小暴露** | 引擎发现直接信任 Redis 中任意 URL；设置广播携带完整 config map，storage/payment 等敏感值可能进入 Pub/Sub。证据：`internal/engine/discovery.go:139`、`:155`、`internal/api/settings_broadcast.go:26`、`:44` | 注册 URL 校验 scheme/host/端口并签名或限制写入者；广播仅传分类、版本与失效通知，敏感配置从 DB 重载；轮换/撤销可观测。 |
 | H36 | P1 | **预算、key 重试与 Provider 绑定原子化** | 预算 check 与 deduct 之间存在竞态；403 一律按 key-scoped 冷却；base_url 变化可能沿用旧 key。证据：`python-engine/app/gateway/budget.py:43`、`:53`、`:62`、`gateway/key_retry.py:42`、`:101`、`gateway/router.py:337` | 预算使用 Lua/事务预占与释放；403 先区分配额、模型无权限和凭证失效；key 绑定 provider/base_url/账号域；重试预算不被 SDK 内部重试放大。 |
-| H37 | P1 | **审批消费与安全评审 fail-safe** | `remote_wait` 使用 GET+DELETE 非原子，多等待者可双消费；Guardian 把 deny+danger=false 归一为 allow；steer 本地副本无 TTL。证据：`python-engine/app/agent/remote_wait.py:103`、`:105`、`agent/guardian.py:271`、`agent/steer.py:114` | 审批使用 GETDEL/Lua 单次消费；矛盾或失败的 Guardian 不得升级为 allow；steer 本地副本有 TTL/代数并在 Redis 成功前不得承诺跨副本投递。 |
 | H38 | P1 | **子 Agent 与撤销操作复用完整执行链** | 生产子 Agent 直接 `registry.execute`，绕过 ToolGuard/Broker/审批/undo/side-effect ledger；undo 存在 LPOP 后失败、二进制替换与 TOCTOU 风险。证据：`python-engine/app/agent/multi_agent.py:275`、`agent/undo.py` | 子 Agent 使用与主 Agent 相同的授权、审计和副作用账本；undo 先验证快照/哈希/路径，失败可恢复且不损坏二进制。 |
-| H39 | P1 | **SSRF 绑定实际连接地址** | `fetch_url_safe` 校验 DNS 后仍由 httpx 再次解析，存在 rebinding 窗口；黑名单未覆盖 `100.64.0.0/10` 等。证据：`python-engine/app/tools/ssrf.py:37`、`:130`、`:172` | 解析后 pin IP 并保留 Host/SNI，或使用连接级 hook 复检；所有重定向重新校验；默认拒绝非全球 unicast 与未覆盖保留段。 |
-| H40 | P1 | **API Key 与 RPA 身份 fail-closed** | API Key 鉴权 SQL 不检查 `users.status`；RPA 调用者 user_id 为空时跳过 owner 校验，客户端列表也退化为全量。证据：`internal/api/api_keys_handler.go:111`、`internal/api/rpa_ws.go:233`、`:642`、`:675` | 禁用/删除用户即使会话纪元写失败也不能使用 API Key；RPA 必须提供非空可信身份，列表与执行都强制 owner 过滤；WS 撤销语义与 HTTP 一致。 |
 | H41 | P1 | **提权 helper 与子进程资源边界** | 一次性 helper 顺序读取 stdout/stderr，可因管道写满死锁；源码部署且引擎根可写时，UAC helper 从该 cwd 加载 `app`，形成条件性本地提权。证据：`python-engine/app/isolation/win_launch.py:877`、`:1253`、`isolation/elevated_client.py:415`、`:443` | 两根管道并发排空并限制总量；提权代码只从 ACL 受保护安装目录加载；helper 启动验证可执行文件/模块路径与签名，拒绝用户可写 cwd。 |
 | H42 | P2 | **ACP submit 返回契约正确** | Go ACP 按 SSE 扫描 `/v1/agent/submit`，网关实际返回 202 JSON，EOF 后仍可能返回成功 stop。证据：`cmd/chiron-acp/main.go`、`internal/api/routes_agent.go:246` | 严格处理 202/JSON/SSE/error 终态；无合法 assistant 终态必须失败；stdin 循环不阻塞 cancel/permission 分发。 |
 | H43 | P2 | **运维与验收脚本不得假成功** | `run.py` 存在 PID/端口误判与假重启；部分 eval/验收脚本在非 2xx、空流、SKIP 或缺证据时仍可能 PASS；临时日志/token 可能残留。证据：`run.py`、`local_env_profile.py`、`scripts/**`、`python-engine/evals/**` | 进程身份与端口归属可验证；重启失败非零退出；验收要求显式证据，SKIP/空结果不得 PASS；敏感 env 不打印，临时产物自动清理。 |
@@ -250,12 +234,10 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | ID | 优先级 | 需求 | 现状/证据 | 验收标准 |
 |---|---|---|---|---|
-| H58 | P1 | **停止与取消必须到达后端** | `stopGeneration()` 只关闭本地 SSE、置 loading=false 并标记 stopped，没有调用已有 interrupt API。证据：`frontend-vue/src/views/ChatView.vue:2912`、`frontend-vue/src/api/index.ts:1692` | 停止绑定捕获的 session/run 并调用 `/v1/agent/interrupt`；收到确认前保持 stopping/可重试状态，失败不得标记为已停止；取消语义与后端 H9 一致。 |
 | H59 | P1 | **审批、问题与 SSE 按会话/run 隔离** | `activeSSE`、`pendingApprovals`、`pendingQuestions` 是全局状态；后台事件可全局追加，提交却使用当前 session；终态事件关闭全局流。子 Agent 流也因任一主流动流打开而丢事件。证据：`frontend-vue/src/views/ChatView.vue:597`、`:612`、`:650`、`:2524`、`:2532`、`:2542`、`frontend-vue/src/composables/useSubagentStream.ts:137` | 连接、游标、审批与问题按 session/run 建图；票据携带不可变归属并拒绝错配提交；只有来源流可关闭自身；子 Agent 事件按 run 去重并以 Last-Event-ID 回放。 |
 | H60 | P2 | **重连、历史恢复与异步竞态守卫** | 重连仅 `/health` 后调用 `switchSession(当前 id)`，同 ID 直接返回；模型/上下文、收件箱、子 Agent、工具输出、工作台与媒体/KB 预览缺少 await 后 generation 校验。证据：`frontend-vue/src/views/ChatView.vue:1872`、`:2066`、`:2115`、`frontend-vue/src/components/chat/InteractionInbox.vue:46`、`frontend-vue/src/components/chat/SubAgentPanel.vue:619`、`frontend-vue/src/components/chat/ToolResultBlock.vue:239`、`frontend-vue/src/components/workbench/WorkbenchPanel.vue:523`、`frontend-vue/src/views/MediaView.vue:318`、`frontend-vue/src/components/KBDocumentPreview.vue:114` | 显式重开当前流、带游标补发并重拉历史；所有异步写回捕获 session/file/run 与 request generation，stale 响应和 finally 状态不得覆盖新视图；关闭/切换时 Abort 并回收 object URL。 |
 | H61 | P2 | **审批/问题失败不丢票与状态失真** | 审批提交吞错后仍移除卡片；问题在提交前移除且失败不恢复；收件箱过期与 free-text 字段未使用权威值，历史 pending 与实时徽标不一致。证据：`frontend-vue/src/views/ChatView.vue:650`、`:737`、`frontend-vue/src/components/chat/InteractionInbox.vue:212`、`frontend-vue/src/components/chat/SubAgentPanel.vue:336` | 票据保持 pending/busy 直至服务端确认；失败恢复并允许重试；使用权威 `expires_at`/`allow_free_text`；历史与实时 pending 统一对账。 |
 | H62 | P2 | **实时输出、错误与日志脱敏** | Provider 错误原文直接显示；子 Agent 审批参数、工具参数与结果实时发射未脱敏；Axios 错误整体进 console，可能含 Authorization 头。证据：`frontend-vue/src/views/ChatView.vue:2583`、`python-engine/app/agent/runtime.py:3196`、`python-engine/app/agent/event_sink.py:290`、`:364`、`:401`、`frontend-vue/src/composables/useSessionSwitch.ts:216` | 发射、显示、持久化与日志前统一脱敏；仅记录 status/code/request ID；明文查看需独立权限与显式揭示；测试覆盖 header、key、token、连接串。 |
-| H63 | P2 | **Mermaid SVG 二次消毒强化** | 已启用 strict，但自定义 sanitizer 保留 `foreignObject`、任意 SVG 属性/CSS，只拦两类 href；未确认具体绕过，属于纵深防御。证据：`frontend-vue/src/components/chat/mermaidRenderer.ts:59`、`:95`、`:109` | 使用专用 DOMPurify SVG/MathML profile、标签/属性白名单与规范化协议校验；禁用不必要 foreignObject/CSS；严格 CSP 与恶意 SVG 回归测试。 |
 | H64 | P3 | **附件 URL 来源与协议约束** | `attachmentUrl()` 直接返回解析或持久化 URL 并进入图片/音频/文件绑定；未确认攻击者可控来源。证据：`frontend-vue/src/components/chat/MessageItem.vue:305`、`:846`、`frontend-vue/src/views/ChatView.vue:1912` | 仅允许明确 scheme/origin；记录附件来源；导出 Markdown 不携带签名 URL；新协议或跨域来源需显式策略。 |
 
 ### 9.10 API 契约、资源身份与项目操作新增项（H65–H86）
@@ -266,16 +248,13 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | ID | 优先级 | 需求 | 现状/证据 | 验收标准 |
 |---|---|---|---|---|
-| H65 | P1 | **聊天附件上传响应契约** | `uploadFile()` 从 `resp.data.asset || resp.data` 取字段，但 Go `OK` 返回 `{success,data}`；真实 ID/URL 丢失后伪造 `Date.now()` ID 与 `/v1/media/{id}/download`。证据：`frontend-vue/src/api/index.ts:718`、`:720`、`:722`、`frontend-vue/src/components/chat/ChatInput.vue:800`、`internal/api/media_upload.go:125`、`internal/api/response.go:63` | 严格按 `{success,data}` 解包并做 schema 校验；缺 ID/file_url 立即失败，不得生成伪 ID；上传后附件可签名、下载并随消息发送；本地/S3、≤50MB 与分片路径均有契约测试。 |
-| H66 | P1 | **非幂等请求不得全局盲重试** | Axios 对本地 503、429/503 或 `retryable=true` 统一重放原 config，未区分 method、端点和幂等键；`createAgent/runAgent` 与 multipart 上传都经过该层，Agent run 在响应前已创建 session 并启动执行。证据：`frontend-vue/src/api/index.ts:551`、`:562`、`:583`、`:601`、`:298`、`:312`、`:718`、`frontend-vue/src/utils/rateLimitBackoff.ts:43`、`internal/api/agents.go:465`、`:482`、`:500` | 仅对可证明幂等的 GET/带幂等键操作自动重试；POST/PATCH/DELETE、上传和派发默认不重放，或强制使用服务端幂等键；503 重试前确认未提交副作用，故障注入不得重复建 Agent/session、计费或上传。 |
+| H65 | P1 | **聊天附件上传响应契约** | `uploadFile()` 从 `resp.data.asset` 或 `resp.data` 取字段，但 Go `OK` 返回 `{success,data}`；真实 ID/URL 丢失后伪造 `Date.now()` ID 与 `/v1/media/{id}/download`。证据：`frontend-vue/src/api/index.ts:718`、`:720`、`:722`、`frontend-vue/src/components/chat/ChatInput.vue:800`、`internal/api/media_upload.go:125`、`internal/api/response.go:63` | 严格按 `{success,data}` 解包并做 schema 校验；缺 ID/file_url 立即失败，不得生成伪 ID；上传后附件可签名、下载并随消息发送；本地/S3、≤50MB 与分片路径均有契约测试。 |
 | H67 | P1 | **私密媒体强制签名 URL 且缓存按账号隔离** | S3 `file_url` 是裸对象 URL，`resolveMediaUrl()` 对非 `/media/` 前缀直接返回，跳过 owner-bound 签名与过期；公开桶时绕过授权语义，私有桶时图片失败。签名缓存仅以 asset ID 为键。证据：`frontend-vue/src/api/index.ts:1032`、`:1044`、`:1046`、`:1064`、`internal/api/media_crud.go:729`、`internal/storage/s3.go:184`、`frontend-vue/src/views/MediaView.vue:178` | 私密存储禁止把裸 S3 URL 交给 renderer；所有资产经服务端 owner-bound 签名或受控代理；缓存键包含 tenant/user/mode/origin 并在登出清空；私有桶与公开桶配置均有回归测试。 |
-| H68 | P1 | **登录、登出与账户切换使用 auth generation 围栏** | token 直接覆盖，profile/logout/401/重试均无账号代次校验；A 的迟到的 401 可清除 B，A 的 profile 可覆盖 B，延迟重试可把 B token 附到 A 请求。证据：`frontend-vue/src/stores/auth.ts:107`、`:394`、`:482`、`frontend-vue/src/api/index.ts:172`、`:583`、`:624`、`frontend-vue/src/router/guard.ts:69` | 每次认证切换递增 generation，请求捕获账号/token scope；响应、401、重试、profile 与路由守卫写回前比对；旧账号回调不得登出新账号或改写身份；账户切换取消在途请求并清理账号域缓存。 |
 | H69 | P2 | **SSE 存活探测与 gap 重拉代次** | 通用 SSE 只在 EOF/异常重连，忽略心跳且无静默 watchdog；gap 重拉仅检查返回时 `run.loading`，若新一轮已结束仍可能用旧快照覆盖新内容。证据：`frontend-vue/src/api/index.ts:912`、`:942`、`:978`、`frontend-vue/src/composables/useSessionSwitch.ts:233`、`:240` | 按服务端心跳间隔设置静默超时，后台恢复/online 时重连；重拉携带 session/run generation，提交 CAS 前确认未被新 turn 推进；watchdog 与 stale 覆盖均有故障注入测试。 |
 | H70 | P2 | **媒体签名过期后重新签名** | 图片签名过期时清缓存并加入 `fallbackIds`，之后直接回退原路径，不再尝试签名。证据：`frontend-vue/src/views/MediaView.vue:187`、`:207`、`:212` | 区分过期、401/403 与永久 404；过期时限频重新签名并重试，不降级到裸路径；重复失败有可见状态且不形成永久黑洞。 |
 | H71 | P2 | **请求取消键与生命周期精确化** | 跟踪键仅 `method:url`，不含 params/body/request ID，并覆盖调用方 CancelToken；同 URL 不同参数并发会互相覆盖，首个响应可能删除全部跟踪。证据：`frontend-vue/src/utils/requestOptimizer.ts:166`、`:169`、`:177`、`:183`、`frontend-vue/src/router/guard.ts:34` | 每个请求有独立 ID/AbortSignal；取消只作用于目标视图/资源代次，不误伤同端点并发操作；完成、失败与取消都只清理自身；导航取消测试覆盖不同 params。 |
 | H72 | P2 | **上传续传元数据按账号隔离并随登出清理** | `chunk-upload:*` 记录文件名、大小、时间、用途、父级和 uploadId，但未纳入 `privateStorage` 前缀，登出后仍可被下一账号读取并尝试续传。证据：`frontend-vue/src/utils/uploader.ts:57`、`:58`、`:80`、`frontend-vue/src/utils/privateStorage.ts:15`、`:36` | 续传键包含 tenant/user/mode/origin 与文件摘要；登出/切换账号清除所有旧账号续传状态；服务端每次读/写/complete 都复核 upload owner，避免元数据残留升级为跨账号上传。 |
-| H73 | P1 | **破坏性预览绑定不可变目标** | checkpoint GC 的 dry-run 使用 A 项目，确认框打开期间 `executeGc()` 重新读取当前 `props.projectId`，可能对未预览的 B 执行删除。证据：`frontend-vue/src/components/workbench/CheckpointTimeline.vue:270`、`:282`、`:294` | 预览计划携带不可变 workspace、generation 与计划摘要；确认执行必须绑定该计划，切换项目使确认失效；服务端校验计划/目标一致，破坏性操作不得按当前 UI 状态重新选目标。 |
-| H74 | P2 | **验证码 Provider 与部署 CSP 一致** | CaptchaWidget 动态加载 Cloudflare/reCAPTCHA/hCaptcha/腾讯脚本，随附 CSP 仅允许 `script-src 'self'` 且无对应 `frame-src`；注释已承认需配置但未提供可用基线。证据：`frontend-vue/src/components/CaptchaWidget.vue:145`、`:156`、`:169`、`:179`、`frontend-vue/security-headers.conf:28`、`:34` | 为每个 provider 提供最小域名 script/frame/connect 白名单与启用开关；部署配置必须与实际 provider 一致；CI/烟雾测试确认脚本、iframe 与 token 回调可用，未启用时不放行第三方域名。 |
+| H73 | P1 | **破坏性预览绑定不可变目标** | 前端已修：预览计划携带不可变 workspace/generation/摘要，确认执行只按该计划落点，切换项目使确认失效（`frontend-vue/src/utils/checkpointGcPlan.ts`、`CheckpointTimeline.vue`、`api/checkpoints.ts` 已带 `plan_digest`）。**未做**：`internal/api/checkpoint_diff.go` 的 `checkpointGcBody` 仍不接收/校验 `plan_digest`，引擎也没有下发"服务端签发的计划摘要"，因此服务端一致校验这一条还不成立。 | 预览计划携带不可变 workspace、generation 与计划摘要；确认执行必须绑定该计划，切换项目使确认失效；**服务端**校验计划/目标一致（dry-run 下发摘要、执行回传并重算比对，不一致 409），破坏性操作不得按当前 UI 状态重新选目标。 |
 | H75 | P2 | **市场内容安装后保持 inert 直至显式信任** | 市场 Agent 直接写 `enabled=true`，skill 直接调用安装接口落盘；前端却提示“装成功不等于可用”，信任状态与执行状态不一致。证据：`internal/api/market_install.go:535`、`:568`、`:790`、`:798`、`frontend-vue/src/views/MarketView.vue:390` | 外部内容安装后默认 disabled/quarantined，不注入、不执行、不连接；展示来源与权限需求并由用户显式启用；启用前完成 H5 完整性与 H24 授权检查，撤销后立即停用。 |
 | H76 | P0 | **技能名路径穿越与共享层越权写入** | install 只检查 name 非空；`_path()` 直接拼接 `{name}.skill.json`，`save()` 创建父目录并原子替换，`../`/绝对路径可覆盖存储目录外或其他用户技能。`update_meta()` 还会就地修改共享层载体。证据：`python-engine/app/api/skills.py:172`、`:183`、`:195`、`python-engine/app/skill/store.py:406`、`:463`、`:469`、`:494`、`:545` | 所有 save/delete/meta/update 入口统一严格 name 校验（白名单、长度、拒绝分隔符/绝对路径）并验证 resolved containment；tenant 共享写入要求 tenant-admin；成员修改共享技能只生成私有 override；跨用户/越界探针不得落盘。 |
 | H77 | P0 | **私有知识库绑定与检索强制 owner 校验** | Agent create/update 接受任意 `kb_id`；派发按 ID 查询 KB 后改用 KB 所有者身份调用 `answer_question`，后者也只按 ID 加载，不比较调用者，可提取他人私有库答案与引用。证据：`internal/api/agents.go:292`、`:382`、`:541`、`python-engine/app/api/agents.py:141`、`:149`、`:153`、`python-engine/app/knowledge/service.py:79`、`:143` | 绑定与每次派发/检索都以实际 caller 校验 KB tenant/user/可见性；不得用资源所有者身份替代授权；撤销权限后既有 Agent 也不能继续检索；跨用户 UUID 测试统一 404/403 且无 Provider 调用与计费。 |
@@ -299,6 +278,39 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H71 | pending request 改用递增 ID 与精确 config 身份，保留调用方 CancelToken，完成/取消时以原 listener 真正退订，响应/失败只清理自身，导航取消保留认证会话请求。证据：`frontend-vue/src/utils/requestOptimizer.ts:27`、`:58`、`:74`、`:86`、`:105`、`:177` | `requestOptimizer.spec.ts` 9 项通过，覆盖同 URL 并发、调用方取消/退订、真实 Axios token 与 retained auth。 | 取消仍需从 URL 粒度细化到目标视图/资源代次；按验收要求补齐 AbortSignal 或等价语义及不同 params 的导航测试。 |
 | H72 | 续传键经 `privateKey` 绑定当前 user，`chunk-upload` 前缀纳入登出清理，旧无账号键也会清除。证据：`frontend-vue/src/utils/uploader.ts:67`、`frontend-vue/src/utils/privateStorage.ts:23` | `uploader.spec.ts` 5 项与 `privateStorage.spec.ts` 3 项通过，覆盖账号切换和旧键清理。 | 键加入 tenant/mode/origin 与内容摘要；服务端查询、写入和 complete 每次复核 upload owner。 |
 | H76 | 共享严格技能名白名单与 resolved containment 覆盖保存、目录、删除、meta 与 API 入口；非法名/越界返回 HTTP 400。原子写使用同目录安全临时文件，`SKILL.md` 自身符号链接也会被拒绝。证据：`python-engine/app/skill/store.py:128`、`:149`、`:156`、`:439`、`:513`、`:590`、`python-engine/app/api/skills.py:55`、`:62` | `test_skill_store_validation.py` 40 项通过，技能相关 Python 回归 177 项通过；含 flat/directory/`SKILL.md` symlink 越界探针。 | tenant 共享写入要求 tenant-admin；成员修改共享技能只生成私有 override；补齐共享层授权与跨用户探针。 |
+
+### 9.12 第二轮加固验收（2026-11-24，已从待办表移除）
+
+- 下表 22 项在本轮按"行为改造 + 自动化回归"完成，且**已从 9.1–9.10 的待办表删除**（编号空洞保留，其它问题不重排）。
+- 判定口径：每条都有能证明"修复前会失败"的回归用例；没有真实主机的项（S3/PG/团队域名/Electron GUI）不计入本条验收，另行留在 §8。
+- 合并后统一门禁：`go build ./...`、`go test ./... -parallel 1`（全包通过）、`python -m pytest` 相关子集 216 项、前端 15 个 spec/133 项、`gofmt`/`ruff`/`vue-tsc` 变更文件。
+
+| ID | 落点 | 回归证据 |
+|---|---|---|
+| H1 | 公共 `/v1/tools/execute` 在网关与引擎两侧都已移除；`tools/client.py` 中的同名调用是死代码 | `internal/api/tool_broker_test.go`（POST 得到 404）、`python-engine/tests/test_tools_service_api.py`（`registry.execute` 未被 await） |
+| H3 | `agent/tool_policy.py` 复用沙箱文本逃逸判据并按平台解析，复合命令一律升级审批 | `tests/test_tool_policy_command_parse.py` |
+| H8 | `agent_submit` 的 `activate_run_fence/deactivate_run_fence` 改为模块级导入（此前是 NameError，围栏从未真正启用） | `tests/test_h8_run_fence_wiring.py`（名字解析 + 上下文变量往返） |
+| H23 | `tools/code_guard.py` 拦截白名单模块的再导出逃逸（`asyncio.base_events.os…`），AST 属性链 + 运行时 capability 双校验；`plugin_runner` 同步 | `tests/test_code_guard_reexport_escape.py` |
+| H26 | 会话写入只接受显式 owner 身份，闭合同租户匿名公共域；空白身份视为缺失 | `tests/test_h26_session_write_owner.py` |
+| H27 | 子 Agent 观测/取消与 trace 按 tenant+user+会话收窄，越权统一 404；引擎 span 写入 `user_id` | `internal/api/subagent_authz_test.go`、`internal/api/trace_owner_test.go` |
+| H28 | 冲突 ID 为随机值，读取/裁决/删除按记录内 scope 与调用者双校验，审计记 actor | `tests/memory/test_conflict_scope.py` |
+| H29 | 媒体对象键由上传会话推导并校验租户前缀；下载强制 `attachment`+`nosniff` 与 private 缓存 | `internal/api/media_*.go` 回归 |
+| H30 | 语义缓存域含 tenant/user/完整上下文 digest/工具与策略/模型 lineage；私有会话默认禁用 | `tests/test_gateway_cache_tenant.py` |
+| H31 | S3 保存路径单次持锁，故障返回明确错误而非挂起 | `tests/test_media_s3_store.py` |
+| H32 | 迁移 DSN 显式环境变量优先、密码只编码一次、默认脱敏输出 | `tests/test_migrations_dsn.py` |
+| H33 | 会话写入用 claims 租户；幂等键含租户；email 规范化与唯一索引一致（迁移 `0013_tenant_identity`） | `internal/db/tenant_identity_guard_test.go`、`internal/session/session_tenant_guard_test.go`、`python scripts/check_migration_head.py` |
+| H34 | 队列不再用裸 `MAXLEN` 裁剪未 ACK 任务；降级裁剪有指标与告警 | `tests/test_queue_retention_h34.py` |
+| H35 | 引擎注册地址过协议/主机/端口校验与可选 HMAC 签名；设置广播只发白名单字段 + 版本 | `internal/engine/discovery_trust_test.go`、`internal/api/settings_broadcast_test.go` |
+| H37 | 审批改 `GETDEL`/Lua 单次消费；Guardian 矛盾判词降级为 unknown（回退人工）；steer 本地副本带 TTL/代数且不承诺跨副本 | `tests/test_approval_single_consume_failsafe.py`、`tests/test_guardian.py`、`tests/test_steer.py` |
+| H39 | SSRF 改为"只放行全球 unicast"，并在连接期钉住已校验 IP（关掉 rebinding 窗口） | `tests/test_ssrf_connect_pinning.py` |
+| H40 | API Key 校验用户状态；RPA 身份与 owner 过滤 fail-closed | `internal/api/api_keys_handler.go` 回归、`internal/api/rpa_authz_test.go` |
+| H58 | 停止生成真正下发 `POST /v1/agent/interrupt`，未确认不标记已停止、可重试 | `frontend-vue/src/composables/__tests__/useTurnStop.spec.ts`、`ChatView.interaction.spec.ts` |
+| H63 | Mermaid 二次消毒改用 DOMPurify SVG/MathML profile + 标签/属性白名单 | `src/components/chat/__tests__/mermaidSanitize.spec.ts` |
+| H66 | 只对可证明幂等的 GET/带幂等键操作重放，POST/上传/派发不再盲重试 | `src/api/__tests__/nonIdempotentRetry.spec.ts`、`src/utils/__tests__/replaySafety.spec.ts` |
+| H68 | 认证代次围栏：响应/401/重试/profile/路由守卫写回前比对 generation | `src/stores/__tests__/authGeneration.spec.ts`、`src/api/__tests__/authGenerationFence.spec.ts` |
+| H74 | 验证码 Provider 最小 `script/frame/connect` 白名单，部署 CSP 与桌面壳同源；未启用不放行 | `src/utils/__tests__/captchaCspConsistency.spec.ts`、`src/components/__tests__/CaptchaWidget.provider.spec.ts` |
+
+遗留（本条不覆盖，仍留在上表）：H58 的"取消可收敛"仍依赖 H9；H39 的连接钉住对代理链路需在真实代理下复验；H35 的注册签名需要引擎侧签发配合（当前为可选开关）。
 
 ## 10. 参考
 
