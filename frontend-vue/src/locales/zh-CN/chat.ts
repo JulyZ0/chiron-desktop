@@ -474,6 +474,10 @@ export default {
   checkpoint_gc_done: "已回收 {n} 个分片，释放 {size}",
   checkpoint_gc_result: "回收 {n} 个分片，释放 {size}；仍被引用 {kept} 个",
   checkpoint_gc_dry: "（预演，未删除）",
+  // 预览计划与执行目标失配（PRD H73）：破坏性操作只认预览时绑定的 workspace/代次/摘要
+  checkpoint_gc_target_changed: "项目已切换，这次回收确认已失效，请重新预演后再确认",
+  checkpoint_gc_plan_mismatch: "回收计划与当前目标不一致，已取消执行（未删除任何内容）",
+  checkpoint_gc_not_executed: "网关没有执行回收（返回的仍是预演结果），未删除任何内容",
   workbench_agent_only: "agent 改过，但 git 没有记录（可能被忽略）",
   workbench_change_deleted: "这个文件已被删除，没有内容可以预览",
   refine_prompt_tooltip: "把当前输入改写成更明确的提示（不会自动发送）",

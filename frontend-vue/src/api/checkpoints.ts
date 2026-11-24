@@ -245,11 +245,19 @@ export async function runCheckpointGc(options: {
   retentionDays?: number
   dryRun?: boolean
   workspaceId?: string
+  /**
+   * 预览（dry-run）时算出的计划摘要，执行阶段原样回传。
+   *
+   * 网关据此校验「要执行的计划」与「用户看过的计划/目标」一致（PRD H73）：
+   * 破坏性操作不能按当前 UI 状态重新选目标。老网关会忽略这个字段。
+   */
+  planDigest?: string
 } = {}): Promise<CheckpointGcResult> {
   const body: Record<string, unknown> = {}
   if (options.retentionDays !== undefined) body.retention_days = options.retentionDays
   if (options.dryRun !== undefined) body.dry_run = options.dryRun
   if (options.workspaceId) body.workspace_id = options.workspaceId
+  if (options.planDigest) body.plan_digest = options.planDigest
   const { data } = await api.post('/v1/admin/checkpoints/gc', body)
   const p = data?.data ?? {}
   return {

@@ -53,6 +53,7 @@ const {
   probe,
 } = require('./config.cjs')
 const shared = require('./shared.cjs')
+const captchaCsp = require('./captcha-csp.cjs')
 const engineEnvSettings = require('./engine-env.cjs')
 const dataDirAcl = require('./data-dir-acl.cjs')
 const windowsHello = require('./windows-hello.cjs')
@@ -347,14 +348,18 @@ function buildCsp() {
       /* 地址已在 config.cjs 校验；这里失败就不额外放行 */
     }
   }
+  // 验证码（PRD H74）：脚本、组件 iframe、令牌回调都要放行，且只放行**实际启用**的
+  // 服务商（`CHIRON_CAPTCHA_PROVIDERS`，默认 turnstile）。表与前端
+  // `src/utils/captchaProviders.ts` 由单测比对；桌面壳这里不放通配。
+  const captcha = captchaCsp.buildCaptchaCsp()
   return [
     `default-src ${local}`,
-    `script-src ${local} 'wasm-unsafe-eval'`,
+    `script-src ${[local, "'wasm-unsafe-eval'", ...captcha.script].join(' ')}`,
     `style-src ${local} 'unsafe-inline'`,
     `img-src ${local} data: blob:`,
     `media-src ${local} data: blob:`,
     `font-src ${local} data:`,
-    `connect-src ${connect.join(' ')}`,
+    `connect-src ${[...connect, ...captcha.connect].join(' ')}`,
     `worker-src ${local} blob:`,
     `child-src ${local} blob:`,
     // frame-src 必须与 child-src 同样放行 blob:。
@@ -363,7 +368,9 @@ function buildCsp() {
     // 带不了请求头，只能先取字节再转 objectURL —— 见 projectFiles.ts）。frame-src
     // 一旦存在就会**覆盖** child-src 对 frame 的授权，只写 child-src 等于没写：
     // 图片能看、PDF 一片空白，且控制台只报一句 CSP 违规，很容易被当成后端坏了。
-    `frame-src ${local} blob:`,
+    //
+    // 验证码的组件 iframe 也走这一条（缺了它验证码框是空白）。
+    `frame-src ${[local, 'blob:', ...captcha.frame].join(' ')}`,
     "object-src 'none'",
     "base-uri 'none'",
     `form-action ${local}`,

@@ -100,6 +100,7 @@ export default {
   account_settings: "账户设置",
   verification_failed: "验证失败",
   captcha_component_failed_to_load_check_your_network_and_refresh_to_retry: "验证码组件加载失败，请检查网络后刷新重试",
+  captcha_provider_not_enabled: "此部署未启用 {provider}：需要在 VITE_CAPTCHA_PROVIDERS 中启用它，并同步放行其 CSP 域名（script/frame/connect）",
   verification_component_failed_to_load_refresh_to_retry: "验证组件加载失败，请刷新重试",
   '2_account_responsibility': "2. 账号责任。",
   '6_digit_verification_code': "6 位数字验证码",

@@ -97,6 +97,7 @@ export default {
   account_settings: "إعدادات الحساب",
   verification_failed: "فشل التحقق",
   captcha_component_failed_to_load_check_your_network_and_refresh_to_retry: "فشل تحميل مكوّن رمز التحقق؛ تحقق من الشبكة ثم حدّث الصفحة للمحاولة",
+  captcha_provider_not_enabled: "لم يُفعِّل هذا النشر {provider}: فعِّله في VITE_CAPTCHA_PROVIDERS واسمح بنطاقاته في CSP (script/frame/connect)",
   verification_component_failed_to_load_refresh_to_retry: "فشل تحميل مكوّن التحقق؛ حدّث الصفحة للمحاولة",
   '2_account_responsibility': "2. مسؤولية الحساب.",
   '6_digit_verification_code': "رمز تحقق مكوّن من 6 أرقام",

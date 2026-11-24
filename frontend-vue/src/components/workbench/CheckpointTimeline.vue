@@ -39,6 +39,11 @@ import { getProjectVcs, initProjectVcs, type ProjectVCS } from '../../api/projec
 import { formatSmart } from '../../utils/datetime'
 import { describeApiError } from '../../utils/apiError'
 import { notify } from '../../utils/notify'
+import {
+  computeGcPlanDigest,
+  verifyGcPlan,
+  type GcPlanBinding,
+} from '../../utils/checkpointGcPlan'
 
 const { t: tr } = useI18n()
 
@@ -257,6 +262,11 @@ async function doPreview(c: ProjectCheckpoint) {
  *
  * 为什么不在一次请求里直接删：`freed_bytes` 与要删的分片数只有算完才知道，
  * 用户需要看到"会删多少"再决定。后端也把缺省的 `dry_run` 当 true，两侧同口径。
+ *
+ * **预览与执行必须绑同一份不可变计划**（PRD H73）：dry-run 的结果连同目标
+ * workspace、请求代次和计划摘要打包成 `GcPlanBinding`，确认框的 onOk 只认这个绑定。
+ * 旧实现执行时重新读 `props.projectId` —— 确认框开着时切项目，就会对**没预览过**
+ * 的项目做删除，而界面上看不到任何异常。
  */
 function requestGc() {
   if (!props.canAdmin || gcLoading.value) return
@@ -264,35 +274,85 @@ function requestGc() {
 }
 
 async function previewGc() {
+  if (!props.canAdmin || gcLoading.value) return
+  // 预览目标固定在这里，后续不再从 props 取
+  const workspaceId = props.projectId
+  if (!workspaceId) return
+  const gen = generation
+  let binding: GcPlanBinding | null = null
   gcLoading.value = true
   gcResult.value = null
   try {
-    const plan = await runCheckpointGc({ workspaceId: props.projectId, dryRun: true })
+    const plan = await runCheckpointGc({ workspaceId, dryRun: true })
+    // 预演期间用户切了项目：这份计划的展示对象已经不存在了，不要弹确认框。
+    if (workspaceId !== props.projectId || gen !== generation) {
+      notify.error(tr('chat.checkpoint_gc_target_changed'))
+      return
+    }
+    binding = {
+      workspaceId,
+      generation: gen,
+      digest: computeGcPlanDigest(plan, workspaceId),
+      result: plan,
+    }
     gcResult.value = plan
-    Modal.confirm({
-      title: tr('chat.checkpoint_gc_confirm_title'),
-      content: tr('chat.checkpoint_gc_confirm', {
-        n: plan.deleted,
-        size: fmtBytes(plan.freed_bytes),
-        kept: plan.referenced,
-      }),
-      okText: tr('chat.checkpoint_gc_ok'),
-      okButtonProps: { danger: true },
-      cancelText: tr('common.cancel'),
-      onOk: () => executeGc(),
-    })
   } catch (e) {
     notify.error(describeApiError(e))
   } finally {
+    // 先收掉 loading 再弹确认框：确认框的 onOk 可能同步触发（测试替身、或极快的
+    // 用户点击），而 executeGc 用 gcLoading 做重入保护 —— 顺序反了会把执行吃掉。
     gcLoading.value = false
   }
+  if (!binding) return
+  const plan = binding
+  Modal.confirm({
+    title: tr('chat.checkpoint_gc_confirm_title'),
+    content: tr('chat.checkpoint_gc_confirm', {
+      n: plan.result.deleted,
+      size: fmtBytes(plan.result.freed_bytes),
+      kept: plan.result.referenced,
+    }),
+    okText: tr('chat.checkpoint_gc_ok'),
+    okButtonProps: { danger: true },
+    cancelText: tr('common.cancel'),
+    onOk: () => executeGc(plan),
+  })
 }
 
-async function executeGc() {
+/**
+ * 执行回收：只按绑定里的计划走。
+ *
+ * 三道闸，任一不过就**一个请求都不发**：
+ *   1. 目标仍是预览时那个 workspace、代次未变（切项目会让代次自增）；
+ *   2. 计划摘要与计划内容自洽（绑定对象没被换掉/改写）；
+ *   3. 服务端返回 `dry_run: true` 说明它没真删 —— 不许显示"已回收"。
+ *
+ * `plan_digest` 一并下发，网关可据此做服务端计划/目标一致性校验。
+ */
+async function executeGc(plan: GcPlanBinding) {
+  const check = verifyGcPlan(plan, props.projectId, generation)
+  if (!check.ok) {
+    notify.error(
+      check.reason === 'target_changed'
+        ? tr('chat.checkpoint_gc_target_changed')
+        : tr('chat.checkpoint_gc_plan_mismatch'),
+    )
+    return
+  }
+  if (gcLoading.value) return
   gcLoading.value = true
   try {
-    const out = await runCheckpointGc({ workspaceId: props.projectId, dryRun: false })
+    const out = await runCheckpointGc({
+      workspaceId: plan.workspaceId,
+      dryRun: false,
+      planDigest: plan.digest,
+    })
     gcResult.value = out
+    if (out.dry_run) {
+      // 网关没执行（仍是预演）：不能报成功，否则用户以为删干净了
+      notify.error(tr('chat.checkpoint_gc_not_executed'))
+      return
+    }
     notify.success(tr('chat.checkpoint_gc_done', { n: out.deleted, size: fmtBytes(out.freed_bytes) }))
   } catch (e) {
     notify.error(describeApiError(e))
