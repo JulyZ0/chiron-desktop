@@ -315,7 +315,10 @@ describe('ChatView 审批失败不丢票（H61）', () => {
       expect(second).toBe(true)
       expect(apiMocks.submitApproval).toHaveBeenCalledTimes(2)
       // 提交用的是**票自己的**归属会话
-      const call = apiMocks.submitApproval.mock.calls[1]?.[0] as { session_id?: string } | undefined
+      // `submitApproval` 在桩里是零参 mock，`calls` 的元素类型因此是空元组；
+      // 这里按实际传参取值（只修类型，断言不变）。
+      const calls = apiMocks.submitApproval.mock.calls as unknown as Array<[{ session_id?: string }?]>
+      const call = calls[1]?.[0]
       expect(call?.session_id).toBe('s-1')
       expect(vm.interactionScope.approvalsOf('s-1')).toHaveLength(0)
     } finally {

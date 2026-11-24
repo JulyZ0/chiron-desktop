@@ -116,7 +116,7 @@ describe('接线：resyncSessionHistory 在提交前做 CAS', () => {
     const pending = stream.resyncSessionHistory('s1')
 
     // 拉取还没回来：新一轮开跑并**已经结束**
-    run.turnSeq += 1
+    run.turnSeq = (run.turnSeq ?? 0) + 1
     run.loading = false
     run.items = [fresh]
 
@@ -160,7 +160,7 @@ describe('接线：resyncSessionHistory 在提交前做 CAS', () => {
     expect(getMock).not.toHaveBeenCalled() // 记账，不立刻覆盖
 
     run.loading = false
-    run.turnSeq += 1 // 这一轮结束（回合推进）
+    run.turnSeq = (run.turnSeq ?? 0) + 1 // 这一轮结束（回合推进）
     stream.flushGapResync('s1')
     await Promise.resolve()
     await Promise.resolve()

@@ -865,7 +865,10 @@ function ensureAskTimer() {
  */
 async function submitQuestionTicket(
   question: ScopedQuestion,
-  payload: Record<string, unknown>,
+  // 只允许这两个字段：`answer` 是必填的答复正文（拒绝时传哨兵由调用方决定），
+  // `declined` 区分"明确拒绝"与"超时/没看见"。用 Record<string, unknown> 会让
+  // 类型检查放不过 `answer` 缺失的调用（H61 之后这个方法确实会真的少传）。
+  payload: { answer: string; declined?: boolean },
 ): Promise<boolean> {
   const ownerSession = String(question.sessionId || '')
   const claim = claimTicket(question, {
