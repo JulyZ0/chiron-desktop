@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -34,6 +36,44 @@ const sessionEpochKeyPrefix = "jwt:epoch:"
 // 纪元键一直存在（否则纪元一消失，旧 token 又"复活"了）。
 const sessionEpochTTL = 25 * time.Hour
 
+// authRevocationChannel 是跨实例撤销事件通道：单次登出广播裸 jti，
+// 批量撤销广播 wsAuthEpochEvent（type=epoch_revoked）JSON。
+// 同一个 channel 两种负载由 handleWebSocketBlacklistEvent 分流。
+const authRevocationChannelSuffix = "jwt:blacklist:sync"
+
+func authRevocationChannel() string {
+	return db.RedisKey(authRevocationChannelSuffix)
+}
+
+// broadcastSessionEpochRevocation 把"某用户已批量撤销"广播给其它网关实例。
+//
+// 为什么必须广播：纪元键只解决**新连接**与**下一次重验**；已经建立的长连接
+// （/ws/rpa 拿着浏览器、/ws/device-fs 直连用户磁盘）默认要等到 15s 后的周期性
+// 重验才断。撤销（改密、禁用、强制下线）是要立刻止血的动作，因此这里主动推事件，
+// 收到事件的实例直接关闭该用户的在连长连接。
+//
+// 广播失败只记日志：Redis 已经写入纪元，新连接与重验仍然会失败，宁可慢 15s 也不能
+// 让"撤销成功但日志报错"变成回滚理由。
+func broadcastSessionEpochRevocation(userID string, epoch int64) {
+	if db.Redis == nil || userID == "" || epoch <= 0 {
+		return
+	}
+	payload, err := json.Marshal(wsAuthEpochEvent{
+		Type:   wsAuthEpochEventType,
+		UserID: userID,
+		Epoch:  epoch,
+	})
+	if err != nil {
+		slog.Warn("session revoke event encode failed", "user_id", userID, "error", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := db.Redis.Publish(ctx, authRevocationChannel(), string(payload)).Err(); err != nil {
+		slog.Warn("session revoke event broadcast failed", "user_id", userID, "error", err)
+	}
+}
+
 // revokeUserSessions 让该用户**当前已签发**的所有 JWT 立即失效。
 //
 // 返回 error 由调用方决定如何处置：改密本身已经成功，不该因为撤销失败而回滚，
@@ -45,8 +85,13 @@ func revokeUserSessions(ctx context.Context, userID string) error {
 	if db.Redis == nil {
 		return errors.New("session revoke store unavailable (redis not configured)")
 	}
-	return db.Redis.Set(ctx, db.RedisKey(sessionEpochKeyPrefix+userID),
-		time.Now().Unix(), sessionEpochTTL).Err()
+	epoch := time.Now().Unix()
+	if err := db.Redis.Set(ctx, db.RedisKey(sessionEpochKeyPrefix+userID), epoch, sessionEpochTTL).Err(); err != nil {
+		return err
+	}
+	// 写纪元成功后才广播：先推事件后写键会出现"连接被断开、但重连又能连上"的窗口。
+	broadcastSessionEpochRevocation(userID, epoch)
+	return nil
 }
 
 // tokenRevokedByEpoch 判断这枚 token 是否签发于最近一次批量撤销之前。

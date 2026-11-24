@@ -316,7 +316,10 @@ func TestWebSocketHandshakeFailsClosedOnRedisError(t *testing.T) {
 	assertWSHandshakeRejected(t, env, http.StatusUnauthorized)
 }
 
-func TestWebSocketHandshakeRejectsSameSecondEpochRevocation(t *testing.T) {
+// 纪元精度是秒，而"改密成功 → 响应里签发新 token"就发生在同一秒内。
+// 判定口径必须是 epoch > iat（严格大于）：否则改密后的新 token 会被立刻判死。
+// WS 曾经用 epoch >= iat，导致同一条链路 HTTP 放行、WS 拒绝 —— 这里锁住对齐后的行为。
+func TestWebSocketHandshakeAcceptsSameSecondEpochLikeHTTP(t *testing.T) {
 	rdb := newWSAuthTestRedis(t)
 	previous := db.Redis
 	db.Redis = rdb
@@ -326,7 +329,12 @@ func TestWebSocketHandshakeRejectsSameSecondEpochRevocation(t *testing.T) {
 	env.issueToken(t, false)
 	epoch := env.claims.IssuedAt.Unix()
 	rdb.Set(context.Background(), db.RedisKey("jwt:epoch:")+env.claims.UserID, epoch, time.Hour)
-	assertWSHandshakeRejected(t, env, http.StatusUnauthorized)
+	if got := env.httpStatus(t); got != http.StatusNoContent {
+		t.Fatalf("HTTP 同秒纪元状态=%d，want 204", got)
+	}
+	conn := dialWSAuth(t, env, "/ws/rpa")
+	readWSHello(t, conn, "/ws/rpa")
+	_ = conn.Close()
 }
 
 func TestWebSocketHandshakeRejectsTokenOlderThanEpoch(t *testing.T) {
