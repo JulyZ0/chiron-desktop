@@ -78,15 +78,18 @@ func (h *SubagentHandler) waitCancelAck(ctx context.Context, runID string) bool 
 //
 // 为什么由网关来写：等待回执的结论（没有实例持有）只有网关知道，而这一行如果继续停在
 // running，前端会永远显示"运行中"—— 正是本次要消灭的形态。
-func (h *SubagentHandler) markRunLost(ctx context.Context, tenant, runID, reason string) bool {
-	if tenant == "" || runID == "" || db.GlobalDBManager == nil {
+//
+// H27：写入同样带 user 归属谓词。缺了它，一条"别人的 run + 本租户"的取消请求
+// 会经由这条收口语句改写对方状态（越权副作用），即使前面的可见性判定漏了。
+func (h *SubagentHandler) markRunLost(ctx context.Context, tenant, userID, runID, reason string) bool {
+	if tenant == "" || userID == "" || runID == "" || h.store == nil {
 		return false
 	}
-	n, err := db.GlobalDBManager.Execute(ctx, `
+	n, err := h.store.Execute(ctx, `
 UPDATE subagent_runs
    SET status = 'lost', finished_at = now(), error = $3
- WHERE id = $1 AND tenant_id = $2
-   AND status NOT IN ('completed', 'failed', 'cancelled', 'lost')`, runID, tenant, reason)
+ WHERE id = $1 AND tenant_id = $2 AND (user_id = $4 OR user_id IS NULL)
+   AND status NOT IN ('completed', 'failed', 'cancelled', 'lost')`, runID, tenant, reason, userID)
 	if err != nil {
 		slog.Warn("subagent mark lost failed", "run_id", runID, "error", err)
 		return false
@@ -154,8 +157,10 @@ func (h *SubagentHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "run_id is required")
 		return
 	}
-	// 租户校验：别人的 run 一律按"不存在"处理（与只读端点同一套判定，不泄露存在性）
-	status, visible := h.runStatusForTenant(r.Context(), subagentTenant(claims), runID)
+	// 归属校验：别人的 run 一律按"不存在"处理（与只读端点同一套判定，不泄露存在性）。
+	// H27：判据从"同租户"收紧到 tenant + user —— 同租户内的普通用户此前可以按 run_id
+	// 停掉别人的子 Agent（越权副作用）。
+	status, _, visible := h.runAccessForCaller(r.Context(), subagentTenant(claims), claims.UserID, runID)
 	if !visible {
 		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "subagent run not found"})
 		return
@@ -194,7 +199,7 @@ func (h *SubagentHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
 
 	// 没有实例认领：实例已退出（映射随 TTL 过期或已在关机时注销）或 Redis 抖动。
 	// 如实收敛为 lost —— 否则这行会一直"运行中"，而用户已经点了停止。
-	marked := h.markRunLost(r.Context(), subagentTenant(claims), runID, lostNoOwner)
+	marked := h.markRunLost(r.Context(), subagentTenant(claims), claims.UserID, runID, lostNoOwner)
 	slog.Warn("subagent cancel had no owner", "run_id", runID, "user_id", claims.UserID,
 		"owner_mapped", ownerMapped, "marked_lost", marked)
 	OK(w, map[string]any{
@@ -222,8 +227,8 @@ func (h *SubagentHandler) CancelSessionRuns(w http.ResponseWriter, r *http.Reque
 		BadRequest(w, "session_id is required")
 		return
 	}
-	// 会话归属校验：不能凭别人的 session_id 去停别人的子 agent
-	if !h.sessionOwnedByUser(r.Context(), sessionID, claims.UserID) {
+	// 会话归属校验：不能凭别人的 session_id 去停别人的子 agent（H27：tenant + user）
+	if !h.sessionOwnedByCaller(r.Context(), sessionID, claims.UserID, claims.TenantID) {
 		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "session not found"})
 		return
 	}
@@ -236,16 +241,6 @@ func (h *SubagentHandler) CancelSessionRuns(w http.ResponseWriter, r *http.Reque
 	}
 	slog.Info("subagent session cancel requested", "session_id", sessionID, "user_id", claims.UserID)
 	OK(w, map[string]string{"status": "accepted", "session_id": sessionID})
-}
-
-// sessionOwnedByUser 判断会话是否属于该用户（与 runOwnedByTenant 同一套风格）。
-func (h *SubagentHandler) sessionOwnedByUser(ctx context.Context, sessionID, userID string) bool {
-	if sessionID == "" || userID == "" || db.GlobalDBManager == nil {
-		return false
-	}
-	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT 1 AS ok FROM sessions WHERE id = $1 AND user_id = $2::uuid`, sessionID, userID)
-	return err == nil && row != nil
 }
 
 // terminalRunStatuses 是不可逆的终态：处于这些状态的 run 无法也不需要再取消。
@@ -264,21 +259,4 @@ var terminalRunStatuses = map[string]bool{
 	// 前端显示"已请求停止"而状态永不变化（即本函数注释里说的那种假成功）。
 	// 跨语言一致性由 `scripts/check_tool_policy_parity.py` 的第八族守住。
 	"partial": true,
-}
-
-// runStatusForTenant 取 run 状态；第二个返回值表示"该 run 对本租户可见"。
-//
-// 可见性判定与 runOwnedByTenant 完全一致：别人的 run 一律按"不存在"处理，
-// 因此调用方对 !visible 统一回 404，不泄露存在性。
-func (h *SubagentHandler) runStatusForTenant(ctx context.Context, tenant, runID string) (string, bool) {
-	if tenant == "" || db.GlobalDBManager == nil {
-		return "", false
-	}
-	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT status FROM subagent_runs WHERE id = $1 AND tenant_id = $2`, runID, tenant)
-	if err != nil || row == nil {
-		return "", false
-	}
-	status, _ := row["status"].(string)
-	return status, true
 }

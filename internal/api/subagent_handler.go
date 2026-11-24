@@ -43,10 +43,24 @@ type SubagentHandler struct {
 	// engine 只用于**写操作**（目前的 P0-2 重跑转发）：只读端点仍走 Redis/DB，
 	// 不经过引擎（避免一次观测请求被引擎的可用性绑架）。
 	engine *engine.PythonClient
+	// store 是 DB 的窄接口（与 apiKeyStore 同一理由）：所有权判定必须能被单测
+	// 覆盖（跨用户/跨租户 404），而仓库既有单测不连真实 PostgreSQL。
+	store subagentStore
+}
+
+// subagentStore 是子 Agent 观测/取消所需的最小数据库能力（`db.DBManager` 天然满足）。
+type subagentStore interface {
+	FetchOne(ctx context.Context, sql string, args ...interface{}) (map[string]interface{}, error)
+	FetchAll(ctx context.Context, sql string, args ...interface{}) ([]map[string]interface{}, error)
+	Execute(ctx context.Context, sql string, args ...interface{}) (int64, error)
 }
 
 func NewSubagentHandler(rdb db.RedisClient, pc *engine.PythonClient) *SubagentHandler {
-	return &SubagentHandler{rdb: rdb, engine: pc}
+	var store subagentStore
+	if db.GlobalDBManager != nil {
+		store = db.GlobalDBManager
+	}
+	return &SubagentHandler{rdb: rdb, engine: pc, store: store}
 }
 
 // subagentTenant 与 trace_handler 保持同一套租户判定（TenantID 回退 UserID）。
@@ -66,6 +80,10 @@ func subagentKey(parts ...string) string {
 }
 
 // ListRuns 返回整棵层级树（session_id）或某节点的直接子节点（parent_run_id）。
+//
+// H27：会话树与父节点两条入口都先校验**调用者所有权**（tenant + user；会话还要
+// 校验会话归属），别人的会话/父 run 一律 404 —— 返回空列表会让越权与"确实没有"
+// 无法区分，也挡不住"用别人的 session_id 探边界"。
 func (h *SubagentHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	claims := auth.GetClaims(r.Context())
 	if claims == nil {
@@ -78,6 +96,16 @@ func (h *SubagentHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	if sessionID == "" && parentRunID == "" {
 		BadRequest(w, "session_id or parent_run_id is required")
 		return
+	}
+	if sessionID != "" && !h.sessionOwnedByCaller(r.Context(), sessionID, claims.UserID, claims.TenantID) {
+		NotFound(w, "session not found")
+		return
+	}
+	if sessionID == "" && parentRunID != "" {
+		if _, _, ok := h.runAccessForCaller(r.Context(), tenant, claims.UserID, parentRunID); !ok {
+			NotFound(w, "subagent run not found")
+			return
+		}
 	}
 
 	// 1) Redis 整树骨架（一次 HGETALL 拿到全部节点摘要）
@@ -95,11 +123,15 @@ func (h *SubagentHandler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// 3) DB 回落（权威；历史 run 必然在这里）
-	runs := h.runsFromDB(r.Context(), tenant, sessionID, parentRunID)
+	runs := h.runsFromDB(r.Context(), tenant, claims.UserID, sessionID, parentRunID)
 	OK(w, map[string]interface{}{"runs": runs, "source": "db"})
 }
 
 // GetRun 返回单个 run 的状态/摘要/用量。
+//
+// H27：Redis 运行期缓存只按 tenant 分键（引擎侧契约），因此**先**用 DB 权威行
+// 证明该 run 属于调用者，再决定是否下发缓存内容。此前只要同租户就能读，
+// 同租户内的普通用户可以直接按 run_id 读到别人的子 Agent 输出。
 func (h *SubagentHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 	claims := auth.GetClaims(r.Context())
 	if claims == nil {
@@ -112,11 +144,15 @@ func (h *SubagentHandler) GetRun(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "run_id is required")
 		return
 	}
+	if _, _, ok := h.runAccessForCaller(r.Context(), tenant, claims.UserID, runID); !ok {
+		NotFound(w, "subagent run not found")
+		return
+	}
 	if view, err := h.runFromRedis(r.Context(), tenant, runID); err == nil && view != nil {
 		OK(w, map[string]interface{}{"run": view, "source": "redis"})
 		return
 	}
-	view := h.runFromDB(r.Context(), tenant, runID)
+	view := h.runFromDB(r.Context(), tenant, claims.UserID, runID)
 	if view == nil {
 		NotFound(w, "subagent run not found")
 		return
@@ -137,6 +173,11 @@ func (h *SubagentHandler) GetRunEvents(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "run_id is required")
 		return
 	}
+	// H27：events 是子 Agent 的完整输出（可能含私有上下文），先证明所有权。
+	if _, _, ok := h.runAccessForCaller(r.Context(), tenant, claims.UserID, runID); !ok {
+		NotFound(w, "subagent run not found")
+		return
+	}
 	limit := subagentEventsLimit
 	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 && v <= subagentEventsLimit {
 		limit = v
@@ -144,11 +185,6 @@ func (h *SubagentHandler) GetRunEvents(w http.ResponseWriter, r *http.Request) {
 
 	if events, err := h.eventsFromRedis(r.Context(), tenant, runID, limit); err == nil && len(events) > 0 {
 		OK(w, map[string]interface{}{"events": events, "source": "redis"})
-		return
-	}
-	// DB 回落前先确认该 run 归属本租户（steps 表本身不带 tenant，必须借 runs 校验）
-	if !h.runOwnedByTenant(r.Context(), tenant, runID) {
-		NotFound(w, "subagent run not found")
 		return
 	}
 	OK(w, map[string]interface{}{"events": h.stepsFromDB(r.Context(), runID, limit), "source": "db"})
@@ -265,12 +301,15 @@ func (h *SubagentHandler) hashAll(ctx context.Context, key string) (map[string]s
 
 // ── DB 回落 ──
 
-func (h *SubagentHandler) runsFromDB(ctx context.Context, tenant, sessionID, parentRunID string) []map[string]interface{} {
+func (h *SubagentHandler) runsFromDB(ctx context.Context, tenant, userID, sessionID, parentRunID string) []map[string]interface{} {
 	out := []map[string]interface{}{}
-	if tenant == "" || db.GlobalDBManager == nil {
+	if tenant == "" || h.store == nil {
 		return out
 	}
-	rows, err := db.GlobalDBManager.FetchAll(ctx, `
+	// H27：user_id 谓词与引擎侧 app/subagent/access.py 的 RUN_ACCESS_CLAUSE 同口径
+	// （历史行 user_id 为空时保留同租户可见性）。少了它，同一租户内任何用户
+	// 都能按 session/父节点列出别人的子 Agent 树。
+	rows, err := h.store.FetchAll(ctx, `
 		SELECT id, COALESCE(parent_run_id, '') AS parent_run_id, depth,
 		       COALESCE(profile_name, '') AS profile_name, status,
 		       COALESCE(summary, '') AS summary, input_tokens, output_tokens, steps,
@@ -278,10 +317,11 @@ func (h *SubagentHandler) runsFromDB(ctx context.Context, tenant, sessionID, par
 		       artifacts, write_paths, created_at
 		  FROM subagent_runs
 		 WHERE tenant_id = $1
-		   AND ($2 = '' OR root_session_id = $2)
-		   AND ($3 = '' OR parent_run_id = $3)
+		   AND (user_id = $2 OR user_id IS NULL)
+		   AND ($3 = '' OR root_session_id = $3)
+		   AND ($4 = '' OR parent_run_id = $4)
 		 ORDER BY created_at DESC
-		 LIMIT $4`, tenant, sessionID, parentRunID, subagentListLimit)
+		 LIMIT $5`, tenant, userID, sessionID, parentRunID, subagentListLimit)
 	if err != nil {
 		slog.Warn("subagent runs query failed", "tenant", tenant, "error", err)
 		return out
@@ -292,39 +332,69 @@ func (h *SubagentHandler) runsFromDB(ctx context.Context, tenant, sessionID, par
 	return out
 }
 
-func (h *SubagentHandler) runFromDB(ctx context.Context, tenant, runID string) map[string]interface{} {
-	if tenant == "" || db.GlobalDBManager == nil {
+func (h *SubagentHandler) runFromDB(ctx context.Context, tenant, userID, runID string) map[string]interface{} {
+	if tenant == "" || h.store == nil {
 		return nil
 	}
-	row, err := db.GlobalDBManager.FetchOne(ctx, `
+	row, err := h.store.FetchOne(ctx, `
 		SELECT id, COALESCE(parent_run_id, '') AS parent_run_id, depth,
 		       COALESCE(profile_name, '') AS profile_name, status,
 		       COALESCE(summary, '') AS summary, input_tokens, output_tokens, steps,
 		       redacted_count, COALESCE(error, '') AS error,
 		       artifacts, write_paths, created_at
 		  FROM subagent_runs
-		 WHERE id = $1 AND tenant_id = $2`, runID, tenant)
+		 WHERE id = $1 AND tenant_id = $2 AND (user_id = $3 OR user_id IS NULL)`,
+		runID, tenant, userID)
 	if err != nil || row == nil {
 		return nil
 	}
 	return normalizeRunRow(row)
 }
 
-func (h *SubagentHandler) runOwnedByTenant(ctx context.Context, tenant, runID string) bool {
-	if tenant == "" || db.GlobalDBManager == nil {
+// runAccessForCaller 回答"这个 run 我能碰吗"，返回状态与根会话（H27）。
+//
+// 三条判据与引擎侧 access.py 逐条对应：tenant、user（历史空 user_id 保留可见）、
+// run 存在性。未知与越权都走同一个 404（不泄露存在性）。root session 由调用方
+// 在带 session 的入口（ListRuns/CancelSessionRuns）另行校验；run 维度的入口
+// 没有可信 session 入参，就只用 run 自身的归属作答，而不是"没传就跳过"。
+func (h *SubagentHandler) runAccessForCaller(
+	ctx context.Context, tenant, userID, runID string,
+) (status, rootSession string, ok bool) {
+	if tenant == "" || userID == "" || runID == "" || h.store == nil {
+		return "", "", false
+	}
+	row, err := h.store.FetchOne(ctx, `
+		SELECT status, COALESCE(root_session_id, '') AS root_session_id
+		  FROM subagent_runs
+		 WHERE id = $1 AND tenant_id = $2 AND (user_id = $3 OR user_id IS NULL)`,
+		runID, tenant, userID)
+	if err != nil || row == nil {
+		return "", "", false
+	}
+	status, _ = row["status"].(string)
+	rootSession, _ = row["root_session_id"].(string)
+	return status, rootSession, true
+}
+
+// sessionOwnedByCaller 判断会话是否属于该调用者（H27：user + tenant 双判据）。
+// 只比 user_id 会让"同用户跨租户"（同一账号被迁租户后的历史 token）读到旧租户数据。
+func (h *SubagentHandler) sessionOwnedByCaller(ctx context.Context, sessionID, userID string, tenantID int16) bool {
+	if sessionID == "" || userID == "" || h.store == nil {
 		return false
 	}
-	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT 1 AS ok FROM subagent_runs WHERE id = $1 AND tenant_id = $2`, runID, tenant)
+	row, err := h.store.FetchOne(ctx,
+		`SELECT 1 AS ok FROM sessions
+		  WHERE id = $1 AND user_id = $2 AND ($3 = 0 OR tenant_id = $3)`,
+		sessionID, userID, tenantID)
 	return err == nil && row != nil
 }
 
 func (h *SubagentHandler) stepsFromDB(ctx context.Context, runID string, limit int) []map[string]interface{} {
 	out := []map[string]interface{}{}
-	if db.GlobalDBManager == nil {
+	if h.store == nil {
 		return out
 	}
-	rows, err := db.GlobalDBManager.FetchAll(ctx, `
+	rows, err := h.store.FetchAll(ctx, `
 		SELECT seq, kind, COALESCE(role, '') AS role, COALESCE(tool_name, '') AS tool_name,
 		       COALESCE(tool_call_id, '') AS tool_call_id, COALESCE(content, '') AS content,
 		       truncated, input_tokens, output_tokens

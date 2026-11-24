@@ -26,7 +26,6 @@ import (
 	"strings"
 
 	"github.com/athenavi/chiron/internal/auth"
-	"github.com/athenavi/chiron/internal/db"
 )
 
 // subagentRerunPath 是引擎侧内网端点的前缀（与 app/api/internal_subagent.py 逐字对应）。
@@ -61,10 +60,10 @@ func subagentRerunGuard(status string) string {
 // 只是这里先做一次"能不能碰"的判定，避免把明显越权的请求再打一趟引擎。
 func (h *SubagentHandler) rerunTargetFor(ctx context.Context, tenant, userID, runID string) (rerunTarget, bool) {
 	var out rerunTarget
-	if tenant == "" || runID == "" || db.GlobalDBManager == nil {
+	if tenant == "" || runID == "" || h.store == nil {
 		return out, false
 	}
-	row, err := db.GlobalDBManager.FetchOne(ctx, `
+	row, err := h.store.FetchOne(ctx, `
 SELECT status, COALESCE(root_session_id, '') AS root_session_id
   FROM subagent_runs
  WHERE id = $1 AND tenant_id = $2
@@ -120,7 +119,7 @@ func (h *SubagentHandler) RerunRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 会话归属：不能凭一条不属于自己的会话去重跑（与 CancelSessionRuns 同一套判定）
-	if target.SessionID != "" && !h.sessionOwnedByUser(r.Context(), target.SessionID, claims.UserID) {
+	if target.SessionID != "" && !h.sessionOwnedByCaller(r.Context(), target.SessionID, claims.UserID, claims.TenantID) {
 		NotFound(w, "subagent run not found")
 		return
 	}

@@ -34,6 +34,26 @@ def get_tenant_stream(tenant_id: int) -> str:
     return TRACES_STREAM_TPL.format(tenant_id)
 
 
+def _span_user_id(metadata: dict[str, Any] | None) -> str:
+    """span 的发起用户（H27）。
+
+    取值顺序：显式 metadata（调用方最清楚自己是谁）→ 运行时上下文。两者都没有时返回
+    空串 —— **空不代表"人人可见"**：网关侧对无法归属的 span 只放行 `admin:read`
+    （fail-closed），宁可在升级期让老记录只对管理员可见，也不让同租户的普通用户
+    凭 trace_id 读到别人的调用链。
+    """
+    if isinstance(metadata, dict):
+        raw = metadata.get("user_id")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    try:
+        from app.tools.context import get_user_id
+
+        return str(get_user_id() or "").strip()
+    except Exception:  # noqa: BLE001 - 归属信息取不到不影响写 span 本身
+        return ""
+
+
 class TraceWriter:
     """异步 trace writer (单例模式,避免重复连接 Redis)."""
 
@@ -112,6 +132,10 @@ class TraceWriter:
                 "duration_ms": str(duration_ms),
                 "timestamp": str(time.time()),
                 "tenant_id": tenant_id or "",
+                # H27：span 归属的发起用户。网关按 tenant 分 stream 之后，同租户内
+                # 所有用户的调用链混在一条流里，只按 tenant 过滤等于"猜到 trace_id
+                # 就能读到别人的完整链路"。这里显式落 `user_id`，Go 侧据此收窄。
+                "user_id": _span_user_id(metadata),
                 "metadata": json.dumps(metadata or {}, ensure_ascii=False),
                 # 差距C：执行图的三要素（稳定的 id、父指针、类别）。
                 "span_id": span_id or "",
@@ -151,6 +175,9 @@ class TraceWriter:
                     "span_name": s["span_name"],
                     "duration_ms": str(s["duration_ms"]),
                     "timestamp": str(time.time()),
+                    # H27：批量路径同样要写归属，否则经批量落盘的 span 在网关侧
+                    # 全部退化成"无法归属"（只有管理员可见）。
+                    "user_id": _span_user_id(s.get("metadata")),
                     "metadata": json.dumps(s.get("metadata", {}), ensure_ascii=False),
                     # 差距C：与 write_span 保持同一套字段（批量路径不能少写父指针，
                     # 否则经批量写入的 span 在执行图里会变成孤点）。

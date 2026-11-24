@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -64,7 +65,9 @@ func (h *RPAHub) handleRemoteCmd(env *rpaCmdEnvelope) {
 		return
 	}
 	// 归属校验：发起方声明的调用者必须与本地连接的 owner 一致（防跨用户投递）。
-	if env.UserID != "" && client.UserID != env.UserID {
+	// 空身份一律拒绝（H40）：此前 `env.UserID != ""` 才校验，于是漏传身份的
+	// 跨实例命令可以投给任意 owner 的连接。
+	if !remoteCmdOwnershipOK(client.UserID, env.UserID) {
 		slog.Warn("rpa remote cmd rejected: client owner mismatch",
 			"client_id", env.ClientID, "caller", env.UserID, "owner", client.UserID)
 		return
@@ -72,6 +75,14 @@ func (h *RPAHub) handleRemoteCmd(env *rpaCmdEnvelope) {
 	if err := client.SendMessage(env.Msg); err != nil {
 		slog.Warn("rpa remote cmd send failed", "client_id", env.ClientID, "error", err)
 	}
+}
+
+// remoteCmdOwnershipOK 是跨实例投递的归属判定（纯函数，便于单测）。
+// 两个身份都必须非空且逐字相等 —— 空值不是"未知"，而是"无法证明归属"。
+func remoteCmdOwnershipOK(ownerUserID, callerUserID string) bool {
+	ownerUserID = strings.TrimSpace(ownerUserID)
+	callerUserID = strings.TrimSpace(callerUserID)
+	return ownerUserID != "" && callerUserID != "" && ownerUserID == callerUserID
 }
 // handleRemoteRes 发起实例收到跨实例结果：按 msg.ID 回填本地 pending。
 func (h *RPAHub) handleRemoteRes(env *rpaResEnvelope) {
@@ -113,22 +124,24 @@ func (h *RPAHub) RefreshRegistry(clientID, userID string) {
 	defer cancel()
 	h.putRegistry(ctx, clientID, userID)
 }
-// registryOwner 返回注册中心记录的 client 所在实例 ID；无记录返回 ""。
-func (h *RPAHub) registryOwner(clientID string) string {
+// registryOwner 返回注册中心记录的 client 所在实例 ID 与 owner user_id；无记录返回 ""。
+// 两个值一起返回：跨实例投递前本实例要先校验 owner（见 SendCommand），
+// 只返回实例 ID 会迫使调用方在拿到实例后再读一次，或者干脆不校验。
+func (h *RPAHub) registryOwner(clientID string) (instanceID, userID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	data, err := h.rdb.Get(ctx, h.registryKeyPrefix+clientID).Bytes()
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	var rec struct {
 		InstanceID string `json:"instance_id"`
 		UserID     string `json:"user_id"`
 	}
 	if err := json.Unmarshal(data, &rec); err != nil {
-		return ""
+		return "", ""
 	}
-	return rec.InstanceID
+	return rec.InstanceID, rec.UserID
 }
 // dropRegistry 移除 client 注册记录（连接断开时调用）。
 func (h *RPAHub) dropRegistry(clientID string) {
