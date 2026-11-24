@@ -56,6 +56,7 @@ const shared = require('./shared.cjs')
 const captchaCsp = require('./captcha-csp.cjs')
 const engineEnvSettings = require('./engine-env.cjs')
 const dataDirAcl = require('./data-dir-acl.cjs')
+const { createSensitiveStoreGate } = require('./sensitive-store-gate.cjs')
 const windowsHello = require('./windows-hello.cjs')
 const accountVerify = require('./account-verify.cjs')
 const twoFactor = require('./two-factor.cjs')
@@ -130,6 +131,17 @@ let currentMode = 'local'
 
 /** 设备文件桥（仅 cloud 模式）：桌面端主动外连远端网关，供 ProjectFS 读本机项目。 */
 let deviceBridge = null
+
+/**
+ * 敏感落盘门禁（H52）：加固结论决定能否往 userData 写 token / provider key。
+ *
+ * 初值 `allowed: false`（未评估即拒绝）是**故意的**：加固发生在模块加载期，
+ * 早于任何 IPC。若加固没跑成（异常、平台不支持、账户名取不到），也绝不能
+ * 退回"照写不误"。
+ */
+const sensitiveStoreGate = createSensitiveStoreGate({
+  log: (level, message) => logMain(level, message),
+})
 
 /** 团队挂载依赖管理器（rclone/WinFsp，按需下载校验；不随安装包）。 */
 let mountDeps = null
@@ -2396,16 +2408,21 @@ try {
 //
 // 时机说明：这里只对**已存在**的 userData 根收口；`local/` 子树由引导器与
 // Electron 后续创建，会继承根的 ACL，所以不必逐个子目录递归。
-// 失败只记日志：权限操作可能因组策略/网络盘失败，那不该让应用起不来。
+//
+// H52：加固 = 补授权 + 移除继承 + **显式审计并清掉未授权显式 ACE** + 再验证
+// （`audit: true`）。以前只取前两步，别人的显式 ACE 会原样留下。
+// 结论不写日志了事，而是喂给敏感落盘门禁：没加固成功就不许写 token / provider key。
 if (enforceUserDataIsolation) {
+  let aclResult = { ok: false, reason: 'not-run' }
   try {
-    const aclResult = dataDirAcl.hardenDataDir({ dir: app.getPath('userData') })
-    if (!aclResult.ok) {
-      logMain('warn', `数据目录权限收口未完成：${aclResult.reason}`)
-    }
+    aclResult = dataDirAcl.hardenDataDir({ dir: app.getPath('userData'), audit: true })
   } catch (err) {
-    logMain('warn', `数据目录权限收口异常：${err?.message || err}`)
+    aclResult = { ok: false, reason: `harden-threw: ${err?.message || err}` }
   }
+  sensitiveStoreGate.applyHardenResult(aclResult)
+  // 输出**脱敏** DACL：主体名已打码，只保留"还有几条、属于哪个类别"。
+  logMain(aclResult.ok ? 'info' : 'error',
+    `数据目录权限收口：${aclResult.ok ? '通过' : `未通过（${aclResult.reason}）`} ${dataDirAcl.summarizeDacl(aclResult)}`)
 }
 
 // 单实例：第二次启动时聚焦已有窗口，而不是再开一个进程
@@ -2610,7 +2627,14 @@ if (!gotLock) {
     })
     ipcMain.handle('desktop:save-token', (event, token) => {
       assertTrustedSender(event)
-      const ok = writeToken(String(token || ''))
+      const next = String(token || '')
+      // H52 门禁：目录没加固成功时不落 token（清空不拦 —— 那是减少泄露面的方向）。
+      if (next && !sensitiveStoreGate.isAllowed()) {
+        const refusal = sensitiveStoreGate.refusal('token')
+        logMain('error', `拒绝保存登录凭据：${refusal.message}`)
+        return false
+      }
+      const ok = writeToken(next)
       // 登录后 token 才可用：立即让设备桥重连，远程模式下项目文件才能马上读。
       deviceBridge?.notifyTokenChanged()
       return ok
@@ -3105,6 +3129,12 @@ if (!gotLock) {
 
     ipcMain.handle('desktop:save-model-config', async (event, payload) => {
       assertTrustedSender(event)
+      // H52 门禁：provider key 也是密钥，与 token 同一条门槛。
+      if (!sensitiveStoreGate.isAllowed()) {
+        const refusal = sensitiveStoreGate.refusal('provider key')
+        logMain('error', `拒绝保存模型密钥：${refusal.message}`)
+        return refusal
+      }
       const mod = optionalSecrets()
       if (!mod) {
         return { ok: false, reason: 'secrets-unavailable', message: '当前版本不支持模型配置（secrets.cjs 未随包发布）' }
