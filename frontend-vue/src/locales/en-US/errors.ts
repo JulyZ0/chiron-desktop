@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 后端稳定错误码 → 文案（en-US）。
  * 键与 internal/api/error_codes.go 的 Code* 常量一一对应，勿改键名。
  */
@@ -174,6 +174,7 @@ export default {
   restore_timeout: "Restore timeout",
   restore_failed: "Restore failed",
   answer_submission_failed_please_retry: "Answer submission failed, please retry",
+  approval_submission_failed_please_retry: "Approval submission failed, please retry (card kept)",
   failed_to_load_session_list: "Failed to load session list",
   failed_to_fetch_agent_list: "Failed to fetch Agent list",
   failed_to_fetch_agent_marketplace: "Failed to fetch Agent marketplace",

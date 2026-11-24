@@ -18,7 +18,7 @@
  * 可复用，形状也根本不同：答复即刻改写那条线的上限并解除暂停，票当场关闭（不停在 `answered`
  * 等下一轮来取），而且**没有"拒绝"这一项** —— 不答复与拒绝提额在效果上是同一件事。
  */
-import { ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import AskCard from './AskCard.vue'
 import SubAgentApprovalCard from './SubAgentApprovalCard.vue'
@@ -27,9 +27,19 @@ import {
   resolveInteraction,
   type PendingInteraction,
 } from '../../api/interactions'
+import { allowFreeTextOf, notifyInteractionsChanged, reconcilePending, type LiveTicketRef } from './pendingReconcile'
 import { describeApiError } from '../../utils/apiError'
 
-const props = defineProps<{ sessionId: string }>()
+const props = defineProps<{
+  sessionId: string
+  /**
+   * 本轮**实时**已经出现在上方卡片区的票据（H61 对账）。
+   *
+   * 同一张票既在库里、又在实时通道里：收件箱再渲染一张答复卡就等于给同一件事两个入口，
+   * 用户点了哪个都说不清。这里据此把重复行跳过（见 `pendingReconcile.ts`）。
+   */
+  liveTickets?: LiveTicketRef[]
+}>()
 const emit = defineEmits<{ (e: 'wake'): void }>()
 
 const { t } = useI18n()
@@ -68,6 +78,37 @@ async function refresh() {
 // 换会话即重取：列表按来电者身份过滤（后端不按会话猜），切走切回看到的都是各自的待办
 watch(() => props.sessionId, () => { void refresh() }, { immediate: true })
 
+/**
+ * 到期判定要走**权威值**（服务端 `expires_at`），而它是按秒推进的：
+ * 没有这一拍，一张 30s 前就该过期的票会一直显示成"还能答"。
+ */
+const nowTick = ref(Date.now())
+let expiryTimer: ReturnType<typeof globalThis.setInterval> | null = null
+watch(
+  () => props.sessionId,
+  () => {
+    if (expiryTimer !== null) return
+    expiryTimer = globalThis.setInterval(() => { nowTick.value = Date.now() }, 1000)
+  },
+  { immediate: true },
+)
+// 卸载时清掉：列表关掉后还在每秒 tick 就是白烧 CPU
+onBeforeUnmount(() => {
+  if (expiryTimer !== null) {
+    globalThis.clearInterval(expiryTimer)
+    expiryTimer = null
+  }
+})
+
+/**
+ * 对账后的行：实时通道已覆盖的票标 `live`，收件箱**不再重复出卡**（实时卡片就在上方）。
+ * 权威到期值一并算在这里 —— 模板里不再自己判时间。
+ */
+const rows = computed(() => reconcilePending(items.value, props.liveTickets || [], nowTick.value))
+
+/** 只剩"历史独有的票"需要收件箱给入口 */
+const inboxRows = computed(() => rows.value.filter((row) => !row.live))
+
 defineExpose({ refresh })
 
 /** 提交一张票。形状由 `kind` 决定，后端按库里的 kind 校验（不看客户端声称的是什么）。 */
@@ -94,6 +135,9 @@ async function respond(item: PendingInteraction, response: Record<string, unknow
       // 就地转成已答复态：不必重拉列表就能看到"这张已处理"，也不给重复作答留按钮
       item.status = 'answered'
     }
+    // 任何一张票落定都要让**角标**跟着重算：它自己按 30s 轮询，
+    // 不通知的话"历史 pending 与实时徽标不一致"会原样出现（角标还数着刚答完的那张）。
+    notifyInteractionsChanged()
     emit('wake')
   } catch (e) {
     // 业务失败是网关映射出来的状态码（404 不存在 / 409 已有下文 / 400 形状不对）：
@@ -167,7 +211,7 @@ function raiseBudget(item: PendingInteraction) {
 
 <template>
   <div
-    v-if="items.length"
+    v-if="inboxRows.length"
     class="interaction-inbox"
   >
     <div class="inbox-head">
@@ -184,7 +228,7 @@ function raiseBudget(item: PendingInteraction) {
     </div>
 
     <div
-      v-for="item in items"
+      v-for="item in inboxRows"
       :key="item.id"
       class="inbox-item"
     >
@@ -213,7 +257,8 @@ function raiseBudget(item: PendingInteraction) {
         v-else-if="item.kind === 'question'"
         :question="questionText(item)"
         :options="questionOptions(item)"
-        :expired="!!submitting[item.id]"
+        :allow-free-text="allowFreeTextOf(item)"
+        :expired="item.expired"
         @answer="(value: string) => respond(item, { answer: value })"
         @decline="() => respond(item, { declined: true })"
       />

@@ -13,7 +13,7 @@
  *
  * 两条都失败时**保持上一次读数**、不弹错：角标是增强，不是页面能否使用的条件。
  */
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { Badge } from 'ant-design-vue'
 import {
   createUserEventsConnection,
@@ -21,13 +21,30 @@ import {
   type PendingInteraction,
 } from '../../api/interactions'
 import type { SSEHandle } from '../../api'
+import { INTERACTIONS_CHANGED_EVENT, pendingUnionCount } from './pendingReconcile'
 
-const props = defineProps<{ pollMs?: number }>()
+const props = defineProps<{
+  pollMs?: number
+  /**
+   * 本轮实时票据的 id（H61 对账）。
+   *
+   * 角标的数据源是**服务端的跨会话列表**，而实时票据是"这一轮真的在等"的现场 ——
+   * 两者都缺一半：列表可能还没落库完，实时那份只覆盖当前会话。读数取**并集**（按票去重），
+   * 于是"角标数着 2、界面上只有 1 张能点"这类不一致不再出现。
+   */
+  liveIds?: string[]
+}>()
 const emit = defineEmits<{ (e: 'select', sessionId: string): void }>()
 
 const items = ref<PendingInteraction[]>([])
 const source = ref<SSEHandle | null>(null)
 let timer: ReturnType<typeof setInterval> | null = null
+
+/** 角标读数：历史 ∪ 实时，同一张票只算一次 */
+const count = computed(() => pendingUnionCount(
+  items.value,
+  (props.liveIds || []).map((id) => ({ id, kind: 'approval' as const })),
+))
 
 async function refresh() {
   try {
@@ -42,9 +59,16 @@ function openFirst() {
   if (sessionId) emit('select', sessionId)
 }
 
+function onInteractionsChanged() {
+  void refresh()
+}
+
 onMounted(() => {
   void refresh()
   timer = setInterval(() => void refresh(), props.pollMs ?? 30_000)
+  // 任何一处把票答完（收件箱 / 实时卡片 / 子 Agent 面板）都会广播一次：
+  // 不接这一条，角标就只能等下一轮 30s 轮询才变 —— 期间它一直数着已经答完的那张。
+  window.addEventListener(INTERACTIONS_CHANGED_EVENT, onInteractionsChanged)
   try {
     source.value = createUserEventsConnection(() => void refresh())
   } catch {
@@ -56,6 +80,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
   timer = null
+  window.removeEventListener(INTERACTIONS_CHANGED_EVENT, onInteractionsChanged)
   source.value?.close()
   source.value = null
 })
@@ -63,13 +88,13 @@ onBeforeUnmount(() => {
 
 <template>
   <button
-    v-if="items.length > 0"
+    v-if="count > 0"
     type="button"
     class="interaction-badge"
     :title="$t('agent.pending_interactions_title')"
     @click="openFirst"
   >
-    <Badge :count="items.length" :overflow-count="99" />
+    <Badge :count="count" :overflow-count="99" />
   </button>
 </template>
 

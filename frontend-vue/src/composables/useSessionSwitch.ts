@@ -41,6 +41,38 @@ export const HISTORY_PAGE_SIZE = 50
 export interface ReplayRunStateLike {
   loading: boolean
   items: ChatItem[]
+  /** 运行代际：该会话的运行时被**重建**（重开同一 id、重新建流）时递增 */
+  gen?: number
+  /**
+   * 回合序号：每提交一轮 +1（H69）。
+   *
+   * 只比 `loading` 不够 —— 拉取期间新一轮可能**已经跑完**（`loading` 回到 false），
+   * 此时旧快照会把这一轮刚产出的内容整段覆盖。代际也不够：它是"运行时重建"，不是"新回合"。
+   */
+  turnSeq?: number
+}
+
+/** 重拉开始时的现场（提交 CAS 前要比对的那份） */
+export interface ResyncSnapshot {
+  gen: number
+  turnSeq: number
+}
+
+/** 取现场：拉取**之前**调用 */
+export function resyncSnapshot(run: ReplayRunStateLike): ResyncSnapshot {
+  return { gen: run.gen ?? 0, turnSeq: run.turnSeq ?? 0 }
+}
+
+/**
+ * 提交 CAS（**纯函数**，单测直接钉）：这份快照还能不能落盘？
+ *
+ * 三个否：会话仍在跑（`loading`，与旧行为一致）、运行时代际变了、回合序号变了
+ * （后两条覆盖"新一轮已结束"这个 loading 看不出来的情形 —— H69 的核心）。
+ */
+export function canCommitResync(run: ReplayRunStateLike, snapshot: ResyncSnapshot): boolean {
+  if (run.loading) return false
+  if ((run.gen ?? 0) !== snapshot.gen) return false
+  return (run.turnSeq ?? 0) === snapshot.turnSeq
 }
 
 /** 一页历史的元信息（消息 + 工具调用两个游标互不相同） */
@@ -231,13 +263,17 @@ export function useSessionSwitch(options: UseSessionSwitchOptions): SessionSwitc
 
   /** 重拉某会话的历史并替换该会话的条目。事实源是消息列表，不是事件流。 */
   async function resyncSessionHistory(sid: string) {
+    // 现场在**发请求之前**取：拉取期间该会话可能又开跑一轮（甚至已经跑完）。
+    const snapshot = resyncSnapshot(options.runOf(sid))
     try {
       const res = await api.get(`/v1/conversations/${sid}?limit=${HISTORY_PAGE_SIZE}`)
       const data = res.data?.data || res.data
       if (!data?.messages) return
       const run = options.runOf(sid)
-      // 拉取期间该会话可能又开跑了新一轮：那时历史是旧的，覆盖会把新内容冲掉
-      if (run.loading) return
+      // CAS：拉取期间该会话可能又开跑了新一轮 —— 那时历史是旧的，覆盖会把新内容冲掉。
+      // **只看 `run.loading` 是 H69 修掉的那个缺口**：新一轮若已结束，loading 已经回到 false，
+      // 旧快照照样会把这一轮的产出整段盖掉（用户看到"刚跑完的结果忽然不见了"）。
+      if (!canCommitResync(run, snapshot)) return
       run.items = mergeHistory(data.messages, data.tool_calls || [])
       if (options.isActiveSession(sid)) {
         await nextTick()
