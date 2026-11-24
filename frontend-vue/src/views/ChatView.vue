@@ -55,6 +55,10 @@ import {
   type ScopedApproval,
   type ScopedQuestion,
 } from '../components/chat/interactionScope'
+import {
+  notifyInteractionsChanged,
+  type LiveTicketRef,
+} from '../components/chat/pendingReconcile'
 import { useTranscriptSearch } from '../composables/useTranscriptSearch'
 import { useTodoPanel } from '../composables/useTodoPanel'
 import { boardFromHistory } from '../components/chat/todoProjection'
@@ -670,6 +674,21 @@ const pendingApprovals = computed<readonly ScopedApproval[]>(
 const pendingQuestions = computed<readonly ScopedQuestion[]>(
   () => interactionScope.questionsOf(activeSessionId.value),
 )
+/**
+ * 实时票据 → 历史列表（收件箱 / 角标）的对账输入（H61）。
+ *
+ * 同一张票既在服务端 `pending_interactions` 里、又在实时通道里。两个数据源各有盲区
+ * （实时只覆盖当前会话，历史是拉取时的快照），所以**按票对齐**而不是二选一：
+ * 收件箱据此不再给同一张票出第二个答复入口，角标取并集计数。见 `pendingReconcile.ts`。
+ */
+const liveInteractionTickets = computed<LiveTicketRef[]>(() => [
+  ...interactionScope.approvalsOf(activeSessionId.value)
+    .map(t => ({ id: t.id, kind: 'approval' as const, toolCallId: t.id })),
+  ...interactionScope.questionsOf(activeSessionId.value)
+    .map(t => ({ id: t.id, kind: 'question' as const, toolCallId: t.id })),
+])
+/** 全部会话的实时票据 id（角标按并集计数） */
+const livePendingIds = computed<string[]>(() => [...interactionScope.liveIds()])
 
 // 审批卡片出现时给一声提示：它会阻塞整个执行链，而用户很可能已经切到别的窗口了。
 // 判据用**全部会话**的票数：后台会话的审批同样在等人，只盯当前会话会让它静默超时。
@@ -753,7 +772,19 @@ async function resolveApproval(
   // 只有服务端确认（无异常）才摘票
   interactionScope.settle('approval', ticket.id)
   clearApprovalEdit(ticket.id)
+  settleInteractionViews()
   return true
+}
+
+/**
+ * 一张票落定后的统一收尾（H61）：让**其它观察者**跟上，而不是各自等轮询。
+ *
+ * 收件箱是历史列表的读视图、角标是跨会话计数 —— 它们都不会自己知道"刚刚答完一张"。
+ * 不通知的话就是那个老问题："我答过了，列表里还在、角标还数着。"
+ */
+function settleInteractionViews() {
+  notifyInteractionsChanged()
+  void interactionInboxRef.value?.refresh()
 }
 
 // ── C5：审批卡片的"编辑参数"折叠区 ────────────────────────────────────────
@@ -844,6 +875,7 @@ async function submitQuestionTicket(
   }
   interactionScope.settle('question', question.id)
   if (interactionScope.questionCount() === 0) stopAskTimer()
+  settleInteractionViews()
   return true
 }
 
@@ -3187,7 +3219,10 @@ function continueGeneration() {
           <div class="toolbar-side toolbar-actions">
             <!-- M21：跨会话待办角标 —— 任何页面都能看到"我还欠哪些答复"，点一下跳过去。
                  M7 的收件箱只在打开那个会话时可见，这条补的正是"不知道哪个会话欠答复"。 -->
-            <InteractionBadge @select="switchSession" />
+            <InteractionBadge
+              :live-ids="livePendingIds"
+              @select="switchSession"
+            />
             <Button
               type="text"
               size="small"
@@ -3580,6 +3615,7 @@ function continueGeneration() {
       <InteractionInbox
         ref="interactionInboxRef"
         :session-id="activeSessionId"
+        :live-tickets="liveInteractionTickets"
         @wake="wakeFromInbox"
       />
 
