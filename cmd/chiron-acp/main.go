@@ -446,13 +446,13 @@ func (c *conn) streamPrompt(ctx context.Context, sessionID, content string) (str
 			continue
 		}
 		var ev struct {
-			Type      string  `json:"type"`
-			Content   string  `json:"content"`
-			ID        string  `json:"tool_call_id"`
-			Name      string  `json:"tool_name"`
-			Arguments string  `json:"tool_arguments"`
-			Error     string  `json:"error"`
-			Stop      string  `json:"stop_reason"`
+			Type      string `json:"type"`
+			Content   string `json:"content"`
+			ID        string `json:"tool_call_id"`
+			Name      string `json:"tool_name"`
+			Arguments string `json:"tool_arguments"`
+			Error     string `json:"error"`
+			Stop      string `json:"stop_reason"`
 		}
 		if err := json.Unmarshal([]byte(payloadText), &ev); err != nil {
 			continue // 无法解析的帧：跳过而不是中断整轮
