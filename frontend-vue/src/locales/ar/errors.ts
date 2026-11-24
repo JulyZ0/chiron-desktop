@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 后端稳定错误码 → 文案（ar，RTL）。
  * 键与 internal/api/error_codes.go 的 Code* 常量一一对应，勿改键名。
  */
@@ -171,6 +171,7 @@ export default {
   restore_timeout: "مهلة الاستعادة",
   restore_failed: "فشل الاستعادة",
   answer_submission_failed_please_retry: "فشل إرسال الإجابة، يرجى المحاولة مرة أخرى",
+  approval_submission_failed_please_retry: "فشل إرسال الموافقة، يرجى المحاولة مرة أخرى (تم الاحتفاظ بالبطاقة)",
   failed_to_load_session_list: "فشل تحميل قائمة الجلسات",
   failed_to_fetch_agent_list: "فشل جلب قائمة الوكلاء",
   failed_to_fetch_agent_marketplace: "فشل جلب سوق الوكلاء",

@@ -19,6 +19,13 @@ export interface PendingApproval {
   arguments: string
   /** 审批截止时间（ms）：与后端 300s 超时对齐，用于卡片倒计时与过期清理 */
   expiresAt?: number
+  /**
+   * 票的**不可变归属**（H59）：票到达时属于哪个会话。
+   *
+   * 提交只认它（不再读 `activeSessionId`）—— 否则在会话 B 里点开 A 的票，批准会发到 B，
+   * 而 A 那边一直等到超时。见 `components/chat/interactionScope.ts`。
+   */
+  sessionId?: string
 }
 
 export interface ApprovalEditState {
@@ -32,7 +39,7 @@ export interface ApprovalEditDeps {
    * 提交审批决定。`editedArguments` 非空 ⇒ "**编辑后批准**"：回传
    * `decision: 'edit'` 与编辑后的完整参数，由引擎重跑工具分级（级别升高则不执行）。
    */
-  resolveApproval: (a: PendingApproval, approved: boolean, editedArguments?: string) => Promise<void>
+  resolveApproval: (a: PendingApproval, approved: boolean, editedArguments?: string) => Promise<unknown>
 }
 
 export function useApprovalEdit(deps: ApprovalEditDeps) {

@@ -1025,6 +1025,19 @@ export interface SSEHandle {
   close(): void
 }
 
+/**
+ * 一帧的传输层元信息（**不影响业务载荷**）。
+ *
+ * 为什么把它交给 `onMessage`：同一条 `/events` 端点会被**两条**连接订阅（一轮的流 + 会话级
+ * 子 Agent 流），两者各有各的续传游标（`Last-Event-ID`）。此前游标只有 `onLastEventId`
+ * 一个出口，而它属于"opts"，接入它就得改 opts 的形状 —— 对于只有一条连接的调用方是噪声。
+ * 现在帧 id 随帧一起交出去：需要的调用方自己记，不需要的照旧忽略第二个参数。
+ */
+export interface SSEFrameMeta {
+  /** 这一帧的 `id:` 行（空串 = 该帧没有 id，不可用于去重/续传） */
+  id: string
+}
+
 /** 重连间隔：够短让流式看起来"没断"，够长不给正在重启的网关添压。 */
 const SSE_RECONNECT_DELAY_MS = 1000
 
@@ -1056,7 +1069,7 @@ function parseSSEFrame(frame: string): { data: string; event: string; id: string
  */
 export function openEventStream(
   url: string,
-  onMessage: (data: unknown) => void,
+  onMessage: (data: unknown, meta: SSEFrameMeta) => void,
   onError?: () => void,
   opts: SSEConnectionOptions = {},
 ): SSEHandle {
@@ -1127,7 +1140,7 @@ export function openEventStream(
     // 收不到它。这里保持一致，否则心跳会变成对话里的幽灵消息。
     if (!parsed.data || (parsed.event && parsed.event !== 'message')) return
     try {
-      onMessage(JSON.parse(parsed.data))
+      onMessage(JSON.parse(parsed.data), { id: parsed.id })
     } catch {
       // 单帧解析失败不断流（旧实现也是这样吞掉的）
     }
@@ -1195,7 +1208,7 @@ export function openEventStream(
 /** 会话事件流：`/events?session_id=…`（身份在 header，见上面那段注释）。 */
 export function createSSEConnection(
   sessionId: string,
-  onMessage: (data: unknown) => void,
+  onMessage: (data: unknown, meta: SSEFrameMeta) => void,
   onError?: () => void,
   opts: SSEConnectionOptions = {},
 ): SSEHandle {

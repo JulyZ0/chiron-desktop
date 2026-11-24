@@ -49,6 +49,12 @@ import { useNewUserOnboarding, markFirstMessageDone } from '../composables/useNe
 import { TOUR_ANCHORS, type TourReason } from '../composables/useOnboardingTour'
 import { useChatShare } from '../composables/useChatShare'
 import { useApprovalEdit, type PendingApproval } from '../composables/useApprovalEdit'
+import {
+  claimTicket,
+  createInteractionScope,
+  type ScopedApproval,
+  type ScopedQuestion,
+} from '../components/chat/interactionScope'
 import { useTranscriptSearch } from '../composables/useTranscriptSearch'
 import { useTodoPanel } from '../composables/useTodoPanel'
 import { boardFromHistory } from '../components/chat/todoProjection'
@@ -604,13 +610,41 @@ const items = computed<ChatItem[]>({
  * 纯函数，那里写明了两条数据源为什么要分开。
  */
 const agentWrittenPaths = computed(() => collectAgentWrittenPaths(items.value))
-let activeSSE: SSEHandle | null = null
+/**
+ * ── SSE 连接**按会话**持有（H59）──
+ *
+ * 此前是一个模块级 `activeSSE`：多会话并行时它只指得着"最后建的那一条"。两个后果都真实发生过：
+ * ① 任何一条流收尾都会去关它 —— 可能关掉的是**另一个会话**仍在跑的流（那个会话就此静默：
+ *    不再出字、`loading` 永远挂着）；② 切会话把指针置空，切回正在跑的会话反而停不了它
+ *    （旧注释写着"宁可停不了，也不能停错"，那正是这个全局变量的代价）。
+ *
+ * 现在每条流只属于建它的会话：收尾 / 出错 / 停止都只关**自己那条**（"只有来源流可关闭自身"）。
+ */
+const sseBySession = reactive(new Map<string, SSEHandle>())
 // 每个会话最后收到的 SSE 事件 id（服务端 id: 行 → event.lastEventId）。
 // 跨轮重建 SSE 时回传（last_event_id），服务端从缓冲流补发上一轮断线缺口（见 api/index.ts createSSEConnection）
 const sseLastIdBySession = new Map<string, string>()
 // H68: auth switch must clear the SSE resume cursor; the map lives here,
 // so the reset is registered as a hook and released on unmount.
 let unregisterAuthScopedReset: (() => void) | undefined
+
+/** 该会话是否有一条本页的会话流（子 Agent 通道据此决定同一帧交给谁） */
+function hasSessionStream(sid: string): boolean {
+  return !!sid && sseBySession.has(sid)
+}
+
+/** 关掉**某个会话**的流（幂等；绝不碰别的会话的流） */
+function closeSessionStream(sid: string): void {
+  const handle = sid ? sseBySession.get(sid) : undefined
+  if (!handle) return
+  sseBySession.delete(sid)
+  handle.close()
+}
+
+/** 关掉全部（卸载 / 认证切换 / 退出统一任务模式） */
+function closeAllSessionStreams(): void {
+  for (const sid of [...sseBySession.keys()]) closeSessionStream(sid)
+}
 
 // ── 失败消息标记与手动修复（实现见 composables/useMessageFailure.ts）──
 const { markMessageFailed, describeFailureMeta, repairSession } = useMessageFailure({
@@ -622,10 +656,25 @@ const { markMessageFailed, describeFailureMeta, repairSession } = useMessageFail
 const currentTraceId = ref('')  // SSE done 事件回传的 trace_id
 
 // 安全修复：待确认工具调用（三态栅栏"确认"态）；类型定义在 useApprovalEdit.ts
-const pendingApprovals = ref<PendingApproval[]>([])
+//
+// H59：票据**按会话建图**（见 `components/chat/interactionScope.ts` 文件头）。两个全局 ref
+// 会有四种后果：会话 A 的票画在 B 的输入区上方、在 B 里点"允许"却批准到 B、切会话把 A
+// 仍在等的票一起清空、后台会话的票静默超时。归属在**到达时**冻结，提交只认票自己的归属。
+const interactionScope = createInteractionScope()
+
+/** 当前视图会话的待审批票据（模板 / 倒计时读它；别的会话的票留在自己的桶里） */
+const pendingApprovals = computed<readonly ScopedApproval[]>(
+  () => interactionScope.approvalsOf(activeSessionId.value),
+)
+/** 当前视图会话的待答提问 */
+const pendingQuestions = computed<readonly ScopedQuestion[]>(
+  () => interactionScope.questionsOf(activeSessionId.value),
+)
+
 // 审批卡片出现时给一声提示：它会阻塞整个执行链，而用户很可能已经切到别的窗口了。
+// 判据用**全部会话**的票数：后台会话的审批同样在等人，只盯当前会话会让它静默超时。
 // 只在"新增"时响（长度变大），过期清理导致的减少不该出声。
-watch(() => pendingApprovals.value.length, (n, prev) => {
+watch(() => interactionScope.approvalCount(), (n, prev) => {
   if (n > prev) playUiSound('tool-pending')
 })
 // 审批卡片倒计时：approval 事件到达时记录截止时间（后端 _await_approval 默认 300s，
@@ -644,11 +693,10 @@ function ensureApprovalTimer() {
   if (approvalTimer) return
   approvalTimer = setInterval(() => {
     approvalTick.value++
-    const now = Date.now()
-    pendingApprovals.value = pendingApprovals.value.filter(
-      (p) => !p.expiresAt || p.expiresAt > now,
-    )
-    if (pendingApprovals.value.length === 0 && approvalTimer) {
+    // 过期清理是**跨会话**的：后台会话的票同样在超时（后端 300s 后按拒绝处理），
+    // 只清"当前视图"那份会让它们在切回来时仍然显示为可批。
+    const remaining = interactionScope.sweepApprovals(Date.now())
+    if (remaining === 0 && approvalTimer) {
       clearInterval(approvalTimer)
       approvalTimer = null
     }
@@ -659,26 +707,53 @@ function ensureApprovalTimer() {
  * 提交审批决定。`editedArguments`（C5）非空 ⇒ "**编辑后批准**"：
  * 回传 `decision: 'edit'` 与编辑后的完整参数，由引擎重跑工具分级
  * （级别升高则不执行）—— 前端**不做**本地放行判断，那会是第二份分级表。
+ *
+ * H59 + H61 的三条：
+ * 1. `session_id` 取**票自己的**归属（到达时冻结），不取 `activeSessionId`；
+ * 2. 归属不符 / 属上一次运行时 / 已在提交中 ⇒ 一律**不提交**，票原地保留（`claimTicket`）；
+ * 3. **服务端确认前不摘票**：失败把原因写回卡片并允许重试（旧实现 `catch {}` 吞掉后照样
+ *    删卡片 —— 用户以为批过了，而引擎一直等到 300s 超时按拒绝处理）。
  */
 async function resolveApproval(
   a: PendingApproval,
   approved: boolean,
   editedArguments?: string,
-) {
+): Promise<boolean> {
+  const ticket = a as ScopedApproval
+  const ownerSession = String(ticket.sessionId || '')
+  const claim = claimTicket(ticket, {
+    sessionId: activeSessionId.value,
+    gen: ownerSession ? runOf(ownerSession).gen : 0,
+  })
+  if (!claim.ok) {
+    // 拒绝错配提交：这张票不属于当前视图（用户已经切走），或已在等上一次回执。
+    // 留一条 warn 便于排查"点了没反应" —— 但它**不该**产生一次真实的放行。
+    console.warn('[chat] approval submit rejected', {
+      reason: claim.reason,
+      id: ticket.id,
+      owner: ownerSession,
+      view: activeSessionId.value,
+    })
+    return false
+  }
+  interactionScope.setBusy('approval', ticket.id, true)
   try {
     await submitApproval({
-      session_id: activeSessionId.value || '',
-      tool_call_id: a.id,
+      session_id: ownerSession,
+      tool_call_id: ticket.id,
       approved: editedArguments ? true : approved,
       decision: editedArguments ? 'edit' : approved ? 'approve' : 'reject',
       ...(editedArguments ? { arguments: editedArguments } : {}),
     })
-  } catch {
-    // 静默失败
-  } finally {
-    pendingApprovals.value = pendingApprovals.value.filter(p => p.id !== a.id)
-    clearApprovalEdit(a.id)
+  } catch (e) {
+    interactionScope.markFailed('approval', ticket.id, describeApiError(e))
+    notify.error(t('errors.approval_submission_failed_please_retry'))
+    return false
   }
+  // 只有服务端确认（无异常）才摘票
+  interactionScope.settle('approval', ticket.id)
+  clearApprovalEdit(ticket.id)
+  return true
 }
 
 // ── C5：审批卡片的"编辑参数"折叠区 ────────────────────────────────────────
@@ -695,19 +770,8 @@ const {
 // ── 结构化提问（ask_user 工具）────────────────────────────────────────────
 // 与审批卡的分工：审批回传布尔（允许/拒绝），提问回传**答案文本**（选项值或自由输入），
 // 因此走独立的 /v1/agent/answer 通道而不是复用 approval。
-interface PendingQuestion {
-  id: string
-  question: string
-  options: string[]
-  allowFreeText: boolean
-  /** 到期时刻；到点置 `expired` 但**保留**卡片与问题上下文（对齐 AskCard 的 expired 语义） */
-  expiresAt: number
-  expired?: boolean
-  /** 用户**已经开始作答**（输入框有内容）。已开始的项不再判超时 —— 人还在写，不该夺走卡片 */
-  drafting?: boolean
-}
-
-const pendingQuestions = ref<PendingQuestion[]>([])
+// 票据形状与归属见 `components/chat/interactionScope.ts`（`ScopedQuestion`）：H59 起
+// 提问与审批共用同一个按会话建图的仓库，`pendingQuestions` 只是"当前视图会话"的投影。
 
 // 任务预算快照（引擎 `done` 事件带 `budget={轴: {used, limit}}`，`limit=0` 表示该轴不限）。
 const budgetSnapshot = ref<Record<string, { used?: number; limit?: number }> | null>(null)
@@ -736,29 +800,55 @@ function stopAskTimer() {
 function ensureAskTimer() {
   if (askTimer) return
   askTimer = setInterval(() => {
-    const now = Date.now()
-    let anyLive = false
-    for (const item of pendingQuestions.value) {
-      // 已经在作答的项**不判超时**（上游 #12884 同款）：人还在写，把卡片禁掉只会白丢他的输入。
-      if (item.expiresAt <= now && !item.drafting) item.expired = true
-      else anyLive = true
-    }
-    if (!anyLive) stopAskTimer()
+    // 跨会话判过期：后台会话的提问同样在等超时，只看当前视图那份会让它们永远显示成可答。
+    if (!interactionScope.sweepQuestions(Date.now())) stopAskTimer()
   }, 1000)
 }
 
-async function answerQuestion(question: PendingQuestion, answer: string) {
-  pendingQuestions.value = pendingQuestions.value.filter(item => item.id !== question.id)
-  if (pendingQuestions.value.length === 0) stopAskTimer()
+/**
+ * 答复一张提问票（H59 + H61）。
+ *
+ * 与审批同一条纪律：归属只认票自己的 `sessionId`、错配拒绝、**确认前不摘票**。
+ * 旧实现在提交**之前**就从列表里删掉，失败只弹一句 toast —— 卡片没了、票还在服务端，
+ * 用户除了刷新页面没有任何补救入口。
+ */
+async function submitQuestionTicket(
+  question: ScopedQuestion,
+  payload: Record<string, unknown>,
+): Promise<boolean> {
+  const ownerSession = String(question.sessionId || '')
+  const claim = claimTicket(question, {
+    sessionId: activeSessionId.value,
+    gen: ownerSession ? runOf(ownerSession).gen : 0,
+  })
+  if (!claim.ok) {
+    console.warn('[chat] question submit rejected', {
+      reason: claim.reason,
+      id: question.id,
+      owner: ownerSession,
+      view: activeSessionId.value,
+    })
+    return false
+  }
+  interactionScope.setBusy('question', question.id, true)
   try {
     await submitAnswer({
-      session_id: activeSessionId.value || '',
+      session_id: ownerSession,
       tool_call_id: question.id,
-      answer,
+      ...payload,
     })
-  } catch {
+  } catch (e) {
+    interactionScope.markFailed('question', question.id, describeApiError(e))
     notify.error(t('errors.answer_submission_failed_please_retry'))
+    return false
   }
+  interactionScope.settle('question', question.id)
+  if (interactionScope.questionCount() === 0) stopAskTimer()
+  return true
+}
+
+async function answerQuestion(question: ScopedQuestion, answer: string) {
+  await submitQuestionTicket(question, { answer })
 }
 
 /** 成本常显：计价在网关侧，引擎只管 token，所以要拉会话级 metrics。 */
@@ -778,19 +868,8 @@ async function refreshSessionCost() {
 }
 
 /** 明确拒绝回答：走同一条通道，但带 `declined` 标志 —— 模型收到的是"用户拒绝"，不是超时错误。 */
-async function declineQuestion(question: PendingQuestion) {
-  pendingQuestions.value = pendingQuestions.value.filter(item => item.id !== question.id)
-  if (pendingQuestions.value.length === 0) stopAskTimer()
-  try {
-    await submitAnswer({
-      session_id: activeSessionId.value || '',
-      tool_call_id: question.id,
-      answer: '',
-      declined: true,
-    })
-  } catch {
-    notify.error(t('errors.answer_submission_failed_please_retry'))
-  }
+async function declineQuestion(question: ScopedQuestion) {
+  await submitQuestionTicket(question, { answer: '', declined: true })
 }
 
 // ── 人工介入待办收件箱（M7c）──────────────────────────────────────────────
@@ -1216,7 +1295,7 @@ async function applyRouteQuery() {
     currentTraceId.value = ''
     loading.value = false
     stopTurnTimer()
-    if (activeSSE) { activeSSE.close(); activeSSE = null }
+    closeAllSessionStreams()
     if (task) await loadUnifiedSession(task)
   }
   errorBanner.value = typeof q.error === 'string' && q.error ? q.error : ''
@@ -1589,7 +1668,7 @@ const {
 } = useSubagentStream({
   sessionId: () => activeSessionId.value,
   resolveRun: () => writingRun.value ?? currentRun.value,
-  isTurnStreamOpen: () => activeSSE !== null,
+  isTurnStreamOpen: (sid?: string) => hasSessionStream(sid || ''),
 })
 
 /**
@@ -1772,7 +1851,12 @@ useKeyboardShortcuts({
 // ── 会话 CRUD（保留原逻辑） ──
 onMounted(async () => {
   unregisterAuthScopedReset?.()
-  unregisterAuthScopedReset = registerAuthScopedReset(() => { sseLastIdBySession.clear() })
+  unregisterAuthScopedReset = registerAuthScopedReset(() => {
+    // 认证切换：续传游标与全部会话流一起作废（旧身份的事件流不该在新身份下继续被消费）
+    sseLastIdBySession.clear()
+    closeAllSessionStreams()
+    interactionScope.clear()
+  })
   // 互联互通：解析 /chat query（task / error / kb / agent / skill）
   await applyRouteQuery()
   await loadSessions()
@@ -1798,8 +1882,7 @@ onUnmounted(() => {
   unregisterAuthScopedReset?.()
   unregisterAuthScopedReset = undefined
   stopTurnTimer()
-  if (activeSSE) { activeSSE.close(); activeSSE = null }
-  // 子 Agent 通道：关常驻连接 + 冲刷未落盘的合批缓冲（见 useSubagentStream.disposeSubagentStream）
+  closeAllSessionStreams()
   disposeSubagentStream()
   if (unifiedDoneTimer) { clearTimeout(unifiedDoneTimer); unifiedDoneTimer = null }
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
@@ -2088,17 +2171,13 @@ async function switchSession(id: string) {
   // 切回来时读到的就是它自己的（可能正在增长的）列表。
   // 顺序要紧：先设 activeSessionId，后面的 currentRun 才指向新会话。
   activeSessionId.value = id
-  // 切会话要**清掉上一个会话遗留的待审批 / 待答问题**（对齐 Reasonix 的
-  // "tab activation clears a stale approval already stored on the target tab"）：
-  // 它们是**那个**会话在等用户操作，显示在当前会话上会让人误以为"在等我处理"。
-  pendingApprovals.value = []
-  pendingQuestions.value = []
-  stopAskTimer()
-  // `activeSSE` 只应指向"**本会话**正在跑的流"。本会话没在跑就置空 ——
-  // 否则在会话 B 里点"停止"会去停 A 仍在跑的流。
-  // （切回正在跑的会话时这里会置空、因而暂时停不了它：**宁可停不了，也不能停错**；
-  //   完整版是给每个会话各自持有连接，属下一批。）
-  if (!currentRun.value.loading) activeSSE = null
+  // 票据**不清**（H59）：票属于**它到达时**的会话（`pendingApprovals` 已是"当前会话"的投影），
+  // 切走只是不再显示它 —— 旧实现把 A 的票一起清空，而服务端仍在等 A 的答复，
+  // 用户切回去时卡片再也不会出现。后台会话的提问也继续按自己的到期时间判定。
+  ensureAskTimer()
+  // 本会话没在跑却还挂着一条流 ⇒ 那是陈旧句柄（上一轮已收尾），收掉它。
+  // 正在跑的会话**保流**：切回来才续得上（旧实现这里会把指针置空，于是切回来就停不了它）。
+  if (!currentRun.value.loading) closeSessionStream(id)
   // 模式（对话模式 + 工具授权模式）不在此同步：它们是前端全局实时状态，
   // 切换会话既不改变它们，也不从会话状态读回（见 buildLlmConfig 的说明）。
   try {
@@ -2347,7 +2426,7 @@ function goalCompletionNotice(raw: string): string {
 
 /** `stream_gap` 后的补拉（含"本轮在跑就先记账"）：见 `composables/useSessionSwitch.ts`，
  *  已在上方解构。断线补不齐时事实源是消息列表，重拉即恢复。 */
-function onSSEMessage(raw: unknown, sid: string) {
+function onSSEMessage(raw: unknown, sid: string, frameId = '') {
   // SSE 载荷来自服务端 JSON（createSSEConnection 的 onMessage 契约即 unknown）：
   // 在边界一次性窄化成 Record，后续各事件分支只做字段级取值，不把 unknown 透出去。
   const evt = (raw ?? {}) as Record<string, unknown>
@@ -2538,7 +2617,8 @@ function onSSEMessage(raw: unknown, sid: string) {
     flushStreamingFlags()
     loading.value = false
     stopTurnTimer()
-    activeSSE?.close(); activeSSE = null
+    // H59：只关**这条流自己**。全局单句柄时代，A 收尾会关掉 B 仍在跑的流（B 从此静默）。
+    closeSessionStream(sid)
     // 轮次可能以 `awaiting_input` 收尾（SSE 已关，实时卡片不会再出现）：刷新收件箱把
     // 落在 pending_interactions 里的待办补上，否则用户只看到"回合结束"却不知还欠一次答复。
     void interactionInboxRef.value?.refresh()
@@ -2548,22 +2628,28 @@ function onSSEMessage(raw: unknown, sid: string) {
     flushGapResync(sid)
   } else if (type === 'approval') {
     const callId = String(d.id ?? d.tool_call_id ?? Date.now())
-    pendingApprovals.value.push({
+    interactionScope.addApproval({
       id: callId,
       toolName: String(d.name ?? 'tool'),
       arguments: String(d.arguments ?? ''),
       // 倒计时：与后端 _await_approval 的 300s 超时对齐（超时按拒绝处理）
       expiresAt: Date.now() + APPROVAL_TIMEOUT_MS,
+      // H59：归属**在到达时冻结** —— 是"发这条事件的那条流"的会话，不是此刻正在看的会话。
+      // 用户切走之后事件仍会到达（多会话并行），用 activeSessionId 会把 A 的票记到 B 头上。
+      sessionId: sid,
+      runGen: runOf(sid).gen,
     })
     ensureApprovalTimer()
   } else if (type === 'ask') {
     // 后端 ask_user 工具在等答案：卡片按 tool_call_id 回填
-    pendingQuestions.value.push({
+    interactionScope.addQuestion({
       id: String(d.id ?? d.tool_call_id ?? Date.now()),
       question: String(d.question ?? d.content ?? t('common.needs_your_confirmation')),
       options: Array.isArray(d.options) ? d.options.map((option: unknown) => String(option)) : [],
       allowFreeText: d.allow_free_text !== false,
       expiresAt: Date.now() + ASK_TIMEOUT_MS,
+      sessionId: sid,
+      runGen: runOf(sid).gen,
     })
     ensureAskTimer()
   } else if (type === 'stream_gap') {
@@ -2574,7 +2660,7 @@ function onSSEMessage(raw: unknown, sid: string) {
     flushStreamingFlags()
     loading.value = false
     stopTurnTimer()
-    activeSSE?.close(); activeSSE = null
+    closeSessionStream(sid) // 同上：只关来源流
     // 被安全策略拦下不是"临时故障"：自动补唤醒只会再撞一次同一道护栏
     clearPendingInboxWake()
     const reason = typeof d.content === 'string' && d.content
@@ -2593,7 +2679,7 @@ function onSSEMessage(raw: unknown, sid: string) {
     flushStreamingFlags()
     loading.value = false
     stopTurnTimer()
-    activeSSE?.close(); activeSSE = null
+    closeSessionStream(sid) // 同上：只关来源流
     // 这一轮以错误收尾：自动补唤醒大概率撞同一个错（401/余额不足/限流），
     // 把一次失败变成反复失败。票留在 answered，等用户手动发下一条时被消费。
     clearPendingInboxWake()
@@ -2612,7 +2698,8 @@ function onSSEMessage(raw: unknown, sid: string) {
     // 子 Agent 进度（docs/subagent-design.md §4.2）：只进侧边栏观测面板。
     // 刻意不落主对话流 —— 子 Agent 的思考/正文是"数据"，不是会话内容。
     const event = (Object.keys(d).length ? { ...d, type } : { ...evt }) as unknown as SubagentEvent
-    pushSubagentEvent(event)
+    // 带上帧 id：同一条事件会经两条连接（本轮流 + 会话级子 Agent 流）各到一份，按 run 去重
+    pushSubagentEvent(event, frameId)
   }
 }
 
@@ -2755,15 +2842,16 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
   const sessionId = activeSessionId.value
   currentTraceId.value = ''
   try {
-    if (activeSSE) { activeSSE.close(); activeSSE = null }
-    activeSSE = createSSEConnection(
+    // H59：只替换**本会话**的流（别的会话仍在跑的流不受影响）
+    closeSessionStream(sessionId)
+    sseBySession.set(sessionId, createSSEConnection(
       sessionId,
-      (raw) => withRun(runOf(sessionId), () => onSSEMessage(raw, sessionId)),
+      (raw, meta) => withRun(runOf(sessionId), () => onSSEMessage(raw, sessionId, meta?.id)),
       () => {
         loading.value = false
         stopTurnTimer()
         connectionLost.value = true
-        activeSSE?.close(); activeSSE = null
+        closeSessionStream(sessionId)
         markMessageFailed(userItemId, t('common.connection_lost'))
         // 真断线（自动重连已用尽）才响：抖动期间的重连不该打扰
         playUiSound('disconnected')
@@ -2775,7 +2863,7 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
         autoReconnect: true,
         onLastEventId: (id) => { sseLastIdBySession.set(sessionId, id) },
       },
-    )
+    ))
     const clientMsgId = crypto.randomUUID()
     const body: Record<string, unknown> = {
       content: text,
@@ -2801,7 +2889,7 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
     void markFirstMessageDone()
     return true
   } catch (e) {
-    if (activeSSE) { activeSSE.close(); activeSSE = null }
+    closeSessionStream(sessionId)
     loading.value = false
     stopTurnTimer()
     flushStreamingFlags()
@@ -2947,8 +3035,9 @@ function stopGeneration() {
     onStopped: (sid) => {
       const run = runOf(sid)
       stopTurnTimer()
-      // 只关**这个会话**的流：用户可能已经切到别的会话上（那边不该被牵连）
-      if (sid === activeSessionId.value && activeSSE) { activeSSE.close(); activeSSE = null }
+      // 只关**这个会话**的流：用户可能已经切到别的会话上（那边不该被牵连）。
+      // H59 起每个会话各持一条，所以这里按 sid 精确关闭，不再需要"等于当前视图"这层判断。
+      closeSessionStream(sid)
       run.loading = false
       withRun(run, () => flushStreamingFlags())
       // 用户喊停是明确说"别再跑了"：这里**不能**补发待办唤醒，否则按下停止后
@@ -3404,6 +3493,14 @@ function continueGeneration() {
           <div class="approval-args">
             {{ a.arguments }}
           </div>
+          <!-- H61：提交失败**票不摘**，错误写在卡片上、按钮可再点（旧实现吞错后照样删卡片 ->
+               用户以为批过了，而引擎一直等到 300s 超时按拒绝处理）。 -->
+          <div
+            v-if="a.error"
+            class="approval-edit-error"
+          >
+            {{ a.error }}
+          </div>
           <div
             v-if="approvalEdit(a)?.open"
             class="approval-edit"
@@ -3427,6 +3524,7 @@ function continueGeneration() {
             <button
               class="approval-btn danger"
               type="button"
+              :disabled="!!a.busy"
               @click="resolveApproval(a, false)"
             >
               {{ $t('errors.reject') }}
@@ -3451,6 +3549,7 @@ function continueGeneration() {
               v-else
               class="approval-btn allow"
               type="button"
+              :disabled="!!a.busy"
               @click="resolveApproval(a, true)"
             >
               {{ $t('common.allow_execution') }}

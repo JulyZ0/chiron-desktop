@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 后端稳定错误码 → 文案（zh-CN，源语言）。
  *
  * 键必须与 internal/api/error_codes.go 的 Code* 常量一一对应：
@@ -177,6 +177,7 @@ export default {
   restore_timeout: "恢复超时",
   restore_failed: "恢复失败",
   answer_submission_failed_please_retry: "回答提交失败，请重试",
+  approval_submission_failed_please_retry: "审批提交失败，请重试（卡片已保留）",
   failed_to_load_session_list: "会话列表加载失败",
   failed_to_fetch_agent_list: "获取 Agent 列表失败",
   failed_to_fetch_agent_marketplace: "获取 Agent 市场失败",
