@@ -36,8 +36,33 @@ from app.knowledge.providers.base import (
 
 logger = logging.getLogger(__name__)
 
+
+def _token_fingerprint(token: str) -> str:
+    """仅供排错的不可逆指纹；绝不把内部令牌写进错误或日志。"""
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
 _LOCAL_SUFFIXES = {".pdf"}
 _CLOUD_SUFFIXES = {".pdf", ".pptx", ".ppt", ".docx", ".doc"}
+
+
+def _display_endpoint(url: str) -> str:
+    """错误消息只暴露 scheme/host/port，丢弃 userinfo、路径、查询串和片段。"""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(str(url or ""))
+        if not parts.scheme or not parts.hostname:
+            return "(invalid endpoint)"
+        host = parts.hostname
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme}://{host}{port}"
+    except Exception:  # noqa: BLE001 — 诊断文案不能反过来抛错
+        return "(invalid endpoint)"
 
 
 class RemoteProvider:
@@ -83,6 +108,7 @@ class RemoteProvider:
         token = str(getattr(settings, "internal_token", "") or "")
         if not token:
             raise ProviderUnavailableError("INTERNAL_TOKEN 未配置，无法调用知识库服务")
+        display = _display_endpoint(base)
         try:
             async with httpx.AsyncClient(
                 base_url=base,
@@ -91,9 +117,15 @@ class RemoteProvider:
             ) as client:
                 resp = await client.post(path, json=payload)
         except Exception as exc:  # noqa: BLE001 — 服务不可达 = provider 不可用，不是 500
-            raise ProviderUnavailableError(f"检索服务不可达（{base}）：{exc}") from exc
+            raise ProviderUnavailableError(f"检索服务不可达（{display}）：{exc}") from exc
         if resp.status_code == 401:
-            raise ProviderUnavailableError("检索服务拒绝内部令牌（INTERNAL_TOKEN 与引擎不一致）")
+            raise ProviderUnavailableError(
+                "检索服务拒绝内部令牌（HTTP 401，"
+                f"endpoint={display}，engine_token_sha256={_token_fingerprint(token)}）："
+                "引擎与 pageindex-service 的 INTERNAL_TOKEN 不一致；"
+                "请确认两者使用同一 APP_SECRET 派生（chiron-internal），"
+                "或显式配置相同的 INTERNAL_TOKEN"
+            )
         if resp.status_code >= 400:
             detail = ""
             try:
@@ -172,7 +204,7 @@ class RemoteProvider:
             body = dict(resp.json() or {})
             if resp.status_code >= 400:
                 return HealthResult(
-                    False, STATUS_ERROR, f"检索服务健康检查失败（HTTP {resp.status_code}，{base}）"
+                    False, STATUS_ERROR, f"检索服务健康检查失败（HTTP {resp.status_code}，{_display_endpoint(base)}）"
                 )
             if not body.get("ok"):
                 # 服务能连上、但自报不可用（例如索引模型未配置）：把它的原话透出去，
@@ -182,7 +214,7 @@ class RemoteProvider:
                 return HealthResult(
                     False,
                     status if status in (STATUS_DISABLED, STATUS_ERROR) else STATUS_ERROR,
-                    f"{detail or '检索服务自报不可用'}（{base}）",
+                    f"{detail or '检索服务自报不可用'}（{_display_endpoint(base)}）",
                 )
             # 本地/自托管索引的**执行者**是 pageindex-worker：服务活着不代表有人消费队列。
             # 不拦这一条，build 会返回"已投递"，然后库永远停在 indexing。
@@ -196,7 +228,7 @@ class RemoteProvider:
                 )
             return HealthResult(True, STATUS_READY, "")
         except Exception as exc:  # noqa: BLE001
-            return HealthResult(False, STATUS_ERROR, f"检索服务不可达（{base}）：{exc}")
+            return HealthResult(False, STATUS_ERROR, f"检索服务不可达（{_display_endpoint(base)}）：{exc}")
 
     def supports(self, filename: str) -> bool:
         suffix = filename[filename.rfind("."):].lower() if "." in filename else ""

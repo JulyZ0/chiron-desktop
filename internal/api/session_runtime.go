@@ -393,7 +393,7 @@ func InjectSessionRuntime(w http.ResponseWriter, r *http.Request, body map[strin
 				"id":        loc.ID,
 				"provider":  loc.Provider,
 				"device_id": loc.DeviceID,
-				"root":      loc.RootPath,
+				"root":      root,
 				"root_key":  loc.RootKey,
 			}
 			body["context"] = ctxMap

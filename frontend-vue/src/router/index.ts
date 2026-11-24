@@ -198,11 +198,13 @@ const routes = [
         redirect: { path: '/admin/monitor', query: { tab: 'overview' } },
       },
       {
-        path: 'api-keys',
-        name: 'AdminApiKeys',
-        component: () => import('../views/admin/ApiKeysView.vue'),
-        meta: { title: t('common.api_key_management') },
+        path: 'providers',
+        name: 'AdminProviders',
+        component: () => import('../views/admin/ProvidersView.vue'),
+        meta: { title: t('common.provider_management') },
       },
+      // 旧书签保留：API Key 管理已更名为服务商管理，后端接口路径不变。
+      { path: 'api-keys', redirect: { path: '/admin/providers' } },
       {
         // 运行时监控：原「性能监控 / 队列监控 / 缓存监控」三页合并为一个 Tabs 页面（懒加载）
         path: 'monitor',

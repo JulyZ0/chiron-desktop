@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, markRaw } from 'vue'
 import { useRouter } from 'vue-router'
-import { Card, Row, Col, Statistic, Tag, Table } from 'ant-design-vue'
+import { Card, Row, Col, Statistic, Tag } from 'ant-design-vue'
 import {
   KeyOutlined, ThunderboltOutlined, SettingOutlined,
   ArrowRightOutlined, ArrowUpOutlined, ArrowDownOutlined, ClockCircleOutlined,
-  ApartmentOutlined, ThunderboltFilled, DatabaseFilled,
+  ApartmentOutlined, OrderedListOutlined, ThunderboltFilled, DatabaseFilled,
 } from '@ant-design/icons-vue'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -16,6 +16,8 @@ import { getMetrics, listApiKeys, getOnboardingFunnel, type OnboardingFunnel } f
 import { useThemeStore } from '@/stores/theme'
 import PageSkeleton from '@/components/common/PageSkeleton.vue'
 import EmptyState from '@/components/common/EmptyState.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
+import AdminErrorState from '@/components/admin/AdminErrorState.vue'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
@@ -29,7 +31,7 @@ const error = ref('')
 // 快捷导航：三个监控页已合并为「运行时监控」，定时任务已拆为独立页面
 const navItems = [
   { label: t('admin.runtime_monitoring'), path: '/admin/monitor', icon: markRaw(ThunderboltOutlined), desc: t('admin.performance_queue_cache') },
-  { label: 'API Key', path: '/admin/api-keys', icon: markRaw(KeyOutlined), desc: t('common.keys_and_rate_limiting') },
+  { label: t('common.provider_management'), path: '/admin/providers', icon: markRaw(KeyOutlined), desc: t('common.keys_and_rate_limiting') },
   { label: t('settings.system_settings'), path: '/admin/settings', icon: markRaw(SettingOutlined), desc: t('common.global_config') },
 ]
 
@@ -183,6 +185,11 @@ async function fetchDashboardData() {
       getOnboardingFunnel(),
     ])
 
+    // 指标与服务商状态是首页核心数据；漏斗单独失败不应拖垮其它内容。
+    if (metricsRes.status === 'rejected' || keysRes.status === 'rejected') {
+      error.value = t('errors.data_load_failed')
+    }
+
     if (metricsRes.status === 'fulfilled') {
       const m = metricsRes.value
       stats.value.connections = m.concurrent_connections || 0
@@ -239,20 +246,12 @@ onUnmounted(() => {
     />
 
     <!-- 错误态 -->
-    <EmptyState
+    <AdminErrorState
       v-else-if="error"
-      size="page"
-      :description="error"
-      :hint="$t('common.please_check_if_the_backend_service_is_normal_or_retry_later')"
-    >
-      <a-button
-        type="primary"
-        size="large"
-        @click="fetchDashboardData"
-      >
-        {{ $t('common.retry') }}
-      </a-button>
-    </EmptyState>
+      :message="error"
+      :retrying="loading"
+      @retry="fetchDashboardData"
+    />
 
     <template v-else>
       <!-- 快捷导航卡片 -->
@@ -265,6 +264,7 @@ onUnmounted(() => {
           tabindex="0"
           @click="router.push(nav.path)"
           @keydown.enter="router.push(nav.path)"
+          @keydown.space.prevent="router.push(nav.path)"
         >
           <div class="nav-card-icon">
             <component :is="nav.icon" />
@@ -474,19 +474,19 @@ onUnmounted(() => {
             <ClockCircleOutlined class="chart-title-icon" /> {{ $t('common.recent_alerts') }}
           </span>
         </template>
-        <EmptyState
-          v-if="alerts.length === 0"
-          size="list"
-          :description="$t('common.no_alerts_yet')"
-          :hint="$t('common.system_running_normally')"
-        />
-        <Table
-          v-else
+        <AdminTable
           :columns="alertColumns"
           :data-source="alerts"
           :pagination="false"
-          size="small"
-        />
+        >
+          <template #emptyText>
+            <EmptyState
+              size="list"
+              :description="$t('common.no_alerts_yet')"
+              :hint="$t('common.system_running_normally')"
+            />
+          </template>
+        </AdminTable>
       </Card>
     </template>
   </div>
@@ -506,9 +506,10 @@ onUnmounted(() => {
   align-items: center;
   gap: 12px;
   padding: 14px 16px;
-  border: var(--hairline-width) solid var(--border-card);
+  border: 0;
   border-radius: var(--sig-radius-card);
   background: var(--bg-card);
+  box-shadow: var(--shadow-sm);
   cursor: pointer;
   transition: border-color var(--dur-fast) ease, box-shadow var(--dur-fast) ease, transform var(--dur-fast) ease;
 }

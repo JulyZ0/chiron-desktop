@@ -1050,7 +1050,7 @@ export default {
     aes_gcm_encrypted_storage: "تخزين مُشفّر بـ AES-GCM",
     analyze_updates_statistics: "ANALYZE يحدّث الإحصاءات",
     api_latency_p99: "زمن استجابة API P99",
-    api_key_management: "إدارة مفتاح API",
+    provider_management: "إدارة المزوّدين",
     api_key_config: "إعداد مفتاح API",
     api_key_config_saved: "تم حفظ إعداد مفتاح API",
     api_key_deleted: "تم حذف مفتاح API",

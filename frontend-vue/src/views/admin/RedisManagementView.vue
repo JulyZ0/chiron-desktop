@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import {
-  Card, Row, Col, Table, Button, Space, Tag, Input, Modal, Alert,
+  Card, Row, Col, Button, Space, Tag, Input, Modal, Alert,
   Statistic, Descriptions, Spin, message,
 } from 'ant-design-vue'
 import { ReloadOutlined, ClearOutlined } from '@ant-design/icons-vue'
 import { api } from '../../api'
 import { apiErrorMessage } from '../../composables/useCrudResource'
 import EmptyState from '../../components/common/EmptyState.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
@@ -164,8 +165,7 @@ onMounted(() => {
 
 <template>
   <div class="redis-management">
-    <div class="page-header">
-      <h1 class="page-title">{{ $t('admin.redis_management') }}</h1>
+    <div class="panel-toolbar">
       <Space>
         <Button @click="loadRedis">
           {{ $t('common.refresh_status') }}
@@ -199,7 +199,6 @@ onMounted(() => {
           v-if="redisData"
           :column="2"
           bordered
-          size="small"
         >
           <Descriptions.Item :label="$t('common.status')">
             <Tag :color="statusColor(redisData.status || '')">
@@ -231,8 +230,7 @@ onMounted(() => {
             :lg="4"
           >
             <Card
-              size="small"
-              class="pool-stat"
+                  class="pool-stat"
             >
               <Statistic
                 :title="s.title"
@@ -254,14 +252,13 @@ onMounted(() => {
           :message="slowError"
           style="margin-bottom: 16px"
         />
-        <Table
+        <AdminTable
           :columns="slowColumns"
           :data-source="slowLog"
           :loading="slowLoading"
           :row-key="(_r: any, i?: number) => i ?? 0"
           :pagination="{ pageSize: 10, showSizeChanger: true }"
           :scroll="{ x: 720 }"
-          size="small"
         >
           <template #emptyText>
             <EmptyState :description="$t('common.no_slow_query_records_yet')" />
@@ -274,7 +271,7 @@ onMounted(() => {
               <span class="cell">{{ slowCellText(record[(column as any).dataIndex as string]) }}</span>
             </template>
           </template>
-        </Table>
+        </AdminTable>
       </Card>
     </Spin>
 
@@ -306,12 +303,8 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.redis-management { padding: 24px; }
+.panel-toolbar { display: flex; justify-content: flex-end; flex-wrap: wrap; }
 .pool-stat { text-align: center; }
 .cell { word-break: break-all; }
-
-@media (max-width: 768px) {
-  .redis-management { padding: 16px 12px; }
-}
 
 </style>

@@ -24,7 +24,7 @@
  * 重启会打断正在进行的对话 —— 那必须由用户显式点。保存成功后把「立即重启」摆出来，
  * 避免用户以为已经生效。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { ReloadOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
@@ -32,6 +32,9 @@ import { useDeviceStore } from '../../stores/device'
 
 const { t } = useI18n()
 const device = useDeviceStore()
+const emit = defineEmits<{
+  'dirty-change': [value: boolean]
+}>()
 
 const loading = ref(false)
 const saving = ref(false)
@@ -48,6 +51,7 @@ const unsupported = ref(false)
 const needsRestart = ref(false)
 
 const dirty = computed(() => JSON.stringify(draft.value) !== JSON.stringify(saved.value))
+watch(dirty, (value) => emit('dirty-change', value), { immediate: true })
 
 /** 开关当前值：没配过时按引擎默认值显示（否则界面会显示成"关"而误导用户） */
 function valueOf(spec: { env: string; default: boolean }): boolean {
@@ -199,6 +203,8 @@ onMounted(() => {
               type="link"
               size="small"
               class="engine-env-reset"
+              :title="$t('settings.engine_env_reset_default')"
+              :aria-label="$t('settings.engine_env_reset_default')"
               @click="resetToDefault(spec)"
             >
               <ReloadOutlined />
@@ -294,8 +300,9 @@ onMounted(() => {
 }
 
 .engine-env-reset {
-  padding: 0 4px;
-  height: auto;
+  min-width: var(--space-10);
+  min-height: var(--space-10);
+  padding-inline: var(--space-2);
 }
 
 .engine-env-name {

@@ -2476,3 +2476,86 @@ html body .hljs-meta,
 html body .hljs-symbol,
 html body .hljs-bullet,
 html body .hljs-link { color: var(--hljs-meta); }
+
+/* ============================================================ */
+/* 后台视觉规范：页面只负责内容，Layout 负责唯一的外层留白。 */
+.admin-page { display: flex; flex-direction: column; gap: var(--space-4); width: 100%; }
+.admin-page-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  flex-wrap: wrap; gap: var(--space-3) var(--space-4);
+}
+.admin-page-heading { flex: 1; min-width: 0; }
+.admin-page-title {
+  margin: 0; color: var(--text-primary); font-size: var(--fs-xl);
+  line-height: var(--lh-snug); font-weight: var(--fw-semibold);
+}
+.admin-page-description {
+  margin: var(--space-1) 0 0; color: var(--text-secondary);
+  font-size: var(--fs-sm); line-height: var(--lh-normal);
+}
+.admin-page-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+.admin-page-body { display: flex; flex-direction: column; gap: var(--space-4); min-width: 0; }
+.admin-page-body > * { min-width: 0; }
+
+/* 卡片无额外边框；统一标题/正文密度，子组件不再自行加页面 padding。 */
+.admin-page .ant-card {
+  border: var(--hairline-width) solid var(--border-card); border-radius: var(--sig-radius-card);
+  background: var(--bg-card); box-shadow: var(--shadow-sm);
+}
+.admin-page .ant-card-head {
+  min-height: var(--space-10); padding-inline: var(--space-5);
+  border-bottom: var(--hairline-width) solid var(--border-card);
+}
+.admin-page .ant-card-head-title { font-size: var(--fs-base); font-weight: var(--fw-semibold); }
+.admin-page .ant-card-body { padding: var(--space-5); }
+.admin-page .ant-card-small > .ant-card-body { padding: var(--space-4); }
+.admin-page .ant-card-small > .ant-card-head { padding-inline: var(--space-4); }
+
+/* 表格统一 middle 密度；行操作沿用组件层的 size="small"。 */
+.admin-table .ant-table-thead > tr > th {
+  padding: var(--space-3) var(--space-4); background: var(--bg-secondary);
+  color: var(--text-secondary); font-size: var(--fs-sm); font-weight: var(--fw-semibold);
+  border-bottom: var(--hairline-width) solid var(--border-card);
+}
+.admin-table .ant-table-tbody > tr > td {
+  padding: var(--space-3) var(--space-4);
+  border-bottom: var(--hairline-width) solid var(--border-card);
+}
+.admin-table .ant-table-tbody > tr:hover > td { background: var(--bg-hover); }
+.admin-table .ant-pagination { margin-block: var(--space-4) 0; }
+.admin-table .ant-empty { margin-block: var(--space-5); }
+.admin-table-empty-hint p { margin: 0; color: var(--text-secondary); }
+.admin-table-empty-hint p + p { margin-block-start: var(--space-1); color: var(--text-tertiary); }
+
+@media (max-width: 768px), (pointer: coarse) {
+  .admin-page .ant-btn,
+  .settings .ant-btn,
+  .admin-root .sider-footer .sider-user-btn {
+    min-height: var(--space-10);
+  }
+
+  .admin-page .ant-btn-icon-only,
+  .settings .ant-btn-icon-only {
+    min-width: var(--space-10);
+  }
+
+  .admin-page .ant-input,
+  .admin-page .ant-input-affix-wrapper,
+  .admin-page .ant-input-number,
+  .admin-page .ant-select-selector,
+  .settings .ant-input,
+  .settings .ant-input-affix-wrapper,
+  .settings .ant-input-number,
+  .settings .ant-select-selector {
+    min-height: var(--space-10);
+  }
+
+  .admin-page .provider-card { min-height: var(--space-10); }
+  .settings .ant-tabs-tab { min-height: var(--space-10); }
+}
+
+@media (max-width: 576px) {
+  .admin-page .ant-card-body,
+  .admin-page .ant-card-small > .ant-card-body { padding: var(--space-4); }
+  .admin-page-actions { width: 100%; }
+}

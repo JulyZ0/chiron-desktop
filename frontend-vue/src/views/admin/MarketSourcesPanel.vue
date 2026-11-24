@@ -25,6 +25,7 @@ import { Alert, Button, Input, Modal, Spin, Switch, Tag, message } from 'ant-des
 import { DeleteOutlined } from '@ant-design/icons-vue'
 import { onBeforeRouteLeave, routerKey } from 'vue-router'
 import { useI18n } from 'vue-i18n'
+import AdminPage from '@/components/admin/AdminPage.vue'
 import {
   emptyMarketSettings,
   getMarketSettings,
@@ -191,19 +192,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="market-panel">
-    <!-- 页面头部与其它 admin 页对齐（面包屑之外再给一个就地标题与一句话定位） -->
-    <div class="page-header">
-      <div>
-        <h2 class="page-title page-title-sm">
-          {{ $t('admin.market.page_title') }}
-        </h2>
-        <p class="mp-page-desc">
-          {{ $t('admin.market.page_desc') }}
-        </p>
-      </div>
-    </div>
-
+  <AdminPage
+    :title="$t('admin.market.page_title')"
+    :description="$t('admin.market.page_desc')"
+  >
     <Spin :spinning="loading">
       <Alert
         v-if="loadError"
@@ -418,12 +410,10 @@ onBeforeUnmount(() => {
         </span>
       </div>
     </Spin>
-  </div>
+  </AdminPage>
 </template>
 
 <style scoped>
-.market-panel { padding: 4px 0 20px; }
-.mp-page-desc { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
 .mp-alert { margin-bottom: 12px; }
 
 .mp-section {

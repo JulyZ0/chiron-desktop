@@ -1048,7 +1048,7 @@ export default {
     aes_gcm_encrypted_storage: "AES-GCM encrypted storage",
     analyze_updates_statistics: "ANALYZE updates statistics",
     api_latency_p99: "API latency P99",
-    api_key_management: "API Key management",
+    provider_management: "Provider management",
     api_key_config: "API Key config",
     api_key_config_saved: "API Key config saved",
     api_key_deleted: "API Key deleted",

@@ -5,7 +5,16 @@
  * 含 {占位符} 的文案必须登记：vue-i18n 在键不存在时会原样返回 key 并跳过插值。
  */
 export default {
+  table_label: 'جدول البيانات',
   providers: {
+    page_title: 'إدارة المزوّدين',
+    page_desc: 'إدارة مزوّدي النماذج ومفاتيح الوصول ونقاط النهاية وأوزان حركة المرور في مكان واحد.',
+    col_provider: 'المزوّد',
+    col_key: 'المفتاح',
+    api_key: 'مفتاح API',
+    base_url: 'عنوان URL الأساسي',
+    empty: 'لا توجد مفاتيح مزوّدين',
+    empty_hint: 'أضف مفتاح مزوّد لإدارة حالته ونقطة النهاية ووزن حركة المرور هنا.',
     /** {name} = provider 名称 */
     configuredName: '{name} (تم تكوين المفتاح)',
   },
@@ -429,6 +438,7 @@ export default {
   share_col_actions: "إجراءات",
   share_revoke: "إبطال",
   share_empty: "لا مشاركات نشطة",
+  share_no_results: "لا توجد مشاركات تطابق البحث. غيّر الكلمة المفتاحية أو امسح البحث.",
   share_untitled: "(محادثة بلا عنوان)",
   share_load_failed: "تعذّر تحميل المشاركات",
   share_revoke_failed: "تعذّر إبطال المشاركة",
@@ -468,6 +478,9 @@ export default {
     status_disabled: "معطّل",
     status_deleted: "محذوف",
     never: "لم يدخل بعد",
+    empty: "لا يوجد أعضاء في الفريق",
+    empty_hint: "اختر «مستخدم جديد» لإنشاء أول حساب فريق.",
+    load_failed: "تعذّر تحميل المستخدمين",
     create_title: "إنشاء مستخدم",
     email: "البريد الإلكتروني",
     username: "اسم المستخدم",

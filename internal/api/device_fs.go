@@ -41,8 +41,38 @@ const (
 	deviceOpTimeout         = 15 * time.Second
 	deviceReadMaxBytes      = 8 << 20 // 8MiB：WebDAV 整文件读取的上限
 	deviceReadDeadline      = 90 * time.Second
+	deviceHeartbeatInterval = 30 * time.Second
 	deviceWriteTimeout      = 10 * time.Second
+	// deviceDisconnectedMsg 是连接被替换/断开时回给在途请求的文案。
+	// callConn 会把它映射回 errDeviceOffline，调用方据此走"设备离线"分支，
+	// 而不是当成设备返回的业务错误。
+	deviceDisconnectedMsg = "device disconnected"
 )
+
+// deviceFSTimings 把连接层的时间参数集中到一处。
+//
+// 生产默认值保持"心跳间隔是读超时的 1/3"：30s 的 ping 让空闲连接不被 NAT/代理掐断，
+// 90s 读超时则保证真正掉线在三倍心跳内被发现。测试可以把 hub 的时间参数缩到毫秒级，
+// 用来验证"超过读超时仍在线""大 op 期间不被误判离线"这类长时间行为，而不改生产默认。
+type deviceFSTimings struct {
+	readDeadline time.Duration
+	heartbeat    time.Duration
+	writeTimeout time.Duration
+}
+
+// withDefaults 给零值补生产默认值：测试只覆盖关心的那几项，其余仍是线上行为。
+func (t deviceFSTimings) withDefaults() deviceFSTimings {
+	if t.readDeadline <= 0 {
+		t.readDeadline = deviceReadDeadline
+	}
+	if t.heartbeat <= 0 {
+		t.heartbeat = deviceHeartbeatInterval
+	}
+	if t.writeTimeout <= 0 {
+		t.writeTimeout = deviceWriteTimeout
+	}
+	return t
+}
 
 type deviceStat struct {
 	Size  int64  `json:"size"`
@@ -111,7 +141,12 @@ func (c *deviceConn) close() {
 		_ = c.ws.Close()
 		c.pendMu.Lock()
 		for id, ch := range c.pending {
-			ch <- deviceOpResponse{ID: id, OK: false, Error: "device disconnected"}
+			// 通道容量是 1，但读循环可能已经塞过一条（先删除再发送，理论上不会同时出现）；
+			// 用 select 兜一层，保证 close 不会因为没人收而阻塞住整个 hub。
+			select {
+			case ch <- deviceOpResponse{ID: id, OK: false, Error: deviceDisconnectedMsg}:
+			default:
+			}
 			close(ch)
 			delete(c.pending, id)
 		}
@@ -119,9 +154,18 @@ func (c *deviceConn) close() {
 	})
 }
 
+// pendingCount 只给测试/诊断用：连接断开后这里必须回到 0。
+func (c *deviceConn) pendingCount() int {
+	c.pendMu.Lock()
+	defer c.pendMu.Unlock()
+	return len(c.pending)
+}
+
 type deviceHub struct {
 	mu    sync.Mutex
 	conns map[string]*deviceConn
+	// timings 是连接层时间参数；零值走生产默认（见 deviceFSTimings.withDefaults）。
+	timings deviceFSTimings
 
 	// 多副本路由（R4）：连接在哪个网关实例上，请求就经 Redis 转给那个实例。
 	rdb        db.RedisClient
@@ -147,7 +191,16 @@ type routedResponse struct {
 }
 
 func newDeviceHub() *deviceHub {
-	return &deviceHub{conns: map[string]*deviceConn{}, pending: map[string]chan routedResponse{}}
+	return &deviceHub{
+		conns:   map[string]*deviceConn{},
+		pending: map[string]chan routedResponse{},
+		timings: deviceFSTimings{}.withDefaults(),
+	}
+}
+
+// timing 返回补全过默认值的时间参数（hub 由测试直接构造时也能安全使用）。
+func (h *deviceHub) timing() deviceFSTimings {
+	return h.timings.withDefaults()
 }
 
 // deviceHubSingleton 进程内共享：项目创建/@引用与 WS 处理必须看到同一张连接表。
@@ -366,7 +419,30 @@ func (h *deviceHub) Call(ctx context.Context, tenant, user, device string, req d
 	return h.callRemote(ctx, tenant, user, device, req)
 }
 
+// 浏览器 WebSocket 不会主动发送协议 ping，服务端必须主动探活。
+//
+// 保活链路：这里发 ping → 客户端协议栈自动回 pong → PongHandler 续期读超时。
+// 因此 deadline 只在"真的没有任何入站帧（含 pong）"时才会到期，空闲连接和
+// 正在跑大 walk/read 的连接都不会被误判离线。
+func heartbeatDeviceConn(conn *deviceConn, interval, writeTimeout time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-conn.closed:
+			return
+		case <-ticker.C:
+			if err := conn.ws.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout)); err != nil {
+				slog.Info("device fs: heartbeat ping failed", "device", conn.device, "error", err)
+				conn.close()
+				return
+			}
+		}
+	}
+}
+
 func (h *deviceHub) callConn(ctx context.Context, conn *deviceConn, req deviceOpRequest) (deviceOpResponse, error) {
+	timing := h.timing()
 	if req.ID == "" {
 		req.ID = newDeviceOpID()
 	}
@@ -384,13 +460,16 @@ func (h *deviceHub) callConn(ctx context.Context, conn *deviceConn, req deviceOp
 	}()
 
 	conn.writeMu.Lock()
-	_ = conn.ws.SetWriteDeadline(time.Now().Add(deviceWriteTimeout))
+	_ = conn.ws.SetWriteDeadline(time.Now().Add(timing.writeTimeout))
 	err := conn.ws.WriteJSON(req)
 	conn.writeMu.Unlock()
 	if err != nil {
 		conn.close()
 		return deviceOpResponse{}, errDeviceOffline
 	}
+	// 请求发出时也续期一次：设备正在跑大 op（walk/git）时，这段时间里只有心跳 pong
+	// 能刷新 deadline，提前续期可以让"请求刚发出就被判掉线"的边界窗口消失。
+	_ = conn.ws.SetReadDeadline(time.Now().Add(timing.readDeadline))
 
 	timer := time.NewTimer(deviceCallTimeout(req))
 	defer timer.Stop()
@@ -405,6 +484,10 @@ func (h *deviceHub) callConn(ctx context.Context, conn *deviceConn, req deviceOp
 		if !resp.OK {
 			if resp.Error == "" {
 				resp.Error = "device_fs_error"
+			}
+			// 连接被关闭/替换时排空的 pending 也走离线语义，调用方才能正确降级。
+			if resp.Error == deviceDisconnectedMsg || resp.Error == errDeviceOffline.Error() {
+				return resp, errDeviceOffline
 			}
 			return resp, errors.New(resp.Error)
 		}
@@ -494,25 +577,32 @@ func DeviceFSHandler(hub *deviceHub, authenticator *auth.Authenticator) http.Han
 		hub.register(dc)
 		defer hub.unregister(dc)
 
-		conn.SetReadDeadline(time.Now().Add(deviceReadDeadline))
+		timing := hub.timing()
+		conn.SetReadDeadline(time.Now().Add(timing.readDeadline))
 		conn.SetPongHandler(func(string) error {
-			return conn.SetReadDeadline(time.Now().Add(deviceReadDeadline))
+			return conn.SetReadDeadline(time.Now().Add(timing.readDeadline))
 		})
+		go heartbeatDeviceConn(dc, timing.heartbeat, timing.writeTimeout)
 		hello := deviceOpResponse{
 			ID:       "hello",
 			OK:       true,
 			Protocol: deviceFSProtocolVersion,
 		}
 		dc.writeMu.Lock()
-		_ = conn.SetWriteDeadline(time.Now().Add(deviceWriteTimeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(timing.writeTimeout))
 		_ = conn.WriteJSON(hello)
 		dc.writeMu.Unlock()
 
 		for {
 			_, data, err := conn.ReadMessage()
 			if err != nil {
+				// 读到错误（对端关闭 / 读超时 / hub 主动替换连接）即认为连接已死：
+				// unregister 会排空 pending，把在途请求全部落成"设备离线"。
 				return
 			}
+			// 任何入站消息都算活跃：大 walk/read 的连续回包、设备主动的其它帧
+			// 都会续期，只有真正静默（连 pong 都没有）才会走到上面的超时分支。
+			_ = conn.SetReadDeadline(time.Now().Add(timing.readDeadline))
 			var resp deviceOpResponse
 			if json.Unmarshal(data, &resp) != nil || resp.ID == "" {
 				continue

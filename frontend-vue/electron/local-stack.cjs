@@ -235,6 +235,27 @@ const KNOWLEDGE_SERVICE_HEALTH_PATH = '/healthz'
 const KNOWLEDGE_SERVICE_TIMEOUT_MS = 120_000
 
 /**
+ * 复用"已经在跑的 pageindex"时的**身份判据**（只读，来自它的 `/healthz`）。
+ *
+ * 为什么必须有判据：端口是跨启动固定的（引擎的 `KNOWLEDGE_SERVICE_URL` 在 spawn 时
+ * 写死），上一轮异常退出后 pageindex 常常还活着并占着那个端口。此时若直接 spawn，
+ * uvicorn 只会回一句 `bind: address already in use`；若不加判断就把端口让给任何
+ * 应答者，则可能把**无关程序**当成知识库服务去用（请求全错、数据写错地方）。
+ *
+ *   - `service`：服务身份，必须是 `pageindex-search`；
+ *   - `engine`：SDK 版本（`pageindex==0.4.4`）。身份对但没有版本说明它自己也没装好；
+ *   - `schema`：索引产物布局版本。**只认相同值**，版本不同就不复用（见下）。
+ *
+ * `schema` 是 pageindex-service `/healthz` 新增的只读字段。老版本没有该字段时按
+ * "同一组件、未标版本"放行：它的身份字段已经足够窄（`pageindex-search` 是本仓库
+ * 独有的字符串），这条温和处理换来的是"升级后第一次重启仍能被复用"。
+ */
+const KNOWLEDGE_SERVICE_IDENTITY = 'pageindex-search'
+const KNOWLEDGE_SERVICE_SCHEMA = '1'
+/** 复用探测的等待上限：占端口的若是无关服务，可能根本不回 HTTP */
+const KNOWLEDGE_SERVICE_PROBE_TIMEOUT_MS = 1500
+
+/**
  * 端口冲突时最多尝试几次（含首次）。与 `components.cjs` 的 `CORE_PORT_ATTEMPTS` 一致。
  *
  * 为什么必须重试：`pickFreePort()` / `find_free_port()` 都只是**借号**——它们 listen 到
@@ -880,6 +901,112 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/**
+ * 判定一个 `/healthz` 响应体是否"可信的 pageindex"。
+ *
+ * 返回 `{trusted, reason, detail}`：`reason` 只用于日志与可行动提示，不参与控制流。
+ * 判据见 `KNOWLEDGE_SERVICE_IDENTITY` 的注释 —— 身份、版本、schema 三项。
+ */
+function evaluateKnowledgeHealth(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { trusted: false, reason: 'not-pageindex', detail: '响应不是 JSON 对象' }
+  }
+  const service = String(body.service || '').trim()
+  if (service !== KNOWLEDGE_SERVICE_IDENTITY) {
+    return {
+      trusted: false,
+      reason: 'not-pageindex',
+      detail: service ? `占用方自报服务名 ${service}` : '响应里没有服务身份字段',
+    }
+  }
+  const engine = String(body.engine || '').trim()
+  // 身份对但版本为空 / unknown：进程可能起着，但它自己都没装上 SDK，复用它只会把
+  // "检索不可用"伪装成"已就绪"。
+  if (!engine || engine === 'pageindex==unknown') {
+    return { trusted: false, reason: 'unknown-version', detail: '服务身份相符但没有可用版本' }
+  }
+  const rawSchema = body.schema
+  if (rawSchema !== undefined && rawSchema !== null && rawSchema !== '') {
+    if (String(rawSchema) !== KNOWLEDGE_SERVICE_SCHEMA) {
+      return {
+        trusted: false,
+        reason: 'schema-mismatch',
+        detail: `索引布局版本 ${rawSchema} ≠ ${KNOWLEDGE_SERVICE_SCHEMA}`,
+      }
+    }
+  }
+  return { trusted: true, service, engine, schema: rawSchema === undefined ? '' : String(rawSchema) }
+}
+
+/**
+ * 探测固定在 `<port>` 上的知识库检索服务。三种结论：
+ *   - `free`：没有进程在监听 —— 正常 spawn；
+ *   - `trusted`：已有的就是**我们自己的** pageindex（身份/版本/schema 都对）—— 复用，
+ *     不重复 spawn，也不去动它；
+ *   - `foreign`：端口被别的程序占着，或占用方自报不是本服务 / schema 不兼容 ——
+ *     返回可行动错误，**绝不终止**对方进程（可能是用户自己的服务或另一个产品）。
+ *
+ * 先用 `isPortListening` 判空再发 HTTP：空闲端口上不必打一次注定失败的请求，也让
+ * 单测（没有真实监听）能稳定走到 spawn 分支。
+ */
+async function probeKnowledgeEndpoint(port) {
+  const candidate = Number(port)
+  const baseUrl = `http://${DEFAULTS.DEFAULT_HOST}:${candidate}`
+  if (!isValidPort(candidate)) return { state: 'free', port: candidate, baseUrl }
+  if (!(await components.isPortListening(candidate))) {
+    return { state: 'free', port: candidate, baseUrl }
+  }
+
+  let res = null
+  try {
+    const signal = typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(KNOWLEDGE_SERVICE_PROBE_TIMEOUT_MS)
+      : undefined
+    res = await fetch(`${baseUrl}${KNOWLEDGE_SERVICE_HEALTH_PATH}`, { method: 'GET', signal })
+  } catch (err) {
+    return {
+      state: 'foreign',
+      port: candidate,
+      baseUrl,
+      reason: 'not-http',
+      detail: `端口已监听但 /healthz 无响应（${(err && err.message) || '连接失败'}）`,
+    }
+  }
+
+  let body = null
+  try {
+    body = await res.json()
+  } catch {
+    body = null
+  }
+  const verdict = evaluateKnowledgeHealth(body)
+  if (verdict.trusted) {
+    return { state: 'trusted', port: candidate, baseUrl, ...verdict, health: body }
+  }
+  return {
+    state: 'foreign',
+    port: candidate,
+    baseUrl,
+    httpStatus: res && res.status,
+    ...verdict,
+  }
+}
+
+/** 端口被占用时的**可行动**错误：说清是谁、为什么不杀、用户该做什么。 */
+function knowledgePortOccupiedMessage(port, probe) {
+  const detail = probe && probe.detail ? `（${probe.detail}）` : ''
+  // 占用方自报不是本服务 / 根本不回 HTTP ⇒ 别人的程序；自报是本服务但版本或
+  // schema 不兼容 ⇒ 我们自己的旧进程。两者都不可复用，但用户该知道区别。
+  const foreign = !probe || probe.reason === 'not-pageindex' || probe.reason === 'not-http'
+  const headline = foreign
+    ? `知识库服务端口 ${port} 已被其它程序占用${detail}，它不是本应用的知识库索引服务`
+    : `端口 ${port} 上的知识库服务无法复用${detail}（需要重启它才能与新版本协同）`
+  return (
+    `${headline}。为避免打断那个程序，没有终止它。请结束占用该端口的进程后点「重启」；` +
+    `引擎仍指向 http://${DEFAULTS.DEFAULT_HOST}:${port}，换端口不会自动同步。`
+  )
+}
+
 /** 停网关。先 SIGTERM，超时再收树（网关是单进程，但仍按树收以防它派生）。 */
 async function stopGateway() {
   const record = state.gateway
@@ -1233,7 +1360,36 @@ async function startKnowledgeService(info, options = {}) {
   let last = null
 
   for (let index = 0; index < attempts; index += 1) {
-    const port = index === 0 ? Number(options.port) : await components.pickFreePort()
+    let port = index === 0 ? Number(options.port) : await components.pickFreePort()
+
+    // **重启前先探测固定端口**（三条路径共用这里：应用重启、崩溃自愈、手动重启）。
+    // 上一轮异常退出的 pageindex 往往还活着并占着这个端口，直接 spawn 只能拿到
+    // `bind: address already in use`；而它恰恰是最该被复用的那个进程。
+    // 判据与处置见 probeKnowledgeEndpoint / knowledgePortOccupiedMessage。
+    if (index === 0 && options.reuseExisting !== false && isValidPort(port)) {
+      const probe = await probeKnowledgeEndpoint(port)
+      if (probe.state === 'trusted') {
+        return adoptKnowledgeService(info, { ...options, port }, probe)
+      }
+      if (probe.state === 'foreign') {
+        // 运行中重启（retryPortConflict:false）= 引擎已按这个端口写死 endpoint。
+        // 迁就一个无关进程只会让业务继续打到错误地址，必须如实失败。
+        if (options.retryPortConflict === false) {
+          return {
+            ok: false,
+            reason: 'port-occupied',
+            message: knowledgePortOccupiedMessage(port, probe),
+            port,
+            baseUrl: probe.baseUrl,
+          }
+        }
+        // 首次启动还没对外承诺过 endpoint（引擎尚未 spawn），换号仍安全；
+        // 但不在已知被占的端口上 spawn 一次、只为换一句 bind 报错。
+        log(`知识库端口 ${port} 已被占用（${probe.detail || probe.reason}），首次启动改用其它端口`)
+        port = await components.pickFreePort()
+      }
+    }
+
     const result = await spawnKnowledgeServiceOnce(info, { ...options, port })
     if (result.ok) return result
 
@@ -1246,6 +1402,47 @@ async function startKnowledgeService(info, options = {}) {
   }
   return last
 }
+
+/**
+ * 认领一个**已经在跑**的可信 pageindex（不 spawn、不重启它）。
+ *
+ * `service` 留空是刻意的：`stopKnowledgeService` 只遍历 `record.service`/`record.worker`，
+ * 于是关停时只会清状态、不会去杀一个不是本实例拉起的进程（与 `state.attached` 同一条
+ * 原则：不是自己起的就不该替别人做生死决定）。worker 例外 —— 它决定索引队列有没有
+ * 消费者，缺了界面会永远停在"索引中"，所以按需补一个（见下方 worker_alive 判断）。
+ */
+function adoptKnowledgeService(info, options, probe) {
+  const port = Number(options.port)
+  const baseUrl = probe.baseUrl || `http://${DEFAULTS.DEFAULT_HOST}:${port}`
+  const health = probe.health || null
+  const workerAlive = Boolean(health && health.worker_alive === true)
+
+  state.knowledge = {
+    service: null,
+    worker: null,
+    port,
+    baseUrl,
+    ready: true,
+    adopted: true,
+    health,
+  }
+  if (!workerAlive) {
+    superviseKnowledgeWorker(options.knowledge, buildKnowledgeServiceEnv(info, { ...options, port }))
+  }
+  log(
+    `复用已在运行的 pageindex（:${port}，${probe.engine || '版本未知'}）：` +
+      `${workerAlive ? '索引 worker 也在，不重复拉起' : '补齐索引 worker'}`,
+  )
+  return {
+    ok: true,
+    reused: true,
+    port,
+    baseUrl,
+    address: `${DEFAULTS.DEFAULT_HOST}:${port}`,
+    health,
+  }
+}
+
 
 /** 单次尝试：换号重试与最终判定由 `startKnowledgeService` 负责。 */
 async function spawnKnowledgeServiceOnce(info, options = {}) {
@@ -1261,14 +1458,21 @@ async function spawnKnowledgeServiceOnce(info, options = {}) {
       env,
     })
   } catch (err) {
-    return { ok: false, reason: 'spawn-failed', message: (err && err.message) || 'spawn 出错' }
+    return {
+      ok: false,
+      reason: 'spawn-failed',
+      message: (err && err.message) || 'spawn 出错',
+      port,
+      baseUrl,
+    }
   }
-  state.knowledge = { service, worker: null, port, baseUrl }
+  state.knowledge = { service, worker: null, port, baseUrl, ready: false }
   const record = state.knowledge
   // 检索服务自身也要监护：它死了以后搜索/索引全部不可用，而旧实现只把退出写进
   // record（无人消费），界面表现为"一直索引中"。只做有限重启，避免崩溃循环。
+  // 启动阶段的退出由 startKnowledgeService 的换号重试负责；这里再拉一次会与它抢端口。
   service.child.once('exit', code => {
-    if (service.stopping || state.knowledge !== record) return
+    if (!record.ready || service.stopping || state.knowledge !== record) return
     const tail = String(service.stderrTail || '').trim().slice(-400)
     console.warn(`[knowledge] 检索服务退出（code ${code}）${tail ? `
 ${tail}` : ''}`)
@@ -1283,9 +1487,23 @@ ${tail}` : ''}`)
         reason: 'exited',
         message: `知识库服务启动后立即退出（退出码 ${service.exitCode}）`,
         stderrTail: service.stderrTail,
+        port,
+        baseUrl,
       }
     }
     if (await probeHttp(baseUrl, KNOWLEDGE_SERVICE_HEALTH_PATH)) {
+      // 端口冲突时，应答可能来自占用该端口的其它进程；自己的 child 已退出就不能认领成功。
+      if (service.exited) {
+        return {
+          ok: false,
+          reason: 'exited',
+          message: `知识库服务启动后立即退出（退出码 ${service.exitCode}）`,
+          stderrTail: service.stderrTail,
+          port,
+          baseUrl,
+        }
+      }
+      record.ready = true
       // worker 失败**不算**服务失败：检索仍可用，界面会显示"索引未完成"，
       // 这比整个知识库 503 更接近事实。
       //
@@ -1304,6 +1522,8 @@ ${tail}` : ''}`)
     reason: 'timeout',
     message: `知识库服务在 ${Math.round((options.timeoutMs || KNOWLEDGE_SERVICE_TIMEOUT_MS) / 1000)}s 内未开始监听`,
     stderrTail: service.stderrTail,
+    port,
+    baseUrl,
   }
 }
 
@@ -1313,8 +1533,11 @@ const KNOWLEDGE_SERVICE_MAX_RESTARTS = 3
 async function restartKnowledgeService(info, options, attempt) {
   if (attempt > KNOWLEDGE_SERVICE_MAX_RESTARTS) return
   await stopKnowledgeService()
-  await sleep(3000)
-  const result = await startKnowledgeService(info, options)
+  // 退避可注入：单测要覆盖"崩溃 → 复用/失败"的判定，不该为此真等 3 秒。
+  await sleep(Number(options.knowledgeRestartDelayMs) >= 0 ? Number(options.knowledgeRestartDelayMs) : 3000)
+  // 引擎的 KNOWLEDGE_SERVICE_URL 已在启动时按这个端口写死。运行中重启若再换号，
+  // 健康检查可能通过，但业务仍会访问旧端口；因此冲突必须如实失败，不能偷偷迁移。
+  const result = await startKnowledgeService(info, { ...options, retryPortConflict: false })
   if (result.ok) return
   const tail = String(result.stderrTail || '').trim().slice(-400)
   console.warn(
@@ -1322,6 +1545,9 @@ async function restartKnowledgeService(info, options, attempt) {
       `${result.message || result.reason || 'unknown'}${tail ? `
 ${tail}` : ''}`,
   )
+  // 端口被无关进程占着：重试只会重复探测同一个结果，还会把"端口被占"淹没在
+  // 三次同样的告警里。如实留一条，等用户处理完再手动重启。
+  if (result.reason === 'port-occupied') return
   await restartKnowledgeService(info, options, attempt + 1)
 }
 
@@ -1658,17 +1884,30 @@ async function restartProcess(role) {
   // 它不参与崩溃自愈（起不来只降级知识库检索，不该触发整栈重启循环），
   // 所以这里只重建进程本身。
   if (role === 'knowledge') {
+    const port = Number(ctx.knowledgeServicePort)
+    if (!isValidPort(port)) {
+      return {
+        ok: false,
+        reason: 'no-endpoint',
+        message: '启动时未预留知识库服务端口，请重启本地后端',
+      }
+    }
     await stopKnowledgeService()
-    const port = ctx.knowledgeServicePort || (await components.pickFreePort())
-    const result = await startKnowledgeService(ctx.info, { ...ctx.options, port })
+    const result = await startKnowledgeService(ctx.info, {
+      ...ctx.options,
+      port,
+      retryPortConflict: false,
+    })
     if (!result.ok) {
       return {
         ok: false,
         reason: result.reason || 'knowledge-failed',
-        message: result.message,
+        message: `${result.message || '知识库服务重启失败'}（保持引擎 endpoint :${port}，未切换端口）`,
       }
     }
-    return { ok: true, port: result.port, baseUrl: result.baseUrl }
+    // 正常路径上端口不会变；显式回写守住后续重启契约。
+    ctx.knowledgeServicePort = result.port
+    return { ok: true, port: result.port, baseUrl: result.baseUrl, reused: Boolean(result.reused) }
   }
 
   return { ok: false, reason: 'not-supervised' }
@@ -1960,7 +2199,7 @@ async function startLocalStack(options = {}) {
     const gatewayPort = isValidPort(options.port) ? Number(options.port) : await components.pickFreePort()
     // 知识库检索服务必须先于引擎：`KNOWLEDGE_SERVICE_URL` 只能在 spawn 时给全，
     // 而引擎起来之后改不了（与 GATEWAY_INTERNAL_URL 同理）。它只是**可选组件**，
-    // 起不来就把地址留空 —— 引擎照常启动，知识库的建索引/检索报"服务不可用"。
+    // 起不来不阻断整栈，但仍预留本次选定的端口给引擎；后续同端口恢复时无需改 endpoint。
     const knowledgePort = options.knowledge
       ? options.knowledgePort || (await components.pickFreePort())
       : 0
@@ -1973,6 +2212,11 @@ async function startLocalStack(options = {}) {
           gatewayPort,
         })
       : { ok: false, reason: 'not-installed' }
+    // 初次启动允许换号，但换号后的端口（或最后一次尝试的端口）从此就是稳定契约。
+    // 即使可选组件启动失败，也把已选端口预置给引擎，避免"后来重启成功却仍连空地址"。
+    const knowledgeServicePort = knowledgeResult.ok
+      ? knowledgeResult.port
+      : (isValidPort(knowledgeResult.port) ? knowledgeResult.port : knowledgePort)
     if (!knowledgeResult.ok) {
       // 可选组件：不阻断本地栈，但**必须留痕** —— 否则"索引一直中"只能靠猜。
       // stderr 尾部是区分"依赖没装好 / 端口冲突 / 导入就崩"的唯一证据。
@@ -1987,7 +2231,7 @@ ${tail}` : ''}`,
       ...options,
       port: enginePort,
       gatewayPort,
-      knowledgeServicePort: knowledgeResult.ok ? knowledgeResult.port : 0,
+      knowledgeServicePort,
     })
     if (!engineResult.ok) {
       // 强依赖：没有引擎就没有可用的本地模式（聊天/知识库/记忆全在引擎侧）
@@ -2013,7 +2257,7 @@ ${tail}` : ''}`,
       options,
       enginePort,
       gatewayPort,
-      knowledgeServicePort: knowledgeResult.ok ? knowledgeResult.port : 0,
+      knowledgeServicePort,
       engineAddress: engineResult.address,
       onEngineExit: options.onEngineExit,
     }
@@ -2054,7 +2298,7 @@ ${tail}` : ''}`,
     startExtraEngines(launcherResult.info, {
       ...options,
       gatewayPort,
-      knowledgeServicePort: knowledgeResult.ok ? knowledgeResult.port : 0,
+      knowledgeServicePort,
     }, extraEnginePorts)
     if (dataDir) {
       runtimeState.writeRuntimeState(dataDir, {
@@ -2142,6 +2386,16 @@ function getStackState() {
     gateway: state.gateway
       ? { pid: state.gateway.child && state.gateway.child.pid, port: state.gateway.port, baseUrl: state.gateway.baseUrl }
       : null,
+    // `adopted:true` = 复用了上一轮残留的 pageindex（不是本实例拉起的）：
+    // 健康面板/日志据此解释"为什么没看到它的 pid"。
+    knowledge: state.knowledge
+      ? {
+          pid: state.knowledge.service && state.knowledge.service.child ? state.knowledge.service.child.pid : null,
+          port: state.knowledge.port,
+          baseUrl: state.knowledge.baseUrl,
+          adopted: Boolean(state.knowledge.adopted),
+        }
+      : null,
   }
 }
 
@@ -2155,6 +2409,11 @@ module.exports = {
   ENGINE_HEALTH_PATH,
   KNOWLEDGE_SERVICE_HEALTH_PATH,
   KNOWLEDGE_SERVICE_TIMEOUT_MS,
+  KNOWLEDGE_SERVICE_IDENTITY,
+  KNOWLEDGE_SERVICE_SCHEMA,
+  /** 复用/占用判定：`/healthz` 身份评估与端口探测（导出给回归用例） */
+  evaluateKnowledgeHealth,
+  probeKnowledgeEndpoint,
   LAUNCHER_TIMEOUT_MS,
   LAUNCHER_EXIT_GRACE_MS,
   GATEWAY_TIMEOUT_MS,

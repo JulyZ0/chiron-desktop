@@ -9,7 +9,9 @@
  * 默认人格每租户最多一条（后端口径）；它只在用户**没有**选择人格时生效。
  */
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Button, Card, Empty, Input, Modal, Popconfirm, Space, Switch, Table, Tag, message } from 'ant-design-vue'
+import { Button, Empty, Input, Modal, Popconfirm, Space, Switch, Tag, message } from 'ant-design-vue'
+import AdminPage from '@/components/admin/AdminPage.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
 import {
@@ -151,34 +153,31 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="personas-view">
-    <Card :bordered="false">
-      <div class="toolbar">
-        <div class="toolbar-title">
-          {{ $t('admin.persona_title') }}
-          <span class="toolbar-hint">{{ $t('admin.persona_hint') }}</span>
-        </div>
-        <Space>
-          <Button :loading="loading" @click="load">
-            {{ $t('notifications.refresh') }}
-          </Button>
-          <Button type="primary" @click="openCreate">
-            <template #icon>
-              <PlusOutlined />
-            </template>
-            {{ $t('admin.persona_add') }}
-          </Button>
-        </Space>
-      </div>
+  <AdminPage
+    :title="$t('admin.persona_title')"
+    :description="$t('admin.persona_hint')"
+  >
+    <template #actions>
+      <Space>
+        <Button :loading="loading" @click="load">
+          {{ $t('notifications.refresh') }}
+        </Button>
+        <Button type="primary" @click="openCreate">
+          <template #icon>
+            <PlusOutlined />
+          </template>
+          {{ $t('admin.persona_add') }}
+        </Button>
+      </Space>
+    </template>
 
-      <Table
-        row-key="id"
-        :columns="columns"
-        :data-source="personas"
-        :loading="loading"
-        :pagination="false"
-        size="middle"
-      >
+    <AdminTable
+      row-key="id"
+      :columns="columns"
+      :data-source="personas"
+      :loading="loading"
+      :pagination="false"
+    >
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'name'">
             <div class="name-cell">
@@ -227,8 +226,7 @@ onMounted(load)
         <template #emptyText>
           <Empty :description="$t('admin.persona_empty')" />
         </template>
-      </Table>
-    </Card>
+      </AdminTable>
 
     <Modal
       v-model:open="modalOpen"
@@ -276,34 +274,10 @@ onMounted(load)
         </label>
       </div>
     </Modal>
-  </div>
+  </AdminPage>
 </template>
 
 <style scoped>
-.personas-view {
-  max-width: 1180px;
-  margin: 0 auto;
-  padding: 24px;
-}
-.toolbar {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
-}
-.toolbar-title {
-  font-size: 18px;
-  font-weight: var(--fw-semibold);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.toolbar-hint {
-  font-size: 12px;
-  font-weight: normal;
-  color: var(--text-secondary);
-}
 .name-cell {
   display: flex;
   align-items: center;

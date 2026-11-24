@@ -60,6 +60,55 @@ def test_cloud_requires_user_key(monkeypatch) -> None:
     assert "API key" in result.detail
 
 
+@pytest.mark.asyncio
+async def test_post_401_reports_endpoint_and_token_fingerprint_without_secret(monkeypatch) -> None:
+    """401 必须能区分"地址错了"和"内外令牌不一致"，但不能泄露令牌本身。"""
+    import hashlib
+
+    import httpx
+
+    from app.knowledge import runtime
+    from app.knowledge.remote import RemoteProvider
+
+    endpoint = "http://127.0.0.1:8123"
+    token = "test-internal-token-do-not-leak"
+    monkeypatch.setattr(runtime, "_BOOTSTRAP_URL", endpoint)
+    monkeypatch.setattr(settings, "knowledge_service_url", endpoint, raising=False)
+    monkeypatch.setattr(settings, "internal_token", token, raising=False)
+
+    seen: list[httpx.Request] = []
+    real_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(401, json={"detail": "unauthorized"})
+
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs)
+    )
+
+    with pytest.raises(ProviderUnavailableError) as caught:
+        await RemoteProvider(mode="selfhosted")._post("/v1/answer", {"question": "q"})
+
+    message = str(caught.value)
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+    assert "HTTP 401" in message
+    assert f"endpoint={endpoint}" in message
+    assert f"engine_token_sha256={fingerprint}" in message
+    assert "APP_SECRET" in message and "INTERNAL_TOKEN" in message
+    assert token not in message, "错误消息不能携带内部令牌明文"
+    assert seen[0].headers["X-Internal-Token"] == token
+
+
+def test_endpoint_display_drops_userinfo_path_and_query() -> None:
+    from app.knowledge.remote import _display_endpoint
+
+    shown = _display_endpoint("https://alice:secret@kb.example.com:8443/private?token=abc")
+    assert shown == "https://kb.example.com:8443"
+    assert "alice" not in shown and "secret" not in shown and "token" not in shown
+
+
 def test_unknown_provider_is_rejected() -> None:
     with pytest.raises(KnowledgeError):
         registry.build_provider("milvus")

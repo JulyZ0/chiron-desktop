@@ -16,6 +16,7 @@ const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const { PassThrough } = require('node:stream')
 const fs = require('node:fs')
+const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 
@@ -582,13 +583,14 @@ test('换一个 APP_SECRET，两个子进程的密钥一起变（不留旧值）
 
 // ------------------------------------------------------------------ 引擎进程
 
-/** 替换全局 fetch：本模块的探针都走 fetch，不打真实网络 */
+/** 替换全局 fetch：本模块的探针都走 fetch，不打真实网络。返回原始实现供用例按需转发。 */
 function mockFetch(t, handler) {
   const original = globalThis.fetch
   globalThis.fetch = handler
   t.after(() => {
     globalThis.fetch = original
   })
+  return original
 }
 
 test('startEngine 没有启动信息时返回 ok:false，且不 spawn', async t => {
@@ -1110,6 +1112,431 @@ test('★ stopLocalStack 会拆掉自愈：关停过程中不会被一边杀一�
   await new Promise(resolve => setTimeout(resolve, 80))
 
   assert.equal(calls.length, before, '关停流程里逐个子进程 kill 必须不被当成崩溃')
+})
+
+// ------------------------------------------------------- 知识库服务的端口 / endpoint 契约
+
+async function waitForKnowledgeSpawn(calls, count) {
+  for (let i = 0; i < 200 && calls.length < count; i += 1) await tick()
+  assert.ok(calls.length >= count, `等待第 ${count} 次 spawn 超时，实际 ${calls.length} 次`)
+}
+
+test('★ pageindex 初次冲突换号后引擎使用新 endpoint，后续重启锁定该端口', async t => {
+  const launcherChild = fakeChild()
+  const knowledgeFirst = fakeChild()
+  const knowledgeSecond = fakeChild()
+  const knowledgeRestart = fakeChild()
+  launcherChild.stdin.on('finish', () => {
+    launcherChild.exitCode = 0
+    launcherChild.emit('exit', 0)
+  })
+  // 引导器 → pageindex(:9600 失败) → pageindex(:9602) → worker → 引擎 → 网关 → 手动重启
+  const calls = withSpawnQueue(t, [
+    launcherChild,
+    knowledgeFirst,
+    knowledgeSecond,
+    fakeChild(),
+    fakeChild(),
+    fakeChild(),
+    knowledgeRestart,
+  ])
+  let knowledgeHealth = false
+  mockFetch(t, async url => {
+    const u = String(url)
+    if ((u.includes(':9600/healthz') || u.includes(':9602/healthz')) && !knowledgeHealth) {
+      return { ok: false }
+    }
+    return gatewayFetch(url)
+  })
+
+  const originalPickFreePort = components.pickFreePort
+  let picks = 0
+  components.pickFreePort = async () => {
+    picks += 1
+    return 9602
+  }
+  t.after(() => {
+    components.pickFreePort = originalPickFreePort
+  })
+
+  const promise = stack.startLocalStack({
+    launcher: { command: 'py', cwd: '/' },
+    exe: 'gateway.exe',
+    port: 9601,
+    appSecret: VALID_SECRET,
+    engine: { command: 'py-engine', args: ['-m', 'app.main'], cwd: '/' },
+    enginePort: 9603,
+    knowledge: { command: 'pageindex', args: ['-m', 'app.main'], cwd: '/' },
+    knowledgePort: 9600,
+    intervalMs: 1,
+  })
+  launcherChild.stdout.write(
+    JSON.stringify({ event: 'launcher-ready', pg_dsn: 'postgresql://u@127.0.0.1:1/c', redis_addr: '127.0.0.1:2' }) + '\n',
+  )
+
+  await waitForKnowledgeSpawn(calls, 2)
+  knowledgeFirst.stderr.write('listen tcp 127.0.0.1:9600: bind: address already in use\n')
+  await tick()
+  knowledgeFirst.exitCode = 1
+  knowledgeFirst.emit('exit', 1)
+  knowledgeHealth = true // 换号后的 :9602 正常监听
+
+  await promise
+
+  assert.equal(picks, 1, '只有初次启动允许冲突换号')
+  assert.deepEqual(calls[2].args.slice(-2), ['--port', '9602'])
+  assert.equal(calls[2].options.env.PAGEINDEX_PORT, '9602')
+  assert.equal(
+    calls[4].options.env.KNOWLEDGE_SERVICE_URL,
+    'http://127.0.0.1:9602',
+    '引擎必须拿到初次换号后的真实 endpoint，而不是原始 :9600',
+  )
+
+  // 运行中重启再遇冲突：禁止偷偷换到 :9603/其它端口，让引擎继续连旧地址。
+  knowledgeHealth = false
+  const restarting = stack.restartProcess('knowledge')
+  await waitForKnowledgeSpawn(calls, 7)
+  knowledgeRestart.stderr.write('listen tcp 127.0.0.1:9602: bind: address already in use\n')
+  await tick()
+  knowledgeRestart.exitCode = 1
+  knowledgeRestart.emit('exit', 1)
+
+  const restarted = await restarting
+  assert.equal(restarted.ok, false)
+  assert.match(restarted.message, /保持引擎 endpoint :9602/)
+  assert.equal(picks, 1, '运行中重启不得挑选新端口')
+  assert.equal(calls.length, 7, '失败后不应再拉起一个换号后的 pageindex')
+  assert.equal(calls[4].options.env.KNOWLEDGE_SERVICE_URL, 'http://127.0.0.1:9602')
+})
+
+test('★ pageindex 初次启动失败也预留端口，后续同端口重启即可被引擎使用', async t => {
+  const launcherChild = fakeChild()
+  const knowledgeFailed = fakeChild()
+  const knowledgeRestart = fakeChild()
+  launcherChild.stdin.on('finish', () => {
+    launcherChild.exitCode = 0
+    launcherChild.emit('exit', 0)
+  })
+  // 引导器 → pageindex(失败) → 引擎 → 网关 → pageindex(同端口恢复) → worker
+  const calls = withSpawnQueue(t, [
+    launcherChild,
+    knowledgeFailed,
+    fakeChild(),
+    fakeChild(),
+    knowledgeRestart,
+    fakeChild(),
+  ])
+  let knowledgeHealth = false
+  mockFetch(t, async url => {
+    const u = String(url)
+    if (u.includes(':9610/healthz') && !knowledgeHealth) return { ok: false }
+    return gatewayFetch(url)
+  })
+
+  const promise = stack.startLocalStack({
+    launcher: { command: 'py', cwd: '/' },
+    exe: 'gateway.exe',
+    port: 9611,
+    appSecret: VALID_SECRET,
+    engine: { command: 'py-engine', args: ['-m', 'app.main'], cwd: '/' },
+    enginePort: 9612,
+    knowledge: { command: 'pageindex', args: ['-m', 'app.main'], cwd: '/' },
+    knowledgePort: 9610,
+    intervalMs: 1,
+  })
+  launcherChild.stdout.write(
+    JSON.stringify({ event: 'launcher-ready', pg_dsn: 'postgresql://u@127.0.0.1:1/c', redis_addr: '127.0.0.1:2' }) + '\n',
+  )
+
+  await waitForKnowledgeSpawn(calls, 2)
+  knowledgeFailed.stderr.write('ModuleNotFoundError: pageindex dependency missing\n')
+  await tick()
+  knowledgeFailed.exitCode = 1
+  knowledgeFailed.emit('exit', 1)
+  await promise
+
+  assert.equal(
+    calls[2].options.env.KNOWLEDGE_SERVICE_URL,
+    'http://127.0.0.1:9610',
+    '可选组件失败不能把引擎的本地 endpoint 留成空值',
+  )
+
+  knowledgeHealth = true
+  const restarting = stack.restartProcess('knowledge')
+  await waitForKnowledgeSpawn(calls, 5)
+  const restarted = await restarting
+  assert.equal(restarted.ok, true)
+  assert.equal(restarted.port, 9610)
+  assert.deepEqual(calls[4].args.slice(-2), ['--port', '9610'])
+  assert.equal(calls[4].options.env.PAGEINDEX_PORT, '9610')
+})
+
+// ------------------------------------------------------- 知识库服务的复用 / 占用判定
+//
+// 端口是**跨重启固定**的：引擎的 `KNOWLEDGE_SERVICE_URL` 在 spawn 时就写死了。上一轮
+// 异常退出后 pageindex 往往还活着并占着它 —— 直接 spawn 只会拿到 `bind: address
+// already in use`，而它恰恰最该被复用；反过来，占端口的也可能是**无关程序**，
+// 绝不能因为"端口被占"就杀掉它。下面几条用例分别钉住这三条路径。
+
+/** pageindex `/healthz` 的可信样例（字段定义见 pageindex-service/app/search_api.py） */
+const PAGEINDEX_HEALTH = {
+  ok: true,
+  status: 'ready',
+  service: 'pageindex-search',
+  engine: 'pageindex==0.4.4',
+  version: '1',
+  schema: 1,
+  worker_alive: true,
+}
+
+/**
+ * 起一个**真实监听**的知识库服务替身。
+ *
+ * 为什么不用 mock fetch 冒充"端口被占用"：复用前要先判端口有没有人在听
+ * （`components.isPortListening` 走真 socket）。没有真实监听时它永远回"空闲"，
+ * 那样测到的不是线上路径。这里用真 HTTP 服务，探测与健康检查都走真实网络。
+ */
+async function startFakePageindex(t, health, options = {}) {
+  const server = http.createServer((req, res) => {
+    const pathname = String(req.url || '').split('?')[0]
+    if (pathname === '/healthz') {
+      const body = typeof health === 'function' ? health() : health
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body || {}))
+      return
+    }
+    res.writeHead(404, { 'content-type': 'text/plain' })
+    res.end('not found')
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(options.port || 0, '127.0.0.1', resolve)
+  })
+  t.after(() => new Promise(resolve => {
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections()
+    server.close(() => resolve())
+  }))
+  const port = server.address().port
+  return { port, baseUrl: `http://127.0.0.1:${port}` }
+}
+
+/**
+ * 起一套带 pageindex 的栈：引导器 → pageindex → worker → 引擎 → 网关。
+ *
+ * `state.live` 控制知识库 `/healthz` 走真网络还是 mock：启动期还没绑定真实服务，
+ * 用 mock 让启动就绪检查通过；置 true 之后一律转发给真实服务 —— 与线上一致。
+ */
+async function startStackWithPageindex(t, kport, state) {
+  const realFetch = mockFetch(t, async (url, init) => {
+    const u = String(url)
+    if (u.includes(`:${kport}/healthz`)) {
+      if (!state.live) return { ok: true, json: async () => ({ ok: true, status: 'starting' }) }
+      return realFetch(url, init)
+    }
+    return gatewayFetch(url)
+  })
+
+  const launcherChild = fakeChild()
+  launcherChild.stdin.on('finish', () => {
+    launcherChild.exitCode = 0
+    launcherChild.emit('exit', 0)
+  })
+  const pageindexChild = fakeChild()
+  const workerChild = fakeChild()
+  const calls = withSpawnQueue(t, [
+    launcherChild,
+    pageindexChild,
+    workerChild,
+    fakeChild(), // 引擎
+    fakeChild(), // 网关
+  ])
+  const promise = stack.startLocalStack({
+    launcher: { command: 'py', cwd: '/' },
+    exe: 'gateway.exe',
+    port: kport + 1,
+    appSecret: VALID_SECRET,
+    engine: { command: 'py-engine', args: ['-m', 'app.main'], cwd: '/' },
+    enginePort: kport + 2,
+    knowledge: { command: 'pageindex', args: ['-m', 'app.main'], cwd: '/' },
+    knowledgePort: kport,
+    intervalMs: 1,
+    // 崩溃自愈的退避在单测里压到 0：要验的是判定，不是等待
+    knowledgeRestartDelayMs: 0,
+  })
+  launcherChild.stdout.write(
+    JSON.stringify({ event: 'launcher-ready', pg_dsn: 'postgresql://u@127.0.0.1:1/c', redis_addr: '127.0.0.1:2' }) + '\n',
+  )
+  await promise
+  return { calls, pageindexChild, workerChild }
+}
+
+test('★★ 应用重启：固定端口上已有可信 pageindex ⇒ 复用，不再 spawn，endpoint 同步给引擎', async t => {
+  // 上一轮进程还活着（真实监听），本轮拿到同一个固定端口
+  const fake = await startFakePageindex(t, PAGEINDEX_HEALTH)
+  const realFetch = mockFetch(t, async (url, init) => {
+    if (String(url).startsWith(fake.baseUrl)) return realFetch(url, init)
+    return gatewayFetch(url)
+  })
+
+  const launcherChild = fakeChild()
+  launcherChild.stdin.on('finish', () => {
+    launcherChild.exitCode = 0
+    launcherChild.emit('exit', 0)
+  })
+  // 复用时 knowledge/worker 都不该 spawn：队列只给 引导器 → 引擎 → 网关 三个
+  const calls = withSpawnQueue(t, [launcherChild, fakeChild(), fakeChild()])
+
+  const promise = stack.startLocalStack({
+    launcher: { command: 'py', cwd: '/' },
+    exe: 'gateway.exe',
+    port: 9621,
+    appSecret: VALID_SECRET,
+    engine: { command: 'py-engine', args: ['-m', 'app.main'], cwd: '/' },
+    enginePort: 9622,
+    knowledge: { command: 'pageindex', args: ['-m', 'app.main'], cwd: '/' },
+    knowledgePort: fake.port,
+    intervalMs: 1,
+  })
+  launcherChild.stdout.write(
+    JSON.stringify({ event: 'launcher-ready', pg_dsn: 'postgresql://u@127.0.0.1:1/c', redis_addr: '127.0.0.1:2' }) + '\n',
+  )
+  await promise
+
+  assert.equal(
+    calls.length,
+    3,
+    `复用可信实例时不得再拉起进程，实际 spawn：${calls.map(c => c.command).join(',')}`,
+  )
+  assert.equal(calls[1].command, 'py-engine')
+  assert.equal(
+    calls[1].options.env.KNOWLEDGE_SERVICE_URL,
+    fake.baseUrl,
+    '引擎必须拿到被复用实例的 endpoint（否则建索引/检索全打到空地址）',
+  )
+  const kb = stack.getStackState().knowledge
+  assert.equal(kb.port, fake.port)
+  assert.equal(kb.adopted, true, 'adopted 标记要能被健康面板看到（不是本实例拉起的进程）')
+})
+
+test('★★ pageindex 崩溃自愈：固定端口上已有可信实例 ⇒ 复用，不再拉起新进程', async t => {
+  const kport = await components.pickFreePort()
+  const state = { live: false }
+  const { calls, pageindexChild } = await startStackWithPageindex(t, kport, state)
+  assert.equal(calls.length, 5)
+  assert.equal(calls[1].command, 'pageindex')
+  assert.equal(stack.getStackState().knowledge.adopted, false)
+
+  // 崩溃发生时，端口上是"上一轮残留"的可信实例（真实监听）
+  await startFakePageindex(t, PAGEINDEX_HEALTH, { port: kport })
+  state.live = true
+
+  // 本实例拉起的服务崩掉（非零退出、非主动关停）⇒ 自愈路径先停后起
+  pageindexChild.exitCode = 1
+  pageindexChild.emit('exit', 1)
+
+  await waitFor(() => {
+    const kb = stack.getStackState().knowledge
+    return Boolean(kb && kb.adopted)
+  }, { label: '崩溃自愈时复用残留实例' })
+
+  assert.equal(calls.length, 5, '复用残留实例时不得再 spawn 新进程')
+  const kb = stack.getStackState().knowledge
+  assert.equal(kb.port, kport, 'endpoint 必须仍是被引擎写死的那个端口')
+  assert.equal(kb.pid, null, '复用的进程不归本实例所有，不该有 pid')
+})
+
+test('★ 手动重启 pageindex：端口被可信实例占着 ⇒ 复用成功，不换端口也不 spawn', async t => {
+  const kport = await components.pickFreePort()
+  const state = { live: false }
+  const { calls, pageindexChild } = await startStackWithPageindex(t, kport, state)
+
+  // 用户点「重启」时，端口上是可信实例（真实监听）
+  const fake = await startFakePageindex(t, PAGEINDEX_HEALTH, { port: kport })
+  state.live = true
+  const before = calls.length
+
+  const result = await stack.restartProcess('knowledge')
+
+  assert.equal(result.ok, true, `复用应成功，实际：${result.message || result.reason}`)
+  assert.equal(result.reused, true)
+  assert.equal(result.port, kport, '复用的 endpoint 必须与引擎写死的一致')
+  assert.equal(result.baseUrl, fake.baseUrl)
+  assert.equal(calls.length, before, '复用时不得再 spawn（spawn 必然撞 bind 冲突）')
+  // 旧记录（ours）已经停了，但复用的实例仍在
+  assert.equal(pageindexChild.exitCode, 0)
+})
+
+test('★ 手动重启 pageindex：端口被无关进程占用 ⇒ 可行动错误，不杀对方也不换端口', async t => {
+  const kport = await components.pickFreePort()
+  const state = { live: false }
+  const { calls } = await startStackWithPageindex(t, kport, state)
+
+  // 无关程序占着这个端口（自报服务名不是 pageindex-search）
+  const foreign = await startFakePageindex(t, { ok: true, service: 'someone-else' }, { port: kport })
+  state.live = true
+  const before = calls.length
+
+  const result = await stack.restartProcess('knowledge')
+
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'port-occupied')
+  assert.match(result.message, /已被其它程序占用/)
+  assert.match(result.message, /没有终止它/, '必须明确说明没有误杀其它进程')
+  assert.match(result.message, new RegExp(`:${kport}`))
+  assert.equal(calls.length, before, '不得换端口重拉：引擎的 endpoint 已经写死')
+
+  // 对方仍在正常应答（探测/判断都不会终止它）
+  const res = await fetch(`${foreign.baseUrl}/healthz`)
+  assert.equal(res.status, 200)
+})
+
+test('evaluateKnowledgeHealth：身份 / 版本 / schema 三项判据', () => {
+  assert.equal(stack.evaluateKnowledgeHealth(PAGEINDEX_HEALTH).trusted, true)
+
+  // 身份不符：绝不能把别人的服务当成知识库索引服务
+  assert.equal(stack.evaluateKnowledgeHealth({ ...PAGEINDEX_HEALTH, service: 'nginx' }).trusted, false)
+  assert.equal(stack.evaluateKnowledgeHealth(null).trusted, false)
+
+  // 身份对但版本缺失/unknown：它自己都没装好 SDK，复用只会把"不可用"伪装成"就绪"
+  for (const engine of ['', 'pageindex==unknown']) {
+    assert.equal(
+      stack.evaluateKnowledgeHealth({ service: 'pageindex-search', engine }).trusted,
+      false,
+      `engine=${JSON.stringify(engine)} 不该被信任`,
+    )
+  }
+
+  // schema 不兼容：产物布局不同，宁可重启也不读写错目录
+  const mismatch = stack.evaluateKnowledgeHealth({ ...PAGEINDEX_HEALTH, schema: 2 })
+  assert.equal(mismatch.trusted, false)
+  assert.equal(mismatch.reason, 'schema-mismatch')
+
+  // 老版本没有 schema 字段：身份+版本已经足够窄，放行（否则升级后第一次重启必失败）
+  assert.equal(
+    stack.evaluateKnowledgeHealth({ service: 'pageindex-search', engine: 'pageindex==0.4.4' }).trusted,
+    true,
+  )
+})
+
+test('isPortListening 只探测不占用：空闲 false，有监听 true，且不打断对方', async t => {
+  const freePort = await components.pickFreePort()
+  assert.equal(await components.isPortListening(freePort), false)
+
+  const fake = await startFakePageindex(t, PAGEINDEX_HEALTH)
+  assert.equal(await components.isPortListening(fake.port), true)
+  // 反复探测不会占住端口，也不影响对方
+  assert.equal(await components.isPortListening(fake.port), true)
+  const res = await fetch(`${fake.baseUrl}/healthz`)
+  assert.equal(res.status, 200)
+})
+
+test('probeKnowledgeEndpoint：空闲端口回 free（不 spawn 判定交给调用方）', async t => {
+  const freePort = await components.pickFreePort()
+  mockFetch(t, async () => {
+    throw new Error('空闲端口不该发 HTTP 请求')
+  })
+  const probe = await stack.probeKnowledgeEndpoint(freePort)
+  assert.equal(probe.state, 'free')
 })
 
 // ------------------------------------------------------- 知识库服务的模型配置

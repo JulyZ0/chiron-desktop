@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
-import { Card, Row, Col, Form, FormItem, Input, InputNumber, InputPassword, Button, Switch, Slider, Select, Tag, message } from 'ant-design-vue'
+import { computed, reactive, ref, watch, type Ref } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { Alert, Button, Spin, Tabs, TabPane, Tag, message } from 'ant-design-vue'
 import {
   saveSettings,
   getSettings,
@@ -12,53 +13,63 @@ import {
   exportTenantData,
   AGENT_SETTINGS_DEFAULTS,
   type AgentSettingsConfig,
+  type MailConfigPatch,
 } from '@/api/admin'
-
-import EngineEnvPanel from '../../components/settings/EngineEnvPanel.vue'
+import { useTabbedQuery } from '@/composables/useTabbedQuery'
+import { useUnsavedChangesGuard } from '@/composables/useUnsavedChangesGuard'
 import { desktopHost } from '@/stores/device'
+import GeneralPanel from '@/components/settings/admin/GeneralPanel.vue'
+import ModelQuotaPanel from '@/components/settings/admin/ModelQuotaPanel.vue'
+import RuntimePanel from '@/components/settings/admin/RuntimePanel.vue'
+import MailPanel from '@/components/settings/admin/MailPanel.vue'
+import DataPanel from '@/components/settings/admin/DataPanel.vue'
+import type {
+  ApiKeyConfig,
+  CacheConfig,
+  MailConfigDraft,
+  ModelRateConfig,
+  QuotaConfig,
+  RateLimitConfig,
+  SettingsTabKey,
+} from '@/components/settings/admin/types'
 
-import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
-/** 引擎功能开关只对桌面端有意义（改的是本机引擎进程环境）。 */
 const isDesktop = Boolean(desktopHost()?.isDesktop)
-const saving = ref(false)
-const loading = ref(false)
 
-/** 保存失败提示：优先 Error.message（调用方/axios 抛出时已带说明），取不到用兜底文案 */
-function saveErrorText(err: unknown): string {
-  return err instanceof Error && err.message ? err.message : t('errors.unknown_error')
-}
-
-const rateLimitConfig = ref({
-  global: 1000,
-  tenant: 500,
-  user: 100,
+const TAB_KEYS: readonly SettingsTabKey[] = ['general', 'models', 'runtime', 'mail', 'data']
+const { activeTab, visited, select } = useTabbedQuery({
+  routePath: '/admin/settings',
+  defaultTab: 'general',
+  tabKeys: TAB_KEYS,
 })
 
-const cacheConfig = ref({
+const tabs = computed<Array<{ key: SettingsTabKey; label: string }>>(() => [
+  { key: 'general', label: t('settings.general_settings') },
+  { key: 'models', label: t('admin.model_rate_config') },
+  { key: 'runtime', label: t('admin.agent_runtime_config') },
+  { key: 'mail', label: t('admin.mail_config') },
+  { key: 'data', label: t('common.data_storage') },
+])
+
+const createRateLimit = (): RateLimitConfig => ({ global: 1000, tenant: 500, user: 100 })
+const createCache = (): CacheConfig => ({
   l1Capacity: 2048,
   l2Ttl: 3600,
   semanticThreshold: 0.95,
   prefetchEnabled: true,
 })
-
-const apiKeyConfig = ref({
+const createApiKey = (): ApiKeyConfig => ({
   circuitBreakerThreshold: 5,
   recoveryTimeout: 60,
   weightDecay: 0.5,
   autoRecovery: true,
 })
-
-// 日费用熔断（分）：0 = 不限。按 usage_events 当日 UTC 汇总，submit 与 OpenAI 兼容入口共用。
-const quotaConfig = ref({
+const createQuota = (): QuotaConfig => ({
   tenant_daily_cost_cents: 0,
   user_daily_cost_cents: 0,
   device_write_max_projects: 0,
 })
-
-// 模型调用限流（租户级，按每次 LLM 调用计数）：0/0 = 关闭。
-// 与 HTTP 请求限流分开，避免一次回合的多次模型调用吃光普通请求额度。
-const modelRateConfig = ref({
+const createModelRate = (): ModelRateConfig => ({
   gateway_model_rpm: 0,
   gateway_model_rps: 0,
   gateway_model_user_rpm: 0,
@@ -67,13 +78,8 @@ const modelRateConfig = ref({
   gateway_model_user_tpm: 0,
   sandbox_max_concurrency_per_tenant: 0,
 })
-
-// Agent 运行配置：键名/默认值/白名单都由 @/api/admin 统一维护（与引擎 config.py 同名同义），
-// 这里只绑定，不重复一份常量 —— 抄两份默认值就会在某次改默认值后悄悄不一致。
-const agentConfig = ref<AgentSettingsConfig>({ ...AGENT_SETTINGS_DEFAULTS })
-
-// 邮件通道：服务端只回密钥"是否已设置"，密码/API Key 输入框留空 = 保持原值。
-const mail = ref({
+const createAgent = (): AgentSettingsConfig => ({ ...AGENT_SETTINGS_DEFAULTS })
+const createMail = (): MailConfigDraft => ({
   provider: 'smtp',
   host: '',
   port: 587,
@@ -87,6 +93,23 @@ const mail = ref({
   api_key: '',
   timeout_seconds: 30,
 })
+
+const rateLimitConfig = ref(createRateLimit())
+const cacheConfig = ref(createCache())
+const apiKeyConfig = ref(createApiKey())
+const quotaConfig = ref(createQuota())
+const modelRateConfig = ref(createModelRate())
+const agentConfig = ref(createAgent())
+const mail = ref(createMail())
+
+const rateLimitBaseline = ref(createRateLimit())
+const cacheBaseline = ref(createCache())
+const apiKeyBaseline = ref(createApiKey())
+const quotaBaseline = ref(createQuota())
+const modelRateBaseline = ref(createModelRate())
+const agentBaseline = ref(createAgent())
+const mailBaseline = ref(createMail())
+
 const mailHasPassword = ref(false)
 const mailHasAPIKey = ref(false)
 const mailReady = ref(false)
@@ -94,736 +117,515 @@ const mailProblem = ref('')
 const testingMail = ref(false)
 const exporting = ref(false)
 
-const mailProviderOptions = computed(() => [
-  { value: 'smtp', label: t('admin.mail_provider_smtp') },
-  { value: 'qingchen', label: t('admin.mail_provider_qingchen') },
-])
-const mailSecurityOptions = computed(() => [
-  { value: 'starttls', label: t('admin.mail_security_starttls') },
-  { value: 'ssl', label: t('admin.mail_security_ssl') },
-  { value: 'none', label: t('admin.mail_security_none') },
-])
+type SaveKey = 'rateLimit' | 'cache' | 'apiKey' | 'quota' | 'modelRate' | 'agent' | 'mail'
+const saving = reactive<Record<SaveKey, boolean>>({
+  rateLimit: false,
+  cache: false,
+  apiKey: false,
+  quota: false,
+  modelRate: false,
+  agent: false,
+  mail: false,
+})
 
-const planApprovalOptions = computed(() => [
-  { value: 'never', label: t('admin.plan_approval_never') },
-  { value: 'always', label: t('admin.plan_approval_always') },
-])
+const loadedTabs = ref<Set<SettingsTabKey>>(new Set())
+const attemptedTabs = ref<Set<SettingsTabKey>>(new Set())
+const tabLoading = reactive<Record<SettingsTabKey, boolean>>({
+  general: false,
+  models: false,
+  runtime: false,
+  mail: false,
+  data: false,
+})
+const tabError = reactive<Record<SettingsTabKey, string>>({
+  general: '',
+  models: '',
+  runtime: '',
+  mail: '',
+  data: '',
+})
 
-const narrationOptions = computed(() => [
-  { value: 'off', label: t('admin.narration_off') },
-  { value: 'brief', label: t('admin.narration_brief') },
-  { value: 'detailed', label: t('admin.narration_detailed') },
-])
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
 
-async function saveRateLimit() {
-  saving.value = true
-  try {
-    await saveSettings('rate_limit', rateLimitConfig.value)
-    message.success(t('common.rate_limit_config_saved'))
-  } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
-  } finally {
-    saving.value = false
+function equal<T>(left: T, right: T): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error && err.message ? err.message : t('errors.unknown_error')
+}
+
+/** 只覆盖后端契约里已有的键，未返回的键继续使用本地默认值。 */
+function mergeConfig<T extends object>(target: T, saved: Record<string, unknown>): void {
+  const writable = target as Record<string, unknown>
+  for (const key of Object.keys(target)) {
+    if (saved[key] !== undefined) writable[key] = saved[key]
   }
 }
 
-async function saveCache() {
-  saving.value = true
+async function loadGeneral(): Promise<void> {
+  mergeConfig(rateLimitConfig.value, await getSettings('rate_limit'))
+  rateLimitBaseline.value = clone(rateLimitConfig.value)
+}
+
+async function loadModels(): Promise<void> {
+  const [apiKey, quota, modelRate] = await Promise.all([
+    getSettings('api_key'),
+    getSettings('quota'),
+    getSettings('python'),
+  ])
+  mergeConfig(apiKeyConfig.value, apiKey)
+  mergeConfig(quotaConfig.value, quota)
+  mergeConfig(modelRateConfig.value, modelRate)
+  apiKeyBaseline.value = clone(apiKeyConfig.value)
+  quotaBaseline.value = clone(quotaConfig.value)
+  modelRateBaseline.value = clone(modelRateConfig.value)
+}
+
+async function loadRuntime(): Promise<void> {
+  agentConfig.value = await getAgentSettings()
+  agentBaseline.value = clone(agentConfig.value)
+}
+
+async function loadMail(): Promise<void> {
+  const cfg = await getMailConfig()
+  mail.value = {
+    provider: cfg.provider === 'qingchen' ? 'qingchen' : 'smtp',
+    host: cfg.host || '',
+    port: cfg.port || 587,
+    username: cfg.username || '',
+    password: '',
+    security: cfg.security || 'starttls',
+    from: cfg.from || '',
+    from_name: cfg.from_name || 'Chiron',
+    reply_to: cfg.reply_to || '',
+    base_url: cfg.base_url || '',
+    api_key: '',
+    timeout_seconds: cfg.timeout_seconds || 30,
+  }
+  mailHasPassword.value = cfg.has_password
+  mailHasAPIKey.value = cfg.has_api_key
+  mailReady.value = cfg.ready
+  mailProblem.value = cfg.problem || ''
+  mailBaseline.value = clone(mail.value)
+}
+
+async function loadData(): Promise<void> {
+  mergeConfig(cacheConfig.value, await getSettings('cache'))
+  cacheBaseline.value = clone(cacheConfig.value)
+}
+
+/** 每个 Tab 只加载一次；失败后可显式重试，切换离开再回来不会重复请求。 */
+async function loadTab(tab: SettingsTabKey, retry = false): Promise<void> {
+  if (loadedTabs.value.has(tab) || tabLoading[tab] || (attemptedTabs.value.has(tab) && !retry)) return
+  attemptedTabs.value = new Set([...attemptedTabs.value, tab])
+  tabLoading[tab] = true
+  tabError[tab] = ''
   try {
-    await saveSettings('cache', cacheConfig.value)
-    message.success(t('admin.cache_config_saved'))
+    switch (tab) {
+      case 'general':
+        await loadGeneral()
+        break
+      case 'models':
+        await loadModels()
+        break
+      case 'runtime':
+        await loadRuntime()
+        break
+      case 'mail':
+        await loadMail()
+        break
+      case 'data':
+        await loadData()
+        break
+    }
+    loadedTabs.value = new Set([...loadedTabs.value, tab])
   } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
+    tabError[tab] = errorText(err)
   } finally {
-    saving.value = false
+    tabLoading[tab] = false
   }
 }
 
-async function saveApiKey() {
-  saving.value = true
-  try {
-    await saveSettings('api_key', apiKeyConfig.value)
-    message.success(t('common.api_key_config_saved'))
-  } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
-  } finally {
-    saving.value = false
+watch(activeTab, (tab) => void loadTab(tab as SettingsTabKey), { immediate: true })
+
+const sectionDirty = computed(() => ({
+  rateLimit: !equal(rateLimitConfig.value, rateLimitBaseline.value),
+  cache: !equal(cacheConfig.value, cacheBaseline.value),
+  apiKey: !equal(apiKeyConfig.value, apiKeyBaseline.value),
+  quota: !equal(quotaConfig.value, quotaBaseline.value),
+  modelRate: !equal(modelRateConfig.value, modelRateBaseline.value),
+  agent: !equal(agentConfig.value, agentBaseline.value),
+  mail: !equal(mail.value, mailBaseline.value),
+}))
+
+const engineDirty = ref(false)
+const hasUnsaved = computed(() => Object.values(sectionDirty.value).some(Boolean) || engineDirty.value)
+useUnsavedChangesGuard(hasUnsaved)
+
+function tabDirty(tab: SettingsTabKey): boolean {
+  switch (tab) {
+    case 'general':
+      return sectionDirty.value.rateLimit
+    case 'models':
+      return sectionDirty.value.apiKey || sectionDirty.value.modelRate || sectionDirty.value.quota
+    case 'runtime':
+      return sectionDirty.value.agent || engineDirty.value
+    case 'mail':
+      return sectionDirty.value.mail
+    case 'data':
+      return sectionDirty.value.cache
   }
 }
 
-async function saveQuota() {
-  saving.value = true
+async function saveConfig<T extends object>(
+  key: SaveKey,
+  category: string,
+  config: T,
+  baseline: Ref<T>,
+  successKey: string,
+): Promise<void> {
+  saving[key] = true
   try {
-    await saveSettings('quota', quotaConfig.value)
-    message.success(t('admin.quota_saved'))
+    const snapshot = clone(config)
+    await saveSettings(category, { ...snapshot } as Record<string, unknown>)
+    baseline.value = snapshot
+    message.success(t(successKey))
   } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
+    message.error(t('errors.save_failed_error', { error: errorText(err) }))
   } finally {
-    saving.value = false
+    saving[key] = false
   }
 }
 
-async function saveModelRate() {
-  saving.value = true
-  try {
-    await saveSettings('python', modelRateConfig.value)
-    message.success(t('admin.model_rate_saved'))
-  } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
-  } finally {
-    saving.value = false
-  }
+function saveRateLimit(): Promise<void> {
+  return saveConfig('rateLimit', 'rate_limit', rateLimitConfig.value, rateLimitBaseline, 'common.rate_limit_config_saved')
 }
 
-async function saveAgent() {
-  saving.value = true
+function saveCache(): Promise<void> {
+  return saveConfig('cache', 'cache', cacheConfig.value, cacheBaseline, 'admin.cache_config_saved')
+}
+
+function saveApiKey(): Promise<void> {
+  return saveConfig('apiKey', 'api_key', apiKeyConfig.value, apiKeyBaseline, 'common.api_key_config_saved')
+}
+
+function saveQuota(): Promise<void> {
+  return saveConfig('quota', 'quota', quotaConfig.value, quotaBaseline, 'admin.quota_saved')
+}
+
+function saveModelRate(): Promise<void> {
+  return saveConfig('modelRate', 'python', modelRateConfig.value, modelRateBaseline, 'admin.model_rate_saved')
+}
+
+async function saveAgent(): Promise<void> {
+  saving.agent = true
   try {
-    await saveAgentSettings(agentConfig.value)
+    const snapshot = clone(agentConfig.value)
+    await saveAgentSettings(snapshot)
+    agentBaseline.value = snapshot
     message.success(t('admin.agent_runtime_config_saved'))
   } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
+    message.error(t('errors.save_failed_error', { error: errorText(err) }))
   } finally {
-    saving.value = false
+    saving.agent = false
   }
 }
 
-async function loadMail() {
+async function saveMail(): Promise<void> {
+  saving.mail = true
   try {
-    const cfg = await getMailConfig()
-    mail.value = {
-      provider: cfg.provider === 'qingchen' ? 'qingchen' : 'smtp',
-      host: cfg.host || '',
-      port: cfg.port || 587,
-      username: cfg.username || '',
-      password: '',
-      security: cfg.security || 'starttls',
-      from: cfg.from || '',
-      from_name: cfg.from_name || 'Chiron',
-      reply_to: cfg.reply_to || '',
-      base_url: cfg.base_url || '',
-      api_key: '',
-      timeout_seconds: cfg.timeout_seconds || 30,
+    const snapshot = clone(mail.value)
+    const patch: MailConfigPatch = {
+      provider: snapshot.provider,
+      host: snapshot.host,
+      port: snapshot.port,
+      username: snapshot.username,
+      security: snapshot.security,
+      from: snapshot.from,
+      from_name: snapshot.from_name,
+      reply_to: snapshot.reply_to,
+      base_url: snapshot.base_url,
+      timeout_seconds: snapshot.timeout_seconds,
+      // 空串表示保持服务端密钥，绝不能作为默认值随表单提交。
+      ...(snapshot.password ? { password: snapshot.password } : {}),
+      ...(snapshot.api_key ? { api_key: snapshot.api_key } : {}),
     }
-    mailHasPassword.value = cfg.has_password
-    mailHasAPIKey.value = cfg.has_api_key
-    mailReady.value = cfg.ready
-    mailProblem.value = cfg.problem || ''
-  } catch {
-    // 读不到时保持空表单：不要用假默认覆盖用户已保存的值。
-  }
-}
-
-async function saveMail() {
-  saving.value = true
-  try {
-    const cfg = await saveMailConfig({
-      provider: mail.value.provider,
-      host: mail.value.host,
-      port: mail.value.port,
-      username: mail.value.username,
-      security: mail.value.security,
-      from: mail.value.from,
-      from_name: mail.value.from_name,
-      reply_to: mail.value.reply_to,
-      base_url: mail.value.base_url,
-      timeout_seconds: mail.value.timeout_seconds,
-      // 只提交实际输入的密钥；空串会清空服务端密钥，不能随表单默认值一起发。
-      ...(mail.value.password ? { password: mail.value.password } : {}),
-      ...(mail.value.api_key ? { api_key: mail.value.api_key } : {}),
-    })
+    const cfg = await saveMailConfig(patch)
     mail.value.password = ''
     mail.value.api_key = ''
     mailHasPassword.value = cfg.has_password
     mailHasAPIKey.value = cfg.has_api_key
     mailReady.value = cfg.ready
     mailProblem.value = cfg.problem || ''
+    mailBaseline.value = { ...snapshot, password: '', api_key: '' }
     message.success(t('admin.mail_saved'))
   } catch (err) {
-    message.error(t('errors.save_failed_error', { error: saveErrorText(err) }))
+    message.error(t('errors.save_failed_error', { error: errorText(err) }))
   } finally {
-    saving.value = false
+    saving.mail = false
   }
 }
 
-async function sendTestMail() {
+async function sendTestMail(): Promise<void> {
   testingMail.value = true
   try {
     const res = await testMailConfig()
     message.success(t('admin.mail_test_sent', { to: res.to }))
   } catch (err) {
-    message.error(t('admin.mail_test_failed', { error: saveErrorText(err) }))
+    message.error(t('admin.mail_test_failed', { error: errorText(err) }))
   } finally {
     testingMail.value = false
   }
 }
 
-async function downloadExport() {
+async function downloadExport(): Promise<void> {
   exporting.value = true
   try {
     const blob = await exportTenantData()
     const stamp = new Date().toISOString().replace(/[:T]/g, '-').slice(0, 19)
     const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `chiron-export-${stamp}.zip`
-    a.click()
-    URL.revokeObjectURL(url)
+    try {
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `chiron-export-${stamp}.zip`
+      a.click()
+    } finally {
+      URL.revokeObjectURL(url)
+    }
     message.success(t('admin.data_export_done'))
   } catch (err) {
-    message.error(t('admin.data_export_failed', { error: saveErrorText(err) }))
+    message.error(t('admin.data_export_failed', { error: errorText(err) }))
   } finally {
     exporting.value = false
   }
 }
 
-// 修复：加载已持久化的真实配置（不再以写死的示例默认值覆盖线上配置）。
-// 按返回的 key 覆盖默认值；后端无记录时保留默认（本地为空态）。
-function mergeConfig(target: { value: Record<string, unknown> }, saved: Record<string, unknown>) {
-  for (const k of Object.keys(target.value)) {
-    if (saved[k] !== undefined) target.value[k] = saved[k]
+function discard(section: keyof typeof sectionDirty.value): void {
+  switch (section) {
+    case 'rateLimit':
+      rateLimitConfig.value = clone(rateLimitBaseline.value)
+      break
+    case 'cache':
+      cacheConfig.value = clone(cacheBaseline.value)
+      break
+    case 'apiKey':
+      apiKeyConfig.value = clone(apiKeyBaseline.value)
+      break
+    case 'quota':
+      quotaConfig.value = clone(quotaBaseline.value)
+      break
+    case 'modelRate':
+      modelRateConfig.value = clone(modelRateBaseline.value)
+      break
+    case 'agent':
+      agentConfig.value = clone(agentBaseline.value)
+      break
+    case 'mail':
+      mail.value = clone(mailBaseline.value)
+      break
   }
 }
-
-onMounted(async () => {
-  loading.value = true
-  try {
-    mergeConfig(rateLimitConfig, await getSettings('rate_limit'))
-    mergeConfig(cacheConfig, await getSettings('cache'))
-    mergeConfig(apiKeyConfig, await getSettings('api_key'))
-    mergeConfig(quotaConfig, await getSettings('quota'))
-    mergeConfig(modelRateConfig, await getSettings('python'))
-    // Agent 运行配置单独一路：后端无记录时要显示**引擎正在用的默认值**，
-    // 不能用 mergeConfig（它只覆盖已有 key，语义不同在此无差别，但归一化要额外做）。
-    agentConfig.value = await getAgentSettings()
-    // 邮件配置独立：失败不能把上面已加载的配置清空。
-    await loadMail()
-  } catch {
-    // 拉取失败保留默认值，不阻断页面
-  } finally {
-    loading.value = false
-  }
-})
 </script>
 
 <template>
   <div class="settings">
-    <Row :gutter="16">
-      <!-- 限流配置 -->
-      <Col
-        :xs="24"
-        :sm="12"
+    <header class="settings-header">
+      <h1>{{ $t('settings.system_settings') }}</h1>
+      <Tag
+        v-if="hasUnsaved"
+        color="warning"
+        data-test="settings-unsaved"
+        role="status"
       >
-        <Card :title="$t('common.rate_limit_config')">
-          <Form
-            :model="rateLimitConfig"
-            layout="vertical"
-          >
-            <FormItem :label="$t('common.global_per_minute')">
-              <InputNumber
-                v-model:value="rateLimitConfig.global"
-                :min="100"
-                :max="1000000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.per_tenant_per_minute')">
-              <InputNumber
-                v-model:value="rateLimitConfig.tenant"
-                :min="10"
-                :max="100000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.per_user_per_minute')">
-              <InputNumber
-                v-model:value="rateLimitConfig.user"
-                :min="1"
-                :max="10000"
-                style="width: 100%"
-              />
-            </FormItem>
-          </Form>
-          <Button
-            type="primary"
-            :loading="saving"
-            @click="saveRateLimit"
-          >
-            {{ $t('common.save') }}
-          </Button>
-          <div class="config-note">
-            {{ $t('common.takes_effect_immediately_after_saving_hot_reload') }}
-          </div>
-        </Card>
-      </Col>
+        {{ $t('common.unsaved') }}
+      </Tag>
+    </header>
 
-      <!-- 缓存配置 -->
-      <Col
-        :xs="24"
-        :sm="12"
+    <Tabs
+      :active-key="activeTab"
+      class="settings-tabs"
+      @change="select"
+    >
+      <TabPane
+        v-for="tab in tabs"
+        :key="tab.key"
       >
-        <Card :title="$t('admin.cache_config')">
-          <Form
-            :model="cacheConfig"
-            layout="vertical"
-          >
-            <FormItem :label="$t('common.l1_capacity')">
-              <InputNumber
-                v-model:value="cacheConfig.l1Capacity"
-                :min="100"
-                :max="10000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem label="L2 TTL">
-              <InputNumber
-                v-model:value="cacheConfig.l2Ttl"
-                :min="60"
-                :max="86400"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.semantic_cache_threshold')">
-              <Slider
-                v-model:value="cacheConfig.semanticThreshold"
-                :min="0.5"
-                :max="1"
-                :step="0.01"
-              />
-            </FormItem>
-            <FormItem :label="$t('common.enable_prefetch')">
-              <Switch v-model:checked="cacheConfig.prefetchEnabled" />
-            </FormItem>
-          </Form>
-          <Button
-            type="primary"
-            :loading="saving"
-            @click="saveCache"
-          >
-            {{ $t('common.save') }}
-          </Button>
-        </Card>
-      </Col>
-
-      <!-- API Key 配置 -->
-      <Col
-        :xs="24"
-        :sm="12"
-      >
-        <Card :title="$t('common.api_key_config')">
-          <Form
-            :model="apiKeyConfig"
-            layout="vertical"
-          >
-            <FormItem :label="$t('common.circuit_breaker_threshold')">
-              <InputNumber
-                v-model:value="apiKeyConfig.circuitBreakerThreshold"
-                :min="1"
-                :max="100"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('errors.restore_timeout')">
-              <InputNumber
-                v-model:value="apiKeyConfig.recoveryTimeout"
-                :min="10"
-                :max="3600"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('common.weight_decay')">
-              <Slider
-                v-model:value="apiKeyConfig.weightDecay"
-                :min="0.1"
-                :max="1"
-                :step="0.1"
-              />
-            </FormItem>
-            <FormItem :label="$t('common.auto_recover')">
-              <Switch v-model:checked="apiKeyConfig.autoRecovery" />
-            </FormItem>
-          </Form>
-          <Button
-            type="primary"
-            :loading="saving"
-            @click="saveApiKey"
-          >
-            {{ $t('common.save') }}
-          </Button>
-        </Card>
-      </Col>
-
-      <!-- 模型调用限流（system_settings 的 python 分类，引擎启动/广播消费）-->
-      <Col
-        :xs="24"
-        :sm="12"
-      >
-        <Card
-          :title="$t('admin.model_rate_config')"
-          data-test="model-rate-config"
-        >
-          <Form
-            :model="modelRateConfig"
-            layout="vertical"
-          >
-            <FormItem :label="$t('admin.model_rate_rpm')">
-              <InputNumber
-                v-model:value="modelRateConfig.gateway_model_rpm"
-                :min="0"
-                :step="60"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.model_rate_rps')">
-              <InputNumber
-                v-model:value="modelRateConfig.gateway_model_rps"
-                :min="0"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.model_rate_user_rpm')">
-              <InputNumber
-                v-model:value="modelRateConfig.gateway_model_user_rpm"
-                :min="0"
-                :step="60"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.model_rate_user_rps')">
-              <InputNumber
-                v-model:value="modelRateConfig.gateway_model_user_rps"
-                :min="0"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.model_rate_tpm')">
-              <InputNumber
-                v-model:value="modelRateConfig.gateway_model_tpm"
-                :min="0"
-                :step="10000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.model_rate_user_tpm')">
-              <InputNumber
-                v-model:value="modelRateConfig.gateway_model_user_tpm"
-                :min="0"
-                :step="10000"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.sandbox_concurrency')">
-              <InputNumber
-                v-model:value="modelRateConfig.sandbox_max_concurrency_per_tenant"
-                :min="0"
-                style="width: 100%"
-              />
-            </FormItem>
-            <div class="config-note">
-              {{ $t('admin.model_rate_hint') }}
-            </div>
-          </Form>
-          <Button
-            type="primary"
-            :loading="saving"
-            @click="saveModelRate"
-          >
-            {{ $t('common.save') }}
-          </Button>
-        </Card>
-      </Col>
-
-      <!-- 日费用熔断（system_settings 的 quota 分类）-->      <Col
-        :xs="24"
-        :sm="12"
-      >
-        <Card
-          :title="$t('admin.quota_config')"
-          data-test="quota-config"
-        >
-          <Form
-            :model="quotaConfig"
-            layout="vertical"
-          >
-            <FormItem :label="$t('admin.quota_tenant_daily')">
-              <InputNumber
-                v-model:value="quotaConfig.tenant_daily_cost_cents"
-                :min="0"
-                :step="100"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.quota_user_daily')">
-              <InputNumber
-                v-model:value="quotaConfig.user_daily_cost_cents"
-                :min="0"
-                :step="100"
-                style="width: 100%"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.device_write_max_projects')">
-              <InputNumber
-                v-model:value="quotaConfig.device_write_max_projects"
-                :min="0"
-                style="width: 100%"
-              />
-            </FormItem>
-            <div class="config-note">
-              {{ $t('admin.quota_hint') }}
-            </div>
-          </Form>
-          <Button
-            type="primary"
-            :loading="saving"
-            @click="saveQuota"
-          >
-            {{ $t('common.save') }}
-          </Button>
-        </Card>
-      </Col>
-
-      <!-- 邮件通道（邀请邮件 / 测试发信）-->
-      <Col
-        :xs="24"
-        :sm="12"
-      >
-        <Card
-          :title="$t('admin.mail_config')"
-          data-test="mail-config"
-        >
-          <div class="mail-status">
-            <Tag :color="mailReady ? 'green' : 'orange'">
-              {{ mailReady ? $t('admin.mail_ready') : $t('admin.mail_not_ready') }}
-            </Tag>
+        <template #tab>
+          <span class="tab-label">
+            {{ tab.label }}
             <span
-              v-if="mailProblem"
-              class="config-note"
-            >{{ mailProblem }}</span>
-          </div>
-          <Form
-            :model="mail"
-            layout="vertical"
-          >
-            <FormItem :label="$t('admin.mail_provider')">
-              <Select
-                v-model:value="mail.provider"
-                :options="mailProviderOptions"
+              v-if="tabDirty(tab.key)"
+              class="tab-dirty-marker"
+              :data-test="`tab-dirty-${tab.key}`"
+              :title="$t('common.unsaved')"
+            >
+              <span
+                class="tab-dirty-dot"
+                aria-hidden="true"
               />
-            </FormItem>
+              <span class="tab-dirty-text">{{ $t('common.unsaved') }}</span>
+            </span>
+          </span>
+        </template>
 
-            <template v-if="mail.provider === 'smtp'">
-              <FormItem :label="$t('admin.mail_host')">
-                <Input
-                  v-model:value="mail.host"
-                  placeholder="smtp.example.com"
-                />
-              </FormItem>
-              <FormItem :label="$t('admin.mail_port')">
-                <InputNumber
-                  v-model:value="mail.port"
-                  :min="1"
-                  :max="65535"
-                  style="width: 100%"
-                />
-              </FormItem>
-              <FormItem :label="$t('admin.mail_security')">
-                <Select
-                  v-model:value="mail.security"
-                  :options="mailSecurityOptions"
-                />
-              </FormItem>
-              <FormItem :label="$t('admin.mail_username')">
-                <Input v-model:value="mail.username" />
-              </FormItem>
-              <FormItem :label="$t('admin.mail_password')">
-                <InputPassword
-                  v-model:value="mail.password"
-                  :placeholder="mailHasPassword ? $t('admin.mail_secret_keep') : ''"
-                />
-              </FormItem>
-            </template>
-
-            <template v-else>
-              <FormItem :label="$t('admin.mail_base_url')">
-                <Input
-                  v-model:value="mail.base_url"
-                  placeholder="https://mail.example.com"
-                />
-              </FormItem>
-              <FormItem :label="$t('admin.mail_api_key')">
-                <InputPassword
-                  v-model:value="mail.api_key"
-                  :placeholder="mailHasAPIKey ? $t('admin.mail_secret_keep') : ''"
-                />
-              </FormItem>
-            </template>
-
-            <FormItem :label="$t('admin.mail_from')">
-              <Input
-                v-model:value="mail.from"
-                placeholder="noreply@example.com"
-              />
-            </FormItem>
-            <FormItem :label="$t('admin.mail_from_name')">
-              <Input v-model:value="mail.from_name" />
-            </FormItem>
-            <FormItem :label="$t('admin.mail_reply_to')">
-              <Input v-model:value="mail.reply_to" />
-            </FormItem>
-            <FormItem :label="$t('admin.mail_timeout')">
-              <InputNumber
-                v-model:value="mail.timeout_seconds"
-                :min="1"
-                :max="120"
-                style="width: 100%"
-              />
-            </FormItem>
-          </Form>
-          <Button
-            type="primary"
-            :loading="saving"
-            @click="saveMail"
-          >
-            {{ $t('common.save') }}
-          </Button>
-          <Button
-            class="mail-test-btn"
-            :loading="testingMail"
-            :disabled="!mailReady"
-            @click="sendTestMail"
-          >
-            {{ $t('admin.mail_send_test') }}
-          </Button>
-        </Card>
-      </Col>
-      <Col
-        :xs="24"
-        :sm="12"
-      >
-        <Card
-          :title="$t('admin.agent_runtime_config')"
-          data-test="agent-config"
+        <div
+          v-if="visited.has(tab.key)"
+          class="tab-content"
         >
-          <Form
-            :model="agentConfig"
-            layout="vertical"
+          <Alert
+            v-if="tabError[tab.key]"
+            type="error"
+            show-icon
+            class="tab-error"
+            :data-test="`${tab.key}-load-error`"
+            :message="tabError[tab.key]"
           >
-            <FormItem :label="$t('admin.plan_approval')">
-              <Select
-                v-model:value="agentConfig.plan_approval"
-                :options="planApprovalOptions"
-              />
-              <div class="config-note">
-                {{ $t('admin.plan_approval_hint') }}
-              </div>
-            </FormItem>
-            <FormItem :label="$t('admin.interaction_wait_seconds')">
-              <InputNumber
-                v-model:value="agentConfig.interaction_wait_seconds"
-                data-test="agent-interaction-wait"
-                :min="1"
-                :max="86400"
-                :step="30"
-                style="width: 100%"
-              />
-              <div class="config-note">
-                {{ $t('admin.interaction_wait_seconds_hint') }}
-              </div>
-            </FormItem>
-            <FormItem :label="$t('admin.narration')">
-              <Select
-                v-model:value="agentConfig.narration"
-                :options="narrationOptions"
-              />
-              <div class="config-note">
-                {{ $t('admin.narration_hint') }}
-              </div>
-            </FormItem>
-            <FormItem :label="$t('admin.no_progress_notice')">
-              <Switch v-model:checked="agentConfig.no_progress_notice" />
-              <div class="config-note">
-                {{ $t('admin.no_progress_notice_hint') }}
-              </div>
-            </FormItem>
-            <FormItem :label="$t('admin.no_progress_threshold')">
-              <InputNumber
-                v-model:value="agentConfig.no_progress_threshold"
-                data-test="agent-no-progress-threshold"
-                :min="0"
-                :max="100"
-                style="width: 100%"
-              />
-              <div class="config-note">
-                {{ $t('admin.no_progress_threshold_hint') }}
-              </div>
-            </FormItem>
-            <FormItem :label="$t('admin.token_window_ratio')">
-              <InputNumber
-                v-model:value="agentConfig.token_window_ratio"
-                data-test="agent-token-window-ratio"
-                :min="0.5"
-                :max="100"
-                :step="0.5"
-                style="width: 100%"
-              />
-              <div class="config-note">
-                {{ $t('admin.token_window_ratio_hint') }}
-              </div>
-            </FormItem>
-          </Form>
-          <Button
-            type="primary"
-            data-test="agent-save"
-            :loading="saving"
-            @click="saveAgent"
-          >
-            {{ $t('common.save') }}
-          </Button>
-        </Card>
-      </Col>
-    </Row>
+            <template #action>
+              <Button
+                size="small"
+                :loading="tabLoading[tab.key]"
+                @click="loadTab(tab.key, true)"
+              >
+                {{ $t('common.retry') }}
+              </Button>
+            </template>
+          </Alert>
 
-    <!-- 数据导出（R10）：ZIP + 每表 NDJSON；不含秘密与二进制原文。 -->
-    <Card
-      :title="$t('admin.data_export')"
-      data-test="data-export"
-      style="margin-top: 16px"
-    >
-      <p class="config-note">
-        {{ $t('admin.data_export_hint') }}
-      </p>
-      <Button
-        type="primary"
-        :loading="exporting"
-        @click="downloadExport"
-      >
-        {{ $t('admin.data_export_btn') }}
-      </Button>
-    </Card>
-
-    <!-- 引擎功能开关：原独立页签/独立后台页并入系统设置（仅桌面端）。 -->
-    <Card
-      v-if="isDesktop"
-      style="margin-top: 16px"
-    >
-      <EngineEnvPanel />
-    </Card>
+          <Spin :spinning="tabLoading[tab.key]">
+            <GeneralPanel
+              v-if="tab.key === 'general'"
+              v-model="rateLimitConfig"
+              :state="{ ready: loadedTabs.has(tab.key), dirty: sectionDirty.rateLimit, saving: saving.rateLimit }"
+              @save="saveRateLimit"
+              @discard="discard('rateLimit')"
+            />
+            <ModelQuotaPanel
+              v-else-if="tab.key === 'models'"
+              v-model:api-key="apiKeyConfig"
+              v-model:model-rate="modelRateConfig"
+              v-model:quota="quotaConfig"
+              :api-key-state="{ ready: loadedTabs.has(tab.key), dirty: sectionDirty.apiKey, saving: saving.apiKey }"
+              :model-rate-state="{ ready: loadedTabs.has(tab.key), dirty: sectionDirty.modelRate, saving: saving.modelRate }"
+              :quota-state="{ ready: loadedTabs.has(tab.key), dirty: sectionDirty.quota, saving: saving.quota }"
+              @save-api-key="saveApiKey"
+              @discard-api-key="discard('apiKey')"
+              @save-model-rate="saveModelRate"
+              @discard-model-rate="discard('modelRate')"
+              @save-quota="saveQuota"
+              @discard-quota="discard('quota')"
+            />
+            <RuntimePanel
+              v-else-if="tab.key === 'runtime'"
+              v-model="agentConfig"
+              :is-desktop="isDesktop"
+              :state="{ ready: loadedTabs.has(tab.key), dirty: sectionDirty.agent, saving: saving.agent }"
+              @save="saveAgent"
+              @discard="discard('agent')"
+              @engine-dirty-change="engineDirty = $event"
+            />
+            <MailPanel
+              v-else-if="tab.key === 'mail'"
+              v-model="mail"
+              :state="{ ready: loadedTabs.has(tab.key), dirty: sectionDirty.mail, saving: saving.mail }"
+              :has-password="mailHasPassword"
+              :has-api-key="mailHasAPIKey"
+              :mail-ready="mailReady"
+              :problem="mailProblem"
+              :testing="testingMail"
+              @save="saveMail"
+              @discard="discard('mail')"
+              @test="sendTestMail"
+            />
+            <DataPanel
+              v-else-if="tab.key === 'data'"
+              v-model="cacheConfig"
+              :cache-state="{ ready: loadedTabs.has(tab.key), dirty: sectionDirty.cache, saving: saving.cache }"
+              :exporting="exporting"
+              @save-cache="saveCache"
+              @discard-cache="discard('cache')"
+              @export-data="downloadExport"
+            />
+          </Spin>
+        </div>
+      </TabPane>
+    </Tabs>
   </div>
 </template>
 
 <style scoped>
-.settings { padding: 0; }
-
-.mail-status {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-bottom: var(--space-3);
+.settings {
+  padding: 0 var(--space-1);
 }
 
-.mail-test-btn { margin-inline-start: var(--space-2); }
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-block-end: var(--space-3);
+}
 
-/* 窄屏：按钮提高触控高度 */
+.settings-header h1 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-snug);
+}
+
+.settings-tabs :deep(.ant-tabs-nav) {
+  margin-block-end: var(--space-4);
+}
+
+.settings-tabs :deep(.ant-tabs-nav-wrap) {
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.settings-tabs :deep(.ant-tabs-nav-list) {
+  min-width: max-content;
+}
+
+.tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.tab-dirty-marker {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--warning);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+
+.tab-dirty-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--warning);
+}
+
+.tab-content {
+  min-width: 0;
+}
+
+.tab-error {
+  margin-block-end: var(--space-4);
+}
+
 @media (max-width: 576px) {
-  .settings :deep(.ant-btn:not(.ant-btn-sm):not(.ant-btn-link)) { min-height: 40px; }
+  .settings-header {
+    align-items: flex-start;
+  }
+
+  .settings-tabs :deep(.ant-tabs-tab) {
+    padding-inline: var(--space-3);
+  }
 }
 </style>

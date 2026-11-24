@@ -407,7 +407,7 @@ onMounted(loadEngines)
 .engine-table td {
   padding: 6px 8px;
   text-align: start;
-  border-bottom: 1px solid var(--border-color);
+  border-bottom: var(--hairline-width) solid var(--border-card);
 }
 
 .engine-table th {

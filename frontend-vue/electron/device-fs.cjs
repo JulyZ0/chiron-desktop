@@ -26,9 +26,20 @@ const MAX_MIRROR_BYTES = 200 * 1024 * 1024
 const MAX_GIT_OUTPUT = 8 << 20
 const GIT_TIMEOUT_MS = 30000
 const RECONNECT_MS = 3000
+const RECONNECT_MAX_MS = 30000
+// WebSocket.OPEN：不直接引用 WebSocket.OPEN，测试里的假实现也能用同一份判断。
+const WS_OPEN = 1
 const NOISE_DIRS = new Set([
   'node_modules', 'dist', 'build', 'target', '__pycache__', 'vendor', '.next', 'coverage',
 ])
+
+function isMirrorSecretFile(name) {
+  const lower = name.toLowerCase()
+  return lower === '.env' || lower.startsWith('.env.') || lower === '.npmrc' ||
+    lower === '.netrc' || lower.startsWith('id_rsa') || lower.startsWith('id_ed25519') ||
+    lower.startsWith('id_ecdsa') || lower.startsWith('id_dsa') || lower.startsWith('credentials') ||
+    /\.(pem|key|p12|pfx|keystore|jks|ppk|kdbx)$/.test(lower)
+}
 
 function stripWindowsVerbatim(p) {
   if (p.startsWith('\\\\?\\UNC\\')) return '\\\\' + p.slice(8)
@@ -163,6 +174,11 @@ async function handleDeviceOp(msg) {
       if (err && err.code === 'ENOENT') return {}
       throw err
     }
+    const expected = String(msg.expected_hash || '').toLowerCase()
+    if (expected && !st.isDirectory()) {
+      const current = await sha256File(abs)
+      if (current !== expected) throw new Error('conflict')
+    }
     if (st.isDirectory()) {
       await fsp.rm(abs, { recursive: true, force: true })
     } else {
@@ -210,7 +226,10 @@ async function handleDeviceOp(msg) {
         continue
       }
       for (const e of entries) {
-        if (e.name.startsWith('.')) continue
+        // .git 可能远大于项目源码且含本机路径，不能全量走设备桥；其它点文件
+        // （.gitignore/.github 等）属于正常项目内容，继续受文件数/字节上限约束。
+        if (e.name === '.git' || (e.isDirectory() && e.name === '.ssh') ||
+          (!e.isDirectory() && isMirrorSecretFile(e.name))) continue
         const childRel = rel ? `${rel}/${e.name}` : e.name
         if (e.isDirectory()) {
           if (NOISE_DIRS.has(e.name)) continue
@@ -357,12 +376,28 @@ function toWsUrl(apiUrl) {
 /**
  * 创建桥实例。只应由主进程在 cloud 模式启动；local 模式不连接。
  *
+ * 长连接稳定性要点（P1）：
+ *   - 同一时刻只允许一条连接：`dialing` 挡住并发 connect（schedule/start/换 token
+ *     同时触发时会各建一条 socket，旧的那条再也不会被关闭）；
+ *   - 回包必须发回**收到请求的那条 socket**，不能发到"当前"连接上，否则重连后
+ *     旧请求的回包会被当成新连接的响应，服务端永远等不到自己的 id；
+ *   - 旧 socket 后到的 close 事件不能把新连接标记为断开（否则 UI 抖动 + 重连风暴）；
+ *   - 重连退避：3s 起，指数增长到 30s 封顶，连上后清零。
+ *
  * @param {object} options
  * @param {import('electron').App} options.app
  * @param {() => Promise<string>} options.readToken  读取登录 token（safeStorage）
  * @param {(level:string,msg:string)=>void} [options.log]
+ * @param {number} [options.reconnectMs]  初始重连间隔（测试可调小）
+ * @param {number} [options.maxReconnectMs] 重连间隔上限
  */
-function createDeviceFSBridge({ app, readToken, log = () => {} }) {
+function createDeviceFSBridge({
+  app,
+  readToken,
+  log = () => {},
+  reconnectMs = RECONNECT_MS,
+  maxReconnectMs = RECONNECT_MAX_MS,
+}) {
   let ws = null
   let stopped = true
   let connected = false
@@ -371,6 +406,8 @@ function createDeviceFSBridge({ app, readToken, log = () => {} }) {
   let timer = null
   let currentApiUrl = ''
   let seq = 0
+  let dialing = false
+  let backoff = 0
 
   function stateFile() {
     return path.join(app.getPath('userData'), 'device-id')
@@ -399,95 +436,132 @@ function createDeviceFSBridge({ app, readToken, log = () => {} }) {
     return deviceId
   }
 
-  function schedule(delay = RECONNECT_MS) {
+  function schedule(delay) {
     if (stopped) return
     if (timer) return
+    let wait = delay
+    if (wait == null) {
+      wait = Math.min(reconnectMs * Math.pow(2, Math.min(backoff, 5)), maxReconnectMs)
+      backoff = Math.min(backoff + 1, 6)
+    }
     timer = setTimeout(() => {
       timer = null
       void connectOnce()
-    }, delay)
+    }, wait)
+  }
+
+  /**
+   * 把回包写回收到请求的那条连接。
+   *
+   * 断开的连接直接丢弃：服务端会把该 op 判成超时/离线，不会污染新连接。
+   * 任何异常都只记日志 —— 长时间运行里一次 send 抛错不能变成未处理的 rejection
+   * 把主进程带崩。
+   */
+  function sendOn(socket, payload) {
+    if (!socket || socket.readyState !== WS_OPEN) return
+    try {
+      socket.send(payload)
+    } catch (err) {
+      log('warn', `device fs reply failed: ${(err && err.message) || err}`)
+    }
   }
 
   async function connectOnce() {
-    if (stopped || !currentApiUrl) return
-    let token = ''
+    if (stopped || !currentApiUrl || dialing) return
+    dialing = true
     try {
-      token = String((await readToken()) || '').trim()
-    } catch {
-      token = ''
-    }
-    if (!token) {
-      lastError = 'not signed in'
-      schedule(5000)
-      return
-    }
-    let url
-    try {
-      url = toWsUrl(currentApiUrl)
-    } catch (err) {
-      lastError = err.message
-      return
-    }
-    const id = ensureDeviceId()
-    url.searchParams.set('device_id', id)
-    url.searchParams.set('token', token)
-    if (typeof WebSocket !== 'function') {
-      lastError = 'WebSocket is unavailable in this runtime'
-      return
-    }
-    try {
-      ws = new WebSocket(url.toString())
-    } catch (err) {
-      lastError = err.message
-      schedule()
-      return
-    }
-    ws.addEventListener('open', () => {
-      connected = true
-      lastError = ''
-      log('info', `device fs bridge connected (device=${id})`)
-    })
-    ws.addEventListener('message', async ev => {
-      let msg
+      let token = ''
       try {
-        msg = JSON.parse(String(ev.data))
+        token = String((await readToken()) || '').trim()
       } catch {
+        token = ''
+      }
+      if (stopped || !currentApiUrl) return
+      if (!token) {
+        lastError = 'not signed in'
+        schedule(5000)
         return
       }
-      if (!msg || !msg.id || msg.id === 'hello') return
-      const replyId = msg.id
+      let url
       try {
-        const result = await handleDeviceOp(msg)
-        ws.send(JSON.stringify({ id: replyId, ok: true, ...result }))
+        url = toWsUrl(currentApiUrl)
       } catch (err) {
-        try {
-          ws.send(JSON.stringify({ id: replyId, ok: false, error: String(err.message || err) }))
-        } catch {
-          /* 连接已断 */
-        }
+        lastError = err.message
+        return
       }
-    })
-    ws.addEventListener('close', () => {
-      connected = false
-      if (!stopped) {
-        log('warn', 'device fs bridge disconnected; retrying')
+      const id = ensureDeviceId()
+      url.searchParams.set('device_id', id)
+      url.searchParams.set('token', token)
+      if (typeof WebSocket !== 'function') {
+        lastError = 'WebSocket is unavailable in this runtime'
+        return
+      }
+      let socket
+      try {
+        socket = new WebSocket(url.toString())
+      } catch (err) {
+        lastError = err.message
         schedule()
+        return
       }
-    })
-    ws.addEventListener('error', () => {
-      lastError = 'websocket error'
-    })
+      ws = socket
+      socket.addEventListener('open', () => {
+        if (ws !== socket) return
+        connected = true
+        lastError = ''
+        backoff = 0
+        log('info', `device fs bridge connected (device=${id})`)
+      })
+      socket.addEventListener('message', ev => {
+        let msg
+        try {
+          msg = JSON.parse(String(ev.data))
+        } catch {
+          return
+        }
+        if (!msg || !msg.id || msg.id === 'hello') return
+        const replyId = msg.id
+        void (async () => {
+          let payload
+          try {
+            const result = await handleDeviceOp(msg)
+            payload = JSON.stringify({ id: replyId, ok: true, ...result })
+          } catch (err) {
+            payload = JSON.stringify({ id: replyId, ok: false, error: String((err && err.message) || err) })
+          }
+          sendOn(socket, payload)
+        })()
+      })
+      socket.addEventListener('close', () => {
+        // 旧连接的后到事件不能影响新连接的状态，也不能再排一次重连。
+        if (ws !== socket) return
+        connected = false
+        ws = null
+        if (!stopped) {
+          log('warn', 'device fs bridge disconnected; retrying')
+          schedule()
+        }
+      })
+      socket.addEventListener('error', () => {
+        if (ws !== socket) return
+        lastError = 'websocket error'
+      })
+    } finally {
+      dialing = false
+    }
   }
 
   function close() {
     connected = false
-    if (ws) {
+    const socket = ws
+    // 先摘掉引用：本函数主动关闭的连接不应再触发一次重连调度（调用方自己会决定）。
+    ws = null
+    if (socket) {
       try {
-        ws.close()
+        socket.close()
       } catch {
         /* ignore */
       }
-      ws = null
     }
   }
 
@@ -497,6 +571,7 @@ function createDeviceFSBridge({ app, readToken, log = () => {} }) {
     if (!stopped && currentApiUrl === next && (connected || ws)) return
     stopped = false
     currentApiUrl = next
+    backoff = 0
     if (timer) {
       clearTimeout(timer)
       timer = null
@@ -507,6 +582,7 @@ function createDeviceFSBridge({ app, readToken, log = () => {} }) {
 
   function stop() {
     stopped = true
+    backoff = 0
     if (timer) {
       clearTimeout(timer)
       timer = null

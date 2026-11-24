@@ -1063,7 +1063,7 @@ export default {
     aes_gcm_encrypted_storage: "AES-GCM 加密存储",
     analyze_updates_statistics: "ANALYZE 更新统计信息",
     api_latency_p99: "API 延迟 P99",
-    api_key_management: "API Key 管理",
+    provider_management: "服务商管理",
     api_key_config: "API Key 配置",
     api_key_config_saved: "API Key 配置已保存",
     api_key_deleted: "API Key 已删除",

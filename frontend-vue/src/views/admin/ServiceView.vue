@@ -22,6 +22,7 @@ import { useI18n } from 'vue-i18n'
 import { getServiceInfo, saveServiceInfo, type AdminServiceInfo } from '@/api/admin'
 import { serverErrorMessage } from '../../utils/apiError'
 import { copyTextOrThrow } from '../../utils/clipboard'
+import AdminPage from '@/components/admin/AdminPage.vue'
 
 const { t } = useI18n()
 
@@ -130,16 +131,11 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="service-view">
-    <div class="page-header">
-      <div>
-        <h2 class="page-title page-title-sm">
-          {{ $t('admin.service.page_title') }}
-        </h2>
-        <p class="page-desc">
-          {{ $t('admin.service.page_desc') }}
-        </p>
-      </div>
+  <AdminPage
+    :title="$t('admin.service.page_title')"
+    :description="$t('admin.service.page_desc')"
+  >
+    <template #actions>
       <div class="header-actions">
         <Button
           :loading="loading"
@@ -160,7 +156,7 @@ onMounted(load)
           {{ $t('common.save') }}
         </Button>
       </div>
-    </div>
+    </template>
 
     <Spin :spinning="loading">
       <Alert
@@ -330,7 +326,7 @@ onMounted(load)
         </section>
       </Card>
     </Spin>
-  </div>
+  </AdminPage>
 </template>
 
 <style scoped>
@@ -341,7 +337,7 @@ onMounted(load)
 .service-section + .service-section {
   margin-top: 24px;
   padding-top: 20px;
-  border-top: 1px solid var(--border-color, rgba(0, 0, 0, 0.06));
+  border-top: var(--hairline-width) solid var(--border-card);
 }
 .section-title {
   margin: 0 0 12px;
@@ -355,11 +351,11 @@ onMounted(load)
   align-items: flex-start;
   gap: 10px;
   padding: 12px 14px;
-  border: 1px solid var(--border-color, rgba(0, 0, 0, 0.06));
-  border-radius: var(--radius-md, 8px);
+  border: var(--hairline-width) solid var(--border-card);
+  border-radius: var(--radius-md);
   cursor: pointer;
 }
-.scope-option--active { border-color: var(--color-primary, #1677ff); }
+.scope-option--active { border-color: var(--primary); }
 .scope-text { display: flex; flex-direction: column; gap: 2px; }
 .scope-label { color: var(--text-primary); font-weight: var(--fw-medium, 500); }
 .scope-desc { color: var(--text-secondary); font-size: var(--fs-sm); }

@@ -1,14 +1,9 @@
 <template>
-  <div class="deps-view">
-    <div class="page-header">
-      <div>
-        <h2 class="page-title page-title-sm">
-          {{ $t('admin.deps_title') }}
-        </h2>
-        <p class="page-desc">
-          {{ $t('admin.deps_desc') }}
-        </p>
-      </div>
+  <AdminPage
+    :title="$t('admin.deps_title')"
+    :description="$t('admin.deps_desc')"
+  >
+    <template #actions>
       <Button
         :loading="loading"
         @click="reload"
@@ -18,7 +13,7 @@
         </template>
         {{ $t('common.refresh') }}
       </Button>
-    </div>
+    </template>
 
     <Alert
       v-if="listError"
@@ -130,7 +125,6 @@
     >
       <template #extra>
         <Button
-          size="small"
           type="primary"
           :disabled="busy || restoring || snapshotCreating"
           @click="openSnapshotModal"
@@ -157,13 +151,12 @@
         :message="snapshotError"
       />
       <Spin :spinning="snapshotLoading">
-        <Table
+        <AdminTable
           :columns="snapshotColumns"
           :data-source="snapshots"
           :pagination="{ pageSize: 5, showSizeChanger: false, hideOnSinglePage: true }"
-          :locale="{ emptyText: $t('admin.deps_snapshot_empty') }"
+          :empty-text="$t('admin.deps_snapshot_empty')"
           row-key="id"
-          size="small"
         >
           <template #bodyCell="{ column, record }">
             <template v-if="column.dataIndex === 'created_at'">
@@ -192,7 +185,7 @@
               </Button>
             </template>
           </template>
-        </Table>
+        </AdminTable>
       </Spin>
     </Card>
 
@@ -211,13 +204,12 @@
         />
       </template>
       <Spin :spinning="loading">
-        <Table
+        <AdminTable
           :columns="columns"
           :data-source="filteredPackages"
           :pagination="{ pageSize: 15, showSizeChanger: false, hideOnSinglePage: true }"
-          :locale="{ emptyText: $t('admin.deps_installed_empty') }"
+          :empty-text="$t('admin.deps_installed_empty')"
           row-key="name"
-          size="small"
         >
           <template #bodyCell="{ column, record }">
             <template v-if="column.dataIndex === 'name'">
@@ -259,7 +251,7 @@
               </Popconfirm>
             </template>
           </template>
-        </Table>
+        </AdminTable>
       </Spin>
     </Card>
 
@@ -534,7 +526,7 @@
         </template>
       </Spin>
     </Modal>
-  </div>
+  </AdminPage>
 </template>
 
 <script setup lang="ts">
@@ -549,7 +541,6 @@ import {
   Popconfirm,
   Progress,
   Spin,
-  Table,
   Tag,
   message,
 } from 'ant-design-vue'
@@ -578,6 +569,8 @@ import {
   type PypiResult,
 } from '../../api/deps'
 import { serverErrorDetail } from '../../utils/apiError'
+import AdminPage from '@/components/admin/AdminPage.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
 
 const { t } = useI18n()
 

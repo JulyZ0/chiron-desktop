@@ -57,11 +57,13 @@ def test_untracked_file_is_captured(tmp_path: Path) -> None:
 
 
 def test_failure_returns_none_instead_of_raising(tmp_path: Path) -> None:
-    """非 git 目录 → 返回 None。**抛异常就是契约破坏**。"""
-    plain = tmp_path / "not-a-repo"
+    """状态目录不可写/被文件占用 → 返回 None。**抛异常就是契约破坏**。"""
+    plain = tmp_path / "plain"
     plain.mkdir()
+    blocker = tmp_path / "state2"
+    blocker.write_text("not a directory", encoding="utf-8")
     rec = cs.create_checkpoint(
-        plain, session_id="s3", seq=1, kind="pre_turn", state_dir=tmp_path / "state2"
+        plain, session_id="s3", seq=1, kind="pre_turn", state_dir=blocker
     )
     assert rec is None
 
@@ -75,10 +77,12 @@ def test_attempt_checkpoint_reports_failure_state(tmp_path: Path) -> None:
 
     判据：失败时 `state='failed'`、`commit_sha` 为空、`error` 非空且 `error_code` 可分类。
     """
-    plain = tmp_path / "not-a-repo"
+    plain = tmp_path / "plain-failed"
     plain.mkdir()
+    blocker = tmp_path / "state-failed"
+    blocker.write_text("not a directory", encoding="utf-8")
     rec = cs.attempt_checkpoint(
-        plain, session_id="s3", seq=1, kind="pre_turn", state_dir=tmp_path / "state2"
+        plain, session_id="s3", seq=1, kind="pre_turn", state_dir=blocker
     )
     assert rec is not None, "失败也要有记录，否则用户看不到这一刻没保护成功"
     assert rec.succeeded is False
@@ -169,32 +173,53 @@ def test_nested_project_seq_ignores_other_sessions(tmp_path: Path) -> None:
     assert gc.next_checkpoint_seq(inner, "s-nest") == 2
 
 
-def test_uninitialized_project_fails_with_actionable_message(tmp_path: Path) -> None:
-    """未 ``git init`` 的项目 ⇒ 失败态记录里的原因要能告诉用户"先 git init"。
+def test_plain_project_checkpoint_restore_end_to_end(tmp_path: Path, monkeypatch) -> None:
+    """非 Git 项目：创建 → 修改/新增 → 恢复，全程不污染用户目录。"""
+    from app.agent import git_checkpoint as gc
 
-    与上一条同源：此前非 git 目录若恰好位于某个仓库之下，会"成功"快照父仓库；
-    现在这类目录是**受支持的 monorepo 子目录**，所以本用例只覆盖真正的
-    "不在任何仓库里"分支。若 ``--basetemp`` 恰好落在仓库内，这里跳过 ——
-    把两种语义塞进一个断言只会让用例在换环境时无故变红。
-    """
+    # basetemp 可能位于本仓库内；阻止 git 向上发现父仓库，确保覆盖真正的普通目录。
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     plain = tmp_path / "plain"
     plain.mkdir()
-    probe = subprocess.run(
-        ["git", "-C", str(plain), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        check=False,
-    )
-    if probe.returncode == 0:
-        import pytest
+    (plain / "a.py").write_text("before\n", encoding="utf-8")
+    (plain / "remove.txt").write_text("remove me\n", encoding="utf-8")
+    (plain / ".gitignore").write_text("cache/\n", encoding="utf-8")
+    (plain / ".env").write_text("SECRET=do-not-snapshot\n", encoding="utf-8")
+    (plain / "node_modules").mkdir()
+    (plain / "node_modules" / "x.js").write_text("noise\n", encoding="utf-8")
+    state = tmp_path / "state"
 
-        pytest.skip("basetemp 在某个 git 仓库内：该目录走 monorepo 子目录分支")
     rec = cs.attempt_checkpoint(
-        plain, session_id="s-plain", seq=1, kind="pre_turn", state_dir=tmp_path / "state"
+        plain, session_id="s-plain", seq=1, kind="pre_turn", state_dir=state
     )
-    assert rec is not None and rec.state == "failed"
-    assert rec.error_code == "git"
-    assert "not a git repository" in rec.error, rec.error
-    assert "git init" in rec.error, "原因里要给出下一步动作，而不只是结论"
+    assert rec is not None and rec.state == "ok", rec.error
+    assert rec.file_count == 3  # a.py / remove.txt / .gitignore；秘密与噪音排除
+    assert [p for p, _ in rec.untracked] == [".gitignore", "a.py", "remove.txt"]
+    assert not (plain / ".git").exists(), "普通项目绝不能被偷偷 git init"
+    assert gc.read_ref(cs.shadow_git_dir(plain, state), rec.ref_name) == rec.commit_sha
+
+    # 钩子看不到影子 ref，会再次传 seq=1；服务层必须依据影子 ref 自增到 2。
+    second = cs.attempt_checkpoint(
+        plain, session_id="s-plain", seq=1, kind="post_turn", state_dir=state,
+        parent_sha=rec.commit_sha,
+    )
+    assert second is not None and second.succeeded and second.seq == 2, second.error
+
+    (plain / "a.py").write_text("after\n", encoding="utf-8")
+    (plain / "remove.txt").unlink()
+    (plain / "new.txt").write_text("new\n", encoding="utf-8")
+    result = cs.restore_plain_directory(
+        plain,
+        manifest=dict(rec.untracked),
+        store_root=state / "untracked",
+        allow_delete=True,
+    )
+    assert result.ok, result.failed
+    assert (plain / "a.py").read_text(encoding="utf-8") == "before\n"
+    assert (plain / "remove.txt").read_text(encoding="utf-8") == "remove me\n"
+    assert not (plain / "new.txt").exists()
+    assert all(p != ".env" for p, _ in rec.untracked)
+    assert (plain / ".env").read_text(encoding="utf-8").startswith("SECRET=")
 
 
 def test_missing_git_binary_failure_is_actionable(tmp_path: Path, monkeypatch) -> None:

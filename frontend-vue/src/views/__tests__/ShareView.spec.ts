@@ -279,3 +279,80 @@ describe('分享落地页的密码保护', () => {
     expect(wrapper.find('.share-retry').exists()).toBe(false)
   })
 })
+
+/**
+ * ── P1 隐私边界：页面是**只读降级**渲染，不夹带消息以外的任何东西 ──
+ *
+ * 后端的公开读接口只回 {id,title,created_at,messages}（见 internal/api/share.go
+ * 的 PublicGet，投影定死 role/content/created_at）。前端这一层再钉一次：
+ * 即便将来接口多带了会话 id、附件引用、知识库/工具元数据，页面也**一个字都不该显示**。
+ * 分享链接是发给任何人的，泄漏点通常不是"有意展示"，而是某个调试字段被顺手渲染。
+ */
+describe('分享落地页的隐私边界', () => {
+  it('★ 响应里多带的字段（会话 id / 附件 / 知识库元数据 / 工具事件）都不渲染', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockResolvedValue({
+      id: 'tok-priv',
+      title: '分享出来的标题',
+      created_at: '2026-11-18T10:00:00Z',
+      // 下面这些字段本就不该存在；存在也不该出现在 DOM 里
+      session_id: 'sess-secret',
+      attachments: ['s3://chiron-private/a.png'],
+      knowledge_base: '内部库',
+      messages: [
+        { role: 'user', content: '可以被看到', created_at: '2026-11-18T10:00:00Z' },
+        {
+          role: 'assistant',
+          content: '也可以被看到',
+          created_at: '2026-11-18T10:00:01Z',
+          attachments: 's3://chiron-private/b.png',
+          tool_events: [{ name: 'exec', args: { path: '/etc/shadow' } }],
+        },
+      ],
+    })
+
+    const wrapper = await mountAt('/s/tok-priv')
+    const text = wrapper.text()
+    const html = wrapper.html()
+
+    for (const leak of ['sess-secret', 's3://', 'chiron-private', '内部库', 'tool_events', 'exec', '/etc/shadow']) {
+      expect(text).not.toContain(leak)
+      expect(html).not.toContain(leak)
+    }
+    expect(text).toContain('分享出来的标题')
+    expect(text).toContain('可以被看到')
+    expect(text).toContain('也可以被看到')
+    // 一次公开读取拿全部内容：页面不该再为附件/会话去发第二个请求。
+    expect(shareApi.getPublicShare).toHaveBeenCalledTimes(1)
+  })
+
+  it('失效文案只来自本地化 key，不回显后端原始 error 串', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockRejectedValue(Object.assign(new Error('share revoked'), {
+      response: {
+        status: 410,
+        data: { success: false, code: 'share_revoked', error: 'share revoked: owner=u1 session=sess-secret' },
+      },
+    }))
+
+    const wrapper = await mountAt('/s/revoked-leak')
+
+    expect(errorText(wrapper)).toContain('删除')
+    expect(wrapper.text()).not.toContain('sess-secret')
+    expect(wrapper.text()).not.toContain('owner=u1')
+  })
+
+  it('提交过的密码不会被渲染进页面（不进文本、不进 DOM 属性）', async () => {
+    shareApi.getPublicShare.mockReset()
+    shareApi.getPublicShare.mockRejectedValue(httpError(401, 'share_password_required'))
+
+    const wrapper = await mountAt('/s/locked-leak')
+    await wrapper.find('.share-password-input').setValue('Top-Secret-9')
+    await wrapper.find('.share-password').trigger('submit')
+    await flushPromises()
+
+    expect(wrapper.find('.share-password-error').text()).toContain('密码不正确')
+    expect(wrapper.text()).not.toContain('Top-Secret-9')
+    expect(wrapper.html()).not.toContain('Top-Secret-9')
+  })
+})

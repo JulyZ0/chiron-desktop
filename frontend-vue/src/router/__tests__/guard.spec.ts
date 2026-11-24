@@ -12,6 +12,11 @@ vi.mock('../../stores/auth', () => ({
   useAuthStore: () => mocks.useAuthStoreMock(),
 }))
 
+// 真实路由表（`router/index.ts`）在导入时会挂进度条与 schema 漂移探测。
+// 本文件只关心路由元数据与守卫判定，两者都替换成空实现，避免导入时发起探测请求。
+vi.mock('../progress', () => ({ setupRouteProgress: vi.fn() }))
+vi.mock('../schemaMismatch', () => ({ setupSchemaMismatchWatch: vi.fn() }))
+
 function makeStore(init: {
   role?: string | null
   isAuthenticated?: boolean
@@ -115,6 +120,33 @@ describe('authGuard', () => {
 
     expect(store.initToken).toHaveBeenCalled()
     expect(next).toHaveBeenCalledWith()
+  })
+
+  it('★ 首登改密残留不影响公开分享页（访客不该被送到 /change-password）', async () => {
+    // 同一个浏览器里上一个登录账号可能留下 `mustChangePassword`。分享页是匿名访客
+    // 打开的只读页面，与任何账号的改密状态无关；把它一起拦走，访客看到的是改密页。
+    const store = makeStore({ role: 'user', isAuthenticated: true })
+    store.mustChangePassword = true
+    const next = fakeNext()
+
+    await authGuard(fakeRoute({ public: true }), {} as RouteLocationNormalized, next)
+
+    expect(next).toHaveBeenCalledWith()
+  })
+
+  it('★ 真实路由表把 /s/:token 与 /share/:id 都标成 public', async () => {
+    // 守卫只能按 meta 判定：只要哪条分享路由漏了 `meta.public`，匿名访客打开它就会
+    // 被先拉一次 profile（401）、或被 requiresAuth 弹去登录页。因此**路由元数据本身**
+    // 也是这条链路的被测对象。
+    const { default: router } = await import('../index')
+
+    for (const [path, name] of [['/s/tok-1', 'ShareShort'], ['/share/tok-1', 'Share']] as const) {
+      const resolved = router.resolve(path)
+      expect(resolved.name).toBe(name)
+      expect(resolved.meta.public).toBe(true)
+      expect(resolved.meta.requiresAuth).toBeFalsy()
+      expect(resolved.meta.requiresAdmin).toBeFalsy()
+    }
   })
 
   describe('requiresAdmin', () => {

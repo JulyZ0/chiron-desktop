@@ -2,7 +2,7 @@
 /**
  * 用户级 API Key 自助管理（P1-3 / T2）。
  *
- * 与 `views/admin/ApiKeysView.vue` **不是同一个东西**：那个页面管的是 LLM 供应商
+ * 与 `views/admin/ProvidersView.vue` **不是同一个东西**：那个页面管的是 LLM 供应商
  * 密钥池（`/v1/admin/api-keys`，带 provider / base_url / weight），属于平台运营配置，
  * 普通用户不该看到。本页打的是 `/v1/api-keys`，管的是「我自己的账号能用来调网关的
  * 凭证」，越权由后端 SQL 里的 `user_id = $1` 挡住。

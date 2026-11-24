@@ -16,7 +16,7 @@
  *     链接是一次处置动作，服务端也只记一条汇总审计。
  */
 import { computed, onMounted, ref } from 'vue'
-import { Button, Card, Checkbox, Empty, Input, Table, Tag, message } from 'ant-design-vue'
+import { Button, Checkbox, Empty, Input, Tag, message } from 'ant-design-vue'
 import type { TableColumnsType } from 'ant-design-vue'
 import { ReloadOutlined, StopOutlined, LinkOutlined, EyeOutlined } from '@ant-design/icons-vue'
 import { useI18n } from 'vue-i18n'
@@ -26,6 +26,9 @@ import {
   revokeAdminShares,
   type AdminShareItem,
 } from '@/api/admin'
+import AdminPage from '@/components/admin/AdminPage.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
+import AdminErrorState from '@/components/admin/AdminErrorState.vue'
 import { serverErrorMessage } from '../../utils/apiError'
 import { copyTextOrThrow } from '../../utils/clipboard'
 import { formatDateTime } from '../../utils/datetime'
@@ -34,6 +37,7 @@ import { resolveShareUrl, ShareLinkUnavailableError } from '../../utils/shareLin
 const { t } = useI18n()
 
 const loading = ref(false)
+const loadError = ref('')
 const revokingId = ref('')
 const items = ref<AdminShareItem[]>([])
 const keyword = ref('')
@@ -53,6 +57,11 @@ const filtered = computed(() => {
     [it.title, it.user_email, it.user_id, it.session_id, it.share_id]
       .some(field => (field ?? '').toLowerCase().includes(kw)))
 })
+
+const emptyText = computed(() =>
+  filtered.value.length === 0 && keyword.value.trim()
+    ? t('admin.share_no_results')
+    : t('admin.share_empty'))
 
 /**
  * 选中项里**仍然存在**的那部分。
@@ -120,12 +129,14 @@ const columns = computed<TableColumnsType>(() => [
 
 async function load() {
   loading.value = true
+  loadError.value = ''
   try {
     items.value = await listAdminShares()
     // 选中集合以列表为准：刷新后不存在的 id 不该继续占着"已选 N 项"
     selectedKeys.value = selectedVisible.value
   } catch (err) {
-    message.error(serverErrorMessage(err, t('admin.share_load_failed')))
+    loadError.value = serverErrorMessage(err, t('admin.share_load_failed'))
+    message.error(loadError.value)
   } finally {
     loading.value = false
   }
@@ -225,26 +236,24 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="share-admin">
-    <Card :bordered="false" class="share-card">
-      <div class="share-toolbar">
-        <div>
-          <h2 class="share-title">{{ $t('admin.share_management') }}</h2>
-          <p class="share-desc">{{ $t('admin.share_management_desc') }}</p>
-        </div>
-        <div class="share-tools">
-          <Input
-            v-model:value="keyword"
-            class="share-search"
-            allow-clear
-            :placeholder="$t('admin.share_search_placeholder')"
-          />
-          <Button :loading="loading" @click="load">
-            <template #icon><ReloadOutlined /></template>
-            {{ $t('common.refresh') }}
-          </Button>
-        </div>
+  <AdminPage
+    :title="$t('admin.share_management')"
+    :description="$t('admin.share_management_desc')"
+  >
+    <template #actions>
+      <div class="share-tools">
+        <Input
+          v-model:value="keyword"
+          class="share-search"
+          allow-clear
+          :placeholder="$t('admin.share_search_placeholder')"
+        />
+        <Button :loading="loading" @click="load">
+          <template #icon><ReloadOutlined /></template>
+          {{ $t('common.refresh') }}
+        </Button>
       </div>
+    </template>
 
       <!-- 批量操作条：只在有选中时出现，避免常驻一个禁用的按钮干扰视线 -->
       <div
@@ -288,14 +297,21 @@ onMounted(load)
         </template>
       </div>
 
-      <Table
+      <AdminErrorState
+        v-if="loadError"
+        :message="loadError"
+        :retrying="loading"
+        @retry="load"
+      />
+
+      <AdminTable
+        v-else
         :columns="columns"
         :data-source="filtered"
         :loading="loading"
         :pagination="{ pageSize: 20, showSizeChanger: false }"
         :row-selection="rowSelection"
         row-key="share_id"
-        size="middle"
         :scroll="{ x: 1500 }"
       >
         <template #bodyCell="{ column, record }">
@@ -347,10 +363,9 @@ onMounted(load)
           </template>
         </template>
         <template #emptyText>
-          <Empty :description="$t('admin.share_empty')" />
+          <Empty :description="emptyText" />
         </template>
-      </Table>
-    </Card>
+      </AdminTable>
 
     <!-- 详情：自绘侧滑面板（不用 antd Drawer 是为了单测能直接找到节点，也少一层 teleport） -->
     <div
@@ -415,22 +430,10 @@ onMounted(load)
         </section>
       </aside>
     </div>
-  </div>
+  </AdminPage>
 </template>
 
 <style scoped>
-.share-admin { width: 100%; }
-.share-card { border-radius: var(--radius-lg); }
-.share-toolbar {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
-  flex-wrap: wrap;
-}
-.share-title { margin: 0; font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--text-primary); }
-.share-desc { margin: 4px 0 0; font-size: var(--fs-sm); color: var(--text-secondary); }
 .share-tools { display: flex; align-items: center; gap: 8px; }
 .share-search { width: 240px; }
 .share-name { color: var(--text-primary); margin-inline-end: 8px; }

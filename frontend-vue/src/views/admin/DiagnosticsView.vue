@@ -1,14 +1,9 @@
 <template>
-  <div class="diagnostics-view">
-    <div class="page-header">
-      <div>
-        <h2 class="page-title page-title-sm">
-          {{ $t('admin.diagnostics') }}
-        </h2>
-        <p class="page-desc">
-          {{ $t('admin.diagnostics_desc') }}
-        </p>
-      </div>
+  <AdminPage
+    :title="$t('admin.diagnostics')"
+    :description="$t('admin.diagnostics_desc')"
+  >
+    <template #actions>
       <Button
         :loading="loading"
         @click="load"
@@ -18,7 +13,7 @@
         </template>
         {{ $t('common.refresh') }}
       </Button>
-    </div>
+    </template>
 
     <!-- P0-1：聚合清单。放在最顶部，因为它是"先看这一屏就知道哪几件事没生效"的那一屏；
          逐项体检（下面的分组）是"具体是哪条配置"的第二层。 -->
@@ -194,7 +189,7 @@
         </template>
       </div>
     </Spin>
-  </div>
+  </AdminPage>
 </template>
 
 <script setup lang="ts">
@@ -214,6 +209,7 @@ import {
   type GatewayBreaker,
 } from '../../api/admin'
 import { useI18n } from 'vue-i18n'
+import AdminPage from '@/components/admin/AdminPage.vue'
 
 const { t } = useI18n()
 

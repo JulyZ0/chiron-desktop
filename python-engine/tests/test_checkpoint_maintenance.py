@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -96,6 +97,33 @@ def test_preview_is_read_only_and_reports_tracked_changes(tmp_path: Path) -> Non
     # git 状态也不能被预览弄脏（临时 index 必须在工作区之外）。
     status = _git(env.root, "status", "--porcelain")
     assert b"a.txt" in status.stdout
+
+
+def test_preview_supports_plain_directory_shadow_checkpoint() -> None:
+    """普通目录没有工作区 .git，也必须能预览影子仓库里的检查点差异。"""
+    from app.agent import checkpoint_service as cs
+
+    # 必须放在仓库之外：放在 tmp_path 会向上命中本仓库的 .git，不再是"普通目录"。
+    with tempfile.TemporaryDirectory(prefix="chiron-plain-preview-") as td:
+        base = Path(td)
+        root, state = base / "plain", base / "state"
+        root.mkdir()
+        (root / "a.txt").write_text("one\n", encoding="utf-8")
+        rec = cs.create_checkpoint(root, session_id="s1", seq=1, kind="pre_turn", state_dir=state)
+        assert rec is not None and rec.succeeded
+        (root / "a.txt").write_text("two\n", encoding="utf-8")
+        (root / "b.txt").write_text("new\n", encoding="utf-8")
+
+        result = cm.preview_diff(
+            root,
+            commit_sha=rec.commit_sha,
+            untracked=dict(rec.untracked),
+            state_dir=state,
+            session_id="s1",
+        )
+        assert result.restored == ("a.txt",)
+        assert "b.txt" in result.removed
+        assert not (root / ".git").exists(), "普通项目不应被预览写入 .git"
 
 
 def test_preview_without_manifest_marks_untracked_omitted(tmp_path: Path) -> None:

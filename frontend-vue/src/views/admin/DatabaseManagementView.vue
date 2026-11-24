@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import {
-  Card, Table, Button, Space, Tag, Input, Alert,
+  Card, Button, Space, Tag, Input, Alert,
   Statistic, Descriptions, Spin, message,
 } from 'ant-design-vue'
 import {
@@ -11,6 +11,7 @@ import {
 import { api } from '../../api'
 import { apiErrorMessage } from '../../composables/useCrudResource'
 import EmptyState from '../../components/common/EmptyState.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
@@ -167,8 +168,7 @@ onMounted(async () => {
 
 <template>
   <div class="database-management">
-    <div class="page-header">
-      <h1 class="page-title">{{ $t('admin.database_management') }}</h1>
+    <div class="panel-toolbar">
       <Space>
         <Button @click="loadStatus">
           {{ $t('common.refresh_status') }}
@@ -186,7 +186,6 @@ onMounted(async () => {
         <Descriptions
           :column="2"
           bordered
-          size="small"
         >
           <Descriptions.Item :label="$t('common.version')">
             <Space>
@@ -207,19 +206,18 @@ onMounted(async () => {
         :title="$t('admin.database_config')"
         style="margin-bottom: 16px"
       >
-        <Table
+        <AdminTable
           :columns="configColumns"
           :data-source="configRows"
           :loading="configLoading"
           row-key="key"
           :pagination="false"
           :scroll="{ x: 600 }"
-          size="small"
         >
           <template #emptyText>
             <EmptyState :description="$t('common.no_config_items_yet')" />
           </template>
-        </Table>
+        </AdminTable>
       </Card>
 
       <!--
@@ -287,21 +285,20 @@ onMounted(async () => {
               {{ $t('common.result_truncated') }}
             </Tag>
           </Space>
-          <Table
+          <AdminTable
             :columns="queryColumns"
             :data-source="queryRows"
             :row-key="(_r: any, i?: number) => i ?? 0"
             :pagination="{ pageSize: 20, showSizeChanger: true }"
             :scroll="{ x: 800 }"
-            size="small"
-          >
+            >
             <template #emptyText>
               <EmptyState :description="$t('common.query_returned_no_results')" />
             </template>
             <template #bodyCell="{ column, record }">
               <span class="cell">{{ cellText(record[(column as any).dataIndex as string]) }}</span>
             </template>
-          </Table>
+          </AdminTable>
         </template>
         <template v-else>
           <EmptyState :description="$t('common.query_results_will_appear_here')" />
@@ -351,11 +348,7 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.database-management { padding: 24px; }
+.panel-toolbar { display: flex; justify-content: flex-end; flex-wrap: wrap; }
 .cell { word-break: break-all; }
-
-@media (max-width: 768px) {
-  .database-management { padding: 16px 12px; }
-}
 
 </style>

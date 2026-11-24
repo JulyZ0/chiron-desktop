@@ -33,6 +33,11 @@ func TestCheckpointDiffOwnershipSQLRequiresTenantAndUser(t *testing.T) {
 	if !strings.Contains(sql, "root_path") {
 		t.Fatalf("归属查询必须一并取回工作区根：%s", sql)
 	}
+	for _, field := range []string{"provider", "device_id", "root_key"} {
+		if !strings.Contains(sql, field) {
+			t.Fatalf("client 检查点解析镜像缺少 %s：%s", field, sql)
+		}
+	}
 }
 
 func TestCheckpointDiffRejectsUnauthenticated(t *testing.T) {

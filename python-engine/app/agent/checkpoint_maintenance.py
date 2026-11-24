@@ -48,6 +48,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.agent import checkpoint_service as cs
 from app.agent import git_checkpoint as gc
 
 # ---------------------------------------------------------------------------
@@ -159,12 +160,17 @@ def preview_diff(
     state_dir: Path,
     session_id: str = "",
     settings: Mapping[str, object] | None = None,
+    expected_files: int | None = None,
 ) -> PreviewResult:
     """算出"回到 ``commit_sha``"需要动哪些文件；**绝不修改工作区**。
 
     ``untracked`` 是**目标快照**的 ``path -> sha256``（来自 PG 的
     ``checkpoint_untracked``）。传 ``None`` 表示读不到清单 —— 此时
     ``untracked_omitted=True``，预览只覆盖 git 跟踪的文件。
+
+    ``expected_files`` 是建点时上报的文件数（``project_checkpoints.file_count``）。
+    普通目录的**整个快照**就是这份清单，因此"清单条数 < 建点文件数"意味着清单没落全。
+    这种点绝不能预览成"只会改这几个文件"：它会让用户以为回滚是完整的。直接报错。
 
     只读性由三点保证：
 
@@ -180,35 +186,58 @@ def preview_diff(
     if not _SHA_RE.match(commit):
         raise gc.GitError(f"invalid commit sha: {commit_sha!r}")
 
-    # 先把仓库布局解析掉：后续一切路径都是"项目根口径"，父仓库内容不进快照。
-    layout = gc.resolve_layout(root)
+    # Git 项目用工作区仓库；普通目录用 create_checkpoint 写入的影子裸仓库。
+    try:
+        layout = gc.resolve_layout(root)
+        git_root, prefix, plain = root, layout.prefix, False
+    except gc.GitError as exc:
+        git_root, prefix, plain = cs.shadow_git_dir(root, state_dir), "", True
+        if not git_root.exists():
+            raise gc.GitError("checkpoint repository not found for this project") from exc
 
-    proc = gc._run_git(root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
+    proc = gc._run_git(git_root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
     if proc.returncode != 0:
         raise gc.GitError(
             f"checkpoint commit not found in this repository: {commit_sha}"
         )
+    # 普通目录的快照完全由清单承载：清单不全就是预览不准（会声称"删掉你的文件"
+    # 或"没有差异"）。只对普通目录做这条校验 —— git 项目的 file_count 还包含树内
+    # 已跟踪文件，与清单条数本来就不相等。
+    if plain and expected_files and len(untracked or {}) < expected_files:
+        raise gc.GitError(
+            f"checkpoint file manifest is incomplete: {len(untracked or {})} of "
+            f"{expected_files} files known; preview would be inaccurate"
+        )
     tree = gc._must(
-        gc._run_git(root, "rev-parse", "--verify", f"{commit}^{{tree}}"), "rev-parse tree"
+        gc._run_git(git_root, "rev-parse", "--verify", f"{commit}^{{tree}}"), "rev-parse tree"
     ).decode("ascii").strip()
 
     workdir = Path(tempfile.mkdtemp(prefix="chiron-preview-"))
     try:
-        current = gc.snapshot(
-            root,
-            # 临时索引：既满足"索引必须在工作区之外"，又不会覆盖热态快照索引。
-            index_file=workdir / "preview.idx",
-            store_root=workdir / "untracked",
-            settings=settings,
-        )
-        current_files = len(current.tree_paths) + len(current.untracked)
-        current_bytes = sum(
-            _tree_entry_sizes(root, current.tree, prefix=layout.prefix).values()
-        ) + _store_bytes(workdir / "untracked", current.untracked.values())
-
-        # 目标树的路径按项目根口径列（``prefix`` 用于剥掉 monorepo 前缀）。
-        target_paths, target_special = gc._tree_entries(root, tree, prefix=layout.prefix)
-        target_sizes = _tree_entry_sizes(root, tree, prefix=layout.prefix)
+        if plain:
+            manifest, _, _, current_total = cs._plain_manifest(
+                root, limits=gc.Limits.resolve(settings), store=None
+            )
+            current = gc.Snapshot(tree="", untracked=manifest)
+            current_files = len(manifest)
+            # 当前字节数**直接取磁盘扫描的总量**：``_plain_manifest`` 只算 sha256、
+            # 不落 CAS，用摘要去 CAS 里找体积会恒得 0（改过的文件根本不在里面）。
+            current_bytes = current_total
+            target_paths, target_special, target_sizes = {}, {}, {}
+        else:
+            current = gc.snapshot(
+                root,
+                # 临时索引：既满足"索引必须在工作区之外"，又不会覆盖热态快照索引。
+                index_file=workdir / "preview.idx",
+                store_root=workdir / "untracked",
+                settings=settings,
+            )
+            current_files = len(current.tree_paths) + len(current.untracked)
+            current_bytes = sum(
+                _tree_entry_sizes(root, current.tree, prefix=prefix).values()
+            ) + _store_bytes(workdir / "untracked", current.untracked.values())
+            target_paths, target_special = gc._tree_entries(root, tree, prefix=prefix)
+            target_sizes = _tree_entry_sizes(root, tree, prefix=prefix)
         omitted = untracked is None
         # 清单读不到时把**当前**清单当成目标：未跟踪那部分因此既不 added 也不
         # removed。用空字典代替会让每个当前存在的未跟踪文件都进 ``removed`` ——
@@ -220,7 +249,34 @@ def preview_diff(
             tree_paths=target_paths,
             non_regular=target_special,
         )
-        plan = gc.diff(root, current=current, target=target)
+        if plain:
+            # 影子仓库是裸库，``git diff-tree`` 不能以工作区 root 为 cwd；普通目录的
+            # 快照本身全部在 untracked 清单里，直接按摘要比较即可。
+            restored: list[str] = []
+            added: list[str] = []
+            removed: list[str] = []
+            protected: list[str] = []
+            current_files_map = dict(current.untracked)
+            for rel, digest in dict(target.untracked).items():
+                if rel not in current_files_map:
+                    added.append(rel)
+                elif current_files_map[rel] != digest:
+                    restored.append(rel)
+            for rel in current_files_map:
+                if rel in target.untracked:
+                    continue
+                if gc._is_excluded(rel, gc.PROTECTED_GLOBS):
+                    protected.append(rel)
+                else:
+                    removed.append(rel)
+            plan = gc.DiffPlan(
+                restored=tuple(sorted(restored)),
+                added=tuple(sorted(added)),
+                removed=tuple(sorted(removed)),
+                protected_removed=tuple(sorted(protected)),
+            )
+        else:
+            plan = gc.diff(root, current=current, target=target)
 
         target_bytes = sum(target_sizes.values()) + (
             0

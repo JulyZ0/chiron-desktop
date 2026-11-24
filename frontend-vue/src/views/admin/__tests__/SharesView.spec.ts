@@ -56,6 +56,7 @@ const SHARE_KEYS = [
   'admin.share_col_actions',
   'admin.share_revoke',
   'admin.share_empty',
+  'admin.share_no_results',
   'admin.share_untitled',
   'admin.share_load_failed',
   'admin.share_revoke_failed',
@@ -164,6 +165,43 @@ describe('SharesView 的三语适配', () => {
 
     expect(wrapper.text()).not.toContain('admin.share_')
 
+    wrapper.unmount()
+  })
+
+  it('列表加载失败可重试，成功后恢复分享表格', async () => {
+    apiMocks.listAdminShares.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce([share()])
+    const wrapper = mountView()
+    await flushPromises()
+
+    const error = wrapper.find('.admin-error-state')
+    expect(error.text()).toContain('读取分享列表失败')
+    expect(wrapper.find('.admin-table').exists()).toBe(false)
+
+    await error.find('button').trigger('click')
+    await flushPromises()
+
+    expect(apiMocks.listAdminShares).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('.admin-error-state').exists()).toBe(false)
+    expect(wrapper.find('.admin-table').text()).toContain('shr_abc123')
+    wrapper.unmount()
+  })
+
+  it('无分享与搜索无结果分别说明，且空表不显示分页', async () => {
+    apiMocks.listAdminShares.mockResolvedValue([])
+    const wrapper = mountView()
+    await flushPromises()
+
+    expect(wrapper.find('.ant-empty-description').text()).toContain('当前没有有效分享')
+    expect(wrapper.find('.ant-pagination').exists()).toBe(false)
+
+    apiMocks.listAdminShares.mockResolvedValue([share()])
+    await wrapper.find('.admin-page-actions button').trigger('click')
+    await flushPromises()
+    await wrapper.find('.share-search input').setValue('不存在的会话')
+    await flushPromises()
+
+    expect(wrapper.find('.ant-empty-description').text()).toContain('没有符合搜索条件的分享')
+    expect(wrapper.find('.ant-pagination').exists()).toBe(false)
     wrapper.unmount()
   })
 })

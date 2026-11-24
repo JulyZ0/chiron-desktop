@@ -989,6 +989,39 @@ function isPortAvailable(port) {
   })
 }
 
+/**
+ * 指定端口当前是否**已有进程在监听**（只连一次，不绑定、不占用、更不终止）。
+ *
+ * 与 `isPortAvailable` 的分工：那个是"我能不能 bind"，这个是"别人是不是已经在
+ * 应答"。重启知识库检索服务前必须先问后者 —— 端口被占用时 spawn 只会拿到一句
+ * `bind: address already in use`，而占用方**可能**正是上一轮残留的 pageindex
+ * （该复用），也**可能**是无关程序（绝不能杀）。
+ *
+ * 连接成功即判定有人在听；拒绝连接/超时都按"没人听"处理（宁可走 spawn 让
+ * 子进程自己报错，也不要凭一次探测失败就认定端口空闲之外的事情）。
+ */
+function isPortListening(port, timeoutMs = 500) {
+  return new Promise((resolve) => {
+    const candidate = Number(port)
+    if (!Number.isInteger(candidate) || candidate <= 0 || candidate > 65535) {
+      resolve(false)
+      return
+    }
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(value)
+    }
+    const socket = net.connect({ host: '127.0.0.1', port: candidate })
+    socket.unref()
+    socket.setTimeout(Math.max(50, Number(timeoutMs) || 500), () => finish(false))
+    socket.once('connect', () => finish(true))
+    socket.once('error', () => finish(false))
+  })
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -1030,6 +1063,7 @@ module.exports = {
   killProcessTree,
   pickFreePort,
   isPortAvailable,
+  isPortListening,
   componentsRoot,
   componentDir,
   coreBinaryPath,

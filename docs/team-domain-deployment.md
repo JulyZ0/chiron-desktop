@@ -162,6 +162,25 @@ New-NetFirewallRule -DisplayName "Chiron HTTP"  -Direction Inbound -Protocol TCP
 - owner 仍可在本机回环免口令进入（`LOCAL_BOOTSTRAP` 保留），用于首次设置密码与运维。
 - 关闭服务模式后，公开注册重新可用（除非 `DISABLE_REGISTRATION` 或 `CHIRON_DEPLOY_MODE=team` 阻止）。
 
+### 8.1 部署后验收（可重复）
+
+```bat
+set CHIRON_OWNER_PASSWORD=<owner 密码>
+python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公司> ^
+    --r2-root R:\project --sse --strict-web ^
+    --json-out .artifacts\team-acceptance.json
+```
+
+- 阶段：`env`（TLS/`/health`/`/ready`/凭据）→ `r2`（读 P95≤50ms、写 P95≤150ms、git 可用）
+  → `web`（登录、首登改密、邀请、强制下线、匿名分享页、可选 SSE）→ `r6`（摄入压测结果）。
+- 退出码：`0` 无 FAIL 且有 PASS；`1` 有 FAIL；`77` 全部 SKIP（缺主机/挂载点/凭据，
+  是"环境不具备"而不是通过）。CI 可直接用 `--json` 消费。
+- 没有团队主机时先跑 `python scripts/team_acceptance.py`：四项都应为 SKIP 且退出 77；
+  任何 SKIP 都会列在 `pending_real_host`，不会被当成已验证。
+- 只验 Web 账号闭环可用 `python scripts/team_smoke.py --base-url ... --email ... --sse`；
+  只验挂载点可用 `python scripts/r2_mount_bench.py --root R:\project`。
+- 这些脚本只读配置/跑临时文件，不修改服务端代码；测试账号在结束时软删除，失败也会清理。
+
 ---
 
 ## 9. 运行隔离与容量规划（WSL2 + 容器）

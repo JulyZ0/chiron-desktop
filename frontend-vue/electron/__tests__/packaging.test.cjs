@@ -11,8 +11,8 @@
  *   1. `dist/` 额外进 `resources/web` —— 网关（独立 Go 进程）打不开 asar，
  *      少了这一份就没有任何人能打开分享链接；
  *   2. 壳层算路径、`CHIRON_WEB_ROOT` 注入 spawn 环境 —— 两侧路径必须一致；
- *   3. 网关的 SPA 回退（`GET /` → index.html）—— `/s/:token` 这类客户端
- *      路由在网关托管下必须能直接打开，而不是 404；
+ *   3. 网关的 SPA 回退（`/` → index.html，handler 仅允许 GET/HEAD）—— `/s/:token`
+ *      这类客户端路由在网关托管下必须能直接打开，而不是 404；
  *   4. 前端路由里 `/s/:token`、`/knowledge`、`/admin/deps` 仍在 —— 分享页、
  *      知识库与依赖页可达。
  */
@@ -80,14 +80,16 @@ test('local-stack.cjs：把 webRoot 注入网关 spawn 环境的 CHIRON_WEB_ROOT
   assert.match(stack, /if\s*\(\s*webRoot\s*\)/, '空串代表不托管，不能注入空路径')
 })
 
-test('internal/api/web_static.go：存在 mountSPA 与 GET / 的 SPA 回退', () => {
+test('internal/api/web_static.go：存在 mountSPA 与 SPA 回退', () => {
   const goSrc = read('internal/api/web_static.go')
   assert.match(goSrc, /func mountSPA\s*\(/, '必须导出 mountSPA（装配处一行接上）')
   assert.match(
     goSrc,
-    /mux\.Handle\("GET \/"/,
-    '必须以 `GET /` 注册兜底：/s/<token>、/knowledge 等客户端路由才有人接',
+    /mux\.Handle\("\/"/,
+    '必须以无方法限定的 "/" 注册兜底，避免 Go 1.22 ServeMux 与更具体的 WebDAV 路由冲突',
   )
+  assert.match(goSrc, /r\.Method != http\.MethodGet && r\.Method != http\.MethodHead/, 'handler 只允许 GET/HEAD')
+  assert.match(goSrc, /NotFound\(w, "not found"\)/, '非 GET/HEAD 与保留 API 前缀必须返回 404')
   assert.match(goSrc, /index\.html/, '回退必须返回 index.html')
   assert.match(goSrc, /SPA/, '文件里必须还写着 SPA 兜底语义（防止被改成纯静态）')
   // API 前缀不能被 SPA 吞掉：否则 /v1/* 未命中会返回 HTML 而不是 JSON 错误

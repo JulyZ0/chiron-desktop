@@ -9,7 +9,7 @@
  */
 import { computed, onMounted, reactive, ref } from 'vue'
 import {
-  Alert, Button, Card, Input, Modal, Popconfirm, Select, Space, Table, Tag, message,
+  Alert, Button, Empty, Input, Modal, Popconfirm, Select, Space, Tag, message,
 } from 'ant-design-vue'
 import { useI18n } from 'vue-i18n'
 import {
@@ -24,12 +24,16 @@ import {
   type AdminManagedUser,
 } from '@/api/admin'
 import { serverErrorMessage } from '../../utils/apiError'
+import AdminPage from '@/components/admin/AdminPage.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
+import AdminErrorState from '@/components/admin/AdminErrorState.vue'
 import { useAuthStore } from '../../stores/auth'
 
 const { t } = useI18n()
 const auth = useAuthStore()
 
 const loading = ref(false)
+const loadError = ref('')
 const users = ref<AdminManagedUser[]>([])
 const page = ref(1)
 const perPage = ref(20)
@@ -75,12 +79,14 @@ function statusColor(status: string) {
 
 async function load() {
   loading.value = true
+  loadError.value = ''
   try {
     const data = await listAdminUsers({ page: page.value, per_page: perPage.value })
     users.value = data?.users || []
     total.value = data?.total || 0
   } catch (err) {
-    message.error(serverErrorMessage(err, t('admin.userAdmin.load_failed')))
+    loadError.value = serverErrorMessage(err, t('admin.userAdmin.load_failed'))
+    message.error(loadError.value)
   } finally {
     loading.value = false
   }
@@ -250,16 +256,11 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="users-view">
-    <div class="page-header">
-      <div>
-        <h2 class="page-title page-title-sm">
-          {{ $t('admin.userAdmin.page_title') }}
-        </h2>
-        <p class="page-desc">
-          {{ $t('admin.userAdmin.page_desc') }}
-        </p>
-      </div>
+  <AdminPage
+    :title="$t('admin.userAdmin.page_title')"
+    :description="$t('admin.userAdmin.page_desc')"
+  >
+    <template #actions>
       <Button
         type="primary"
         data-test="user-create"
@@ -267,7 +268,7 @@ onMounted(load)
       >
         {{ $t('admin.userAdmin.new') }}
       </Button>
-    </div>
+    </template>
 
     <Alert
       type="info"
@@ -276,8 +277,15 @@ onMounted(load)
       :message="$t('admin.userAdmin.password_hint')"
     />
 
-    <Card :bordered="false">
-      <Table
+    <AdminErrorState
+      v-if="loadError"
+      :message="loadError"
+      :retrying="loading"
+      @retry="load"
+    />
+
+    <AdminTable
+        v-else
         :columns="columns"
         :data-source="users"
         :loading="loading"
@@ -289,8 +297,17 @@ onMounted(load)
           onChange: (p: number) => { page = p; load() },
         }"
         :row-key="(row: AdminManagedUser) => row.id"
-        size="middle"
       >
+        <template #emptyText>
+          <Empty>
+            <template #description>
+              <div class="admin-table-empty-hint">
+                <p>{{ $t('admin.userAdmin.empty') }}</p>
+                <p>{{ $t('admin.userAdmin.empty_hint') }}</p>
+              </div>
+            </template>
+          </Empty>
+        </template>
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'account'">
             <div class="user-account">
@@ -379,8 +396,7 @@ onMounted(load)
             </Space>
           </template>
         </template>
-      </Table>
-    </Card>
+      </AdminTable>
 
     <Modal
       v-model:open="createOpen"
@@ -516,11 +532,10 @@ onMounted(load)
         {{ $t('admin.userAdmin.invite_no_base_url') }}
       </p>
     </Modal>
-  </div>
+  </AdminPage>
 </template>
 
 <style scoped>
-.users-view { display: flex; flex-direction: column; gap: 12px; }
 .users-hint { border-radius: var(--radius-lg); }
 .user-account { display: flex; flex-direction: column; gap: 2px; }
 .user-email { color: var(--text-primary); }

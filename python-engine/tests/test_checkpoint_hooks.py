@@ -44,13 +44,26 @@ def test_creates_checkpoint_when_project_bound(monkeypatch, tmp_path: Path) -> N
     assert hooks.turn_checkpoint("post_turn", state_dir=tmp_path / "st") == 2
 
 
-def test_failure_never_raises(monkeypatch, tmp_path: Path) -> None:
-    """项目根是个普通目录（非 git）→ 返回 None，不抛异常。"""
+def test_plain_project_checkpoints_and_seq_increments(monkeypatch, tmp_path: Path) -> None:
+    """普通目录也应成功，且钩子重复传 1 时不会发生影子 ref CAS 冲突。"""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     plain = tmp_path / "plain"
     plain.mkdir()
+    (plain / "a.txt").write_text("hello", encoding="utf-8")
     monkeypatch.setattr(hooks, "project_root", lambda: plain)
     monkeypatch.setattr(hooks, "_session_id", lambda: "s2")
-    assert hooks.turn_checkpoint("pre_turn", state_dir=tmp_path / "st2") is None
+    assert hooks.turn_checkpoint("pre_turn", state_dir=tmp_path / "st2") == 1
+    assert hooks.turn_checkpoint("post_turn", state_dir=tmp_path / "st2") == 2
+
+
+def test_failure_never_raises(monkeypatch, tmp_path: Path) -> None:
+    """真实 IO 失败 → 返回 None，不抛异常。"""
+    root = _repo(tmp_path)
+    blocker = tmp_path / "state-file"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(hooks, "project_root", lambda: root)
+    monkeypatch.setattr(hooks, "_session_id", lambda: "s-fail")
+    assert hooks.turn_checkpoint("pre_turn", state_dir=blocker) is None
 
 
 def test_seq_survives_packed_refs(monkeypatch, tmp_path: Path) -> None:

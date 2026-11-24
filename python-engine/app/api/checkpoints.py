@@ -11,11 +11,12 @@
 
 网关的职责只是鉴权与转发，前端只需要给一个 ``checkpoint_id``。
 
-## 归属与路径都是查出来的，不是传进来的
+## 归属与路径都由可信调用方确定
 
-请求体只有 ``checkpoint_id``（以及可选的路径子集与 ``allow_delete``）。
-项目根、tree、未跟踪清单全部按主键查库得到 —— 让调用方指定工作区路径等于让它
-在任意目录上执行写操作。
+请求体通常只有 ``checkpoint_id``（以及可选的路径子集与 ``allow_delete``）。
+本地项目根从数据库取；client 项目的设备 Windows 路径不能直接在服务端使用，因此
+网关在完成 tenant/user 归属校验后可传可信的 ``root``（实际服务端镜像）。该字段
+只接受内部令牌调用，外部客户端不能借它指定任意写目录。
 
 ## ``allow_delete`` 默认 False
 
@@ -35,6 +36,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.agent import checkpoint_hooks
+from app.agent import checkpoint_service as cs
 from app.agent import git_checkpoint as gc
 from app.api.isolation import _verify_gateway_key
 
@@ -48,12 +50,25 @@ MAX_RESTORE_PATHS = 2000
 
 class RestoreRequest(BaseModel):
     checkpoint_id: str = Field(..., min_length=1, max_length=64)
+    root: str | None = Field(
+        None,
+        max_length=4096,
+        description="可信网关为 client 项目传入的服务端镜像根；本地项目不要传",
+    )
     allow_delete: bool = Field(
         False, description="是否删除快照之后新增的文件（默认否）"
     )
     paths: list[str] | None = Field(
         None, description="只回滚这些路径；None = 全部"
     )
+
+
+def _as_int(value: object) -> int:
+    """把 DB 里取回的计数转成 int；``None``/不可解析按 0（不抛，DB 驱动可能是 Decimal/str）。"""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
 
 
 def _split_paths(paths: list[str] | None) -> list[str] | None:
@@ -87,6 +102,7 @@ async def restore_checkpoint(request: Request, body: RestoreRequest) -> dict[str
     db = get_db_client()
     row = await db.fetch_one(
         """SELECT c.ref_name, c.tree_sha, c.commit_sha, c.session_id, c.state,
+                  COALESCE(c.file_count, 0) AS file_count,
                   c.workspace_id, w.root_path AS root_path
              FROM project_checkpoints c
              JOIN session_map_workspaces w ON w.id = c.workspace_id
@@ -101,10 +117,12 @@ async def restore_checkpoint(request: Request, body: RestoreRequest) -> dict[str
             status_code=409,
             detail=f"checkpoint state is {row.get('state')!r}, not 'ok'",
         )
-    root_raw = str(row.get("root_path") or "")
+    root_raw = str(body.root or row.get("root_path") or "").strip()
     if not root_raw:
         raise HTTPException(status_code=409, detail="workspace has no root path")
     root = Path(root_raw)
+    if body.root is not None and not root.is_absolute():
+        raise HTTPException(status_code=400, detail="trusted root must be absolute")
     if not root.is_dir():
         raise HTTPException(status_code=409, detail="workspace root no longer exists")
 
@@ -125,22 +143,57 @@ async def restore_checkpoint(request: Request, body: RestoreRequest) -> dict[str
     session_id = str(row.get("session_id") or "")
     index_file = state_dir / f"snap-{session_id}.idx"
 
+    restore_paths = _split_paths(body.paths)
+    shadow = cs.shadow_git_dir(root, state_dir)
     try:
-        tree_paths, non_regular = gc._tree_entries(root, tree)
-        target = gc.Snapshot(
-            tree=tree,
-            untracked=untracked,
-            tree_paths=frozenset(tree_paths),
-            non_regular=frozenset(non_regular),
-        )
-        result = gc.restore(
-            root,
-            target=target,
-            store_root=state_dir / "untracked",
-            paths=_split_paths(body.paths),
-            allow_delete=body.allow_delete,
-            index_file=index_file,
-        )
+        try:
+            gc.resolve_layout(root)
+            plain = False
+        except gc.GitError:
+            # 只有确实创建过影子仓库的普通目录才能走 CAS 恢复；真实 Git 仓库
+            # 若因 git 缺失/损坏而解析失败，绝不能退化成"只恢复未跟踪文件"。
+            if not (shadow / "HEAD").exists():
+                raise
+            plain = True
+
+        if plain:
+            # 普通目录的**整个快照**就是这份清单（没有 git 树）。清单短于建点时
+            # 上报的文件数，说明 `checkpoint_untracked` 没落全（上报被截断/写库失败）。
+            # 此时恢复只会写出其中一部分，却仍然返回 ``ok=True`` —— 用户看到"回滚成功"
+            # 而工作区只回来一半。宁可明确失败，也不假成功。
+            expected = _as_int(row.get("file_count"))
+            if expected > len(untracked):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"checkpoint file manifest is incomplete: "
+                        f"{len(untracked)} of {expected} files known; "
+                        "refusing to restore a partial snapshot"
+                    ),
+                )
+            result = cs.restore_plain_directory(
+                root,
+                manifest=untracked,
+                store_root=state_dir / "untracked",
+                paths=restore_paths,
+                allow_delete=body.allow_delete,
+            )
+        else:
+            tree_paths, non_regular = gc._tree_entries(root, tree)
+            target = gc.Snapshot(
+                tree=tree,
+                untracked=untracked,
+                tree_paths=frozenset(tree_paths),
+                non_regular=frozenset(non_regular),
+            )
+            result = gc.restore(
+                root,
+                target=target,
+                store_root=state_dir / "untracked",
+                paths=restore_paths,
+                allow_delete=body.allow_delete,
+                index_file=index_file,
+            )
     except gc.GitError as exc:
         logger.warning("checkpoint restore failed id=%s: %s", body.checkpoint_id, exc)
         raise HTTPException(status_code=409, detail=str(exc)) from exc

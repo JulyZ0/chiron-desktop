@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import AdminTabbedView from '@/components/admin/AdminTabbedView.vue'
+import AdminPage from '@/components/admin/AdminPage.vue'
 import RedisManagementView from './RedisManagementView.vue'
 import DatabaseManagementView from './DatabaseManagementView.vue'
 
@@ -13,9 +14,11 @@ const tabs = [
 </script>
 
 <template>
-  <AdminTabbedView
-    route-path="/admin/datastores"
-    default-tab="redis"
-    :tabs="tabs"
-  />
+  <AdminPage :title="t('common.data_storage')">
+    <AdminTabbedView
+      route-path="/admin/datastores"
+      default-tab="redis"
+      :tabs="tabs"
+    />
+  </AdminPage>
 </template>

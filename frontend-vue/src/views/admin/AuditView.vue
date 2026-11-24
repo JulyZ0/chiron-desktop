@@ -6,7 +6,9 @@
  * 最后一手，所以这里只读：不做删除/改写入口，也不在页面里加载详情全文以外的资源。
  */
 import { computed, onMounted, ref } from 'vue'
-import { Button, Input, Table, message } from 'ant-design-vue'
+import { Button, Input, message } from 'ant-design-vue'
+import AdminPage from '@/components/admin/AdminPage.vue'
+import AdminTable from '@/components/admin/AdminTable.vue'
 import { useI18n } from 'vue-i18n'
 import {
   downloadAuditLogs,
@@ -123,7 +125,7 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="audit-page">
+  <AdminPage :title="$t('admin.operation_audit')">
     <div class="audit-toolbar">
       <Input
         v-model:value="action"
@@ -169,8 +171,7 @@ onMounted(load)
       </Button>
     </div>
 
-    <Table
-      size="small"
+    <AdminTable
       row-key="id"
       :columns="columns"
       :data-source="rows"
@@ -210,12 +211,11 @@ onMounted(load)
       <template #emptyText>
         {{ $t('admin.audit_empty') }}
       </template>
-    </Table>
-  </div>
+    </AdminTable>
+  </AdminPage>
 </template>
 
 <style scoped>
-.audit-page { display: flex; flex-direction: column; gap: 16px; }
 .audit-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .audit-field { width: 200px; }
 .audit-date {

@@ -80,8 +80,12 @@ def _abs_dir(raw: str) -> Path:
 
 async def _load_untracked(
     *, checkpoint_id: str, commit_sha: str, session_id: str
-) -> dict[str, str] | None:
+) -> tuple[dict[str, str] | None, int | None]:
     """读目标快照的未跟踪清单；**读不到返回 None**（而不是空字典）。
+
+    第二个返回值是这个检查点建点时上报的文件数（``file_count``），用于识别
+    "清单没落全"：普通目录的整个快照就是这份清单，条数少于文件数时预览与回滚
+    都会不完整 —— 必须让下游知道，而不是按"这个点只有这么几个文件"处理。
 
     这个区别是整个预览里最重要的一处：
 
@@ -109,7 +113,17 @@ async def _load_untracked(
             if row:
                 cid = str(row.get("id") or "")
         if not cid:
-            return None
+            return None, None
+        expected: int | None = None
+        head = await db.fetch_one(
+            "SELECT COALESCE(file_count, 0) AS file_count FROM project_checkpoints WHERE id = $1",
+            [cid],
+        )
+        if head:
+            try:
+                expected = int(head.get("file_count") or 0)
+            except (TypeError, ValueError):
+                expected = None
         rows = await db.fetch_all(
             "SELECT path, sha256 FROM checkpoint_untracked WHERE checkpoint_id = $1",
             [cid],
@@ -118,10 +132,10 @@ async def _load_untracked(
             str(r.get("path") or ""): str(r.get("sha256") or "") for r in rows
         }
         manifest.pop("", None)
-        return manifest
+        return manifest, expected
     except Exception as exc:  # noqa: BLE001 — 读不到清单不影响跟踪文件的预览
         logger.warning("checkpoint diff: untracked manifest unavailable: %s", exc)
-        return None
+        return None, None
 
 
 @router.post("/diff")
@@ -130,7 +144,7 @@ async def checkpoint_diff(body: DiffRequest, request: Request) -> dict[str, Any]
     _verify_gateway_key(request)
     root = _abs_dir(body.root)
 
-    untracked = await _load_untracked(
+    untracked, expected_files = await _load_untracked(
         checkpoint_id=body.checkpoint_id,
         commit_sha=body.commit_sha,
         session_id=body.session_id,
@@ -143,6 +157,7 @@ async def checkpoint_diff(body: DiffRequest, request: Request) -> dict[str, Any]
             untracked=untracked,
             state_dir=checkpoint_hooks.checkpoint_state_dir(),
             session_id=body.session_id,
+            expected_files=expected_files,
         )
     except gc.GitError as exc:
         logger.warning("checkpoint diff failed root=%s: %s", root, exc)

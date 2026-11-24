@@ -70,5 +70,5 @@ const {
 </template>
 
 <style scoped>
-.tabbed-admin-page { padding: 0 4px; }
+.tabbed-admin-page { width: 100%; }
 </style>

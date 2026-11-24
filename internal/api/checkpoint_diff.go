@@ -46,10 +46,10 @@ const checkpointGcDefaultRetentionDays = 90
 type checkpointScaleStats struct {
 	// SampleCount 是统计窗口内的成功检查点数。为 0 时平均值没有意义，
 	// 前端据此显示"暂无数据"而不是一个 0。
-	SampleCount     int64   `json:"sample_count"`
-	AvgFileCount    float64 `json:"avg_file_count"`
-	AvgByteSize     float64 `json:"avg_byte_size"`
-	WindowDays      int     `json:"window_days"`
+	SampleCount  int64   `json:"sample_count"`
+	AvgFileCount float64 `json:"avg_file_count"`
+	AvgByteSize  float64 `json:"avg_byte_size"`
+	WindowDays   int     `json:"window_days"`
 	// CurrentFiles/CurrentBytes 只在差异预览里有（当前工作区快照规模）。
 	CurrentFiles int64 `json:"current_files,omitempty"`
 	CurrentBytes int64 `json:"current_bytes,omitempty"`
@@ -106,9 +106,12 @@ func checkpointAverages(ctx context.Context, workspaceID string) checkpointScale
 const checkpointDiffOwnershipSQL = `SELECT c.id, c.state, c.commit_sha,
 	       COALESCE(c.session_id,'') AS session_id,
 	       COALESCE(c.workspace_id,'') AS workspace_id,
-	       COALESCE(w.root_path,'') AS root_path
+	       COALESCE(w.provider,'server') AS provider,
+	       COALESCE(w.device_id,'') AS device_id,
+	       COALESCE(w.root_path,'') AS root_path,
+	       COALESCE(w.root_key,'') AS root_key
 	  FROM project_checkpoints c
-	  LEFT JOIN session_map_workspaces w ON w.id = c.workspace_id
+	  LEFT JOIN session_map_workspaces w ON w.id = c.workspace_id AND w.tenant_id = c.tenant_id
 	 WHERE c.id = $1 AND c.tenant_id = $2 AND COALESCE(c.user_id,'') = $3`
 
 // CheckpointDiffHandler 是 POST /v1/checkpoints/{cid}/diff。
@@ -167,10 +170,11 @@ func CheckpointDiffHandler(python *engine.PythonClient) http.HandlerFunc {
 			})
 			return
 		}
-		rootPath := strings.TrimSpace(stringOf(owned["root_path"]))
-		if rootPath == "" {
+		loc := checkpointLocatorFromRow(owned)
+		rootPath, err := checkpointRootForLocator(r.Context(), claims, loc)
+		if err != nil {
 			JSON(w, http.StatusConflict, APIResponse{
-				Success: false, Error: "workspace has no root path", Code: CodeRequestFailed,
+				Success: false, Error: err.Error(), Code: CodeRequestFailed,
 			})
 			return
 		}

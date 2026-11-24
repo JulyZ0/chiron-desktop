@@ -5,7 +5,16 @@
  * 会原样返回 key 并跳过插值，界面上就会显示成 `{name}（已配置 Key）`。
  */
 export default {
+  table_label: 'Data table',
   providers: {
+    page_title: 'Provider management',
+    page_desc: 'Manage model providers, access keys, endpoints, and traffic weights in one place.',
+    col_provider: 'Provider',
+    col_key: 'Key',
+    api_key: 'API Key',
+    base_url: 'Base URL',
+    empty: 'No provider keys',
+    empty_hint: 'Add a provider key to manage its status, endpoint, and traffic weight here.',
     /** {name} = provider name */
     configuredName: '{name} (Key configured)',
   },
@@ -429,6 +438,7 @@ export default {
   share_col_actions: "Actions",
   share_revoke: "Revoke",
   share_empty: "No active shares",
+  share_no_results: "No shares match your search. Change the keyword or clear the search.",
   share_untitled: "(untitled conversation)",
   share_load_failed: "Failed to load shares",
   share_revoke_failed: "Failed to revoke the share",
@@ -468,6 +478,9 @@ export default {
     status_disabled: "Disabled",
     status_deleted: "Deleted",
     never: "Never",
+    empty: "No team members",
+    empty_hint: "Choose “New user” to create the first team account.",
+    load_failed: "Failed to load users",
     create_title: "Create user",
     email: "Email",
     username: "Username",

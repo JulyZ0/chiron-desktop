@@ -260,7 +260,12 @@ class UnifiedChatHandler:
 
         # ── 创建/获取会话 (内存 L1 缓存 + PostgreSQL 写穿透持久化) ──
         if not session_id:
-            session_id = f"session_{int(time.time())}_{tenant_id}"
+            session_id = f"session_{int(time.time())}_{tenant_id}_{uuid.uuid4().hex[:8]}"
+
+        # quick-execute 是 chat/submit 的别名；两条入口都必须把**实际会话 ID**
+        # 交给 TaskRouter。provider 只读 ContextVar，不读这里的 llm_config，因此
+        # 仅透传模型/provider 仍会导致 OpenCode 请求缺少 x-opencode-session。
+        context["session_id"] = session_id
 
         session = self.sessions.get(session_id)
         if session is None:
@@ -347,14 +352,21 @@ class UnifiedChatHandler:
 
             # 调用 TaskRouter (带模式选择)
             if mode == "agent":
-                # 强制使用 Agent 工作台 (context.agent 覆盖 SubAgent 配置)
-                result = await self._execute_via_agent(
-                    effective_input,
-                    tenant_id,
-                    trace_id,
-                    agent_config=ctx_agent,
-                    attachments=attachments,
-                )
+                # Agent 直连 gateway，不经过 TaskRouter；OpenCode 的会话头仍须由
+                # 这里设置。用实际 session_id，并在返回后精确复位，避免并发串线。
+                from app.providers.session_context import reset_llm_session_id, set_llm_session_id
+
+                session_token = set_llm_session_id(session_id)
+                try:
+                    result = await self._execute_via_agent(
+                        effective_input,
+                        tenant_id,
+                        trace_id,
+                        agent_config=ctx_agent,
+                        attachments=attachments,
+                    )
+                finally:
+                    reset_llm_session_id(session_token)
             else:
                 # 自动模式 (默认)
                 if context:

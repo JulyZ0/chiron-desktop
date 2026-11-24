@@ -95,10 +95,36 @@ ProjectLocator { project_id, provider: server|client, device_id?, root, root_key
 
 ## 8. 剩余工作
 
-1. **R2 实测定案**：团队主机安装 rclone+WinFsp，运行 `scripts/r2_mount_bench.py` 与 §4 决策门；通过则切挂载、删镜像。
-   - 通过标准：fs/git/run_code 可用；rename/delete 生效；读/写 P95 ≤50/150ms；10 分钟稳定。
-2. **团队 Web E2E**：真实域名/TLS 下登录、SSE、首登改密、强制下线、分享页。`scripts/team_smoke.py` 已覆盖账号/邀请闭环，`--sse` 追加首 token 与 `turn_done` 验收。
-3. **R6 压测**：P=2/4，P95 首 token、逐引擎 RSS、空闲回收；核对 `/metrics` 的引擎池指标。
+统一入口 `scripts/team_acceptance.py` 串联下列可自动部分，输出 JSON + 人类摘要；
+没有真实主机/挂载点时对应阶段明确 SKIP（退出码 77），**不把 SKIP 记成 PASS**。
+
+```bat
+set CHIRON_OWNER_PASSWORD=<owner 密码>
+python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公司> ^
+    --r2-root R:\project --sse --strict-web ^
+    --json-out .artifacts/team-acceptance.json
+```
+
+退出码：0=无 FAIL 且至少一项 PASS；1=有 FAIL；77=全部 SKIP（缺主机/挂载点/凭据）。
+
+1. **R2 实测定案**：团队主机安装 rclone+WinFsp，运行 `scripts/r2_mount_bench.py`
+   （或验收入口的 `--r2-root`），通过则切挂载、删镜像。门禁 id：
+   `r2.read_p95`（≤50ms）、`r2.write_p95`（≤150ms）、`r2.git`（`rev-parse
+   --is-inside-work-tree` 必须为 true；`--skip-git` 只记 SKIP）、`r2.io_errors`、
+   `r2.rename_delete`。仍待人工：fs/git/run_code 全链路、业务侧 rename/delete 生效、
+   10 分钟稳定性。
+2. **团队 Web E2E**：真实域名/TLS 下登录、首登改密、邀请一次性、强制下线、SSE 首
+   token/`turn_done`、匿名分享页（数据面 + `/s/<token>` HTML）。`scripts/team_smoke.py`
+   可单独跑；`--sse` 产生消息后才会判定分享页，没有消息时是 SKIP。门禁 id 见
+   `team_acceptance.py` 头部（`web.login` / `web.must_change_password` /
+   `web.first_login_password_change` / `web.invite` / `web.force_logout` /
+   `web.share_anonymous` / `web.share_page_html` / `web.sse_first_token` 等）。
+3. **R6 压测**：P=2/4，P95 首 token、逐引擎 RSS、空闲回收；核对 `/metrics` 的引擎池
+   指标。已有结果时由验收入口 `--r6-report` 摄入，报告形状：
+   `{"metrics_checked": true, "runs": [{"pool": 2, "first_token_p95_ms": 900,
+   "engine_rss_mb": [320, 318], "idle_reclaimed": true}, {"pool": 4, …}]}`。
+   缺 P=2/4、缺指标或未确认空闲回收均 FAIL；首 token 阈值可选
+   `--r6-first-token-p95-ms`（PRD 暂未给硬指标，不设则只记录）。
 4. 暂缓项：LiteLLM、Langfuse 实接、租户删除、S5、企业权限的更多维度（按需）。
 
 ## 9. 参考

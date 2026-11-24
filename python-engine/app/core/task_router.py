@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -190,7 +191,7 @@ class TaskRouter:
             }
         """
         start_time = time.time()
-        task_id = f"task_{int(time.time())}_{tenant_id}"
+        task_id = f"task_{int(time.time())}_{tenant_id}_{uuid.uuid4().hex[:8]}"
 
         logger.info(
             "Routing task (task_id=%s, tenant=%s, priority=%s, trace_id=%s)",
@@ -209,6 +210,15 @@ class TaskRouter:
         # 都登记到这里，最后随回包交给网关记账（引擎自己不记账）。
         # 必须建在 try 之外：异常路径也要把**已经花掉的** token 带回去。
         usage_acc = UsageAccumulator(fallback_model=llm_model)
+
+        # OpenCode 的 x-opencode-session 由 provider 从 ContextVar 读取。统一入口
+        # 在 context.session_id 传入实际会话 ID；直接调用 quick_execute/route_task
+        # 时没有会话，则用本次任务的稳定 ID 兜底。token 必须覆盖整个编排过程
+        # （意图理解 + agent:* 能力），并在 finally 精确复位，避免并发请求串会话。
+        from app.providers.session_context import reset_llm_session_id, set_llm_session_id
+
+        llm_session_id = str((context or {}).get("session_id") or "").strip() or task_id
+        session_token = set_llm_session_id(llm_session_id)
 
         try:
             # ── 阶段 1: 意图理解 ─────────────────────────────────────
@@ -297,6 +307,8 @@ class TaskRouter:
                 # 把 usage 挂在异常上同一口径）。
                 "usage": usage_acc.to_block(),
             }
+        finally:
+            reset_llm_session_id(session_token)
 
     async def _understand_intent(
         self,

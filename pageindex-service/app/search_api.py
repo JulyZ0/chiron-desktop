@@ -34,6 +34,13 @@ from app.config import Config
 
 logger = logging.getLogger(__name__)
 
+#: 服务接口版本（/healthz 的只读字段 `version`）：桌面壳层只在身份+版本+schema
+#: 都对得上时才复用已在运行的进程。
+SERVICE_VERSION = "1"
+#: 索引产物布局版本（/healthz 的只读字段 `schema`）：产物结构变化时递增，
+#: 让新壳层拒绝认领旧进程（宁可重启一次，也不要读写错布局的目录）。
+INDEX_SCHEMA_VERSION = 1
+
 app = FastAPI(title="pageindex-search", docs_url=None, openapi_url=None, redoc_url=None)
 
 _cfg: Config | None = None
@@ -176,6 +183,11 @@ async def healthz() -> dict[str, Any]:
         "worker_alive": await _worker_alive(),
         "engine": sdk_version(),
         "service": "pageindex-search",
+        # 只读身份字段：桌面壳层在复用"上一轮残留的 pageindex"之前据此判断兼容性
+        # （见 frontend-vue/electron/local-stack.cjs::evaluateKnowledgeHealth）。
+        # `schema` 变化意味着索引产物布局改了，旧进程不能被新壳层直接认领。
+        "version": SERVICE_VERSION,
+        "schema": INDEX_SCHEMA_VERSION,
     }
 
 

@@ -117,6 +117,73 @@ func safeMirrorRel(rel string) (string, bool) {
 	return rel, true
 }
 
+// mirrorHasGitMetadata 对任意层级的 .git 文件/目录生效。VCS 元数据可能很大且含
+// 本机绝对路径，绝不通过设备桥全量镜像；检查点内容由服务端 CAS/影子仓库保护。
+func mirrorHasGitMetadata(rel string) bool {
+	rel = strings.TrimSpace(strings.ReplaceAll(rel, `\`, "/"))
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == ".git" {
+			return true
+		}
+	}
+	return false
+}
+
+// mirrorHasSensitiveFile 与服务端检查点的密钥排除保持一致，防止旧版/第三方设备
+// 实现把 .env、私钥等文件经 walk 送到服务端。普通点文件（.gitignore/.github）不受影响。
+func mirrorHasSensitiveFile(rel string) bool {
+	normalized := strings.ReplaceAll(rel, `\`, "/")
+	for _, seg := range strings.Split(normalized, "/") {
+		// .ssh/.aws/.gnupg 是"整个目录都是凭据"的典型：与 git_checkpoint.SECRET_GLOBS
+		// 的 `.ssh/**` / `.aws/**` / `.gnupg/**` 对齐，否则目录里的任意文件名都会漏。
+		if strings.EqualFold(seg, ".ssh") || strings.EqualFold(seg, ".aws") || strings.EqualFold(seg, ".gnupg") {
+			return true
+		}
+	}
+	base := strings.ToLower(normalized[strings.LastIndex(normalized, "/")+1:])
+	if base == ".env" || strings.HasPrefix(base, ".env.") || base == ".npmrc" || base == ".netrc" ||
+		strings.HasPrefix(base, "id_rsa") || strings.HasPrefix(base, "id_ed25519") ||
+		strings.HasPrefix(base, "id_ecdsa") || strings.HasPrefix(base, "id_dsa") ||
+		strings.HasPrefix(base, "credentials") {
+		return true
+	}
+	for _, suffix := range []string{".pem", ".key", ".p12", ".pfx", ".keystore", ".jks", ".ppk", ".kdbx"} {
+		if strings.HasSuffix(base, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkpointLocatorFromRow 把归属查询结果还原成项目定位信息。调用方必须先完成
+// tenant/user 校验，不能把客户端请求体里的设备身份直接带到 ensureProjectMirror。
+func checkpointLocatorFromRow(row map[string]interface{}) projectLocator {
+	return projectLocator{
+		ID:       stringOf(row["workspace_id"]),
+		Provider: stringOf(row["provider"]),
+		DeviceID: stringOf(row["device_id"]),
+		RootPath: stringOf(row["root_path"]),
+		RootKey:  stringOf(row["root_key"]),
+	}
+}
+
+// checkpointRootForLocator 返回检查点可使用的服务端 root。client 项目一定是镜像，
+// 设备 Windows 路径只保留在 locator 中供设备桥使用。
+func checkpointRootForLocator(ctx context.Context, claims *auth.Claims, loc projectLocator) (string, error) {
+	root, ok := projectRootFromLocator(claims, loc, loc.ID != "")
+	if !ok {
+		return "", errors.New("workspace has no usable root path")
+	}
+	if loc.Provider == smProviderClient {
+		mirror, err := ensureProjectMirror(ctx, smTenant(claims), claims.UserID, loc)
+		if err != nil {
+			return "", fmt.Errorf("project mirror unavailable: %w", err)
+		}
+		return mirror, nil
+	}
+	return root, nil
+}
+
 // ensureProjectMirror 建立（或复用）项目镜像，返回服务端本地根目录。
 func ensureProjectMirror(ctx context.Context, tenant, user string, loc projectLocator) (string, error) {
 	if loc.Provider != smProviderClient {
@@ -154,7 +221,7 @@ func ensureProjectMirror(ctx context.Context, tenant, user string, loc projectLo
 	skipped := 0
 	for _, ent := range walkResp.Entries {
 		rel, ok := safeMirrorRel(ent.Name)
-		if !ok || ent.IsDir {
+		if !ok || ent.IsDir || mirrorHasGitMetadata(rel) || mirrorHasSensitiveFile(rel) {
 			continue
 		}
 		abs := filepath.Join(loc.RootPath, filepath.FromSlash(rel))
@@ -206,7 +273,7 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 	if err != nil {
 		return nil // 没镜像过 / 清单缺失：没有可回写的内容
 	}
-	var conflicts []string
+	var conflicts, failures []string
 	changed := 0
 	seen := map[string]bool{}
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -225,7 +292,7 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
-		if !safeMirrorRelOk(rel) {
+		if !safeMirrorRelOk(rel) || mirrorHasGitMetadata(rel) {
 			return nil
 		}
 		seen[rel] = true
@@ -238,14 +305,33 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 			return nil
 		}
 		st, err := os.Stat(path)
-		if err != nil || st.Size() > mirrorMaxWriteFile {
+		if err != nil {
+			return nil
+		}
+		if st.Size() > mirrorMaxWriteFile {
+			// 静默跳过等于"agent 的修改凭空消失"：回写结果必须让用户看到失败，
+			// 否则他会在设备上打开一个旧文件，却以为这轮改动已经生效。
+			failures = append(failures, fmt.Sprintf("%s: exceeds %d bytes write-back limit", rel, mirrorMaxWriteFile))
 			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
+			failures = append(failures, rel+": "+err.Error())
 			return nil
 		}
 		abs := filepath.Join(loc.RootPath, filepath.FromSlash(rel))
+		// 新文件（基线里没有它）必须单独判冲突：设备 `write` 在 expected_hash 为空时
+		// 不做任何校验，直接落盘 —— 而"镜像里新增"恰恰发生在设备可能刚被用户新建了
+		// 同名文件的窗口里。先探一次 hash，存在就按冲突处理，绝不静默覆盖。
+		if !existed {
+			pre, preErr := deviceHubSingleton.Call(ctx, tenant, user, loc.DeviceID, deviceOpRequest{
+				Op: "hash", Root: loc.RootPath, Path: abs,
+			})
+			if preErr == nil && pre.Hash != "" {
+				conflicts = append(conflicts, rel)
+				return nil
+			}
+		}
 		resp, err := deviceHubSingleton.Call(ctx, tenant, user, loc.DeviceID, deviceOpRequest{
 			Op: "write", Root: loc.RootPath, Path: abs,
 			DataB64: base64.StdEncoding.EncodeToString(data), ExpectedHash: base,
@@ -255,16 +341,22 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 				conflicts = append(conflicts, rel)
 			} else {
 				slog.Warn("mirror write back failed", "project", loc.ID, "path", rel, "error", err)
+				failures = append(failures, rel+": "+err.Error())
 			}
 			return nil
 		}
+		// 基线必须是设备确认的新内容；设备没回 hash 时用本地算出的摘要兜底，
+		// 否则基线为空，下一轮回写就失去了冲突检测（静默覆盖）。
 		manifest[rel] = resp.Hash
+		if manifest[rel] == "" {
+			manifest[rel] = sum
+		}
 		changed++
 		return nil
 	})
 	// 删除同步：镜像里消失、且设备侧内容仍是基线 ⇒ 删除；设备侧已变 ⇒ conflict。
 	for rel, base := range manifest {
-		if seen[rel] {
+		if seen[rel] || mirrorHasGitMetadata(rel) {
 			continue
 		}
 		abs := filepath.Join(loc.RootPath, filepath.FromSlash(rel))
@@ -274,6 +366,7 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 		if hashErr != nil {
 			if !strings.Contains(strings.ToLower(hashErr.Error()), "not found") {
 				slog.Warn("mirror delete check failed", "project", loc.ID, "path", rel, "error", hashErr)
+				failures = append(failures, rel+": "+hashErr.Error())
 			}
 			continue
 		}
@@ -282,9 +375,14 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 			continue
 		}
 		if _, delErr := deviceHubSingleton.Call(ctx, tenant, user, loc.DeviceID, deviceOpRequest{
-			Op: "remove", Root: loc.RootPath, Path: abs,
+			Op: "remove", Root: loc.RootPath, Path: abs, ExpectedHash: base,
 		}); delErr != nil {
-			slog.Warn("mirror delete failed", "project", loc.ID, "path", rel, "error", delErr)
+			if strings.Contains(delErr.Error(), "conflict") {
+				conflicts = append(conflicts, rel)
+			} else {
+				slog.Warn("mirror delete failed", "project", loc.ID, "path", rel, "error", delErr)
+				failures = append(failures, rel+": "+delErr.Error())
+			}
 			continue
 		}
 		delete(manifest, rel)
@@ -302,6 +400,9 @@ func syncProjectMirrorBack(ctx context.Context, tenant, user string, loc project
 		db.AuditLog(ctx, user, parseTenantID(tenant), "device_write_synced",
 			"/v1/session-map/projects/"+loc.ID+"/device-write",
 			fmt.Sprintf("files=%d conflicts=%d", changed, len(conflicts)), "", nil)
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("project_mirror_sync_failed: %s", strings.Join(failures, "; "))
 	}
 	if len(conflicts) > 0 {
 		return fmt.Errorf("project_mirror_conflict: %s", strings.Join(conflicts, ", "))

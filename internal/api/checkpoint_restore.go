@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
@@ -55,8 +57,15 @@ func CheckpointRestoreHandler(python *engine.PythonClient) http.HandlerFunc {
 		// 任何"创建时没有 user_id"的检查点都会被判成不存在 —— 用户看到的是
 		// "还原点列得出来，但点了回滚报 not found"。
 		owned, err := db.GlobalDBManager.FetchOne(r.Context(),
-			`SELECT id, state, COALESCE(session_id,'') AS session_id FROM project_checkpoints
-			  WHERE id = $1 AND tenant_id = $2 AND COALESCE(user_id,'') = $3`,
+			`SELECT c.id, c.state, COALESCE(c.session_id,'') AS session_id,
+			        COALESCE(c.workspace_id,'') AS workspace_id,
+			        COALESCE(w.provider,'server') AS provider,
+			        COALESCE(w.device_id,'') AS device_id,
+			        COALESCE(w.root_path,'') AS root_path,
+			        COALESCE(w.root_key,'') AS root_key
+			   FROM project_checkpoints c
+			   LEFT JOIN session_map_workspaces w ON w.id = c.workspace_id AND w.tenant_id = c.tenant_id
+			  WHERE c.id = $1 AND c.tenant_id = $2 AND COALESCE(c.user_id,'') = $3`,
 			cid, smTenant(claims), claims.UserID)
 		if err != nil {
 			slog.Error("checkpoint restore: ownership lookup failed", "error", err, "id", cid)
@@ -78,8 +87,24 @@ func CheckpointRestoreHandler(python *engine.PythonClient) http.HandlerFunc {
 			return
 		}
 
+		loc := checkpointLocatorFromRow(owned)
+		if loc.Provider == smProviderClient && !deviceWriteAllowed(r.Context(), loc.ID) {
+			JSONWithCode(w, http.StatusForbidden, "device_write_required", nil,
+				"grant write access to this project before restoring a checkpoint")
+			return
+		}
+		root, err := checkpointRootForLocator(r.Context(), claims, loc)
+		if err != nil {
+			JSONWithCode(w, http.StatusConflict, "checkpoint_root_unavailable", nil, err.Error())
+			return
+		}
+
 		// 只转发白名单字段：调用方不该能用请求体改 checkpoint_id 以外的任何身份信息。
+		// client 项目的 root 只能由网关按归属查询结果解析为服务端镜像。
 		forward := map[string]interface{}{"checkpoint_id": cid}
+		if loc.Provider == smProviderClient {
+			forward["root"] = root
+		}
 		if v, ok := body["allow_delete"]; ok {
 			forward["allow_delete"] = v
 		}
@@ -99,10 +124,19 @@ func CheckpointRestoreHandler(python *engine.PythonClient) http.HandlerFunc {
 			})
 			return
 		}
-		// client 项目：引擎回滚写的是服务端镜像；回滚成功后必须立刻把差异回写设备，
-		// 否则用户看到"回滚成功"，本机文件却没变（下一次回合才同步）。
-		if sid := stringOf(owned["session_id"]); sid != "" {
-			syncProjectMirrorForSession(r.Context(), sid)
+		// client 项目：引擎回滚写的是服务端镜像；成功后按既有 ExpectedHash 语义
+		// 立刻回写。冲突必须显式返回，不能把"镜像已恢复、设备未改"报成完整成功。
+		if loc.Provider == smProviderClient {
+			if ok, _ := result["ok"].(bool); ok {
+				// 回写用**独立**上下文：用户点完回滚就切走页面时请求 ctx 会被取消，
+				// 那会让镜像已经恢复、设备却停在半路（下一次回合还会以旧为基线）。
+				sctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+				defer cancel()
+				if err := syncProjectMirrorBack(sctx, smTenant(claims), claims.UserID, loc); err != nil {
+					JSONWithCode(w, http.StatusConflict, "checkpoint_sync_failed", nil, err.Error())
+					return
+				}
+			}
 		}
 		OK(w, result)
 	}

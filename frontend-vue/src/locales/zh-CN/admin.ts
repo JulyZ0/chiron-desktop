@@ -5,7 +5,16 @@
  * 会原样返回 key 并跳过插值，界面上就会显示成 `{name}（已配置 Key）`。
  */
 export default {
+  table_label: '数据表格',
   providers: {
+    page_title: '服务商管理',
+    page_desc: '统一管理模型服务商、访问密钥、端点与流量权重。',
+    col_provider: '服务商',
+    col_key: '密钥',
+    api_key: 'API Key',
+    base_url: 'Base URL',
+    empty: '暂无服务商密钥',
+    empty_hint: '添加服务商密钥后，可在此管理状态、端点与流量权重。',
     /** {name} = provider 名称 */
     configuredName: '{name}（已配置 Key）',
   },
@@ -425,6 +434,7 @@ export default {
   share_col_actions: "操作",
   share_revoke: "撤销分享",
   share_empty: "当前没有有效分享",
+  share_no_results: "没有符合搜索条件的分享，请调整关键词或清空搜索",
   share_untitled: "（无标题会话）",
   share_load_failed: "读取分享列表失败",
   share_revoke_failed: "撤销分享失败",
@@ -465,6 +475,9 @@ export default {
     status_disabled: "已禁用",
     status_deleted: "已删除",
     never: "从未登录",
+    empty: "暂无团队成员",
+    empty_hint: "点击“新建用户”创建第一个团队账号。",
+    load_failed: "读取用户列表失败",
     create_title: "新建用户",
     email: "邮箱",
     username: "用户名",

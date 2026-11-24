@@ -4,6 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { Alert, Button, Card, InputNumber, RadioButton, RadioGroup, Switch, Tag } from 'ant-design-vue'
 
 import AdminTabbedView from '@/components/admin/AdminTabbedView.vue'
+import AdminPage from '@/components/admin/AdminPage.vue'
 import DashboardView from './DashboardView.vue'
 import Sparkline from '@/components/admin/Sparkline.vue'
 import PerformancePanel from '@/components/admin/monitor/PerformancePanel.vue'
@@ -141,8 +142,8 @@ function rangeLabel(r: MonitorWindow): string {
 </script>
 
 <template>
-  <div
-    class="monitor-view"
+  <AdminPage
+    :title="t('admin.runtime_monitoring')"
     data-test="monitor-view"
   >
     <div
@@ -409,12 +410,10 @@ function rangeLabel(r: MonitorWindow): string {
       default-tab="performance"
       :tabs="tabs"
     />
-  </div>
+  </AdminPage>
 </template>
 
 <style scoped>
-.monitor-view { padding: 0 4px; }
-
 .monitor-toolbar {
   display: flex;
   flex-wrap: wrap;

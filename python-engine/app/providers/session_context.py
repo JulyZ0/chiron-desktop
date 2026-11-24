@@ -14,15 +14,25 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 
 #: 当前请求所属的会话标识（空串 = 未知，此时不注入该头，行为与不带头的旧版本一致）
 _llm_session_id: ContextVar[str] = ContextVar("chiron_llm_session_id", default="")
 
 
-def set_llm_session_id(value: str) -> None:
-    """由 AgentRuntime 在开始一次运行前设置（task.session_id 优先，缺省用 task.id）。"""
-    _llm_session_id.set(str(value or ""))
+def set_llm_session_id(value: str) -> Token[str]:
+    """设置当前请求会话 ID，并返回供 finally 精确复位的 token。
+
+    AgentRuntime 用 task.session_id（缺省 task.id）；quick/auto 路由用会话 ID
+    （缺省 task.id）。调用方若持有 token，必须在请求结束时 reset，避免复用长生命周期
+    执行上下文时把上一请求的会话标识带给下一请求。
+    """
+    return _llm_session_id.set(str(value or ""))
+
+
+def reset_llm_session_id(token: Token[str]) -> None:
+    """恢复 set_llm_session_id 之前的 ContextVar 值。"""
+    _llm_session_id.reset(token)
 
 
 def get_llm_session_id() -> str:
