@@ -66,12 +66,29 @@ export async function authGuard(
   // admin 访问（或还没有 user）时向后端拉取权威身份。
   // fetchProfile 内部失败会登出；此处不抛错，继续按现有本地态降级判定。
   // meta.public 的页面不需要登录态，跳过拉取（如分享页）。
-  if (to.meta.requiresAdmin || (!auth.user && !to.meta.public)) {
+  //
+  // H68：守卫的每个结论都属于**某一次认证**，而 `initToken` / `fetchProfile` 都是异步的。
+  // 期间用户登出并以另一个账号登录时，用 A 的 role 给 B 放行（或把 B 当游客弹回登录页）
+  // 都是错的。所以抓一份代次，任何身份写回之后都比对一次；不一致就按当前账号重取一次。
+  let fence = auth.generation
+  const refreshIdentity = async () => {
     try {
       await auth.fetchProfile()
     } catch {
       /* fetchProfile 已内部登出 */
     }
+    if (auth.generation === fence) return
+    // 拉取期间换过账号：刚拿到的判定依据作废，用当前账号再取一次（只补一次，
+    // 反复抖动时交给下面的"仍在切换中"分支处理，绝不用旧账号的身份做导航决定）。
+    fence = auth.generation
+    try {
+      await auth.fetchProfile()
+    } catch {
+      /* 同上 */
+    }
+  }
+  if (to.meta.requiresAdmin || (!auth.user && !to.meta.public)) {
+    await refreshIdentity()
   }
 
   // 登录页：已登录则直接回到目标页（或首页），避免登录后点浏览器后退又停在表单上。
@@ -96,6 +113,20 @@ export async function authGuard(
   ) {
     next('/change-password')
     return
+  }
+
+  // H68：写回（导航决定）之前最后比对一次代次。
+  // 到这一步已经按更便宜的顺序做过判定，期间的登录/登出切换会让那些依据整体作废：
+  // 此时用**当前**账号再确认一次身份；如果仍在切换中，就退回一个与身份无关的落地页，
+  // 而不是拿旧账号的结论去导航（那会把新账号弹去登录页，或把 A 的 role 当成 B 的）。
+  if (auth.generation !== fence) {
+    fence = auth.generation
+    await refreshIdentity()
+    if (auth.generation !== fence) {
+      if (to.meta.public) next()
+      else next('/')
+      return
+    }
   }
 
   if (to.meta.requiresAuth && !auth.isAuthenticated) {
