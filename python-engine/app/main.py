@@ -22,6 +22,13 @@ from app.deps import (
     verify_sandbox_backend,
     verify_sandbox_root,
 )
+
+# run 所有权围栏：`agent_submit` 里 `activate_run_fence/deactivate_run_fence` 是**模块级**
+# 使用点（SSE 生成器的开头与 finally 都要用）。此前只在 `_pump_runtime` 内部局部导入，
+# 于是这两个名字在 `agent_submit` 作用域里根本不存在 —— 只要带了 session_id（几乎总是）
+# 就会在建连后的第一行抛 NameError，把整轮 run 打断（H8：围栏必须真正生效，而不是
+# 因为名字解析失败而根本没启用）。
+from app.run_registry import activate_run_fence, deactivate_run_fence
 from app.session_store import SessionStore
 
 if TYPE_CHECKING:
