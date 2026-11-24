@@ -5,9 +5,10 @@ import { MenuOutlined, CopyOutlined, LinkOutlined, CloseOutlined } from '@ant-de
 import {
   api, createSSEConnection, submitApproval, submitAnswer, steerRun,
   getChatSessionMessages, resolveMediaUrl, listModels,
-  createAgent,
+  createAgent, interruptAgentRun,
 } from '../api'
 import type { LlmModel, SSEHandle } from '../api'
+import { requestTurnStop, type TurnRef, type TurnStopState } from '../composables/useTurnStop'
 import { getSessionMetrics, getSessionRuntime, putSessionRuntime, type SessionRuntime } from '../api/sessionRuntime'
 import { getProjectVcs, initProjectVcs } from '../api/projectVcs'
 import { listPersonas, type Persona } from '../api/personas'
@@ -499,6 +500,15 @@ interface SessionRunState {
    * 「已答复，下一次发送即从暂停处继续」。记在这里，本轮收尾后补一次唤醒。
    */
   pendingInboxWake?: boolean
+  /**
+   * 这一轮 run 的现场（H58）：`sessionId` + 提交时的 `client_msg_id`。
+   *
+   * 为什么必须**捕获**而不是在停止时现取：用户按下停止前往往已经切走了会话，
+   * 而取消要打到**发出这一轮**的会话上，不是此刻正在看的那个。
+   */
+  turn?: TurnRef
+  /** 停止请求的现场（H58）：`stopping` = 已下发、等确认；`failed` = 未确认、可重试 */
+  stop?: TurnStopState
 }
 
 /**
@@ -2759,14 +2769,19 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
         onLastEventId: (id) => { sseLastIdBySession.set(sessionId, id) },
       },
     )
+    const clientMsgId = crypto.randomUUID()
     const body: Record<string, unknown> = {
       content: text,
       session_id: sessionId,
       // 发送侧幂等：同一条消息最多被引擎执行一次（服务端用 Redis SETNX 做 5 分钟去重）。
       // 必须由**客户端**生成 —— 只有客户端知道"这两次提交是同一条消息"：
       // 网络重试或用户重发时这个 ID 不变，服务端据此判定"已在处理"而不再重复触发引擎。
-      llm_config: { ...buildLlmConfig(), client_msg_id: crypto.randomUUID() },
+      llm_config: { ...buildLlmConfig(), client_msg_id: clientMsgId },
     }
+    // H58：记下"这一轮"的现场。停止必须打到这个会话，而不是用户按下停止时
+    // 恰好停在的那个会话（切会话不该改变取消的目标）。
+    runOf(sessionId).turn = { sessionId, clientMsgId }
+    runOf(sessionId).stop = undefined
     const ctx = buildContext()
     if (ctx) body.context = ctx
     const resolvedAtts = await resolveAttachmentUrls(attachments)
@@ -2783,6 +2798,9 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
     loading.value = false
     stopTurnTimer()
     flushStreamingFlags()
+    // 这一轮根本没送达：清掉现场，别让"停止"打到一个不存在的 run 上。
+    runOf(sessionId).turn = undefined
+    runOf(sessionId).stop = undefined
     const reason = describeApiError(e)
     // meta 必须一起带上：少了 code/retry_after_seconds，错误块就退化成"只有一句重试"，
     // 余额不足拿不到"去充值"、限流拿不到"等 N 秒"—— 正是 P0-2 要修的那条裂缝。
@@ -2910,17 +2928,36 @@ async function onSteer(text: string): Promise<void> {
 }
 
 function stopGeneration() {
-  stopTurnTimer()
-  if (activeSSE) { activeSSE.close(); activeSSE = null }
-  loading.value = false
-  flushStreamingFlags()
-  // 用户喊停是明确说"别再跑了"：这里**不能**补发待办唤醒，否则按下停止后
-  // 又会自动发一条「请继续」，看起来像按钮失灵。
-  clearPendingInboxWake()
-  const last = items.value[items.value.length - 1]
-  if (last && last.kind === 'text' && last.role === 'assistant') {
-    last.stopped = true
-  }
+  return requestTurnStop({
+    activeSessionId: () => activeSessionId.value,
+    turnOf: (sid) => runOf(sid).turn,
+    stopOf: (sid) => runOf(sid).stop,
+    setStop: (sid, stop) => { runOf(sid).stop = stop },
+    clearTurn: (sid) => { runOf(sid).turn = undefined },
+    // H58：取消真正打到后端（网关按 session 从 run 亲和路由里补 run_token，
+    // 见 internal/api/submit_handler.go::SubmitInterrupt）。返回 true = 服务端确认。
+    interrupt: (sessionId) => interruptAgentRun(sessionId),
+    onStopped: (sid) => {
+      const run = runOf(sid)
+      stopTurnTimer()
+      // 只关**这个会话**的流：用户可能已经切到别的会话上（那边不该被牵连）
+      if (sid === activeSessionId.value && activeSSE) { activeSSE.close(); activeSSE = null }
+      run.loading = false
+      withRun(run, () => flushStreamingFlags())
+      // 用户喊停是明确说"别再跑了"：这里**不能**补发待办唤醒，否则按下停止后
+      // 又会自动发一条「请继续」，看起来像按钮失灵。
+      run.pendingInboxWake = false
+      const last = run.items[run.items.length - 1]
+      if (last && last.kind === 'text' && last.role === 'assistant') {
+        last.stopped = true
+      }
+    },
+    // 未确认：保持 loading / 不给消息打 stopped —— run 可能还在跑。
+    // 用户再点一次停止就是重试（`failed` 状态允许重入）。
+    onFailed: () => {
+      notify.warning(t('errors.request_failed'))
+    },
+  })
 }
 
 // 继续生成（停止后）

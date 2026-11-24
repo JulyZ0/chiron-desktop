@@ -99,6 +99,11 @@ const apiMocks = vi.hoisted(() => {
       { provider: 'test-provider', name: 'test-model', display_name: 'Test Model', context_window: 8192 },
     ])),
     createAgent: vi.fn(emptyList),
+    // H58：「停止生成」现在真的打 `POST /v1/agent/interrupt`。这是**生产依赖**，
+    // 必须在这里给一个桩 —— 真实的 `interruptAgentRun` 走 api/index.ts 内的
+    // axios 实例（本文件的 `apiMocks.api` 替不到它），在 jsdom 里必然 reject，
+    // 于是停止永远"未确认"，用例会看到 loading 仍为 true。
+    interruptAgentRun: vi.fn(() => Promise.resolve(true)),
   }
 })
 
@@ -286,6 +291,11 @@ describe('ChatView 交互级：提交 → SSE 帧 → transcript', () => {
     expect(vm.loading).toBe(true)
 
     wrapper.findComponent(ChatInput).vm.$emit('stop')
+    // H58 之后"停止"是一次**需要服务端确认**的请求（真正打到
+    // `POST /v1/agent/interrupt`），因此收尾至少要多等一个微任务：
+    // 旧断言在这一步之后立刻检查 loading，等于要求"发出即算停止" ——
+    // 那正是本次要消灭的形态（run 还在跑，界面却已宣布停手）。
+    await flushPromises()
     await flushPromises()
 
     expect(vm.loading).toBe(false)
