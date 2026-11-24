@@ -97,6 +97,7 @@ export default {
   account_settings: "Account settings",
   verification_failed: "Verification failed",
   captcha_component_failed_to_load_check_your_network_and_refresh_to_retry: "Captcha component failed to load; check your network and refresh to retry",
+  captcha_provider_not_enabled: "This deployment has not enabled {provider}: enable it in VITE_CAPTCHA_PROVIDERS and allow its CSP origins (script/frame/connect)",
   verification_component_failed_to_load_refresh_to_retry: "Verification component failed to load; refresh to retry",
   '2_account_responsibility': "2. Account responsibility.",
   '6_digit_verification_code': "6-digit verification code",

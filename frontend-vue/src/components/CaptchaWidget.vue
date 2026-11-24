@@ -9,9 +9,19 @@
  *
  * 验证成功后 emit('verified', { token, randstr })；
  * 提交失败后由父组件调用 reset() 重置。
+ *
+ * **启用开关与 CSP 一致性（PRD H74）**：只有部署方在 `VITE_CAPTCHA_PROVIDERS` 里
+ * 声明启用的 provider 才会加载脚本 —— 未启用时**一个第三方请求都不发**（不插
+ * `<script>`、不建 iframe），而不是"先加载再看 CSP 拦不拦"。脚本 URL 与需要放行的
+ * 域名都来自 `utils/captchaProviders.ts`（唯一事实来源），部署侧
+ * `security-headers.conf` 的 CSP 与它逐源一致（由 spec 强制）。
  */
 import { ref, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import {
+  CAPTCHA_PROVIDERS,
+  isCaptchaProviderEnabled,
+} from '../utils/captchaProviders'
 
 const props = defineProps<{
   provider: string
@@ -135,14 +145,29 @@ function waitFor<T>(getter: () => T | undefined, timeoutMs = 8000): Promise<T> {
 
 let widgetId: CaptchaWidgetId | null = null
 
+/** 该 provider 的官方脚本地址（白名单里的唯一一条；未知 provider 抛错由调用方兜底） */
+function providerScriptUrl(provider: string): string {
+  const spec = CAPTCHA_PROVIDERS[provider]
+  const url = spec?.scriptUrls[0]
+  if (!url) throw new Error(`no script url for captcha provider: ${provider}`)
+  return url
+}
+
 async function renderWidget() {
   if (!container.value) return
+  // 部署方没启用这个 provider：不加载任何第三方脚本，直接如实报出来。
+  // 顺序很重要 —— 先判启用、再 `loadScript`，否则"加载了但被 CSP 拦住"会成为
+  // 最难查的那类线上问题（控制台只有一条 CSP violation）。
+  if (!isCaptchaProviderEnabled(props.provider)) {
+    loadError.value = t('auth.captcha_provider_not_enabled', { provider: providerLabel.value })
+    return
+  }
   loading.value = true
   loadError.value = ''
   try {
     switch (props.provider) {
       case 'turnstile': {
-        await loadScript('https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit')
+        await loadScript(providerScriptUrl('turnstile'))
         const ts = await waitFor<CaptchaRenderer>(() => captchaGlobal().turnstile)
         widgetId = ts.render(container.value, {
           sitekey: props.siteKey,
@@ -153,7 +178,7 @@ async function renderWidget() {
         break
       }
       case 'recaptcha': {
-        await loadScript('https://www.google.com/recaptcha/api.js?render=explicit')
+        await loadScript(providerScriptUrl('recaptcha'))
         const g = await waitFor<CaptchaRenderer>(() => {
           const g = captchaGlobal().grecaptcha
           return g?.render ? g : undefined
@@ -166,7 +191,7 @@ async function renderWidget() {
         break
       }
       case 'hcaptcha': {
-        await loadScript('https://js.hcaptcha.com/1/api.js?render=explicit')
+        await loadScript(providerScriptUrl('hcaptcha'))
         const h = await waitFor<CaptchaRenderer>(() => captchaGlobal().hcaptcha)
         widgetId = h.render(container.value, {
           sitekey: props.siteKey,
@@ -176,7 +201,7 @@ async function renderWidget() {
         break
       }
       case 'tencent': {
-        await loadScript('https://ssl.captcha.qq.com/TCaptcha.js')
+        await loadScript(providerScriptUrl('tencent'))
         const TC = await waitFor<TencentCaptchaCtor>(() => captchaGlobal().TencentCaptcha)
         // 弹出式：点击按钮时 show() 触发
         tencentCaptcha.value = new TC(props.siteKey, (res: TencentCaptchaResult) => {
