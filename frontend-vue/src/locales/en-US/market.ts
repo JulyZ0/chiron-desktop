@@ -38,6 +38,25 @@ export default {
   installed_badge: 'Installed',
   installed_disabled_badge: 'Installed (disabled)',
 
+  enable: 'Enable',
+  disable: 'Disable',
+  enable_confirm_title: 'Enable “{name}”?',
+  enable_confirm_hint:
+    'Enabling re-verifies the content (external items re-fetch the manifest and check its digest and signature) and checks the required authorization. Only then will this content be injected, executed or connected.',
+  disable_confirm_title: 'Disable “{name}”?',
+  disable_confirm_hint: 'Disabling takes effect immediately and also revokes the related authorization. Re-enable and re-authorize when needed.',
+  enable_success: 'Enabled “{name}”',
+  disable_success: 'Disabled “{name}”',
+  quarantine_hint: 'Installed but not enabled: it is not injected, executed or connected yet. Review the source and permissions, then enable it.',
+
+  permission: {
+    env: 'Requires env vars: {keys}',
+    model: 'Requires a usable model',
+    approval: 'Needs per-plugin approval on the plugins page',
+    command: 'Runs an MCP command locally',
+    none: 'No extra permission required',
+  },
+
   install: 'Install',
   installing: 'Installing…',
   install_confirm_title: 'Install “{name}”?',
@@ -56,6 +75,7 @@ export default {
     author: 'Author',
     homepage: 'Homepage',
     manifest_url: 'Manifest URL',
+    permissions_label: 'Source & permissions',
     requires_model: 'This item needs a configured model',
     requires_approval: 'It still needs approval on the plugins page before it can run',
     requires_env: 'Required environment variables',
@@ -94,6 +114,9 @@ export default {
     user_sources_forbidden: 'This deployment does not allow adding market sources',
     source_limit_reached: 'The market source limit has been reached — remove one first',
     conflict: 'Conflict: this source already exists',
+    enable_denied: 'Cannot enable yet: external sources may be off, or this content is not yet authorized on the plugins page',
+    enable_conflict: 'This kind does not support in-place updates — uninstall and reinstall it',
+    integrity_failed: 'The content failed its integrity check (digest or signature mismatch); install/enable was rejected',
     request_failed: 'Market request failed, please try again later',
   },
 }

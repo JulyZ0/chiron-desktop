@@ -108,6 +108,10 @@ class SkillInstallRequest(BaseModel):
     #: H5：是否**强制**要求摘要。网关路径恒为 true（外部内容必须带摘要），
     #: 缺摘要直接拒绝且不落盘；老调用方缺省 false，行为与引入前完全一致。
     integrity_required: bool = False
+    #: H75：是否**惰性安装**（`enabled=false` + `auto_inject=false`）。
+    #: 市场安装流水线对外部内容恒传 true：装完不注入、不可运行，等用户显式启用。
+    #: 老调用方缺省 false，行为与引入前完全一致。
+    inert: bool = False
 
 
 def _verify_inline_integrity(raw: bytes, req: "SkillInstallRequest") -> None:
@@ -254,6 +258,12 @@ async def install_skill(
         metadata=metadata,
         origin=origin,
     )
+    if body.inert:
+        # H75：外部内容装完**不注入、不执行**。两个开关一起关 ——
+        # 只关 enabled 会让它继续占每轮 system 上下文，只关 auto_inject 会让它"看着装了却跑不了"，
+        # 两种半开状态都让"未启用"这件事说不清。
+        skill.enabled = False
+        skill.auto_inject = False
     _save_skill(store, skill)
     payload = skill.to_dict()
     payload["source"] = store.write_scope
@@ -261,6 +271,8 @@ async def install_skill(
         "skill": payload,
         "message": f"Skill '{skill.name}' installed",
         "scope": store.write_scope,
+        # 让调用方（市场页）能明确提示"装了但未启用"，而不是只看到安装成功。
+        "enabled": skill.enabled,
     }
 
 
@@ -338,6 +350,10 @@ async def delete_skill(
 
 class SkillToggleRequest(BaseModel):
     enabled: bool = True
+    #: H75：启用/停用同时切注入策略（市场启用是"让这条内容真正可用"，
+    #: 不是只把它从列表里去掉 disabled 标记）。缺省 None = 不动 injection 策略 ——
+    #: 既有的 PUT /v1/skills/{name} 调用方行为完全不变。
+    auto_inject: bool | None = None
 
 
 class SkillMetaRequest(BaseModel):
@@ -460,6 +476,9 @@ async def toggle_skill(
 
     命中的技能可能来自租户/全局共享层；回写时落在 user 私有目录形成“本地覆盖”
     （仅影响当前用户，团队共享技能可被成员本地停用）。
+
+    `auto_inject` 非 nil 时一起写回（H75：市场启用 = 可用 + 进注入）。为 nil 表示
+    只切 `enabled` —— 既有调用方的行为与引入该字段前完全一致。
     """
     store = _store_for(user_id, tenant_id)
 
@@ -468,6 +487,8 @@ async def toggle_skill(
     if not skill:
         raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
     skill.enabled = body.enabled
+    if body.auto_inject is not None:
+        skill.auto_inject = bool(body.auto_inject)
     _save_skill(store, skill)
     return {
         "skill": _skill_payload(skill),

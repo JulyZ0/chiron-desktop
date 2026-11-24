@@ -78,6 +78,18 @@ type Updater interface {
 	Update(ctx context.Context, item Item, ref map[string]any) (newRef map[string]any, err error)
 }
 
+// Enabler 是**可选**落点能力：启用/停用一个已安装内容（H75）。
+//
+// 语义分两层，实现方都要做到：
+//   - 启用（enabled=true）：让内容真的可被执行/被注入（agent.enabled、插件 active+approved、
+//     技能 enabled+auto_inject）；
+//   - 停用（enabled=false）：**立即**失效（插件的旧授权一并作废），不是只改市场页的徽标。
+//
+// 未实现该接口的落点（例如 knowledge：它没有"执行"这回事）不报错，编排层只更新记录。
+type Enabler interface {
+	SetEnabled(ctx context.Context, item Item, ref map[string]any, enabled bool) error
+}
+
 // InstallOptions 是安装策略开关（来自环境变量，见 config.Config 的 MARKET_* ）。
 type InstallOptions struct {
 	// AllowRemoteMCP 决定**外部源**的 mcp 条目能否安装（MARKET_ALLOW_REMOTE_MCP）。
@@ -89,7 +101,20 @@ type InstallOptions struct {
 	// 为 nil 表示"不校验"：只有内置目录、没有外部源的部署形态才是合法的 nil
 	// （生产路径由 api 层无条件注入，见 market_install.go 的 NewMarketInstallHandler）。
 	Verifier Verifier
+	// EnableCheck 是「启用前的额外授权检查」（H75）。
+	//
+	// 为什么需要它：mcp 条目的执行资格由**插件页的逐条授权 + 用户级总开关**决定，
+	// 而那两样都不在本包里（本包不认识 plugins.json）。把它做成钩子而不是让 api
+	// 层在调用前自己检查，是为了让"启用"这条路径**不可能**绕过检查 —— 检查在落点
+	// 动作之前、在编排流程内部。
+	EnableCheck EnableCheck
 }
+
+// EnableCheck 是启用前的授权检查（返回错误即拒绝启用）。
+//
+// item 是**目录里的当前条目**（外部条目带 manifest_url/sha256/signature），
+// ref 是安装记录的落点引用（拿插件名、agent_id 用）。
+type EnableCheck func(ctx context.Context, item Item, ref map[string]any) error
 
 // 安装链路上的稳定错误。HTTP 层按 errors.Is 映射状态码。
 var (
@@ -105,6 +130,11 @@ var (
 	ErrUpdateUnavailable = errors.New("installer does not support in-place update")
 	// ErrNotInstalled 表示要操作（启用/停用/更新）的条目本机没装过。
 	ErrNotInstalled = errors.New("market item is not installed")
+	// ErrEnableDenied 表示启用前的授权检查未通过（H75：内容还不能执行）。
+	//
+	// 与「参数错误」区分开：用户没做错什么，只是**还差一步授权**
+	// （例如 mcp 插件还没有在插件页被逐条确认），HTTP 层据此给 403 + 可操作原因。
+	ErrEnableDenied = errors.New("market content is not authorized to run yet")
 )
 
 // Result 是一次安装的结果。字段与前端契约一一对应（见 market_install.go 的响应体）。
@@ -323,6 +353,107 @@ func (s *InstallService) Uninstall(ctx context.Context, tenantID, userID, source
 			"kind", string(k), "source", source, "id", id)
 	}
 	return s.store.Delete(ctx, tenantID, userID, source, k, id)
+}
+
+// SetEnabled 启用/停用一个**已安装**条目（H75：显式信任才算可用）。
+//
+// 启用路径上依次做三件事，任一失败即拒绝（记录与落点都保持原状）：
+//
+//  1. **H5 完整性复验**：外部条目的 manifest 会被重新抓取、重新比对 sha256 与签名。
+//     发布方撤下内容、摘要变化、签名失效都会在这里被拦住 —— "装的时候是好的"
+//     不能当作"永远可信"；
+//  2. **H24 授权检查**（通过 EnableCheck 钩子，目前用于 mcp 的插件逐条授权与用户
+//     总开关）：内容可执行 ≠ 用户已经批准它执行；
+//  3. 落点启停（Enabler）：插件改成 active、agent.enabled=true、技能 enabled 等。
+//
+// 停用路径**不做**复验：撤销必须是随时可用的，不能因为"现在抓不到 manifest"
+// 就把用户卡在一个已经启用、又关不掉的状态里。
+func (s *InstallService) SetEnabled(ctx context.Context, tenantID, userID string, item Item, enabled bool) (Result, error) {
+	k, err := ParseKind(string(item.Kind))
+	if err != nil {
+		return Result{}, installKeyError("%v", err)
+	}
+	if item.Source == "" || item.ID == "" {
+		return Result{}, installKeyError("source and id are required")
+	}
+	if s.store == nil {
+		return Result{}, errors.New("install store unavailable")
+	}
+
+	probe := InstalledRecord{Source: item.Source, Kind: k, MarketID: item.ID}
+	existing, found, err := s.store.Get(ctx, tenantID, userID, probe)
+	if err != nil {
+		return Result{}, err
+	}
+	if !found {
+		return Result{}, fmt.Errorf("%w: %s/%s", ErrNotInstalled, item.Source, item.ID)
+	}
+	if existing.Enabled == enabled {
+		// 幂等：重复启用/停用不重复触发落点动作（插件页可能已手工改过状态）。
+		return Result{
+			Source:           existing.Source,
+			Kind:             existing.Kind,
+			ID:               existing.MarketID,
+			Ref:              nonNilRef(existing.Ref),
+			Enabled:          existing.Enabled,
+			RequiresApproval: requiresApproval(item, item.Source != SourceBuiltin),
+		}, nil
+	}
+
+	external := item.Source != SourceBuiltin
+	ref := nonNilRef(existing.Ref)
+	item.Kind, item.Source, item.ID = k, existing.Source, existing.MarketID
+
+	if enabled {
+		item, ref, err = s.prepareEnable(ctx, item, ref, external)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+
+	// 外部 mcp 的策略闸与安装口径一致：没打开 MARKET_ALLOW_REMOTE_MCP 就不允许启用。
+	if enabled && k == KindMCP && external && !s.opts.AllowRemoteMCP {
+		return Result{}, ErrRemoteMCPForbidden
+	}
+
+	if inst, ok := s.installers[k]; ok {
+		if en, ok := inst.(Enabler); ok {
+			if err := en.SetEnabled(ctx, item, ref, enabled); err != nil {
+				return Result{}, err
+			}
+		}
+	}
+
+	existing.Enabled = enabled
+	existing.Ref = ref
+	if err := s.store.Upsert(ctx, tenantID, userID, existing); err != nil {
+		return Result{}, err
+	}
+	return Result{
+		Source:           existing.Source,
+		Kind:             existing.Kind,
+		ID:               existing.MarketID,
+		Ref:              ref,
+		Enabled:          enabled,
+		RequiresApproval: requiresApproval(item, external),
+	}, nil
+}
+
+// prepareEnable 在**启用前**做完整性复验与授权检查，返回刷新后的 item/ref。
+func (s *InstallService) prepareEnable(ctx context.Context, item Item, ref map[string]any, external bool) (Item, map[string]any, error) {
+	if external && s.opts.Verifier != nil {
+		verified, verification, err := s.opts.Verifier.Verify(ctx, item)
+		if err != nil {
+			return item, ref, err
+		}
+		item, ref = verified, mergeVerification(ref, verification)
+	}
+	if s.opts.EnableCheck != nil {
+		if err := s.opts.EnableCheck(ctx, item, ref); err != nil {
+			return item, ref, err
+		}
+	}
+	return item, ref, nil
 }
 
 // List 返回当前用户已安装的记录（kind 为空表示全部）。

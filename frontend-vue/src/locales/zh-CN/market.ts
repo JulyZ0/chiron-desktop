@@ -44,6 +44,27 @@ export default {
   installed_badge: '已安装',
   installed_disabled_badge: '已安装（未启用）',
 
+  // 启用 / 停用（H75：装完 inert，显式信任才可用）
+  enable: '启用',
+  disable: '停用',
+  enable_confirm_title: '启用「{name}」？',
+  enable_confirm_hint:
+    '启用后会重新校验内容完整性（外部条目会重新抓取清单并核对摘要与签名），并检查所需授权；通过后这条内容才会被注入、执行或连接。',
+  disable_confirm_title: '停用「{name}」？',
+  disable_confirm_hint: '停用立即生效：相关授权会一并撤回，需要时再重新启用并授权。',
+  enable_success: '已启用「{name}」',
+  disable_success: '已停用「{name}」',
+  quarantine_hint: '已安装但未启用：目前不会被注入、执行或连接。确认来源与权限需求后再启用。',
+
+  // 权限需求摘要（详情抽屉）
+  permission: {
+    env: '需要环境变量：{keys}',
+    model: '需要可用模型',
+    approval: '需要在插件页逐条授权',
+    command: '会在本机执行 MCP 命令',
+    none: '无需额外权限',
+  },
+
   install: '安装',
   installing: '安装中…',
   install_confirm_title: '确认安装「{name}」？',
@@ -62,6 +83,7 @@ export default {
     author: '作者',
     homepage: '主页',
     manifest_url: '清单地址',
+    permissions_label: '来源与权限需求',
     requires_model: '该条目需要已配置可用的模型',
     requires_approval: '安装后仍需在插件页授权才能真正执行',
     requires_env: '需要填写的环境变量',
@@ -101,6 +123,9 @@ export default {
     user_sources_forbidden: '当前部署不允许自行添加市场来源',
     source_limit_reached: '市场来源数量已达上限，请先删除一个再添加',
     conflict: '操作冲突：该来源已存在',
+    enable_denied: '还不能启用：外部源可能未开启，或该内容尚未在插件页获得授权',
+    enable_conflict: '该类型不支持原地更新，请卸载后重新安装',
+    integrity_failed: '内容完整性校验未通过（摘要或签名不匹配），已拒绝安装/启用',
     request_failed: '市场请求失败，请稍后重试',
   },
 }
