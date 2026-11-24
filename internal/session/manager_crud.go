@@ -70,9 +70,18 @@ const DefaultTenantID = db.DefaultTenantID
 
 // CreateSession inserts a new session into PG and caches in Redis.
 // If id is empty, returns an error.
-func (m *Manager) CreateSession(ctx context.Context, id, userID, title string) (*model.Session, error) {
+//
+// tenantID 必须来自调用方 claims（多租户下会话的归属真相）。此前这里硬编码
+// `DefaultTenantID`：多租户/邀请码租户里创建的新会话会被记进默认租户，于是
+// 「用户看不到自己的会话」与「跨租户会话出现在同一列表」同时发生 —— 而
+// sessions.tenant_id 又是 RLS/清理任务的分区键，写错等于把数据放到错的桶里。
+// tenantID == 0 仅用于单租户/内部任务，退回默认租户（与 seed 单一来源一致）。
+func (m *Manager) CreateSession(ctx context.Context, id, userID, title string, tenantID int16) (*model.Session, error) {
 	if id == "" {
 		return nil, fmt.Errorf("session id is required")
+	}
+	if tenantID == 0 {
+		tenantID = DefaultTenantID
 	}
 
 	if title == "" {
@@ -101,7 +110,7 @@ func (m *Manager) CreateSession(ctx context.Context, id, userID, title string) (
 			 VALUES ($1, $2, $3::uuid, $4, $5, $6)
 			 ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, updated_at = EXCLUDED.updated_at
 			  WHERE sessions.user_id IS NOT DISTINCT FROM EXCLUDED.user_id`,
-			id, DefaultTenantID, uid, title, now, now)
+			id, tenantID, uid, title, now, now)
 		if err != nil {
 			return nil, fmt.Errorf("create session: %w", err)
 		}

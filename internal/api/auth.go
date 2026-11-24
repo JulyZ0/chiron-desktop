@@ -299,6 +299,14 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "email, password, and name are required")
 		return
 	}
+	// 邮箱落库前规范化（去空白 + 小写）：users 的唯一索引建在 lower(email) 上
+	// （0013 迁移），登录也用 lower(email) 匹配。不规范化就等于「同一邮箱可注册
+	// 两次」，而其中一条永远登不进去。
+	req.Email = auth.NormalizeEmail(req.Email)
+	if req.Email == "" {
+		BadRequest(w, "email is required")
+		return
+	}
 	if ok, msg := auth.ValidatePasswordComplexity(req.Password); !ok {
 		BadRequest(w, msg)
 		return
@@ -336,8 +344,11 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	// 就照常查库：唯一索引始终是真相源，过滤器出错最多让我们多查一次库。
 	if h.emailBloom.MightExist(tenantStr(tenantID), req.Email) {
 		var exists int
+		// 判重谓词与唯一索引、登录谓词三者对齐：都看 lower(email)。
+		// 只看原始 email 会漏掉存量里的 `Bob@X.com`（唯一索引也会漏），
+		// 于是同一邮箱能注册出第二行，而登录按 lower() 只能命中其中一行。
 		if err := tx.QueryRow(ctx,
-			`SELECT COUNT(*) FROM users WHERE email = $1 AND tenant_id = $2`,
+			`SELECT COUNT(*) FROM users WHERE lower(COALESCE(email, '')) = $1 AND tenant_id = $2`,
 			req.Email, tenantID,
 		).Scan(&exists); err != nil {
 			slog.Error("check existing user", "error", err)

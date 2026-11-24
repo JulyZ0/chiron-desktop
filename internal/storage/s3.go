@@ -3,9 +3,12 @@ package storage
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -182,13 +185,106 @@ func (s *S3Store) PresignedGetURL(ctx context.Context, path string, ttl time.Dur
 }
 
 // ObjectURL returns the public HTTP URL for an object.
-func (s *S3Store) ObjectURL(path string) string {
-	objPath := s.objectPath(path)
-	scheme := "https"
-	if s.endpoint == "localhost" || s.endpoint == "127.0.0.1" {
-		scheme = "http"
+func (s *S3Store) ObjectURL(objKey string) string {
+	objPath := s.objectPath(objKey)
+	return fmt.Sprintf("%s://%s/%s/%s", s.scheme(), s.endpoint, s.bucket, objPath)
+}
+
+// scheme 与 ObjectURL 的协议推导保持一致（本地 MinIO 走 http）。
+func (s *S3Store) scheme() string {
+	return ObjectURLScheme(s.endpoint)
+}
+
+// ObjectURLScheme 返回给定 endpoint 对应的公开 URL 协议。
+//
+// 与 ObjectURL 同源：只有「就地部署的 MinIO」是 http，其余按 https。
+func ObjectURLScheme(endpoint string) string {
+	if endpoint == "localhost" || strings.HasPrefix(endpoint, "localhost:") ||
+		endpoint == "127.0.0.1" || strings.HasPrefix(endpoint, "127.0.0.1:") {
+		return "http"
 	}
-	return fmt.Sprintf("%s://%s/%s/%s", scheme, s.endpoint, s.bucket, objPath)
+	return "https"
+}
+
+// ErrObjectKeyNotInBucket 表示 URL 指向的不是本 store 的 bucket/prefix。
+var ErrObjectKeyNotInBucket = errors.New("object url does not address this bucket")
+
+// ObjectKeyFromURL 把一个「对象公开 URL」反解为对象键，并严格校验它确实由本
+// 存储后端签出：scheme、host、bucket、prefix 四段都必须匹配。
+//
+// 为什么不能只比较 scheme/host：同 host 上通常还有别的 bucket（备份桶、其它环境
+// 的桶），只比 host 等于承认「同 host 即同一对象所有权」—— 攻击者只要拿到同 host
+// 下任意对象的 URL（哪怕属于别人、别的桶），就能把它写进自己的资产行，再通过
+// 下载端点代理读取。所有权证明必须到 bucket + prefix 这一级。
+func (s *S3Store) ObjectKeyFromURL(raw string) (string, error) {
+	return ObjectKeyFromURL(raw, s.endpoint, s.bucket, s.prefix)
+}
+
+// ObjectKeyFromURL 是 (*S3Store).ObjectKeyFromURL 的纯函数形态（便于单测）。
+func ObjectKeyFromURL(raw, endpoint, bucket, prefix string) (string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return "", ErrObjectKeyNotInBucket
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", ErrObjectKeyNotInBucket
+	}
+	if u.User != nil {
+		return "", ErrObjectKeyNotInBucket
+	}
+	if u.Scheme != ObjectURLScheme(endpoint) || u.Host != endpoint {
+		return "", ErrObjectKeyNotInBucket
+	}
+	// 用 EscapedPath 再 Unescape：避免 %2e%2e 之类的编码绕过 path.Clean。
+	escaped := u.EscapedPath()
+	unescaped, err := url.PathUnescape(escaped)
+	if err != nil {
+		return "", ErrObjectKeyNotInBucket
+	}
+	key := strings.TrimPrefix(unescaped, "/")
+	wantBucket := bucket + "/"
+	if !strings.HasPrefix(key, wantBucket) {
+		return "", ErrObjectKeyNotInBucket
+	}
+	key = strings.TrimPrefix(key, wantBucket)
+	if prefix != "" {
+		if !strings.HasPrefix(key, prefix+"/") {
+			return "", ErrObjectKeyNotInBucket
+		}
+		key = strings.TrimPrefix(key, prefix+"/")
+	}
+	if key == "" || path.Clean(key) != key || strings.Contains(key, "..") || strings.Contains(key, "\\") {
+		return "", ErrObjectKeyNotInBucket
+	}
+	return key, nil
+}
+
+// PresignedGetURLWithResponse 生成带「响应头覆盖」的预签名下载 URL。
+//
+// 对象存储会把 response-content-type / response-content-disposition /
+// response-cache-control 原样写进下载响应，于是「必须另存为」「不得缓存」这类
+// 策略在 302 直达对象存储的路径上同样生效 —— 否则网关侧设的响应头会在重定向后
+// 全部丢失（浏览器最终看到的是对象存储的默认头）。
+func (s *S3Store) PresignedGetURLWithResponse(ctx context.Context, objKey string, ttl time.Duration, contentType, disposition, cacheControl string) (string, error) {
+	params := url.Values{}
+	if contentType != "" {
+		params.Set("response-content-type", contentType)
+	}
+	if disposition != "" {
+		params.Set("response-content-disposition", disposition)
+	}
+	if cacheControl != "" {
+		params.Set("response-cache-control", cacheControl)
+	}
+	if len(params) == 0 {
+		return s.PresignedGetURL(ctx, objKey, ttl)
+	}
+	objPath := s.objectPath(objKey)
+	u, err := s.client.PresignedGetObject(ctx, s.bucket, objPath, ttl, params)
+	if err != nil {
+		return "", fmt.Errorf("s3 presigned get object %q: %w", objPath, err)
+	}
+	return u.String(), nil
 }
 
 // objectPath joins the store prefix with the user-provided path.

@@ -136,47 +136,40 @@ func (h *MediaHandler) ServeSignedMedia(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid signature", http.StatusForbidden)
 		return
 	}
-	// 取文件路径。
+	// 取资产行。
 	// 签名已经把 (assetID, tenant, user) 绑在一起，但**查询本身也必须带归属谓词**：
 	// 否则签名校验与数据读取之间是"信任一个不属于本次查询的租户参数"——
 	// 只要签名密钥或参数拼装出现任何一处偏差，就能拿 A 的签名读到 B 的文件。
-	var filePath string
+	var filePath, fileURL, mimeType, assetName string
 	if err := db.GlobalDBManager.QueryRow(r.Context(),
-		`SELECT COALESCE(file_path, '') FROM media_assets WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-		assetID, tenantID, userID).Scan(&filePath); err != nil || filePath == "" {
-
-		// Fallback: 如果 file_path 为空，从 file_url 动态推导
-		var fileURL string
-		if err2 := db.GlobalDBManager.QueryRow(r.Context(),
-			`SELECT COALESCE(file_url, '') FROM media_assets WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-			assetID, tenantID, userID).Scan(&fileURL); err2 != nil || fileURL == "" {
-			slog.Error("ServeSignedMedia: asset not found", "assetID", assetID)
-			http.Error(w, "media not found", http.StatusNotFound)
-			return
-		}
-
-		// 从 file_url 推导 file_path: /media/xxx -> xxx
-		if strings.HasPrefix(fileURL, "/media/") {
-			filePath = strings.TrimPrefix(fileURL, "/media/")
-			slog.Debug("ServeSignedMedia: derived file_path from file_url",
-				"assetID", assetID, "fileURL", fileURL, "filePath", filePath)
-		} else {
-			slog.Error("ServeSignedMedia: invalid file_url format", "assetID", assetID, "fileURL", fileURL)
-			http.Error(w, "media not found", http.StatusNotFound)
-			return
-		}
+		`SELECT COALESCE(file_path, ''), COALESCE(file_url, ''), COALESCE(mime_type, ''), COALESCE(name, '')
+		 FROM media_assets WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
+		assetID, tenantID, userID).Scan(&filePath, &fileURL, &mimeType, &assetName); err != nil {
+		slog.Error("ServeSignedMedia: asset not found", "assetID", assetID)
+		http.Error(w, "media not found", http.StatusNotFound)
+		return
 	}
 
-	// 归一化 file_path：历史数据里直传路径写入的是完整对象键（含 "media/" 前缀），
-	// 分片路径写入/推导的是相对媒体根的路径。统一为「相对媒体根」，否则与 mediaRoot
-	// 叠加会出现 StorageRoot/media/media/... 的错位路径。
-	filePath = strings.TrimPrefix(filepath.ToSlash(filePath), "media/")
+	// 重新校验对象归属（H29）：签名只证明「这张票是这个租户/用户/资产换来的」，
+	// 并不证明库里那条 file_path/file_url 指向的对象属于他们。历史脏数据、迁移事故、
+	// 或任何曾经信任过客户端 file_url 的写入都可能留下越界路径 —— 这里按
+	// 「本租户 + 本资产」前缀（或该 owner 的旧布局目录）重新推导并拒绝越界。
+	relKey, keyErr := mediaOwnedObjectKey(parseTenantID(tenantID), assetID, userID, filePath, fileURL, h.store)
+	if keyErr != nil {
+		slog.Warn("ServeSignedMedia: object key outside tenant scope",
+			"assetID", assetID, "tenant", tenantID, "file_path", filePath, "error", keyErr)
+		http.Error(w, "media not found", http.StatusForbidden)
+		return
+	}
+
+	policy := mediaDownloadHeaders(mimeType, assetName)
 
 	// S3 后端：签名已校验通过，直接 302 到对象存储的预签名 URL
 	// （对象存储自行处理 Range/断点续传，网关不中转大文件）。
-	// 本地后端：继续走下方 ServeFile，保留 Range 支持。
+	// 下载策略通过 response-* 查询参数透传：否则网关设的响应头在重定向后全部丢失。
 	if s3 := h.s3Store(); s3 != nil {
-		url, perr := s3.PresignedGetURL(r.Context(), "media/"+filePath, mediaSignTTL)
+		url, perr := s3.PresignedGetURLWithResponse(r.Context(), "media/"+relKey, mediaSignTTL,
+			policy.ContentType, policy.Disposition, policy.CacheControl)
 		if perr != nil {
 			slog.Error("ServeSignedMedia: presign failed", "assetID", assetID, "error", perr)
 			http.Error(w, "media unavailable", http.StatusBadGateway)
@@ -186,7 +179,16 @@ func (h *MediaHandler) ServeSignedMedia(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	full := filepath.Join(h.mediaRoot(), filepath.FromSlash(filePath))
+	h.serveMediaFile(w, r, relKey, policy)
+}
+
+// serveMediaFile 本地后端：按下载策略设置响应头后流式返回文件。
+//
+// 抽成独立函数（不碰 DB）是为了让「HTML/SVG 必须 attachment + nosniff」
+// 「私有媒体 private/no-store」这些判据可以被单测直接覆盖 —— 安全头写错时
+// 不会有任何运行时错误，只能靠断言发现。
+func (h *MediaHandler) serveMediaFile(w http.ResponseWriter, r *http.Request, relKey string, policy mediaDownloadPolicy) {
+	full := filepath.Join(h.mediaRoot(), filepath.FromSlash(relKey))
 	// 防御：确保解析后仍在媒体根目录内
 	root := filepath.Clean(h.mediaRoot())
 	clean := filepath.Clean(full)
@@ -197,34 +199,7 @@ func (h *MediaHandler) ServeSignedMedia(w http.ResponseWriter, r *http.Request) 
 
 	// 设置正确的响应头以支持音频/视频流式播放
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Cache-Control", "public, max-age=3600")
-
-	// 根据文件扩展名设置 Content-Type（flyfish-viewer 需要）
-	ext := strings.ToLower(filepath.Ext(clean))
-	switch ext {
-	case ".mp3":
-		w.Header().Set("Content-Type", "audio/mpeg")
-	case ".wav":
-		w.Header().Set("Content-Type", "audio/wav")
-	case ".ogg":
-		w.Header().Set("Content-Type", "audio/ogg")
-	case ".flac":
-		w.Header().Set("Content-Type", "audio/flac")
-	case ".m4a":
-		w.Header().Set("Content-Type", "audio/mp4")
-	case ".mp4":
-		w.Header().Set("Content-Type", "video/mp4")
-	case ".webm":
-		w.Header().Set("Content-Type", "video/webm")
-	case ".pdf":
-		w.Header().Set("Content-Type", "application/pdf")
-	case ".jpg", ".jpeg":
-		w.Header().Set("Content-Type", "image/jpeg")
-	case ".png":
-		w.Header().Set("Content-Type", "image/png")
-	case ".gif":
-		w.Header().Set("Content-Type", "image/gif")
-	}
+	applyMediaHeaders(w.Header(), policy)
 
 	http.ServeFile(w, r, clean)
 }

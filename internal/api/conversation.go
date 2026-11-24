@@ -387,6 +387,10 @@ func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	claims := auth.GetClaims(r.Context())
+	if claims == nil || claims.TenantID == 0 {
+		Unauthorized(w, ErrAuthRequired)
+		return
+	}
 	userID := claims.UserID
 
 	sessionID, err := id.UUID()
@@ -394,7 +398,9 @@ func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
 		logAndRespond(w, err, http.StatusInternalServerError, "generate id failed")
 		return
 	}
-	sess, err := h.sessionMgr.CreateSession(r.Context(), sessionID, userID, body.Title)
+	// 会话的租户归属必须来自 claims：写死默认租户会让邀请码/多租户用户创建的
+	// 会话落到别人的租户下（H33）。
+	sess, err := h.sessionMgr.CreateSession(r.Context(), sessionID, userID, body.Title, claims.TenantID)
 	if err != nil {
 		logAndRespond(w, err, http.StatusInternalServerError, "create session failed")
 		return

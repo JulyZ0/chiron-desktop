@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -144,6 +143,12 @@ func (h *MediaHandler) PresignUpload(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "name is required")
 		return
 	}
+	// 预签名与完成阶段必须用同一份净化结果拼对象键，否则两边推导出的键不同，
+	// 合法上传会在 complete 阶段被判成「不属于本会话」。
+	if sanitizeUploadName(body.Name) == "" {
+		BadRequest(w, "invalid name")
+		return
+	}
 	if body.Type == "" {
 		body.Type = "file"
 	}
@@ -217,85 +222,60 @@ func (h *MediaHandler) CompleteUpload(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, ErrInvalidReq)
 		return
 	}
-	if body.FileURL == "" {
-		BadRequest(w, "file_url is required")
+	// 上传会话 id 就是对象键的目录段：服务端据此推导键，客户端不能自带路径。
+	if !uuidRe.MatchString(body.ID) {
+		BadRequest(w, "id (upload session) is required and must be a UUID")
 		return
 	}
 	if body.Type == "" {
 		body.Type = "file"
 	}
 
-	// 校验 file_url 指向配置的存储后端（防止客户端伪造任意 URL 入库）
-	inner := h.store
-	if atomic, ok := h.store.(*storage.AtomicStore); ok {
-		inner = atomic.LoadRaw()
-	}
-	switch s := inner.(type) {
-	case *storage.S3Store:
-		// 使用 url.Parse 严格校验 host/scheme，防止前缀匹配绕过
-		parsedURL, err := url.Parse(body.FileURL)
-		if err != nil {
-			BadRequest(w, "invalid file_url")
-			return
-		}
-		expectedURL, err := url.Parse(s.ObjectURL(""))
-		if err != nil {
-			InternalError(w, "storage backend misconfigured")
-			return
-		}
-		if parsedURL.Scheme != expectedURL.Scheme || parsedURL.Host != expectedURL.Host {
-			BadRequest(w, "file_url does not match configured storage backend")
-			return
-		}
-	case *storage.LocalStore:
-		// Reject protocol-relative URLs and require /media/ prefix
-		if !strings.HasPrefix(body.FileURL, "/media/") || strings.HasPrefix(body.FileURL, "//") {
-			BadRequest(w, "file_url does not match configured storage backend")
-			return
-		}
-	default:
-		BadRequest(w, "unsupported storage backend")
+	// ── 对象键：服务端从上传会话推导，客户端 file_url 只用于比对 ──
+	//
+	// 旧实现只比较 scheme/host（S3）或 `/media/` 前缀（本地），通过之后**原样入库**。
+	// 「同 host」于是被当成「同一对象所有权」：同桶里任何可读对象都能被写进自己的
+	// 资产行，再经下载端点代理读出（签名下载又会照着库里的 URL 去取）。
+	objectKey, keyErr := resolveSessionObjectKey(tenantID, body.ID, body.Name, body.FileURL, h.store)
+	if keyErr != nil {
+		slog.Warn("complete upload rejected: object key does not match upload session",
+			"tenant_id", tenantID, "asset_id", body.ID, "file_url", body.FileURL, "error", keyErr)
+		BadRequest(w, "file_url does not match the upload session object key")
 		return
 	}
 
-	// 对已通过预签名上传到 S3 的文件进行 MIME 类型检测
-	// （防止客户端绕过 MIME 检查直接上传恶意文件）
-	if body.FileURL != "" {
-		resp, err := http.Head(body.FileURL)
-		if err == nil {
-			contentType := resp.Header.Get("Content-Type")
-			if isExecutableMIME(contentType, body.Name) {
-				BadRequest(w, "file type not allowed")
-				return
-			}
-		}
+	// ── 内容类型强校验：直接读我们自己推导出的对象（不再 HEAD 客户端 URL）──
+	//
+	// 旧实现 `http.Head(body.FileURL)` 有两个问题：一是客户端可控目标（SSRF），
+	// 二是它读的可能是别人的对象。这里读存储后端上真实落盘的内容，读不到即拒绝
+	//（完成阶段对象必然已存在，否则入库只会留下悬空资产）。
+	mimeType := truncateMIME(baseMime(body.MimeType))
+	sniffed, sniffErr := sniffStoredObject(r.Context(), h.store, objectKey)
+	if sniffErr != nil {
+		slog.Warn("complete upload rejected: uploaded object not readable",
+			"tenant_id", tenantID, "asset_id", body.ID, "object_key", objectKey, "error", sniffErr)
+		BadRequest(w, "uploaded object not found; upload the file before completing")
+		return
 	}
+	if isExecutableMIME(sniffed, body.Name) || isActiveContentMIME(sniffed) {
+		BadRequest(w, "file type not allowed: "+sniffed)
+		return
+	}
+	mimeType = sniffed
 
-	// 资产 ID 与预签名阶段保持一致：客户端传入的 ID 只有在「合法 UUID」且
-	// 「其对象键确实位于本租户前缀 media/<tenantID>/<assetID>/ 之下」时才复用，
-	// 因此无法用它去覆盖他人或其他路径的对象。其余情况回退到服务端新生成。
-	assetID := ""
-	if uuidRe.MatchString(body.ID) && strings.Contains(body.FileURL, "/"+tenantStr(tenantID)+"/"+body.ID+"/") {
-		assetID = body.ID
-	}
-	if assetID == "" {
-		var genErr error
-		assetID, genErr = id.UUID()
-		if genErr != nil {
-			logAndRespond(w, genErr, http.StatusInternalServerError, "generate id failed")
-			return
-		}
-	}
+	assetID := body.ID
+	// file_url 一律用服务端推导值：与对象键同源，客户端无法把任意 URL 塞进库里。
+	fileURL := h.objectURL(objectKey)
 	_, err := db.GlobalDBManager.Exec(r.Context(),
-		`INSERT INTO media_assets (id, tenant_id, user_id, type, name, file_url, mime_type, category, size, parent_id, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '', NOW(), NOW())`,
-		assetID, tenantID, claims.UserID, body.Type, body.Name, body.FileURL, truncateMIME(body.MimeType), nullableStr(body.Category), body.Size)
+		`INSERT INTO media_assets (id, tenant_id, user_id, type, name, file_url, file_path, mime_type, category, size, parent_id, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, '', NOW(), NOW())`,
+		assetID, tenantID, claims.UserID, body.Type, body.Name, fileURL, objectKey, mimeType, nullableStr(body.Category), body.Size)
 	if err != nil {
 		logAndRespond(w, err, http.StatusInternalServerError, "create asset failed")
 		return
 	}
 
-	OK(w, map[string]string{"id": assetID, "name": body.Name, "file_url": body.FileURL})
+	OK(w, map[string]string{"id": assetID, "name": body.Name, "file_url": fileURL})
 }
 
 // ── Upload helpers ──
