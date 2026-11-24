@@ -3468,8 +3468,34 @@ if (!gotLock) {
     })
 
     // 设备文件桥：只在 cloud 模式启动（local 模式本机即执行端，不需要隧道）。
+    //
+    // H46：桥不再"服务端说哪个 root 就是哪个"。注入的是主进程持有的**用户批准名单**，
+    // 未授权 root 在 op 执行前就会被拒；`requestRootApproval` 让用户在原生的
+    // 目录授权对话框里当场批准（一次），拒绝则永久拒到用户主动批准为止。
+    // 票据换取走 HTTP（Authorization 头），WS 只带一次性 ticket —— 见 device-fs.cjs。
     if (!deviceBridge) {
-      deviceBridge = createDeviceFSBridge({ app, readToken, log: logMain })
+      deviceBridge = createDeviceFSBridge({
+        app,
+        readToken,
+        log: logMain,
+        isRootGranted: candidate => (projectRoots ? projectRoots.covers(candidate) : false),
+        requestRootApproval: async info => {
+          const screened = screenRootCandidate(info.root)
+          if (!screened.ok) {
+            logMain('warn', `设备桥请求的根不可授权（${screened.reason}）`)
+            return false
+          }
+          const approved = await confirmProjectRootApproval(screened.root, info.path || screened.root)
+          if (!approved) return false
+          try {
+            projectRoots.grant(screened.root)
+            return true
+          } catch (err) {
+            logMain('warn', `设备桥根授权写入失败：${err?.message || err}`)
+            return false
+          }
+        },
+      })
     }
     if (!mountDeps) {
       mountDeps = createMountDeps({ app, net, shell, log: logMain })
