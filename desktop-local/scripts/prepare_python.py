@@ -47,12 +47,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 DESKTOP_LOCAL = Path(__file__).resolve().parents[1]
@@ -65,8 +68,17 @@ UV_ASSETS_DIR = FRONTEND_VUE / "assets" / "uv"
 
 # 必须与 electron/runtime-install.cjs::RUNTIME_PYTHON_VERSION 保持一致。
 # 两处各自写死是有意的：构建脚本不该去解析 JS，而运行时不读本文件。
-# 3.14：与 CI/桌面工作流验证口径一致；具体补丁版本由 uv 就位时选当前最新稳定版。
-RUNTIME_PYTHON_VERSION = "3.14"
+#
+# PRD 9.10 / H86：**固定到补丁版本**。此前只到 `3.14`，具体补丁由 uv 就位时选"当前
+# 最新稳定版"——于是不同日期、不同镜像上的干净构建会拿到不同解释器，制品无法复现，
+# 供应链核对也无从谈起（"昨天打的包"和"今天打的包"不是同一个运行时）。
+# 升级补丁版本是本文件 + runtime-install.cjs 两处同时改，并同步
+# `docs/desktop-local/packaging.md` 的记录。
+RUNTIME_PYTHON_VERSION = "3.14.4"
+
+#: 运行时清单文件名（落在 ``assets/python-runtime/`` 根上，随 extraResources 一起装进包）。
+#: 内容是"这包带的解释器到底是哪一版、摘要是什么"，用于发布审计与事后核对（H86）。
+MANIFEST_NAME = "python-runtime.json"
 
 # 单步超时（秒）。解释器约 20MB，慢网络留足余量
 INSTALL_TIMEOUT = 600
@@ -146,6 +158,46 @@ def _is_version_suffix(path: Path) -> bool:
     return bool(parts) and all(part.isdigit() for part in parts)
 
 
+def write_runtime_manifest(platform_key: str) -> Path | None:
+    """把就位结果写成 ``python-runtime.json``（H86）。
+
+    内容只包含"事后可核对"的事实：期望版本、实测版本、平台、解释器相对路径与
+    SHA256、生成时间。写失败不影响构建成功（清单是**证据**，不是运行时依赖），
+    但会在 stderr 留一行，避免"以为有清单其实没有"。
+    """
+    directory = target_dir(platform_key)
+    layout = find_installed_layout(directory) if directory.is_dir() else None
+    exe = interpreter_in(layout) if layout is not None else None
+    if exe is None:
+        print(f"[WARN] {platform_key}: 无法定位解释器，跳过运行时清单", file=sys.stderr)
+        return None
+
+    digest = hashlib.sha256()
+    try:
+        with open(exe, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        print(f"[WARN] {platform_key}: 解释器摘要失败：{exc}", file=sys.stderr)
+        return None
+
+    doc = {
+        "version": RUNTIME_PYTHON_VERSION,
+        "platform": platform_key,
+        "interpreter": str(exe.relative_to(directory)).replace("\\", "/"),
+        "interpreter_sha256": digest.hexdigest(),
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    target = directory / MANIFEST_NAME
+    try:
+        target.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"[WARN] {platform_key}: 运行时清单写入失败：{exc}", file=sys.stderr)
+        return None
+    print(f"   运行时清单：{target}")
+    return target
+
+
 def _version_key(path: Path) -> tuple[int, ...]:
     return tuple(int(part) for part in path.name.split(".")[1:] if part.isdigit())
 
@@ -202,9 +254,11 @@ def self_check(platform_key: str, version: str, *, verbose: bool = True) -> int:
         report(f"[FAIL] {exe} 无法运行：{exc}")
         return 1
 
-    if not out.startswith(f"{version}."):
+    # H86：**精确到补丁版本**。此前只比前两段（`3.14` 前缀），于是就位的解释器是
+    # 3.14.1 还是 3.14.4 都能过 —— 制品因此在两个构建日之间悄悄漂移。
+    if out != version:
         report(
-            f"[FAIL] 解释器版本是 {out}，期望 {version}.x。"
+            f"[FAIL] 解释器版本是 {out}，期望 {version}（补丁版本必须一致，见 PRD H86）。"
             "请改 RUNTIME_PYTHON_VERSION 或重新就位。"
         )
         return 1
@@ -358,7 +412,15 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nPython {RUNTIME_PYTHON_VERSION} 已就位于 {target}")
     print("   打包时由 electron-builder 的 extraResources 拷到 resources/python-runtime/")
-    return self_check(platform_key, RUNTIME_PYTHON_VERSION)
+    rc = self_check(platform_key, RUNTIME_PYTHON_VERSION)
+    if rc == 0:
+        # H86：把**实际就位的**解释器与摘要落成清单，附在运行时目录里。
+        #
+        # 目的不是"再校验一次"（self_check 已经做过），而是让发布制品能自证：
+        # 这个包带的解释器是哪一版、可执行文件摘要是什么。否则有人手工替换了运行时
+        # 目录后，事后无法从制品本身看出差异，供应链审计也就无从落地。
+        write_runtime_manifest(platform_key)
+    return rc
 
 
 if __name__ == "__main__":

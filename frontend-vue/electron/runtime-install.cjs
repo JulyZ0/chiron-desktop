@@ -41,8 +41,16 @@ const childProcess = require('node:child_process')
 const { probeRuntime } = require('./runtime-probe.cjs')
 const { PIP_INDEX_MIRRORS } = require('./shared.cjs')
 
-/** 受管 CPython 版本。desktop-local 的 `requires-python` 是 >=3.11；3.14 与 CI/桌面工作流一致。 */
-const RUNTIME_PYTHON_VERSION = '3.14'
+/**
+ * 受管 CPython 版本。desktop-local 的 `requires-python` 是 >=3.11。
+ *
+ * PRD 9.10 / H86：**固定到补丁版本**（3.14.4），不再写两位。写两位时具体补丁由
+ * uv 就位时按"当前最新稳定版"决定 —— 运行时和构建期可能拿到不同解释器，
+ * 制品的可复现性与供应链核对都无从谈起。必须与
+ * `desktop-local/scripts/prepare_python.py::RUNTIME_PYTHON_VERSION` 逐字一致
+ * （`electron/__tests__/runtime-version-pin.test.cjs` 守住这一条）。
+ */
+const RUNTIME_PYTHON_VERSION = '3.14.4'
 
 /** 安装阶段（渲染层按 id 显示文案；顺序即真实顺序） */
 const INSTALL_STAGES = Object.freeze({
