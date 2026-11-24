@@ -1,7 +1,7 @@
 package api
 
 import (
-	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -12,27 +12,51 @@ import (
 
 // ── Download ──
 
-// Download redirects to the asset's storage URL.
+// Download 返回资产的下载响应。
+//
+// 旧实现把库里存的 `file_url` 直接 302 出去：一旦库里出现任意 URL（历史写入
+// 信任过客户端、迁移事故、注入），这里就成了开放式代理。现在改为**从资产行
+// 重新推导对象键并校验归属**，再按下载策略（attachment/nosniff/private）出流。
 func (h *MediaHandler) Download(w http.ResponseWriter, r *http.Request) {
 	claims := auth.GetClaims(r.Context())
+	if claims == nil || claims.TenantID == 0 {
+		Unauthorized(w, ErrAuthRequired)
+		return
+	}
 	id := r.PathValue("id")
 	if id == "" {
 		BadRequest(w, "id is required")
 		return
 	}
-	tenantID := claims.TenantID
-	var fileURL string
+
+	var filePath, fileURL, mimeType, name string
 	if err := db.GlobalDBManager.QueryRow(r.Context(),
-		`SELECT COALESCE(file_url,'') FROM media_assets WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
-		id, tenantID, claims.UserID).Scan(&fileURL); err != nil {
+		`SELECT COALESCE(file_path,''), COALESCE(file_url,''), COALESCE(mime_type,''), COALESCE(name,'')
+		 FROM media_assets WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		id, claims.TenantID, claims.UserID).Scan(&filePath, &fileURL, &mimeType, &name); err != nil {
 		NotFound(w, "media asset not found")
 		return
 	}
-	if fileURL == "" {
+	relKey, keyErr := mediaOwnedObjectKey(claims.TenantID, id, claims.UserID, filePath, fileURL, h.store)
+	if keyErr != nil {
+		slog.Warn("media download rejected: object key outside tenant scope",
+			"asset_id", id, "tenant_id", claims.TenantID, "file_path", filePath, "error", keyErr)
 		NotFound(w, "asset has no stored file")
 		return
 	}
-	http.Redirect(w, r, fileURL, http.StatusFound)
+
+	policy := mediaDownloadHeaders(mimeType, name)
+	if s3 := h.s3Store(); s3 != nil {
+		url, err := s3.PresignedGetURLWithResponse(r.Context(), "media/"+relKey, mediaSignTTL,
+			policy.ContentType, policy.Disposition, policy.CacheControl)
+		if err != nil {
+			logAndRespond(w, err, http.StatusInternalServerError, "generate download url failed")
+			return
+		}
+		http.Redirect(w, r, url, http.StatusFound)
+		return
+	}
+	h.serveMediaFile(w, r, relKey, policy)
 }
 
 // ── Share ──
@@ -40,6 +64,10 @@ func (h *MediaHandler) Download(w http.ResponseWriter, r *http.Request) {
 // Share returns a time-limited presigned download URL (S3 backend only).
 func (h *MediaHandler) Share(w http.ResponseWriter, r *http.Request) {
 	claims := auth.GetClaims(r.Context())
+	if claims == nil || claims.TenantID == 0 {
+		Unauthorized(w, ErrAuthRequired)
+		return
+	}
 	id := r.PathValue("id")
 	if id == "" {
 		BadRequest(w, "id is required")
@@ -61,11 +89,22 @@ func (h *MediaHandler) Share(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var fileName, userID string
+	var filePath, fileURL, fileName, mimeType string
 	if err := db.GlobalDBManager.QueryRow(r.Context(),
-		`SELECT COALESCE(name,''), COALESCE(user_id,'') FROM media_assets WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
-		id, claims.TenantID, claims.UserID).Scan(&fileName, &userID); err != nil {
+		`SELECT COALESCE(file_path,''), COALESCE(file_url,''), COALESCE(name,''), COALESCE(mime_type,'')
+		 FROM media_assets WHERE id=$1 AND tenant_id=$2 AND user_id=$3`,
+		id, claims.TenantID, claims.UserID).Scan(&filePath, &fileURL, &fileName, &mimeType); err != nil {
 		NotFound(w, "media asset not found")
+		return
+	}
+	// 分享链接必须指向**这条资产自己的**对象：旧实现用
+	// `media/u_<user>/<id[:8]>_<name>` 现拼键（名字还来自请求行），等于可以拿一张
+	// 分享票去签同目录下任意文件名。现在只接受资产行推导出的、通过归属校验的键。
+	relKey, keyErr := mediaOwnedObjectKey(claims.TenantID, id, claims.UserID, filePath, fileURL, h.store)
+	if keyErr != nil {
+		slog.Warn("media share rejected: object key outside tenant scope",
+			"asset_id", id, "tenant_id", claims.TenantID, "file_path", filePath, "error", keyErr)
+		NotFound(w, "asset has no stored file")
 		return
 	}
 
@@ -80,14 +119,10 @@ func (h *MediaHandler) Share(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir := "anonymous"
-	if userID != "" {
-		dir = "u_" + userID
-	}
-	// legacyShortAssetID：存量资产的旧布局键（file_path 为空时的回退）
-	objectKey := fmt.Sprintf("media/%s/%s_%s", dir, legacyShortAssetID(id), fileName)
 	ttl := time.Duration(body.ExpiresInSeconds) * time.Second
-	url, err := s3store.PresignedGetURL(r.Context(), objectKey, ttl)
+	policy := mediaDownloadHeaders(mimeType, fileName)
+	url, err := s3store.PresignedGetURLWithResponse(r.Context(), "media/"+relKey, ttl,
+		policy.ContentType, policy.Disposition, policy.CacheControl)
 	if err != nil {
 		logAndRespond(w, err, http.StatusInternalServerError, "generate share link failed")
 		return

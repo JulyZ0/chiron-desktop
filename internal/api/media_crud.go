@@ -186,6 +186,26 @@ func (h *MediaHandler) Create(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "name is required")
 		return
 	}
+	if sanitizeUploadName(body.Name) == "" {
+		BadRequest(w, "invalid name")
+		return
+	}
+	// ── 文本/代码创建路径的类型校验（H29）──
+	//
+	// 直传（Upload）与内部写入（InternalCreateAsset）都会拦可执行/HTML/SVG，
+	// 只有这条「新建文本」路径完全不看类型：`name: "x.html"` + 任意内容就能在
+	// 媒体库里落一条可内联渲染的资产（配合签名 URL ⇒ 同源存储型 XSS）。
+	// 现在统一按同一套判据拦住：扩展名命中危险名单，或内容 magic bytes 判成
+	// HTML/XML/SVG 等「浏览器会当文档执行」的类型。
+	detectedText := truncateMIME(http.DetectContentType([]byte(body.Content)))
+	if body.Content != "" && (isActiveContentMIME(detectedText) || isExecutableMIME(detectedText, body.Name)) {
+		BadRequest(w, "file type not allowed: "+detectedText)
+		return
+	}
+	if isExecutableMIME("", body.Name) {
+		BadRequest(w, "file type not allowed: "+body.Name)
+		return
+	}
 	if body.Type == "" {
 		body.Type = "text"
 	}
@@ -220,10 +240,14 @@ func (h *MediaHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 		fileURL = h.objectURL(objectKey)
 
-		// 鏇存柊 file_url
+		// 更新 file_url / file_path / mime_type。
+		// file_path 必须一起写：签名下载按「租户 + 资产」前缀重新校验归属，没有
+		// file_path 时只能从 file_url 反解，多一条可被写脏的路径。
+		// WHERE 带 tenant_id：此前只按 id 更新，跨租户同 id 会互相覆盖。
 		_, err = db.GlobalDBManager.Exec(r.Context(),
-			`UPDATE media_assets SET file_url = $1 WHERE id = $2`,
-			fileURL, assetID)
+			`UPDATE media_assets SET file_url = $1, file_path = $2, mime_type = $3
+			 WHERE id = $4 AND tenant_id = $5`,
+			fileURL, objectKey, truncateMIME(detectedText), assetID, claims.TenantID)
 		if err != nil {
 			slog.Warn("update file_url", "error", err)
 		}
