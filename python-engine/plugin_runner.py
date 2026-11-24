@@ -26,6 +26,15 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 
+#: runner 要求的最小守卫能力版本（与 `app/tools/code_guard.py:GUARD_API_VERSION` 对齐）。
+#:
+#: 为什么要在 runner 侧校验：本文件按**路径**加载守卫（避开 `app.tools.__init__` 的
+#: 重量级 import 链），因此"加载到的是哪一版守卫"取决于磁盘上的那份文件 —— 旧副本
+#: （只认 `Name.attr` 两段、没有属性链与运行时 capability 校验）会让
+#: `asyncio.base_events.os.system(...)` 这类再导出逃逸**在插件通道上照常生效**。
+#: 版本不达标一律 fail-closed：宁可拒绝跑插件，也不用弱守卫跑。
+_GUARD_MIN_VERSION = 2
+
 
 def _load_code_guard():
     """按文件路径加载守卫模块（不触发 app.tools.__init__）。"""
@@ -35,7 +44,21 @@ def _load_code_guard():
         raise RuntimeError(f"cannot load code_guard from {guard_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _assert_guard_capable(module)
     return module
+
+
+def _assert_guard_capable(guard) -> None:
+    """校验加载到的守卫确实是"AST + 运行时 capability 双重校验"那一版。"""
+    version = getattr(guard, "GUARD_API_VERSION", 0)
+    if not isinstance(version, int) or version < _GUARD_MIN_VERSION:
+        raise RuntimeError(
+            f"plugin runner requires code_guard API >= {_GUARD_MIN_VERSION}, got {version!r} "
+            "(stale guard would let re-export escapes through)"
+        )
+    for attr in ("check_static", "safe_builtins", "capability_reason"):
+        if not callable(getattr(guard, attr, None)):
+            raise RuntimeError(f"plugin runner: code_guard is missing {attr}()")
 
 
 def _apply_resource_limits(max_memory_mb: int, max_cpu_seconds: float) -> None:
@@ -114,7 +137,13 @@ def main() -> int:
     except (TypeError, ValueError):
         pass  # 配置非法时用默认值，不阻断
 
-    guard = _load_code_guard()
+    try:
+        guard = _load_code_guard()
+    except RuntimeError as e:
+        # 守卫加载/版本校验失败 ⇒ **fail-closed**：结构化错误，绝不在弱守卫下执行插件。
+        _write_stdout(json.dumps({"success": False, "error": f"guard unavailable: {e}"},
+                                 ensure_ascii=False))
+        return 0
     try:
         result = _run_plugin(guard, payload)
     except RuntimeError as e:
