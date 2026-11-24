@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -217,11 +218,18 @@ func (h *RPAHub) GetClientByUser(userID string) (*RPAClient, bool) {
 
 // SendCommand 发送命令并等待结果（带超时）。
 // 本地未命中时若 Redis 注册中心指示对端在其它网关副本，则跨实例投递并等待结果。
+//
+// H40：调用者身份**必须非空**且与连接 owner 一致。此前 `userID == ""` 会跳过归属
+// 校验，于是任何漏传身份的调用方（旧引擎、错误的工具上下文）都能对**任意用户**的
+// 浏览器连接下发命令 —— 那是跨用户浏览器接管，不是"兼容旧调用方"。
 func (h *RPAHub) SendCommand(ctx context.Context, clientID string, cmd *RPACommand, userID string) (*RPAResult, error) {
+	if userID == "" {
+		return nil, fmt.Errorf("rpa caller user_id is required")
+	}
 	if client, ok := h.GetClient(clientID); ok {
 		// 归属校验：调用者（引擎按其当前用户传入）必须与连接 owner 一致，
 		// 否则会把命令投给另一个用户的浏览器。
-		if userID != "" && client.UserID != userID {
+		if client.UserID != userID {
 			return nil, fmt.Errorf("rpa client not owned by caller: %s", clientID)
 		}
 		return h.sendLocal(ctx, client, cmd)
@@ -229,11 +237,16 @@ func (h *RPAHub) SendCommand(ctx context.Context, clientID string, cmd *RPAComma
 	if h.localOnly {
 		return nil, fmt.Errorf("rpa client not connected: %s", clientID)
 	}
-	// 跨实例：查注册中心定位持有该 client 的网关副本
-	owner := h.registryOwner(clientID)
+	// 跨实例：查注册中心定位持有该 client 的网关副本。
+	// 归属校验必须在**本实例**先做一遍：注册记录里的 user_id 是目标连接的真实
+	// owner，只信目标实例的二次校验等于让一个被入侵/被绕过的副本把命令投给别人。
+	owner, ownerUser := h.registryOwner(clientID)
 	if owner == "" || owner == h.instanceID {
 		// 无记录 = 未连接；记录在本实例但本地已断 = 清理窗口，与未连接等价
 		return nil, fmt.Errorf("rpa client not connected: %s", clientID)
+	}
+	if ownerUser == "" || ownerUser != userID {
+		return nil, fmt.Errorf("rpa client not owned by caller: %s", clientID)
 	}
 	return h.sendRemote(ctx, clientID, owner, cmd, userID)
 }
@@ -417,10 +430,12 @@ func (h *RPAHub) AllClientIDs() []string {
 }
 
 // ClientIDsForUser 返回指定用户可见的已连接客户端（本实例 + Redis 注册中心）。
-// userID 为空时退化为全量（兼容未带身份的旧调用方）。
+//
+// H40：空 user_id 一律返回空列表。此前空身份会退化为"全量"—— 任何漏传身份的
+// 调用方都能枚举所有用户的浏览器连接（连接 ID 是下发命令的句柄，枚举即暴露攻击面）。
 func (h *RPAHub) ClientIDsForUser(userID string) []string {
-	if userID == "" {
-		return h.AllClientIDs()
+	if strings.TrimSpace(userID) == "" {
+		return []string{}
 	}
 	set := make(map[string]struct{})
 	for _, c := range h.ConnectedClients() {
@@ -640,11 +655,18 @@ func RPAExecHandler(hub *RPAHub, internalToken string) http.HandlerFunc {
 			ClientID string                 `json:"client_id"`
 			Method   string                 `json:"method"`
 			Params   map[string]interface{} `json:"params"`
-			// UserID 由引擎按其当前工具上下文的用户注入；非空时网关校验 client owner。
-			UserID string `json:"user_id,omitempty"`
+			// UserID 由引擎按其当前工具上下文的用户注入；**必填**（H40）。
+			UserID string `json:"user_id"`
 		}
 		if err := DecodeJSON(w, r, &req); err != nil || req.Method == "" || req.ClientID == "" {
 			BadRequest(w, "client_id and method are required")
+			return
+		}
+		// 身份必须是可信且非空的：空 user_id 无法做 owner 判定，只能 fail-closed。
+		// 旧引擎漏传时这里直接 400，浏览器工具会明确报错，而不是悄悄把命令投给
+		// 某个用户的连接（跨用户浏览器接管）。
+		if strings.TrimSpace(req.UserID) == "" {
+			BadRequest(w, "user_id is required")
 			return
 		}
 		result, err := hub.ExecCommand(r.Context(), req.ClientID, req.Method, req.Params, req.UserID)
@@ -656,15 +678,20 @@ func RPAExecHandler(hub *RPAHub, internalToken string) http.HandlerFunc {
 	}
 }
 
-// RPAClientsHandler 返回已连接浏览器插件客户端列表（本实例 + Redis 注册中心的全量）。
+// RPAClientsHandler 返回调用者自己的已连接浏览器插件客户端（本实例 + Redis 注册中心）。
 func RPAClientsHandler(hub *RPAHub, internalToken string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !rpaInternalTokenOK(r, internalToken) {
 			Unauthorized(w, "invalid internal token")
 			return
 		}
-		// 归属过滤：引擎按其当前用户查询 —— 未带 user_id 时退化为全量（兼容旧引擎）。
-		OK(w, map[string]interface{}{"client_ids": hub.ClientIDsForUser(r.URL.Query().Get("user_id"))})
+		// H40：列表必须按 owner 过滤，且空身份不能退化为全量。
+		userID := strings.TrimSpace(r.URL.Query().Get("user_id"))
+		if userID == "" {
+			BadRequest(w, "user_id is required")
+			return
+		}
+		OK(w, map[string]interface{}{"client_ids": hub.ClientIDsForUser(userID)})
 	}
 }
 

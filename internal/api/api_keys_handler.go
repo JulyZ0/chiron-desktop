@@ -87,8 +87,14 @@ const apiKeyRevokeQuery = `UPDATE api_keys SET revoked = true
 
 // apiKeyAuthQuery 是 `X-API-Key` 鉴权的唯一查询（`AuthMiddleware` 使用）。
 //
-// 一次 JOIN 完成五件事：key 存在、未吊销、未过期、所属用户绑定了租户、
-// 以及取回 key 的**签发时间**（用于与会话纪元比对）。
+// 一次 JOIN 完成六件事：key 存在、未吊销、未过期、所属用户**仍处于 active 状态**、
+// 所属用户绑定了租户、以及取回 key 的**签发时间**（用于与会话纪元比对）。
+//
+// 为什么状态判定必须写进这条 SQL（H40）：会话纪元是 Redis 里的一条记录，
+// `revokeUserSessions` 写失败（Redis 抖动/不可用）时 `AuthMiddleware` 会 fail-close
+// 拒绝**新的**请求，但缓存里的负命中或降级窗口仍可能放行；而"禁用/删除用户"
+// 是数据库里的权威事实，不依赖任何旁路写入。少了这一个谓词，管理员禁用某人后，
+// 该用户名下所有长期 API key 依然可用 —— 恰恰是最需要立即止血的场景。
 // `expires_at IS NULL` 表示永不过期 —— 漏掉这一支会让"永久 key"变成永久无效。
 //
 // 第 5 列是 key 的**签发时刻**（Unix 秒），供 `AuthMiddleware` 与会话纪元比对 ——
@@ -114,7 +120,8 @@ const apiKeyAuthQuery = `SELECT ak.id, u.id, u.role, COALESCE(u.tenant_id::text,
 					 JOIN api_keys ak ON ak.user_id = u.id
 					 WHERE ak.key_hash = $1
 					   AND COALESCE(ak.revoked, false) = false
-					   AND (ak.expires_at IS NULL OR ak.expires_at > NOW())`
+					   AND (ak.expires_at IS NULL OR ak.expires_at > NOW())
+					   AND COALESCE(NULLIF(u.status, ''), 'active') = 'active'`
 
 // apiKeyMarkUsedQuery 回写 `last_used_at`（由 `markAPIKeyUsed` 按节流调用）。
 const apiKeyMarkUsedQuery = `UPDATE api_keys SET last_used_at = now() WHERE id = $1`
