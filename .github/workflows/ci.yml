@@ -35,13 +35,47 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: .go-version
           cache: true
       # `-mod=mod` 是必需的：仓库里的 vendor/ 放的是参考源码（vendor/DeepSeek-Reasonix，
       # 不含 vendor/modules.txt），Go 只要看到 vendor/ 就会按 vendor 模式做一致性检查
       # 并报 "inconsistent vendoring"。run.py / Makefile / Dockerfile 同样显式排除了它。
       - run: go build -mod=mod ./...
       - run: go vet -mod=mod ./...
+      # ── H18：格式与漏洞门禁（缺一条就等于"这门禁可以被跳过"）──
+      #
+      # 版本固定在 `.go-version`（H13），本地也照它对齐；`go-version-file` 与
+      # `scripts/check_ci_gates.py` 一起守住"CI 装的就是这个版本"。
+      - name: gofmt (must be clean)
+        run: |
+          out="$(gofmt -l ./cmd ./internal ./config)"
+          if [ -n "$out" ]; then
+            echo "::error::gofmt 未通过："
+            echo "$out"
+            exit 1
+          fi
+      # 速度优先，但**不许静默跳过**：装了固定版本就一定会跑到；版本写死在这里，
+      # 随 `.go-version` 一起升级（避免"今天装 1.x、明天装 2.x"的隐式漂移）。
+      - name: golangci-lint (pinned)
+        env:
+          GOLANGCI_LINT_VERSION: v2.5.0
+        run: |
+          go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}"
+          "$(go env GOPATH)/bin/golangci-lint" version
+          "$(go env GOPATH)/bin/golangci-lint" run --timeout 5m
+      - name: govulncheck
+        env:
+          GOVULNCHECK_VERSION: v1.1.4
+        run: |
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          "$(go env GOPATH)/bin/govulncheck" ./...
+      # 并发缺陷只在 -race 下暴露；只挑并发重的包，控制时长。
+      - name: Race detector (concurrency-heavy packages)
+        run: |
+          go test -mod=mod -race -count=1 -parallel 1 \
+            ./internal/api/ ./internal/session/ ./internal/auth/ ./internal/queue/... 2>/dev/null \
+            || go test -mod=mod -race -count=1 -parallel 1 \
+                 ./internal/api/ ./internal/session/ ./internal/auth/
       # live/diag 用例要**真机** PostgreSQL/Redis（由下面的 integration job 用 services 提供）。
       # 这里按测试名过滤：仓内 live 用例没有 //go:build 标记，靠"环境缺失即自跳过"，
       # 混在一起只会让"跳过"与"通过"分不清。口径与 scripts/ci-smoke.sh 一致。
@@ -56,6 +90,26 @@ jobs:
           else
             echo "no vendor/modules.txt —— 跳过 vendor 一致性检查"
           fi
+
+  # ── H18：跨 OS 门禁 ─────────────────────────────────────────────────────
+  # 执行隔离在 Linux 与 Windows 上是**两套实现**（bwrap/RLIMIT 与低完整性/Job Object）。
+  # 只在 ubuntu 上跑等于默认"Windows 那半没坏" —— 这条 job 就是为了不让它靠假设。
+  go-windows:
+    name: Go gateway (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: .go-version
+          cache: true
+      - run: go build -mod=mod ./...
+      - run: go vet -mod=mod ./...
+      - name: Unit tests (Windows-visible packages)
+        # 与 linux job 同口径（跳过 Live/Diag），但不跑 race：Windows 上的 race
+        # 需要 cgo + gcc，属"环境不满足"而不是"代码有问题"。
+        run: go test -mod=mod ./internal/... ./config/... ./cmd/... -count=1 -skip 'Live|Diag'
+
 
   # ── Python 引擎 ─────────────────────────────────────────────────────────
   # job id 是 `engine`，对外显示名仍是 "Python engine"（分支保护按显示名匹配，
@@ -303,6 +357,66 @@ jobs:
         working-directory: frontend-vue/electron
         run: node --test __tests__/*.test.cjs
 
+  # ── H18：两个独立服务必须有独立 job ──────────────────────────────────────
+  # 它们的测试此前**根本没有 job** —— 于是"改坏了 sandbox 服务"或"PageIndex 检索
+  # 前缀规则退化"在 CI 上完全看不见（既不是通过也不是跳过，而是压根没跑）。
+  pageindex:
+    name: PageIndex service
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pageindex-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: pageindex-service/requirements*.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Ruff (lint)
+        run: ruff check .
+      - name: Pytest
+        run: python -m pytest -q
+
+  sandbox-service:
+    name: Sandbox service
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sandbox-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+      # 这个服务目前是**单文件**（`service.py` 直接复用引擎的 `app.tools.sandbox`）。
+      # 没有独立测试时，至少要把"它还能被导入/编译"钉住 —— 否则它坏掉的表现是
+      # 生产上执行全挂，而 CI 一片绿。
+      - name: Import & compile check
+        run: python -m py_compile service.py
+      - name: Pytest (repo-wide sandbox tests that cover this service)
+        working-directory: python-engine
+        env:
+          APP_SECRET: ci-python-app-secret-0123456789abcdef
+          JWT_SECRET: ci-python-jwt-secret-0123456789abcdef
+          INTERNAL_TOKEN: ci-integration-internal-token-0123456789
+        run: |
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          # ⚠ 不许静默 SKIP：这些用例覆盖"隔离不可用时必须拒绝执行"。
+          # `-rs` 把跳过原因打出来；一旦出现 skip 说明这台 runner 少了机制，
+          # 那是**要修 CI** 的信号，不是"当作通过"。
+          python -m pytest tests/test_sandbox_service.py tests/test_sandbox_isolation.py \
+            tests/test_sandbox_service_wiring.py -q -rs --no-header | tee /tmp/sandbox.txt
+          if grep -qE '^[0-9]+ skipped' /tmp/sandbox.txt; then
+            echo "::error::沙箱隔离用例出现 skip —— 执行隔离门禁不得静默跳过"
+            exit 1
+          fi
+
   # ── 迁移链整体性 ─────────────────────────────────────────────────────────
   schema:
     name: Migration chain
@@ -464,7 +578,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: .go-version
           cache: true
 
       - uses: actions/setup-python@v7
@@ -565,7 +679,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: .go-version
           cache: true
 
       - uses: pnpm/action-setup@v6
