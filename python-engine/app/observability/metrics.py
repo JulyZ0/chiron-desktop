@@ -127,6 +127,14 @@ QUEUE_RETRY_TOTAL = Counter(
     ["task_type"],
 )
 
+#: H34：本可以按 `MAXLEN` 裁剪、但为了不删掉 PEL 里未 ACK 的任务而**主动放弃裁剪**的次数。
+#: 这个数 > 0 说明队列积压已经顶到保留上限 —— 属于"降级但没丢任务"，需要告警跟进容量。
+QUEUE_RETENTION_DEGRADED = Counter(
+    "queue_retention_degraded_total",
+    "Queue appends that skipped trimming to protect un-ACKed (PEL) entries",
+    ["stream"],
+)
+
 # ── 子 Agent 作业级（P1-3：状态转移的观测面）──
 #
 # 为什么需要：子 Agent 的终态写入点不止一处（正常收尾 / 取消收尾 / 超时定时器 /

@@ -10,7 +10,7 @@ from typing import Any
 import redis.asyncio as aioredis
 
 from app.observability.logging import trace_id_var
-from app.queue.streams import queue_for_task
+from app.queue.streams import append_task, queue_for_task
 from app.redis_keys import rkey
 
 logger = logging.getLogger(__name__)
@@ -111,13 +111,24 @@ class QueueProducer:
         }
 
         spec = queue_for_task(task_type)
-        stream_id = await self._redis.xadd(spec.stream, message, maxlen=spec.maxlen)
+        # H34：不用裸 `XADD MAXLEN` 直接入队 —— 那会把仍在 PEL、未 ACK 的任务当成
+        # "最旧的条目"删掉且不进 DLQ。`append_task` 在组内有未 ACK 任务时放弃裁剪
+        # （降级 + 指标告警），否则使用近似裁剪。
+        span = await append_task(
+            self._redis,
+            stream=spec.stream,
+            group=spec.group,
+            fields=message,
+            maxlen=spec.maxlen,
+        )
         logger.info(
-            "Task enqueued: id=%s type=%s queue=%s stream_id=%s",
+            "Task enqueued: id=%s type=%s queue=%s stream_id=%s trimmed=%s degraded=%s",
             task_id,
             task_type,
             spec.key,
-            stream_id,
+            span.message_id,
+            span.trimmed,
+            span.degraded,
         )
         return task_id
 

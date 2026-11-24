@@ -16,12 +16,16 @@ DLQ 与延迟重试键也**按队列分开**：否则 kb 任务的重试会落�
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
 import redis.asyncio as aioredis
 
+from app.observability.metrics import QUEUE_RETENTION_DEGRADED
 from app.redis_keys import rkey
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -85,14 +89,22 @@ local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
 if #pending == 0 or pending[1][2] ~= ARGV[2] then
     return false
 end
-local added = redis.call('XADD', KEYS[2], 'MAXLEN', ARGV[4], '*', unpack(ARGV, 5))
+-- H34：源流里还有别人的未 ACK 条目就不裁剪（那可能是最旧的条目）。
+local summary = redis.call('XPENDING', KEYS[1], ARGV[1])
+local others = tonumber(summary[1] or 0) or 0
+local added
+if others > 1 then
+    added = redis.call('XADD', KEYS[2], '*', unpack(ARGV, 5))
+else
+    added = redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[4], '*', unpack(ARGV, 5))
+end
 redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
 return added
 """
 
 _PROMOTE_LUA = """
 local message = cjson.decode(ARGV[2])
-local fields = {'MAXLEN', ARGV[1], '*'}
+local fields = {'MAXLEN', '~', ARGV[1], '*'}
 for key, value in pairs(message) do
     fields[#fields + 1] = key
     fields[#fields + 1] = tostring(value)
@@ -117,6 +129,93 @@ def _field_args(fields: dict[Any, Any]) -> list[str]:
             value.decode() if isinstance(value, bytes) else value,
         )
     ]
+
+
+@dataclass(frozen=True)
+class AppendSpan:
+    """一次入队的结果：id + 是否发生了裁剪 / 是否因保护 PEL 而降级。"""
+
+    message_id: str
+    trimmed: bool
+    degraded: bool
+
+
+async def _pending_count(redis: aioredis.Redis, stream: str, group: str) -> int | None:
+    """消费组里未 ACK 的条数；读不到（NOGROUP/Redis 故障）返回 None。
+
+    ``None`` 在调用方那里按"可能有未 ACK 项"处理 —— 宁可少裁剪，也不赌一把删掉任务。
+    """
+    try:
+        summary = await redis.xpending(stream, group)
+    except Exception as exc:  # noqa: BLE001 - 读不到就不裁剪
+        logger.debug("queue retention: XPENDING failed for %s/%s: %s", stream, group, exc)
+        return None
+    if isinstance(summary, bool):  # bool 是 int 的子类，先排除
+        return None
+    if isinstance(summary, (int, str)):
+        try:
+            return int(summary)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(summary, dict):
+        try:
+            return int(summary.get("pending", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+    # 某些客户端/版本返回 `[count, min, max, consumers]`
+    if isinstance(summary, (list, tuple)) and summary:
+        try:
+            return int(summary[0] or 0)
+        except (TypeError, ValueError):
+            return None
+    return 0
+
+
+async def append_task(
+    redis: aioredis.Redis,
+    *,
+    stream: str,
+    group: str,
+    fields: dict[Any, Any],
+    maxlen: int,
+) -> AppendSpan:
+    """入队，且**绝不为了裁剪而删掉未 ACK 的任务**（PRD 9.7 H34）。
+
+    Redis 的 ``XADD MAXLEN`` 是流级修剪：删的是最旧的条目，它并不知道那条任务还在
+    某个消费组的 PEL 里等着重试。一旦积压顶到上限，一次普通入队就能把"正在重试的
+    任务"从流里抹掉 —— 且不进 DLQ、不留日志。
+
+    策略（保守优先）：
+
+    1. 组里**还有未 ACK 的条目** → 完全不裁剪（``XADD`` 不带 MAXLEN）。队列会短暂
+       超出上限，但既没有任务被删，也能通过 :data:`QUEUE_RETENTION_DEGRADED` 指标
+       与告警看到"该扩容/该查积压了"。
+    2. ``XPENDING`` 读不到（NOGROUP / Redis 抖动）→ 同样不裁剪（同上，宁可超限）。
+    3. 没有未 ACK 条目 → 用**近似裁剪** ``MAXLEN ~ n``：允许长度在 n 附近浮动，
+       换取 O(1) 的追加成本，并且不会为了"精确 n"去逐条评估删除。
+    """
+    if maxlen is None or maxlen <= 0:
+        message_id = await redis.xadd(stream, fields)
+        return AppendSpan(str(message_id), trimmed=False, degraded=False)
+
+    pending = await _pending_count(redis, stream, group)
+    if pending is None or pending > 0:
+        QUEUE_RETENTION_DEGRADED.labels(stream=stream).inc()
+        logger.warning(
+            "queue retention degraded: stream=%s group=%s pending=%s maxlen=%d "
+            "-> append without MAXLEN to protect un-ACKed tasks",
+            stream,
+            group,
+            "unknown" if pending is None else pending,
+            maxlen,
+        )
+        message_id = await redis.xadd(stream, fields)
+        return AppendSpan(str(message_id), trimmed=False, degraded=True)
+
+    # 近似裁剪：`~` 让 Redis 在"块边界"上停止删除，不会为了精确长度做额外工作；
+    # 具体长度由 Redis 决定，但成本是 O(1) 摊还。
+    message_id = await redis.xadd(stream, fields, maxlen=maxlen, approximate=True)
+    return AppendSpan(str(message_id), trimmed=True, degraded=False)
 
 
 async def atomic_xadd_ack(

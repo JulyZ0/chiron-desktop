@@ -118,7 +118,16 @@ if #pending == 0 or pending[1][2] ~= ARGV[3] then
     return 0
 end
 if ARGV[5] == 'xadd' then
-    redis.call('XADD', KEYS[3], 'MAXLEN', ARGV[7], '*', unpack(ARGV, 11))
+    -- 近似裁剪（H34）：源流里还有**别人的**未 ACK 条目时完全不裁剪 —— 它们可能正是
+    -- 最旧的条目，一次重投就会把它们抹掉且不进 DLQ。只剩本条（本脚本稍后会 XACK
+    -- 它）时才用 `MAXLEN ~`。
+    local summary = redis.call('XPENDING', KEYS[2], ARGV[2])
+    local others = tonumber(summary[1] or 0) or 0
+    if others > 1 then
+        redis.call('XADD', KEYS[3], '*', unpack(ARGV, 11))
+    else
+        redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[7], '*', unpack(ARGV, 11))
+    end
 elseif ARGV[5] == 'zadd' then
     redis.call('ZADD', KEYS[3], ARGV[8], ARGV[11])
 elseif ARGV[5] ~= 'none' then

@@ -23,15 +23,28 @@ Resolves the database URL from:
 不该被用户 ``.env`` 里的开发库地址覆盖；反过来，托管路径也不该改写开发的约定。
 """
 import os
+import sys
+from collections.abc import Callable
 from logging.config import fileConfig
 from pathlib import Path
-
-from dotenv import load_dotenv
-
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
+from typing import Any
 
 from alembic import context
+from dotenv import load_dotenv  # noqa: F401  - 兼容既有的环境依赖，真实加载走 dsn 模块
+from sqlalchemy import engine_from_config, pool
+
+# 纯函数放在 `migrations/dsn.py`（可单测，不触发迁移）：这里只负责把它们串起来。
+_MIGRATIONS_DIR = Path(__file__).resolve().parent
+if str(_MIGRATIONS_DIR) not in sys.path:
+    sys.path.insert(0, str(_MIGRATIONS_DIR))
+
+from dsn import (  # noqa: E402  - 必须先补 sys.path
+    load_env_files,
+    normalize_dsn,
+    password_of,
+    sanitize_text,
+    target_line,
+)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -45,100 +58,65 @@ if config.config_file_name is not None:
 # 加载 .env 文件 - 支持多个位置
 project_root = Path(__file__).parent.parent
 
-# 按优先级尝试加载 .env 文件
+# 按优先级尝试加载 .env 文件。**不覆盖显式环境变量**：旧实现带 override，会把桌面壳
+# 临时写入的 `DATABASE_DSN`（指向内嵌 PG 实例）覆盖成用户 .env 里的开发库地址 ——
+# 迁移打到错误的库上，且进程内看起来"成功"。
 env_candidates = [
     project_root / '.env',              # 根目录 .env
     project_root / 'config' / '.env',   # config 目录 .env
 ]
-env_loaded = False
-for env_file in env_candidates:
-    if env_file.exists():
-        load_dotenv(env_file, override=True)
-        print(f"[Alembic] Loaded .env from {env_file}")
-        env_loaded = True
-        break
+env_loaded = load_env_files(env_candidates)
 
-if not env_loaded:
-    print(f"[Alembic] Warning: .env file not found. Searched:")
+if env_loaded is not None:
+    print(f"[Alembic] Loaded .env from {env_loaded} (explicit environment variables win)")
+else:
+    print("[Alembic] Warning: .env file not found. Searched:")
     for p in env_candidates:
         print(f"  - {p}")
 
-def get_database_url() -> str | None:
-    """Resolve database URL from DATABASE_DSN env → alembic.ini fallback."""
+
+def get_database_url() -> tuple[str | None, str]:
+    """Resolve database URL from DATABASE_DSN env → alembic.ini fallback.
+
+    返回 ``(dsn, source)``，``source`` 只用于迁移前摘要（不参与连接）。
+    """
     # 1) DATABASE_DSN environment variable (highest priority)
     db_dsn = os.getenv("DATABASE_DSN")
     if db_dsn:
-        return db_dsn
+        return db_dsn, "env:DATABASE_DSN"
 
     # 2) alembic.ini fallback
     fallback = config.get_main_option("sqlalchemy.url")
     if fallback:
-        print(f"[Alembic] Using fallback URL from alembic.ini")
-        return fallback
+        return fallback, "alembic.ini"
 
-    return None
+    return None, "none"
+
+
+def migration_head() -> str:
+    """当前 migration head（打印用；拿不到也不阻断迁移）。"""
+    try:
+        from alembic.script import ScriptDirectory
+
+        head = ScriptDirectory.from_config(config).get_current_head()
+        return str(head or "(unknown)")
+    except Exception as exc:  # noqa: BLE001 - 摘要失败不该拦住迁移
+        return f"(unknown: {type(exc).__name__})"
+
 
 # Set the database URL
-db_url = get_database_url()
-# 隐藏密码打印
-# 隐藏密码打印：密码可能含 @ 与 :（如 p@ssw0rd!），必须按「最后一个 @」定位 host，
-# 否则密码后半段会被当成 host 打印进 Alembic 日志（凭据泄露）。
-safe_url = "(none)"
-if db_url:
-    if '@' in db_url:
-        _scheme, _, _rest = db_url.partition('://')
-        _userinfo, _, _host = _rest.rpartition('@')
-        if ':' in _userinfo:
-            safe_url = f"{_scheme}://{_userinfo.split(':', 1)[0]}:***@{_host}"
-        else:
-            safe_url = db_url
-    else:
-        safe_url = db_url
-print(f"[Alembic] Database URL: {safe_url}")
-if db_url:
-    # Ensure postgresql:// prefix for SQLAlchemy
-    if db_url.startswith('postgres://'):
-        db_url = db_url.replace('postgres://', 'postgresql://', 1)
-    
-    # URL-encode the password if it contains special characters
-    # Use regex to extract and re-encode the password portion
-    from urllib.parse import quote
-    import re
-    
-    try:
-        # Match pattern: postgresql://user:password@host...
-        # Use greedy match for password to handle @ in password
-        # The last @ before host is the separator
-        match = re.match(r'(postgresql://[^:]+:)(.+)(@[^@]+:\d+/.+)', db_url)
-        if match:
-            prefix = match.group(1)  # postgresql://user:
-            raw_password = match.group(2)  # raw password (may contain @ and other special chars)
-            suffix = match.group(3)  # @host:port/db?params
-            
-            # URL-encode the password
-            from urllib.parse import quote
-            encoded_password = quote(raw_password, safe='')
-            db_url = prefix + encoded_password + suffix
-            print(f"[Alembic] Password URL-encoded successfully")
-        else:
-            # Try simpler pattern without port
-            match = re.match(r'(postgresql://[^:]+:)(.+)(@[^@:]+\..+)', db_url)
-            if match:
-                prefix = match.group(1)
-                raw_password = match.group(2)
-                suffix = match.group(3)
-                
-                from urllib.parse import quote
-                encoded_password = quote(raw_password, safe='')
-                db_url = prefix + encoded_password + suffix
-                print(f"[Alembic] Password URL-encoded successfully (simple pattern)")
-            else:
-                print(f"[Alembic] Warning: Could not parse URL structure for password encoding")
-                print(f"[Alembic] Debug: db_url = {db_url}")
-    except Exception as e:
-        print(f"[Alembic] Warning: Failed to encode URL: {e}")
-    
-    config.set_main_option("sqlalchemy.url", db_url)
+raw_url, url_source = get_database_url()
+db_url = normalize_dsn(raw_url) if raw_url else None
+# 默认只打印脱敏目标 + head（PRD 9.7 H32）：DSN 本身绝不进日志，规范化差异也不回显
+# 任何凭据形态。
+print(target_line(db_url, migration_head(), url_source))
+if db_url and raw_url and db_url != raw_url:
+    print("[Alembic] DSN normalized (scheme fixed / password percent-encoded exactly once)")
+# **不把 URL 写回 alembic 的 ini 配置**：`Config.set_main_option` 走 ConfigParser，
+# 编码后的密码（如 `p%40ss`）会被当成插值语法直接抛
+# `ValueError: invalid interpolation syntax`，迁移连一次都不跑。URL 改为直接传给
+# `context.configure` / `engine_from_config`（见下），既不经过插值，也不再落进日志。
+
 
 # 迁移为**手写 SQL**（各迁移文件的 op.execute）：这里不再注册 ORM metadata。
 # 2026-10-16：`models.yaml → shared/models ORM → 守卫` 的生成链路已整体移除
@@ -165,7 +143,7 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    url = config.get_main_option("sqlalchemy.url")
+    url = db_url or config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -184,10 +162,15 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    engine_kwargs: dict[str, Any] = {"poolclass": pool.NullPool}
+    if db_url:
+        # 显式 URL 覆盖 ini 里的 sqlalchemy.url：不经 ConfigParser 插值，密码里的
+        # `%` 不会被当成语法错误。
+        engine_kwargs["url"] = db_url
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
+        **engine_kwargs,
     )
 
     with connectable.connect() as connection:
@@ -224,7 +207,23 @@ def run_migrations_online() -> None:
             context.run_migrations()
 
 
+def _run_guarded(target: Callable[[], None]) -> None:
+    """执行迁移；失败时打印**脱敏后**的错误再原样抛出（失败必须响亮，凭据不许外泄）。"""
+    try:
+        target()
+    except BaseException as exc:  # noqa: BLE001 - 只做脱敏，语义不变
+        message = sanitize_text(
+            f"{type(exc).__name__}: {exc}",
+            db_url or "",
+            raw_url or "",
+            password_of(db_url or ""),
+            password_of(raw_url or ""),
+        )
+        print(f"[Alembic] migration failed: {message}", file=sys.stderr)
+        raise
+
+
 if context.is_offline_mode():
-    run_migrations_offline()
+    _run_guarded(run_migrations_offline)
 else:
-    run_migrations_online()
+    _run_guarded(run_migrations_online)
