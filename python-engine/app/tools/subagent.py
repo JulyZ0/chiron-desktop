@@ -443,6 +443,17 @@ async def subagent(
         if current is not None and current.cancelling():
             if not work.done():
                 work.cancel()
+                # H9：取消要**真有上界**。只 `cancel()` 不等待，父 turn 会带着
+                # CancelledError 退出、子 task 可能还在收尾（落库 / 还租约甚至继续
+                # 打模型）—— 那就是"父已取消、子还在跑"。等一个收敛宽限，超时就
+                # 交回给租约 TTL 兜底（宁可偶尔漏一次释放，也不无限等）。
+                from app.agent.cancellation import terminate_grace_seconds
+
+                try:
+                    await asyncio.wait({work}, timeout=terminate_grace_seconds())
+                except asyncio.CancelledError:
+                    # 外层在等的时候又被取消：直接向上传播，收尾交给租约。
+                    raise
             raise
         return {
             "status": "cancelled",

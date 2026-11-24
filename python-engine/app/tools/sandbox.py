@@ -1241,10 +1241,13 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
     except Exception as exc:  # noqa: BLE001 — 隔离附加失败不应让命令跑不起来
         logger.warning("shell_exec: job object attach failed: %s", exc)
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        # H9：取消/超时都必须**先杀进程再返回**。`await proc.communicate()` 被取消时
+        # 只是这个协程停下，子进程照旧跑（POSIX 上没有 Job Object 兜底）—— 那就是
+        # "用户点了停止，命令还在写磁盘"。回收逻辑统一在 `communicate_or_cancel` 里。
+        from app.agent.cancellation import communicate_or_cancel
+
+        stdout, stderr = await communicate_or_cancel(proc, timeout=timeout)
     except TimeoutError:
-        proc.kill()
-        await proc.wait()
         return {"error": "timeout", "timeout": timeout}
     finally:
         # 必须显式关闭：job 句柄泄漏会累积内核对象，且 KILL_ON_JOB_CLOSE 永远不触发

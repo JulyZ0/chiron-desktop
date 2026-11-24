@@ -389,7 +389,26 @@ async def execute_tool(
     if is_subagent:
         await hooks.subagent_start(task=task, tool_call=tool_call)
 
-    result = await runtime._dispatch_tool(tool_call, task)
+    # ── H9：取消要能落到**当前这次调用**上 ──
+    # 只是在轮次边界查一次中断，等于"用户点了停止，工具照旧跑完"：长命令、长委派、
+    # 长网络请求都会在用户以为已经停下之后继续产生作用。这里把调用跑在独立 task 里，
+    # 与会话中断信号赛跑：命中即取消并在收敛期内确认它真的停下；已经可能产生外部
+    # 动作的调用返回"结果未知"，而不是一个看起来成功的空结果。
+    from app.agent.cancellation import run_tool_with_cancellation
+
+    result, cancelled = await run_tool_with_cancellation(
+        runtime,
+        tool_call,
+        task,
+        dispatch=lambda: runtime._dispatch_tool(tool_call, task),
+    )
+    if cancelled:
+        logger.info(
+            "tool %s cancelled while running (id=%s outcome=%s)",
+            tool_name,
+            tool_call.get("id"),
+            (result or {}).get("outcome") if isinstance(result, dict) else "?",
+        )
 
     if is_subagent:
         await hooks.subagent_stop(task=task, tool_call=tool_call, result=result)
