@@ -726,6 +726,11 @@ function toAbsolute(rel: string): string {
  *
  * 二进制文件本来就无法预览，提示里写着"用系统程序打开" —— 那就必须真的有一个
  * 能按的地方。Web 端没有这层能力时明说，而不是点了一下什么都不发生。
+ *
+ * H49：把 `root` 一并交给主进程 —— 主进程要判定 canonical 路径确实落在
+ * **用户批准的**项目根内，而不是信任渲染层给的任意路径。这里的 `rootPath`
+ * 来自后端文件列表接口，只是"声明的根"；批准动作由主进程弹原生对话框完成，
+ * 页面没有任何绕过手段。
  */
 async function openWithSystem(entry: ProjectFileEntry) {
   const host = desktopHost()
@@ -734,7 +739,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
     return
   }
   try {
-    const res = await host.openPath({ path: toAbsolute(entry.path) })
+    const res = await host.openPath({ path: toAbsolute(entry.path), root: rootPath.value })
     if (!res?.ok) {
       notify.error(tr('chat.workbench_open_failed', { message: res?.message || res?.reason || '' }))
     }

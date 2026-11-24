@@ -110,10 +110,12 @@ export interface ChironDesktopHost {
   /**
    * 用系统默认程序打开本地路径，或在文件管理器里定位（`reveal: true`）。
    *
-   * 只接受**绝对路径**；主进程会先确认存在再交给系统。老外壳没有这个成员，
-   * 调用点必须能降级（例如复制路径并提示用户自己打开）。
+   * 主进程会按 H49 的口径判定：realpath 之后的路径必须落在**用户批准的项目根**内
+   * （`root` 是工作台从 API 拿到的项目根，仅作为"声明的根"参与判定；真正批准
+   * 只能由主进程的原生对话框完成），`reveal` 始终放行，可执行类型需要独立确认。
+   * 老外壳没有这个成员，调用点必须能降级（例如复制路径并提示用户自己打开）。
    */
-  openPath?: (payload: { path: string; reveal?: boolean }) => Promise<OpenPathResult>
+  openPath?: (payload: { path: string; reveal?: boolean; root?: string }) => Promise<OpenPathResult>
   /**
    * 引擎环境变量开关（白名单）。
    *
@@ -179,9 +181,17 @@ export interface WindowTitleBarApi {
 /** `openPath` 的结构化结果：失败要能区分原因 */
 export interface OpenPathResult {
   ok: boolean
-  /** `empty-path` / `not-absolute` / `missing` / `open-failed` */
+  /**
+   * `empty-path` / `not-absolute` / `missing` / `open-failed`（既有）；
+   * `unc-path` / `outside-approved-root` / `root-not-approved`（H49 新增）；
+   * `executable-needs-confirmation` / `unknown-needs-confirmation`（H49 新增）。
+   */
   reason?: string
   message?: string
+  /** 主进程实际做了什么：定位（不执行）还是打开。 */
+  action?: 'reveal' | 'open'
+  /** 目标的判定类型：`dir` / `document` / `executable` / `unknown`。 */
+  kind?: string
 }
 
 /**
