@@ -33,6 +33,8 @@ import {
   BUILTIN_SOURCE_ID,
   MARKET_KINDS,
   describeMarketError,
+  disableMarketItem,
+  enableMarketItem,
   getMarketItem,
   installMarketItem,
   listInstalledMarketItems,
@@ -80,6 +82,9 @@ const dismissedWarnings = ref<Set<string>>(new Set())
 
 /** 正在安装/卸载的条目 key —— 只让被点的那张卡片转圈。 */
 const installingKey = ref('')
+
+/** 正在启用/停用的条目 key（与安装分开：两条动作可以并行发生但按钮各自转圈）。 */
+const togglingKey = ref('')
 
 // ── 详情抽屉 ──
 
@@ -275,6 +280,26 @@ function installedEnabled(it: { source: string; kind: MarketKind; id: string }):
 }
 
 /**
+ * 「权限需求」的可读摘要（H75：启用前要让用户看清这条内容要什么）。
+ *
+ * 只列**需求**、不列凭据值：`requires.env` 里是键名，值由用户在表单里填、只在内存。
+ * 三类需求分开说，因为它们对应不同的下一步动作：
+ *   - env     → 要在安装/设置里提供凭据；
+ *   - model   → 需要一个可用的模型；
+ *   - approval→ 要先去插件页逐条授权（外部 mcp 还有用户级总开关）。
+ */
+function permissionSummary(it: MarketItem): string {
+  const parts: string[] = []
+  const envKeys = it.requires?.env ?? []
+  if (envKeys.length) parts.push(tr('market.permission.env', { keys: envKeys.join(', ') }))
+  if (it.requires?.model) parts.push(tr('market.permission.model'))
+  if (it.requires?.approval) parts.push(tr('market.permission.approval'))
+  if (it.kind === 'mcp') parts.push(tr('market.permission.command'))
+  if (!parts.length) return tr('market.permission.none')
+  return parts.join(' · ')
+}
+
+/**
  * 告警文案。`reason` 是稳定机器码，一律本地化 —— 后端 `detail` 里带 URL 和英文异常，
  * 直接展示等于把内部实现甩给用户。
  *
@@ -425,6 +450,55 @@ function installFromDetail() {
   const it = detailItem.value
   if (!it) return
   confirmInstall(it, { ...detailEnv })
+}
+
+// ── 启用 / 停用（H75：装完 inert，显式信任才可用）──
+
+/**
+ * 启用前先确认。
+ *
+ * 为什么要一次显式确认：启用意味着这条内容**开始被注入/执行/连接**，
+ * 而它来自外部源。确认文案必须说清"启用前会重新校验完整性 + 检查插件授权"，
+ * 否则用户会以为"启用"只是把徽标从灰变绿。
+ */
+function askEnable(it: { source: string; kind: MarketKind; id: string; name: string }) {
+  Modal.confirm({
+    title: tr('market.enable_confirm_title', { name: it.name }),
+    content: tr('market.enable_confirm_hint'),
+    okText: tr('market.enable'),
+    cancelText: tr('common.cancel'),
+    onOk: () => doToggle(it, true),
+  })
+}
+
+function askDisable(it: { source: string; kind: MarketKind; id: string; name: string }) {
+  Modal.confirm({
+    title: tr('market.disable_confirm_title', { name: it.name }),
+    content: tr('market.disable_confirm_hint'),
+    okText: tr('market.disable'),
+    okButtonProps: { danger: true },
+    cancelText: tr('common.cancel'),
+    onOk: () => doToggle(it, false),
+  })
+}
+
+async function doToggle(
+  it: { source: string; kind: MarketKind; id: string; name: string },
+  enable: boolean,
+) {
+  togglingKey.value = marketItemKey(it)
+  try {
+    if (enable) await enableMarketItem(it.source, it.kind, it.id)
+    else await disableMarketItem(it.source, it.kind, it.id)
+    await loadInstalled()
+    message.success(
+      tr(enable ? 'market.enable_success' : 'market.disable_success', { name: it.name }),
+    )
+  } catch (e) {
+    message.error(describeMarketError(e, enable ? 'enable' : 'disable'))
+  } finally {
+    togglingKey.value = ''
+  }
 }
 </script>
 
@@ -635,6 +709,15 @@ function installFromDetail() {
           {{ $t('market.unsigned_hint') }}
         </p>
 
+        <!-- 装完 inert（H75）：外部内容必须由用户显式启用才可注入/执行/连接 -->
+        <p
+          v-if="isInstalled(it) && !installedEnabled(it)"
+          class="quarantine-hint"
+          data-testid="market-quarantine-hint"
+        >
+          {{ $t('market.quarantine_hint') }}
+        </p>
+
         <div class="card-actions">
           <Button
             type="text"
@@ -653,16 +736,37 @@ function installFromDetail() {
           >
             {{ $t('market.install') }}
           </Button>
-          <Button
-            v-else
-            danger
-            size="small"
-            data-testid="market-uninstall"
-            :loading="installingKey === marketItemKey(it)"
-            @click.stop="askUninstall(it)"
-          >
-            {{ $t('market.uninstall') }}
-          </Button>
+          <template v-else>
+            <!-- 装完 inert：未启用的条目只给「启用」，已启用的给「停用」（H75） -->
+            <Button
+              v-if="!installedEnabled(it)"
+              type="primary"
+              size="small"
+              data-testid="market-enable"
+              :loading="togglingKey === marketItemKey(it)"
+              @click.stop="askEnable(it)"
+            >
+              {{ $t('market.enable') }}
+            </Button>
+            <Button
+              v-else
+              size="small"
+              data-testid="market-disable"
+              :loading="togglingKey === marketItemKey(it)"
+              @click.stop="askDisable(it)"
+            >
+              {{ $t('market.disable') }}
+            </Button>
+            <Button
+              danger
+              size="small"
+              data-testid="market-uninstall"
+              :loading="installingKey === marketItemKey(it)"
+              @click.stop="askUninstall(it)"
+            >
+              {{ $t('market.uninstall') }}
+            </Button>
+          </template>
         </div>
       </div>
     </div>
@@ -842,6 +946,26 @@ function installFromDetail() {
           </p>
         </div>
 
+        <!-- 来源与权限需求：启用前用户要能一眼看清"这是谁给的、需要什么"（H75） -->
+        <div
+          class="detail-section"
+          data-testid="market-detail-permissions"
+        >
+          <span class="detail-label">{{ $t('market.detail.permissions_label') }}</span>
+          <p class="detail-value">
+            {{ sourceLabel(detailItem.source) }} · {{ sourceTypeLabel(detailItem.source) }}
+          </p>
+          <p class="detail-value">
+            {{ permissionSummary(detailItem) }}
+          </p>
+          <p
+            v-if="isInstalled(detailItem)"
+            class="detail-value"
+          >
+            {{ installedEnabled(detailItem) ? $t('market.installed_badge') : $t('market.installed_disabled_hint') }}
+          </p>
+        </div>
+
         <div class="detail-actions">
           <Button @click="closeDetail">
             {{ $t('common.close') }}
@@ -854,14 +978,32 @@ function installFromDetail() {
           >
             {{ $t('market.install') }}
           </Button>
-          <Button
-            v-else
-            danger
-            :loading="installingKey === marketItemKey(detailItem)"
-            @click="askUninstall(detailItem)"
-          >
-            {{ $t('market.uninstall') }}
-          </Button>
+          <template v-else>
+            <Button
+              v-if="!installedEnabled(detailItem)"
+              type="primary"
+              data-testid="market-detail-enable"
+              :loading="togglingKey === marketItemKey(detailItem)"
+              @click="askEnable(detailItem)"
+            >
+              {{ $t('market.enable') }}
+            </Button>
+            <Button
+              v-else
+              data-testid="market-detail-disable"
+              :loading="togglingKey === marketItemKey(detailItem)"
+              @click="askDisable(detailItem)"
+            >
+              {{ $t('market.disable') }}
+            </Button>
+            <Button
+              danger
+              :loading="installingKey === marketItemKey(detailItem)"
+              @click="askUninstall(detailItem)"
+            >
+              {{ $t('market.uninstall') }}
+            </Button>
+          </template>
         </div>
       </div>
       <PageSkeleton
@@ -995,12 +1137,21 @@ function installFromDetail() {
   line-height: 1.5;
 }
 
+/* 装完 inert 的提示：与"未签名"同一视觉层级（提醒，不是错误） */
+.quarantine-hint {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-secondary, var(--text-3));
+  line-height: 1.5;
+}
+
 .card-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 4px;
   margin-top: auto;
+  flex-wrap: wrap;
 }
 
 .market-pagination {

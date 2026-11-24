@@ -259,6 +259,55 @@ export async function uninstallMarketItem(
   )
 }
 
+/**
+ * 启用一条已安装内容（H75：显式信任）。
+ *
+ * 后端在启用前会**重新做完整性校验**（外部条目的 manifest 会再抓一次、比对 sha256
+ * 与签名）与**插件授权检查**（mcp 需要插件页已逐条授权 + 用户级总开关已开）。
+ * 因此 403 是"还差一步授权"，422 是"内容已不可信"，两者都要给可操作提示，
+ * 不能折叠成一句"请求失败"。
+ */
+export async function enableMarketItem(
+  source: string,
+  kind: MarketKind,
+  id: string,
+): Promise<MarketInstallResult> {
+  const { data } = await api.post(
+    `/v1/market/install/${encodeURIComponent(source)}/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/enable`,
+  )
+  return normalizeToggleResult(data?.data, { source, kind, id })
+}
+
+/** 停用一条已安装内容：**立即**失去执行资格（插件旧授权同时作废）。 */
+export async function disableMarketItem(
+  source: string,
+  kind: MarketKind,
+  id: string,
+): Promise<MarketInstallResult> {
+  const { data } = await api.post(
+    `/v1/market/install/${encodeURIComponent(source)}/${encodeURIComponent(kind)}/${encodeURIComponent(id)}/disable`,
+  )
+  return normalizeToggleResult(data?.data, { source, kind, id })
+}
+
+/** 启停接口的响应与安装同形；缺字段时按"已启用/未启用"分别兜底。 */
+function normalizeToggleResult(
+  raw: unknown,
+  fallback: { source: string; kind: MarketKind; id: string },
+): MarketInstallResult {
+  const body = (raw ?? {}) as Partial<MarketInstallResult>
+  return {
+    installed: body.installed ?? true,
+    source: body.source ?? fallback.source,
+    kind: body.kind ?? fallback.kind,
+    id: body.id ?? fallback.id,
+    ref: body.ref,
+    already_installed: body.already_installed,
+    enabled: body.enabled ?? false,
+    requires_approval: body.requires_approval ?? false,
+  }
+}
+
 export async function listInstalledMarketItems(kind?: MarketKind): Promise<MarketInstalledItem[]> {
   const { data } = await api.get('/v1/market/install', {
     params: { kind: kind || undefined },
@@ -290,24 +339,42 @@ export function marketWarningKey(w: MarketWarning): string {
   return `${w.source}|${w.reason}`
 }
 
-export type MarketErrorOp = 'catalog' | 'install' | 'uninstall' | 'source_add' | 'source_remove'
+export type MarketErrorOp =
+  | 'catalog'
+  | 'install'
+  | 'uninstall'
+  | 'enable'
+  | 'disable'
+  | 'source_add'
+  | 'source_remove'
 
 /**
  * 把市场请求失败翻译成**用户能看懂**的本地化文案。
  *
  * 为什么不直接用 `describeApiError`：市场有几个与业务强绑定的状态码语义 ——
  * `403` 是"这个部署不允许自建源"（不是权限不足），`409` 在**加源**时是"数量已达上限"
- * 而在**安装**时是"已经装过了"。通用映射会把这些都说成"请求失败"，用户无从处置。
+ * 而在**安装**时是"已经装过了"，在**启用**时是"该类型不支持原地更新/需要重装"。
+ * 通用映射会把这些都说成"请求失败"，用户无从处置。
  */
 export function describeMarketError(error: unknown, op: MarketErrorOp = 'catalog'): string {
   const status = errorStatus(error)
-  if (status === 403 && (op === 'source_add' || op === 'source_remove')) {
-    return t('market.error.user_sources_forbidden')
+  if (status === 403) {
+    if (op === 'source_add' || op === 'source_remove') {
+      return t('market.error.user_sources_forbidden')
+    }
+    if (op === 'enable') {
+      // 启用被拒：外部源关闭 / 插件还没被逐条授权 / 用户总开关没开。
+      return t('market.error.enable_denied')
+    }
   }
   if (status === 409) {
-    return op === 'source_add'
-      ? t('market.error.source_limit_reached')
-      : t('market.error.conflict')
+    if (op === 'source_add') return t('market.error.source_limit_reached')
+    if (op === 'enable') return t('market.error.enable_conflict')
+    return t('market.error.conflict')
+  }
+  if (status === 422 && (op === 'install' || op === 'enable')) {
+    // 完整性/信任链不通过：内容不可信，需要联系发布方或换源，重试没有意义。
+    return t('market.error.integrity_failed')
   }
   return t('market.error.request_failed')
 }

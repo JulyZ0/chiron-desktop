@@ -47,6 +47,16 @@ var (
 	errInstallUpstream       = errors.New("market install upstream failed")
 )
 
+// MCP 插件配置的 status 取值（与插件页 Update 接受的枚举一致：active / inactive）。
+//
+// 引擎侧只连 `status=active` 的 server（见 python-engine/app/plugins/store.py 的
+// active_servers），所以"装完能不能连上"完全由这个字段决定 —— 市场内容在获得显式
+// 信任之前必须是 inactive（H75：不注入、不执行、不连接）。
+const (
+	pluginStatusActive   = "active"
+	pluginStatusInactive = "inactive"
+)
+
 // installResponse 是 POST /v1/market/install 的响应体（与前端分支的契约一一对应）。
 type installResponse struct {
 	Installed        bool           `json:"installed"`
@@ -55,6 +65,7 @@ type installResponse struct {
 	ID               string         `json:"id"`
 	Ref              map[string]any `json:"ref"`
 	AlreadyInstalled bool           `json:"already_installed,omitempty"`
+	Updated          bool           `json:"updated,omitempty"`
 	Enabled          bool           `json:"enabled"`
 	RequiresApproval bool           `json:"requires_approval"`
 }
@@ -62,15 +73,18 @@ type installResponse struct {
 // MarketInstallHandler 暴露安装/卸载/已安装列表三条路由。
 type MarketInstallHandler struct {
 	svc *market.Service
-	// install 是编排服务（幂等与策略都在里面）。
+	// install 是编排服务（幂等、策略与信任链校验都在里面）。
 	install *market.InstallService
+	// plugins 是 mcp 落点用的插件存储，也是「启用前插件授权检查」的读取口
+	// （H75：外部 mcp 必须先被用户逐条授权，市场侧的启用才有意义）。
+	plugins *PluginHandler
 }
 
 // NewMarketInstallHandler 构造安装 handler。
 //
 // `py` 可为 nil（未接引擎）：skill / knowledge 两类随之返回 501，其余照常。
 // `plugins` 为 MCP 落点（复用插件页的 plugins.json 读写，不新开一份配置文件）。
-// `cfg` 为 nil 时按最保守的默认值走（外部 MCP 禁止）。
+// `cfg` 为 nil 时按最保守的默认值走（外部 MCP 禁止、外部源关闭）。
 func NewMarketInstallHandler(
 	svc *market.Service,
 	py *engine.PythonClient,
@@ -88,14 +102,175 @@ func NewMarketInstallHandler(
 	if cfg != nil {
 		opts.AllowRemoteMCP = cfg.MarketAllowRemoteMCP
 	}
-	return &MarketInstallHandler{svc: svc, install: market.NewInstallService(store, installers, opts)}
+	// H5：外部内容一律先过 manifest fetch + sha256 + Ed25519 才允许落盘。
+	// 生产路径**无条件注入**：外部源关闭时验证器本身会拒绝（ErrExternalSourceDisabled），
+	// 因此"忘开关"不会退化成"外部内容可以随便装"。
+	opts.Verifier = newMarketTrustVerifier(svc, py, cfg)
+	// H75/H24：启用 mcp 之前必须确认插件已被用户逐条授权、且用户级总开关是开的。
+	opts.EnableCheck = newPluginEnableCheck(plugins, cfg)
+	return &MarketInstallHandler{
+		svc:     svc,
+		install: market.NewInstallService(store, installers, opts),
+		plugins: plugins,
+	}
 }
 
-// RegisterRoutes 注册安装流水线的三条路由（auth + rate limited）。
+// newPluginEnableCheck 返回"启用 mcp 前必须已获插件授权"的检查（H75 + H24）。
+//
+// 为什么把插件授权放在**市场启用**这一侧而不是只靠插件页：市场页的"启用"按钮
+// 是用户对"这条外部内容可以用"的显式表达。若它不检查逐条授权，等于让用户在
+// 市场页点一下就绕过了插件页的授权闸 —— 而插件页才是命令执行的授权入口。
+//
+// 检查三件事：插件条目已被 approve、用户级 commands_enabled 已开、命令仍在运维
+// 允许的上界内（运维收紧 allowlist 后，旧配置不该还能被"重新启用"）。
+func newPluginEnableCheck(plugins *PluginHandler, cfg *config.Config) market.EnableCheck {
+	if plugins == nil {
+		return nil
+	}
+	return func(ctx context.Context, item market.Item, ref map[string]any) error {
+		if item.Kind != market.KindMCP {
+			return nil
+		}
+		claims := auth.GetClaims(ctx)
+		if claims == nil || claims.UserID == "" {
+			return fmt.Errorf("%w: missing identity", market.ErrBadRequest)
+		}
+		name := firstNonEmpty(refStringOf(ref, "name"), item.Name)
+		if name == "" {
+			return fmt.Errorf("%w: install record has no plugin name", market.ErrEnableDenied)
+		}
+
+		plugins.mu.Lock()
+		defer plugins.mu.Unlock()
+		pf, err := plugins.readPluginsFile(claims.UserID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("%w: plugin %q is not configured", market.ErrEnableDenied, name)
+			}
+			return fmt.Errorf("%w: read plugins.json: %v", errInstallUpstream, err)
+		}
+		for _, p := range pf.MCPServers {
+			if p.Name != name {
+				continue
+			}
+			if !p.Approved {
+				return fmt.Errorf("%w: plugin %q must be approved on the plugins page first",
+					market.ErrEnableDenied, name)
+			}
+			if !pf.CommandsEnabled {
+				return fmt.Errorf("%w: plugin commands are disabled for this user (commands_enabled=false)",
+					market.ErrEnableDenied)
+			}
+			if err := checkOperatorAllowlist(p.Command, cfg); err != nil {
+				return fmt.Errorf("%w: %v", market.ErrEnableDenied, err)
+			}
+			return nil
+		}
+		return fmt.Errorf("%w: plugin %q is not configured", market.ErrEnableDenied, name)
+	}
+}
+
+// newMarketTrustVerifier 构造外部内容的信任链校验器。
+//
+// 总开关与可信公钥**取自 Service 的当前配置**（env 与后台 system_settings 的合并结果），
+// 而不是直接读 env —— 否则后台打开外部源后安装流水线仍然只认 env，两处口径会漂移。
+//
+// 签名要求恒为 true（H5 的验收口径）：外部内容没有发布方背书就不进入落点。
+// 需要放开的环境目前不存在，这是刻意的 —— 放开应当是一次经过评审的产品决策，
+// 而不是一个运维随手可以改的开关。
+func newMarketTrustVerifier(svc *market.Service, py *engine.PythonClient, cfg *config.Config) market.Verifier {
+	policy := market.TrustPolicy{RequireSignature: true}
+	if svc != nil {
+		mc := svc.Config()
+		policy.ExternalEnabled = mc.RemoteEnabled
+		policy.TrustedKeys = market.ParseTrustedKeys(mc.TrustedKeys)
+	}
+	if cfg != nil && len(policy.TrustedKeys) == 0 {
+		// 兜底：Service 未配置时仍可用 env 里的公钥（例如只注入 cfg 的构造路径）。
+		policy.TrustedKeys = market.ParseTrustedKeys(cfg.MarketTrustedKeys)
+	}
+	var docs market.DocumentFetcher
+	if py != nil {
+		docs = engineDocumentFetcher{py: py}
+	}
+	return market.NewTrustVerifier(docs, policy)
+}
+
+// RegisterRoutes 注册安装流水线的路由（auth + rate limited）。
+//
+// enable/disable 是 H75 的核心写路径：装完只是"文件在磁盘上"，启用才是"内容可以
+// 被注入/执行/连接"。两条路由分开而不是一个 `PATCH {enabled}`：撤销必须能单独
+// 表达（"停用"在审计与前端确认流程里是另一个动作）。
 func (h *MarketInstallHandler) RegisterRoutes(mux *http.ServeMux, authMW, rlMW routeMiddleware) {
 	mux.Handle("POST /v1/market/install", authMW(rlMW(http.HandlerFunc(h.Install))))
 	mux.Handle("DELETE /v1/market/install/{source}/{kind}/{id}", authMW(rlMW(http.HandlerFunc(h.Uninstall))))
 	mux.Handle("GET /v1/market/install", authMW(rlMW(http.HandlerFunc(h.List))))
+	mux.Handle("POST /v1/market/install/{source}/{kind}/{id}/enable", authMW(rlMW(http.HandlerFunc(h.Enable))))
+	mux.Handle("POST /v1/market/install/{source}/{kind}/{id}/disable", authMW(rlMW(http.HandlerFunc(h.Disable))))
+}
+
+// Enable POST /v1/market/install/{source}/{kind}/{id}/enable
+//
+// 启用前完成 H5 完整性复验（外部条的 manifest 会重新抓取并比对摘要/签名）与
+// H24 授权检查（mcp 需要插件已授权 + 用户总开关打开）。
+func (h *MarketInstallHandler) Enable(w http.ResponseWriter, r *http.Request) {
+	h.setEnabled(w, r, true)
+}
+
+// Disable POST /v1/market/install/{source}/{kind}/{id}/disable
+//
+// **撤销立即生效**：落点的执行资格当场关闭（插件 approved=false + status=inactive、
+// agent.enabled=false、技能 enabled/auto_inject=false），不只是改市场页的徽标。
+func (h *MarketInstallHandler) Disable(w http.ResponseWriter, r *http.Request) {
+	h.setEnabled(w, r, false)
+}
+
+// setEnabled 是 enable/disable 的共同实现。
+func (h *MarketInstallHandler) setEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	tenantID, userID, ok := installIdentity(w, r)
+	if !ok {
+		return
+	}
+	source := strings.TrimSpace(r.PathValue("source"))
+	id := strings.TrimSpace(r.PathValue("id"))
+	if source == "" || id == "" {
+		BadRequest(w, "source, kind and id are required")
+		return
+	}
+	kind, err := market.ParseKind(strings.TrimSpace(r.PathValue("kind")))
+	if err != nil {
+		BadRequest(w, err.Error())
+		return
+	}
+
+	// 目录里能找到就用目录条目：启用前要用它的 manifest_url / sha256 / signature
+	// 做完整性复验。外部源已下线时只剩 (source, kind, id)，复验会失败 —— 这正是
+	// 期望的 fail-closed 行为（不能验证就不许重新启用）。
+	item := market.Item{Kind: kind, ID: id, Source: source}
+	if h.svc == nil {
+		// 没有目录服务的部署（理论上不存在）：只剩记录侧身份，外部条目会因为
+		// 无法复验而被拒；内置条目仍可正常启停。
+		InternalError(w, "market service unavailable")
+		return
+	}
+	if found, ok := market.Find(h.svc.LoadFor(r.Context(), marketUserID(r)).Items, source, id); ok && found.Kind == kind {
+		item = found
+	}
+
+	res, err := h.install.SetEnabled(r.Context(), tenantID, userID, item, enabled)
+	if err != nil {
+		writeInstallError(w, err)
+		return
+	}
+	OK(w, installResponse{
+		Installed:        true,
+		Source:           res.Source,
+		Kind:             res.Kind,
+		ID:               res.ID,
+		Ref:              res.Ref,
+		Enabled:          res.Enabled,
+		RequiresApproval: res.RequiresApproval,
+	})
 }
 
 // Install POST /v1/market/install
@@ -152,6 +327,7 @@ func (h *MarketInstallHandler) Install(w http.ResponseWriter, r *http.Request) {
 		ID:               res.ID,
 		Ref:              res.Ref,
 		AlreadyInstalled: res.AlreadyInstalled,
+		Updated:          res.Updated,
 		Enabled:          res.Enabled,
 		RequiresApproval: res.RequiresApproval,
 	})
@@ -235,7 +411,9 @@ func installIdentity(w http.ResponseWriter, r *http.Request) (tenantID, userID s
 //
 // 映射口径：
 //   - 参数类（kind 非法、缺字段、kind 与条目不符）→ 400
-//   - 外部 MCP 默认禁止                          → 403（原因写清楚，不是 500）
+//   - 外部 MCP 默认禁止 / 外部源默认关闭            → 403（原因写清楚，不是 500）
+//   - 内容完整性/信任链不通过（缺 sha256、digest 不符、未签名、验签失败）→ 422
+//     （这是"发布方给的内容不可信"，既不是调用方参数错，也不是网关故障）
 //   - 本部署缺该 kind 的落点                     → 501
 //   - 上游明确拒绝（引擎 4xx）                   → 对应 4xx（如知识库未选 provider 是 400）
 //   - 其余（引擎不可达、写库/写文件失败）        → 502
@@ -243,8 +421,20 @@ func writeInstallError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, market.ErrBadRequest):
 		BadRequest(w, strings.TrimPrefix(err.Error(), market.ErrBadRequest.Error()+": "))
-	case errors.Is(err, market.ErrRemoteMCPForbidden):
+	case errors.Is(err, market.ErrRemoteMCPForbidden), errors.Is(err, market.ErrExternalSourceDisabled),
+		errors.Is(err, market.ErrEnableDenied):
+		// 403：不是参数错，是**还没获得授权/开关未开**。原因写清楚，用户才知道下一步做什么。
 		Forbidden(w, err.Error())
+	case errors.Is(err, market.ErrNotInstalled):
+		NotFound(w, err.Error())
+	case errors.Is(err, market.ErrUpdateUnavailable):
+		JSON(w, http.StatusConflict, APIResponse{Success: false, Error: err.Error()})
+	case errors.Is(err, market.ErrManifestFetchFailed):
+		// 抓不下来 → 上游故障（可重试），不是"内容不可信"。
+		JSON(w, http.StatusBadGateway, APIResponse{Success: false, Error: "market install failed: " + err.Error()})
+	case isTrustError(err):
+		// 422：内容没通过完整性/信任链校验。**不落盘**，用户需要联系发布方或换源。
+		JSON(w, http.StatusUnprocessableEntity, APIResponse{Success: false, Error: err.Error()})
 	case errors.Is(err, market.ErrInstallerUnavailable), errors.Is(err, errInstallNotImplemented):
 		NotImplemented(w, err.Error())
 	default:
@@ -266,6 +456,26 @@ func writeInstallError(w http.ResponseWriter, err error) {
 		// 安装失败 → 502：网关自己没坏，是它依赖的落点没成功。
 		JSON(w, http.StatusBadGateway, APIResponse{Success: false, Error: "market install failed: " + err.Error()})
 	}
+}
+
+// isTrustError 判断错误是否属于「外部内容完整性/信任链校验失败」。
+//
+// 单列一个判断而不是在 switch 里堆 7 个 case：这组错误的对外语义是同一条
+// （发布方内容不可信 → 422 且不落盘），以后新增校验项只改这里。
+func isTrustError(err error) bool {
+	for _, target := range []error{
+		market.ErrManifestUnavailable,
+		market.ErrManifestDigestMissing,
+		market.ErrManifestDigestMismatch,
+		market.ErrManifestUnsigned,
+		market.ErrTrustRootMissing,
+		market.ErrManifestSignatureInvalid,
+	} {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // upstreamError 携带上游明确给出的状态码与消息（引擎 4xx 原样透出，其余归 502）。
@@ -532,8 +742,9 @@ type agentPayload struct {
 //     只能靠读侧 COALESCE 兜，"这行归谁"在写入侧就成了隐含假设；
 //   - kind 显式写 'chat'：列表只收 `kind IS NULL OR kind = 'chat'`，一旦默认值漂移或
 //     子 Agent 写入路径混用，整行会被列表静默排除；
-//   - enabled 写 true：市场装完即用；"外部源需显式启用"是 market_installations.enabled
-//     的语义（市场页徽标），与这一行能不能被 Agents 页列出无关；
+//   - enabled 由 agentEnabledOnInstall 决定：**内置源 true、外部源 false**（H75）。
+//     外部内容装完不进注入链，用户显式启用后由 SetEnabled 把这一行打开；
+//     同一判断必须与 market_installations.enabled 一致，否则两页会各说一套；
 //   - created_at / updated_at 必须写：agents 表这两列**无默认值**，省略即 NULL，
 //     而列表把 NULL 时间戳扫进 time.Time 会报错并整行跳过 —— 这正是此前
 //     "市场装完 Agents 页仍是空状态"的根因。
@@ -567,8 +778,17 @@ func agentInstallArgs(claims *auth.Claims, agentID string, item market.Item, p a
 	}
 	return []any{
 		agentID, claims.TenantID, claims.UserID, item.Name, description, p.SystemPrompt,
-		toolsJSON, llmJSON, maxTurns, timeout, true,
+		toolsJSON, llmJSON, maxTurns, timeout, agentEnabledOnInstall(item),
 	}
+}
+
+// agentEnabledOnInstall 决定市场装出来的 agent 行**初始是否启用**。
+//
+// 口径与安装记录一致：**内置源装完即可用，外部源装完禁用**（H75）。
+// 两边必须同一个判断，否则会出现"市场页显示已启用、Agents 页里那行却是停用的"
+// 这种自相矛盾状态（用户既没有启用入口，也说不清哪个才是真的）。
+func agentEnabledOnInstall(item market.Item) bool {
+	return item.Source == market.SourceBuiltin
 }
 
 func (agentMarketInstaller) Install(ctx context.Context, item market.Item, env map[string]string) (map[string]any, error) {
@@ -628,6 +848,85 @@ func (agentMarketInstaller) Uninstall(ctx context.Context, item market.Item, ref
 		`DELETE FROM agents WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
 		agentID, claims.TenantID, claims.UserID); err != nil {
 		return fmt.Errorf("%w: delete agent: %v", errInstallUpstream, err)
+	}
+	return nil
+}
+
+// agentUpdateQuery 原地更新已装 agent（H5 的"原子更新"：**一条 UPDATE**）。
+//
+// 为什么不删旧行再插新行：删除与插入之间崩溃会留下"卸载成功但重装失败"的空洞，
+// 而用户看到的只是"市场里显示已安装、Agents 页里没有"。单条 UPDATE 要么整行生效、
+// 要么整行保持旧值。
+//
+// `enabled` 不在 SET 里：内容换了之后是否可用由启用动作（H75）决定，
+// 更新本身不替用户做"重新信任"的决定。
+const agentUpdateQuery = `
+UPDATE agents
+   SET name = $2, description = $3, system_prompt = $4, tools = $5, llm_config = $6,
+       max_turns = $7, timeout_seconds = $8, updated_at = NOW()
+ WHERE id = $1 AND tenant_id = $9 AND user_id = $10`
+
+// Update 实现 market.Updater：按 ref 里的 agent_id 原地替换内容。
+func (agentMarketInstaller) Update(ctx context.Context, item market.Item, ref map[string]any) (map[string]any, error) {
+	claims := auth.GetClaims(ctx)
+	if claims == nil || claims.UserID == "" {
+		return nil, fmt.Errorf("%w: missing identity", market.ErrBadRequest)
+	}
+	if db.Pool == nil {
+		return nil, fmt.Errorf("%w: agents require a database", errInstallNotImplemented)
+	}
+	agentID := refStringOf(ref, "agent_id")
+	if agentID == "" {
+		// 记录里有 ref 却没有 agent_id：无法安全地定位到"哪一行"，让用户卸载重装。
+		return nil, fmt.Errorf("%w: install record has no agent_id", market.ErrUpdateUnavailable)
+	}
+
+	var p agentPayload
+	if len(item.Payload) > 0 {
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return nil, fmt.Errorf("%w: invalid agent payload: %v", market.ErrBadRequest, err)
+		}
+	}
+	args := agentInstallArgs(claims, agentID, item, p)
+	// agentInstallArgs 的尾部是 (max_turns, timeout, enabled)；更新不需要 enabled。
+	if _, err := db.GlobalDBManager.Exec(ctx, agentUpdateQuery,
+		args[0], args[3], args[4], args[5], args[6], args[7], args[8], args[9],
+		claims.TenantID, claims.UserID); err != nil {
+		return nil, fmt.Errorf("%w: update agent: %v", errInstallUpstream, err)
+	}
+	return map[string]any{
+		"agent_id":      agentID,
+		"name":          item.Name,
+		"market_id":     item.ID,
+		"approval_mode": "workbench",
+		"updated":       true,
+	}, nil
+}
+
+// SetEnabled 实现 market.Enabler：启用/停用这条 agent（**立即生效**）。
+//
+// 只改 enabled 一列：内容不可变时启用不该重写配置（重写会让用户手工调过的
+// max_turns / tools 被市场默认值覆盖）。
+func (agentMarketInstaller) SetEnabled(ctx context.Context, item market.Item, ref map[string]any, enabled bool) error {
+	claims := auth.GetClaims(ctx)
+	if claims == nil || claims.UserID == "" {
+		return fmt.Errorf("%w: missing identity", market.ErrBadRequest)
+	}
+	agentID := refStringOf(ref, "agent_id")
+	if agentID == "" {
+		// 老记录可能没有 agent_id（早期安装），没有可操作的行：只更新市场记录。
+		slog.Warn("market enable: install record has no agent_id, skipping agent update",
+			"market_id", item.ID)
+		return nil
+	}
+	if db.Pool == nil {
+		return fmt.Errorf("%w: agents require a database", errInstallNotImplemented)
+	}
+	if _, err := db.GlobalDBManager.Exec(ctx,
+		`UPDATE agents SET enabled = $4, updated_at = NOW()
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
+		agentID, claims.TenantID, claims.UserID, enabled); err != nil {
+		return fmt.Errorf("%w: update agent enabled: %v", errInstallUpstream, err)
 	}
 	return nil
 }
@@ -702,6 +1001,12 @@ func (m mcpMarketInstaller) Install(ctx context.Context, item market.Item, env m
 		}
 	}
 
+	// 外部源装完落成 inactive（引擎只连 active ⇒ **不连接**），等用户显式启用；
+	// 内置源随包发布，保持既有的 active（它仍要用户在插件页逐条授权才能执行）。
+	status := pluginStatusActive
+	if item.Source != market.SourceBuiltin {
+		status = pluginStatusInactive
+	}
 	pf.MCPServers = append(pf.MCPServers, MCPPlugin{
 		Name:        name,
 		Command:     p.Command,
@@ -709,7 +1014,7 @@ func (m mcpMarketInstaller) Install(ctx context.Context, item market.Item, env m
 		Env:         env,
 		Description: firstNonEmpty(p.Description, item.Description),
 		Version:     firstNonEmpty(p.Version, item.Version),
-		Status:      "active",
+		Status:      status,
 		Source:      "market",
 		// 市场装的是配置，不是授权：用户必须在插件页逐条确认后才可执行。
 		Approved: false,
@@ -766,6 +1071,136 @@ func (m mcpMarketInstaller) Uninstall(ctx context.Context, item market.Item, ref
 	return nil
 }
 
+// Update 实现 market.Updater：按 ref 里的 name 原地替换**内容字段**。
+//
+// 三个必须重置的授权状态（内容变了 = 旧授权不再适用）：
+//   - `Approved=false`：用户批的是旧命令；
+//   - `Status=inactive`：未被重新授权的配置不能被引擎连上（不注入、不连接）；
+//   - 命令/参数/只读声明整体覆盖为新值。
+//
+// `Env` 保留用户填的旧值：凭据是用户资产，更新内容不该顺手清掉。
+func (m mcpMarketInstaller) Update(ctx context.Context, item market.Item, ref map[string]any) (map[string]any, error) {
+	claims := auth.GetClaims(ctx)
+	if claims == nil || claims.UserID == "" {
+		return nil, fmt.Errorf("%w: missing identity", market.ErrBadRequest)
+	}
+	if m.plugins == nil {
+		return nil, fmt.Errorf("%w: plugin store unavailable", errInstallNotImplemented)
+	}
+	name := refStringOf(ref, "name")
+	if name == "" {
+		name = item.Name
+	}
+	if name == "" {
+		return nil, fmt.Errorf("%w: install record has no plugin name", market.ErrUpdateUnavailable)
+	}
+
+	var p mcpPayload
+	if len(item.Payload) > 0 {
+		if err := json.Unmarshal(item.Payload, &p); err != nil {
+			return nil, fmt.Errorf("%w: invalid mcp payload: %v", market.ErrBadRequest, err)
+		}
+	}
+	if p.Command == "" {
+		return nil, fmt.Errorf("%w: mcp payload missing command", market.ErrBadRequest)
+	}
+	if err := validatePluginCommandShape(p.Command); err != nil {
+		return nil, fmt.Errorf("%w: %v", market.ErrBadRequest, err)
+	}
+	if err := checkOperatorAllowlist(p.Command, m.plugins.cfg); err != nil {
+		return nil, fmt.Errorf("%w: %v", market.ErrBadRequest, err)
+	}
+	if err := checkPluginArgsAllowed(p.Args); err != nil {
+		return nil, fmt.Errorf("%w: %v", market.ErrBadRequest, err)
+	}
+
+	m.plugins.mu.Lock()
+	defer m.plugins.mu.Unlock()
+
+	pf, err := m.plugins.readPluginsFile(claims.UserID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: plugins.json is missing", market.ErrUpdateUnavailable)
+		}
+		return nil, fmt.Errorf("%w: read plugins.json: %v", errInstallUpstream, err)
+	}
+
+	for i := range pf.MCPServers {
+		if pf.MCPServers[i].Name != name {
+			continue
+		}
+		if pf.MCPServers[i].Source != "market" {
+			// 用户手工配过的同名条目不该被市场更新覆盖（用户配置优先）。
+			return nil, fmt.Errorf("%w: plugin %q is locally configured", market.ErrUpdateUnavailable, name)
+		}
+		pf.MCPServers[i].Command = p.Command
+		pf.MCPServers[i].Args = p.Args
+		pf.MCPServers[i].Description = firstNonEmpty(p.Description, item.Description)
+		pf.MCPServers[i].Version = firstNonEmpty(p.Version, item.Version)
+		pf.MCPServers[i].ReadOnly = p.ReadOnly
+		// 内容换了：旧授权作废，配置进入不可执行状态，等用户在插件页重新确认。
+		pf.MCPServers[i].Approved = false
+		pf.MCPServers[i].Status = pluginStatusInactive
+		if err := m.plugins.savePluginsFile(claims.UserID, pf); err != nil {
+			return nil, fmt.Errorf("%w: save plugins.json: %v", errInstallUpstream, err)
+		}
+		return map[string]any{"name": name, "command": p.Command, "market_id": item.ID, "updated": true}, nil
+	}
+	return nil, fmt.Errorf("%w: plugin %q not found", market.ErrUpdateUnavailable, name)
+}
+
+// SetEnabled 实现 market.Enabler：切换插件配置的 status（引擎只连 active）。
+//
+// **停用会顺带撤回授权**（Approved=false）：撤销的意义是"立刻不能执行"，
+// 留着旧授权等于把这个插件变成"下次打开总开关就能跑"的隐藏入口。
+//
+// 启用**不会**自动授权：授权只能来自用户对具体命令的逐条确认（插件页 Approve）。
+// 启用前的检查由编排层的 EnableCheck 完成（见 newPluginEnableCheck）。
+func (m mcpMarketInstaller) SetEnabled(ctx context.Context, item market.Item, ref map[string]any, enabled bool) error {
+	claims := auth.GetClaims(ctx)
+	if claims == nil || claims.UserID == "" {
+		return fmt.Errorf("%w: missing identity", market.ErrBadRequest)
+	}
+	if m.plugins == nil {
+		return fmt.Errorf("%w: plugin store unavailable", errInstallNotImplemented)
+	}
+	name := refStringOf(ref, "name")
+	if name == "" {
+		name = item.Name
+	}
+	if name == "" {
+		return nil
+	}
+
+	m.plugins.mu.Lock()
+	defer m.plugins.mu.Unlock()
+
+	pf, err := m.plugins.readPluginsFile(claims.UserID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 配置被用户手工删了：没有可切换的状态，记录侧照实更新（幂等）。
+			return nil
+		}
+		return fmt.Errorf("%w: read plugins.json: %v", errInstallUpstream, err)
+	}
+	for i := range pf.MCPServers {
+		if pf.MCPServers[i].Name != name {
+			continue
+		}
+		if enabled {
+			pf.MCPServers[i].Status = pluginStatusActive
+		} else {
+			pf.MCPServers[i].Status = pluginStatusInactive
+			pf.MCPServers[i].Approved = false
+		}
+		if err := m.plugins.savePluginsFile(claims.UserID, pf); err != nil {
+			return fmt.Errorf("%w: save plugins.json: %v", errInstallUpstream, err)
+		}
+		return nil
+	}
+	return nil
+}
+
 // ── 落点 3/4：skill → 代理 Python ──────────────────────────
 
 // skillMarketInstaller 把市场 skill 条目交给引擎的技能安装接口
@@ -796,6 +1231,16 @@ func (s skillMarketInstaller) Install(ctx context.Context, item market.Item, _ m
 	// 技能列表分不清"市场装的 / 本地传的"，升级端点也找不到上游（它只对市场来源生效）。
 	origin := "market:" + item.Source + "/" + item.ID
 	body := map[string]any{"inline": string(item.Payload), "origin": origin}
+	if item.Source != market.SourceBuiltin {
+		// H5 的第二道闸：把**网关已经校验过**的 manifest 摘要一起交给引擎，
+		// 由引擎复核"传过去的字节"没有被中间环节改写。`integrity_required` 让引擎
+		// 拒绝缺少摘要的外部内容（不落盘），引擎侧见 skills.py 的 install_skill。
+		body["sha256"] = strings.ToLower(strings.TrimSpace(item.SHA256))
+		body["integrity_required"] = true
+		// H75：外部技能先装成 **inert**（enabled=false / auto_inject=false）——
+		// 不注入每轮上下文、不可运行，等用户显式启用再打开。
+		body["inert"] = true
+	}
 	if err := s.py.PostJSON(ctx, target, body, &resp); err != nil {
 		return nil, classifyUpstream("install skill", err)
 	}
@@ -809,6 +1254,53 @@ func (s skillMarketInstaller) Install(ctx context.Context, item market.Item, _ m
 		"market_id": item.ID,
 		"origin":    origin,
 	}, nil
+}
+
+// Update 实现 market.Updater：把新内容重新写进**同一个技能名**（引擎侧原子替换）。
+//
+// 技能落点天然支持原地更新（SkillStore.save 用"临时文件 + 原子替换"落盘），
+// 所以这里只需要复用安装走的那条引擎调用，不带 env。
+func (s skillMarketInstaller) Update(ctx context.Context, item market.Item, ref map[string]any) (map[string]any, error) {
+	name := firstNonEmpty(refStringOf(ref, "name"), item.Name)
+	newRef, err := s.Install(ctx, item, nil)
+	if err != nil {
+		return nil, err
+	}
+	// 名字以**新内容**为准（发布方改名时落点跟着改），ref 里保留旧名以便排查。
+	if name != "" {
+		newRef["previous_name"] = name
+	}
+	newRef["updated"] = true
+	return newRef, nil
+}
+
+// SetEnabled 实现 market.Enabler：切换技能的 enabled / auto_inject。
+//
+// 两个字段必须一起切：只开 `enabled` 会让技能"可运行但仍不进每轮上下文"，
+// 用户点了启用却看不到任何变化；只开 `auto_inject` 则相反（注入了却跑不了）。
+func (s skillMarketInstaller) SetEnabled(ctx context.Context, item market.Item, ref map[string]any, enabled bool) error {
+	claims := auth.GetClaims(ctx)
+	if claims == nil || claims.UserID == "" {
+		return fmt.Errorf("%w: missing identity", market.ErrBadRequest)
+	}
+	if s.py == nil {
+		return fmt.Errorf("%w: python engine unavailable for skill enable", errInstallNotImplemented)
+	}
+	name := firstNonEmpty(refStringOf(ref, "name"), item.Name)
+	if name == "" {
+		return nil
+	}
+	body := map[string]any{"enabled": enabled, "auto_inject": enabled}
+	target := withQuery("/v1/skills/"+url.PathEscape(name), identityQuery(claims))
+	if err := s.py.PutJSON(ctx, target, body, nil); err != nil {
+		if isUpstreamNotFound(err) {
+			// 技能已被用户删掉：没有可切换的落点，记录侧照实更新。
+			slog.Warn("market enable: skill no longer exists in engine", "name", name)
+			return nil
+		}
+		return classifyUpstream("toggle skill", err)
+	}
+	return nil
 }
 
 func (s skillMarketInstaller) Uninstall(ctx context.Context, item market.Item, ref map[string]any) error {
@@ -1056,6 +1548,13 @@ func (k knowledgeMarketInstaller) rollback(ctx context.Context, claims *auth.Cla
 	}
 	slog.Info("market install: rolled back knowledge base after failed document import",
 		"kb_id", kbID, "market_id", marketID)
+}
+
+// SetEnabled 实现 market.Enabler：知识库没有"执行面"（不会被注入、不会被运行），
+// 所以启停只影响市场记录的徽标，不需要动落点。**显式实现而不是让它落到默认分支**：
+// 默认分支的语义是"该 kind 没有启停能力"，而这里是"有状态但没有副作用"。
+func (k knowledgeMarketInstaller) SetEnabled(_ context.Context, _ market.Item, _ map[string]any, _ bool) error {
+	return nil
 }
 
 func (k knowledgeMarketInstaller) Uninstall(ctx context.Context, item market.Item, ref map[string]any) error {
