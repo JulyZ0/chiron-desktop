@@ -267,6 +267,9 @@ test('桥：重复 start 只建立一条连接（不会泄漏旧 socket）', asy
   const bridge = createDeviceFSBridge({
     app: fakeApp(t),
     readToken: async () => 'token',
+    // H46：桥不再把 token 放进 WS query，而是先换一次性票据。这些用例测的是
+    // 连接/重连语义，票据本身由 device-bridge-auth.test.cjs 覆盖。
+    exchangeTicket: async () => ({ ok: true, ticket: 'test-ticket' }),
     log: () => {},
     reconnectMs: 10,
   })
@@ -285,6 +288,9 @@ test('桥：断线后重连，旧 socket 的迟到 close 不会打断新连接',
   const bridge = createDeviceFSBridge({
     app: fakeApp(t),
     readToken: async () => 'token',
+    // H46：桥不再把 token 放进 WS query，而是先换一次性票据。这些用例测的是
+    // 连接/重连语义，票据本身由 device-bridge-auth.test.cjs 覆盖。
+    exchangeTicket: async () => ({ ok: true, ticket: 'test-ticket' }),
     log: () => {},
     reconnectMs: 10,
     maxReconnectMs: 40,
@@ -321,6 +327,9 @@ test('桥：断开后不再重连（stop 生效），且不会留下定时器', 
   const bridge = createDeviceFSBridge({
     app: fakeApp(t),
     readToken: async () => 'token',
+    // H46：桥不再把 token 放进 WS query，而是先换一次性票据。这些用例测的是
+    // 连接/重连语义，票据本身由 device-bridge-auth.test.cjs 覆盖。
+    exchangeTicket: async () => ({ ok: true, ticket: 'test-ticket' }),
     log: () => {},
     reconnectMs: 10,
   })
@@ -338,6 +347,9 @@ test('桥：op 的回包只发回收到请求的那条连接，不串到重连�
   const bridge = createDeviceFSBridge({
     app: fakeApp(t),
     readToken: async () => 'token',
+    // H46：桥不再把 token 放进 WS query，而是先换一次性票据。这些用例测的是
+    // 连接/重连语义，票据本身由 device-bridge-auth.test.cjs 覆盖。
+    exchangeTicket: async () => ({ ok: true, ticket: 'test-ticket' }),
     log: () => {},
     reconnectMs: 0,
   })
@@ -382,6 +394,9 @@ test('桥：断开连接上的 send 抛错被吞掉，不产生未处理 rejecti
   const bridge = createDeviceFSBridge({
     app: fakeApp(t),
     readToken: async () => 'token',
+    // H46：桥不再把 token 放进 WS query，而是先换一次性票据。这些用例测的是
+    // 连接/重连语义，票据本身由 device-bridge-auth.test.cjs 覆盖。
+    exchangeTicket: async () => ({ ok: true, ticket: 'test-ticket' }),
     log: () => {},
     reconnectMs: 10000,
   })

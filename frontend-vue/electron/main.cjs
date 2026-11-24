@@ -56,6 +56,7 @@ const shared = require('./shared.cjs')
 const captchaCsp = require('./captcha-csp.cjs')
 const engineEnvSettings = require('./engine-env.cjs')
 const dataDirAcl = require('./data-dir-acl.cjs')
+const { createSensitiveStoreGate } = require('./sensitive-store-gate.cjs')
 const windowsHello = require('./windows-hello.cjs')
 const accountVerify = require('./account-verify.cjs')
 const twoFactor = require('./two-factor.cjs')
@@ -86,6 +87,8 @@ const { readToken, writeToken, clearToken } = require('./token-store.cjs')
 const { switchMode } = require('./mode-switch.cjs')
 const { wipeLocalData, relaunchAfterWipe } = require('./wipe-data.cjs')
 const { createDeviceFSBridge } = require('./device-fs.cjs')
+const { createApprovedRoots, screenRootCandidate } = require('./approved-roots.cjs')
+const openPathGuard = require('./open-path-guard.cjs')
 const { createMountDeps } = require('./mount-deps.cjs')
 const {
   parseLatestYml,
@@ -130,6 +133,26 @@ let currentMode = 'local'
 
 /** 设备文件桥（仅 cloud 模式）：桌面端主动外连远端网关，供 ProjectFS 读本机项目。 */
 let deviceBridge = null
+
+/**
+ * 用户批准的项目根名单（canonical root grant）。
+ *
+ * 设备文件桥与 `desktop:open-path` 共用这一份：两处都不接受"调用方说这是根"
+ * 这种自证，只认这里被**用户**批准过的 realpath。延迟到 whenReady 里创建，
+ * 因为 userData 根在模块加载期才被 `app.setPath` 定下来。
+ */
+let projectRoots = null
+
+/**
+ * 敏感落盘门禁（H52）：加固结论决定能否往 userData 写 token / provider key。
+ *
+ * 初值 `allowed: false`（未评估即拒绝）是**故意的**：加固发生在模块加载期，
+ * 早于任何 IPC。若加固没跑成（异常、平台不支持、账户名取不到），也绝不能
+ * 退回"照写不误"。
+ */
+const sensitiveStoreGate = createSensitiveStoreGate({
+  log: (level, message) => logMain(level, message),
+})
 
 /** 团队挂载依赖管理器（rclone/WinFsp，按需下载校验；不随安装包）。 */
 let mountDeps = null
@@ -1998,6 +2021,83 @@ function relaunchIntoSetup() {
 }
 
 /**
+ * 让用户批准一个项目根（H46/H49 共用的唯一授权入口）。
+ *
+ * **为什么必须是主进程自己弹的对话框**：渲染层的 `confirmed: true` 只是又一个
+ * 不可信输入；真正有约束力的是"用户看见 canonical 路径并点了允许"。这里把
+ * realpath 之后的路径原样展示 —— 用户批准的是 `D:\secrets`，而不是一个看起来
+ * 无害的 `D:\proj\link`。
+ */
+async function confirmProjectRootApproval(rootCanonical, targetPath) {
+  const detailLines = [`目录：${rootCanonical}`]
+  if (targetPath && targetPath !== rootCanonical) detailLines.push(`目标：${targetPath}`)
+  detailLines.push('', '批准后桌面端才能读写/打开该目录内的文件；随时可在设置里撤销。')
+  const options = {
+    type: 'warning',
+    title: '授权项目根目录',
+    message: '桌面端请求访问一个尚未授权的目录',
+    detail: detailLines.join('\n'),
+    buttons: ['允许', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  }
+  try {
+    const result = mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showMessageBox(mainWindow, options)
+      : await dialog.showMessageBox(options)
+    const approved = result && result.response === 0
+    logMain(approved ? 'info' : 'warn', `项目根授权${approved ? '通过' : '被用户拒绝'}`)
+    return approved
+  } catch (err) {
+    logMain('error', `项目根授权对话框失败：${err?.message || err}`)
+    return false
+  }
+}
+
+/**
+ * 打开可执行/未知类型前的独立确认（H49）。
+ *
+ * 不是"再点一次确定"那种橡皮图章：复选框默认为空，必须**同时**点「打开」且勾选
+ * 才能继续。这一步的意义是给用户一个明确的、只能由他完成的动作 —— 渲染层无法
+ * 伪造，也不存在"顺手回车"就执行的可能。
+ */
+async function confirmExecutableOpen(info = {}) {
+  const file = String(info.path || '')
+  const name = path.basename(file)
+  const ext = String(info.ext || '')
+  const options = {
+    type: 'warning',
+    title: '确认打开可执行内容',
+    message: `即将用系统默认程序打开：${name}`,
+    detail: [
+      `路径：${file}`,
+      `类型：${info.kind || 'unknown'}${ext ? `（.${ext}）` : ''}`,
+      '',
+      '打开它可能执行代码（脚本、安装器、快捷方式都在此列）。',
+      '确认请勾选下面的复选框后再点「打开」。',
+    ].join('\n'),
+    buttons: ['打开', '取消'],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+    checkboxLabel: '我确认要打开这个可执行文件',
+    checkboxChecked: false,
+  }
+  try {
+    const result = mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showMessageBox(mainWindow, options)
+      : await dialog.showMessageBox(options)
+    const approved = Boolean(result && result.response === 0 && result.checkboxChecked)
+    logMain(approved ? 'warn' : 'info', `可执行文件打开确认${approved ? '通过' : '未通过'}：${name}`)
+    return approved
+  } catch (err) {
+    logMain('error', `可执行打开确认对话框失败：${err?.message || err}`)
+    return false
+  }
+}
+
+/**
  * 在线升级（不依赖 electron-updater）。
  *
  * ## 为什么不直接用 electron-updater
@@ -2396,17 +2496,30 @@ try {
 //
 // 时机说明：这里只对**已存在**的 userData 根收口；`local/` 子树由引导器与
 // Electron 后续创建，会继承根的 ACL，所以不必逐个子目录递归。
-// 失败只记日志：权限操作可能因组策略/网络盘失败，那不该让应用起不来。
+//
+// H52：加固 = 补授权 + 移除继承 + **显式审计并清掉未授权显式 ACE** + 再验证
+// （`audit: true`）。以前只取前两步，别人的显式 ACE 会原样留下。
+// 结论不写日志了事，而是喂给敏感落盘门禁：没加固成功就不许写 token / provider key。
 if (enforceUserDataIsolation) {
+  let aclResult = { ok: false, reason: 'not-run' }
   try {
-    const aclResult = dataDirAcl.hardenDataDir({ dir: app.getPath('userData') })
-    if (!aclResult.ok) {
-      logMain('warn', `数据目录权限收口未完成：${aclResult.reason}`)
-    }
+    aclResult = dataDirAcl.hardenDataDir({ dir: app.getPath('userData'), audit: true })
   } catch (err) {
-    logMain('warn', `数据目录权限收口异常：${err?.message || err}`)
+    aclResult = { ok: false, reason: `harden-threw: ${err?.message || err}` }
   }
+  sensitiveStoreGate.applyHardenResult(aclResult)
+  // 输出**脱敏** DACL：主体名已打码，只保留"还有几条、属于哪个类别"。
+  logMain(aclResult.ok ? 'info' : 'error',
+    `数据目录权限收口：${aclResult.ok ? '通过' : `未通过（${aclResult.reason}）`} ${dataDirAcl.summarizeDacl(aclResult)}`)
 }
+
+// 项目根批准名单：设备桥与 open-path 共用的唯一真值来源。
+// 必须在 `app.setPath('userData', ...)` 之后创建，否则名单会落到旧的默认目录里，
+// 重装/升级后"已批准的根"凭空消失。
+projectRoots = createApprovedRoots({
+  dir: app.getPath('userData'),
+  log: (level, message) => logMain(level, message),
+})
 
 // 单实例：第二次启动时聚焦已有窗口，而不是再开一个进程
 const gotLock = app.requestSingleInstanceLock()
@@ -2610,7 +2723,14 @@ if (!gotLock) {
     })
     ipcMain.handle('desktop:save-token', (event, token) => {
       assertTrustedSender(event)
-      const ok = writeToken(String(token || ''))
+      const next = String(token || '')
+      // H52 门禁：目录没加固成功时不落 token（清空不拦 —— 那是减少泄露面的方向）。
+      if (next && !sensitiveStoreGate.isAllowed()) {
+        const refusal = sensitiveStoreGate.refusal('token')
+        logMain('error', `拒绝保存登录凭据：${refusal.message}`)
+        return false
+      }
+      const ok = writeToken(next)
       // 登录后 token 才可用：立即让设备桥重连，远程模式下项目文件才能马上读。
       deviceBridge?.notifyTokenChanged()
       return ok
@@ -3105,6 +3225,12 @@ if (!gotLock) {
 
     ipcMain.handle('desktop:save-model-config', async (event, payload) => {
       assertTrustedSender(event)
+      // H52 门禁：provider key 也是密钥，与 token 同一条门槛。
+      if (!sensitiveStoreGate.isAllowed()) {
+        const refusal = sensitiveStoreGate.refusal('provider key')
+        logMain('error', `拒绝保存模型密钥：${refusal.message}`)
+        return refusal
+      }
       const mod = optionalSecrets()
       if (!mod) {
         return { ok: false, reason: 'secrets-unavailable', message: '当前版本不支持模型配置（secrets.cjs 未随包发布）' }
@@ -3239,35 +3365,82 @@ if (!gotLock) {
     /**
      * 用系统默认程序打开一个本地路径，或在文件管理器里定位它。
      *
-     * 这里不判"这个路径该不该给用户看"（那是后端 `validateRootPath` 的职责，主进程
-     * 再判一遍只会让两处判据漂移），但必须挡住"渲染层随手把任意字符串丢给 shell"：
-     * 只接受**已存在的绝对路径**。`shell.openPath` 对不存在的路径只回一个无意义的
-     * 错误码，对 UNC / 断开的网络共享则会挂起到超时 —— 先 access 一次能把这两种情况
-     * 在进入系统调用之前分开。
+     * H49：判定不在这个 handler 里写死，而是交给 `open-path-guard.cjs`，因为
+     * "该不该开"有三层判据，全塞进 handler 会变成一堆 assert：
      *
-     * 回结构化结果而不是抛错：调用方要能区分"文件没了"与"没有关联程序"。
+     *   1. canonical（realpath）之后的路径必须落在**用户批准的项目根**内；
+     *      不在就先弹主进程自己的原生对话框问一次用户 —— 渲染层无权自助批准；
+     *   2. 默认只做安全动作：`reveal`（定位不执行）与白名单文档类型；
+     *   3. 可执行类型（exe/bat/cmd/ps1/js/lnk/…）与未知类型必须再经一次
+     *      **独立的勾选式确认**才放行；UNC / 网络路径直接拒绝。
+     *
+     * 以前这里只查"绝对路径 + 存在"，而工作台的文件列表来自后端 API ——
+     * 服务端投毒一条 `report.pdf.exe` 就能让用户"点开文件"时运行任意程序。
+     *
+     * 回结构化结果而不是抛错：调用方要能区分"文件没了""根没授权""类型要确认"。
      */
     ipcMain.handle('desktop:open-path', async (event, payload) => {
       assertTrustedSender(event)
       const target = payload && typeof payload === 'object' ? String(payload.path || '') : ''
       const reveal = Boolean(payload && payload.reveal)
-      if (!target) return { ok: false, reason: 'empty-path', message: '路径为空' }
-      if (!path.isAbsolute(target)) {
-        return { ok: false, reason: 'not-absolute', message: '只能打开绝对路径' }
+      const declaredRoot = payload && typeof payload === 'object' ? String(payload.root || '') : ''
+      if (!projectRoots) return { ok: false, reason: 'not-ready', message: '应用尚未就绪' }
+      const verdict = await openPathGuard.authorizeOpenPath({
+        target,
+        reveal,
+        root: declaredRoot,
+        roots: projectRoots.list(),
+        platform: process.platform,
+        confirmRoot: async ({ root }) => confirmProjectRootApproval(root, target),
+        confirmExecutable: async info => confirmExecutableOpen(info),
+      })
+      if (!verdict.ok) {
+        if (verdict.reason !== 'missing' && verdict.reason !== 'empty-path') {
+          logMain('warn', `打开路径被拒（${verdict.reason}）：${verdict.path || target}`)
+        }
+        return {
+          ok: false,
+          reason: verdict.reason || 'blocked',
+          message: verdict.message || '打开失败',
+          kind: verdict.kind,
+        }
       }
-      try {
-        await fs.promises.access(target, fs.constants.F_OK)
-      } catch {
-        return { ok: false, reason: 'missing', message: '路径不存在' }
-      }
-      if (reveal) {
-        shell.showItemInFolder(target)
-        return { ok: true }
+      if (verdict.action === 'reveal') {
+        shell.showItemInFolder(verdict.path)
+        return { ok: true, action: 'reveal' }
       }
       // openPath 用空串表示成功，非空串是系统给出的错误描述
-      const failure = await shell.openPath(target)
+      const failure = await shell.openPath(verdict.path)
       if (failure) return { ok: false, reason: 'open-failed', message: failure }
-      return { ok: true }
+      return { ok: true, action: 'open' }
+    })
+
+    // 项目根授权：只由主进程的原生对话框产生，渲染层拿到的是只读名单。
+    ipcMain.handle('desktop:project-roots', event => {
+      assertTrustedSender(event)
+      return { roots: projectRoots ? projectRoots.list() : [] }
+    })
+    ipcMain.handle('desktop:grant-project-root', async (event, candidate) => {
+      assertTrustedSender(event)
+      if (!projectRoots) return { ok: false, reason: 'not-ready' }
+      const value = String(candidate || '').trim()
+      const screened = screenRootCandidate(value)
+      if (!screened.ok) return { ok: false, reason: screened.reason, message: screened.message }
+      const approved = await confirmProjectRootApproval(screened.root, screened.root)
+      if (!approved) return { ok: false, reason: 'root-not-approved', message: '用户未批准该项目根' }
+      try {
+        const root = projectRoots.grant(screened.root)
+        return { ok: true, root }
+      } catch (err) {
+        return { ok: false, reason: err?.reason || 'grant-failed', message: err?.message || String(err) }
+      }
+    })
+    ipcMain.handle('desktop:revoke-project-root', (event, root) => {
+      assertTrustedSender(event)
+      if (!projectRoots) return { ok: false, reason: 'not-ready' }
+      const removed = projectRoots.revoke(String(root || ''))
+      logMain('info', `撤销项目根授权：${removed ? '已移除' : '未命中'}`)
+      return { ok: removed, roots: projectRoots.list() }
     })
 
     // 版本与在线升级（手动清单方案，见 UPDATE_MANIFEST_URL 上方说明）。
@@ -3295,8 +3468,34 @@ if (!gotLock) {
     })
 
     // 设备文件桥：只在 cloud 模式启动（local 模式本机即执行端，不需要隧道）。
+    //
+    // H46：桥不再"服务端说哪个 root 就是哪个"。注入的是主进程持有的**用户批准名单**，
+    // 未授权 root 在 op 执行前就会被拒；`requestRootApproval` 让用户在原生的
+    // 目录授权对话框里当场批准（一次），拒绝则永久拒到用户主动批准为止。
+    // 票据换取走 HTTP（Authorization 头），WS 只带一次性 ticket —— 见 device-fs.cjs。
     if (!deviceBridge) {
-      deviceBridge = createDeviceFSBridge({ app, readToken, log: logMain })
+      deviceBridge = createDeviceFSBridge({
+        app,
+        readToken,
+        log: logMain,
+        isRootGranted: candidate => (projectRoots ? projectRoots.covers(candidate) : false),
+        requestRootApproval: async info => {
+          const screened = screenRootCandidate(info.root)
+          if (!screened.ok) {
+            logMain('warn', `设备桥请求的根不可授权（${screened.reason}）`)
+            return false
+          }
+          const approved = await confirmProjectRootApproval(screened.root, info.path || screened.root)
+          if (!approved) return false
+          try {
+            projectRoots.grant(screened.root)
+            return true
+          } catch (err) {
+            logMain('warn', `设备桥根授权写入失败：${err?.message || err}`)
+            return false
+          }
+        },
+      })
     }
     if (!mountDeps) {
       mountDeps = createMountDeps({ app, net, shell, log: logMain })

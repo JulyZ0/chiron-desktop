@@ -198,10 +198,24 @@ contextBridge.exposeInMainWorld('chironDesktop', {
   /**
    * 用系统默认程序打开本地路径，或在文件管理器里定位（`reveal: true`）。
    *
-   * 只接受绝对路径，合法性判断留给后端。返回 `{ ok, reason?, message? }` ——
-   * 页面要能区分"文件已经不在了"与"没有关联程序"，而不是一律说"打开失败"。
+   * H49：主进程不再只看"绝对 + 存在"。可以带上 `root`（工作台从 API 拿到的项目根），
+   * 主进程会用 realpath 之后的路径做判定：
+   *   - 不在已批准的项目根内 ⇒ 弹主进程自己的原生对话框问用户，页面无权批准；
+   *   - `reveal` 只定位、不执行，始终放行；
+   *   - 文档白名单以外（可执行/未知类型）需要用户在系统对话框里勾选确认；
+   *   - UNC / 网络路径直接拒绝。
+   *
+   * 返回 `{ ok, reason?, message?, action?, kind? }` —— 页面要能区分
+   * "文件没了" / "根没授权" / "类型需要确认" / "没有关联程序"。
    */
   openPath: (payload) => ipcRenderer.invoke('desktop:open-path', payload || {}),
+
+  /** 已批准的项目根（只读名单；批准只能由主进程的原生对话框产生） */
+  listProjectRoots: () => ipcRenderer.invoke('desktop:project-roots'),
+  /** 请求批准一个项目根：主进程会弹原生对话框，用户同意才入名单 */
+  grantProjectRoot: root => ipcRenderer.invoke('desktop:grant-project-root', root),
+  /** 撤销一个已批准的项目根 */
+  revokeProjectRoot: root => ipcRenderer.invoke('desktop:revoke-project-root', root),
 
   /**
    * 本地模型配置（provider / 端点 / 模型名 / key）。
