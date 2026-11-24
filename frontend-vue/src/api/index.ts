@@ -165,6 +165,24 @@ function cancelInFlightRequests(): void {
 }
 
 /**
+ * 认证切换时要一并清掉的**账号域状态**（由视图层登记）。
+ *
+ * 为什么需要这个钩子：断线续传游标（`Last-Event-ID`）这类状态由视图层持有，
+ * api 层看不到也无法直接清；但它和 token 一样"只对原账号有意义"——
+ * 账号切换后拿旧游标去续传，等于把新账号的流接到旧账号的位置上。
+ * 视图层在挂载时登记、卸载时注销，`bumpAuthGeneration` 负责统一触发。
+ */
+const authScopedResetHooks = new Set<() => void>()
+
+/** 登记一个"认证切换时清空"的钩子，返回注销函数。 */
+export function registerAuthScopedReset(hook: () => void): () => void {
+  authScopedResetHooks.add(hook)
+  return () => {
+    authScopedResetHooks.delete(hook)
+  }
+}
+
+/**
  * 认证切换：递增代次 + 取消在途请求 + 清账号域缓存。
  *
  * 返回新的代次，便于调用方在同一次切换里继续使用（例如 `login` 用它校验自己的响应）。
@@ -175,7 +193,13 @@ export function bumpAuthGeneration(reason = 'auth-switch'): number {
   cancelInFlightRequests()
   try {
     // 账号域缓存：断线续传点位与签名 URL 都只对原账号有意义。
-    sseLastIdBySession.clear()
+    for (const hook of authScopedResetHooks) {
+      try {
+        hook()
+      } catch {
+        /* 单个钩子失败不应阻止其它清理（清理是尽力而为，代次比对才是硬门） */
+      }
+    }
     signedMediaCache.clear()
   } catch {
     /* 同上 */

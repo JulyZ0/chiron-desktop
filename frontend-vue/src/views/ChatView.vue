@@ -5,7 +5,7 @@ import { MenuOutlined, CopyOutlined, LinkOutlined, CloseOutlined } from '@ant-de
 import {
   api, createSSEConnection, submitApproval, submitAnswer, steerRun,
   getChatSessionMessages, resolveMediaUrl, listModels,
-  createAgent, interruptAgentRun,
+  createAgent, interruptAgentRun, registerAuthScopedReset,
 } from '../api'
 import type { LlmModel, SSEHandle } from '../api'
 import { requestTurnStop, type TurnRef, type TurnStopState } from '../composables/useTurnStop'
@@ -608,6 +608,9 @@ let activeSSE: SSEHandle | null = null
 // 每个会话最后收到的 SSE 事件 id（服务端 id: 行 → event.lastEventId）。
 // 跨轮重建 SSE 时回传（last_event_id），服务端从缓冲流补发上一轮断线缺口（见 api/index.ts createSSEConnection）
 const sseLastIdBySession = new Map<string, string>()
+// H68: auth switch must clear the SSE resume cursor; the map lives here,
+// so the reset is registered as a hook and released on unmount.
+let unregisterAuthScopedReset: (() => void) | undefined
 
 // ── 失败消息标记与手动修复（实现见 composables/useMessageFailure.ts）──
 const { markMessageFailed, describeFailureMeta, repairSession } = useMessageFailure({
@@ -1768,6 +1771,8 @@ useKeyboardShortcuts({
 
 // ── 会话 CRUD（保留原逻辑） ──
 onMounted(async () => {
+  unregisterAuthScopedReset?.()
+  unregisterAuthScopedReset = registerAuthScopedReset(() => { sseLastIdBySession.clear() })
   // 互联互通：解析 /chat query（task / error / kb / agent / skill）
   await applyRouteQuery()
   await loadSessions()
@@ -1790,6 +1795,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  unregisterAuthScopedReset?.()
+  unregisterAuthScopedReset = undefined
   stopTurnTimer()
   if (activeSSE) { activeSSE.close(); activeSSE = null }
   // 子 Agent 通道：关常驻连接 + 冲刷未落盘的合批缓冲（见 useSubagentStream.disposeSubagentStream）

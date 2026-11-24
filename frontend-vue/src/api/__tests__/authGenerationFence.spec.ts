@@ -48,6 +48,11 @@ function httpError(config: unknown, status: number, data: Record<string, unknown
 type Deferred = {
   config: Record<string, unknown>
   reject: (reason: unknown) => void
+  /**
+   * 由用例手动放行。这里刻意接 `unknown` 并在下面做一次显式收窄：
+   * axios 的 adapter 必须给出 `Promise<AxiosResponse>`，直接存 `resolve` 会被 TS
+   * 判成"形参不兼容"（它要的是 `unknown`，拿到的却是 `AxiosResponse`）。
+   */
   resolve: (value: unknown) => void
 }
 
@@ -55,7 +60,13 @@ function controllableAdapter(mod: ApiModule): Deferred[] {
   const pending: Deferred[] = []
   mod.api.defaults.adapter = (config) =>
     new Promise((resolve, reject) => {
-      pending.push({ config: config as unknown as Record<string, unknown>, resolve, reject })
+      pending.push({
+        config: config as unknown as Record<string, unknown>,
+        // 收窄成 `(value: unknown) => void`：调用方传什么都能放行，
+        // 而 axios 侧仍然拿到它需要的 `resolve<AxiosResponse>`。
+        resolve: resolve as unknown as (value: unknown) => void,
+        reject,
+      })
     })
   return pending
 }
