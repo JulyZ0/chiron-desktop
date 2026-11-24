@@ -16,6 +16,7 @@ _GIT_SAFE_CONFIG: tuple[tuple[str, str], ...] = (
     ("core.hooksPath", os.devnull),
     ("core.fsmonitor", "false"),
     ("core.pager", "cat"),
+    ("core.alternateRefsCommand", ""),
     ("credential.helper", ""),
     ("diff.external", ""),
     ("commit.gpgSign", "false"),
@@ -28,6 +29,22 @@ _GIT_SAFE_CONFIG: tuple[tuple[str, str], ...] = (
     ("protocol.allow", "never"),
 )
 _GIT_ENV_KEYS = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP"})
+
+#: 模型给出的 git 参数里，这几个能**把安全配置重新打开**（或换一个仓库/一套配置来跑）——
+#: 一律拒绝，而不是"先放行再看仓库配置探测"：`-c filter.x.clean=evil` 会覆盖掉我们
+#: 追加在前的 `-c`，等价于绕过整层覆盖。
+_GIT_FORBIDDEN_OPTIONS: tuple[str, ...] = (
+    "-c",
+    "--config",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--upload-pack",
+    "--receive-pack",
+    "--super-prefix",
+)
 
 
 def _git_environment() -> dict[str, str]:
@@ -189,6 +206,112 @@ async def _probe_git_config() -> tuple[tuple[tuple[str, str], ...], dict[str, An
         return _config_overrides(config_stdout), None
     except ValueError as exc:
         return (), {"error": f"git repository configuration probe failed: {exc}"}
+
+
+def _forbidden_git_option(argv: list[str]) -> str | None:
+    """找出会重新打开"仓库配置可执行程序"那个缺口的全局参数。"""
+    for arg in argv:
+        for option in _GIT_FORBIDDEN_OPTIONS:
+            if arg == option or arg.startswith(option + "="):
+                return arg
+            # `-cfoo=bar`（紧贴写法）与 `-c foo=bar` 等价，同样拒绝。
+            if option == "-c" and len(option) < len(arg) and arg.startswith(option):
+                return arg
+    return None
+
+
+async def harden_shell_git(
+    argv: list[str],
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    """把**模型给出的** git argv 收成与 git 工具同一口径的安全命令（H25）。
+
+    为什么 `shell_exec` 必须单独走这一条：白名单里 `git` 是允许的可执行文件，
+    但此前只挡了 `clone/push/...` 这类网络子命令 —— 于是 `shell_exec("git status")`
+    在恶意仓库里照样能触发 `core.fsmonitor` / `core.pager` / filter / hooks，
+    与 `git_status` 工具**不是同一个口径**。PRD 的验收要求"所有 Git 入口"一致。
+
+    返回 ``(argv, None)`` 或 ``(None, error)``。三道闸门都在**执行前**：
+
+    1. 仓库根不得向上穿透到工作根之外（与 git 工具同一条断言）；
+    2. 模型不得用 `-c` / `--config` / `--git-dir` / `--exec-path` 等把安全配置重新打开；
+    3. 仓库配置探测失败 ⇒ **拒绝执行**（探测不出配置就不敢声称已覆盖 filter）。
+    """
+    guard = await _ensure_sandbox_repo()
+    if guard:
+        return None, guard
+    forbidden = _forbidden_git_option(argv)
+    if forbidden:
+        return None, {
+            "error": (
+                f"git option blocked: {forbidden!r} can re-enable repository-controlled "
+                "execution (config / external helper)"
+            )
+        }
+    overrides, probe_error = await _probe_git_config()
+    if probe_error:
+        return None, probe_error
+    cmd = ["git", "--no-pager"]
+    for key, value in (*_GIT_SAFE_CONFIG, *overrides):
+        cmd.extend(("-c", f"{key}={value}"))
+    cmd.extend(argv)
+    return cmd, None
+
+
+def git_exec_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """给**任意**会起 git 的子进程用的环境（长驻 shell / 一次性 shell 共用）。
+
+    用 `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` 把固定安全配置
+    钉成"命令行级"（与 `-c` 同优先级，高于系统/全局/仓库配置）。这样即使命令是
+    模型在长驻 shell 里敲的 `git status`（我们无法改写它的 argv），仓库配置里的
+    `core.fsmonitor` / hooks / pager / 外部 diff 也不会被执行。
+
+    `base` 必须已经是 `sandboxed_env()` 的结果（只做增量，不替换清洗）。
+    """
+    from app.tools.sandbox import sandboxed_env
+
+    env = dict(sandboxed_env() if base is None else base)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_ALLOW_PROTOCOL": "",
+            "GIT_PROTOCOL_FROM_USER": "0",
+        }
+    )
+    for index, (key, value) in enumerate(_GIT_SAFE_CONFIG):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    env["GIT_CONFIG_COUNT"] = str(len(_GIT_SAFE_CONFIG))
+    return env
+
+
+async def git_shell_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """长驻 shell 用的环境：静态安全配置 + 当前仓库的动态 filter 覆盖。
+
+    动态覆盖要**此刻**探一次仓库配置（`filter.*.clean` / `diff.*.textconv` 是仓库自带的
+    驱动程序名，静态表写不出来）。探测失败时只保留静态层并告警 —— 与 git 工具不同，
+    这里起的是通用 shell，不能因为某个仓库配置读失败就让用户连 `ls` 都用不了。
+    """
+    env = git_exec_env(base)
+    try:
+        overrides, probe_error = await _probe_git_config()
+    except Exception as exc:  # noqa: BLE001 — 探测异常同样只降级到静态层
+        logger.warning("git shell env: config probe failed: %s", exc)
+        return env
+    if probe_error:
+        logger.warning("git shell env: %s", probe_error.get("error"))
+        return env
+    count = int(env["GIT_CONFIG_COUNT"])
+    for key, value in overrides:
+        env[f"GIT_CONFIG_KEY_{count}"] = key
+        env[f"GIT_CONFIG_VALUE_{count}"] = value
+        count += 1
+    env["GIT_CONFIG_COUNT"] = str(count)
+    return env
 
 
 async def _ensure_sandbox_repo() -> dict[str, Any] | None:

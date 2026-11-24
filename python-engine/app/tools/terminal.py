@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from app.tools.context import get_session_id
+from app.tools.git_tools import git_shell_env
 from app.tools.registry import registry
 from app.tools.sandbox import (
     _rlimit_kwargs,
@@ -145,7 +146,11 @@ class PersistentTerminal:
             cwd=ws,
             # S 安全修复：清理宿主 env(API key/JWT_SECRET/internal token 等)，
             # 仅保留 PATH/HOME 等基础变量并重定向到沙箱，防止模型 `env` 外带密钥。
-            env=sandboxed_env(),
+            # H25：长驻 shell 里敲的 `git status` 读的是**仓库自带配置**（`core.fsmonitor`
+            # / hooks / pager / filter）。它的 argv 我们改不了，所以把固定安全配置用
+            # `GIT_CONFIG_*` 钉进环境（与 `-c` 同级，高于仓库配置），并带上此刻探测到的
+            # 动态 filter 覆盖。
+            env=await git_shell_env(sandboxed_env()),
             # S5-1：长驻 shell 此前**没有资源限制**（一次性 shell_exec 走 run_in_sandbox
             # 现在也有了）。POSIX 下施加 RLIMIT；Windows 无 resource，靠调用方超时兜底。
             **_rlimit_kwargs(),
@@ -206,7 +211,7 @@ class PersistentTerminal:
             opener,
             [shell_exe],
             cwd=ws,
-            env=sandboxed_env(),
+            env=await git_shell_env(sandboxed_env()),
         )
         if session is None:
             # fail-closed：起不来就拒绝，**不**退回无隔离的普通 shell。
