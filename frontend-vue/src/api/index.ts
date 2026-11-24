@@ -1,7 +1,17 @@
 import axios from 'axios'
 import { describeApiError, serverErrorDetail } from '../utils/apiError'
 import { toToolList, type ToolInfo } from '../utils/toolList'
-import { canAutoRetry, readRetryable, resolveResponseWaitMs, shouldRetryResponse } from '../utils/rateLimitBackoff'
+import {
+  canAutoRetry,
+  isUploadPayload,
+  readHeader,
+  readRetryable,
+  replayVerdict,
+  resolveResponseWaitMs,
+  shouldRetryResponse,
+  IDEMPOTENCY_KEY_HEADER,
+  type ReplayVerdict,
+} from '../utils/rateLimitBackoff'
 import { isNewerStreamId } from '../utils/streamId'
 import type { WorkstationType } from '../types/workstation'
 
@@ -296,7 +306,9 @@ export async function listAgents(): Promise<Agent[]> {
 }
 
 export async function createAgent(body: Partial<Agent>): Promise<Agent> {
-  const { data } = await api.post('/v1/agents', body)
+  // H66：建 Agent 是一次**不可去重**的写（服务端没有按请求键去重）。
+  // 显式禁止自动重放，避免 503 时凭空多出一个同名 Agent。
+  const { data } = await api.post('/v1/agents', body, { __noRetry: true })
   return data?.data
 }
 
@@ -310,7 +322,10 @@ export async function deleteAgent(id: string): Promise<void> {
 }
 
 export async function runAgent(id: string, task: string): Promise<AgentSession> {
-  const { data } = await api.post(`/v1/agents/${encodeURIComponent(id)}/run`, { task })
+  // H66：一次派发 = 服务端建一个 AgentSession 并启动执行（`internal/api/agents.go`），
+  // 响应还没回来时副作用就已经落库。限流自动重放会让同一条任务跑两遍（并计费两次），
+  // 因此这里显式拒绝自动重试 —— 由用户决定要不要再发一次。
+  const { data } = await api.post(`/v1/agents/${encodeURIComponent(id)}/run`, { task }, { __noRetry: true })
   return data?.data
 }
 
@@ -502,7 +517,33 @@ declare module 'axios' {
   export interface AxiosRequestConfig {
     /** 置 true 时拦截器不派发 `api:error`（错误仍原样 reject 给调用方） */
     __silent?: boolean
+    /**
+     * 置 true 时**禁止**自动重放（H66）。用于调用方已知「这次副作用无法靠幂等键去重」的写请求
+     * —— 例如 `POST /v1/agents/{id}/run`（一个请求建一个 AgentSession）。
+     */
+    __noRetry?: boolean
   }
+}
+
+/**
+ * 这个失败请求能不能安全地自动重发（H66）。判据在 `replayVerdict`（纯函数，可单测）。
+ *
+ * 这里只做 `config → ReplayInput` 的搬运：方法、`Idempotency-Key` 头、是否上传、
+ * 以及调用方的 `__noRetry`。
+ */
+function requestReplayVerdict(config: unknown): ReplayVerdict {
+  const cfg = (config ?? {}) as {
+    method?: string
+    headers?: unknown
+    data?: unknown
+    __noRetry?: boolean
+  }
+  return replayVerdict({
+    method: cfg.method,
+    idempotencyKey: readHeader(cfg.headers, IDEMPOTENCY_KEY_HEADER),
+    isUpload: isUploadPayload(cfg.data, readHeader(cfg.headers, 'content-type')),
+    retryDisabled: cfg.__noRetry === true,
+  })
 }
 
 /**
@@ -556,7 +597,11 @@ api.interceptors.response.use(
       // 从 5s 起指数退避到几十秒。次数用完仍不就绪，就如实报原因 ——
       // 组件真没起来时，前端再怎么等也没用。
       const delayMs = LOCAL_NOT_READY_RETRY_DELAYS_MS[localAttempt - 1]
-      if (localConfig && delayMs !== undefined) {
+      // H66：只有**可重放**的请求才走这段等待。本地 503 表示"组件还没起来"，
+      // 读请求重试是纯收益；但一条 `POST /submit`/派发/上传重放会真的再建一次
+      // session 或再传一遍文件 —— 宁可立刻把"No ready"如实报出来让用户自己重发。
+      const localReplay = requestReplayVerdict(error.config)
+      if (localConfig && localReplay.safe && delayMs !== undefined) {
         localConfig.__localReadyRetry = localAttempt
         await new Promise(resolve => setTimeout(resolve, delayMs))
         return api.request(localConfig)
@@ -583,7 +628,12 @@ api.interceptors.response.use(
     if (shouldRetryResponse(status, retryable)) {
       const config = error.config as (typeof error.config & { __rateLimitRetry?: number }) | undefined
       const attempt = (config?.__rateLimitRetry ?? 0) + 1
-      if (config && canAutoRetry(attempt)) {
+      // H66：`retryable`/状态码只说"再发一次**可能有用**"，不证明"再发一次**没有副作用**"。
+      // 只有 GET/HEAD/OPTIONS 或带 `Idempotency-Key` 的非上传请求才真去重放；
+      // 其余写请求一律不重放，直接把错误交回调用方（提示仍是"服务繁忙，请稍后再试"，
+      // 但**没有**替用户偷偷再派发一次 Agent / 再建一个 session / 再传一遍文件）。
+      const replay = requestReplayVerdict(error.config)
+      if (config && replay.safe && canAutoRetry(attempt)) {
         config.__rateLimitRetry = attempt
         const waitMs = resolveResponseWaitMs(
           attempt,
@@ -718,7 +768,9 @@ export async function uploadFile(file: File): Promise<{
   form.append('file', file)
   // S 修复：不要手动设 multipart Content-Type（会丢 boundary 致 "invalid form"），
   // 让浏览器/axios 自动生成带 boundary 的正确头。
-  const resp = await api.post('/v1/media/upload', form)
+  // H66：上传**不自动重放**。既不用 `__noRetry` 兜底（FormData 本身也会被判为不可重放），
+  // 也让"限流时悄悄再传一遍 50MB"这条路径彻底不存在。
+  const resp = await api.post('/v1/media/upload', form, { __noRetry: true })
   const envelope = resp.data as { success?: boolean; data?: Record<string, unknown> }
   const d = envelope?.success === true ? envelope.data : undefined
   const id = typeof d?.id === 'string' ? d.id : ''
