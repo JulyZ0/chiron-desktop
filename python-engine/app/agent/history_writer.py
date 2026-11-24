@@ -26,8 +26,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -51,6 +54,17 @@ ARCHIVE_INLINE_CHARS = 64_000
 
 #: 一次读取返回的最大消息数。历史是用来重建上下文的，不是导出工具。
 DEFAULT_HISTORY_LIMIT = 500
+_SOURCE_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class ProjectionClaim:
+    claim_id: str
+    session_id: str
+    tenant_id: int
+    source_digest: str
+    message_revision: int
+    folds: list[dict[str, Any]]
 
 
 def _truncate(text: str, limit: int = MESSAGE_CONTENT_MAX_CHARS) -> str:
@@ -386,8 +400,8 @@ async def persist_folds(session_id: str, tenant_id: Any, folds: list[dict[str, A
                     status = await conn.execute(
                         "INSERT INTO session_folds "
                         "(id, session_id, covered_from, covered_to, digest, "
-                        "digest_model, digest_prompt, body_suffix) "
-                        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8) "
+                        "digest_model, digest_prompt, body_suffix, lineage) "
+                        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
                         "ON CONFLICT (session_id, covered_from, covered_to) DO NOTHING",
                         str(uuid.uuid4()),
                         session_id,
@@ -397,6 +411,16 @@ async def persist_folds(session_id: str, tenant_id: Any, folds: list[dict[str, A
                         str(fold.get("digest_model") or ""),
                         str(fold.get("digest_prompt") or "prune"),
                         int(fold.get("body_suffix") or 0),
+                        (
+                            json.dumps(
+                                fold["lineage"],
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            if isinstance(fold.get("lineage"), dict)
+                            else None
+                        ),
                     )
                     # 必须按**实际影响行数**计数：`ON CONFLICT DO NOTHING` 命中时
                     # 什么都没写，先前无条件 `written += 1` 会把冲突谎报成写入。
@@ -427,6 +451,28 @@ async def persist_folds(session_id: str, tenant_id: Any, folds: list[dict[str, A
         return 0
 
 
+def _decode_fold_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        lineage = row["lineage"]
+        if isinstance(lineage, str):
+            try:
+                lineage = json.loads(lineage)
+            except (TypeError, ValueError):
+                lineage = None
+        out.append(
+            {
+                "covered_from": int(row["covered_from"]),
+                "covered_to": int(row["covered_to"]),
+                "digest": row["digest"] or "",
+                "digest_model": row["digest_model"] or "",
+                "body_suffix": int(row["body_suffix"] or 0),
+                "lineage": lineage if isinstance(lineage, dict) else None,
+            }
+        )
+    return out
+
+
 async def load_folds(session_id: str, tenant_id: Any) -> list[dict[str, Any]]:
     """取该会话全部折叠记录（按区间升序），供投影重建使用。
 
@@ -454,9 +500,9 @@ async def load_folds(session_id: str, tenant_id: Any) -> list[dict[str, Any]]:
             return []
 
         # 按 covered_from 升序：投影要按时间顺序拼接，乱序会让摘要顺序错乱。
-        # 读 digest_model 是为了让调用方判断摘要可信度（提取式 vs 模型生成）。
+        # lineage 为 NULL 的旧记录仍可读取，但投影校验会拒绝将其作为可信摘要。
         rows = await pool.fetch(
-            "SELECT covered_from, covered_to, digest, digest_model, body_suffix "
+            "SELECT covered_from, covered_to, digest, digest_model, body_suffix, lineage "
             "FROM session_folds WHERE session_id = $1 "
             "ORDER BY covered_from ASC",
             session_id,
@@ -465,18 +511,191 @@ async def load_folds(session_id: str, tenant_id: Any) -> list[dict[str, Any]]:
         logger.warning("history_writer: load folds failed (session=%s): %s", session_id, exc)
         return []
 
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        out.append(
-            {
-                "covered_from": int(row["covered_from"]),
-                "covered_to": int(row["covered_to"]),
-                "digest": row["digest"] or "",
-                "digest_model": row["digest_model"] or "",
-                "body_suffix": int(row["body_suffix"] or 0),
-            }
+    return _decode_fold_rows(rows)
+
+
+def _runtime_projection_message(message: dict[str, Any]) -> dict[str, Any]:
+    from app.agent.message_codec import make_message
+
+    extra = {key: message[key] for key in ("id", "seq") if message.get(key) is not None}
+    return make_message(
+        role=str(message.get("role") or "user"),
+        content=str(message.get("content") or ""),
+        tool_call_id=str(message.get("tool_call_id") or ""),
+        tool_calls=message.get("tool_calls"),
+        **extra,
+    )
+
+
+async def claim_fold_projection(
+    session_id: str,
+    tenant_id: Any,
+    messages: list[dict[str, Any]],
+    *,
+    expected_source_digest: str,
+) -> ProjectionClaim | None:
+    """Claim one database-backed installation right for a source snapshot."""
+    from app.agent.compaction import projection_source_digest
+
+    tid = _coerce_tenant(tenant_id)
+    if (
+        not session_id
+        or tid <= 0
+        or not messages
+        or not _SOURCE_DIGEST_RE.fullmatch(expected_source_digest)
+        or projection_source_digest(messages) != expected_source_digest
+    ):
+        return None
+
+    from app.db import get_pool
+    from app.middleware.privacy_middleware import is_no_retention
+
+    if is_no_retention():
+        return None
+
+    try:
+        pool = get_pool()
+        if pool is None:
+            return None
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                session = await conn.fetchrow(
+                    "SELECT message_revision FROM sessions "
+                    "WHERE id = $1 AND tenant_id = $2 FOR SHARE",
+                    session_id,
+                    tid,
+                )
+                if session is None:
+                    return None
+                revision = int(session["message_revision"])
+                rows = await conn.fetch(
+                    "SELECT role, content, COALESCE(tool_calls::text, ''), "
+                    "COALESCE(turn_id::text, ''), COALESCE(tool_call_id, ''), id, seq "
+                    "FROM messages WHERE session_id = $1 "
+                    "ORDER BY seq DESC LIMIT $2",
+                    session_id,
+                    DEFAULT_HISTORY_LIMIT,
+                )
+                durable = await _decode_message_rows(conn, session_id, rows)
+                system = [m for m in messages if m.get("role") == "system"]
+                current_source = system + [
+                    _runtime_projection_message(message) for message in durable
+                ]
+                expected_source = system + [
+                    _runtime_projection_message(message)
+                    for message in messages
+                    if message.get("role") != "system"
+                ]
+                if projection_source_digest(current_source) != projection_source_digest(
+                    expected_source
+                ):
+                    return None
+                fold_rows = await conn.fetch(
+                    "SELECT covered_from, covered_to, digest, digest_model, body_suffix, lineage "
+                    "FROM session_folds WHERE session_id = $1 ORDER BY covered_from ASC",
+                    session_id,
+                )
+                folds = _decode_fold_rows(fold_rows)
+                if not folds:
+                    return None
+                claim_id = str(uuid.uuid4())
+                claimed = await conn.fetchrow(
+                    "INSERT INTO session_projection_claims "
+                    "(id, session_id, source_digest, message_revision) "
+                    "VALUES ($1, $2, $3, $4) "
+                    "ON CONFLICT (session_id, source_digest) DO NOTHING RETURNING id",
+                    claim_id,
+                    session_id,
+                    expected_source_digest,
+                    revision,
+                )
+                if claimed is None:
+                    return None
+                return ProjectionClaim(
+                    claim_id=str(claimed["id"]),
+                    session_id=session_id,
+                    tenant_id=tid,
+                    source_digest=expected_source_digest,
+                    message_revision=revision,
+                    folds=folds,
+                )
+    except Exception as exc:  # noqa: BLE001 — projection is optional; CAS failure is a refusal
+        logger.warning("history_writer: projection claim failed (session=%s): %s", session_id, exc)
+        return None
+
+
+async def complete_fold_projection(
+    claim: ProjectionClaim, *, projection_digest: str
+) -> bool:
+    """Mark a claim installed only while its shared message revision is unchanged."""
+    if not _SOURCE_DIGEST_RE.fullmatch(projection_digest):
+        return False
+
+    from app.db import get_pool
+
+    try:
+        pool = get_pool()
+        if pool is None:
+            return False
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                session = await conn.fetchrow(
+                    "SELECT message_revision FROM sessions "
+                    "WHERE id = $1 AND tenant_id = $2 FOR UPDATE",
+                    claim.session_id,
+                    claim.tenant_id,
+                )
+                if session is None or int(session["message_revision"]) != claim.message_revision:
+                    return False
+                status = await conn.execute(
+                    "UPDATE session_projection_claims "
+                    "SET status = 'installed', projection_digest = $6, installed_at = NOW() "
+                    "WHERE id = $1 AND session_id = $2 AND source_digest = $3 "
+                    "AND message_revision = $4 AND status = 'claimed' "
+                    "AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = $2 "
+                    "AND s.tenant_id = $5 AND s.message_revision = $4)",
+                    claim.claim_id,
+                    claim.session_id,
+                    claim.source_digest,
+                    claim.message_revision,
+                    claim.tenant_id,
+                    projection_digest,
+                )
+                return _rowcount(status) > 0
+    except Exception as exc:  # noqa: BLE001 — never install after an unverifiable CAS
+        logger.warning(
+            "history_writer: projection completion failed (session=%s claim=%s): %s",
+            claim.session_id,
+            claim.claim_id,
+            exc,
         )
-    return out
+        return False
+
+
+async def abort_fold_projection(claim: ProjectionClaim) -> None:
+    """Release this owner's claim when validation or the local swap did not finish."""
+    from app.db import get_pool
+
+    try:
+        pool = get_pool()
+        if pool is None:
+            return
+        await pool.execute(
+            "DELETE FROM session_projection_claims c "
+            "WHERE c.id = $1 AND c.session_id = $2 "
+            "AND c.status IN ('claimed', 'installed') "
+            "AND EXISTS (SELECT 1 FROM sessions s WHERE s.id = $2 AND s.tenant_id = $3)",
+            claim.claim_id,
+            claim.session_id,
+            claim.tenant_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — stale claimed rows fail closed on future attempts
+        logger.warning(
+            "history_writer: projection abort failed (session=%s claim=%s): %s",
+            claim.session_id,
+            claim.claim_id,
+            exc,
+        )
 
 
 async def load_message_content(
@@ -560,6 +779,49 @@ async def load_message_content(
     return content[offset:], total
 
 
+async def _decode_message_rows(
+    pool: Any, session_id: str, rows: list[Any]
+) -> list[dict[str, Any]]:
+    # DESC 取尾 → 反转成时间顺序
+    out: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        msg: dict[str, Any] = {"role": row["role"], "content": row["content"]}
+        # `id` 只用于**内部**定位原文：压缩时要把它写进裁剪通知，模型才能拿
+        # `read_archive(ref=...)` 取回。它不会进入 provider 请求 ——
+        # `message_codec.to_chat_messages` 只转发 role/content/tool_call_id/tool_calls。
+        if row["id"]:
+            msg["id"] = row["id"]
+        # `seq` 是 `session_folds` 的区间坐标（半开区间 [covered_from, covered_to)）。
+        # 用 id 无法回答"这条在折叠边界内吗"，只有单调的 seq 可以。
+        if row["seq"] is not None:
+            msg["seq"] = row["seq"]
+        raw_calls = row[2]
+        if raw_calls:
+            import json
+
+            try:
+                calls = json.loads(raw_calls)
+            except (TypeError, ValueError):
+                calls = None
+            if isinstance(calls, list) and calls:
+                normalized = _normalize_stored_tool_calls(calls)
+                if normalized:
+                    msg["tool_calls"] = normalized
+        if row[3]:
+            msg["turn_id"] = row[3]
+        # tool 消息必须带 tool_call_id 才能与 assistant.tool_calls 配对；
+        # 缺了它，`_ensure_valid_tool_sequence` 会把这条当孤儿删掉 ——
+        # 于是"入库存了、读回来没了"。
+        if row[4]:
+            msg["tool_call_id"] = row[4]
+        out.append(msg)
+    if not out:
+        return []
+
+    await _backfill_tool_call_names(pool, session_id, out)
+    return out
+
+
 async def load_messages(
     session_id: str, tenant_id: Any, *, limit: int = DEFAULT_HISTORY_LIMIT
 ) -> list[dict[str, Any]]:
@@ -602,44 +864,7 @@ async def load_messages(
         logger.warning("history_writer: load failed (session=%s): %s", session_id, exc)
         return []
 
-    # DESC 取尾 → 反转成时间顺序
-    out: list[dict[str, Any]] = []
-    for row in reversed(rows):
-        msg: dict[str, Any] = {"role": row["role"], "content": row["content"]}
-        # `id` 只用于**内部**定位原文：压缩时要把它写进裁剪通知，模型才能拿
-        # `read_archive(ref=...)` 取回。它不会进入 provider 请求 ——
-        # `message_codec.to_chat_messages` 只转发 role/content/tool_call_id/tool_calls。
-        if row["id"]:
-            msg["id"] = row["id"]
-        # `seq` 是 `session_folds` 的区间坐标（半开区间 [covered_from, covered_to)）。
-        # 用 id 无法回答"这条在折叠边界内吗"，只有单调的 seq 可以。
-        if row["seq"] is not None:
-            msg["seq"] = row["seq"]
-        raw_calls = row[2]
-        if raw_calls:
-            import json
-
-            try:
-                calls = json.loads(raw_calls)
-            except (TypeError, ValueError):
-                calls = None
-            if isinstance(calls, list) and calls:
-                normalized = _normalize_stored_tool_calls(calls)
-                if normalized:
-                    msg["tool_calls"] = normalized
-        if row[3]:
-            msg["turn_id"] = row[3]
-        # tool 消息必须带 tool_call_id 才能与 assistant.tool_calls 配对；
-        # 缺了它，`_ensure_valid_tool_sequence` 会把这条当孤儿删掉 ——
-        # 于是"入库存了、读回来没了"。
-        if row[4]:
-            msg["tool_call_id"] = row[4]
-        out.append(msg)
-    if not out:
-        return []
-
-    await _backfill_tool_call_names(pool, session_id, out)
-    return out
+    return await _decode_message_rows(pool, session_id, rows)
 
 
 def _normalize_stored_tool_calls(calls: list[Any]) -> list[dict[str, Any]]:

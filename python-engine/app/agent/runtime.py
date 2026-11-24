@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
@@ -130,7 +130,7 @@ from app.agent.runtime_types import (
     ApprovalDecision as ApprovalDecision,
 )
 from app.agent.runtime_types import (
-    ApprovalTicket as ApprovalTicket,
+    ApprovalTicket as _ApprovalTicketBase,
 )
 from app.agent.tool_execution import (  # noqa: F401 — 再导出：既有 import 路径不变
     SUBAGENT_TOOL as SUBAGENT_TOOL,
@@ -167,6 +167,54 @@ APPROVAL_TTL_SECONDS = 300.0
 #: 网关的预算从**提交那一刻**开始算，等待从**工具调用那一刻**开始算（必然更晚），
 #: 所以"相等"实际就是"网关先到点"。60s 覆盖模型这一段里已花掉的时间与调度抖动。
 _INTERACTION_WAIT_MARGIN_SECONDS = 60.0
+
+
+@dataclass
+class ApprovalTicket(_ApprovalTicketBase):
+    """一次审批的完整绑定：调用、调用者、资源范围与规范化参数摘要。
+
+    旧 ``runtime_types.ApprovalTicket`` 只带工具名、轮次和参数哈希，无法证明同一张票
+    属于同一个用户/会话，也无法记录项目根或目标资源的变化。这里在 runtime 内扩展它，
+    既保持既有 import 路径，又不改动其他模块共用的数据面类型。
+
+    ``caller_id`` 与 ``resource_scope`` 都是稳定 JSON 字符串；缺任一字段的旧票据一律
+    视为损坏（fail-closed），不能因为工具名/参数恰好相同而复用。
+    """
+
+    caller_id: str = ""
+    resource_scope: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "tool_call_id": self.tool_call_id,
+                "tool_name": self.tool_name,
+                "args_hash": self.args_hash,
+                "turn_id": self.turn_id,
+                "caller_id": self.caller_id,
+                "resource_scope": self.resource_scope,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> ApprovalTicket | None:
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:  # noqa: BLE001 - 票据损坏按"无票据"处理（fail-closed）
+            return None
+        required = ("tool_call_id", "tool_name", "args_hash", "turn_id", "caller_id", "resource_scope")
+        if not isinstance(data, dict) or any(not isinstance(data.get(key), str) or not data[key] for key in required):
+            return None
+        return cls(
+            tool_call_id=data["tool_call_id"],
+            tool_name=data["tool_name"],
+            args_hash=data["args_hash"],
+            turn_id=data["turn_id"],
+            caller_id=data["caller_id"],
+            resource_scope=data["resource_scope"],
+        )
 
 
 def _parse_go_duration(raw: str) -> float | None:
@@ -455,6 +503,81 @@ def _plugin_names_of(workbench_context: dict[Any, Any] | None) -> list[str]:
             if name and name not in out:
                 out.append(name)
     return out
+
+
+def _approval_caller_id(task: Any) -> str:
+    """Broker 实际看到的调用者身份（租户归一方式与 Broker 请求一致）。"""
+    return json.dumps(
+        {
+            "tenant_id": to_tenant_int(getattr(task, "tenant_id", 0)),
+            "user_id": str(getattr(task, "user_id", "") or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+#: 审批资源范围显式覆盖的目标参数。其余参数仍全部进入 args_hash；这里单列是为了让
+#: "批准的是哪个文件/URL/作业/项目"可审计，并能在不比较完整参数正文的情况下复核。
+_APPROVAL_RESOURCE_ARG_KEYS: frozenset[str] = frozenset(
+    {
+        "path", "file", "filepath", "filename", "dir", "directory", "root", "cwd",
+        "target", "dest", "destination", "source", "url", "uri", "endpoint",
+        "job_id", "run_id", "resource", "resource_id", "repository", "repo", "server",
+    }
+)
+_APPROVAL_RESOURCE_ARG_COLLECTIONS: frozenset[str] = frozenset(
+    {"paths", "files", "targets", "destinations", "sources", "urls", "job_ids", "run_ids", "resources"}
+)
+
+
+def _approval_resource_scope(task: Any, tool_name: str, args: dict[str, Any] | None) -> str:
+    """会话/项目授权边界 + 本次调用的目标资源，稳定序列化后绑定到票据。"""
+    from app.agent.tool_policy import COMMAND_TOOLS, canonical_args
+
+    context = getattr(task, "workbench_context", None)
+    project = context.get("project") if isinstance(context, dict) else ""
+    root = _project_root_of(context)
+    canonical = canonical_args(tool_name, args)
+    resources = {
+        key: value
+        for key, value in canonical.items()
+        if key.lower() in _APPROVAL_RESOURCE_ARG_KEYS or key.lower() in _APPROVAL_RESOURCE_ARG_COLLECTIONS
+    }
+    if tool_name in COMMAND_TOOLS:
+        # 命令的资源边界无法可靠拆解，整条命令必须作为范围的一部分；完整参数摘要仍覆盖
+        # cwd/env 等其余字段。这样 `ls a` → `ls b` 不会只靠风险等级相同被复用。
+        for key in ("command", "cmd", "script", "code"):
+            if key in canonical:
+                resources[key] = canonical[key]
+    return json.dumps(
+        {
+            "session_id": str(getattr(task, "session_id", "") or ""),
+            "project": project.strip() if isinstance(project, str) else "",
+            "root_path": canonical_args(tool_name, {"root": root})["root"],
+            "project_locator": _project_locator_of(context),
+            "resources": resources,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _approval_ticket_for(tool_call: dict[Any, Any], task: Any, args: dict[str, Any]) -> ApprovalTicket:
+    """审批发起与 edit 后重写共用的唯一票据构造点。"""
+    from app.agent.tool_policy import args_hash
+
+    tool_name = str(tool_call.get("name", "") or "")
+    return ApprovalTicket(
+        tool_call_id=str(tool_call.get("id") or tool_name),
+        tool_name=tool_name,
+        args_hash=args_hash(tool_name, args),
+        turn_id=str(getattr(task, "id", "") or ""),
+        caller_id=_approval_caller_id(task),
+        resource_scope=_approval_resource_scope(task, tool_name, args),
+    )
 
 
 def _tool_name_of(tool: dict[Any, Any]) -> str:
@@ -1099,6 +1222,7 @@ class AgentRuntime:
         因为显式配置是租户/模式的明确口径，而常量只是"查不到时的兜底"。
         """
         comp_cfg = self._resolve_compaction(mode_cfg, llm_config)
+        provider = str((llm_config or {}).get("provider", "") or "")
         # 窗口预算先扣掉输出额度与估算余量（`_input_budget`）：窗口是输入输出共用的，
         # 按整窗排满等于把不存在的空间算成可用 —— 那正是"还没到压缩线就先溢出"的来源。
         budget = (
@@ -1109,10 +1233,21 @@ class AgentRuntime:
         # 工具表也是输入的一部分。此前判定只数消息，工具多时系统性偏乐观。
         tools_tokens = _tools_tokens(tools, model)
         comp_cfg = (
-            replace(comp_cfg, max_context_tokens=budget, model=model, tools_tokens=tools_tokens)
+            replace(
+                comp_cfg,
+                max_context_tokens=budget,
+                model=model,
+                provider=provider or comp_cfg.provider,
+                context_window=window or comp_cfg.context_window,
+                tools_tokens=tools_tokens,
+            )
             if comp_cfg is not None
             else CompactionConfig(
-                max_context_tokens=budget, model=model, tools_tokens=tools_tokens
+                max_context_tokens=budget,
+                model=model,
+                provider=provider,
+                context_window=window,
+                tools_tokens=tools_tokens,
             )
         )
         if force:
@@ -1209,6 +1344,7 @@ class AgentRuntime:
         （例如单条消息本身就超窗），继续重试只是烧钱。
         """
         comp_cfg = self._resolve_compaction(mode_cfg, llm_config)
+        provider = str((llm_config or {}).get("provider", "") or "")
         budget = (
             (comp_cfg.max_context_tokens if comp_cfg else 0)
             or _input_budget(window, max_output)
@@ -1221,6 +1357,8 @@ class AgentRuntime:
             snipe_ratio=0.0,
             strategy="auto",
             model=model,
+            provider=provider or (comp_cfg.provider if comp_cfg else ""),
+            context_window=window or (comp_cfg.context_window if comp_cfg else 0),
             tools_tokens=_tools_tokens(tools, model),
         )
         compacted = _compact_messages(messages, forced, dropped=dropped, folds=folds)
@@ -1778,37 +1916,97 @@ class AgentRuntime:
         **任何环节失败都返回原 `messages`**：读不到 fold、区间校验不过、摘要为空，
         统统回退全量。宁可超预算走既有的实时裁剪，也不发一份漏段的投影。
         """
+        claim = None
         try:
             if _estimate_tokens(messages, model=model) <= MAX_CONTEXT_TOKENS:
                 return messages
 
             from app.agent import history_writer
+            from app.agent.compaction import (
+                build_fold_projection,
+                install_fold_projection,
+                projection_source_digest,
+            )
 
-            folds = await history_writer.load_folds(
+            source_digest = projection_source_digest(messages)
+            claim = await history_writer.claim_fold_projection(
                 getattr(task, "session_id", "") or "",
                 getattr(task, "tenant_id", 0) or 0,
+                messages,
+                expected_source_digest=source_digest,
             )
-            if not folds:
+            if claim is None:
+                logger.info(
+                    "context projection claim rejected (session=%s)",
+                    getattr(task, "session_id", ""),
+                )
                 return messages
 
-            projected = _apply_folds(messages, folds, model=model)
+            provider = str((getattr(task, "llm_config", None) or {}).get("provider", "") or "")
+            context_window = int(getattr(self, "_context_window", 0) or 0)
+            message_count = len(messages)
+            projected = build_fold_projection(
+                messages,
+                claim.folds,
+                expected_source_digest=source_digest,
+                model=model,
+                provider=provider,
+                context_window=context_window,
+            )
             if projected is None:
+                fold_count = len(claim.folds)
+                await history_writer.abort_fold_projection(claim)
+                claim = None
                 logger.info(
                     "context projection rejected by validation (session=%s folds=%d)",
                     getattr(task, "session_id", ""),
-                    len(folds),
+                    fold_count,
+                )
+                return messages
+
+            projection_digest = projection_source_digest(projected)
+            if not await history_writer.complete_fold_projection(
+                claim, projection_digest=projection_digest
+            ):
+                revision = claim.message_revision
+                await history_writer.abort_fold_projection(claim)
+                claim = None
+                logger.info(
+                    "context projection CAS rejected (session=%s revision=%d)",
+                    getattr(task, "session_id", ""),
+                    revision,
+                )
+                return messages
+
+            installed = install_fold_projection(
+                messages,
+                claim.folds,
+                expected_source_digest=source_digest,
+                model=model,
+                provider=provider,
+                context_window=context_window,
+            )
+            if installed is None:
+                await history_writer.abort_fold_projection(claim)
+                claim = None
+                logger.info(
+                    "context projection source changed before local install (session=%s)",
+                    getattr(task, "session_id", ""),
                 )
                 return messages
 
             logger.info(
-                "context projection applied (session=%s folds=%d %d→%d messages)",
+                "context projection applied (session=%s folds=%d %d→%d messages revision=%d)",
                 getattr(task, "session_id", ""),
-                len(folds),
-                len(messages),
-                len(projected),
+                len(claim.folds),
+                message_count,
+                len(installed),
+                claim.message_revision,
             )
-            return projected
+            return installed
         except Exception as exc:  # noqa: BLE001 — 投影是优化项，失败就用全量
+            if claim is not None:
+                await history_writer.abort_fold_projection(claim)
             logger.warning("context projection skipped: %s", exc)
             return messages
 
@@ -4674,19 +4872,12 @@ class AgentRuntime:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[bool] = loop.create_future()
         self._pending_approvals[tc_id] = future
-        # 票据：先把"我这次请求的是什么"写进 Redis，执行前再读回复核
-        # （见 _second_check_approval）。写失败不阻断审批 —— 少一道校验，而不是卡住用户。
+        # 票据：先把"我这次请求的是什么、谁请求、作用于哪个范围"写进 Redis，执行前再读回复核
+        # （见 _second_check_approval）。写失败不阻断审批 —— 缺票据会在执行前 fail-closed。
         from app.agent.tool_policy import args_hash as _args_hash
 
         ahash = _args_hash(tool_name, targs)
-        await self._store_approval_ticket(
-            ApprovalTicket(
-                tool_call_id=tc_id,
-                tool_name=tool_name,
-                args_hash=ahash,
-                turn_id=str(getattr(task, "id", "") or ""),
-            )
-        )
+        await self._store_approval_ticket(_approval_ticket_for(tool_call, task, targs))
         # "问"也要留痕（与决定按 tool_call_id 配对）：只记决定的话，
         # "问了但没等到决定"（等待期进程被杀 / 副本被回收 / 连接断开）在流水里看不出来。
         _record_approval_request(tc_id, tool_name, level=level, arguments=targs)
@@ -4748,6 +4939,42 @@ class AgentRuntime:
             tool_arguments=json.dumps(targs, ensure_ascii=False),
             content=content,
         )
+
+    async def _authorize_edited_approval(
+        self,
+        tool_call: dict[Any, Any],
+        task: AgentTask,
+        edited_args: dict[str, Any],
+    ) -> str:
+        """edit 改变规范化参数后，向 Broker 重新申请一次服务端授权。
+
+        人工批准只表达"用户同意编辑后的动作"，不能替代服务端对**新参数**的授权。
+        因此调用失败、响应非法或 ``allowed=false`` 都必须拒绝执行；风险等级是否变化
+        不参与这里的前提判断（调用方已比较规范化参数摘要）。
+        """
+        from app.agent.tool_policy import tool_level
+        from app.tools import broker
+
+        tool_name = str(tool_call.get("name", "") or "")
+        try:
+            decision = await broker.authorize(
+                tool_name,
+                edited_args,
+                tenant_id=to_tenant_int(getattr(task, "tenant_id", 0)),
+                user_id=str(getattr(task, "user_id", "") or ""),
+                session_id=str(getattr(task, "session_id", "") or ""),
+                tool_call_id=str(tool_call.get("id") or tool_name),
+                tools_mode=str(getattr(self, "_current_mode", "auto") or "auto"),
+            )
+        except Exception as exc:  # noqa: BLE001 - 新参数拿不到服务端授权就不执行
+            return f"authorization service unavailable: {exc}"
+        if not isinstance(decision, dict) or not decision.get("allowed", False):
+            reason = decision.get("reason") if isinstance(decision, dict) else None
+            return f"denied by server policy: {reason or 'not allowed by server policy'}"
+        broker_level = str(decision.get("level") or "")
+        if broker_level and _LEVEL_RANK.get(broker_level, 99) > _LEVEL_RANK.get(tool_level(tool_name, edited_args), 99):
+            return f"server escalated the edited action level to {broker_level}"
+        return ""
 
     async def _await_approval(
         self, tool_call: dict[Any, Any], task: AgentTask, timeout: float | None = None
@@ -4897,8 +5124,8 @@ class AgentRuntime:
 
         # ── C5：`edit` = "编辑后批准" ──
         # 用户改的是"将要执行的那一次调用"，因此此后一律以**编辑后的参数**为准
-        # （执行 / 二次校验 / 票据）。但编辑后的参数**必须**重跑分级 —— 否则 `edit`
-        # 就成了绕过 `tool_policy` 分级的新通道（方案 01 §3.5）。
+        # （Broker 重新授权 / 执行 / 二次校验 / 票据）。编辑后的参数**必须**重跑分级 ——
+        # 否则 `edit` 就成了绕过 `tool_policy` 分级的新通道（方案 01 §3.5）。
         edited_args: dict[str, Any] | None = None
         level_before = ""
         level_after = ""
@@ -4916,7 +5143,7 @@ class AgentRuntime:
                         f"'arguments' as a JSON object"
                     )
                 }
-            from app.agent.tool_policy import tool_level
+            from app.agent.tool_policy import args_hash, tool_level
 
             level_before = tool_level(tool_name, orig_args)
             level_after = tool_level(tool_name, raw_edited)
@@ -4946,9 +5173,38 @@ class AgentRuntime:
                         f"from scratch. Re-issue the tool call if it is still needed."
                     )
                 }
-            edited_args = raw_edited
+            edited_args = json.loads(json.dumps(raw_edited, ensure_ascii=False))
             tool_call = dict(tool_call)
             tool_call["arguments"] = json.dumps(edited_args, ensure_ascii=False)
+
+            # H10：等级不变不代表授权不变。只要规范化参数摘要变化，就必须让 Broker
+            # 对编辑后的完整参数重新授权；不能用原先那次授权或"都是 delete/write"复用。
+            if args_hash(tool_name, orig_args) != args_hash(tool_name, edited_args):
+                authorization_failure = await self._authorize_edited_approval(tool_call, task, edited_args)
+                if authorization_failure:
+                    logger.warning(
+                        "approval edit re-authorization FAILED (tool=%s id=%s): %s",
+                        tool_name,
+                        tc_id,
+                        authorization_failure,
+                    )
+                    _record_approval_audit(
+                        tc_id,
+                        tool_name,
+                        DECISION_EDIT,
+                        original_arguments=orig_args,
+                        edited_arguments=edited_args,
+                        level_before=level_before,
+                        level_after=level_after,
+                        reason=f"edited arguments re-authorization failed: {authorization_failure}",
+                    )
+                    return {
+                        "error": (
+                            f"Tool '{tool_name}' was NOT executed: edited arguments require fresh "
+                            f"Broker authorization and it failed ({authorization_failure}); "
+                            f"re-issue the tool call if it is still needed"
+                        )
+                    }
 
         # ── 二次校验（人工确认之外的第二道关）──
         # 确认解决"用户同不同意"；二次校验解决"将要执行的是不是**刚才批准的那一次**"。
@@ -5227,18 +5483,18 @@ class AgentRuntime:
 
         return rkey(f"approval_req:{tc_id}")
 
-    async def _store_approval_ticket(self, ticket: ApprovalTicket) -> None:
+    async def _store_approval_ticket(self, ticket: ApprovalTicket) -> bool:
         """把审批请求的票据写入 Redis（TTL 与审批决策一致）。
 
-        写失败不阻断审批：这一层是"执行前复核"的依据，缺了它只是少一道校验 ——
-        "没有票据就拒绝执行"的 fail-closed 由 :meth:`_second_check_approval` 保证。
+        发起审批时写失败不阻断提问，但执行前没有票据必然 fail-closed。edit 后重写失败
+        同样不能执行：原票已消费，必须能持久化"被批准且将被执行"的新参数绑定。
         """
         try:
             from app.redis_client import get_redis
 
             redis = await get_redis()
             if redis is None:
-                return
+                return False
             await redis.set(
                 self._approval_ticket_key(ticket.tool_call_id),
                 ticket.to_json(),
@@ -5246,8 +5502,10 @@ class AgentRuntime:
                 # 用户在窗口内点的批准无从核对（见 `_decision_key_ttl_seconds`）。
                 ex=_decision_key_ttl_seconds(),
             )
+            return True
         except Exception as e:  # noqa: BLE001 - 票据写失败不该阻断审批
             logger.warning("approval ticket store failed (id=%s): %s", ticket.tool_call_id, e)
+            return False
 
     async def _second_check_approval(
         self,
@@ -5258,13 +5516,14 @@ class AgentRuntime:
     ) -> str:
         """执行前二次校验；返回拒绝原因（空串 = 通过）。
 
-        校验三项：票据存在、`tool_name` 一致、`turn_id` 与**本次提交**一致、参数哈希一致。
-        票据按单次消费（读完即删），避免同一张票据被用第二次。
+        校验七项：票据存在、`tool_call_id` 一致、`tool_name` 一致、`turn_id` 与**本次提交**
+        一致、调用者一致、资源范围一致、规范化参数摘要一致。票据按单次消费（读完即删），
+        避免同一张票据被用第二次。
 
         `original_arguments`（C5 · `edit`）：非 None 表示本次批准的是**编辑后**的参数。
         核对票据仍以**模型原始请求**为据 —— 那是"这张票属于这次调用"的凭据；核对通过后把
-        票据**重写**为编辑后参数的哈希，使"票据 = 被批准且将被执行的那个调用"这一语义在
-        edit 之后依然成立（方案 01 §3.5 的不变量"批准的就是执行的"）。
+        票据**重写**为编辑后参数的摘要与资源范围，使"票据 = 被批准且将被执行的那个调用"
+        这一语义在 edit 之后依然成立（方案 01 §3.5 的不变量"批准的就是执行的"）。
         """
         from app.agent.tool_policy import args_hash
 
@@ -5292,12 +5551,18 @@ class AgentRuntime:
         ticket = ApprovalTicket.from_json(raw or "")
         if ticket is None:
             return "no approval ticket for this call (expired, or never requested)"
+        if ticket.tool_call_id != str(tc_id):
+            return f"ticket call id mismatch ({ticket.tool_call_id} != {tc_id})"
         if ticket.tool_name != tool_name:
             return f"ticket tool mismatch ({ticket.tool_name} != {tool_name})"
 
         current_turn = str(getattr(task, "id", "") or "")
         if ticket.turn_id != current_turn:
             return f"ticket turn mismatch ({ticket.turn_id} != {current_turn})"
+
+        expected_caller = _approval_caller_id(task)
+        if ticket.caller_id != expected_caller:
+            return "ticket caller mismatch (the approval belongs to another tenant/user)"
 
         try:
             targs = (
@@ -5307,19 +5572,18 @@ class AgentRuntime:
             )
         except Exception:  # noqa: BLE001
             targs = {}
+        if not isinstance(targs, dict):
+            return "ticket args mismatch (tool arguments must be a JSON object)"
         # edit 场景：票据对着"模型原始请求"，执行对着"编辑后参数"（targs 已是编辑后的）
-        expected_args = original_arguments if original_arguments is not None else (targs or {})
+        expected_args = original_arguments if original_arguments is not None else targs
         if ticket.args_hash != args_hash(tool_name, expected_args):
             return "ticket args mismatch (the approved call is not the one being executed)"
+        expected_scope = _approval_resource_scope(task, tool_name, expected_args)
+        if ticket.resource_scope != expected_scope:
+            return "ticket resource scope mismatch (the approval belongs to another session/project/target)"
         if original_arguments is not None:
-            await self._store_approval_ticket(
-                ApprovalTicket(
-                    tool_call_id=str(tc_id),
-                    tool_name=str(tool_name),
-                    args_hash=args_hash(tool_name, targs or {}),
-                    turn_id=ticket.turn_id,
-                )
-            )
+            if not await self._store_approval_ticket(_approval_ticket_for(tool_call, task, targs)):
+                return "edited approval ticket rewrite failed (the new argument binding was not persisted)"
         return ""
 
     async def _wait_approval_decision(

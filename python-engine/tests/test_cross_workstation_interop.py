@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 
 import app.main
 from app.api.unified_executor import get_chat_handler
+from app.config import settings
 from app.core.capabilities import (
     CapabilitiesRegistry,
     Capability,
@@ -24,6 +26,11 @@ from app.core.task_router import ExecutedTask, SubTask, TaskRouter
 from app.main import create_app
 
 TENANT = 1
+
+
+@pytest.fixture
+def gateway_headers():
+    return {"X-Internal-Token": settings.internal_token}
 
 
 def _fake_gateway(intent: dict):
@@ -200,17 +207,21 @@ async def test_recommended_workstations_pipeline(monkeypatch):
 # ── 统一入口 HTTP 路由 ─────────────────────────────────────────────
 
 
-async def test_chat_submit_rejects_missing_message():
+async def test_chat_submit_rejects_missing_message(gateway_headers):
     app = create_app()
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=gateway_headers
+    ) as ac:
         resp = await ac.post("/v1/chat/submit?user_id=u1&tenant_id=1", json={})
     assert resp.status_code == 200
     assert resp.json()["success"] is False
 
 
-async def test_chat_submit_rejects_missing_tenant():
+async def test_chat_submit_rejects_missing_tenant(gateway_headers):
     app = create_app()
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=gateway_headers
+    ) as ac:
         # 身份由网关经 query 注入。缺 tenant_id 时应被认证层直接拒绝，
         # 而不是放行到 handler 再靠 body 里的字段兜底 —— 后者意味着
         # "没有租户身份也能到达业务逻辑"。
@@ -222,7 +233,7 @@ async def test_chat_submit_rejects_missing_tenant():
     assert resp.status_code == 401
 
 
-async def test_chat_submit_cross_workstation_pipeline(monkeypatch):
+async def test_chat_submit_cross_workstation_pipeline(monkeypatch, gateway_headers):
     """端到端: 统一入口 → LLM 意图 → 推荐站台编排 → 跨工作台执行 → 结果聚合
 
     agent 工作台用假 gateway 成功执行；knowledge 工作台在无 DB 环境下
@@ -244,7 +255,9 @@ async def test_chat_submit_cross_workstation_pipeline(monkeypatch):
     monkeypatch.setattr(app.main, "get_gateway", _get_gateway)
 
     fastapi_app = create_app()
-    async with AsyncClient(transport=ASGITransport(app=fastapi_app), base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=ASGITransport(app=fastapi_app), base_url="http://test", headers=gateway_headers
+    ) as ac:
         resp = await ac.post(
             "/v1/chat/submit",
             json={"message": "分析一下数据", "tenant_id": TENANT, "mode": "auto"},

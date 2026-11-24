@@ -54,26 +54,26 @@ async def test_identity_is_required_without_gateway_headers():
 
 
 @pytest.mark.asyncio
-async def test_execute_tool_requires_name():
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"input": {}},
+        {"name": "shell_exec", "input": {"command": "rm -rf /tmp/h1-probe"}},
+    ],
+    ids=["missing-name", "dangerous-tool"],
+)
+async def test_execute_tool_route_removed_without_dispatch(payload, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from app.tools.registry import registry
+
+    execute = AsyncMock(return_value={"stdout": "unexpected execution"})
+    monkeypatch.setattr(registry, "execute", execute)
     app = create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        resp = await ac.post("/v1/tools/execute", json={"input": {}}, params=IDENTITY)
-    assert resp.status_code == 422
-
-
-@pytest.mark.asyncio
-async def test_execute_tool_returns_output_for_known_tool():
-    app = create_app()
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        resp = await ac.post(
-            "/v1/tools/execute",
-            json={"name": "shell_exec", "input": {"command": "echo ok"}},
-            params=IDENTITY,
-        )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body.get("exit_code") == 0
-    assert "ok" in body.get("stdout", "")
+        resp = await ac.post("/v1/tools/execute", json=payload, params=IDENTITY)
+    assert resp.status_code == 404
+    execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

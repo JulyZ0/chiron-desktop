@@ -326,9 +326,11 @@ class Settings(BaseSettings):
     memory_distill_max_items: int = 3  # 一次提炼最多入库几条候选
     memory_distill_confidence: int = 30  # 候选条目的置信度（低置信 ⇒ 先被整理淘汰）
 
-    # ── LLM Gateway 缓存 ──
+    # ── LLM Gateway cache ──
     cache_l1_capacity: int = 2048
     cache_l2_ttl: int = 3600
+    # None keeps semantic entries on the exact-cache TTL; set independently for L3.
+    cache_l3_ttl: int | None = None
     semantic_cache_threshold: float = 0.95
     semantic_cache_prefix_dims: int = 64
 

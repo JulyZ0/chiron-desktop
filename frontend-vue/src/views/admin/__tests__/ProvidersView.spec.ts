@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { Modal } from 'ant-design-vue'
+import type { ApiKey } from '@/api/admin'
 
 const apiMocks = vi.hoisted(() => ({
   listApiKeys: vi.fn(),
@@ -42,14 +43,14 @@ const provider = {
   docs_url: '',
 }
 
-const key = {
-  id: 1,
+// 与 Go ListLLMKeys 经过真实响应脱敏中间件后的契约一致：id 是 12 位哈希前缀，
+// key_preview 是五个掩码字符 + 八位哈希，响应不含明文 key/key_hash。
+const key: ApiKey = {
+  id: '0123456789ab',
   provider: 'openai',
-  key_preview: 'sk-…1234',
+  key_preview: '•••••01234567',
   status: 'active',
   weight: 10,
-  failures: 0,
-  last_used: '',
   remark: '',
 }
 
@@ -67,7 +68,8 @@ describe('ProvidersView 服务商管理', () => {
     expect(wrapper.find('.admin-page-title').text()).toBe('服务商管理')
     expect(wrapper.find('.admin-table .ant-table').classes()).toContain('ant-table-middle')
     expect(wrapper.text()).toContain('OpenAI')
-    expect(wrapper.text()).toContain('sk-…1234')
+    expect(wrapper.text()).toContain('•••••01234567')
+    expect(wrapper.text()).toContain('0123456789ab')
     expect(wrapper.text()).not.toContain('API Key 管理')
     expect(apiMocks.listApiKeys).toHaveBeenCalledOnce()
     wrapper.unmount()

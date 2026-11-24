@@ -24,6 +24,7 @@ from app.agent.compaction import (
     CompactionConfig,
     _apply_folds,
     _prune_messages,
+    make_fold_lineage,
 )
 from app.agent.runtime import AgentRuntime
 
@@ -64,6 +65,62 @@ def _turn_messages() -> list[dict[str, Any]]:
 
 def _all_content(messages: list[dict[str, Any]]) -> str:
     return "\n".join(str(m.get("content") or "") for m in messages)
+
+
+def _apply_trusted(
+    messages: list[dict[str, Any]], folds: list[dict[str, Any]]
+) -> list[dict[str, Any]] | None:
+    lineage_messages = messages
+    effective_folds = folds
+    if any(m.get("role") != "system" and m.get("seq") is None for m in messages):
+        rebuilt: list[dict[str, Any]] = []
+        seq = 0
+        for message in messages:
+            if message["role"] == "system":
+                rebuilt.append(message)
+            else:
+                rebuilt.append({**message, "seq": seq})
+                seq += 1
+        lineage_messages = rebuilt
+        rest = [message for message in rebuilt if message["role"] != "system"]
+        if any(not message.get("id") for message in rest):
+            return _apply_folds(
+                messages,
+                folds,
+                provider="openai",
+                lineage_model="gpt-test",
+                context_window=128_000,
+            )
+        positions = {str(message["id"]): index for index, message in enumerate(rest)}
+        effective_folds = []
+        for fold in folds:
+            indexes = [positions[str(i)] for i in (fold.get("covered_ids") or []) if str(i) in positions]
+            if not indexes:
+                return _apply_folds(
+                    messages,
+                    folds,
+                    provider="openai",
+                    lineage_model="gpt-test",
+                    context_window=128_000,
+                )
+            effective_folds.append({**fold, "covered_from": min(indexes), "covered_to": max(indexes) + 1})
+    for fold in effective_folds:
+        fold["lineage"] = make_fold_lineage(
+            lineage_messages,
+            int(fold["covered_from"]),
+            int(fold["covered_to"]),
+            provider="openai",
+            model="gpt-test",
+            context_window=128_000,
+        )
+    folds[:] = effective_folds
+    return _apply_folds(
+        messages,
+        effective_folds,
+        provider="openai",
+        lineage_model="gpt-test",
+        context_window=128_000,
+    )
 
 
 def _assert_no_orphan_tool(messages: list[dict[str, Any]]) -> None:
@@ -239,7 +296,7 @@ def test_digest_chain_is_bounded_and_keeps_the_newest():
     per = DIGEST_CHAIN_MAX_CHARS // 2 - 10  # 两条装得下、三条装不下
     folds = _folds_with_long_digests(per)
 
-    projected = _apply_folds(_twelve_messages(), folds)
+    projected = _apply_trusted(_twelve_messages(), folds)
 
     assert projected is not None
     summary = projected[1]["content"]
@@ -250,7 +307,7 @@ def test_digest_chain_is_bounded_and_keeps_the_newest():
 def test_digest_chain_keeps_everything_when_it_fits():
     folds = _folds_with_long_digests(100)
 
-    projected = _apply_folds(_twelve_messages(), folds)
+    projected = _apply_trusted(_twelve_messages(), folds)
 
     assert projected is not None
     summary = projected[1]["content"]
@@ -268,7 +325,7 @@ def test_single_oversized_digest_is_truncated_not_dropped():
         }
     ]
 
-    projected = _apply_folds(_twelve_messages(), folds)
+    projected = _apply_trusted(_twelve_messages(), folds)
 
     assert projected is not None
     assert "NEW" in projected[1]["content"]
@@ -296,7 +353,7 @@ def test_missing_seq_is_rebuilt_from_covered_ids():
         }
     ]
 
-    projected = _apply_folds(_no_seq_messages(), folds)
+    projected = _apply_trusted(_no_seq_messages(), folds)
 
     assert projected is not None, "有 id 就足以重建坐标，不该整段放弃"
     assert "早前要点" in projected[1]["content"]
@@ -317,7 +374,7 @@ def test_projection_still_refuses_when_ids_are_unusable():
         }
     ]
 
-    assert _apply_folds(messages, folds) is None
+    assert _apply_trusted(messages, folds) is None
 
 
 # ── D6：手动压缩准入门槛 ─────────────────────────────────────────────

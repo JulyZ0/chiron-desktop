@@ -7,11 +7,19 @@ tool 消息必须带 tool_call_id 否则读回来会被当孤儿删掉。
 
 from __future__ import annotations
 
+import importlib.util
+import json
+import os
+import uuid
+from concurrent.futures import ProcessPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from app.agent import history_writer
+from app.agent.compaction import projection_source_digest
+from app.agent.history_writer import ProjectionClaim
 
 
 class _Row(dict):
@@ -28,9 +36,7 @@ class _Row(dict):
 
 
 class _FakeConn:
-    def __init__(
-        self, sink: list[tuple], insert_rowcount: int = 1, sqls: list[str] | None = None
-    ) -> None:
+    def __init__(self, sink: list[tuple], insert_rowcount: int = 1, sqls: list[str] | None = None) -> None:
         self.sink = sink
         # 同时记下语句本身：断言若靠"参数个数"区分 messages 与 archive 行，
         # 每加一列就会让不相干的用例误报 —— 按 SQL 内容认行才稳。
@@ -71,17 +77,21 @@ class _FakePool:
         owned: bool = True,
         existing_ids: list[str] | None = None,
         insert_rowcount: int = 1,
+        rows: list[dict[str, Any]] | None = None,
     ) -> None:
         self.owned = owned
         self.existing_ids = existing_ids or []
         self.inserted: list[tuple] = []
         self.sqls: list[str] = []
         self.insert_rowcount = insert_rowcount
+        self.rows = rows
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
         return {"ok": 1} if self.owned else None
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        if self.rows is not None:
+            return self.rows
         return [{"tool_call_id": i} for i in self.existing_ids]
 
     def acquire(self) -> _FakeConn:
@@ -93,15 +103,372 @@ class _FakePool:
 
 @pytest.fixture
 def no_privacy(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(
-        "app.middleware.privacy_middleware.is_no_retention", lambda: False, raising=False
-    )
+    monkeypatch.setattr("app.middleware.privacy_middleware.is_no_retention", lambda: False, raising=False)
 
 
 def _patch_pool(monkeypatch: pytest.MonkeyPatch, pool: Any) -> None:
     import app.db
 
     monkeypatch.setattr(app.db, "get_pool", lambda: pool, raising=False)
+
+
+def _projection_message_rows() -> list[dict[str, Any]]:
+    return [
+        _Row(
+            {
+                "role": "user",
+                "content": "hello",
+                "tool_calls": "",
+                "turn_id": "",
+                "tool_call_id": "",
+                "id": "m1",
+                "seq": 1,
+            }
+        )
+    ]
+
+
+def _projection_fold_rows() -> list[dict[str, Any]]:
+    return [
+        {
+            "covered_from": 1,
+            "covered_to": 2,
+            "digest": "summary",
+            "digest_model": "extractive",
+            "body_suffix": 0,
+            "lineage": None,
+        }
+    ]
+
+
+class _ProjectionConn:
+    def __init__(
+        self,
+        *,
+        revision: int = 7,
+        message_rows: list[dict[str, Any]] | None = None,
+        fold_rows: list[dict[str, Any]] | None = None,
+        claim_wins: bool = True,
+        update_rowcount: int = 1,
+    ) -> None:
+        self.revision = revision
+        self.message_rows = message_rows or []
+        self.fold_rows = fold_rows or []
+        self.claim_wins = claim_wins
+        self.update_rowcount = update_rowcount
+        self.sqls: list[str] = []
+        self.args: list[tuple[Any, ...]] = []
+
+    def transaction(self) -> _FakeTx:
+        return _FakeTx()
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        self.sqls.append(sql)
+        self.args.append(args)
+        if "INSERT INTO session_projection_claims" in sql:
+            return {"id": "claim-1"} if self.claim_wins else None
+        if "FROM sessions" in sql:
+            return {"message_revision": self.revision}
+        return None
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.sqls.append(sql)
+        self.args.append(args)
+        return self.message_rows if "FROM messages" in sql else self.fold_rows
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.sqls.append(sql)
+        self.args.append(args)
+        return f"UPDATE {self.update_rowcount}"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        return None
+
+
+class _ProjectionPool:
+    def __init__(self, conn: _ProjectionConn) -> None:
+        self.conn = conn
+
+    def acquire(self) -> _ProjectionConn:
+        return self.conn
+
+
+class TestProjectionClaim:
+    @pytest.mark.asyncio
+    async def test_claim_returns_atomic_snapshot_and_uses_database_conflict(
+        self, monkeypatch: pytest.MonkeyPatch, no_privacy
+    ):
+        messages = [{"role": "system", "content": "sys"}, *_projection_message_rows()]
+        conn = _ProjectionConn(message_rows=_projection_message_rows(), fold_rows=_projection_fold_rows())
+        _patch_pool(monkeypatch, _ProjectionPool(conn))
+
+        claim = await history_writer.claim_fold_projection(
+            "s1", 1, messages, expected_source_digest=projection_source_digest(messages)
+        )
+
+        assert claim == ProjectionClaim(
+            claim_id="claim-1",
+            session_id="s1",
+            tenant_id=1,
+            source_digest=projection_source_digest(messages),
+            message_revision=7,
+            folds=_projection_fold_rows(),
+        )
+        assert any("FOR SHARE" in sql for sql in conn.sqls)
+        insert_sql = next(sql for sql in conn.sqls if "INSERT INTO session_projection_claims" in sql)
+        assert "ON CONFLICT (session_id, source_digest) DO NOTHING" in insert_sql
+        assert "RETURNING id" in insert_sql
+
+    @pytest.mark.asyncio
+    async def test_claim_rejects_database_source_change(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
+        messages = [{"role": "system", "content": "sys"}, *_projection_message_rows()]
+        changed_rows = [
+            *_projection_message_rows(),
+            _Row(
+                {
+                    "role": "assistant",
+                    "content": "new",
+                    "tool_calls": "",
+                    "turn_id": "",
+                    "tool_call_id": "",
+                    "id": "m2",
+                    "seq": 2,
+                }
+            ),
+        ]
+        conn = _ProjectionConn(message_rows=changed_rows, fold_rows=_projection_fold_rows())
+        _patch_pool(monkeypatch, _ProjectionPool(conn))
+
+        claim = await history_writer.claim_fold_projection(
+            "s1", 1, messages, expected_source_digest=projection_source_digest(messages)
+        )
+
+        assert claim is None
+        assert not any("INSERT INTO session_projection_claims" in sql for sql in conn.sqls)
+
+    @pytest.mark.asyncio
+    async def test_claim_conflict_has_no_winner(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
+        messages = [{"role": "system", "content": "sys"}, *_projection_message_rows()]
+        conn = _ProjectionConn(
+            message_rows=_projection_message_rows(),
+            fold_rows=_projection_fold_rows(),
+            claim_wins=False,
+        )
+        _patch_pool(monkeypatch, _ProjectionPool(conn))
+
+        assert (
+            await history_writer.claim_fold_projection(
+                "s1", 1, messages, expected_source_digest=projection_source_digest(messages)
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_complete_rechecks_shared_message_revision(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
+        messages = [{"role": "system", "content": "sys"}, *_projection_message_rows()]
+        claim = ProjectionClaim(
+            claim_id="claim-1",
+            session_id="s1",
+            tenant_id=1,
+            source_digest=projection_source_digest(messages),
+            message_revision=7,
+            folds=_projection_fold_rows(),
+        )
+        conn = _ProjectionConn(revision=8)
+        _patch_pool(monkeypatch, _ProjectionPool(conn))
+
+        assert (
+            await history_writer.complete_fold_projection(
+                claim, projection_digest=projection_source_digest([{"role": "user"}])
+            )
+            is False
+        )
+        assert any("FOR UPDATE" in sql for sql in conn.sqls)
+        assert not any("UPDATE session_projection_claims" in sql for sql in conn.sqls)
+
+    @pytest.mark.asyncio
+    async def test_complete_marks_only_the_claiming_owner_installed(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
+        messages = [{"role": "system", "content": "sys"}, *_projection_message_rows()]
+        claim = ProjectionClaim(
+            claim_id="claim-1",
+            session_id="s1",
+            tenant_id=1,
+            source_digest=projection_source_digest(messages),
+            message_revision=7,
+            folds=_projection_fold_rows(),
+        )
+        conn = _ProjectionConn(revision=7)
+        _patch_pool(monkeypatch, _ProjectionPool(conn))
+        projection_digest = projection_source_digest([{"role": "user", "content": "summary"}])
+
+        assert await history_writer.complete_fold_projection(claim, projection_digest=projection_digest)
+        sql = next(sql for sql in conn.sqls if "UPDATE session_projection_claims" in sql)
+        assert "message_revision" in sql
+        assert "status = 'installed'" in sql
+        assert conn.args[-1][-1] == projection_digest
+
+
+def _claim_projection_in_process(
+    dsn: str, session_id: str, tenant_id: int, messages: list[dict[str, Any]], source_digest: str
+) -> bool:
+    async def _run() -> bool:
+        from app.db import close_pool, init_pool
+
+        await init_pool(dsn)
+        try:
+            return (
+                await history_writer.claim_fold_projection(
+                    session_id, tenant_id, messages, expected_source_digest=source_digest
+                )
+                is not None
+            )
+        finally:
+            await close_pool()
+
+    import asyncio
+
+    return asyncio.run(_run())
+
+
+async def _new_projection_session() -> tuple[int, str]:
+    import app.db
+
+    pool = app.db.get_pool()
+    tenant_id = 1000 + int(uuid.uuid4().hex[:4], 16) % 20000
+    session_id = str(uuid.uuid4())
+    await pool.execute("INSERT INTO tenants (id, name) VALUES ($1, $2)", tenant_id, "h15-test")
+    await pool.execute(
+        "INSERT INTO sessions (id, tenant_id, title) VALUES ($1, $2, $3)",
+        session_id,
+        tenant_id,
+        "h15-test",
+    )
+    return tenant_id, session_id
+
+
+async def _delete_projection_session(tenant_id: int, session_id: str) -> None:
+    import app.db
+
+    pool = app.db.get_pool()
+    await pool.execute("DELETE FROM messages WHERE session_id = $1", session_id)
+    await pool.execute("DELETE FROM tool_calls WHERE session_id = $1", session_id)
+    await pool.execute("DELETE FROM sessions WHERE id = $1", session_id)
+    await pool.execute("DELETE FROM tenants WHERE id = $1", tenant_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_database_claim_has_one_winner_across_processes(no_privacy):
+    import app.db
+
+    tenant_id, session_id = await _new_projection_session()
+    try:
+        assert await history_writer.persist_messages(session_id, tenant_id, [{"role": "user", "content": "hello"}]) == 1
+        assert (
+            await history_writer.persist_folds(
+                session_id,
+                tenant_id,
+                [{"covered_from": 1, "covered_to": 2, "body_suffix": 0, "digest": "summary"}],
+            )
+            == 1
+        )
+        messages = [
+            {"role": "system", "content": "sys"},
+            *await history_writer.load_messages(session_id, tenant_id),
+        ]
+        source_digest = projection_source_digest(messages)
+        dsn = os.environ["POSTGRES_DSN"]
+
+        with ProcessPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    _claim_projection_in_process,
+                    dsn,
+                    session_id,
+                    tenant_id,
+                    messages,
+                    source_digest,
+                )
+                for _ in range(2)
+            ]
+            winners = [future.result(timeout=30) for future in futures]
+
+        assert sorted(winners) == [False, True]
+        count = await app.db.get_pool().fetchval(
+            "SELECT count(*) FROM session_projection_claims "
+            "WHERE session_id = $1 AND source_digest = $2 AND status = 'claimed'",
+            session_id,
+            source_digest,
+        )
+        assert count == 1
+    finally:
+        await _delete_projection_session(tenant_id, session_id)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_async_message_change_rejects_pending_projection(no_privacy):
+    import app.db
+
+    tenant_id, session_id = await _new_projection_session()
+    try:
+        assert await history_writer.persist_messages(session_id, tenant_id, [{"role": "user", "content": "hello"}]) == 1
+        assert (
+            await history_writer.persist_folds(
+                session_id,
+                tenant_id,
+                [{"covered_from": 1, "covered_to": 2, "body_suffix": 0, "digest": "summary"}],
+            )
+            == 1
+        )
+        messages = [
+            {"role": "system", "content": "sys"},
+            *await history_writer.load_messages(session_id, tenant_id),
+        ]
+        source_digest = projection_source_digest(messages)
+        pool = app.db.get_pool()
+        revision = await pool.fetchval("SELECT message_revision FROM sessions WHERE id = $1", session_id)
+        claim = await history_writer.claim_fold_projection(
+            session_id, tenant_id, messages, expected_source_digest=source_digest
+        )
+        assert claim is not None
+
+        assert (
+            await history_writer.persist_messages(session_id, tenant_id, [{"role": "assistant", "content": "new"}]) == 1
+        )
+        changed_revision = await pool.fetchval("SELECT message_revision FROM sessions WHERE id = $1", session_id)
+        assert changed_revision == revision + 1
+        assert (
+            await history_writer.complete_fold_projection(
+                claim, projection_digest=projection_source_digest([{"role": "user"}])
+            )
+            is False
+        )
+        await history_writer.abort_fold_projection(claim)
+        assert (
+            await history_writer.claim_fold_projection(
+                session_id, tenant_id, messages, expected_source_digest=source_digest
+            )
+            is None
+        )
+    finally:
+        await _delete_projection_session(tenant_id, session_id)
+
+
+def test_h15_migration_chain_keeps_exactly_one_head():
+    root = Path(__file__).resolve().parents[2]
+    script_path = root / "scripts" / "check_migration_head.py"
+    spec = importlib.util.spec_from_file_location("check_migration_head", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    revisions, parents = module.parse(root / "migrations" / "versions")
+
+    assert set(revisions) - parents == {"0012_session_fold_lineage"}
 
 
 def test_tenant_id_is_coerced_not_raised():
@@ -115,9 +482,7 @@ def test_tenant_id_is_coerced_not_raised():
 
 class TestTenantBoundary:
     @pytest.mark.asyncio
-    async def test_refuses_write_when_session_not_owned(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_refuses_write_when_session_not_owned(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """跨租户写入必须 fail-closed —— 这是引擎直连 PG 时唯一的边界。"""
         pool = _FakePool(owned=False)
         _patch_pool(monkeypatch, pool)
@@ -130,16 +495,12 @@ class TestTenantBoundary:
         assert pool.inserted == [], "归属校验失败时不得写入任何行"
 
     @pytest.mark.asyncio
-    async def test_refuses_load_when_session_not_owned(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    async def test_refuses_load_when_session_not_owned(self, monkeypatch: pytest.MonkeyPatch):
         _patch_pool(monkeypatch, _FakePool(owned=False))
         assert await history_writer.load_messages("s1", 1) == []
 
     @pytest.mark.asyncio
-    async def test_invalid_tenant_skips_without_touching_db(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_invalid_tenant_skips_without_touching_db(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
 
@@ -153,9 +514,7 @@ class TestPrivacyMode:
         """隐私模式是合规要求，不是性能开关。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
-        monkeypatch.setattr(
-            "app.middleware.privacy_middleware.is_no_retention", lambda: True, raising=False
-        )
+        monkeypatch.setattr("app.middleware.privacy_middleware.is_no_retention", lambda: True, raising=False)
 
         written = await history_writer.persist_messages(
             "s1", 1, [{"role": "tool", "content": "secret"}], roles={"tool"}
@@ -167,9 +526,7 @@ class TestPrivacyMode:
 
 class TestRoleFilter:
     @pytest.mark.asyncio
-    async def test_roles_filter_prevents_double_write(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_roles_filter_prevents_double_write(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """user/assistant 由 Go 写；引擎再写一遍会产生重复行。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
@@ -190,9 +547,7 @@ class TestRoleFilter:
         assert pool.inserted[0][1] == "tool", "只应写入 tool 角色"
 
     @pytest.mark.asyncio
-    async def test_system_messages_are_never_persisted(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_system_messages_are_never_persisted(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """system 段每轮重建（技能目录/记忆都会变），存下来只会互相矛盾。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
@@ -209,9 +564,7 @@ class TestRoleFilter:
 
 class TestIdempotency:
     @pytest.mark.asyncio
-    async def test_existing_tool_call_ids_are_skipped(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_existing_tool_call_ids_are_skipped(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """overflow 重试会重复走收尾路径；重复插入会让同一个结果出现两次。"""
         pool = _FakePool(existing_ids=["c1"])
         _patch_pool(monkeypatch, pool)
@@ -232,9 +585,7 @@ class TestIdempotency:
 
 class TestToolCallIdRoundTrip:
     @pytest.mark.asyncio
-    async def test_tool_call_id_is_written_and_read_back(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_tool_call_id_is_written_and_read_back(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """缺了 tool_call_id，读回来的 tool 消息会被 _ensure_valid_tool_sequence 当孤儿删掉。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
@@ -246,12 +597,30 @@ class TestToolCallIdRoundTrip:
         assert pool.inserted[0][4] == "call_1"
 
     @pytest.mark.asyncio
-    async def test_load_preserves_tool_call_id_and_order(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    async def test_load_preserves_tool_call_id_and_order(self, monkeypatch: pytest.MonkeyPatch):
         rows = [
-            _Row({"role": "tool", "content": "b", "tool_calls": "", "turn_id": "", "tool_call_id": "c2", "id": "m2", "seq": 2}),
-            _Row({"role": "user", "content": "a", "tool_calls": "", "turn_id": "t1", "tool_call_id": "", "id": "m1", "seq": 1}),
+            _Row(
+                {
+                    "role": "tool",
+                    "content": "b",
+                    "tool_calls": "",
+                    "turn_id": "",
+                    "tool_call_id": "c2",
+                    "id": "m2",
+                    "seq": 2,
+                }
+            ),
+            _Row(
+                {
+                    "role": "user",
+                    "content": "a",
+                    "tool_calls": "",
+                    "turn_id": "t1",
+                    "tool_call_id": "",
+                    "id": "m1",
+                    "seq": 1,
+                }
+            ),
         ]
 
         class _LoadPool(_FakePool):
@@ -310,9 +679,7 @@ class TestStoredToolCallsNormalization:
         assert out == [], "认不出的条目直接丢弃，不得抛错"
 
     @pytest.mark.asyncio
-    async def test_load_normalizes_and_backfills_names(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
+    async def test_load_normalizes_and_backfills_names(self, monkeypatch: pytest.MonkeyPatch):
         """端到端：库里是 id 数组，读出来必须带名字（来自 tool_calls 表）。"""
         rows = [
             _Row(
@@ -338,9 +705,9 @@ class TestStoredToolCallsNormalization:
 
         out = await history_writer.load_messages("s1", 1)
 
-        assert out[0]["tool_calls"] == [
-            {"id": "call_1", "name": "read_file", "arguments": '{"path":"x"}'}
-        ]
+        assert out[0]["tool_calls"] == [{"id": "call_1", "name": "read_file", "arguments": '{"path":"x"}'}]
+
+
 class TestRecallByMessageId:
     """`read_archive` 的底层通道：按 messages.id 取原文，必须带会话归属校验。"""
 
@@ -396,6 +763,7 @@ class TestRecallByMessageId:
     @pytest.mark.asyncio
     async def test_archive_read_failure_falls_back_to_stored_content(self, monkeypatch):
         """对象丢了不能返回空：退回 content（前 64k + 标记）总比什么都取不回好。"""
+
         class _Pool(_FakePool):
             async def fetchrow(self, sql, *args):
                 return _Row({"content": "前64k[archived]", "storage_key": "archives/arc_x.txt"})
@@ -415,6 +783,7 @@ class TestRecallByMessageId:
     @pytest.mark.asyncio
     async def test_no_blob_ref_does_not_touch_object_store(self, monkeypatch):
         """普通消息不该白白触发一次对象存储往返。"""
+
         class _Pool(_FakePool):
             async def fetchrow(self, sql, *args):
                 return _Row({"content": "短正文", "storage_key": None})
@@ -439,9 +808,7 @@ class TestTieredArchiving:
     """
 
     @pytest.mark.asyncio
-    async def test_content_below_threshold_is_stored_verbatim(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_content_below_threshold_is_stored_verbatim(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """256k 字符以上、4MB 以下的正文必须**原样**入库，不能被旧上限截断。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
@@ -454,9 +821,7 @@ class TestTieredArchiving:
         assert pool.inserted[0][6] is None, "未超阈值不该产生 blob_ref"
 
     @pytest.mark.asyncio
-    async def test_content_above_threshold_is_archived(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_content_above_threshold_is_archived(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """>4MB 正文写对象存储，content 只留前 64k + 标记，blob_ref 指向归档。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
@@ -475,11 +840,7 @@ class TestTieredArchiving:
         # 归档行先于消息行写入 —— 先落对象再写行，避免库里留下指向不存在对象的
         # blob_ref。按语句内容挑出 messages 那条，而不是按参数个数：后者每加一列
         # 都会误伤这条断言，且失败信息完全指错方向。
-        rows = [
-            args
-            for sql, args in zip(pool.sqls, pool.inserted, strict=True)
-            if "INSERT INTO messages" in sql
-        ]
+        rows = [args for sql, args in zip(pool.sqls, pool.inserted, strict=True) if "INSERT INTO messages" in sql]
         assert len(rows) == 1, f"应只写一条 messages，实际 {len(pool.inserted)} 条语句"
         row = rows[0]
         # 参数序：(session_id, role, content, tool_calls, tool_call_id, tid, blob_ref, source)
@@ -496,9 +857,7 @@ class TestTieredArchiving:
         ), "缺少 message_archives 记录"
 
     @pytest.mark.asyncio
-    async def test_archive_failure_falls_back_to_truncation(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_archive_failure_falls_back_to_truncation(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """归档挂了不能连累消息写入：退回截断，宁可丢原文也不能丢整条历史。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
@@ -527,9 +886,7 @@ class TestPersistFolds:
     """
 
     @pytest.mark.asyncio
-    async def test_writes_one_row_per_fold(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_writes_one_row_per_fold(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
 
@@ -549,17 +906,68 @@ class TestPersistFolds:
         assert n == 1
         row = pool.inserted[0]
         # 参数序：(id, session_id, covered_from, covered_to, digest,
-        #          digest_model, digest_prompt, body_suffix)
-        assert len(row) == 8
+        #          digest_model, digest_prompt, body_suffix, lineage)
+        assert len(row) == 9
         assert row[1] == "s1"
         assert row[2] == 3 and row[3] == 17, "区间必须原样落库，半开区间错一位就会误覆盖"
         assert row[7] == 42, "body_suffix 丢了，投影拼接就会错位"
         assert row[0], "id 必须生成（无主键行写不进去）"
 
     @pytest.mark.asyncio
-    async def test_conflict_does_not_count_as_write(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_persists_fold_lineage_as_json(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
+        pool = _FakePool()
+        _patch_pool(monkeypatch, pool)
+        lineage = {
+            "version": 1,
+            "provider": "openai",
+            "model": "gpt-test",
+            "context_window": 128000,
+            "covered_from": 3,
+            "covered_to": 17,
+            "covered_prefix_digest": "a" * 64,
+        }
+
+        assert (
+            await history_writer.persist_folds("s1", 1, [{"covered_from": 3, "covered_to": 17, "lineage": lineage}])
+            == 1
+        )
+        assert pool.inserted[0][8] is not None
+        assert json.loads(pool.inserted[0][8]) == lineage
+        assert "ON CONFLICT (session_id, covered_from, covered_to) DO NOTHING" in pool.sqls[0]
+
+    @pytest.mark.asyncio
+    async def test_loads_legacy_and_lineage_rows_without_promoting_legacy(self, monkeypatch: pytest.MonkeyPatch):
+        lineage = {"version": 1, "covered_prefix_digest": "b" * 64}
+        pool = _FakePool(
+            rows=[
+                {
+                    "covered_from": 1,
+                    "covered_to": 3,
+                    "digest": "old",
+                    "digest_model": "extractive",
+                    "body_suffix": 2,
+                    "lineage": None,
+                },
+                {
+                    "covered_from": 3,
+                    "covered_to": 5,
+                    "digest": "new",
+                    "digest_model": "gpt-test",
+                    "body_suffix": 1,
+                    "lineage": lineage,
+                },
+            ]
+        )
+        _patch_pool(monkeypatch, pool)
+
+        folds = await history_writer.load_folds("s1", 1)
+
+        assert folds[0]["lineage"] is None
+        assert folds[0]["digest"] == "old"
+        assert folds[1]["lineage"] == lineage
+
+    @pytest.mark.asyncio
+    async def test_conflict_does_not_count_as_write(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """`ON CONFLICT DO NOTHING` 命中时不得计入写入数。
 
         这是规则二（`docs/context-projection-design.md` §3.3）的落地点：跨副本用
@@ -579,16 +987,12 @@ class TestPersistFolds:
         assert len(pool.inserted) == 1, "语句本身仍然执行了（由唯一索引裁决）"
 
     @pytest.mark.asyncio
-    async def test_refuses_when_session_not_owned(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_refuses_when_session_not_owned(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """跨租户不能往别人的会话里塞折叠记录。"""
         pool = _FakePool(owned=False)
         _patch_pool(monkeypatch, pool)
 
-        n = await history_writer.persist_folds(
-            "s1", 1, [{"covered_from": 1, "covered_to": 2, "body_suffix": 0}]
-        )
+        n = await history_writer.persist_folds("s1", 1, [{"covered_from": 1, "covered_to": 2, "body_suffix": 0}])
 
         assert n == 0
         assert pool.inserted == []
@@ -604,29 +1008,21 @@ class TestPersistFolds:
     @pytest.mark.asyncio
     async def test_no_retention_skips_write(self, monkeypatch: pytest.MonkeyPatch):
         """合规优先：no_retention 下任何历史痕迹都不落库。"""
-        monkeypatch.setattr(
-            "app.middleware.privacy_middleware.is_no_retention", lambda: True, raising=False
-        )
+        monkeypatch.setattr("app.middleware.privacy_middleware.is_no_retention", lambda: True, raising=False)
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
 
-        n = await history_writer.persist_folds(
-            "s1", 1, [{"covered_from": 1, "covered_to": 2, "body_suffix": 0}]
-        )
+        n = await history_writer.persist_folds("s1", 1, [{"covered_from": 1, "covered_to": 2, "body_suffix": 0}])
 
         assert n == 0
         assert pool.inserted == []
 
     @pytest.mark.asyncio
-    async def test_digest_falls_back_without_covered_ids(
-        self, monkeypatch: pytest.MonkeyPatch, no_privacy
-    ):
+    async def test_digest_falls_back_without_covered_ids(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """摘要缺失时不能写空串：`digest` 是 NOT NULL 且有排查价值。"""
         pool = _FakePool()
         _patch_pool(monkeypatch, pool)
 
-        await history_writer.persist_folds(
-            "s1", 1, [{"covered_from": 5, "covered_to": 9, "body_suffix": 1}]
-        )
+        await history_writer.persist_folds("s1", 1, [{"covered_from": 5, "covered_to": 9, "body_suffix": 1}])
 
         assert pool.inserted[0][4], "digest 不能为空"

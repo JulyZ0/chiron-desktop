@@ -15,6 +15,9 @@ from app.tools.context import set_tool_context
 from app.tools.sandbox import (
     _has_escape,
     _parse_command,
+    check_command_text,
+    check_shell_command,
+    parse_shell_program,
     run_in_sandbox,
     sandbox_root,
     workspace_dir,
@@ -107,11 +110,155 @@ class TestShellEscapeBlock:
         assert _has_escape("python script.py") is None
         assert _has_escape("Get-ChildItem -Force") is None
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ok & echo done",
+            "echo ok; echo done",
+            "echo ok && echo done",
+            "echo ok || echo fallback",
+            "echo ok | grep ok",
+            "echo ok > output.txt",
+            "(echo ok)",
+            "{ echo ok; echo done; }",
+            "FOO=bar echo ok",
+            "echo 'semicolon; and & pipe | stay literal'",
+            "python -Bc \"print('python-ok')\"",
+        ],
+    )
+    def test_shell_parser_accepts_normal_constructs(self, command):
+        assert check_command_text(command, dialect="posix") is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ok & rm -rf victim",
+            "echo ok; rm -rf victim",
+            "echo ok && rm -rf victim",
+            "echo ok || rm -rf victim",
+            "echo ok | rm -rf victim",
+            "echo ok > output.txt; rm -rf victim",
+            "(rm -rf victim)",
+            "{ echo ok; rm -rf victim; }",
+            "FOO=bar rm -rf victim",
+            "echo ok & (rm -rf victim)",
+            "echo ok &&",
+            "echo 'unterminated",
+            "echo ok |",
+            "echo ;;",
+            "; echo ok",
+            "echo ok &;",
+            "echo $(rm -rf victim)",
+            "if true; then rm -rf victim; fi",
+        ],
+    )
+    def test_shell_parser_checks_every_nested_command(self, command):
+        assert check_command_text(command, dialect="posix") is not None
+
+    def test_parser_exposes_assignments_operators_and_redirections(self):
+        program = parse_shell_program("FOO=bar echo ok > out.txt && (echo done | grep done)")
+        assert len(program.commands) == 3
+        assert program.commands[0].assignments == ("FOO=bar",)
+        assert program.commands[0].redirections == ((">", "out.txt"),)
+        assert set(program.operators) == {"&&", "|"}
+        assert program.grouped is True
+
+    @pytest.mark.parametrize("operator", ["&", ";", "&&", "||", "|"])
+    def test_windows_cmd_parser_checks_each_operator(self, operator):
+        attack = f"echo safe {operator} rm -rf victim"
+        program = parse_shell_program(attack, dialect="cmd")
+        assert [cmd.argv[0] for cmd in program.commands] == ["echo", "rm"]
+        assert check_command_text(attack, dialect="cmd") is not None
+
+    def test_windows_cmd_parser_checks_ampersand_and_groups(self):
+        assert check_command_text('echo "safe" && echo done', dialect="cmd") is None
+        assert check_command_text('(echo "safe")', dialect="cmd") is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "PATH=workspace echo ok",
+            "export PYTHONPATH=workspace",
+            'set "PYTHONPATH=workspace"',
+            "alias echo='rm -rf victim'",
+            "source script.sh",
+            "echo ok 2>&1",
+            "echo ok > output.txt",
+        ],
+    )
+    def test_shell_parser_handles_environment_builtins_and_fd_redirection(self, command):
+        reason = check_command_text(command, dialect="posix")
+        if command in {"echo ok 2>&1", "echo ok > output.txt"}:
+            assert reason is None
+        else:
+            assert reason is not None
+
+    def test_synchronous_terminal_gate_checks_python_inline_code(self):
+        reason = check_command_text("python -c \"import os; os.system('id')\"", dialect="posix")
+        assert reason is not None and "python code rejected" in reason
+        assert check_command_text("python --version", dialect="posix") is None
+        assert check_command_text("python -c \"print('ok')\"", dialect="posix") is None
+
+    @pytest.mark.asyncio
+    async def test_synchronous_terminal_gate_checks_python_script_source(self):
+        from app.tools.sandbox import safe_join
+
+        set_tool_context(session_id="s", user_id="u1", tenant_id="t1", gateway=None)
+        path = safe_join("terminal_guard_probe.py")
+        path.write_text("import os\nos.system('id')\n", encoding="utf-8")
+        try:
+            reason = check_command_text("python terminal_guard_probe.py", dialect="posix")
+            assert reason is not None and "python code rejected" in reason
+        finally:
+            path.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python -c \"import os; os.system('id')\"",
+            "python -Bc \"import os; os.system('id')\"",
+            "echo ok | python -c \"import os; os.system('id')\"",
+            "FOO=bar python -c \"import os; os.system('id')\"",
+        ],
+    )
+    async def test_python_inline_code_is_checked_in_every_shell_position(self, command):
+        reason = await check_shell_command(command)
+        assert reason is not None and "python" in reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command",
+        ["python", "python -", "python -m json.tool", "python -X presite=evil.py -c \"print(1)\""],
+    )
+    async def test_uninspectable_python_entrypoints_are_blocked(self, command):
+        reason = await check_shell_command(command)
+        assert reason is not None and "python" in reason
+
     @pytest.mark.asyncio
     async def test_run_in_sandbox_blocks_escape(self):
         set_tool_context(session_id="s", user_id="u1", tenant_id="t1", gateway=None)
         out = await run_in_sandbox("Get-ChildItem 'X:\\project\\chiron'")
         assert "error" in out and "blocked" in out["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ok & rm -rf victim",
+            "echo ok; rm -rf victim",
+            "echo ok && rm -rf victim",
+            "echo ok || rm -rf victim",
+            "echo ok | rm -rf victim",
+            "(rm -rf victim)",
+            "FOO=bar echo ok",
+            "echo ok > output.txt",
+        ],
+    )
+    async def test_direct_exec_rejects_shell_constructs_before_spawn(self, command):
+        set_tool_context(session_id="s", user_id="u1", tenant_id="t1", gateway=None)
+        out = await run_in_sandbox(command)
+        assert "blocked" in out.get("error", ""), out
 
     @pytest.mark.asyncio
     async def test_run_in_sandbox_executes_normal(self):

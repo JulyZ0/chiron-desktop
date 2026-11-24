@@ -88,8 +88,6 @@ const columns = computed(() => [
   { title: t('admin.providers.col_key'), dataIndex: 'key_preview', width: 180 },
   { title: t('common.status'), dataIndex: 'status', width: 100 },
   { title: t('common.weight'), dataIndex: 'weight', width: 80 },
-  { title: t('errors.failure_count'), dataIndex: 'failures', width: 100 },
-  { title: t('common.last_used'), dataIndex: 'last_used', width: 180 },
   { title: t('memory.note'), dataIndex: 'remark' },
   { title: t('common.action'), dataIndex: 'actions', width: 150, fixed: 'right' as const },
 ])

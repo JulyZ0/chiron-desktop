@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -185,43 +184,44 @@ class PromptEngine:
         commits.  Returns an empty string if the directory is not a git repo
         or git is unavailable.
 
-        **同步阻塞实现**：内部串行跑 3 次 `subprocess`（每次 timeout 5s）。
+        **同步阻塞实现**：内部串行跑 3 次受安全守卫保护的 git（每次 timeout 5s）。
+        它们复用统一工具层的配置探测、动态 filter/diff 覆盖与最小环境。
         `assemble()` 是 async 的，必须经 `asyncio.to_thread` 调用它 ——
-        直接在协程里调用会让整个事件循环停在这三个子进程上，
+        直接在协程里调用会让整个事件循环停在这些子进程上，
         期间所有会话的流式输出、心跳、超时判定全部冻结。
         仓库在慢盘上时 3×5s 的停顿足以拖垮并发的所有请求。
         """
+        from app.agent.git_checkpoint import GitError, _git_guard, _run_git
+
         parts: list[str] = []
 
         def _run(args: list[str]) -> str:
             try:
-                result = subprocess.run(
-                    args,
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=5,
-                )
-                return result.stdout.strip()
-            except Exception:
+                result = _run_git(Path(root), *args, timeout=5)
+                return result.stdout.decode("utf-8", errors="replace").strip()
+            except (GitError, OSError, ValueError):
                 return ""
 
-        # Current branch
-        branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        if branch:
-            parts.append(f"**Branch:** {branch}")
+        try:
+            with _git_guard(Path(root)):
+                # Current branch
+                branch = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+                if branch:
+                    parts.append(f"**Branch:** {branch}")
 
-        # Status (short)
-        status = _run(["git", "status", "--short"])
-        if status:
-            parts.append(f"**Status:**\n```\n{status}\n```")
+                # Status (short)
+                status = _run(["status", "--short"])
+                if status:
+                    parts.append(f"**Status:**\n```\n{status}\n```")
 
-        # Recent commits
-        log = _run(["git", "log", "--oneline", "-5"])
-        if log:
-            parts.append(f"**Recent commits:**\n```\n{log}\n```")
+                # Recent commits
+                log = _run(["log", "--oneline", "-5"])
+                if log:
+                    parts.append(f"**Recent commits:**\n```\n{log}\n```")
+        except GitError:
+            # A malformed or unreadable repository configuration must not silently
+            # execute helper commands and must not break prompt assembly.
+            return ""
 
         if not parts:
             return ""

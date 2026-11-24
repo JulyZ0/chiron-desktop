@@ -19,14 +19,19 @@ import { setActiveMode } from '../device'
 import { api } from '../../api'
 import { privateKey } from '../../utils/privateStorage'
 
-const mockUser = { id: 'u1', email: 'a@b.c', name: 'A', role: 'admin', tenant_id: 1 }
+const mockUser = {
+  id: 'u1', email: 'a@b.c', name: 'A', role: 'admin', tenant_id: 1,
+  password_set: true, must_change_password: false,
+}
 
 /**
  * localStorage 里**只允许**出现最小字段。
  * email / tenant_id 属敏感信息，被 S 安全修复刻意排除（见 src/stores/auth.ts 的
  * persistUserToStorage / loadUserFromStorage）：刷新后由 GET /v1/auth/profile 回填。
  */
-const mockUserStored = { id: 'u1', name: 'A', role: 'admin' }
+const mockUserStored = {
+  id: 'u1', name: 'A', role: 'admin', password_set: true, must_change_password: false,
+}
 
 describe('auth store', () => {
   beforeEach(() => {
@@ -99,7 +104,7 @@ describe('auth store', () => {
       expect(store.token).toBe('rtok')
       expect(localStorage.getItem('token')).toBeNull()
       expect(JSON.parse(localStorage.getItem('user') || 'null')).toEqual(
-        { id: user.id, name: user.name, role: user.role },
+        { id: user.id, name: user.name, role: user.role, password_set: true, must_change_password: false },
       )
     })
   })
@@ -133,6 +138,19 @@ describe('auth store', () => {
       expect(store.isAuthenticated).toBe(true)
     })
 
+    it('持久化恢复保留密码状态；旧数据缺失时按 fail-closed 恢复', () => {
+      localStorage.setItem('user', JSON.stringify({ ...mockUserStored, password_set: false, must_change_password: true }))
+      let store = useAuthStore()
+      expect(store.user?.password_set).toBe(false)
+      expect(store.mustChangePassword).toBe(true)
+
+      setActivePinia(createPinia())
+      localStorage.setItem('user', JSON.stringify({ id: 'u1', name: 'A', role: 'admin' }))
+      store = useAuthStore()
+      expect(store.user?.password_set).toBe(true)
+      expect(store.mustChangePassword).toBe(true)
+    })
+
     it('user localStorage 损坏时优雅降级为 null', () => {
       localStorage.setItem('user', '{broken')
       const store = useAuthStore()
@@ -141,15 +159,51 @@ describe('auth store', () => {
   })
 
   describe('fetchProfile', () => {
-    it('成功后更新并持久化 user', async () => {
+    it('成功后更新并持久化 user 与密码状态', async () => {
       localStorage.setItem('user', JSON.stringify(mockUser))
       vi.mocked(api.get).mockResolvedValue({
-        data: { data: { user_id: 'u2', email: 'x@y.z', name: 'X', role: 'user', tenant_id: 2 } },
+        data: { data: {
+          user_id: 'u2', email: 'x@y.z', username: 'xy', name: 'X', nickname: '小王', role: 'user', tenant_id: 2,
+          password_set: false, must_change_password: true,
+        } },
       })
       const store = useAuthStore()
       await store.fetchProfile()
-      expect(store.user).toEqual({ id: 'u2', email: 'x@y.z', name: 'X', role: 'user', tenant_id: 2 })
-      expect(JSON.parse(localStorage.getItem('user') || 'null')).toEqual({ id: 'u2', name: 'X', role: 'user' })
+      expect(store.user).toEqual({
+        id: 'u2', email: 'x@y.z', username: 'xy', name: 'X', nickname: '小王', role: 'user', tenant_id: 2,
+        password_set: false, must_change_password: true,
+      })
+      expect(store.mustChangePassword).toBe(true)
+      expect(JSON.parse(localStorage.getItem('user') || 'null')).toEqual({
+        id: 'u2', name: 'X', role: 'user', nickname: '小王', password_set: false, must_change_password: true,
+      })
+    })
+
+    it('profile 缺失密码状态时 fail-closed，不解除首登改密', async () => {
+      localStorage.setItem('user', JSON.stringify(mockUser))
+      vi.mocked(api.get).mockResolvedValue({
+        data: { data: { user_id: 'u1', email: 'a@b.c', name: 'A', role: 'admin', tenant_id: 1 } },
+      })
+      const store = useAuthStore()
+      await store.fetchProfile()
+      expect(store.user?.password_set).toBe(true)
+      expect(store.user?.must_change_password).toBe(true)
+      expect(store.mustChangePassword).toBe(true)
+    })
+
+    it('API Key profile 不继承交互式密码改密流程', async () => {
+      localStorage.setItem('user', JSON.stringify(mockUser))
+      vi.mocked(api.get).mockResolvedValue({
+        data: { data: {
+          user_id: 'u1', email: 'a@b.c', name: 'A', role: 'admin', tenant_id: 1,
+          auth_method: 'api_key', must_change_password: true,
+        } },
+      })
+      const store = useAuthStore()
+      await store.fetchProfile()
+      expect(store.isApiKeySession).toBe(true)
+      expect(store.user?.password_set).toBe(true)
+      expect(store.mustChangePassword).toBe(false)
     })
 
     it('失败（cookie 无效）时自动登出并清理本地态', async () => {
@@ -168,6 +222,23 @@ describe('auth store', () => {
       const store = useAuthStore()
       await store.fetchProfile()
       expect(api.get).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('changePassword', () => {
+    it('成功后同步解除 must_change_password 并持久化 password_set', async () => {
+      const store = useAuthStore()
+      store.user = { ...mockUser, password_set: false, must_change_password: true }
+      vi.mocked(api.post).mockResolvedValue({
+        data: { data: { token: 'new-token', user: { ...mockUser, password_set: true, must_change_password: false } } },
+      })
+
+      await store.changePassword('', 'NewPassword123!')
+
+      expect(store.token).toBe('new-token')
+      expect(store.user?.password_set).toBe(true)
+      expect(store.mustChangePassword).toBe(false)
+      expect(JSON.parse(localStorage.getItem('user') || 'null')).toEqual(mockUserStored)
     })
   })
 

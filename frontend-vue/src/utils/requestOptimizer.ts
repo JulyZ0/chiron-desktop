@@ -1,5 +1,5 @@
-import axios, {  } from 'axios'
-import type { AxiosRequestConfig, Canceler, AxiosInstance } from 'axios'
+import axios from 'axios'
+import type { AxiosRequestConfig, Canceler, AxiosInstance, CancelToken } from 'axios'
 
 /**
  * 请求优化管理器
@@ -19,8 +19,18 @@ declare module 'axios' {
      * 它的结果与页面无关，被导航取消等于把登录态丢掉。
      */
     __retainAcrossNavigation?: boolean
+    /** 由请求管理器写入；同 URL 的并发请求也各自拥有独立身份。 */
+    __requestId?: string
   }
 }
+
+interface PendingRequest {
+  cancel: Canceler
+  config: AxiosRequestConfig
+  unlinkCaller?: () => void
+}
+
+let requestSequence = 0
 
 /** 该请求是否要跨导航存活（`cancelAll` 的唯一例外） */
 function isRetainedAcrossNavigation(config?: AxiosRequestConfig): boolean {
@@ -28,7 +38,7 @@ function isRetainedAcrossNavigation(config?: AxiosRequestConfig): boolean {
 }
 
 class RequestManager {
-  public pendingRequests: Map<string, { cancel: Canceler; config: AxiosRequestConfig }> = new Map()
+  public pendingRequests: Map<string, PendingRequest> = new Map()
   private requestCache: Map<string, { promise: Promise<unknown>; timestamp: number }> = new Map()
   private readonly CACHE_TTL = 3000 // 缓存 TTL 3秒
 
@@ -45,29 +55,39 @@ class RequestManager {
   /**
    * 添加请求到管理器
    */
-  addRequest(config: AxiosRequestConfig): void {
-    const key = this.getKey(config)
+  addRequest(config: AxiosRequestConfig): string {
+    const requestId = `req-${++requestSequence}`
     const cancelSource = axios.CancelToken.source()
-    
+    const callerToken = config.cancelToken as (CancelToken & { subscribe?: (listener: Canceler) => void }) | undefined
+    let unlinkCaller: (() => void) | undefined
+    if (callerToken?.subscribe) {
+      const listener = cancelSource.cancel
+      callerToken.subscribe(listener)
+      unlinkCaller = () => callerToken.unsubscribe(listener)
+    }
+    config.__requestId = requestId
     config.cancelToken = cancelSource.token
-    this.pendingRequests.set(key, { cancel: cancelSource.cancel, config })
+    this.pendingRequests.set(requestId, { cancel: cancelSource.cancel, config, unlinkCaller })
+    return requestId
   }
 
-  /**
-   * 移除已完成的请求
-   */
   removeRequest(config: AxiosRequestConfig): void {
-    const key = this.getKey(config)
-    this.pendingRequests.delete(key)
+    const requestId = config?.__requestId
+    if (!requestId) return
+    const entry = this.pendingRequests.get(requestId)
+    if (!entry || entry.config !== config) return
+    entry.unlinkCaller?.()
+    this.pendingRequests.delete(requestId)
   }
 
   /**
    * 取消特定 URL 的请求
    */
   cancelRequest(url: string): void {
-    this.pendingRequests.forEach(({ cancel, config }, key) => {
-      if (config.url === url) {
-        cancel('Request cancelled')
+    this.pendingRequests.forEach((entry, key) => {
+      if (entry.config.url === url) {
+        entry.unlinkCaller?.()
+        entry.cancel('Request cancelled')
         this.pendingRequests.delete(key)
       }
     })
@@ -83,16 +103,12 @@ class RequestManager {
    * 而且 `initToken` 已经缓存了那次初始化，之后不会自发重试。
    */
   cancelAll(): void {
-    const retained: Array<[string, { cancel: Canceler; config: AxiosRequestConfig }]> = []
-    this.pendingRequests.forEach((entry, key) => {
-      if (isRetainedAcrossNavigation(entry.config)) {
-        retained.push([key, entry])
-        return
-      }
+    for (const [key, entry] of [...this.pendingRequests]) {
+      if (isRetainedAcrossNavigation(entry.config)) continue
+      entry.unlinkCaller?.()
       entry.cancel('Page navigated away')
-    })
-    this.pendingRequests.clear()
-    for (const [key, entry] of retained) this.pendingRequests.set(key, entry)
+      this.pendingRequests.delete(key)
+    }
   }
 
   /**
@@ -159,32 +175,19 @@ export function isSlowNetwork(): boolean {
  * 自动注册到请求管理器
  */
 export function setupRequestInterceptors(instance: AxiosInstance): void {
-  const CancelToken = axios.CancelToken
-  const isCancel = axios.isCancel
-
   // 请求拦截器：注册到管理器
   instance.interceptors.request.use(config => {
-    const source = CancelToken.source()
-    config.cancelToken = source.token
-    requestManager.pendingRequests.set(
-      `${config.method}:${config.url}`,
-      { cancel: source.cancel, config }
-    )
+    requestManager.addRequest(config)
     return config
   })
 
-  // 响应拦截器：清理已完成的请求
   instance.interceptors.response.use(
     response => {
-      const key = `${response.config.method}:${response.config.url}`
-      requestManager.pendingRequests.delete(key)
+      requestManager.removeRequest(response.config)
       return response
     },
     error => {
-      if (!isCancel(error)) {
-        const key = error.config ? `${error.config.method}:${error.config.url}` : null
-        if (key) requestManager.pendingRequests.delete(key)
-      }
+      if (error.config) requestManager.removeRequest(error.config)
       return Promise.reject(error)
     }
   )

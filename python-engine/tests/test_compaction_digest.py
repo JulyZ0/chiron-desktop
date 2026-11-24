@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,11 +20,16 @@ import pytest
 from app.agent.compaction import (
     DIGEST_MAX_CHARS,
     CompactionConfig,
+    _apply_folds,
     _digest_anchors,
     _digest_prompt,
     _digest_source,
     _prune_messages,
     _validate_digest,
+    covered_prefix_digest,
+    install_fold_projection,
+    make_fold_lineage,
+    projection_source_digest,
 )
 from app.agent.runtime import AgentRuntime
 from app.gateway.provider import ChatResponse
@@ -44,10 +50,7 @@ def _big_source() -> list[dict[str, Any]]:
     而 `_upgrade_fold_digests` 现在会拒绝这种区间（Reasonix `foldEconomics` 同款）。
     升级路径的测试必须用够大的区间，否则测的是门槛而不是升级。
     """
-    return [
-        {**m, "content": (m.get("content") or "") + "补充说明。" * 120}
-        for m in _range()
-    ]
+    return [{**m, "content": (m.get("content") or "") + "补充说明。" * 120} for m in _range()]
 
 
 def _range() -> list[dict[str, Any]]:
@@ -121,9 +124,7 @@ def test_digest_source_keeps_role_identity():
 
 def test_digest_source_is_bounded_and_does_not_cut_a_message():
     """超长区间要截断，但不能把一条消息切成半截 —— 半截的命令会被读成另一条。"""
-    messages = [
-        {"role": "user", "content": f"第 {i} 条：{'x' * 400}"} for i in range(200)
-    ]
+    messages = [{"role": "user", "content": f"第 {i} 条：{'x' * 400}"} for i in range(200)]
 
     source = _digest_source(messages)
 
@@ -166,8 +167,7 @@ def test_validate_digest_rejects_a_summary_without_any_anchor():
     一份通篇没提具体标识符的摘要只要出现 `user` 就能通过。
     """
     fabricated = (
-        "用户和助手围绕一个软件工程问题进行了多轮讨论，"
-        "助手给出了一些方案，用户表示认可，随后双方继续推进后续工作。"
+        "用户和助手围绕一个软件工程问题进行了多轮讨论，助手给出了一些方案，用户表示认可，随后双方继续推进后续工作。"
     )
     assert "user" in _digest_source(_range())  # 序列化头里有角色名
     assert _validate_digest(fabricated, _range()) == ""
@@ -226,9 +226,7 @@ async def test_upgrade_keeps_extractive_when_the_call_fails():
 
 @pytest.mark.asyncio
 async def test_upgrade_keeps_extractive_when_the_summary_is_fabricated():
-    gateway = _StubGateway(
-        content="用户和助手围绕一个软件工程问题进行了多轮讨论，助手给出了一些方案，用户表示认可。"
-    )
+    gateway = _StubGateway(content="用户和助手围绕一个软件工程问题进行了多轮讨论，助手给出了一些方案，用户表示认可。")
     folds = [_fold(_big_source())]
 
     await _runtime(gateway)._upgrade_fold_digests(folds)
@@ -278,3 +276,370 @@ def test_prune_fold_carries_the_range_source_for_upgrade():
     assert source, "同步层没带出原文，模型摘要就无从生成"
     assert "问题 0" in _digest_source(source)
     assert folds[0]["digest_model"] == "extractive", "同步层只能写提取式，标注要如实"
+
+
+# ── H15：fold lineage、covered-prefix digest 与投影安装 CAS ──
+
+LINEAGE_PROVIDER = "openai"
+LINEAGE_MODEL = "gpt-test"
+LINEAGE_WINDOW = 128_000
+
+
+def _lineage_messages(count: int = 6) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = [{"role": "system", "content": "sys"}]
+    for seq in range(1, count + 1):
+        out.append(
+            {
+                "id": f"m{seq}",
+                "role": "user" if seq % 2 else "assistant",
+                "content": f"内容 {seq}",
+                "seq": seq,
+            }
+        )
+    return out
+
+
+def _trusted_fold(
+    messages: list[dict[str, Any]],
+    frm: int = 1,
+    to: int = 4,
+    body_suffix: int = 3,
+) -> dict[str, Any]:
+    return {
+        "covered_from": frm,
+        "covered_to": to,
+        "body_suffix": body_suffix,
+        "digest": "- [user] 早前要点",
+        "digest_model": "extractive",
+        "lineage": make_fold_lineage(
+            messages,
+            frm,
+            to,
+            provider=LINEAGE_PROVIDER,
+            model=LINEAGE_MODEL,
+            context_window=LINEAGE_WINDOW,
+        ),
+    }
+
+
+def _apply_trusted(messages: list[dict[str, Any]], folds: list[dict[str, Any]]):
+    return _apply_folds(
+        messages,
+        folds,
+        provider=LINEAGE_PROVIDER,
+        lineage_model=LINEAGE_MODEL,
+        context_window=LINEAGE_WINDOW,
+    )
+
+
+def test_prune_records_complete_fold_lineage_and_prefix_digest():
+    messages = _lineage_messages(8)
+    folds: list[dict[str, Any]] = []
+
+    _prune_messages(
+        messages,
+        CompactionConfig(
+            max_messages=3,
+            provider=LINEAGE_PROVIDER,
+            model=LINEAGE_MODEL,
+            context_window=LINEAGE_WINDOW,
+        ),
+        folds=folds,
+    )
+
+    assert len(folds) == 1
+    lineage = folds[0]["lineage"]
+    assert lineage["version"] == 1
+    assert lineage["provider"] == LINEAGE_PROVIDER
+    assert lineage["model"] == LINEAGE_MODEL
+    assert lineage["context_window"] == LINEAGE_WINDOW
+    assert lineage["covered_from"] == 1
+    assert lineage["covered_to"] == 7
+    assert lineage["covered_prefix_digest"] == covered_prefix_digest(messages, 1, 7)
+    assert _apply_trusted(messages, folds) is not None
+
+
+@pytest.mark.parametrize("force_entry", [False, True])
+def test_runtime_compaction_records_effective_lineage(monkeypatch: pytest.MonkeyPatch, force_entry: bool):
+    from app.agent import runtime as runtime_mod
+
+    captured: dict[str, CompactionConfig] = {}
+    real_compact = runtime_mod._compact_messages
+
+    def recording_compact(messages, cfg=None, **kwargs):
+        captured["cfg"] = cfg
+        return real_compact(messages, cfg, **kwargs)
+
+    monkeypatch.setattr(runtime_mod, "_compact_messages", recording_compact)
+    runtime = AgentRuntime(gateway=None)
+    mode = SimpleNamespace(
+        compaction={
+            "strategy": "prune",
+            "max_messages": 3,
+            "provider": "stale-provider",
+            "context_window": 1_000,
+        }
+    )
+    messages = _lineage_messages(8)
+    folds: list[dict[str, Any]] = []
+
+    if force_entry:
+        runtime._force_compact(
+            messages,
+            mode,
+            {"provider": LINEAGE_PROVIDER},
+            window=256_000,
+            max_output=8_000,
+            model=LINEAGE_MODEL,
+            folds=folds,
+        )
+    else:
+        runtime._compact_with_notice(
+            messages,
+            mode,
+            {"provider": LINEAGE_PROVIDER},
+            window=256_000,
+            max_output=8_000,
+            model=LINEAGE_MODEL,
+            folds=folds,
+        )
+
+    cfg = captured["cfg"]
+    assert cfg.provider == LINEAGE_PROVIDER
+    assert cfg.context_window == 256_000
+    assert folds[0]["lineage"]["provider"] == LINEAGE_PROVIDER
+    assert folds[0]["lineage"]["model"] == LINEAGE_MODEL
+    assert folds[0]["lineage"]["context_window"] == 256_000
+
+
+def test_prefix_digest_is_canonical_and_covers_message_identity():
+    messages = _lineage_messages(4)
+    reordered_keys = [dict(reversed(list(message.items()))) for message in messages]
+
+    assert covered_prefix_digest(messages, 1, 4) == covered_prefix_digest(reordered_keys, 1, 4)
+    changed = [dict(message) for message in messages]
+    changed[1]["id"] = "another-message"
+    assert covered_prefix_digest(changed, 1, 4) != covered_prefix_digest(messages, 1, 4)
+
+
+@pytest.mark.parametrize("field", ["provider", "model", "context_window"])
+def test_projection_rejects_lineage_mismatch(field: str):
+    messages = _lineage_messages()
+    fold = _trusted_fold(messages)
+    original = fold["lineage"][field]
+    fold["lineage"][field] = original + 1 if isinstance(original, int) else f"{original}-other"
+
+    assert _apply_trusted(messages, [fold]) is None
+
+
+@pytest.mark.parametrize("field", ["content", "id", "tool_calls"])
+def test_projection_rejects_changed_covered_prefix(field: str):
+    messages = _lineage_messages()
+    fold = _trusted_fold(messages)
+    messages[1][field] = "changed"
+
+    assert _apply_trusted(messages, [fold]) is None
+
+
+def test_legacy_fold_without_lineage_is_readable_but_not_trusted():
+    messages = _lineage_messages()
+    fold = _trusted_fold(messages)
+    fold.pop("lineage")
+
+    assert fold["digest"] == "- [user] 早前要点"
+    assert _apply_trusted(messages, [fold]) is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("version", 999), ("covered_prefix_digest", "0" * 64), ("provider", "")],
+)
+def test_projection_rejects_incomplete_or_unknown_lineage(field: str, value: Any):
+    messages = _lineage_messages()
+    fold = _trusted_fold(messages)
+    fold["lineage"][field] = value
+
+    assert _apply_trusted(messages, [fold]) is None
+
+
+def test_projection_install_cas_rejects_stale_source_without_mutating_it():
+    messages = _lineage_messages()
+    folds = [_trusted_fold(messages)]
+    expected = projection_source_digest(messages)
+    messages.append({"id": "m7", "role": "user", "content": "new", "seq": 7})
+    before = list(messages)
+
+    assert (
+        install_fold_projection(
+            messages,
+            folds,
+            expected_source_digest=expected,
+            provider=LINEAGE_PROVIDER,
+            model=LINEAGE_MODEL,
+            context_window=LINEAGE_WINDOW,
+        )
+        is None
+    )
+    assert messages == before
+
+
+def test_projection_install_cas_swaps_only_a_matching_snapshot():
+    messages = _lineage_messages()
+    folds = [_trusted_fold(messages)]
+    expected = projection_source_digest(messages)
+    original_id = id(messages)
+
+    installed = install_fold_projection(
+        messages,
+        folds,
+        expected_source_digest=expected,
+        provider=LINEAGE_PROVIDER,
+        model=LINEAGE_MODEL,
+        context_window=LINEAGE_WINDOW,
+    )
+
+    assert installed is messages
+    assert id(messages) == original_id
+    assert "早前要点" in messages[1]["content"]
+    assert [m["seq"] for m in messages[2:]] == [4, 5, 6]
+
+
+def test_concurrent_projection_install_has_exactly_one_cas_winner():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    messages = _lineage_messages()
+    folds = [_trusted_fold(messages)]
+    expected = projection_source_digest(messages)
+    barrier = Barrier(2)
+
+    def _install():
+        barrier.wait()
+        return install_fold_projection(
+            messages,
+            folds,
+            expected_source_digest=expected,
+            provider=LINEAGE_PROVIDER,
+            model=LINEAGE_MODEL,
+            context_window=LINEAGE_WINDOW,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _install(), range(2)))
+
+    assert sum(result is not None for result in results) == 1
+    assert sum(result is None for result in results) == 1
+    assert "早前要点" in messages[1]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutate_during_claim", [False, True])
+async def test_runtime_projection_install_uses_database_cas(monkeypatch: pytest.MonkeyPatch, mutate_during_claim: bool):
+    import app.agent.runtime as runtime_module
+    from app.agent import history_writer
+
+    monkeypatch.setattr(runtime_module, "MAX_CONTEXT_TOKENS", 0)
+    messages = _lineage_messages()
+    folds = [_trusted_fold(messages)]
+    claim = SimpleNamespace(
+        claim_id="claim-1",
+        session_id="s1",
+        tenant_id=1,
+        source_digest=projection_source_digest(messages),
+        message_revision=7,
+        folds=folds,
+    )
+    completed: list[str] = []
+    aborted: list[str] = []
+
+    async def _claim(session_id, tenant_id, source, *, expected_source_digest):
+        assert session_id == "s1" and tenant_id == 1
+        assert expected_source_digest == projection_source_digest(source)
+        if mutate_during_claim:
+            source.append({"id": "m7", "role": "user", "content": "new", "seq": 7})
+            return None
+        return claim
+
+    async def _complete(c, *, projection_digest):
+        completed.append(c.claim_id)
+        return True
+
+    async def _abort(c):
+        aborted.append(c.claim_id)
+
+    monkeypatch.setattr(history_writer, "claim_fold_projection", _claim)
+    monkeypatch.setattr(history_writer, "complete_fold_projection", _complete)
+    monkeypatch.setattr(history_writer, "abort_fold_projection", _abort)
+    runtime = object.__new__(AgentRuntime)
+    runtime._context_window = LINEAGE_WINDOW
+    task = SimpleNamespace(
+        session_id="s1",
+        tenant_id=1,
+        llm_config={"provider": LINEAGE_PROVIDER, "model": LINEAGE_MODEL},
+    )
+
+    projected = await runtime._project_over_budget(messages, task, LINEAGE_MODEL)
+
+    assert projected is messages
+    if mutate_during_claim:
+        assert len(messages) == 8
+        assert "早前要点" not in messages[1]["content"]
+        assert completed == []
+    else:
+        assert len(messages) == 5
+        assert "早前要点" in messages[1]["content"]
+        assert completed == ["claim-1"]
+    assert aborted == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_projection_without_provider_aborts_database_claim(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import app.agent.runtime as runtime_module
+    from app.agent import history_writer
+    from app.tools import context as tool_context
+
+    monkeypatch.setattr(runtime_module, "MAX_CONTEXT_TOKENS", 0)
+    monkeypatch.setattr(tool_context, "get_tool_context", lambda *_args: "")
+    messages = _lineage_messages()
+    folds = [_trusted_fold(messages)]
+    claim = SimpleNamespace(
+        claim_id="claim-1",
+        session_id="s1",
+        tenant_id=1,
+        source_digest=projection_source_digest(messages),
+        message_revision=7,
+        folds=folds,
+    )
+    completed: list[str] = []
+    aborted: list[str] = []
+
+    async def _claim(*_args, **_kwargs):
+        return claim
+
+    async def _complete(c, *, projection_digest):
+        completed.append(c.claim_id)
+        return True
+
+    async def _abort(c):
+        aborted.append(c.claim_id)
+
+    monkeypatch.setattr(history_writer, "claim_fold_projection", _claim)
+    monkeypatch.setattr(history_writer, "complete_fold_projection", _complete)
+    monkeypatch.setattr(history_writer, "abort_fold_projection", _abort)
+    runtime = object.__new__(AgentRuntime)
+    runtime._context_window = LINEAGE_WINDOW
+    task = SimpleNamespace(
+        session_id="s1",
+        tenant_id=1,
+        llm_config={"model": LINEAGE_MODEL},
+    )
+    before = list(messages)
+
+    projected = await runtime._project_over_budget(messages, task, LINEAGE_MODEL)
+
+    assert projected is messages
+    assert messages == before
+    assert completed == []
+    assert aborted == ["claim-1"]

@@ -7,6 +7,8 @@
   * 命令类工具按**内容**判定：`shell_exec` 既能 `ls` 也能 `rm -rf`；
   * 参数归一化是票据绑定与重复检测的共同基础 —— 改个写法就能绕开的话，两者都等于没有。
 """
+import pytest
+
 from app.agent.tool_policy import (
     DELETE,
     EXTERNAL,
@@ -51,6 +53,52 @@ def test_command_tool_level_depends_on_content():
     assert tool_level("shell_exec", {"command": "git status"}) == WRITE
     # 无法判定（没有命令文本）时保守停在 DELETE
     assert tool_level("shell_exec", {}) == DELETE
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ok & rm -rf victim",
+        "echo ok; rm -rf victim",
+        "echo ok && rm -rf victim",
+        "echo ok || rm -rf victim",
+        "echo ok | rm -rf victim",
+        "echo ok > output.txt",
+        "(rm -rf victim)",
+        "{ echo ok; rm -rf victim; }",
+        "FOO=bar rm -rf victim",
+        "python -c \"import os; os.system('id')\"",
+        "python -Bc \"import os; os.system('id')\"",
+        "python script.py",
+        "python -m json.tool",
+        "echo ok\nrm -rf victim",
+        "echo 'ok; rm -rf victim' && rm -rf victim",
+    ],
+)
+def test_shell_prefix_cannot_downgrade_complex_or_python_commands(command):
+    level = tool_level("shell_exec", {"command": command})
+    assert level == DELETE
+    assert requires_confirmation(level, "auto") is True
+    assert requires_second_check(level) is True
+
+
+@pytest.mark.parametrize("command", ["echo 'a; b'", "ls -la", "cat README.md", "git status"])
+def test_provably_simple_shell_commands_remain_write(command):
+    assert tool_level("shell_exec", {"command": command}) == WRITE
+
+
+@pytest.mark.parametrize(
+    ("tool", "key", "source"),
+    [
+        ("execute_python", "code", "print('hello')"),
+        ("run_code", "code", "print('hello')"),
+        ("execute_python", "code", "import os\nos.system('id')"),
+    ],
+)
+def test_python_source_is_never_downgraded_by_prefix(tool, key, source):
+    level = tool_level(tool, {key: source})
+    assert level == DELETE
+    assert requires_confirmation(level, "auto") is True
 
 
 def test_confirmation_matrix():

@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -67,6 +68,7 @@ SHARED_DIR = "_shared"
 DEFAULT_SKILL_ROOT = os.path.join(".", "data", "skills")
 # 身份段白名单：防路径穿越（不允许 / \ .. 空格等）
 _IDENTITY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +132,11 @@ def _atomic_write_text(path: Path, text: str) -> None:
     **旧文件仍然完整** —— 这是"失败不破坏旧版本"的落点。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}")
-    tmp.write_text(text, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    tmp = Path(tmp_name)
     try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
         os.replace(tmp, path)
     finally:
         if tmp.exists():
@@ -140,6 +144,35 @@ def _atomic_write_text(path: Path, text: str) -> None:
                 tmp.unlink()
             except OSError:
                 pass
+
+
+def validate_skill_name(name: str) -> str:
+    """技能名是目录/文件名，不是路径；统一拒绝绝对路径、分隔符、穿越与隐藏名。"""
+    if not isinstance(name, str) or not _SKILL_NAME_RE.fullmatch(name):
+        raise ValueError(f"invalid skill name: {name!r}")
+    return name
+
+
+def _contained_path(root: PathLike, relative: str) -> Path:
+    """解析符号链接后校验候选路径仍位于 root 内。"""
+    resolved_root = Path(root).resolve()
+    candidate = (resolved_root / relative).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"skill path escapes store: {relative!r}") from exc
+    return candidate
+
+
+def _contained_in_any(path: PathLike, roots: list[Path]) -> Path:
+    resolved = Path(path).resolve()
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+        return resolved
+    raise ValueError(f"skill path escapes store: {path!r}")
 
 
 def _safe_segment(value: str, label: str) -> str:
@@ -404,7 +437,12 @@ class SkillStore:
         return self._roots.write_scope
 
     def _path(self, name: str) -> Path:
-        return self._root / f"{name}.skill.json"
+        safe = validate_skill_name(name)
+        return _contained_path(self._root, f"{safe}.skill.json")
+
+    def _skill_dir(self, name: str) -> Path:
+        safe = validate_skill_name(name)
+        return _contained_path(self._root, safe)
 
     def _iter_search(self) -> Iterator[tuple[SkillDef, str]]:
         """按优先级遍历搜索路径，产出 (SkillDef, scope)。
@@ -475,7 +513,8 @@ class SkillStore:
     def _flat_carrier(self, name: str) -> Path | None:
         """按搜索优先级找 `{dir}/{name}.skill.json` 的**物理位置**（找不到返回 None）。"""
         for d, _scope in self._roots.search:
-            p = d / f"{name}.skill.json"
+            safe = validate_skill_name(name)
+            p = _contained_path(d, f"{safe}.skill.json")
             if p.is_file():
                 return p
         return None
@@ -528,6 +567,12 @@ class SkillStore:
         carrier: Path | None = None
         if skill.scope != SCOPE_BUILTIN and skill.source_dir:
             carrier = Path(skill.source_dir) / META_FILE
+            search_roots = [d for d, scope in self._roots.search if scope != SCOPE_BUILTIN]
+            try:
+                carrier = _contained_in_any(carrier, search_roots)
+            except ValueError:
+                logger.warning("skill store: refuse metadata write outside store: %s", carrier)
+                raise
             try:
                 self._merge_meta(carrier, updates)
                 return skill
@@ -549,28 +594,18 @@ class SkillStore:
         要的形态写。这里只做**路径安全**校验（名字不能含路径分隔符 / `..`）；**内容校验不在
         这里** —— 调用方写完用 `load_skill_dir()` 复查，不通过就回滚（见 `app/skill/generate.py`）。
         """
-        safe = (name or "").strip()
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
-        if (
-            not safe
-            or len(safe) > 64
-            or not set(safe) <= allowed
-            or safe.startswith(".")
-            or safe.startswith("-")
-        ):
-            raise ValueError(f"invalid skill name: {name!r}")
-        target = self._root / safe
-        target.mkdir(parents=True, exist_ok=True)
-        path = target / "SKILL.md"
-        path.write_text(text, encoding="utf-8")
+        safe = validate_skill_name(name)
+        path = _contained_path(self._root, f"{safe}/SKILL.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, text)
         return path
 
     def delete_skill_dir(self, name: str) -> bool:
         """删除**目录型**技能（D4 的失败回滚：宁可什么都不留，也不留半个坏技能）。"""
-        safe = (name or "").strip().strip("/")
-        if not safe or any(ch in safe for ch in "/\\") or safe in (".", ".."):
+        try:
+            target = self._skill_dir(name)
+        except ValueError:
             return False
-        target = self._root / safe
         if not target.is_dir():
             return False
         for item in sorted(target.rglob("*"), reverse=True):

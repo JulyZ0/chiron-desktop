@@ -108,6 +108,7 @@ async def _auto_resume_runner(task: Any) -> None:
     from app.agent.event_sink import EventSink
     from app.agent.runtime import AgentRuntime
     from app.memory.service import get_service as get_memory_service
+    from app.run_registry import RunLease, activate_run_fence, deactivate_run_fence, resolve_run_fence
     from app.tools.context import set_tool_context
 
     gateway = await get_gateway()
@@ -124,8 +125,28 @@ async def _auto_resume_runner(task: Any) -> None:
         memory=get_memory_service(),
         unattended=True,
     )
-    async for _ev in resume_runtime.run(task):
-        pass  # 事件无人订阅；结论经 session_store / subagent_runs 落库
+    token = getattr(task, "run_token", "") or ""
+    fence = resolve_run_fence(token)
+    lease = None
+    context_token = None
+    if fence is not None:
+        lease = RunLease(
+            _redis, task.session_id, _get_instance_id(), fence.run_token,
+            owner_uid=getattr(task, "user_id", "") or "",
+            url=settings.engine_advertise_url, generation=fence.generation,
+        )
+        if not await lease.start():
+            logger.warning("auto-resume skipped: run ownership already replaced")
+            return
+        context_token = activate_run_fence(fence)
+    try:
+        async for _ev in resume_runtime.run(task):
+            pass  # 事件无人订阅；结论经 session_store / subagent_runs 落库
+    finally:
+        if context_token is not None:
+            deactivate_run_fence(context_token)
+        if lease is not None:
+            await lease.stop()
 
 
 
@@ -801,6 +822,7 @@ async def _start_gateway() -> Any:
             embed_fn=_embed_for_cache,
             l1_capacity=settings.cache_l1_capacity,
             l2_ttl=settings.cache_l2_ttl,
+            l3_ttl=settings.cache_l3_ttl,
             semantic_threshold=settings.semantic_cache_threshold,
             semantic_prefix_dims=settings.semantic_cache_prefix_dims,
         )
@@ -2170,6 +2192,7 @@ async def agent_submit(
     )
     session_id = task.session_id
     run_lease = None
+    run_generation = 1
     if session_id:
         import uuid
 
@@ -2263,7 +2286,8 @@ async def agent_submit(
             for sub_event in sink.drain():
                 yield _frame(sub_event.to_payload())
 
-        pump = asyncio.create_task(_pump_runtime())
+        pump: asyncio.Task[Any] | None = None
+        context_token = None
 
         # 客户端断开后**不取消这一轮**：置位后由 finally 把它转成后台任务跑完。
         # 见 except asyncio.CancelledError 分支的说明。
@@ -2325,7 +2349,17 @@ async def agent_submit(
 
         try:
             if run_lease is not None:
-                await run_lease.start()
+                if not await run_lease.start():
+                    raise RuntimeError("run ownership replaced before start")
+                from app.agent import checkpoint as checkpoint_mod
+
+                await checkpoint_mod.claim_new(
+                    tenant_id=task.tenant_id or 0, session_id=session_id,
+                    run_token=run_token, generation=run_generation,
+                )
+                context_token = activate_run_fence(run_lease.fence)
+            assert pump is None
+            pump = asyncio.create_task(_pump_runtime())
             while True:
                 # 1) 先冲刷子 Agent 旁路（保证进度实时性）
                 async for frame in _sink_frames():
@@ -2441,6 +2475,8 @@ async def agent_submit(
                 if session_id:
                     _ACTIVE_RUNTIMES.pop(session_id, None)
                     crash_forensics.clear_active_run(session_id)
+            if context_token is not None:
+                deactivate_run_fence(context_token)
 
     return StreamingResponse(
         event_generator(),
@@ -2654,8 +2690,20 @@ async def agent_interrupt(
             return {"ok": False, "error": "stale run token"}
 
     from app.agent.interrupt import request_interrupt
+    from app.run_registry import owner_of, resolve_run_fence
 
     redis_ok = await request_interrupt(session_id, redis=_redis)
+    if not redis_ok:
+        owner = await owner_of(_redis, session_id)
+        if owner is not None:
+            fence = resolve_run_fence(
+                str(owner.get("run_token") or ""), int(owner.get("generation") or 0)
+            )
+            if fence is not None:
+                redis_ok = await request_interrupt(
+                    session_id, redis=_redis, run_token=fence.run_token,
+                    generation=fence.generation,
+                )
     logger.info(
         "Interrupt requested (session=%s caller=%s redis=%s)",
         session_id,

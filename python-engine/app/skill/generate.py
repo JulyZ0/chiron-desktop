@@ -62,8 +62,13 @@ def slugify(description: str) -> str:
 
 
 def _name_is_safe(name: str) -> bool:
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
-    return bool(name) and len(name) <= MAX_NAME_CHARS and set(name) <= allowed and not name.startswith(".")
+    from app.skill.store import validate_skill_name
+
+    try:
+        validate_skill_name(name)
+    except ValueError:
+        return False
+    return True
 
 
 def extract_markdown(text: str) -> str:

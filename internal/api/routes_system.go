@@ -16,17 +16,15 @@ import (
 
 func registerSystemRoutes(
 	mux *http.ServeMux,
-	authMW, rlMW, sanitizeMW routeMiddleware,
+	authMW, rlMW, _ routeMiddleware,
 	toolHandler *ToolHandler,
 	systemHandler *SystemHandler,
 	traceHandler *TraceHandler,
 	pythonClient *engine.PythonClient,
 ) {
-	// Tools (rate limited, proxies to Python)
-	// 工具面属于内部信息（含 MCP 注入工具名/描述/完整入参 schema），
-	// 未认证即可枚举等于免费交付攻击面清单。同组 /v1/tools/execute 早有 authMW。
+	// Tool execution is Agent-only. A public execute route would bypass ToolGuard,
+	// Broker authorization, approvals, and hooks.
 	mux.Handle("GET /v1/tools", authMW(rlMW(http.HandlerFunc(toolHandler.ListTools))))
-	mux.Handle("POST /v1/tools/execute", authMW(rlMW(sanitizeMW(http.HandlerFunc(toolHandler.ExecuteTool)))))
 
 	// System (rate limited; spans/traces 仅管理员可见，S 安全修复：原为公开信息泄露)
 	// 健康评分属内部运行信息；同组的 spans/traces 都要求 PermAdminRead，此处漏了鉴权。

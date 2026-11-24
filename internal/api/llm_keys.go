@@ -31,7 +31,30 @@ var (
 	llmKeysChangedChannel = db.RedisKey("llm:keys:changed")
 )
 
-const llmKeysStatuses = "active rate_limited circuit_open"
+const (
+	llmKeysStatuses       = "active rate_limited circuit_open"
+	llmKeyPreviewMask     = "•••••"
+	llmKeyPreviewHashSize = 8
+)
+
+// llmKeyPreview 只从不可逆的 key_hash 取固定长度指纹，绝不读取明文或 encrypted_key。
+func llmKeyPreview(keyHash string) string {
+	if len(keyHash) < llmKeyPreviewHashSize {
+		return llmKeyPreviewMask
+	}
+	return llmKeyPreviewMask + keyHash[:llmKeyPreviewHashSize]
+}
+
+func llmKeyListItem(provider, keyHash, status, remark string, weight int) map[string]interface{} {
+	return map[string]interface{}{
+		"id":          keyHash[:12],
+		"provider":    provider,
+		"key_preview": llmKeyPreview(keyHash),
+		"status":      status,
+		"remark":      remark,
+		"weight":      weight,
+	}
+}
 
 func llmKeyHash(provider, key string) string {
 	d := sha256.Sum256([]byte(provider + ":" + key))
@@ -243,14 +266,7 @@ func (h *AdminHandler) ListLLMKeys(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Scan(&id, &provider, &keyHash, &status, &remark, &weight); err != nil {
 			continue
 		}
-		keys = append(keys, map[string]interface{}{
-			"id":       keyHash[:12],
-			"provider": provider,
-			"key":      "•••••" + keyHash[:8], // 仅指纹，不触碰明文
-			"status":   status,
-			"remark":   remark,
-			"weight":   weight, // M27：每 key 权重（smooth WRR 的分配比例）
-		})
+		keys = append(keys, llmKeyListItem(provider, keyHash, status, remark, weight))
 		stats["total"] = stats["total"].(int) + 1
 		stats[status] = stats[status].(int) + 1
 	}

@@ -83,13 +83,13 @@ class TestConflictAuditEvents:
         assert auditor.events[-1][1]["conflict_id"] == "c1"
         assert auditor.events[-1][1]["tenant_id"] == "t1"
 
-        await cm.resolve_conflict("c1", "use_new")
+        await cm.resolve_conflict("c1", "t1", "u1", "use_new")
         assert auditor.names == [EVENT_DETECTED, EVENT_RESOLVED]
         # 裁决流水带上最终值，事后可对账「当时选了哪个」
         assert auditor.events[-1][1]["final_value"] == "北京"
 
         await cm.register_conflict(_conflict("c2"))
-        await cm.delete_conflict("c2")
+        await cm.delete_conflict("c2", "t1", "u1")
         assert auditor.names == [
             EVENT_DETECTED,
             EVENT_RESOLVED,
@@ -121,7 +121,7 @@ class TestConflictAuditEvents:
         # 审计器抛异常，登记/读取/裁决仍然照常成功
         assert await cm.register_conflict(_conflict("c1")) is True
         assert (await cm.get_pending_conflicts("t1", "u1"))[0].conflict_id == "c1"
-        ok, _ = await cm.resolve_conflict("c1", "keep_old")
+        ok, _ = await cm.resolve_conflict("c1", "t1", "u1", "keep_old")
         assert ok is True
 
     async def test_default_auditor_is_noop(self):

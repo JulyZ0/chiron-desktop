@@ -48,10 +48,12 @@ class _RecordingConn:
 
     def __init__(self, result=None):
         self.calls: list[dict] = []
+        self.timeouts: list[float] = []
         self._result = {"ok": True} if result is None else result
 
-    async def send_jsonrpc(self, method, params=None):
+    async def send_jsonrpc(self, method, params=None, *, timeout=30.0):
         self.calls.append({"method": method, "params": params})
+        self.timeouts.append(timeout)
         return dict(self._result)
 
 
@@ -112,6 +114,7 @@ def test_read_only_hint_makes_tool_safe():
 
 
 def test_destructive_hint_wins():
+    """显式破坏性声明不能被同时出现的 readOnlyHint 降级。"""
     from app.mcp.client import MCPTool
 
     tool = MCPTool(
@@ -120,7 +123,21 @@ def test_destructive_hint_wins():
         input_schema={},
         server_name="xerj",
         local_name="x",
-        annotations={"destructiveHint": True},
+        annotations={"readOnlyHint": True, "destructiveHint": True},
+    )
+    assert is_tool_destructive(tool) is True
+
+
+def test_non_boolean_read_only_hint_fails_closed():
+    from app.mcp.client import MCPTool
+
+    tool = MCPTool(
+        name="xerj_x",
+        description="",
+        input_schema={},
+        server_name="xerj",
+        local_name="x",
+        annotations={"readOnlyHint": "true"},
     )
     assert is_tool_destructive(tool) is True
 
@@ -246,6 +263,31 @@ def test_call_proceeds_when_read_only_hint_present():
 
 
 # ── annotations_for：给上层的元数据通道 ──────────────────────────────────
+
+
+async def test_contradictory_annotations_are_refused_before_io():
+    server = _server(read_only=True)
+    client, conn = _client_with(
+        server,
+        [{
+            "name": "write",
+            "inputSchema": {},
+            "annotations": {"readOnlyHint": True, "destructiveHint": True},
+        }],
+    )
+    result = await client.call_tool("xerj_write", {})
+    assert result["denied"] is True
+    assert conn.calls == []
+
+
+async def test_call_tool_forwards_timeout_to_connection():
+    server = _server(read_only=True)
+    client, conn = _client_with(
+        server,
+        [{"name": "read", "inputSchema": {}, "annotations": {"readOnlyHint": True}}],
+    )
+    assert await client.call_tool("xerj_read", {}, timeout=0.25) == {"ok": True}
+    assert conn.timeouts == [0.25]
 
 
 def test_annotations_for_reports_destructive_flag():

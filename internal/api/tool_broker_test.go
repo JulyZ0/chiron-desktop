@@ -164,3 +164,29 @@ func TestFlexTenantIDNormalizesBothForms(t *testing.T) {
 		}
 	}
 }
+
+func TestSystemRoutesDoNotExposePublicToolExecution(t *testing.T) {
+	mux := http.NewServeMux()
+	passthrough := func(next http.Handler) http.Handler { return next }
+	registerSystemRoutes(mux, passthrough, passthrough, passthrough, NewToolHandler(nil, nil), nil, nil, nil)
+
+	t.Run("execute route removed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/tools/execute", strings.NewReader(
+			`{"name":"shell_exec","input":{"command":"rm -rf /tmp/h1-probe"}}`,
+		))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("POST /v1/tools/execute status = %d, want 404; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("tool listing retained", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/v1/tools", nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /v1/tools status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+		}
+	})
+}

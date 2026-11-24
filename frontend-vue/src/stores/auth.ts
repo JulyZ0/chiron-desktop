@@ -16,12 +16,27 @@ export interface User {
   role: string
   tenant_id: number
   /** 是否已由用户自己设置过密码；false = 本地 owner 首次设置 */
-  password_set?: boolean
+  password_set: boolean
   /** 首登/管理员重置后必须改密（团队模式） */
-  must_change_password?: boolean
+  must_change_password: boolean
   /** 用户设置（换肤、朗读音色等）。由 GET /v1/auth/profile 下发、PUT 局部合并。 */
   settings?: Record<string, unknown>
   /** 权限清单（profile 下发）。API Key 会话只有剔除管理面后的业务权限。 */
+  perms?: string[]
+}
+
+interface AuthProfile {
+  user_id: string
+  email: string
+  username?: string
+  name?: string
+  nickname?: string
+  role: string
+  tenant_id?: number
+  password_set?: boolean
+  must_change_password?: boolean
+  auth_method?: 'session' | 'api_key'
+  settings?: Record<string, unknown>
   perms?: string[]
 }
 
@@ -31,6 +46,21 @@ interface UserStored {
   role: string
   name: string
   nickname?: string
+  password_set?: boolean
+  must_change_password?: boolean
+}
+
+type AuthUserPayload = Omit<User, 'password_set' | 'must_change_password'> & {
+  password_set?: boolean
+  must_change_password?: boolean
+}
+
+function normalizeAuthUser(user: AuthUserPayload): User {
+  return {
+    ...user,
+    password_set: user.password_set !== false,
+    must_change_password: user.must_change_password !== false,
+  }
 }
 
 function loadUserFromStorage(): User | null {
@@ -38,11 +68,12 @@ function loadUserFromStorage(): User | null {
     const raw = localStorage.getItem('user')
     if (!raw) return null
     const stored = JSON.parse(raw) as UserStored
-    // 从存储恢复最小字段，其余字段由后端 profile 填充
-    return {
+    return normalizeAuthUser({
       id: stored.id, role: stored.role, name: stored.name,
       nickname: stored.nickname, email: '', tenant_id: 0,
-    }
+      password_set: stored.password_set,
+      must_change_password: stored.must_change_password,
+    })
   } catch {
     return null
   }
@@ -50,7 +81,10 @@ function loadUserFromStorage(): User | null {
 
 function persistUserToStorage(u: User | null) {
   if (u) {
-    const stored: UserStored = { id: u.id, role: u.role, name: u.name, nickname: u.nickname }
+    const stored: UserStored = {
+      id: u.id, role: u.role, name: u.name, nickname: u.nickname,
+      password_set: u.password_set, must_change_password: u.must_change_password,
+    }
     localStorage.setItem('user', JSON.stringify(stored))
   } else {
     localStorage.removeItem('user')
@@ -214,8 +248,8 @@ export const useAuthStore = defineStore('auth', () => {
       if (!localToken) return false
       applyToken(localToken)
       setAuthMethod('session')
-      user.value = d.user
-      persistUserToStorage(d.user)
+      user.value = normalizeAuthUser(d.user)
+      persistUserToStorage(user.value)
       return true
     } catch {
       return false
@@ -317,8 +351,8 @@ export const useAuthStore = defineStore('auth', () => {
       // 把 token 交给请求层走 Bearer（仅桌面端持久化）。
       applyToken(d.token)
       setAuthMethod('session')
-      user.value = d.user
-      persistUserToStorage(d.user)
+      user.value = normalizeAuthUser(d.user)
+      persistUserToStorage(user.value)
       return d
     } finally {
       loading.value = false
@@ -345,8 +379,12 @@ export const useAuthStore = defineStore('auth', () => {
         id: data.user_id,
         email: data.email || '',
         name: data.name || data.email || 'API Key',
+        nickname: data.nickname || undefined,
+        username: data.username || undefined,
         role: data.role,
         tenant_id: data.tenant_id || 0,
+        password_set: true,
+        must_change_password: false,
         settings: data.settings,
         perms: Array.isArray(data.perms) ? data.perms : undefined,
       }
@@ -383,8 +421,8 @@ export const useAuthStore = defineStore('auth', () => {
       const d = response.data?.data
       if (!d) throw new Error('invalid register response')
       applyToken(d.token)
-      user.value = d.user
-      persistUserToStorage(d.user)
+      user.value = normalizeAuthUser(d.user)
+      persistUserToStorage(user.value)
       return d
     } finally {
       loading.value = false
@@ -402,20 +440,23 @@ export const useAuthStore = defineStore('auth', () => {
     if (!user.value) return
     try {
       const response = await api.get('/v1/auth/profile')
-      const data = response.data?.data
+      const data = response.data?.data as AuthProfile | undefined
       if (!data) throw new Error('invalid profile response')
-      user.value = {
+      const authMethod = data.auth_method === 'api_key' ? 'api_key' : 'session'
+      user.value = normalizeAuthUser({
         id: data.user_id,
         email: data.email,
+        username: data.username,
         name: data.name || data.email,
+        nickname: data.nickname,
         role: data.role,
         tenant_id: data.tenant_id || 0,
+        password_set: data.password_set !== false,
+        must_change_password: authMethod === 'api_key' ? false : data.must_change_password !== false,
         settings: data.settings,
         perms: Array.isArray(data.perms) ? data.perms : undefined,
-      }
-      // 以服务端为准：同一份 token 可能来自 API Key 或交互式登录，
-      // 前端不能只靠自己记忆的登录方式（刷新/恢复后尤其如此）。
-      setAuthMethod(data.auth_method === 'api_key' ? 'api_key' : 'session')
+      })
+      setAuthMethod(authMethod)
       persistUserToStorage(user.value)
       // 按服务端语言偏好对齐界面（仅在本机未显式选择过语言时生效）。
       // 服务端渲染的通知邮件只能读 users.settings.locale，这里同步是为了让
@@ -438,8 +479,8 @@ export const useAuthStore = defineStore('auth', () => {
       // 桌面端同样走 Bearer：SSO 回跳的 cookie 在 file:// 下也不会被带上
       applyToken(d.token)
       setAuthMethod('session')
-      user.value = d.user
-      persistUserToStorage(d.user)
+      user.value = normalizeAuthUser(d.user)
+      persistUserToStorage(user.value)
       return true
     } catch {
       return false
@@ -457,8 +498,8 @@ export const useAuthStore = defineStore('auth', () => {
       const d = response.data?.data
       if (d?.token) applyToken(d.token)
       if (d?.user) {
-        user.value = d.user
-        persistUserToStorage(d.user)
+        user.value = normalizeAuthUser(d.user)
+        persistUserToStorage(user.value)
       }
       return d
     } finally {
@@ -474,8 +515,8 @@ export const useAuthStore = defineStore('auth', () => {
     if (!t) throw new Error('invalid session: empty token')
     applyToken(t)
     setAuthMethod('session')
-    user.value = u
-    persistUserToStorage(u)
+    user.value = normalizeAuthUser(u)
+    persistUserToStorage(user.value)
   }
 
   // S 安全：logout 调后端清 httpOnly cookie（否则登出后 cookie 仍有效，鉴权不失效）

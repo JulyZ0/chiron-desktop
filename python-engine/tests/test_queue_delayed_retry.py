@@ -71,13 +71,45 @@ def received(redis: FakeRedis) -> list[dict]:
 
 
 @pytest.fixture(autouse=True)
-def _no_pg_idempotency(monkeypatch):
-    """幂等闸门走 PG：单测里替换掉，避免依赖真实数据库。"""
+def _mock_fenced_transitions(monkeypatch):
     from app.queue import idempotency
+    from app.queue import worker as worker_module
 
-    monkeypatch.setattr(idempotency, "claim", AsyncMock(return_value=True))
-    monkeypatch.setattr(idempotency, "complete", AsyncMock())
-    monkeypatch.setattr(idempotency, "fail", AsyncMock())
+    claim = idempotency.Attempt("engine", "agent_followup:t1", "state", "token", 1)
+    monkeypatch.setattr(
+        idempotency,
+        "claim",
+        AsyncMock(return_value=idempotency.ClaimDecision(idempotency.ClaimStatus.ACQUIRED, claim)),
+    )
+    monkeypatch.setattr(idempotency, "complete", AsyncMock(return_value=True))
+    monkeypatch.setattr(idempotency, "ack_completed", AsyncMock(return_value=True))
+
+    async def retry(_redis, _claim, **kwargs):
+        _redis.streams.append({"stream": kwargs["target"], "fields": kwargs["fields"]})
+        return True
+
+    async def defer(_redis, _claim, **kwargs):
+        _redis.zset[kwargs["member"]] = kwargs["score"]
+        return True
+
+    async def dead_letter(_redis, _claim, **kwargs):
+        _redis.streams.append({"stream": kwargs["target"], "fields": kwargs["fields"]})
+        return True
+
+    async def promote(redis, **kwargs):
+        if not await redis.zrem(kwargs["delayed"], kwargs["member"]):
+            return None
+        import json
+
+        redis.streams.append(
+            {"stream": kwargs["target"], "fields": json.loads(kwargs["member"])}
+        )
+        return "promoted"
+
+    monkeypatch.setattr(idempotency, "retry", AsyncMock(side_effect=retry))
+    monkeypatch.setattr(idempotency, "defer", AsyncMock(side_effect=defer))
+    monkeypatch.setattr(idempotency, "dead_letter", AsyncMock(side_effect=dead_letter))
+    monkeypatch.setattr(worker_module, "atomic_promote_delayed", AsyncMock(side_effect=promote))
 
 
 class TestDeferredRetry:
@@ -96,7 +128,10 @@ class TestDeferredRetry:
         message = json.loads(next(iter(redis.zset)))
         assert message["retry_count"] == "0", "延迟重试不是失败，不能消耗重试预算"
         assert message["delay_count"] == "1"
-        assert redis.acked == ["1-0"], "原消息必须 ACK，否则会被 reclaim 重复处理"
+        from app.queue import idempotency
+
+        idempotency.defer.assert_awaited_once()
+        assert idempotency.defer.await_args.kwargs["message_id"] == "1-0"
 
     async def test_promote_moves_due_task_back_to_stream(self):
         redis = FakeRedis()
@@ -143,7 +178,10 @@ class TestDeferredRetry:
         assert len(dlq) == 1
         assert "deferred retry limit" in dlq[0]["fields"]["error"]
         assert not redis.zset
-        assert redis.acked == ["1-0"]
+        from app.queue import idempotency
+
+        idempotency.dead_letter.assert_awaited_once()
+        assert idempotency.dead_letter.await_args.kwargs["message_id"] == "1-0"
 
     async def test_falls_back_to_immediate_requeue_when_zset_unavailable(self):
         """延迟集合写不进去（Redis 故障）时必须退回立即重投：宁可早试，不能丢。"""
@@ -151,6 +189,9 @@ class TestDeferredRetry:
             async def zadd(self, key, mapping):
                 raise RuntimeError("WRONGTYPE")
 
+        from app.queue import idempotency
+
+        idempotency.defer.side_effect = RuntimeError("WRONGTYPE")
         redis = _BrokenZset()
         worker = QueueWorker(redis=redis)
         worker._dispatch = AsyncMock(side_effect=RetryLaterError("session busy"))
@@ -160,7 +201,8 @@ class TestDeferredRetry:
         queued = received(redis)
         assert len(queued) == 1
         assert queued[0]["fields"]["retry_count"] == "1"  # 退化为普通重试，预算正常消耗
-        assert redis.acked == ["1-0"]
+        idempotency.retry.assert_awaited_once()
+        assert idempotency.retry.await_args.kwargs["message_id"] == "1-0"
 
     async def test_backoff_grows_and_is_capped(self):
         exc = RetryLaterError("busy")

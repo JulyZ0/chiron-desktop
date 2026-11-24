@@ -11,17 +11,15 @@ import (
 	"github.com/athenavi/chiron/internal/auth"
 	"github.com/athenavi/chiron/internal/db"
 	"github.com/athenavi/chiron/internal/engine"
-	"github.com/athenavi/chiron/internal/monitor"
 )
 
-// ToolHandler handles tool listing and execution (Python-backed).
+// ToolHandler exposes the Python-backed tool catalog.
 type ToolHandler struct {
-	python        *engine.PythonClient
-	authenticator *auth.Authenticator
+	python *engine.PythonClient
 }
 
-func NewToolHandler(python *engine.PythonClient, authenticator *auth.Authenticator) *ToolHandler {
-	return &ToolHandler{python: python, authenticator: authenticator}
+func NewToolHandler(python *engine.PythonClient, _ *auth.Authenticator) *ToolHandler {
+	return &ToolHandler{python: python}
 }
 
 // ListTools returns tools from Python service only.
@@ -62,59 +60,6 @@ func (h *ToolHandler) ListTools(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	OK(w, map[string]interface{}{"tools": result})
-}
-
-// ExecuteTool proxies execution to Python service.
-func (h *ToolHandler) ExecuteTool(w http.ResponseWriter, r *http.Request) {
-	claims := auth.GetClaims(r.Context())
-	if claims == nil {
-		Unauthorized(w, ErrAuthRequired)
-		return
-	}
-
-	var body struct {
-		Name      string                 `json:"name"`
-		Input     map[string]interface{} `json:"input"`
-		SessionID string                 `json:"session_id"`
-	}
-	if err := DecodeJSON(w, r, &body); err != nil {
-		BadRequest(w, ErrInvalidReq)
-		return
-	}
-	if body.Name == "" {
-		BadRequest(w, "tool name is required")
-		return
-	}
-	if body.Input == nil {
-		body.Input = make(map[string]interface{})
-	}
-
-	monitor.IncToolCall()
-	start := time.Now()
-
-	if h.python == nil {
-		BadRequest(w, "tool not available: "+body.Name)
-		return
-	}
-	req := struct {
-		Name     string                 `json:"name"`
-		Input    map[string]interface{} `json:"input"`
-		UserID   string                 `json:"user_id"`
-		TenantID string                 `json:"tenant_id"`
-	}{Name: body.Name, Input: body.Input, UserID: claims.UserID, TenantID: tenantStr(claims.TenantID)}
-	var pyResult map[string]interface{}
-	if err := h.python.PostJSON(r.Context(), "/v1/tools/execute", req, &pyResult); err != nil {
-		slog.Warn("tool execute: python proxy failed", "tool", body.Name, "error", err)
-		monitor.IncToolError()
-		InternalError(w, "python tool execution failed")
-		return
-	}
-	elapsed := time.Since(start)
-	_ = recordToolCall(r, body.Name, body.Input, body.SessionID, pyResult, nil, elapsed)
-	if pyResult == nil {
-		pyResult = make(map[string]interface{})
-	}
-	OK(w, pyResult)
 }
 
 // toolOutputMaxBytes 是单条工具结果入库的上限。

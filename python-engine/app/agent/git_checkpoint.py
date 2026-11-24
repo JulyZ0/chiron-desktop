@@ -46,10 +46,13 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
-from typing import Literal
+from typing import Literal, ParamSpec, TypeVar, cast
 
 # ---------------------------------------------------------------------------
 # 排除与保护
@@ -321,25 +324,33 @@ def git_bin() -> str:
     return (os.environ.get(GIT_BIN_ENV) or "").strip() or "git"
 
 
-#: 这些变量会让 git 指向**另一个**仓库。必须清掉，否则在用户的
-#: ``GIT_DIR`` 环境里调用会静默操作到别处（跨仓库写入是最坏的一类 bug）。
-_UNSAFE_GIT_ENV = (
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+_GIT_INDEX_AND_IDENTITY_ENV = frozenset(
+    {
+        "GIT_INDEX_FILE",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    }
 )
 
 
-def _git_env(index_file: Path | None = None) -> dict[str, str]:
-    """构造 git 子进程环境：清掉指向别处的变量 + 显式身份。
+@dataclass(frozen=True)
+class _GitGuard:
+    top: Path
+    overrides: tuple[tuple[str, str], ...]
 
-    显式身份是必要的：既避免"用户没配 ``user.email`` 就失败"，
-    也避免把检查点提交记到用户自己的名下。
-    """
-    env = {k: v for k, v in os.environ.items() if k not in _UNSAFE_GIT_ENV}
+
+_ACTIVE_GIT_GUARD: ContextVar[_GitGuard | None] = ContextVar("chiron_git_guard", default=None)
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _git_env(index_file: Path | None = None) -> dict[str, str]:
+    """Build the shared minimal Git environment plus an isolated index and fixed identity."""
+    from app.tools.git_tools import _git_environment
+
+    env = _git_environment()
     if index_file is not None:
         env["GIT_INDEX_FILE"] = str(index_file)
     env.update(
@@ -348,12 +359,106 @@ def _git_env(index_file: Path | None = None) -> dict[str, str]:
             "GIT_AUTHOR_EMAIL": "chiron@local",
             "GIT_COMMITTER_NAME": "Chiron",
             "GIT_COMMITTER_EMAIL": "chiron@local",
-            # 检查点永远纯本地（D3：不推送）。任何凭据提示都只会卡住后台进程。
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_OPTIONAL_LOCKS": "0",
         }
     )
     return env
+
+
+def _git_argv(
+    root: Path,
+    *args: str,
+    overrides: tuple[tuple[str, str], ...] = (),
+) -> list[str]:
+    from app.tools.git_tools import _GIT_SAFE_CONFIG
+
+    cmd = [git_bin(), "--no-pager", "-C", str(root)]
+    # Keep internal/checkpoint calls aligned with the device gateway while the
+    # shared tool table is reused for all other settings.
+    safe_config = (*_GIT_SAFE_CONFIG, ("core.alternateRefsCommand", ""))
+    for key, value in (*safe_config, *overrides):
+        cmd.extend(("-c", f"{key}={value}"))
+    cmd.extend(args)
+    return cmd
+
+
+def _run_git_unchecked(
+    root: Path,
+    *args: str,
+    env: Mapping[str, str] | None = None,
+    timeout: int = 120,
+    stdin: bytes | None = None,
+    overrides: tuple[tuple[str, str], ...] = (),
+) -> subprocess.CompletedProcess[bytes]:
+    exe = git_bin()
+    cmd = _git_argv(root, *args, overrides=overrides)
+    child_env = _git_env()
+    if env is not None:
+        for key, value in env.items():
+            if key in _GIT_INDEX_AND_IDENTITY_ENV:
+                child_env[key] = str(value)
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            input=stdin,
+            stdin=subprocess.DEVNULL if stdin is None else None,
+            env=child_env,
+            timeout=timeout,
+            creationflags=creationflags,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise GitError(
+            f"未找到 git（git executable not found）: {exe!r}；"
+            f"检查点已跳过。请安装 git，或设置环境变量 {GIT_BIN_ENV} "
+            f"指向 git 可执行文件的绝对路径。"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(
+            f"git {' '.join(args)} timed out after {timeout}s "
+            f"(repository too large or locked by another process)"
+        ) from exc
+
+
+@contextmanager
+def _git_guard(root: Path) -> Iterator[None]:
+    """Share one fail-closed configuration probe across a checkpoint operation."""
+    active = _ACTIVE_GIT_GUARD.get()
+    if active is not None and _same_dir(active.top, root):
+        yield
+        return
+
+    from app.tools.git_tools import _config_overrides
+
+    probe = _run_git_unchecked(root, "config", "--includes", "--null", "--list", timeout=30)
+    if probe.returncode != 0:
+        detail = probe.stderr.decode("utf-8", errors="replace").strip()
+        raise GitError(f"git repository configuration probe failed: {detail or f'exit {probe.returncode}'}")
+    try:
+        overrides = _config_overrides(probe.stdout.decode("utf-8", errors="replace"))
+    except ValueError as exc:
+        raise GitError(f"git repository configuration probe failed: {exc}") from exc
+
+    top_probe = _run_git_unchecked(root, "rev-parse", "--show-toplevel", timeout=30, overrides=overrides)
+    top = Path(top_probe.stdout.decode("utf-8", errors="replace").strip()) if top_probe.returncode == 0 else root
+    if not top.is_absolute():
+        top = root
+    token = _ACTIVE_GIT_GUARD.set(_GitGuard(top=top, overrides=overrides))
+    try:
+        yield
+    finally:
+        _ACTIVE_GIT_GUARD.reset(token)
+
+
+def _guarded_git(func: Callable[_P, _R]) -> Callable[_P, _R]:
+    @wraps(func)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        raw_root = args[0] if args else kwargs["root"]
+        with _git_guard(Path(cast("Path", raw_root))):
+            return func(*args, **kwargs)
+
+    return wrapped
 
 
 def _run_git(
@@ -363,37 +468,19 @@ def _run_git(
     timeout: int = 120,
     stdin: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    """跑一条 git 命令，返回原始 bytes（不解码 —— 文件名与二进制内容都要保真）。"""
-    exe = git_bin()
-    cmd = [exe, "-C", str(root), *args]
-    # 后台打包运行时不能弹黑框；非 Windows 传 0 等价于不设。
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    try:
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            input=stdin,
-            env=dict(env) if env is not None else _git_env(),
-            timeout=timeout,
-            creationflags=creationflags,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        # ``subprocess`` 的原始异常是 ``[WinError 2] 系统找不到指定的文件``：
-        # 它既没说是"哪个东西"没找到，也没给出下一步。对用户而言这条链路
-        # 表现为"还原点一直是空的"，完全无法自助排查。
-        raise GitError(
-            f"未找到 git（git executable not found）: {exe!r}；"
-            f"检查点已跳过。请安装 git，或设置环境变量 {GIT_BIN_ENV} "
-            f"指向 git 可执行文件的绝对路径。"
-        ) from exc
-    except subprocess.TimeoutExpired as exc:
-        # 同上：``TimeoutExpired`` 不是 ``OSError``，直接抛出去会被上层归到
-        # "unknown" 错误码，前端就只能显示一个无法分类的原因。
-        raise GitError(
-            f"git {' '.join(args)} timed out after {timeout}s "
-            f"(repository too large or locked by another process)"
-        ) from exc
+    """Run Git with raw byte I/O after the shared repository configuration guard."""
+    active = _ACTIVE_GIT_GUARD.get()
+    if active is None or not _same_dir(active.top, root):
+        with _git_guard(root):
+            return _run_git(root, *args, env=env, timeout=timeout, stdin=stdin)
+    return _run_git_unchecked(
+        root,
+        *args,
+        env=env,
+        timeout=timeout,
+        stdin=stdin,
+        overrides=active.overrides,
+    )
 
 
 def _must(proc: subprocess.CompletedProcess[bytes], what: str) -> bytes:
@@ -468,6 +555,7 @@ class RepoLayout:
         return text[len(self.prefix):] if text.startswith(self.prefix) else text
 
 
+@_guarded_git
 def resolve_layout(root: Path) -> RepoLayout:
     """解析 ``root`` 所在的仓库布局；不是仓库时抛可行动的 ``GitError``。
 
@@ -745,6 +833,7 @@ def _oversized_paths(root: Path, limit: int) -> set[str]:
     return oversized
 
 
+@_guarded_git
 def snapshot(
     root: Path,
     *,
@@ -1050,6 +1139,7 @@ def _tree_diff(root: Path, base: str, target: str) -> list[tuple[str, str]]:
     return out
 
 
+@_guarded_git
 def diff(
     root: Path,
     *,
@@ -1227,6 +1317,7 @@ def _prune_empty_dirs(root: Path, paths: Iterable[str]) -> list[str]:
     return removed
 
 
+@_guarded_git
 def restore(
     root: Path,
     *,
@@ -1350,6 +1441,7 @@ def restore(
 # ---------------------------------------------------------------------------
 
 
+@_guarded_git
 def commit_tree(
     root: Path,
     *,
@@ -1386,6 +1478,7 @@ def checkpoint_ref_prefix(session_id: str) -> str:
     return f"refs/chiron/checkpoints/{session_id}/"
 
 
+@_guarded_git
 def list_checkpoint_refs(root: Path, session_id: str, *, index_file: Path | None = None) -> list[str]:
     """列出该会话**已存在**的检查点 ref 名（完整 refname）。
 
@@ -1453,6 +1546,7 @@ def checkpoint_ref(session_id: str, seq: int, kind: str) -> str:
     return f"refs/chiron/checkpoints/{session_id}/{seq:06d}-{kind}"
 
 
+@_guarded_git
 def write_ref(root: Path, ref: str, sha: str, *, index_file: Path | None = None) -> None:
     """CAS 写入 ref：旧值必须是"空"，因此**物理上不可能覆盖**已有检查点。
 
@@ -1463,6 +1557,7 @@ def write_ref(root: Path, ref: str, sha: str, *, index_file: Path | None = None)
     _must(proc, f"update-ref {ref}")
 
 
+@_guarded_git
 def read_ref(root: Path, ref: str, *, index_file: Path | None = None) -> str | None:
     """读 ref 指向的 sha；不存在返回 None（不抛异常 —— ref 缺失是**正常**的修复场景）。"""
     proc = _run_git(root, "rev-parse", "--verify", "--quiet", ref, env=_git_env(index_file))

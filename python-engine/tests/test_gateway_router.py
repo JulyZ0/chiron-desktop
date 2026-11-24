@@ -7,10 +7,13 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from app.gateway.cache import SemanticCache
 from app.gateway.provider import (
     ChatResponse,
     EmbeddingResponse,
@@ -221,3 +224,312 @@ class TestTokenQuotaGate:
             set_tool_context(user_id="")
         assert resp.error_code == "rate_limited"
         assert "user" in resp.message
+
+
+class _FakeRedis:
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.ttls: dict[str, int] = {}
+        self.now = 1000.0
+
+    async def get(self, key: str) -> str | None:
+        expires_at = self.ttls.get(key)
+        if expires_at is not None and self.now >= expires_at:
+            self.store.pop(key, None)
+            self.ttls.pop(key, None)
+            return None
+        return self.store.get(key)
+
+    async def set(self, key: str, value: str, ex: int | None = None) -> bool:
+        self.store[key] = value
+        if ex is not None:
+            self.ttls[key] = self.now + ex
+        return True
+
+    async def delete(self, key: str) -> int:
+        existed = self.store.pop(key, None) is not None
+        self.ttls.pop(key, None)
+        return int(existed)
+
+
+class _CacheProvider(FakeProvider):
+    def __init__(self, name: str = "fake") -> None:
+        super().__init__([])
+        self.name = name
+        self.calls = 0
+
+    async def chat_stream(self, messages, model, **kwargs):
+        self.calls += 1
+        yield ChatResponse(content=f"{self.name}-answer-{self.calls}", finish_reason="stop")
+
+    async def chat(self, messages, model, **kwargs):
+        self.calls += 1
+        return ChatResponse(content=f"{self.name}-answer-{self.calls}", finish_reason="stop")
+
+
+def _cache(redis: _FakeRedis, **kwargs: Any) -> SemanticCache:
+    async def embed(text: str) -> list[float]:
+        return [0.5] * 8
+
+    return SemanticCache(redis=redis, embed_fn=embed, **kwargs)
+
+
+@contextmanager
+def _runtime_scope(*, user_id: str = "user-a", tenant_id: int = 7, **extra: Any):
+    from app.tools.context import get_all, restore_context, set_tool_context
+
+    snapshot = get_all()
+    set_tool_context(user_id=user_id, tenant_id=tenant_id, **extra)
+    try:
+        yield
+    finally:
+        restore_context(snapshot)
+
+
+async def _invoke(router: GatewayRouter, *, stream: bool, **kwargs: Any) -> ChatResponse:
+    messages = [{"role": "user", "content": "Summarize this shared production request."}]
+    if not stream:
+        return await router.chat(messages, "fake-model", **kwargs)
+    chunks = [chunk async for chunk in router.chat_stream(messages, "fake-model", **kwargs)]
+    assert len(chunks) == 1
+    return chunks[0]
+
+
+class TestProductionCacheDomain:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_private_default_and_private_context_never_cache(self, stream: bool) -> None:
+        redis = _FakeRedis()
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(redis))
+
+        with _runtime_scope():
+            first = await _invoke(router, stream=stream)
+            second = await _invoke(router, stream=stream)
+        with _runtime_scope(session_visibility="private"):
+            third = await _invoke(router, stream=stream, private=False)
+            fourth = await _invoke(router, stream=stream, private=False)
+        with _runtime_scope(session_visibility="shared"):
+            fifth = await _invoke(router, stream=stream, private=True)
+            sixth = await _invoke(router, stream=stream, private=True)
+
+        answers = {first.content, second.content, third.content, fourth.content, fifth.content, sixth.content}
+        assert len(answers) == 6
+        assert provider.calls == 6
+        assert redis.store == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_shared_scope_hits_with_runtime_identity(self, stream: bool) -> None:
+        redis = _FakeRedis()
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(redis))
+
+        with _runtime_scope():
+            first = await _invoke(router, stream=stream, private=False)
+            second = await _invoke(router, stream=stream, private=False)
+
+        assert first.content == second.content == "fake-answer-1"
+        assert provider.calls == 1
+        assert len(redis.store) == 2
+        assert set(redis.ttls.values()) == {redis.now + 3600}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_shared_visibility_context_enables_cache(self, stream: bool) -> None:
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(_FakeRedis()))
+
+        with _runtime_scope(session_visibility="shared"):
+            first = await _invoke(router, stream=stream)
+            second = await _invoke(router, stream=stream)
+
+        assert first.content == second.content == "fake-answer-1"
+        assert provider.calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize(
+        ("user_id", "tenant_id"),
+        [("", 7), ("user-a", 0)],
+    )
+    async def test_incomplete_runtime_identity_fails_closed(
+        self, stream: bool, user_id: str, tenant_id: int
+    ) -> None:
+        redis = _FakeRedis()
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(redis))
+
+        with _runtime_scope(user_id=user_id, tenant_id=tenant_id):
+            first = await _invoke(router, stream=stream, private=False)
+            second = await _invoke(router, stream=stream, private=False)
+
+        assert first.content == "fake-answer-1"
+        assert second.content == "fake-answer-2"
+        assert provider.calls == 2
+        assert redis.store == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_cross_user_requests_do_not_hit(self, stream: bool) -> None:
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(_FakeRedis()))
+
+        with _runtime_scope(user_id="user-a"):
+            answer_a = await _invoke(router, stream=stream, private=False)
+        with _runtime_scope(user_id="user-b"):
+            answer_b = await _invoke(router, stream=stream, private=False)
+        with _runtime_scope(user_id="user-a"):
+            answer_a_again = await _invoke(router, stream=stream, private=False)
+
+        assert answer_a.content == answer_a_again.content == "fake-answer-1"
+        assert answer_b.content == "fake-answer-2"
+        assert provider.calls == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_final_provider_lineage_change_does_not_hit(self, stream: bool) -> None:
+        provider_a = _CacheProvider("fake-a")
+        provider_b = _CacheProvider("fake-b")
+        router = GatewayRouter(
+            {"fake-a": provider_a, "fake-b": provider_b}, cache=_cache(_FakeRedis())
+        )
+
+        with _runtime_scope():
+            answer_a = await _invoke(
+                router, stream=stream, private=False, provider_hint="fake-a"
+            )
+            answer_b = await _invoke(
+                router, stream=stream, private=False, provider_hint="fake-b"
+            )
+            answer_b_again = await _invoke(
+                router, stream=stream, private=False, provider_hint="fake-b"
+            )
+
+        assert answer_a.content == "fake-a-answer-1"
+        assert answer_b.content == answer_b_again.content == "fake-b-answer-1"
+        assert provider_a.calls == 1
+        assert provider_b.calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_catalog_revision_change_does_not_hit(self, stream: bool) -> None:
+        provider = _CacheProvider()
+        router = GatewayRouter(
+            {"fake": provider},
+            cache=_cache(_FakeRedis()),
+            provider_catalog=[{"id": "fake", "revision": "catalog-1"}],
+        )
+
+        with _runtime_scope():
+            first = await _invoke(router, stream=stream, private=False)
+            router._catalog["fake"]["revision"] = "catalog-2"
+            second = await _invoke(router, stream=stream, private=False)
+            third = await _invoke(router, stream=stream, private=False)
+
+        assert first.content == "fake-answer-1"
+        assert second.content == third.content == "fake-answer-2"
+        assert provider.calls == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_output_policy_change_does_not_hit(self, stream: bool) -> None:
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(_FakeRedis()))
+
+        with _runtime_scope():
+            first = await _invoke(router, stream=stream, private=False, max_tokens=32)
+            second = await _invoke(router, stream=stream, private=False, max_tokens=64)
+            third = await _invoke(router, stream=stream, private=False, max_tokens=64)
+
+        assert first.content == "fake-answer-1"
+        assert second.content == third.content == "fake-answer-2"
+        assert provider.calls == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_dropped_response_format_uses_effective_policy(self, stream: bool) -> None:
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(_FakeRedis()))
+
+        with _runtime_scope():
+            first = await _invoke(
+                router,
+                stream=stream,
+                private=False,
+                response_format={"type": "json_object"},
+            )
+            second = await _invoke(router, stream=stream, private=False)
+
+        assert first.content == second.content == "fake-answer-1"
+        assert provider.calls == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_caller_policy_digest_change_does_not_hit(self, stream: bool) -> None:
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(_FakeRedis()))
+
+        with _runtime_scope():
+            first = await _invoke(
+                router, stream=stream, private=False, policy_digest="policy-1"
+            )
+            second = await _invoke(
+                router, stream=stream, private=False, policy_digest="policy-2"
+            )
+            third = await _invoke(
+                router, stream=stream, private=False, policy_digest="policy-2"
+            )
+
+        assert first.content == "fake-answer-1"
+        assert second.content == third.content == "fake-answer-2"
+        assert provider.calls == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_router_cache_expires_after_configured_ttl(self, stream: bool) -> None:
+        redis = _FakeRedis()
+        provider = _CacheProvider()
+        router = GatewayRouter(
+            {"fake": provider}, cache=_cache(redis, l2_ttl=5, l3_ttl=5)
+        )
+
+        with _runtime_scope():
+            first = await _invoke(router, stream=stream, private=False)
+            assert set(redis.ttls.values()) == {redis.now + 5}
+
+            redis.now += 6
+            fresh_router = GatewayRouter(
+                {"fake": provider}, cache=_cache(redis, l2_ttl=5, l3_ttl=5)
+            )
+            second = await _invoke(fresh_router, stream=stream, private=False)
+
+        assert first.content == "fake-answer-1"
+        assert second.content == "fake-answer-2"
+        assert provider.calls == 2
+
+    @pytest.mark.asyncio
+    async def test_router_delete_uses_the_same_domain(self) -> None:
+        redis = _FakeRedis()
+        provider = _CacheProvider()
+        router = GatewayRouter({"fake": provider}, cache=_cache(redis))
+        messages = [{"role": "user", "content": "Delete this shared cached answer."}]
+
+        with _runtime_scope():
+            first = await router.chat(messages, "fake-model", private=False)
+            assert await router.delete_cache(messages, "fake-model", private=False) == 3
+            assert redis.store == {}
+            second = await router.chat(messages, "fake-model", private=False)
+
+        assert first.content == "fake-answer-1"
+        assert second.content == "fake-answer-2"
+        assert provider.calls == 2
+
+
+def test_cache_ttl_settings_are_configurable() -> None:
+    from app.config import Settings
+
+    settings = Settings(_env_file=None, cache_l2_ttl=120, cache_l3_ttl=30)
+
+    assert settings.cache_l2_ttl == 120
+    assert settings.cache_l3_ttl == 30

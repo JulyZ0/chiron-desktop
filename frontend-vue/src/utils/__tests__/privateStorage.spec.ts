@@ -18,6 +18,8 @@ describe('privateStorage（私有数据的本地隔离）', () => {
     localStorage.setItem('chiron:composer-history:v1:u1', '["hi"]')
     // 历史遗留的"无账号命名空间"数据也必须被清掉 —— 它正是越权的来源
     localStorage.setItem('chiron:composer-history:v1', '["legacy"]')
+    localStorage.setItem('chunk-upload:media::file:1:u1', 'upload-secret-id')
+    localStorage.setItem('chunk-upload:media::file:1', 'legacy-upload-id')
     localStorage.setItem('chiron-theme', 'dark')
     localStorage.setItem('user', '{}')
 
@@ -26,6 +28,8 @@ describe('privateStorage（私有数据的本地隔离）', () => {
     expect(localStorage.getItem('chat_sessions:u1')).toBeNull()
     expect(localStorage.getItem('chiron:composer-history:v1:u1')).toBeNull()
     expect(localStorage.getItem('chiron:composer-history:v1')).toBeNull()
+    expect(localStorage.getItem('chunk-upload:media::file:1:u1')).toBeNull()
+    expect(localStorage.getItem('chunk-upload:media::file:1')).toBeNull()
     // UI 偏好与登录态不属于"私有数据"，不在此模块职责内
     expect(localStorage.getItem('chiron-theme')).toBe('dark')
     expect(localStorage.getItem('user')).toBe('{}')

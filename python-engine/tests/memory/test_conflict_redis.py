@@ -50,11 +50,11 @@ class TestConflictRedisCrossReplica:
         # 副本 B 从未 register 过，仍能在列表里看到，并取到详情
         seen = await replica_b.get_pending_conflicts("t1", "u1")
         assert [c.conflict_id for c in seen] == ["c1"]
-        detail = await replica_b.get_conflict("c1")
+        detail = await replica_b.get_conflict("c1", "t1", "u1")
         assert detail is not None and detail.old_value == "上海"
 
         # 在 B 上裁决 → A 的列表也随之清空（共享同一份活数据）
-        ok, _ = await replica_b.resolve_conflict("c1", "use_new")
+        ok, _ = await replica_b.resolve_conflict("c1", "t1", "u1", "use_new")
         assert ok is True
         assert await replica_a.get_pending_conflicts("t1", "u1") == []
 
@@ -71,7 +71,7 @@ class TestConflictRedisTTL:
         redis.advance(PENDING_CONFIRMATION_TTL + 1)
 
         assert await cm.get_pending_conflicts("t1", "u1") == []
-        assert await cm.get_conflict("c1") is None
+        assert await cm.get_conflict("c1", "t1", "u1") is None
 
     async def test_not_expired_before_ttl(self):
         redis = FakeRedis()

@@ -48,6 +48,7 @@ describe('utils/uploader（分片上传 / 断点续传）', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     localStorage.clear()
+    localStorage.setItem('user', JSON.stringify({ id: 'u1' }))
     apiMocks.get.mockResolvedValue({ data: { data: { received_chunks: [] } } })
     apiMocks.post.mockImplementation((url?: string) => {
       if (url === '/v1/uploads') return Promise.resolve({ data: { data: { upload_id: 'u-1' } } })
@@ -83,7 +84,7 @@ describe('utils/uploader（分片上传 / 断点续传）', () => {
     })
     // 预置：这个文件已经建过会话，且服务端已收 0 与 1
     const f = makeFile('a.bin', 250, 111)
-    const fingerprint = `chunk-upload:generic::a.bin:250:111:100`
+    const fingerprint = `chunk-upload:generic::a.bin:250:111:100:u1`
     localStorage.setItem(fingerprint, 'u-1')
     apiMocks.get.mockResolvedValue({ data: { data: { received_chunks: [0, 1] } } })
 
@@ -95,6 +96,19 @@ describe('utils/uploader（分片上传 / 断点续传）', () => {
     expect(apiMocks.put.mock.calls[0]?.[0]).toBe('/v1/uploads/u-1/chunks/2')
     // 续传时**不该**再 create
     expect(apiMocks.post.mock.calls.filter(c => c[0] === '/v1/uploads')).toHaveLength(0)
+  })
+
+  it('★ 切换账号后不能复用上一个账号遗留的 upload_id', async () => {
+    const f = makeFile('same.bin', 50, 111)
+    const first = await createChunkUpload(f, { ...baseOpts, concurrency: 1 })
+    await first.done
+
+    localStorage.setItem('user', JSON.stringify({ id: 'u2' }))
+    const second = await createChunkUpload(f, { ...baseOpts, concurrency: 1 })
+    await second.done
+
+    expect(apiMocks.post.mock.calls.filter(c => c[0] === '/v1/uploads')).toHaveLength(2)
+    expect(apiMocks.get).not.toHaveBeenCalled()
   })
 
   it('★ 单片的失败会重试（前两次失败不该让整个上传失败）', async () => {

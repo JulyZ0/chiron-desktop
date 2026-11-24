@@ -195,19 +195,12 @@ jobs:
       # 拆成显式步骤而不是 `pnpm run build`：这样失败时报的是**哪一档**红了。
       - name: UI contracts
         run: npm run check:ui
-      - name: Typecheck (vue-tsc --noEmit)
-        # **允许**存量错误 `src/api/index.ts` 的 IsolationHelperResult 族（P2 跟踪）。
-        # 过滤只针对这一族：其余任何 `error TS` 都必须让门禁红 —— 否则 --noEmit 形同虚设。
-        # 注意不能直接用 `vue-tsc -b`（npm run build 里的那份）：它把错误写进 buildinfo，
-        # 第二次跑会"看起来通过"。
+      - name: Typecheck (uncached, no emit)
+        # 与桌面发布、ci-smoke 共用硬门禁：任何非零退出都失败，不按诊断文本放行。
+        # --force 避免 buildinfo 把旧错误缓存成绿色；故障注入测试先钉住退出码传播。
         run: |
-          out="$(npx vue-tsc --noEmit -p tsconfig.app.json 2>&1 || true)"
-          printf '%s\n' "$out"
-          remaining="$(printf '%s\n' "$out" | grep 'error TS' | grep -v 'IsolationHelperResult' || true)"
-          if [ -n "$remaining" ]; then
-            echo "::error::vue-tsc 报出非 IsolationHelperResult 的类型错误"
-            exit 1
-          fi
+          node --test scripts/ci-typecheck.test.cjs
+          bash scripts/ci-typecheck.sh
       - name: Unit tests (fast subset)
         # 快速档：只跑**被改动最频繁、且跑得快**的目录（api/composables/config/router/
         # stores/utils，约 53 个 spec）。它的作用是让"明显打断"在 1~2 分钟内红，

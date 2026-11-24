@@ -48,7 +48,7 @@ class TestConflictSharedStorage:
         conflict_id = (await b.list_conflicts_shared("t1", "u1"))[0]["conflict_id"]
 
         # 在 B 上裁决 —— B 本地没有这条，必须从共享存储取回
-        result = await b.resolve_conflict(conflict_id, "adopt_new")
+        result = await b.resolve_conflict(conflict_id, "t1", "u1", "adopt_new")
         assert result["status"] == "resolved"
         assert result["resolved_value"] == "北京"
 
@@ -64,7 +64,7 @@ class TestConflictSharedStorage:
         await _seed_conflict(a)
         conflict_id = (await b.list_conflicts_shared("t1", "u1"))[0]["conflict_id"]
 
-        assert await b.delete_conflict(conflict_id) is True
+        assert await b.delete_conflict(conflict_id, "t1", "u1") is True
         assert await a.list_conflicts_shared("t1", "u1") == []
 
     @pytest.mark.asyncio
@@ -86,6 +86,6 @@ class TestConflictSharedStorage:
         assert len(await svc.list_conflicts_shared("t1", "u1")) == 1
 
         conflict_id = svc.list_conflicts("t1", "u1")[0]["conflict_id"]
-        result = await svc.resolve_conflict(conflict_id, "keep_old")
+        result = await svc.resolve_conflict(conflict_id, "t1", "u1", "keep_old")
         assert result["resolved_value"] == "上海"
         assert svc.list_conflicts("t1", "u1") == []

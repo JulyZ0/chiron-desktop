@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -26,6 +27,7 @@ from app.agent.runtime import (
     AgentRuntime,
     ApprovalDecision,
     ApprovalTicket,
+    _approval_ticket_for,
     parse_approval_payload,
 )
 from app.agent.tool_policy import args_hash, tool_level
@@ -140,6 +142,21 @@ def fake_redis(monkeypatch: pytest.MonkeyPatch) -> _FakeRedis:
 
 
 @pytest.fixture(autouse=True)
+def broker_authorize(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """H10：edit 的参数变化必须重新经过 Broker；默认替身允许，供语义测试断言调用。"""
+    authorize = AsyncMock(
+        return_value={
+            "allowed": True,
+            "level": "write",
+            "requires_user_approval": True,
+            "requires_second_check": False,
+        }
+    )
+    monkeypatch.setattr("app.tools.broker.authorize", authorize)
+    return authorize
+
+
+@pytest.fixture(autouse=True)
 def _audit_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """审计落到 tmp，避免污染仓库 logs/；同时便于断言其内容。"""
     from app.agent import approval_audit
@@ -149,7 +166,17 @@ def _audit_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _task() -> SimpleNamespace:
-    return SimpleNamespace(id="turn_1")
+    return SimpleNamespace(
+        id="turn_1",
+        tenant_id=7,
+        user_id="user-1",
+        session_id="session-1",
+        workbench_context={
+            "project": "project-1",
+            "root_path": "workspace",
+            "project_locator": {"id": "project-1", "provider": "local", "root": "workspace"},
+        },
+    )
 
 
 def _call(arguments: dict[str, Any], name: str = "shell_exec") -> dict[str, Any]:
@@ -166,24 +193,25 @@ def _runtime() -> AgentRuntime:
     runtime = AgentRuntime.__new__(AgentRuntime)
     runtime._pending_approvals = {}  # noqa: SLF001
     runtime._reset_interaction_state()  # noqa: SLF001
+    runtime._current_mode = "ask"  # noqa: SLF001
     return runtime
 
 
 async def _prepare(
-    runtime: AgentRuntime, call: dict[str, Any], decision: ApprovalDecision, redis: _FakeRedis
+    runtime: AgentRuntime,
+    call: dict[str, Any],
+    decision: ApprovalDecision,
+    redis: _FakeRedis,
+    task: SimpleNamespace | None = None,
 ) -> None:
     """模拟"审批已发起"（票据在 Redis、future 待唤醒），再投递决策。"""
     import asyncio
 
+    task = task or _task()
     tc_id = call["id"]
     runtime._pending_approvals[tc_id] = asyncio.get_running_loop().create_future()
     await runtime._store_approval_ticket(
-        ApprovalTicket(
-            tool_call_id=tc_id,
-            tool_name=call["name"],
-            args_hash=args_hash(call["name"], json.loads(call["arguments"])),
-            turn_id="turn_1",
-        )
+        _approval_ticket_for(call, task, json.loads(call["arguments"]))
     )
     runtime._pending_approvals[tc_id].set_result(decision)
 
@@ -363,3 +391,231 @@ async def test_edit_ticket_is_rewritten_to_edited_arguments(
     ticket = ApprovalTicket.from_json(raw)
     assert ticket is not None
     assert ticket.args_hash == args_hash("shell_exec", {"cmd": "ls -la"})
+    assert ticket.caller_id == _approval_ticket_for(call, _task(), {"cmd": "ls"}).caller_id
+    assert ticket.resource_scope == _approval_ticket_for(call, _task(), {"cmd": "ls -la"}).resource_scope
+
+
+# ── H10：票据绑定与同等级 edit 重新授权 ────────────────────────────────
+
+
+def test_ticket_serializes_all_binding_fields() -> None:
+    call = _call({"path": "a.txt"}, name="delete_file")
+    ticket = _approval_ticket_for(call, _task(), {"path": "a.txt"})
+    parsed = ApprovalTicket.from_json(ticket.to_json())
+    assert parsed == ticket
+    assert parsed.caller_id
+    assert parsed.resource_scope
+
+
+@pytest.mark.parametrize("missing", ["caller_id", "resource_scope"])
+def test_unbound_legacy_ticket_is_rejected(missing: str) -> None:
+    """旧格式缺调用者/资源范围时不能因工具名与参数相同而复用。"""
+    call = _call({"path": "a.txt"}, name="delete_file")
+    payload = json.loads(_approval_ticket_for(call, _task(), {"path": "a.txt"}).to_json())
+    payload.pop(missing)
+    assert ApprovalTicket.from_json(json.dumps(payload)) is None
+
+
+async def test_same_level_edit_reauthorizes_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: _FakeRedis,
+    broker_authorize: AsyncMock,
+    _audit_dir: Path,
+) -> None:
+    """delete_file a→b 等级不变，也必须先把编辑后的完整参数交给 Broker。"""
+    broker_authorize.return_value = {
+        "allowed": True,
+        "level": "delete",
+        "requires_user_approval": True,
+        "requires_second_check": True,
+    }
+    executed: list[dict[str, Any]] = []
+    _capture_execution(monkeypatch, executed)
+    runtime = _runtime()
+    task = _task()
+    call = _call({"path": "a.txt"}, name="delete_file")
+    await _prepare(
+        runtime,
+        call,
+        ApprovalDecision(decision=DECISION_EDIT, arguments={"path": "b.txt"}),
+        fake_redis,
+        task,
+    )
+
+    result = await runtime._await_approval(call, task, timeout=1)
+
+    assert result.get("error") is None
+    assert executed == [{"path": "b.txt"}]
+    broker_authorize.assert_awaited_once()
+    authorized = broker_authorize.await_args
+    assert authorized.args == ("delete_file", {"path": "b.txt"})
+    assert authorized.kwargs["tenant_id"] == 7
+    assert authorized.kwargs["user_id"] == "user-1"
+    assert authorized.kwargs["session_id"] == "session-1"
+    assert authorized.kwargs["tool_call_id"] == "call_1"
+
+    from app.redis_keys import rkey
+
+    ticket = ApprovalTicket.from_json(fake_redis.store[rkey("approval_req:call_1")])
+    assert ticket is not None
+    assert ticket.args_hash == args_hash("delete_file", {"path": "b.txt"})
+    assert json.loads(ticket.resource_scope)["resources"] == {"path": "b.txt"}
+
+
+async def test_edit_cannot_execute_when_new_ticket_binding_cannot_be_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: _FakeRedis,
+    broker_authorize: AsyncMock,
+    _audit_dir: Path,
+) -> None:
+    broker_authorize.return_value = {
+        "allowed": True,
+        "level": "delete",
+        "requires_user_approval": True,
+        "requires_second_check": True,
+    }
+    executed: list[dict[str, Any]] = []
+    _capture_execution(monkeypatch, executed)
+    runtime = _runtime()
+    task = _task()
+    call = _call({"path": "a.txt"}, name="delete_file")
+    await _prepare(
+        runtime,
+        call,
+        ApprovalDecision(decision=DECISION_EDIT, arguments={"path": "b.txt"}),
+        fake_redis,
+        task,
+    )
+    monkeypatch.setattr(runtime, "_store_approval_ticket", AsyncMock(return_value=False))
+
+    result = await runtime._await_approval(call, task, timeout=1)
+
+    assert executed == []
+    assert "edited approval ticket rewrite failed" in result.get("error", "")
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        {"allowed": False, "reason": "target outside approved scope"},
+        RuntimeError("broker unavailable"),
+    ],
+)
+async def test_same_level_edit_fails_closed_without_fresh_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: _FakeRedis,
+    broker_authorize: AsyncMock,
+    outcome: object,
+    _audit_dir: Path,
+) -> None:
+    executed: list[dict[str, Any]] = []
+    _capture_execution(monkeypatch, executed)
+    runtime = _runtime()
+    task = _task()
+    call = _call({"path": "a.txt"}, name="delete_file")
+    if isinstance(outcome, Exception):
+        broker_authorize.side_effect = outcome
+    else:
+        broker_authorize.return_value = outcome
+    await _prepare(
+        runtime,
+        call,
+        ApprovalDecision(decision=DECISION_EDIT, arguments={"path": "b.txt"}),
+        fake_redis,
+        task,
+    )
+
+    result = await runtime._await_approval(call, task, timeout=1)
+
+    assert executed == []
+    assert "fresh Broker authorization" in result.get("error", "")
+    broker_authorize.assert_awaited_once()
+
+
+async def test_canonically_unchanged_edit_does_not_reauthorize(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: _FakeRedis,
+    broker_authorize: AsyncMock,
+    _audit_dir: Path,
+) -> None:
+    """键序/路径写法变化但规范化摘要相同，不是一次新的参数授权。"""
+    executed: list[dict[str, Any]] = []
+    _capture_execution(monkeypatch, executed)
+    runtime = _runtime()
+    task = _task()
+    call = _call({"path": "./a.txt", "content": "x"}, name="edit_file")
+    await _prepare(
+        runtime,
+        call,
+        ApprovalDecision(decision=DECISION_EDIT, arguments={"content": "x", "path": "a.txt"}),
+        fake_redis,
+        task,
+    )
+
+    result = await runtime._await_approval(call, task, timeout=1)
+
+    assert result.get("error") is None
+    assert executed == [{"content": "x", "path": "a.txt"}]
+    broker_authorize.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("user_id", "user-2", "caller mismatch"),
+        ("tenant_id", 8, "caller mismatch"),
+        ("session_id", "session-2", "resource scope mismatch"),
+        ("workbench_context", {"project": "project-2", "root_path": "other"}, "resource scope mismatch"),
+    ],
+)
+async def test_second_check_rejects_caller_or_resource_scope_mismatch(
+    fake_redis: _FakeRedis,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    runtime = _runtime()
+    task = _task()
+    call = _call({"path": "a.txt"}, name="delete_file")
+    await runtime._store_approval_ticket(_approval_ticket_for(call, task, {"path": "a.txt"}))
+    changed = SimpleNamespace(**vars(task))
+    setattr(changed, field, value)
+
+    failure = await runtime._second_check_approval(call, changed)
+
+    assert message in failure
+
+
+async def test_second_check_rejects_tool_and_same_level_argument_mismatch(fake_redis: _FakeRedis) -> None:
+    from app.redis_keys import rkey
+
+    runtime = _runtime()
+    task = _task()
+    original = _call({"path": "a.txt"}, name="delete_file")
+    ticket = _approval_ticket_for(original, task, {"path": "a.txt"})
+    payload = json.loads(ticket.to_json())
+    payload["tool_call_id"] = "another-call"
+    fake_redis.store[rkey("approval_req:call_1")] = json.dumps(payload)
+    assert "call id mismatch" in await runtime._second_check_approval(original, task)
+
+    await runtime._store_approval_ticket(ticket)
+    wrong_tool = _call({"path": "a.txt"}, name="forget")
+    assert "tool mismatch" in await runtime._second_check_approval(wrong_tool, task)
+
+    # 重新放票，模拟另一次同 id 审批；同等级改目标不能被原票复用。
+    await runtime._store_approval_ticket(_approval_ticket_for(original, task, {"path": "a.txt"}))
+    changed_args = _call({"path": "b.txt"}, name="delete_file")
+    assert "args mismatch" in await runtime._second_check_approval(changed_args, task)
+
+
+async def test_second_check_consumes_ticket_and_canonical_equivalence_passes(fake_redis: _FakeRedis) -> None:
+    runtime = _runtime()
+    task = _task()
+    original = _call({"path": "./a.txt", "content": "x"}, name="edit_file")
+    await runtime._store_approval_ticket(
+        _approval_ticket_for(original, task, {"path": "./a.txt", "content": "x"})
+    )
+    equivalent = _call({"content": "x", "path": "a.txt"}, name="edit_file")
+
+    assert await runtime._second_check_approval(equivalent, task) == ""
+    assert "no approval ticket" in await runtime._second_check_approval(equivalent, task)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any
 
@@ -11,8 +12,82 @@ from app.tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
+_GIT_SAFE_CONFIG: tuple[tuple[str, str], ...] = (
+    ("core.hooksPath", os.devnull),
+    ("core.fsmonitor", "false"),
+    ("core.pager", "cat"),
+    ("credential.helper", ""),
+    ("diff.external", ""),
+    ("commit.gpgSign", "false"),
+    ("tag.gpgSign", "false"),
+    ("log.showSignature", "false"),
+    ("gpg.program", ""),
+    ("core.sshCommand", ""),
+    ("core.gitProxy", ""),
+    ("core.askPass", ""),
+    ("protocol.allow", "never"),
+)
+_GIT_ENV_KEYS = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP"})
 
-async def _run_git(*args: str, timeout: int = 30) -> dict[str, Any]:
+
+def _git_environment() -> dict[str, str]:
+    from app.tools.sandbox import sandboxed_env
+
+    env = {key: value for key, value in sandboxed_env().items() if key in _GIT_ENV_KEYS}
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_ALLOW_PROTOCOL": "",
+            "GIT_PROTOCOL_FROM_USER": "0",
+            "LC_ALL": "C",
+            "LANG": "C",
+        }
+    )
+    return env
+
+
+def _config_overrides(config_stdout: str) -> tuple[tuple[str, str], ...]:
+    """Disable every repository-declared filter and text conversion command."""
+    filter_drivers: dict[str, None] = {}
+    diff_drivers: dict[str, None] = {}
+    for entry in config_stdout.split("\0"):
+        if not entry:
+            continue
+        key, separator, _value = entry.partition("\n")
+        if not separator or not key:
+            raise ValueError("malformed git configuration listing")
+        lowered = key.lower()
+        attribute = lowered.rsplit(".", 1)[-1]
+        if lowered.startswith("filter.") and attribute in {"clean", "smudge", "process"}:
+            driver = key[len("filter.") : -(len(attribute) + 1)]
+            if not driver:
+                raise ValueError("malformed git filter configuration")
+            filter_drivers[driver] = None
+        elif lowered.startswith("diff.") and attribute in {"textconv", "command"}:
+            driver = key[len("diff.") : -(len(attribute) + 1)]
+            if not driver:
+                raise ValueError("malformed git diff configuration")
+            diff_drivers[driver] = None
+
+    overrides: list[tuple[str, str]] = []
+    for driver in sorted(filter_drivers):
+        overrides.extend((f"filter.{driver}.{attribute}", "") for attribute in ("clean", "smudge", "process"))
+        overrides.append((f"filter.{driver}.required", "false"))
+    for driver in sorted(diff_drivers):
+        overrides.extend((f"diff.{driver}.{attribute}", "") for attribute in ("textconv", "command"))
+    return tuple(overrides)
+
+
+async def _run_git(
+    *args: str,
+    timeout: int = 30,
+    config_overrides: tuple[tuple[str, str], ...] = (),
+) -> dict[str, Any]:
     """Run a git command in the sandbox workspace and return stdout/stderr/exit_code.
 
     使用 sandboxed_env 清理环境变量，防止宿主密钥泄露给 git 子进程。
@@ -30,10 +105,13 @@ async def _run_git(*args: str, timeout: int = 30) -> dict[str, Any]:
         OUTCOME_TIMEOUT,
         record_execution,
     )
-    from app.tools.sandbox import isolation_exec_argv, sandboxed_env, workspace_dir
+    from app.tools.sandbox import isolation_exec_argv, workspace_dir
 
     started = time.monotonic()
-    cmd = ["git", *args]
+    cmd = ["git", "--no-pager"]
+    for key, value in (*_GIT_SAFE_CONFIG, *config_overrides):
+        cmd.extend(("-c", f"{key}={value}"))
+    cmd.extend(args)
     # 按隔离档位包装：git 能改工作区外的一切（`-C`、hooks、`core.pager`），
     # 不包装就等于给了一条绕过档位的执行入口。
     try:
@@ -47,13 +125,23 @@ async def _run_git(*args: str, timeout: int = 30) -> dict[str, Any]:
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         return {"error": f"isolation unavailable: {exc}"}
-    proc = await asyncio.create_subprocess_exec(
-        *exec_argv,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(workspace_dir()),
-        env=sandboxed_env(),
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *exec_argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(workspace_dir()),
+            env=_git_environment(),
+        )
+    except Exception as exc:  # noqa: BLE001 — 启动失败按探测失败处理，不继续执行
+        record_execution(
+            tool="git",
+            command=" ".join(cmd),
+            outcome=OUTCOME_ERROR,
+            reason=f"git process unavailable: {exc}",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"git process unavailable: {exc}"}
     # Windows：挂进 Job Object。git 会起 `git-remote-https`、编辑器、hook 等子树，
     # 墙钟 timeout 只能 kill 直接子进程 —— Chiron 退出时那些孙进程会成为孤儿。
     from app.isolation import COMMAND_LIMITS, attach_job
@@ -86,6 +174,23 @@ async def _run_git(*args: str, timeout: int = 30) -> dict[str, Any]:
     }
 
 
+async def _probe_git_config() -> tuple[tuple[tuple[str, str], ...], dict[str, Any] | None]:
+    result = await _run_git("config", "--includes", "--null", "--list")
+    if "error" in result or result.get("exit_code") != 0:
+        detail = result.get("stderr", "").strip() or result.get("error", "unknown git error")
+        error: dict[str, Any] = {"error": f"git repository configuration probe failed: {detail}"}
+        if "exit_code" in result:
+            error["exit_code"] = result["exit_code"]
+        return (), error
+    config_stdout = result.get("stdout")
+    if not isinstance(config_stdout, str):
+        return (), {"error": "git repository configuration probe failed: invalid git output"}
+    try:
+        return _config_overrides(config_stdout), None
+    except ValueError as exc:
+        return (), {"error": f"git repository configuration probe failed: {exc}"}
+
+
 async def _ensure_sandbox_repo() -> dict[str, Any] | None:
     """校验 git 仓库根没有**向上穿透**到工作根之外。
 
@@ -99,27 +204,27 @@ async def _ensure_sandbox_repo() -> dict[str, Any] | None:
 
     返回 None 表示通过；否则返回错误 dict。
     """
-    import os
-
     from app.tools.sandbox import project_root, workspace_dir
 
     ws = os.path.normpath(str(workspace_dir()))
     check = await _run_git("rev-parse", "--show-toplevel")
     if "error" in check:
-        # 非 git 仓库（或命令失败）→ 无穿透风险
-        return None
-    top = os.path.normpath(check["stdout"].strip())
-    if not top:
-        return None
+        return {"error": f"git repository probe failed: {check['error']}"}
+    if check.get("exit_code") != 0:
+        stderr = check.get("stderr", "").strip()
+        if check.get("exit_code") == 128 and "not a git repository" in stderr.lower():
+            return None
+        return {"error": f"git repository probe failed: {stderr or 'unknown git error'}"}
+    top = os.path.normpath(check.get("stdout", "").strip())
+    if not top or not os.path.isabs(top):
+        return {"error": "git repository probe failed: invalid repository root"}
     if top != ws:
         # 绑定项目时要求仓库根**恰为**项目根：项目根若落在 monorepo 子目录，top 会
         # 升到父层，git 操作将作用到整个仓库 —— 这是 D6「仅适配单仓库目录」要拒的。
         # 沙箱模式保留旧行为：agent 在 workspace 的子目录里自建仓库是合法的，
         # 需要拦的只是"向上穿透到 workspace 之外"。
         if project_root() is not None or not top.startswith(ws + os.sep):
-            return {
-                "error": f"git repository root does not match workspace: {top} != {ws}"
-            }
+            return {"error": f"git repository root does not match workspace: {top} != {ws}"}
     return None
 
 
@@ -134,7 +239,10 @@ async def _run_git_guarded(*args: str, timeout: int = 30) -> dict[str, Any]:
     guard = await _ensure_sandbox_repo()
     if guard:
         return guard
-    return await _run_git(*args, timeout=timeout)
+    overrides, probe_error = await _probe_git_config()
+    if probe_error:
+        return probe_error
+    return await _run_git(*args, timeout=timeout, config_overrides=overrides)
 
 
 async def git_status() -> dict[str, Any]:
@@ -163,7 +271,7 @@ async def git_status() -> dict[str, Any]:
 
 async def git_diff(staged: bool = False) -> dict[str, Any]:
     """Return diff of changes. If staged=True, shows staged changes."""
-    args = ["diff"]
+    args = ["diff", "--no-ext-diff", "--no-textconv"]
     if staged:
         args.append("--cached")
     result = await _run_git_guarded(*args)
@@ -185,9 +293,7 @@ async def git_log(limit: int = 10) -> dict[str, Any]:
     commits: list[dict[str, str]] = []
     for line in lines:
         parts = line.split(" ", 1)
-        commits.append(
-            {"hash": parts[0], "message": parts[1] if len(parts) > 1 else ""}
-        )
+        commits.append({"hash": parts[0], "message": parts[1] if len(parts) > 1 else ""})
     return {"exit_code": result["exit_code"], "count": len(commits), "commits": commits}
 
 

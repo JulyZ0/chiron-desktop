@@ -122,6 +122,7 @@ class RunCheckpoint(TypedDict, total=False):
     usage: dict[str, int]
     last_event_id: str
     instance_id: str
+    generation: int
     saved_at: str
     #: C1 批 3+：**重建 AgentTask 所需的最小元信息**（`llm_config` / `workbench_context` /
     #: `system_prompt` / `user_id` / `max_turns` …）。有了它，reconciler 才能自动续跑 ——
@@ -134,6 +135,24 @@ def _pool() -> Any:
     from app.db import get_pool
 
     return get_pool()
+
+
+def _generation_for(run_token: str, generation: int) -> int:
+    from app import run_registry
+
+    if generation > 0:
+        return generation
+    if not run_token:
+        return 0
+    current = run_registry.current_run_fence()
+    if current is not None and current.run_token == run_token:
+        return current.generation
+    fence = run_registry.resolve_run_fence(run_token)
+    return fence.generation if fence is not None else 0
+
+
+def _generation_sql() -> str:
+    return "COALESCE((checkpoint->>'generation')::int, 0)"
 
 
 def merge_turn_ids(
@@ -177,6 +196,7 @@ def build_snapshot(
     usage: dict[str, int] | None = None,
     last_event_id: str = "",
     instance_id: str = "",
+    generation: int = 0,
     task_meta: dict[str, Any] | None = None,
     max_tail_messages: int = SNAPSHOT_MAX_TAIL_MESSAGES,
     min_tail_messages: int = SNAPSHOT_MIN_TAIL_MESSAGES,
@@ -216,6 +236,7 @@ def build_snapshot(
         turn_ids_truncated=bool(turn_ids_truncated),
         last_event_id=last_event_id,
         instance_id=instance_id,
+        generation=generation,
         saved_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         task_meta=dict(task_meta or {}),
     )
@@ -228,6 +249,7 @@ async def save(
     checkpoint: RunCheckpoint,
     run_token: str = "",
     instance_id: str = "",
+    generation: int = 0,
 ) -> bool:
     """回合末落盘（**异步、失败只降级恢复粒度**）。
 
@@ -242,6 +264,13 @@ async def save(
 
     payload = json.dumps(checkpoint, ensure_ascii=False)
     now_token = run_token or uuid.uuid4().hex
+    now_generation = _generation_for(run_token, generation)
+    if run_token and now_generation < 1:
+        return False
+    if run_token:
+        checkpoint = dict(checkpoint)
+        checkpoint["generation"] = now_generation
+        payload = json.dumps(checkpoint, ensure_ascii=False)
     try:
         pool = _pool()
         if pool is None:
@@ -259,6 +288,7 @@ async def save(
              WHERE session_id = $1
                AND ($2 = 0 OR tenant_id = $2)
                AND status IN ('running', 'checkpointed', 'resuming')
+               AND ($5 = '' OR (run_token = $5 AND COALESCE((checkpoint->>'generation')::int, 0) = $7))
             """,
             session_id,
             to_tenant_int(tenant_id),
@@ -266,9 +296,12 @@ async def save(
             str(checkpoint.get("turn_id", "") or ""),
             now_token,
             instance_id,
+            now_generation,
         )
         if _rowcount(updated) > 0:
             return True
+        if run_token:
+            return False
 
         await pool.execute(
             """
@@ -335,6 +368,7 @@ async def mark(
     session_id: str,
     status: str,
     run_token: str = "",
+    generation: int = 0,
 ) -> bool:
     """迁移状态（`completed` / `failed` / `cancelled` / `abandoned` …）。
 
@@ -344,10 +378,14 @@ async def mark(
     新 run 接管（save 会把行上的 token 换成新 run 的），带旧 token 的 UPDATE 必须
     0 行命中 —— 否则旧 run 的迟到收尾会把**正在运行的新 run** 标成终态、
     释放唯一索引，等于第三个 run 也能进来（双 runtime 竞态）。
-    reconciler/abandoned 等"旁观者"路径不带 token，保持原有语义。
+    新 run 必须携带 generation；只有 migration 前的 generation=0 行才接受未绑定
+    generation 的旧 token，且条件仍要求 token 与 generation=0 同时匹配。
     """
     if not session_id:
         return False
+    if generation < 0:
+        return False
+    now_generation = _generation_for(run_token, generation)
     try:
         pool = _pool()
         if pool is None:
@@ -357,13 +395,14 @@ async def mark(
             UPDATE agent_runs
                SET status = $3, updated_at = now()
              WHERE session_id = $1 AND ($2 = 0 OR tenant_id = $2)
-               AND ($4 = '' OR run_token = $4)
+               AND ($4 = '' OR (run_token = $4 AND COALESCE((checkpoint->>'generation')::int, 0) = $5))
                AND status IN ('running', 'checkpointed', 'resuming')
             """,
             session_id,
             to_tenant_int(tenant_id),
             status,
             run_token or "",
+            now_generation,
         )
         return _rowcount(result) > 0
     except Exception as exc:  # noqa: BLE001
@@ -376,6 +415,7 @@ async def claim(
     tenant_id: int,
     session_id: str,
     expected_run_token: str,
+    expected_generation: int = 0,
     new_run_token: str,
 ) -> bool:
     """**原子抢占**一个僵尸 run（C1 批 3+ 的接管 CAS）。返回是否抢到。
@@ -388,8 +428,11 @@ async def claim(
     "同一会话出现两行活跃"，而接管是**同一行改状态**，索引不参与 —— 所以这里用条件更新达到
     同一目的，语义更直接。）
     """
-    if not session_id or not new_run_token:
+    if not session_id or not expected_run_token or not new_run_token:
         return False
+    if expected_generation < 0:
+        return False
+    new_generation = expected_generation + 1
     try:
         pool = _pool()
         if pool is None:
@@ -397,21 +440,73 @@ async def claim(
         result = await pool.execute(
             """
             UPDATE agent_runs
-               SET status = $4, run_token = $5, updated_at = now()
+               SET status = $5,
+                   run_token = $6,
+                   checkpoint = jsonb_set(
+                       COALESCE(checkpoint, '{}'::jsonb), '{generation}', to_jsonb($7::int), true
+                   ),
+                   updated_at = now()
              WHERE session_id = $1
                AND ($2 = 0 OR tenant_id = $2)
                AND status IN ('running', 'checkpointed')
-               AND ($3 = '' OR run_token = $3)
+               AND run_token = $3
+               AND COALESCE((checkpoint->>'generation')::int, 0) = $4
             """,
             session_id,
             to_tenant_int(tenant_id),
-            expected_run_token or "",
+            expected_run_token,
+            expected_generation,
             STATUS_RESUMING,
             new_run_token,
+            new_generation,
         )
-        return _rowcount(result) > 0
+        if _rowcount(result) < 1:
+            return False
+        from app import run_registry
+
+        run_registry.bind_run_fence(new_run_token, new_generation)
+        return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("checkpoint claim failed (session=%s): %s", session_id, exc)
+        return False
+
+
+async def claim_new(
+    *, tenant_id: int, session_id: str, run_token: str, generation: int
+) -> bool:
+    """Atomically create the initial ownership row for a fenced worker."""
+    if not session_id or not run_token or generation < 1:
+        return False
+    try:
+        pool = _pool()
+        if pool is None:
+            return False
+        result = await pool.execute(
+            """
+            INSERT INTO agent_runs
+                (id, tenant_id, session_id, run_token, status, checkpoint,
+                 instance_id, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, 'running', jsonb_build_object('generation', $5::int),
+                    NULL, now(), now())
+            ON CONFLICT (session_id) WHERE status IN ('running', 'checkpointed', 'resuming')
+            DO UPDATE SET run_token = agent_runs.run_token, updated_at = agent_runs.updated_at
+             WHERE agent_runs.run_token = $4
+               AND COALESCE((agent_runs.checkpoint->>'generation')::int, 0) = $5
+            """,
+            uuid.uuid4().hex,
+            to_tenant_int(tenant_id),
+            session_id,
+            run_token,
+            generation,
+        )
+        if _rowcount(result) < 1:
+            return False
+        from app import run_registry
+
+        run_registry.bind_run_fence(run_token, generation)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("checkpoint initial claim failed (session=%s): %s", session_id, exc)
         return False
 
 
@@ -485,7 +580,8 @@ async def load_awaiting(
             return None
         row = await pool.fetchrow(
             """
-            SELECT checkpoint, run_token
+            SELECT checkpoint, run_token,
+                   COALESCE((checkpoint->>'generation')::int, 0) AS generation
               FROM agent_runs
              WHERE session_id = $1 AND ($2 = 0 OR tenant_id = $2)
                AND status = 'awaiting_input'
@@ -501,14 +597,27 @@ async def load_awaiting(
         parsed = json.loads(raw) if isinstance(raw, str) else dict(raw)
         if not isinstance(parsed, dict):
             return None
-        return {"checkpoint": cast(RunCheckpoint, parsed), "run_token": str(row["run_token"] or "")}
+        return {
+            "checkpoint": cast(RunCheckpoint, parsed),
+            "run_token": str(row["run_token"] or ""),
+            "generation": int(
+                row.get("generation")
+                if row.get("generation") is not None
+                else parsed.get("generation") or 0
+            ),
+        }
     except Exception as exc:  # noqa: BLE001
         logger.warning("awaiting-input load failed (session=%s): %s", session_id, exc)
         return None
 
 
 async def claim_awaiting(
-    *, tenant_id: int, session_id: str, new_run_token: str
+    *,
+    tenant_id: int,
+    session_id: str,
+    expected_run_token: str = "",
+    expected_generation: int = 0,
+    new_run_token: str,
 ) -> bool:
     """把挂起的 run **交还给即将续跑的这一轮**（`awaiting_input → resuming`）。
 
@@ -520,8 +629,9 @@ async def claim_awaiting(
     `ux_agent_runs_session_active` ⇒ 抛异常 ⇒ 返回 False ⇒ 调用方按"没能续跑"走普通路径。
     也就是说：**宁可重来一遍上下文，也不会让两个 run 共用一份挂起现场。**
     """
-    if not session_id or not new_run_token:
+    if not session_id or not expected_run_token or not new_run_token or expected_generation < 0:
         return False
+    new_generation = expected_generation + 1
     try:
         pool = _pool()
         if pool is None:
@@ -529,22 +639,36 @@ async def claim_awaiting(
         result = await pool.execute(
             """
             UPDATE agent_runs
-               SET status = 'resuming', run_token = $3, updated_at = now()
+               SET status = 'resuming', run_token = $5,
+                   checkpoint = jsonb_set(
+                       COALESCE(checkpoint, '{}'::jsonb), '{generation}', to_jsonb($6::int), true
+                   ),
+                   updated_at = now()
              WHERE session_id = $1 AND ($2 = 0 OR tenant_id = $2)
                AND status = 'awaiting_input'
+               AND run_token = $3
+               AND COALESCE((checkpoint->>'generation')::int, 0) = $4
             """,
             session_id,
             to_tenant_int(tenant_id),
+            expected_run_token,
+            expected_generation,
             new_run_token,
+            new_generation,
         )
-        return _rowcount(result) > 0
+        if _rowcount(result) < 1:
+            return False
+        from app import run_registry
+
+        run_registry.bind_run_fence(new_run_token, new_generation)
+        return True
     except Exception as exc:  # noqa: BLE001 — 唯一索引冲突是**预期**结果，不是故障
         logger.info("awaiting-input claim rejected (session=%s): %s", session_id, str(exc)[:160])
         return False
 
 
 async def release_awaiting(
-    *, tenant_id: int, session_id: str, run_token: str = ""
+    *, tenant_id: int, session_id: str, run_token: str = "", generation: int = 0
 ) -> bool:
     """M7：把挂起现场**作废**（`awaiting_input → abandoned`）—— 读完之后唯一的其他出路。
 
@@ -554,6 +678,9 @@ async def release_awaiting(
     的同一原则。
     """
     if not session_id:
+        return False
+    now_generation = _generation_for(run_token, generation)
+    if run_token and now_generation < 1:
         return False
     try:
         pool = _pool()
@@ -565,11 +692,12 @@ async def release_awaiting(
                SET status = 'abandoned', updated_at = now()
              WHERE session_id = $1 AND ($2 = 0 OR tenant_id = $2)
                AND status = 'awaiting_input'
-               AND ($3 = '' OR run_token = $3)
+               AND ($3 = '' OR (run_token = $3 AND COALESCE((checkpoint->>'generation')::int, 0) = $4))
             """,
             session_id,
             to_tenant_int(tenant_id),
             run_token or "",
+            now_generation,
         )
         return _rowcount(result) > 0
     except Exception as exc:  # noqa: BLE001
@@ -702,6 +830,9 @@ def resume_window(checkpoint: RunCheckpoint) -> str:
 def _rowcount(result: Any) -> int:
     """从 asyncpg 的 `UPDATE n` 状态串里取行数（统一客户端也返回同一形状）。"""
     text = str(result or "")
+    if text.startswith("INSERT "):
+        parts = text.split()
+        return int(parts[-1]) if len(parts) >= 3 else 0
     if text.startswith("UPDATE "):
         try:
             return int(text.split(" ", 1)[1])

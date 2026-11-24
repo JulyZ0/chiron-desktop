@@ -32,6 +32,7 @@ import logging
 import os
 import socket
 import time
+import threading
 import uuid
 from typing import Any
 
@@ -52,16 +53,58 @@ OWNER_HEARTBEAT_SECONDS = 600
 #: 回执 TTL：网关只等几秒；留一点余量给网络往返，避免键泄漏。
 ACK_TTL_SECONDS = 120
 
+_OWNED: dict[str, tuple[str, int]] = {}
+_OWNED_LOCK = threading.Lock()
+
+_CLAIM_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if cur then
+  local ok, data = pcall(cjson.decode, cur)
+  if not ok or type(data) ~= 'table' or data['token'] ~= ARGV[3]
+     or data['generation'] ~= tonumber(ARGV[4]) then
+    return 0
+  end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
+_PUBLISH_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if not cur then return 0 end
+local ok, data = pcall(cjson.decode, cur)
+if not ok or type(data) ~= 'table' or data['token'] ~= ARGV[3]
+   or data['generation'] ~= tonumber(ARGV[4]) then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
 _RELEASE_LUA = """
 local cur = redis.call('GET', KEYS[1])
 if not cur then
   return 0
 end
 local ok, data = pcall(cjson.decode, cur)
-if ok and data['token'] == ARGV[1] then
+if ok and type(data) == 'table' and data['token'] == ARGV[1]
+   and data['generation'] == tonumber(ARGV[2]) then
   return redis.call('DEL', KEYS[1])
 end
 return 0
+"""
+
+_ACK_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if not cur then return 0 end
+local ok, data = pcall(cjson.decode, cur)
+if not ok or type(data) ~= 'table' or data['token'] ~= ARGV[1]
+   or data['generation'] ~= tonumber(ARGV[2]) then
+  return 0
+end
+redis.call('LPUSH', KEYS[2], '1')
+redis.call('EXPIRE', KEYS[2], ARGV[3])
+return 1
 """
 
 
@@ -117,13 +160,16 @@ def owner_ttl() -> int:
     return value if value > 0 else DEFAULT_OWNER_TTL
 
 
-def _payload(*, run_id: str, token: str, session_id: str, tenant_id: int) -> str:
+def _payload(
+    *, run_id: str, token: str, generation: int, session_id: str, tenant_id: int
+) -> str:
     from app.config import settings
 
     return json.dumps({
         "instance_id": cached_instance_id(),
         "url": getattr(settings, "engine_advertise_url", "") or "",
         "token": token,
+        "generation": generation,
         # 用 run_id 自身作为"内容指纹"：归属键本来就按 run 唯一，这里额外带上便于排查。
         "run_id": run_id,
         "session_id": session_id,
@@ -144,37 +190,103 @@ async def get_owner_redis() -> Any:
         return None
 
 
+async def claim_owner(
+    redis: Any,
+    run_id: str,
+    *,
+    token: str,
+    generation: int,
+    session_id: str = "",
+    tenant_id: int = 0,
+) -> bool:
+    """Atomically claim a missing owner or refresh the identical fence."""
+    if redis is None or not run_id or not token or generation < 1:
+        return False
+    try:
+        result = await redis.eval(
+            _CLAIM_LUA,
+            1,
+            owner_key(run_id),
+            _payload(
+                run_id=run_id,
+                token=token,
+                generation=generation,
+                session_id=session_id,
+                tenant_id=tenant_id,
+            ),
+            owner_ttl(),
+            token,
+            generation,
+        )
+        if int(result) != 1:
+            return False
+        with _OWNED_LOCK:
+            _OWNED[run_id] = (token, generation)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("subagent affinity claim failed: run=%s err=%s", run_id, str(exc)[:160])
+        return False
+
+
 async def publish_owner(
     redis: Any,
     run_id: str,
     *,
     token: str,
+    generation: int = 1,
     session_id: str = "",
     tenant_id: int = 0,
 ) -> bool:
-    """写入（或续期）一次作业归属。返回是否成功。"""
-    if redis is None or not run_id:
+    """写入（或续期）一次作业归属；陈旧 token/generation 不得覆盖。"""
+    if redis is None or not run_id or not token or generation < 1:
         return False
     try:
-        await redis.set(
+        result = await redis.eval(
+            _PUBLISH_LUA,
+            1,
             owner_key(run_id),
-            _payload(run_id=run_id, token=token, session_id=session_id, tenant_id=tenant_id),
-            ex=owner_ttl(),
+            _payload(
+                run_id=run_id,
+                token=token,
+                generation=generation,
+                session_id=session_id,
+                tenant_id=tenant_id,
+            ),
+            owner_ttl(),
+            token,
+            generation,
         )
+        if int(result) != 1:
+            with _OWNED_LOCK:
+                if _OWNED.get(run_id) == (token, generation):
+                    _OWNED.pop(run_id, None)
+            return False
+        with _OWNED_LOCK:
+            _OWNED[run_id] = (token, generation)
         return True
     except Exception as exc:  # noqa: BLE001 - 归属写入失败不该影响子 Agent
         logger.warning("subagent affinity publish failed: run=%s err=%s", run_id, str(exc)[:160])
         return False
 
 
-async def release_owner(redis: Any, run_id: str, token: str = "") -> None:
-    """注销归属（带 token 校验：迟到的清理不会删掉同 run 的新登记）。"""
-    if redis is None or not run_id:
-        return
+async def release_owner(
+    redis: Any, run_id: str, token: str = "", generation: int = 0
+) -> bool:
+    """注销归属（仅 token+generation 完全匹配）。"""
+    if redis is None or not run_id or not token or generation < 1:
+        return False
     try:
-        await redis.eval(_RELEASE_LUA, 1, owner_key(run_id), token)
+        result = await redis.eval(
+            _RELEASE_LUA, 1, owner_key(run_id), token, generation
+        )
+        if int(result) == 1:
+            with _OWNED_LOCK:
+                if _OWNED.get(run_id) == (token, generation):
+                    _OWNED.pop(run_id, None)
+        return int(result) == 1
     except Exception as exc:  # noqa: BLE001
         logger.debug("subagent affinity release failed: run=%s err=%s", run_id, str(exc)[:160])
+        return False
 
 
 async def owner_of(redis: Any, run_id: str) -> dict[str, Any] | None:
@@ -195,7 +307,9 @@ async def owner_of(redis: Any, run_id: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-async def ack_cancel(redis: Any, run_id: str) -> bool:
+async def ack_cancel(
+    redis: Any, run_id: str, token: str = "", generation: int = 0
+) -> bool:
     """写下"本实例认领并已发出取消"的回执（网关 BLPOP 取走）。
 
     这是网关区分"真取消"与"广播无人应答"的**唯一**依据 —— 没有它，取消只能在
@@ -203,10 +317,23 @@ async def ack_cancel(redis: Any, run_id: str) -> bool:
     """
     if redis is None or not run_id:
         return False
+    if not token or generation < 1:
+        with _OWNED_LOCK:
+            fence = _OWNED.get(run_id)
+        if fence is None:
+            return False
+        token, generation = fence
     try:
-        await redis.lpush(ack_key(run_id), "1")
-        await redis.expire(ack_key(run_id), ACK_TTL_SECONDS)
-        return True
+        result = await redis.eval(
+            _ACK_LUA,
+            2,
+            owner_key(run_id),
+            ack_key(run_id),
+            token,
+            generation,
+            ACK_TTL_SECONDS,
+        )
+        return int(result) == 1
     except Exception as exc:  # noqa: BLE001 - 回执失败只影响网关的判定精度
         logger.warning("subagent cancel ack failed: run=%s err=%s", run_id, str(exc)[:160])
         return False
@@ -233,14 +360,17 @@ class OwnerLease:
         tenant_id: int = 0,
         redis: Any = None,
         ttl_seconds: int | None = None,
+        generation: int = 1,
     ) -> None:
         self._run_id = run_id
         self._session_id = session_id
         self._tenant_id = tenant_id
         self._redis = redis
         self._token = uuid.uuid4().hex
+        self._generation = generation
         self._ttl = ttl_seconds
         self._task: asyncio.Task[Any] | None = None
+        self._owned = False
 
     @property
     def enabled(self) -> bool:
@@ -252,13 +382,15 @@ class OwnerLease:
             return False
         if self._redis is None:
             self._redis = await get_owner_redis()
-        ok = await publish_owner(
+        ok = await claim_owner(
             self._redis,
             self._run_id,
             token=self._token,
+            generation=self._generation,
             session_id=self._session_id,
             tenant_id=self._tenant_id,
         )
+        self._owned = ok
         if ok and self._task is None:
             self._task = asyncio.create_task(self._loop())
         return ok
@@ -274,7 +406,11 @@ class OwnerLease:
             except Exception:  # noqa: BLE001 - 续期循环的异常不该影响收尾
                 pass
             self._task = None
-        await release_owner(self._redis, self._run_id, self._token)
+        if self._owned:
+            await release_owner(
+                self._redis, self._run_id, self._token, self._generation
+            )
+            self._owned = False
 
     async def _loop(self) -> None:
         try:
@@ -282,13 +418,16 @@ class OwnerLease:
                 await asyncio.sleep(OWNER_HEARTBEAT_SECONDS)
                 if self._redis is None:
                     self._redis = await get_owner_redis()
-                await publish_owner(
+                if not await publish_owner(
                     self._redis,
                     self._run_id,
                     token=self._token,
+                    generation=self._generation,
                     session_id=self._session_id,
                     tenant_id=self._tenant_id,
-                )
+                ):
+                    self._owned = False
+                    return
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - 续期失败不阻断 run
@@ -309,10 +448,13 @@ async def release_owners(run_ids: list[str]) -> int:
         return 0
     released = 0
     for run_id in run_ids:
+        with _OWNED_LOCK:
+            fence = _OWNED.get(run_id)
+        if fence is None:
+            continue
         try:
-            # 关机路径不校验 token（进程要走了，键留着只会误导网关）
-            await redis.delete(owner_key(run_id))
-            released += 1
+            if await release_owner(redis, run_id, fence[0], fence[1]):
+                released += 1
         except Exception as exc:  # noqa: BLE001
             logger.debug("subagent affinity release-all failed: run=%s err=%s",
                          run_id, str(exc)[:160])

@@ -1,24 +1,55 @@
-"""MCP Client — connects to MCP servers over stdio, discovers and calls tools.
-
-Mirrors Go internal/mcp/client.go with multi-server support.
-"""
+"""Multi-server MCP client for stdio and HTTP SSE transports."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import ipaddress
 import json
 import logging
 import socket
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, TypeGuard, cast
 
 import httpx
 
-# MCP protocol version
 MCP_PROTOCOL_VERSION = "2025-03-26"
+SUPPORTED_PROTOCOL_VERSIONS = (MCP_PROTOCOL_VERSION, "2024-11-05")
+MCP_REQUEST_TIMEOUT = 30.0
+MCP_CANCEL_TIMEOUT = 1.0
+RequestId = int | str
+MessageHandler = Callable[[dict[str, Any]], Any]
 
 logger = logging.getLogger(__name__)
+
+
+class MCPProtocolError(RuntimeError):
+    """The peer violated the JSON-RPC/MCP message contract."""
+
+
+class MCPError(RuntimeError):
+    """A JSON-RPC error response with its wire identity preserved."""
+
+    def __init__(self, error: dict[str, Any], request_id: RequestId):
+        self.code = error.get("code")
+        self.data = error.get("data")
+        self.request_id = request_id
+        super().__init__(f"MCP error {self.code}: {error.get('message', 'unknown')}")
+
+
+class MCPRequestCancelledError(RuntimeError):
+    """The MCP server cancelled a pending client request."""
+
+
+def _valid_request_id(value: Any) -> TypeGuard[RequestId]:
+    return type(value) in (int, str)
+
+
+def _result_dict(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise MCPProtocolError("MCP response result must be an object")
+    return value
 
 
 def _is_private_ip(host: str) -> bool:
@@ -54,30 +85,16 @@ class ServerDef:
     env: dict[str, str] = field(default_factory=dict)
     transport: str = "stdio"  # "stdio" | "http_sse"
     url: str = ""  # HTTP SSE endpoint URL (used when transport="http_sse")
-    #: 该 server 是否**只提供只读操作**。引擎只直连 read_only 的 server（见 _connect_server 的
-    #: 连接守卫）：连接凭据（env / url）会留在引擎进程里，而那正是 agent 能读到的地方。
-    #: 未声明默认 False —— fail-closed：宁可工具不可用，也不给引擎高权限凭据。
+    #: Engine-direct connections require an explicit read-only declaration.
     read_only: bool = False
-    #: 拒绝装载的工具（**服务器本地名**，即 tools/list 返回的 name）。
-    #: 用于剔除出站写操作 —— 典型是 XERJ 的 `field_report` / `corpus_feedback`：
-    #: 它们 `confirm` 默认 true，省略参数就会把内容发往 xerj.org。只读插件不该持有。
-    #: 在内置清单里声明（app/plugins/builtin.py），注册阶段**根本不注册**。
+    #: Server-local tool names excluded at both registration and call time.
     deny_tools: frozenset[str] = frozenset()
-    #: 该命令是否来自**部署者受信的内置清单**（app/plugins/builtin.py）。
-    #: 为 True 时跳过用户级 `PLUGIN_COMMAND_ALLOWLIST`（内置命令由清单自身约束），
-    #: 但**仍**要求 command 是裸 basename / 绝对路径（复用 `_command_path_ok`）。
+    #: Trusted built-ins skip the user command allowlist, not path validation.
     builtin: bool = False
 
 
 def assert_server_connectable(server: ServerDef, *, role: str = "engine") -> None:
-    """直连守卫：**引擎**只允许直连 **read_only** 的 MCP server（见 ``_connect_server``）。
-
-    ``role="broker"``（独立 MCP broker 进程）是唯一被允许连危险 server 的角色 —— 它的凭据与
-    执行面都与引擎隔离，且执行前仍要向服务端（Go 的 Tool Broker）要授权：判定权威在服务端，
-    broker 只负责"用凭据执行"，两者不在同一个信任域。
-
-    抽成模块级函数是为了能被直接单测 —— 这条边界值得有独立断言。
-    """
+    """Only the isolated broker role may connect directly to a non-read-only server."""
     if role == "broker" or server.read_only:
         return
     raise PermissionError(
@@ -96,40 +113,24 @@ class MCPTool:
     input_schema: dict[str, Any]
     server_name: str
     local_name: str  # Original tool name on the server
-    #: 服务器在 `tools/list` 里声明的 annotations（MCP 规范）：
-    #: `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint`。
-    #: 保留原始字典而不是拆成字段 —— 规范还在演进，丢掉未知键就无法在调用阶段
-    #: 做新增维度的判定。
+    #: Raw MCP annotations are retained so call-time policy can inspect every hint.
     annotations: dict[str, Any] = field(default_factory=dict)
 
 
 def is_tool_denied(server: ServerDef, local_name: str) -> bool:
-    """该工具是否被 `deny_tools` 策略拒绝。**注册与调用两处共用这一个判定**。
-
-    为什么要抽出来：如果注册阶段按一套规则过滤、调用阶段另写一套，两者迟早漂移，
-    而漂移的表现是"看起来注册了却调不通"或更糟的"看起来拦了却调得通"。规则只能
-    有**一处**事实来源。
-
-    deny 匹配要容忍两种写法：服务器可能返回裸名（`field_report`），也可能自带
-    命名空间前缀（XERJ 返回的是 `xerj_field_report`）。只按裸名匹配会漏掉后者。
-    """
+    """Match deny rules against both bare and server-prefixed local names."""
     prefix = f"{server.name}_"
     bare = local_name[len(prefix) :] if local_name.startswith(prefix) else local_name
     return local_name in server.deny_tools or bare in server.deny_tools
 
 
 def is_tool_destructive(tool: MCPTool) -> bool:
-    """工具是否声明为破坏性。
-
-    **缺省视为破坏性**（fail-closed）：没声明 `readOnlyHint: true` 的工具一律按
-    可能写东西对待。MCP 的 annotations 是自述，服务器可以不填；把"没说"当成
-    "安全"就是把边界交给对方决定。
-    """
+    """Missing, malformed, or contradictory safety hints are destructive."""
     annotations = tool.annotations or {}
-    if annotations.get("readOnlyHint") is True:
-        return False
     if annotations.get("destructiveHint") is True:
         return True
+    if annotations.get("readOnlyHint") is True:
+        return False
     return True
 
 
@@ -139,13 +140,15 @@ class HTTPSSEConnection:
     def __init__(self, url: str, name: str):
         self.url = url.rstrip("/")
         self.name = name
+        self.protocol_version: str | None = None
         self._req_id = 0
         self._lock = asyncio.Lock()
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=MCP_REQUEST_TIMEOUT)
         self._session_id: str | None = None
+        self._closed = False
 
-        # P0 安全修复：SSRF 防护 — 检查 URL 主机构是否为私有地址
         from urllib.parse import urlparse
+
         parsed = urlparse(url)
         host = parsed.hostname
         if host and _is_private_ip(host):
@@ -154,149 +157,398 @@ class HTTPSSEConnection:
                 f"(host={host}, server={name})"
             )
 
-    async def send_jsonrpc(
-        self, method: str, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Send a JSON-RPC request via HTTP POST and read the response."""
-        self._req_id += 1
-        req = {
-            "jsonrpc": "2.0",
-            "id": self._req_id,
-            "method": method,
-            "params": params or {},
-        }
+    def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
+        return headers
 
+    async def _post(self, message: dict[str, Any]) -> httpx.Response:
+        if self._closed:
+            raise ConnectionError(f"MCP server {self.name} is closed")
         async with self._lock:
-            resp = await self._client.post(
-                f"{self.url}/messages",
-                json=req,
-                headers=headers,
+            response = await self._client.post(
+                f"{self.url}/messages", json=message, headers=self._headers()
             )
-            resp.raise_for_status()
-            data = resp.json()
-
-            # Extract session ID from SSE response headers
-            session_id = resp.headers.get("Mcp-Session-Id")
+            response.raise_for_status()
+            session_id = response.headers.get("Mcp-Session-Id")
             if session_id:
                 self._session_id = session_id
+            return response
 
-        if "error" in data and data["error"]:
-            raise RuntimeError(f"MCP error: {data['error'].get('message', 'unknown')}")
-        result: dict[str, Any] = data.get("result", {})
-        return result
+    async def send_notification(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> None:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        await self._post(message)
+
+    async def send_jsonrpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = MCP_REQUEST_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Send a JSON-RPC request via HTTP POST and validate its response identity."""
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._req_id += 1
+        request_id = self._req_id
+        request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params or {},
+        }
+        reason = "cancelled"
+        try:
+            response = await asyncio.wait_for(self._post(request), timeout=timeout)
+            data = response.json()
+        except TimeoutError:
+            reason = "timeout"
+            await self._cancel(request_id, reason)
+            raise
+        except asyncio.CancelledError:
+            await self._cancel(request_id, reason)
+            raise
+        except Exception:
+            await self._cancel(request_id, reason)
+            raise
+
+        if not isinstance(data, dict) or not _valid_request_id(data.get("id")):
+            raise MCPProtocolError("MCP HTTP response has an invalid request id")
+        if data["id"] != request_id:
+            raise MCPProtocolError(
+                f"MCP HTTP response id {data['id']!r} does not match request {request_id}"
+            )
+        if ("result" in data) == ("error" in data):
+            raise MCPProtocolError("MCP HTTP response must contain exactly one of result/error")
+        if "error" in data:
+            error = data["error"]
+            if not isinstance(error, dict):
+                raise MCPProtocolError("MCP HTTP error must be an object")
+            raise MCPError(error, request_id)
+        return _result_dict(data["result"])
+
+    async def _cancel(self, request_id: RequestId, reason: str) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(
+                    self.send_notification(
+                        "notifications/cancelled", {"requestId": request_id, "reason": reason}
+                    )
+                ),
+                timeout=MCP_CANCEL_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 - cancellation must preserve the original failure
+            logger.warning("MCP %s: failed to send cancellation: %s", self.name, type(exc).__name__)
 
     async def close(self) -> None:
+        self._closed = True
         await self._client.aclose()
 
 
 class ServerConnection:
-    """Connection to a single MCP server process."""
+    """A single stdio MCP process with one reader and ID-keyed pending requests."""
 
-    def __init__(self, proc: asyncio.subprocess.Process, name: str, job: Any = None):
+    def __init__(
+        self,
+        proc: asyncio.subprocess.Process,
+        name: str,
+        job: Any = None,
+        *,
+        notification_handler: MessageHandler | None = None,
+        request_handler: MessageHandler | None = None,
+    ):
         self.proc = proc
         self.name = name
-        #: Windows Job Object 句柄（非 Windows / 挂载失败时为 None）。
-        #:
-        #: 必须由连接对象**持有**：job 句柄一关，`KILL_ON_JOB_CLOSE` 立刻杀光整棵
-        #: 进程树。提前 GC 会让一个还在用的 MCP server 莫名消失；反过来，不持有它
-        #: 就等于 MCP server 在引擎崩溃/被强杀时变成孤儿进程（它是最长寿的一条 spawn）。
+        self.protocol_version: str | None = None
         self._job = job
         self._req_id = 0
         self._lock = asyncio.Lock()
-        # create_subprocess_exec 传了 PIPE，三个流运行时恒非 None；这里 cast 只为把
-        # `StreamReader | None` 收窄成具体类型（存成属性，避免每个使用点各自断言）。
         self._stdin = cast("asyncio.StreamWriter", proc.stdin)
         self._stdout = cast("asyncio.StreamReader", proc.stdout)
         self._stderr = cast("asyncio.StreamReader", proc.stderr)
-        # 异步读取 stderr 并记录到日志，避免 DEVNULL 丢弃错误信息
-        self._stderr_task = asyncio.ensure_future(self._read_stderr())
+        self._notification_handler = notification_handler
+        self._request_handler = request_handler
+        self._pending: dict[RequestId, asyncio.Future[dict[str, Any]]] = {}
+        self._handler_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
+        self._reader_task = asyncio.create_task(self._read_stdout())
+        self._stderr_task = asyncio.create_task(self._read_stderr())
 
     async def _read_stderr(self) -> None:
-        """异步读取 MCP 服务器 stderr 并记录到日志。"""
         try:
             async for line in self._stderr:
                 if line.strip():
-                    logger.warning(
-                        "MCP stderr [%s]: %s", self.name, line.decode().rstrip()
-                    )
+                    logger.warning("MCP stderr [%s]: %s", self.name, line.decode().rstrip())
+        except (asyncio.CancelledError, ConnectionError):
+            raise
         except Exception:
             pass
 
-    async def send_jsonrpc(
-        self, method: str, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Send a JSON-RPC request and read the response."""
-        self._req_id += 1
-        req = {
-            "jsonrpc": "2.0",
-            "id": self._req_id,
-            "method": method,
-            "params": params,
-        }
-        req_line = json.dumps(req) + "\n"
+    def _ensure_open(self) -> None:
+        if self._closed or self._reader_task.done():
+            raise ConnectionError(f"MCP server {self.name} is closed")
 
+    def _fail_pending(self, error: BaseException) -> None:
+        pending, self._pending = self._pending, {}
+        for future in pending.values():
+            if not future.done():
+                future.set_exception(error)
+
+    def _spawn_handler(self, coroutine: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.create_task(coroutine)
+        self._handler_tasks.add(task)
+        task.add_done_callback(self._handler_tasks.discard)
+
+    async def _read_stdout(self) -> None:
+        try:
+            while line := await self._stdout.readline():
+                try:
+                    message = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.warning("MCP %s: ignoring malformed stdout JSON", self.name)
+                    continue
+                self._dispatch(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - every waiter needs the transport failure
+            self._fail_pending(ConnectionError(f"MCP server {self.name} stdout failed: {exc}"))
+        finally:
+            self._fail_pending(ConnectionError(f"No response from MCP server {self.name}"))
+
+    def _dispatch(self, message: Any) -> None:
+        if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+            logger.warning("MCP %s: ignoring invalid JSON-RPC message", self.name)
+            return
+        method = message.get("method")
+        if isinstance(method, str):
+            if "id" in message:
+                if _valid_request_id(message["id"]):
+                    self._spawn_handler(self._handle_server_request(message))
+                else:
+                    logger.warning("MCP %s: ignoring server request with invalid id", self.name)
+            elif method == "notifications/cancelled":
+                self._handle_server_cancellation(message.get("params"))
+                self._spawn_handler(self._handle_notification(message))
+            else:
+                self._spawn_handler(self._handle_notification(message))
+            return
+
+        request_id = message.get("id")
+        if not _valid_request_id(request_id):
+            logger.warning("MCP %s: ignoring response with invalid id", self.name)
+            return
+        future = self._pending.pop(request_id, None)
+        if future is None or future.done():
+            logger.debug("MCP %s: ignoring unknown or late response id=%r", self.name, request_id)
+            return
+        if ("result" in message) == ("error" in message):
+            future.set_exception(
+                MCPProtocolError("MCP response must contain exactly one of result/error")
+            )
+        elif "error" in message:
+            error = message["error"]
+            if isinstance(error, dict):
+                future.set_exception(MCPError(error, request_id))
+            else:
+                future.set_exception(MCPProtocolError("MCP error response must be an object"))
+        else:
+            try:
+                future.set_result(_result_dict(message["result"]))
+            except MCPProtocolError as exc:
+                future.set_exception(exc)
+
+    async def _handle_notification(self, message: dict[str, Any]) -> None:
+        try:
+            if self._notification_handler is not None:
+                result = self._notification_handler(message)
+                if inspect.isawaitable(result):
+                    await result
+            elif message.get("method") == "notifications/progress":
+                logger.debug("MCP %s progress: %s", self.name, message.get("params"))
+        except Exception:  # noqa: BLE001 - observer failures must not break request routing
+            logger.exception("MCP %s notification handler failed", self.name)
+
+    def _handle_server_cancellation(self, params: Any) -> None:
+        if not isinstance(params, dict):
+            return
+        request_id = params.get("requestId")
+        if not _valid_request_id(request_id):
+            return
+        future = self._pending.pop(request_id, None)
+        if future is not None and not future.done():
+            reason = params.get("reason", "cancelled")
+            future.set_exception(MCPRequestCancelledError(f"Request {request_id} cancelled by MCP server: {reason}"))
+
+    async def _handle_server_request(self, message: dict[str, Any]) -> None:
+        request_id = cast("RequestId", message["id"])
+        response: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id}
+        try:
+            if self._request_handler is None:
+                response["error"] = {"code": -32601, "message": "Method not found"}
+            else:
+                result = self._request_handler(message)
+                if inspect.isawaitable(result):
+                    result = await result
+                response["result"] = _result_dict(result)
+        except Exception as exc:  # noqa: BLE001 - peer receives an error, reader keeps running
+            logger.warning("MCP %s server request handler failed: %s", self.name, type(exc).__name__)
+            response.pop("result", None)
+            response["error"] = {"code": -32603, "message": "Internal error"}
+        try:
+            await self._write_message(response)
+        except (ConnectionError, OSError):
+            pass
+
+    async def _write_message(self, message: dict[str, Any]) -> None:
+        self._ensure_open()
         async with self._lock:
-            self._stdin.write(req_line.encode())
+            self._stdin.write((json.dumps(message) + "\n").encode())
             await self._stdin.drain()
 
-            response_line = await asyncio.wait_for(
-                self._stdout.readline(), timeout=30.0
-            )
-            if not response_line:
-                raise ConnectionError(f"No response from MCP server {self.name}")
+    async def send_notification(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> None:
+        if not isinstance(method, str) or not method:
+            raise ValueError("method must be a non-empty string")
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        await self._write_message(message)
 
-        resp = json.loads(response_line)
-        if "error" in resp and resp["error"]:
-            raise RuntimeError(f"MCP error: {resp['error'].get('message', 'unknown')}")
-        result: dict[str, Any] = resp.get("result", {})
-        return result
+    async def send_jsonrpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = MCP_REQUEST_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Send one request; notifications and other responses never consume its result."""
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+        self._ensure_open()
+        self._req_id += 1
+        request_id = self._req_id
+        future = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
+        request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        try:
+            await self._write_message(request)
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.CancelledError:
+            await self._cancel(request_id, "cancelled")
+            raise
+        except TimeoutError:
+            await self._cancel(request_id, "timeout")
+            raise
+        except BaseException:
+            self._pending.pop(request_id, None)
+            future.cancel()
+            raise
+
+    async def _cancel(self, request_id: RequestId, reason: str) -> None:
+        future = self._pending.pop(request_id, None)
+        if future is None:
+            return
+        if not future.done():
+            future.cancel()
+        if self._closed:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(
+                    self.send_notification(
+                        "notifications/cancelled", {"requestId": request_id, "reason": reason}
+                    )
+                ),
+                timeout=MCP_CANCEL_TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve timeout/cancellation as the primary error
+            logger.warning("MCP %s: failed to send cancellation: %s", self.name, type(exc).__name__)
+
+    async def initialize(self, *, timeout: float = MCP_REQUEST_TIMEOUT) -> str:
+        return await _initialize_connection(self, timeout=timeout)
 
     async def close(self) -> None:
-        """Kill the server process（并释放 Job Object）。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._fail_pending(ConnectionError(f"MCP server {self.name} is closed"))
+        tasks = [self._reader_task, self._stderr_task, *self._handler_tasks]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self.proc and self.proc.returncode is None:
             try:
                 self.proc.terminate()
                 await asyncio.wait_for(self.proc.wait(), timeout=5.0)
             except (TimeoutError, ProcessLookupError):
                 self.proc.kill()
-        # 释放 job 句柄：`KILL_ON_JOB_CLOSE` 会把残余的整棵进程树一起收掉。
-        # 放在 terminate 之后：先礼后兵，让 server 有机会把 stdio 收干净。
         if self._job is not None:
             try:
                 self._job.close()
-            except Exception as exc:  # noqa: BLE001 — 释放失败不该让 close 抛错
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("MCP %s: job object close failed: %s", self.name, exc)
             self._job = None
+
+
+async def _initialize_connection(
+    conn: ServerConnection | HTTPSSEConnection, *, timeout: float = MCP_REQUEST_TIMEOUT
+) -> str:
+    if conn.protocol_version is not None:
+        raise MCPProtocolError("MCP connection is already initialized")
+    capabilities: dict[str, Any] = {}
+    if isinstance(conn, ServerConnection) and conn._request_handler is not None:  # noqa: SLF001
+        capabilities["sampling"] = {}
+    result = await conn.send_jsonrpc(
+        "initialize",
+        {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "clientInfo": {"name": "chiron-python", "version": "3.0.0"},
+            "capabilities": capabilities,
+        },
+        timeout=timeout,
+    )
+    version = result.get("protocolVersion")
+    if not isinstance(version, str) or version not in SUPPORTED_PROTOCOL_VERSIONS:
+        raise MCPProtocolError(f"Unsupported MCP protocol version: {version!r}")
+    conn.protocol_version = version
+    await conn.send_notification("notifications/initialized")
+    return version
 
 
 class MCPClient:
     """Manages connections to multiple MCP servers and their tools."""
 
-    def __init__(self, servers: list[ServerDef], *, role: str = "engine"):
-        #: "engine"（默认）= 只能连 read_only 的 server；"broker" = 独立 MCP broker 进程，
-        #: 唯一被允许持凭据连危险 server 的角色（见 assert_server_connectable）。
+    def __init__(
+        self,
+        servers: list[ServerDef],
+        *,
+        role: str = "engine",
+        notification_handler: MessageHandler | None = None,
+        request_handler: MessageHandler | None = None,
+    ):
         self._role = role
         self._servers = servers
         self._conns: dict[str, ServerConnection | HTTPSSEConnection] = {}
         self._tools: list[MCPTool] = []
+        self._notification_handler = notification_handler
+        self._request_handler = request_handler
 
     async def start(self) -> None:
         """Connect to all configured MCP servers and discover their tools."""
         for server in self._servers:
             try:
-                # 收尾3：把该 server 的凭据登记进**进程级集合**。于是所有走 `redact_text`
-                # 的出站路径（输出栅栏 / 审计留痕 / 工具结果回灌）自动覆盖它们 ——
-                # 不必要求每个调用点各自记得处理（那正是"迟早漏一处"的来源）。
                 from app.mcp.credential_projection import collect_secrets, register_secrets
 
                 register_secrets(collect_secrets(server))
                 await self._connect_server(server)
             except Exception as e:
-                # D4：连接失败消息里可能带 url / env 的凭据（HTTP SSE 常把 token 放 query），
-                # 所以这里先**脱敏**再记日志 —— 日志会被采集、被转发、被贴进工单。
+                # Connection errors can contain credentials from URLs or environment values.
                 from app.mcp.credential_projection import collect_secrets, redact, safe_label
 
                 logger.error(
@@ -307,18 +559,7 @@ class MCPClient:
                 raise
 
     async def _connect_server(self, server: ServerDef) -> None:
-        """Connect to a single MCP server and discover its tools.
-
-        **直连守卫（安全边界）**：引擎只允许直连**声明为只读**的 MCP server。
-
-        理由：连接凭据来自 ``ServerDef.env`` / ``url``（插件配置），而引擎进程正在处理
-        不可信内容 —— 被 prompt injection 影响的 agent 可以直接拿这些凭据触达外部系统，
-        绕过网关的全部授权、审计与限流（docs/agent-safety-and-reliability.md §1.4）。
-
-        未声明 ``read_only`` 的 server 一律**不连**（fail-closed）。要放行请在插件配置里显式
-        写 ``"read_only": true``（表示它只提供读操作）；含写 / 删 / 外部操作的 server 应由服务端
-        分发，不能把凭据留在 agent 可触达的地方。
-        """
+        """Apply the direct-connection guard before selecting a transport."""
         assert_server_connectable(server, role=self._role)
         if server.transport == "http_sse":
             await self._connect_http_sse(server)
@@ -333,32 +574,23 @@ class MCPClient:
             raise ValueError("HTTP SSE transport requires 'url' in ServerDef")
         conn = HTTPSSEConnection(server.url, server.name)
         self._conns[server.name] = conn
-
-        # Initialize
-        await conn.send_jsonrpc(
-            "initialize",
-            {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "clientInfo": {"name": "chiron-python", "version": "3.0.0"},
-                "capabilities": {},
-            },
-        )
-
-        # List tools
-        tools_result = await conn.send_jsonrpc("tools/list", None)
+        try:
+            await _initialize_connection(conn)
+            tools_result = await conn.send_jsonrpc("tools/list", None)
+        except BaseException:
+            self._conns.pop(server.name, None)
+            await conn.close()
+            raise
         raw_tools = tools_result.get("tools", [])
         self._register_tools(server, raw_tools)
         logger.info("MCP server %s connected (HTTP SSE): %d tools", server.name, len(raw_tools))
 
     async def _connect_stdio(self, server: ServerDef) -> None:
         """Connect to an MCP server via stdio (subprocess)."""
-        # 安全修复（P0-S7）：仅允许 PLUGIN_COMMAND_ALLOWLIST 白名单内的命令被拉起
+        # User-configured commands require the administrator allowlist.
         from app.tools.ssrf import _command_path_ok, command_allowed
 
         if server.builtin:
-            # 内置插件（app/plugins/builtin.py）由**部署者**清单约束，不走用户级白名单 ——
-            # 否则用户不配 PLUGIN_COMMAND_ALLOWLIST 就用不了随应用分发的能力。
-            # 但"从哪跑"的约束一视同仁：仍拒绝相对穿越 / UNC（见 _command_path_ok）。
             if not _command_path_ok(server.command):
                 raise PermissionError(
                     f"内置插件命令 {server.command!r} 不是裸 basename 或绝对路径"
@@ -368,16 +600,7 @@ class MCPClient:
                 f"MCP server command {server.command!r} not allowed: add its basename to the "
                 "plugin command allowlist in admin settings (takes effect immediately, no restart)"
             )
-        # 无论 server 是否声明 env，子进程环境都必须以 sandboxed_env() 为基底。
-        #
-        # 此前这里是 `env = None` + `if server.env:` —— 于是**未声明 env 的 stdio server
-        # 会完整继承引擎进程环境**（JWT_SECRET / INTERNAL_TOKEN / APP_SECRET / 数据库
-        # 口令 / 各 provider 的 API key 全在其中）。而 agent 能通过 MCP server 读自己的
-        # 环境（`env` 命令、`/proc/self/environ`、任何库读 os.environ），等于把网关的
-        # 全部凭据交给一段由第三方代码驱动的子进程 —— 这也是 sandboxed_env() 存在的理由。
-        #
-        # 复用 credential_projection.project_stdio_env：它已经过单测（不改入参、只叠加
-        # server 自己声明的键），避免此处再写一份"清理 + 叠加"而两处漂移。
+        # Never inherit engine credentials into a third-party stdio process.
         from app.mcp.credential_projection import project_stdio_env
         from app.tools.sandbox import sandboxed_env
 
@@ -398,44 +621,33 @@ class MCPClient:
             # 拉起插件进程失败同样要留痕（谁、哪个插件、哪个命令、为什么失败）
             record_plugin(plugin=server.name, action="spawn", success=False, error=str(exc))
             raise
-        # Windows：挂进 Job Object。**MCP server 是最容易变孤儿的一条**——
-        # 它是长驻进程（stdin 关掉才会退），而 Chiron 被强杀/崩溃时不会走到
-        # `MCPClient.close()`，于是 `npx some-mcp-server` 会一直留在进程列表里。
-        #
-        # 挂进 Job 后 `KILL_ON_JOB_CLOSE` 让"引擎进程消失"等价于"整棵树被回收"。
-        # job 句柄交给 `ServerConnection` 持有：提前 GC 会立刻杀掉正在用的 server。
+        # The connection owns the Job Object so process-tree cleanup survives until close.
         from app.isolation import COMMAND_LIMITS, attach_job
 
         job = attach_job(proc, COMMAND_LIMITS, label=f"mcp:{server.name}")
         # 成功拉起：这是"某租户在某会话里让宿主机起了一个插件进程"的事实记录
         record_plugin(plugin=server.name, action="spawn", success=True)
-        conn = ServerConnection(proc, server.name, job=job)
-        self._conns[server.name] = conn
-
-        # Initialize
-        await conn.send_jsonrpc(
-            "initialize",
-            {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
-                "clientInfo": {"name": "chiron-python", "version": "3.0.0"},
-            },
+        conn = ServerConnection(
+            proc,
+            server.name,
+            job=job,
+            notification_handler=self._notification_handler,
+            request_handler=self._request_handler,
         )
-
-        # List tools
-        result = await conn.send_jsonrpc("tools/list", None)
+        self._conns[server.name] = conn
+        try:
+            await conn.initialize()
+            result = await conn.send_jsonrpc("tools/list", None)
+        except BaseException:
+            self._conns.pop(server.name, None)
+            await conn.close()
+            raise
         raw_tools = result.get("tools", [])
         self._register_tools(server, raw_tools)
         logger.info("MCP server %s connected (stdio): %d tools", server.name, len(raw_tools))
 
     def _register_tools(self, server: ServerDef, raw_tools: list[dict[str, Any]]) -> None:
-        """Register tools from a server response.
-
-        - ``deny_tools`` 命中的工具**根本不注册**（不是"隐藏"）：用于剔除出站写操作。
-          判定与调用阶段共用 ``is_tool_denied``，避免两处规则漂移。
-        - 命名空间前缀去重：工具的本地名已带 ``{server.name}_`` 前缀时不再叠加，
-          否则 XERJ 会得到 ``xerj_xerj_code_search`` 这种双前缀。
-        - ``annotations`` 原样保留：调用阶段要靠 ``readOnlyHint`` 判断破坏性。
-        """
+        """Register non-denied tools, preserving local names and raw annotations."""
         prefix = f"{server.name}_"
         for i, t in enumerate(raw_tools):
             local_name = t.get("name", f"unnamed_{i}")
@@ -462,27 +674,13 @@ class MCPClient:
         return self._tools
 
     async def call_tool(
-        self, tool_name: str, arguments: dict[str, Any]
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout: float = MCP_REQUEST_TIMEOUT,
     ) -> dict[str, Any]:
-        """Call a tool on the appropriate MCP server.
-
-        本地名以**注册时登记的映射**为准，而不是从 ``{server}_{...}`` 反推前缀：
-        去重后 ``xerj_code_search`` 的本地名仍是 ``xerj_code_search``（不是 ``code_search``），
-        按前缀截断会把名字截错，服务器侧必然报 unknown tool。
-
-        **调用阶段的第二道过滤**（注册阶段已经剔除过 deny_tools，这里是复查）：
-
-        1. ``is_tool_denied`` 再算一次 —— 工具条目可能来自更早的一次注册，
-           期间 server 的 deny 策略被配置热重载改严；只在注册时判一次，
-           改严之后旧条目仍然可调。
-        2. ``read_only`` 的 server 上出现**显式声明破坏性**的工具 ⇒ 拒绝。
-           这是自相矛盾：部署者声明"这个 server 只读"，服务器却说"这工具会写"。
-           两者不能都信，也不能挑软的 —— fail-closed，拒绝并留痕。
-        3. 未声明 ``readOnlyHint`` 的工具**照常执行**，但返回体里带上
-           ``annotations`` 与 ``destructive`` 标记，让上游（确认卡片 / 审计）
-           自己决定要不要拦。不在这里一刀切拒绝：多数 MCP 服务器根本不填
-           annotations，全拒会让插件体系整体不可用。
-        """
+        """Recheck deny/destructive policy at call time, then propagate timeout/cancellation."""
         for tool in self._tools:
             if tool.name != tool_name:
                 continue
@@ -530,18 +728,12 @@ class MCPClient:
             return await conn.send_jsonrpc(
                 "tools/call",
                 {"name": tool.local_name, "arguments": arguments},
+                timeout=timeout,
             )
         return {"error": f"Tool {tool_name} not found on any MCP server"}
 
     def annotations_for(self, tool_name: str) -> dict[str, Any]:
-        """该工具的自述注解，附上引擎推断出的 ``destructive``。
-
-        用途是让上层（确认卡片 / 审计 / use_capability）知道"这个工具会不会写东西"。
-        **不塞进 ``call_tool`` 的返回体** —— 那是 MCP 协议响应，往里加字段等于伪造
-        协议内容，而且会让所有既有调用方拿到的形状凭空多一个键。
-
-        没找到该工具时返回空字典：调用方据此按"未知"处理，而不是"安全"。
-        """
+        """Expose the engine's destructive inference without altering protocol results."""
         for tool in self._tools:
             if tool.name != tool_name:
                 continue
@@ -559,8 +751,7 @@ class MCPClient:
             try:
                 await conn.close()
             except Exception as e:
-                # 这里只有名字，拿不到 server 定义 ⇒ 无法枚举凭据；但仍按"可能含凭据"处理，
-                # 只记异常类型与名字（不对未知文本做替换，避免把日志弄得不可读）。
+                # Server definitions are unavailable here, so log only the exception type.
                 logger.warning("Error closing MCP server %s: %s", name, type(e).__name__)
         self._conns.clear()
 
@@ -584,10 +775,6 @@ async def load_mcp_config(config_path: str) -> list[ServerDef]:
                 env=s.get("env", {}),
                 transport=s.get("transport", "stdio"),
                 url=s.get("url", ""),
-                # 之前漏了这一行：`ServerDef.read_only` 默认 False（fail-closed），而
-                # `assert_server_connectable()` 只放行 read_only 的 server ⇒ **任何**
-                # 插件都会被引擎拒连，配置里写 `"read_only": true` 也不生效。
-                # 表现是 `MCP connect xerj failed: not declared read-only`。
                 read_only=bool(s.get("read_only", False)),
             )
         )

@@ -14,6 +14,7 @@ from typing import Any, cast
 import redis.asyncio as aioredis
 
 from app.observability.metrics import QUEUE_DEPTH, QUEUE_DLQ_TOTAL, QUEUE_PROCESSING_DURATION, QUEUE_RETRY_TOTAL
+from app.queue import idempotency
 from app.redis_keys import rkey
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 from app.queue.streams import (  # noqa: E402
     ENGINE_QUEUE,
     QueueSpec,
+    atomic_promote_delayed,
+    atomic_xadd_ack,
     is_foreign,
     queue_for_task,
 )
@@ -48,7 +51,7 @@ GATE_RETRY_INTERVAL = 0.5
 CLAIM_MIN_IDLE_SECS = int(os.getenv("QUEUE_CLAIM_MIN_IDLE_SECS", "600"))
 CLAIM_MIN_IDLE_MS = CLAIM_MIN_IDLE_SECS * 1000
 # lease 心跳周期：阈值 1/3（下限 30s），保证阈值窗口内至少刷新两次。
-HEARTBEAT_SECS = max(30, CLAIM_MIN_IDLE_SECS // 3)
+HEARTBEAT_SECS = max(1, CLAIM_MIN_IDLE_SECS // 3)
 CLAIM_LOOP_SECS = 60
 CLAIM_BATCH = 50
 
@@ -116,6 +119,21 @@ def _as_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _text_field(fields: dict[Any, Any], name: str | bytes, default: str = "") -> str:
+    value = fields.get(name, default) if isinstance(name, bytes) else fields.get(name, fields.get(name.encode(), default))
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode()
+    return str(value) if value is not None else default
+
+
+def _text_fields(fields: dict[Any, Any]) -> dict[str, str]:
+    message: dict[str, str] = {}
+    for key in fields:
+        name = key.decode() if isinstance(key, bytes) else str(key)
+        message[name] = _text_field(fields, key)
+    return message
 
 
 def _retry_after(resp: Any) -> float:
@@ -339,17 +357,17 @@ class QueueWorker:
             self._semaphore.release()
             return
         task = asyncio.create_task(self._process_message(stream_id, fields))
-        # 设置超时保护，防止 task 永久挂起
         timeout_task = asyncio.create_task(asyncio.wait_for(task, timeout=3600))
         self._in_flight.add(timeout_task)
         timeout_task.add_done_callback(self._task_done)
-        # lease 心跳：处理期间周期刷新该消息的 PEL idle，使其它实例的 reclaim
-        # 不会把仍在执行的长任务当作崩溃残留抢走（阈值因此可下调到分钟级）。
-        lease_task = asyncio.create_task(self._heartbeat_lease(stream_id, timeout_task))
-        timeout_task.add_done_callback(lambda _t: lease_task.cancel())
 
-    async def _heartbeat_lease(self, stream_id: str, owner: asyncio.Task[Any]) -> None:
-        """处理期间刷新 PEL idle（XCLAIM ... JUSTID），充当任务 lease 心跳。"""
+    async def _heartbeat_lease(
+        self,
+        stream_id: str,
+        claim: idempotency.Attempt,
+        owner: asyncio.Task[Any],
+    ) -> None:
+        """Renew ownership and PEL idle time with the same fenced token."""
         while not owner.done():
             try:
                 await asyncio.sleep(HEARTBEAT_SECS)
@@ -358,17 +376,22 @@ class QueueWorker:
             if owner.done():
                 return
             try:
-                await self._redis.xclaim(
-                    self._q.stream,
-                    self._q.group,
-                    self._consumer_name,
-                    0,
-                    [stream_id],
-                    justid=True,
+                renewed = await idempotency.renew(
+                    self._redis,
+                    claim,
+                    stream=self._q.stream,
+                    group=self._q.group,
+                    consumer=self._consumer_name,
+                    message_id=stream_id,
+                    lease_seconds=CLAIM_MIN_IDLE_SECS,
                 )
+                if not renewed:
+                    logger.warning("worker attempt fenced off: id=%s", stream_id)
+                    owner.cancel()
+                    return
             except asyncio.CancelledError:
                 return
-            except Exception as e:  # noqa: BLE001 - 心跳失败不应打断任务本身
+            except Exception as e:  # noqa: BLE001 - a transient failure is not proof of lost ownership
                 logger.debug("worker lease heartbeat failed for %s: %s", stream_id, e)
 
     async def _reclaim_loop(self) -> None:
@@ -424,28 +447,10 @@ class QueueWorker:
                 )
 
     async def _spawn_claimed(self, msg_id: str, fields: dict[Any, Any]) -> None:
-        """认领到的消息：retry_count 递增后重新进入处理；超限进 DLQ。"""
-        raw = fields.get(b"retry_count", fields.get("retry_count", 0))
-        try:
-            retry = int(raw) + 1
-        except (TypeError, ValueError):
-            retry = 1
-        fields[b"retry_count"] = str(retry).encode()
-        if retry > MAX_RETRIES:
-            raw_type = fields.get(b"task_type", fields.get("task_type", ""))
-            task_type = raw_type.decode() if isinstance(raw_type, bytes) else str(raw_type or "")
-            try:
-                await self._redis.xadd(self._q.dlq, fields, maxlen=self._q.dlq_maxlen)
-                await self._redis.xack(self._q.stream, self._q.group, msg_id)
-                # 必须带 task_type 标签：QUEUE_DLQ_TOTAL 定义了该标签，无标签调用会抛
-                # ValueError，被下面的 except 吞掉 —— 结果是"进 DLQ"这件事在指标里
-                # 完全不可见（这正是"要么可见地失败"要消灭的形态）。
-                QUEUE_DLQ_TOTAL.labels(task_type=task_type).inc()
-                logger.warning("reclaimed message exceeded retries, moved to DLQ: %s", msg_id)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("reclaimed DLQ move failed: %s", e)
-            return
-        await self._spawn_message(msg_id, fields)
+        """Count a reclaim as a retry; the fenced processor owns any DLQ transition."""
+        message = _text_fields(fields)
+        message["retry_count"] = str(_as_int(message.get("retry_count")) + 1)
+        await self._spawn_message(msg_id, message)
 
     async def _try_acquire_gate(self, stream_id: str, fields: dict[Any, Any]) -> bool:
         """全局并发门控：抢到槽位返回 True；等待 GATE_WAIT_SECS 仍满则放回队尾返回 False。
@@ -464,19 +469,23 @@ class QueueWorker:
             if ok:
                 return True
             if loop.time() >= deadline:
-                # 放回队尾（保持顺序）并 ACK 原消息
-                requeue = {
-                    (k.decode() if isinstance(k, bytes) else k): (
-                        v.decode() if isinstance(v, bytes) else v
-                    )
-                    for k, v in fields.items()
-                }
+                requeue = _text_fields(fields)
                 try:
-                    await self._redis.xadd(self._q.stream, requeue, maxlen=self._q.maxlen)
-                    await self._redis.xack(self._q.stream, self._q.group, stream_id)
+                    moved = await atomic_xadd_ack(
+                        self._redis,
+                        source=self._q.stream,
+                        target=self._q.stream,
+                        group=self._q.group,
+                        consumer=self._consumer_name,
+                        message_id=stream_id,
+                        fields=requeue,
+                        maxlen=self._q.maxlen,
+                    )
+                    if moved is None:
+                        return True
                 except Exception as exc:
                     logger.warning("worker gate requeue failed: %s", exc)
-                    return True  # 放回失败：宁可处理也不丢
+                    return True
                 task_id = requeue.get("task_id", "")
                 logger.info(
                     "worker global concurrency full; message requeued id=%s",
@@ -546,132 +555,125 @@ class QueueWorker:
             logger.error("Task exception: %s", task.exception())
 
     async def _forward_foreign(
-        self, stream_id: str, task_type: str, fields: dict[Any, Any]
+        self,
+        stream_id: str,
+        task_type: str,
+        fields: dict[str, str],
+        claim: idempotency.Attempt,
     ) -> None:
-        """把不属于本队列的任务**原样**转发到它的目标队列，然后 ACK。
-
-        为什么是转发而不是就地失败：滚动升级期间旧版 producer 仍会把 kb_index 投到主
-        队列（它还不知道新队列）。就地失败 → 升级窗口内的索引任务全部进 DLQ，需要人工
-        重投；转发则保留原信封（task_id / idempotency_key / deadline），目标 worker
-        能照常处理。转发失败**不 ACK**，留给既有重试/DLQ 路径兜底。
-        """
+        """Atomically forward the unchanged envelope and ACK the owned attempt."""
         target = queue_for_task(task_type)
-        try:
-            await self._redis.xadd(target.stream, fields, maxlen=target.maxlen)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Forward foreign task failed: type=%s to=%s: %s",
-                task_type,
-                target.key,
-                exc,
-            )
-            raise
-        await self._redis.xack(self._q.stream, self._q.group, stream_id)
-        logger.warning(
-            "Forwarded foreign task: id=%s type=%s from=%s to=%s",
-            stream_id,
-            task_type,
-            self._q.key,
-            target.key,
+        moved = await idempotency.forward(
+            self._redis,
+            claim,
+            source=self._q.stream,
+            target=target.stream,
+            group=self._q.group,
+            consumer=self._consumer_name,
+            message_id=stream_id,
+            fields=fields,
+            maxlen=target.maxlen,
         )
+        if moved:
+            logger.warning(
+                "Forwarded foreign task: id=%s type=%s from=%s to=%s",
+                stream_id,
+                task_type,
+                self._q.key,
+                target.key,
+            )
 
     async def _process_message(self, stream_id: str, fields: dict[Any, Any]) -> None:
-        """处理单条消息"""
-        task_type = (
-            fields.get(b"task_type", b"").decode()
-            if isinstance(fields.get(b"task_type"), bytes)
-            else fields.get("task_type", "")
-        )
+        """Process one message under an exclusive, fenced Redis attempt."""
+        message = _text_fields(fields)
+        task_type = message.get("task_type", "")
+        task_id = message.get("task_id", "")
+        payload_raw = message.get("payload", "{}")
+        retry_count = _as_int(message.get("retry_count"))
+        tenant_id = _as_int(message.get("tenant_id"))
+        idem_key = idempotency.key_for(task_type, task_id, message.get("idempotency_key", ""))
+        deadline_raw = message.get("deadline", "")
 
-        # 本该投到别的队列却出现在本队列 = 滚动升级期间旧版 producer 的路由。
-        # 转发过去并 ACK（本镜像可能根本没有那个 SDK，就地失败会把升级窗口内的
-        # 任务全打进 DLQ）。
-        if is_foreign(task_type, self._q):
-            await self._forward_foreign(stream_id, task_type, fields)
+        decision = await idempotency.claim(
+            self._redis,
+            namespace=self._q.key,
+            key=idem_key,
+            task_id=task_id,
+            task_type=task_type,
+            tenant_id=tenant_id,
+            lease_seconds=CLAIM_MIN_IDLE_SECS,
+        )
+        if decision.status is idempotency.ClaimStatus.COMPLETED:
+            await idempotency.ack_completed(
+                self._redis,
+                namespace=self._q.key,
+                key=idem_key,
+                stream=self._q.stream,
+                group=self._q.group,
+                consumer=self._consumer_name,
+                message_id=stream_id,
+            )
             return
-        task_id = (
-            fields.get(b"task_id", b"").decode()
-            if isinstance(fields.get(b"task_id"), bytes)
-            else fields.get("task_id", "")
-        )
-        payload_raw = (
-            fields.get(b"payload", b"{}").decode()
-            if isinstance(fields.get(b"payload"), bytes)
-            else fields.get("payload", "{}")
-        )
-        retry_count = int(
-            fields.get(b"retry_count", 0)
-            if isinstance(fields.get(b"retry_count"), bytes)
-            else fields.get("retry_count", 0)
-        )
-        tenant_id = (
-            fields.get(b"tenant_id", b"").decode()
-            if isinstance(fields.get(b"tenant_id"), bytes)
-            else fields.get("tenant_id", "")
-        )
-        # 幂等键：消息显式提供优先，否则回退 {task_type}:{task_id}
-        from app.queue import idempotency
+        if decision.status is idempotency.ClaimStatus.BUSY:
+            logger.debug("Task already owned: id=%s key=%s", task_id, idem_key)
+            return
+        claim = decision.claim
+        assert claim is not None
 
-        idem_raw = fields.get(b"idempotency_key", fields.get("idempotency_key", ""))
-        idem_key = idempotency.key_for(
-            task_type,
-            task_id,
-            idem_raw.decode() if isinstance(idem_raw, bytes) else (idem_raw or ""),
+        owner = asyncio.current_task()
+        heartbeat = (
+            asyncio.create_task(self._heartbeat_lease(stream_id, claim, owner))
+            if owner is not None
+            else None
         )
-
-        # 过期任务直接 ACK 丢弃:deadline 由投递方写入(RFC3339 UTC,见 producer/jobs/workflows)。
-        # 缺省/解析失败视为无期限,保持既有行为。
-        deadline_raw = (
-            fields.get(b"deadline", b"").decode()
-            if isinstance(fields.get(b"deadline"), bytes)
-            else fields.get("deadline", "")
-        )
-        if deadline_raw:
-            try:
-                dl = datetime.datetime.strptime(
-                    deadline_raw, "%Y-%m-%dT%H:%M:%SZ"
-                ).replace(tzinfo=datetime.UTC)
-            except ValueError:
-                dl = None
-            if dl is not None and dl < datetime.datetime.now(datetime.UTC):
-                # 过期任务不再执行,但也不能静默丢弃(A3):转 DLQ 保留可见性与人工重投能力。
-                logger.warning(
-                    "Task expired (deadline=%s), moved to DLQ: id=%s type=%s",
-                    deadline_raw,
-                    task_id,
-                    task_type,
-                )
-                try:
-                    await self._redis.xadd(
-                        self._q.dlq,
-                        {
-                            "task_id": task_id,
-                            "task_type": task_type,
-                            "payload": payload_raw,
-                            "error": f"deadline exceeded: {deadline_raw}",
-                            "retry_count": str(retry_count),
-                        },
-                        maxlen=self._q.dlq_maxlen,
-                    )
-                    QUEUE_DLQ_TOTAL.labels(task_type=task_type).inc()
-                except Exception as exc:  # noqa: BLE001 - DLQ 写入失败也必须 ACK，避免无限重投
-                    logger.warning("expired DLQ move failed: %s", exc)
-                await self._redis.xack(self._q.stream, self._q.group, stream_id)
-                return
-
         start = time.monotonic()
+        dispatch_succeeded = False
         try:
-            payload = json.loads(payload_raw)
-            # 幂等闸门：该键已 completed 说明是重复投递（执行后 ACK 前崩溃被 reclaim），
-            # 直接 ACK 丢弃，避免 tool_job 等副作用任务重复执行。
-            if not await idempotency.claim(idem_key, task_id, task_type, tenant_id):
-                await self._redis.xack(self._q.stream, self._q.group, stream_id)
+            if retry_count > MAX_RETRIES:
+                moved = await self._move_to_dlq(
+                    claim, stream_id, message, f"reclaim retries exhausted: {retry_count}"
+                )
+                if moved:
+                    logger.warning("Task moved to DLQ: id=%s (retries=%d)", task_id, retry_count)
                 return
-            await self._dispatch(task_type, payload, tenant_id)
-            await idempotency.complete(idem_key)
 
-            # 成功 → ACK
-            await self._redis.xack(self._q.stream, self._q.group, stream_id)
+            if deadline_raw:
+                try:
+                    deadline = datetime.datetime.strptime(
+                        deadline_raw, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=datetime.UTC)
+                except ValueError:
+                    deadline = None
+                if deadline is not None and deadline < datetime.datetime.now(datetime.UTC):
+                    logger.warning(
+                        "Task expired (deadline=%s), moved to DLQ: id=%s type=%s",
+                        deadline_raw,
+                        task_id,
+                        task_type,
+                    )
+                    await self._move_to_dlq(
+                        claim, stream_id, message, f"deadline exceeded: {deadline_raw}"
+                    )
+                    return
+
+            if is_foreign(task_type, self._q):
+                await self._forward_foreign(stream_id, task_type, message, claim)
+                return
+
+            payload = json.loads(payload_raw)
+            await self._dispatch(task_type, payload, tenant_id)
+            dispatch_succeeded = True
+            completed = await idempotency.complete(
+                self._redis,
+                claim,
+                self._q.stream,
+                self._q.group,
+                self._consumer_name,
+                stream_id,
+            )
+            if not completed:
+                logger.warning("Stale task completion ignored: id=%s", task_id)
+                return
             elapsed = time.monotonic() - start
             QUEUE_PROCESSING_DURATION.labels(task_type=task_type).observe(elapsed)
             logger.info(
@@ -685,59 +687,84 @@ class QueueWorker:
             logger.warning(
                 "Task deferred: id=%s type=%s reason=%s", task_id, task_type, str(e)[:200]
             )
-            await idempotency.fail(idem_key)
-            await self._defer_message(stream_id, fields, task_id, task_type, payload_raw, e)
+            await self._defer_message(claim, stream_id, message, e)
 
         except Exception as e:
+            if dispatch_succeeded:
+                logger.error("Task completion transition failed: id=%s error=%s", task_id, e)
+                raise
             logger.error("Task failed: id=%s type=%s error=%s", task_id, task_type, e)
-            # 标记失败：幂等键仍可重试（claim 只拒绝 completed）
-            await idempotency.fail(idem_key)
-
             if retry_count >= MAX_RETRIES:
-                # 移入死信队列
-                await self._move_to_dlq(task_id, task_type, payload_raw, str(e), retry_count)
-                await self._redis.xack(self._q.stream, self._q.group, stream_id)
-                logger.warning(
-                    "Task moved to DLQ: id=%s (retries=%d)", task_id, retry_count
-                )
+                moved = await self._move_to_dlq(claim, stream_id, message, str(e))
+                if moved:
+                    logger.warning(
+                        "Task moved to DLQ: id=%s (retries=%d)", task_id, retry_count
+                    )
             else:
-                # 重试：重新投递消息并递增 retry_count（保留租户标识以保持观测链路）
-                retry_count += 1
-                retry_msg: dict[Any, Any] = {
-                    "task_type": task_type,
-                    "task_id": task_id,
-                    "payload": payload_raw,
-                    "retry_count": str(retry_count),
-                }
-                if tenant_id:
-                    retry_msg["tenant_id"] = tenant_id
-                await self._redis.xadd(self._q.stream, retry_msg, maxlen=self._q.maxlen)
-                await self._redis.xack(self._q.stream, self._q.group, stream_id)
-                QUEUE_RETRY_TOTAL.labels(task_type=task_type).inc()
-                logger.info(
-                    "Task re-queued for retry: id=%s (retry=%d/%d)",
-                    task_id,
-                    retry_count,
-                    MAX_RETRIES,
-                )
+                await self._retry_message(claim, stream_id, message, task_type)
+
+        finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
     # ── 延迟重试与死信 ──
 
     async def _move_to_dlq(
-        self, task_id: str, task_type: str, payload_raw: str, error: str, retry_count: int | str
-    ) -> None:
-        """把任务移进死信队列（可见、可人工重投；绝不静默丢弃）。"""
-        await self._redis.xadd(
-            self._q.dlq,
-            {
-                "task_id": task_id,
-                "task_type": task_type,
-                "payload": payload_raw,
-                "error": error,
-                "retry_count": str(retry_count),
-            },
+        self,
+        claim: idempotency.Attempt,
+        stream_id: str,
+        message: dict[str, str],
+        error: str,
+    ) -> bool:
+        """Atomically preserve the full envelope in DLQ and ACK this attempt."""
+        fields = dict(message)
+        fields["error"] = error
+        moved = await idempotency.dead_letter(
+            self._redis,
+            claim,
+            source=self._q.stream,
+            target=self._q.dlq,
+            group=self._q.group,
+            consumer=self._consumer_name,
+            message_id=stream_id,
+            fields=fields,
+            maxlen=self._q.dlq_maxlen,
         )
-        QUEUE_DLQ_TOTAL.labels(task_type=task_type).inc()
+        if moved:
+            QUEUE_DLQ_TOTAL.labels(task_type=fields.get("task_type", "")).inc()
+        return moved
+
+    async def _retry_message(
+        self,
+        claim: idempotency.Attempt,
+        stream_id: str,
+        message: dict[str, str],
+        task_type: str,
+    ) -> bool:
+        """Atomically requeue the unchanged envelope with an incremented retry budget."""
+        fields = dict(message)
+        fields["retry_count"] = str(_as_int(fields.get("retry_count")) + 1)
+        moved = await idempotency.retry(
+            self._redis,
+            claim,
+            source=self._q.stream,
+            target=self._q.stream,
+            group=self._q.group,
+            consumer=self._consumer_name,
+            message_id=stream_id,
+            fields=fields,
+            maxlen=self._q.maxlen,
+        )
+        if moved:
+            QUEUE_RETRY_TOTAL.labels(task_type=task_type).inc()
+            logger.info(
+                "Task re-queued for retry: id=%s (retry=%s/%d)",
+                fields.get("task_id", ""),
+                fields["retry_count"],
+                MAX_RETRIES,
+            )
+        return moved
 
     @staticmethod
     def _defer_delay(attempts: int, exc: RetryLaterError) -> float:
@@ -752,72 +779,74 @@ class QueueWorker:
 
     async def _defer_message(
         self,
+        claim: idempotency.Attempt,
         stream_id: str,
-        fields: dict[Any, Any],
-        task_id: str,
-        task_type: str,
-        payload_raw: str,
+        message: dict[str, str],
         exc: RetryLaterError,
     ) -> None:
-        """把"等一会儿再试"的任务放进延迟集合，稍后由 :meth:`_promote_delayed` 搬回主队列。
-
-        刻意**不递增** ``retry_count``：延迟重试不是失败，消耗失败预算会让一个
-        "本来只是要等"的任务在几次之后就进 DLQ（那正是修复前的行为）。
-        边界改由两处兜底：消息自带的 ``deadline``（到期进 DLQ）与 ``DELAY_MAX_ATTEMPTS``。
-        """
-        message = {
-            (k.decode() if isinstance(k, bytes) else k): (
-                v.decode() if isinstance(v, bytes) else v
-            )
-            for k, v in fields.items()
-        }
-        try:
-            attempts = _as_int(message.get("delay_count")) + 1
-        except (TypeError, ValueError):
-            attempts = 1
-
+        """Atomically defer without spending the ordinary failure retry budget."""
+        task_id = message.get("task_id", "")
+        task_type = message.get("task_type", "")
+        attempts = _as_int(message.get("delay_count")) + 1
         if attempts > DELAY_MAX_ATTEMPTS:
             logger.error(
-                "Task deferred %d times, giving up: id=%s type=%s reason=%s — "
-                "任务不会自动重试了（deadline/上限已到），需要人工重投",
-                attempts - 1, task_id, task_type, str(exc)[:200],
+                "Task deferred %d times, giving up: id=%s type=%s reason=%s",
+                attempts - 1,
+                task_id,
+                task_type,
+                str(exc)[:200],
             )
             await self._move_to_dlq(
-                task_id, task_type, payload_raw,
+                claim,
+                stream_id,
+                message,
                 f"deferred retry limit ({DELAY_MAX_ATTEMPTS}) reached: {exc}",
-                message.get("retry_count", "0"),
             )
-            await self._redis.xack(self._q.stream, self._q.group, stream_id)
             return
 
+        message = dict(message)
         message["delay_count"] = str(attempts)
         delay = self._defer_delay(attempts, exc)
+        member = json.dumps(message, ensure_ascii=False)
         try:
-            await self._redis.zadd(
-                self._q.delayed, {json.dumps(message, ensure_ascii=False): time.time() + delay}
+            deferred = await idempotency.defer(
+                self._redis,
+                claim,
+                source=self._q.stream,
+                target=self._q.delayed,
+                group=self._q.group,
+                consumer=self._consumer_name,
+                message_id=stream_id,
+                member=member,
+                score=time.time() + delay,
             )
-            await self._redis.xack(self._q.stream, self._q.group, stream_id)
-        except Exception as e:  # noqa: BLE001 - 延迟集合不可用：退回立即重投（至少不丢）
+        except Exception as fallback_error:  # noqa: BLE001
             logger.warning(
                 "Task defer failed (%s), falling back to immediate requeue: id=%s",
-                str(e)[:160], task_id,
+                str(fallback_error)[:160],
+                task_id,
             )
-            retry_count = _as_int(message.get("retry_count"))
-            if retry_count >= MAX_RETRIES:
-                await self._move_to_dlq(task_id, task_type, payload_raw,
-                                        f"defer failed and retries exhausted: {exc}",
-                                        retry_count)
+            if _as_int(message.get("retry_count")) >= MAX_RETRIES:
+                await self._move_to_dlq(
+                    claim,
+                    stream_id,
+                    message,
+                    f"defer failed and retries exhausted: {exc}",
+                )
             else:
-                requeue = dict(message)
-                requeue["retry_count"] = str(retry_count + 1)
-                requeue.pop("delay_count", None)
-                await self._redis.xadd(self._q.stream, requeue, maxlen=self._q.maxlen)
-                QUEUE_RETRY_TOTAL.labels(task_type=task_type).inc()
-            await self._redis.xack(self._q.stream, self._q.group, stream_id)
+                message.pop("delay_count", None)
+                await self._retry_message(claim, stream_id, message, task_type)
+            return
+        if not deferred:
             return
         logger.warning(
             "Task deferred %.0fs (attempt %d/%d): id=%s type=%s reason=%s",
-            delay, attempts, DELAY_MAX_ATTEMPTS, task_id, task_type, str(exc)[:160],
+            delay,
+            attempts,
+            DELAY_MAX_ATTEMPTS,
+            task_id,
+            task_type,
+            str(exc)[:160],
         )
 
     async def _delay_loop(self) -> None:
@@ -832,11 +861,7 @@ class QueueWorker:
                 logger.warning("worker delayed-retry loop error: %s", e)
 
     async def _promote_delayed(self, now: float | None = None) -> int:
-        """把到期的延迟任务搬回主队列，返回到期数量。
-
-        多实例并发是安全的：用 ``ZREM`` 的返回值做**原子抢占**，只有一个实例会重投。
-        抢到之后如果 ``XADD`` 失败，则把它放回延迟集合（下次再试）—— 绝不丢。
-        """
+        """Atomically promote due members; only one instance can remove each one."""
         ts = time.time() if now is None else now
         try:
             members: list[Any] = await self._redis.zrangebyscore(
@@ -847,25 +872,20 @@ class QueueWorker:
             return 0
         promoted = 0
         for raw in members or []:
+            member = raw.decode() if isinstance(raw, bytes) else str(raw)
             try:
-                claimed = await self._redis.zrem(self._q.delayed, raw)
+                added = await atomic_promote_delayed(
+                    self._redis,
+                    delayed=self._q.delayed,
+                    target=self._q.stream,
+                    member=member,
+                    maxlen=self._q.maxlen,
+                )
             except Exception as e:  # noqa: BLE001
-                logger.warning("worker delayed claim failed: %s", e)
+                logger.warning("worker delayed promotion failed: %s", e)
                 continue
-            if not claimed:
-                continue  # 其它实例已抢走
-            text = raw.decode() if isinstance(raw, bytes) else raw
-            try:
-                message = json.loads(text)
-                await self._redis.xadd(self._q.stream, message, maxlen=self._q.maxlen)
+            if added is not None:
                 promoted += 1
-            except Exception as e:  # noqa: BLE001 - 放回延迟集合，不丢
-                logger.warning("worker delayed requeue failed (%s), re-scheduling: %s",
-                               str(e)[:160], text[:160])
-                try:
-                    await self._redis.zadd(self._q.delayed, {text: time.time() + DELAY_BASE_SECONDS})
-                except Exception as e2:  # noqa: BLE001
-                    logger.error("worker delayed re-schedule failed, message lost: %s", e2)
         return promoted
 
     async def _dispatch(

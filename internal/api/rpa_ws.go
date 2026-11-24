@@ -115,8 +115,6 @@ const (
 	rpaCrossInstanceWait = 15 * time.Second // 远端实例命令等待上限（远端离线/无订阅时快速失败）
 )
 
-
-
 // RPAHub 管理本实例进程内的 RPA 插件连接，并桥接跨网关副本的命令/结果。
 type RPAHub struct {
 	mu      sync.RWMutex
@@ -164,14 +162,7 @@ func (h *RPAHub) Start(ctx context.Context) {
 	})
 }
 
-
-
-
 // ── Redis 注册中心 ──
-
-
-
-
 
 // Register 注册一个插件连接。返回 false 表示该 client_id 已被**其它用户**占用 ——
 // 拒绝顶替：否则他人用同一 id 连接即可顶掉原连接，并接管引擎发往该 id 的浏览器命令。
@@ -469,8 +460,6 @@ func (h *RPAHub) ClientIDsForUser(userID string) []string {
 	return ids
 }
 
-
-
 // ExecCommand sends a command to a connected browser extension and returns the result map.
 // This implements tools.RPABrowserHub interface, breaking the import cycle.
 func (h *RPAHub) ExecCommand(ctx context.Context, clientID string, method string, params map[string]interface{}, userID string) (map[string]interface{}, error) {
@@ -521,9 +510,9 @@ func RPAWebSocketHandler(hub *RPAHub, authenticator *auth.Authenticator) http.Ha
 			return
 		}
 
-		claims, err := authenticator.ValidateToken(token)
-		if err != nil || claims == nil {
-			http.Error(w, "invalid or missing token", http.StatusUnauthorized)
+		claims, authErr := validateWebSocketToken(r.Context(), authenticator, token, r.URL.Path)
+		if authErr != nil {
+			writeWebSocketAuthError(w, authErr)
 			return
 		}
 		userID := claims.UserID
@@ -533,6 +522,8 @@ func RPAWebSocketHandler(hub *RPAHub, authenticator *auth.Authenticator) http.Ha
 			slog.Warn("rpa ws upgrade", "error", err)
 			return
 		}
+		stopAuthMonitor := monitorWebSocketAuth(conn, claims, authenticator, token, r.URL.Path)
+		defer stopAuthMonitor()
 
 		client := &RPAClient{
 			ID:       clientID,
@@ -673,7 +664,7 @@ func RPAClientsHandler(hub *RPAHub, internalToken string) http.HandlerFunc {
 			return
 		}
 		// 归属过滤：引擎按其当前用户查询 —— 未带 user_id 时退化为全量（兼容旧引擎）。
-	OK(w, map[string]interface{}{"client_ids": hub.ClientIDsForUser(r.URL.Query().Get("user_id"))})
+		OK(w, map[string]interface{}{"client_ids": hub.ClientIDsForUser(r.URL.Query().Get("user_id"))})
 	}
 }
 

@@ -69,6 +69,7 @@ function mountPanel() {
         'a-button': {
           name: 'AButton',
           props: ['disabled'],
+          emits: ['click'],
           template: '<button type="button" :disabled="disabled" @click="$emit(\'click\')"><slot /></button>',
         },
         'a-input': {
@@ -81,7 +82,11 @@ function mountPanel() {
           props: ['value'],
           template: '<input type="password" :value="value" @input="$emit(\'update:value\', $event.target.value)" />',
         },
-        'a-modal': { name: 'AModal', props: ['open', 'title'], template: '<div v-if="open" class="modal"><slot /></div>' },
+        'a-modal': {
+          name: 'AModal',
+          props: ['open', 'title', 'closable', 'keyboard'],
+          template: '<div v-if="open" class="modal"><slot /></div>',
+        },
       },
     },
   })
@@ -96,6 +101,10 @@ beforeEach(() => {
     recoveryCodesLeft: 0,
     unreadable: false,
   })
+  deviceStoreMock.beginTwoFactor.mockResolvedValue({ ok: true, secret: 'JBSWY3DPEHPK3PXP', otpauth: 'otpauth://totp/x' })
+  deviceStoreMock.confirmTwoFactor.mockResolvedValue({ ok: true, recoveryCodes: ['AAAA-BBBB', 'CCCC-DDDD'] })
+  deviceStoreMock.disableTwoFactor.mockResolvedValue({ ok: true })
+  deviceStoreMock.regenerateRecoveryCodes.mockResolvedValue({ ok: true, recoveryCodes: ['EEEE-FFFF'] })
 })
 
 describe('TwoFactorPanel', () => {
@@ -126,6 +135,80 @@ describe('TwoFactorPanel', () => {
     expect(codes.exists(), '恢复码必须摆出来让用户抄 —— 丢了验证器时它是唯一出路').toBe(true)
     expect(codes.text()).toContain('AAAA-BBBB')
     expect(codes.text()).toContain('CCCC-DDDD')
+  })
+
+  it('★★ 确认期间禁止关闭，迟到成功的一次性恢复码不会丢', async () => {
+    let resolveConfirm: ((value: Record<string, unknown>) => void) | undefined
+    deviceStoreMock.confirmTwoFactor.mockImplementationOnce(() => new Promise(resolve => {
+      resolveConfirm = resolve
+    }))
+    const w = mountPanel()
+    await flushPromises()
+    await w.find('[data-test="tfa-enable"]').trigger('click')
+    await flushPromises()
+    await w.find('[data-test="tfa-confirm-input"]').setValue('123456')
+    await w.find('[data-test="tfa-confirm"]').trigger('click')
+    await flushPromises()
+
+    const enrollModal = w.findAllComponents({ name: 'AModal' })
+      .find(modal => modal.attributes('data-test') === 'tfa-enroll-modal')
+    expect(enrollModal).toBeDefined()
+    expect(enrollModal!.props('closable')).toBe(false)
+    expect(enrollModal!.props('keyboard')).toBe(false)
+    enrollModal!.vm.$emit('update:open', false)
+    await flushPromises()
+
+    expect(w.find('[data-test="tfa-enroll-modal"]').exists()).toBe(true)
+    resolveConfirm?.({ ok: true, recoveryCodes: ['ONLY-CODE'] })
+    await flushPromises()
+    expect(w.find('[data-test="tfa-recovery-codes"]').text()).toContain('ONLY-CODE')
+  })
+
+  it('取消启用会清掉候选密钥、二维码和验证码', async () => {
+    const w = mountPanel()
+    await flushPromises()
+    await w.find('[data-test="tfa-enable"]').trigger('click')
+    await flushPromises()
+    await w.find('[data-test="tfa-confirm-input"]').setValue('123456')
+
+    await w.find('[data-test="tfa-enroll-cancel"]').trigger('click')
+    await flushPromises()
+    deviceStoreMock.beginTwoFactor.mockResolvedValueOnce({
+      ok: true, secret: 'NEW-ENROLLMENT-SECRET', otpauth: 'otpauth://totp/new',
+    })
+    await w.find('[data-test="tfa-enable"]').trigger('click')
+    await flushPromises()
+    expect(deviceStoreMock.beginTwoFactor).toHaveBeenCalledTimes(2)
+
+    expect(w.find('[data-test="tfa-secret"]').text()).toContain('NEW-ENROLLMENT-SECRET')
+    expect(w.find('[data-test="tfa-secret"]').text()).not.toContain('JBSWY3DPEHPK3PXP')
+    expect(w.find('[data-test="tfa-confirm-input"]').element).toHaveProperty('value', '')
+  })
+
+  it('恢复码弹窗通过 X/Escape 关闭时也会清掉恢复码', async () => {
+    const w = mountPanel()
+    await flushPromises()
+    await w.find('[data-test="tfa-enable"]').trigger('click')
+    await flushPromises()
+    await w.find('[data-test="tfa-confirm-input"]').setValue('123456')
+    await w.find('[data-test="tfa-confirm"]').trigger('click')
+    await flushPromises()
+    expect(w.find('[data-test="tfa-recovery-codes"]').exists()).toBe(true)
+
+    const recoveryModal = w.findAllComponents({ name: 'AModal' })
+      .find(modal => modal.attributes('data-test') === 'tfa-recovery-modal')
+    expect(recoveryModal).toBeDefined()
+    recoveryModal!.vm.$emit('update:open', false)
+    await flushPromises()
+    deviceStoreMock.confirmTwoFactor.mockResolvedValueOnce({ ok: true, recoveryCodes: ['NEW-CODE'] })
+    await w.find('[data-test="tfa-enable"]').trigger('click')
+    await flushPromises()
+    await w.find('[data-test="tfa-confirm-input"]').setValue('123456')
+    await w.find('[data-test="tfa-confirm"]').trigger('click')
+    await flushPromises()
+
+    expect(w.find('[data-test="tfa-recovery-codes"]').text()).toContain('NEW-CODE')
+    expect(w.find('[data-test="tfa-recovery-codes"]').text()).not.toContain('AAAA-BBBB')
   })
 
   it('★★ 停用必须先验密码（旁人拿到未锁窗口也关不掉第二因素）', async () => {
@@ -172,6 +255,7 @@ describe('TwoFactorPanel', () => {
 
     // 弹窗仍在（还能再试），且给出了原因
     expect(w.find('[data-test="tfa-password-input"]').exists()).toBe(true)
+    expect(w.find('[data-test="tfa-password-input"]').element).toHaveProperty('value', '')
     expect(w.text()).toContain('密码不正确')
   })
 

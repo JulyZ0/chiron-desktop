@@ -1,6 +1,12 @@
 package api
 
-import "testing"
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
 
 // 「哪个字段该被响应脱敏」的回归 —— 这个包此前**没有任何测试文件**，所以下面那条缺陷
 // （登录/注册的 token 被打码）能在 CI 沉默很久。
@@ -27,6 +33,95 @@ func TestSensitiveFieldsKeepsClientCredentials(t *testing.T) {
 
 // 一次性交付凭据必须原样返回：后台「重置密码 / 建号」要把明文交给管理员。
 // 子串匹配曾让 temporary_password / initial_password 命中 "password" 被打成星号。
+// H85 契约必须走真实中间件，不能只测 sanitizeMap：旧 bug 正是 handler 已生成指纹，
+// 但 /v1/admin 响应缓冲阶段又按字段名把 key 打成星号。
+func TestLLMKeyPreviewContractThroughSanitizeMiddleware(t *testing.T) {
+	const plaintext = "sk-contract-secret-must-not-leak"
+	keyHash := llmKeyHash("openai", plaintext)
+	wantPreview := llmKeyPreviewMask + keyHash[:llmKeyPreviewHashSize]
+
+	handler := SanitizeResponseMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		OK(w, map[string]interface{}{
+			"keys": []map[string]interface{}{
+				llmKeyListItem("openai", keyHash, "active", "contract", 10),
+			},
+			// 探针：即使响应误带这些字段，真实中间件也必须继续脱敏。
+			"key":      plaintext,
+			"key_hash": keyHash,
+		})
+	}))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/admin/api-keys", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data struct {
+			Keys []map[string]interface{} `json:"keys"`
+			Key  string                   `json:"key"`
+			Hash string                   `json:"key_hash"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v (body=%s)", err, rec.Body.String())
+	}
+	if len(body.Data.Keys) != 1 {
+		t.Fatalf("keys 数量 = %d, want 1", len(body.Data.Keys))
+	}
+	item := body.Data.Keys[0]
+	if got := item["key_preview"]; got != wantPreview {
+		t.Errorf("key_preview = %v, want %q", got, wantPreview)
+	}
+	if got := item["id"]; got != keyHash[:12] {
+		t.Errorf("id = %v, want 12 位哈希前缀 %q", got, keyHash[:12])
+	}
+	if _, exists := item["key"]; exists {
+		t.Error("Provider Key 列表不得返回 key 字段")
+	}
+	if _, exists := item["key_hash"]; exists {
+		t.Error("Provider Key 列表不得返回 key_hash 字段")
+	}
+	if body.Data.Key != "********" || body.Data.Hash != "********" {
+		t.Errorf("敏感字段未脱敏: key=%q key_hash=%q", body.Data.Key, body.Data.Hash)
+	}
+	raw := rec.Body.String()
+	if strings.Contains(raw, plaintext) || strings.Contains(raw, keyHash) {
+		t.Fatalf("响应泄漏明文或完整哈希: %s", raw)
+	}
+}
+
+func TestSanitizeKeyPreviewOnlyAllowsTruncatedHash(t *testing.T) {
+	valid := llmKeyPreviewMask + "01234567"
+	for _, tc := range []struct {
+		name  string
+		value string
+		allow bool
+	}{
+		{"截断哈希", valid, true},
+		{"明文", "sk-plaintext-secret", false},
+		{"完整哈希", strings.Repeat("a", 64), false},
+		{"无掩码哈希", "01234567", false},
+		{"过长指纹", llmKeyPreviewMask + "0123456789", false},
+		{"过短指纹", llmKeyPreviewMask + "0123456", false},
+		{"非十六进制", llmKeyPreviewMask + "0123456g", false},
+		{"非规范大小写", llmKeyPreviewMask + "0123456A", false},
+		{"空串", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := map[string]interface{}{"key_preview": tc.value}
+			sanitizeMap(data)
+			want := tc.value
+			if !tc.allow {
+				want = "********"
+			}
+			if got := data["key_preview"]; got != want {
+				t.Errorf("key_preview = %v, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestSanitizeKeepsOneTimeDeliveryPasswords(t *testing.T) {
 	data := map[string]interface{}{
 		"temporary_password": "Temp-pass-123",

@@ -244,15 +244,9 @@ stage_frontend_full() {
     fi
     npm run check:ui || exit 1
 
-    # 存量已知错误：src/api/index.ts 的 IsolationHelperResult 族（P2 跟踪）。
-    # 只过滤这一族；其余任何 `error TS` 都必须让门禁红，否则 --noEmit 形同虚设。
-    out="$(npx vue-tsc --noEmit -p tsconfig.app.json 2>&1 || true)"
-    printf '%s\n' "$out"
-    remaining="$(printf '%s\n' "$out" | grep 'error TS' | grep -v 'IsolationHelperResult' || true)"
-    if [ -n "$remaining" ]; then
-      echo "   ✘ vue-tsc 报出非 IsolationHelperResult 的类型错误" >&2
-      exit 1
-    fi
+    # 与 PR / 桌面发布共用硬门禁；先注入失败，证明空输出和进程级错误也不会假绿。
+    node --test scripts/ci-typecheck.test.cjs || exit 1
+    bash scripts/ci-typecheck.sh || exit 1
 
     npx vitest run src || exit 1
     npx vite build

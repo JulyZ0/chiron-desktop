@@ -1,95 +1,140 @@
-"""任务幂等闸门（PG 唯一键）。
+"""Redis-backed exclusive task claims and fenced attempt transitions.
 
-背景：Redis Streams 消费组是 at-least-once——worker 执行成功但 ACK 前崩溃/被杀，
-消息会由本实例或其它实例的 reclaim 再次投递。缺少幂等约束时，有副作用的任务
-（tool_job / kb_index 等）会被重复执行：重复扣费、重复写文件、
-重复调用外部 API。
-
-策略：
-- 唯一键为 `idempotency_key`（消息字段 `idempotency_key`，缺省回退
-  `{task_type}:{task_id}`）；
-- 执行前 ``claim()``：首次插入 running；已存在且非 completed 时递增 attempt 并放行
-  （覆盖崩溃恢复与显式重试）；已 completed 时返回 False，调用方直接 ACK 丢弃重复消息；
-- 执行成功 ``complete()``，进入重试/进死信前 ``fail()``；
-- PG 不可用/未初始化时 fail-open（放行执行）并告警——幂等是加固，不应因数据库
-  抖动让任务无法执行。
-
-表由权威迁移 migrations/versions/0001_authoritative_baseline.py 创建。
+A claim is a lease with a unique token. Every completion, failure, or ACK checks
+both the token and PEL consumer, so a reclaimed attempt cannot mutate its successor.
+Completed keys suppress duplicate side effects for a bounded retention window.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import uuid
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
+
+import redis.asyncio as aioredis
 
 logger = logging.getLogger(__name__)
 
-_CLAIM_SQL = """
-INSERT INTO task_idempotency
-    (idempotency_key, task_id, task_type, tenant_id, status, attempt, created_at, updated_at)
-VALUES ($1, $2, $3, $4, 'running', 1, now(), now())
-ON CONFLICT (idempotency_key) DO UPDATE
-    SET attempt = task_idempotency.attempt + 1,
-        status = 'running',
-        updated_at = now()
-    WHERE task_idempotency.status <> 'completed'
-RETURNING idempotency_key
+RETENTION_SECONDS = max(1, int(os.getenv("QUEUE_IDEMPOTENCY_RETENTION_SECONDS", "2592000")))
+
+_CLAIM_LUA = """
+local kind = redis.call('TYPE', KEYS[1])['ok']
+if kind ~= 'none' and kind ~= 'hash' then
+    return redis.error_reply('WRONGTYPE idempotency state is not a hash')
+end
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local status = redis.call('HGET', KEYS[1], 'status')
+local attempt = tonumber(redis.call('HGET', KEYS[1], 'attempt') or '0')
+if status == 'completed' then
+    return {'completed', attempt}
+end
+local lease_until = tonumber(redis.call('HGET', KEYS[1], 'lease_until') or '0')
+if status == 'running' and lease_until > now then
+    return {'busy', attempt}
+end
+attempt = attempt + 1
+redis.call('HSET', KEYS[1],
+    'status', 'running',
+    'attempt', attempt,
+    'token', ARGV[1],
+    'task_id', ARGV[2],
+    'task_type', ARGV[3],
+    'tenant_id', ARGV[4],
+    'lease_until', now + tonumber(ARGV[5]),
+    'updated_at', now)
+redis.call('PEXPIRE', KEYS[1], ARGV[6])
+return {'acquired', attempt, ARGV[1]}
 """
 
-_COMPLETE_SQL = """
-UPDATE task_idempotency
-SET status = 'completed', result_ref = $2, updated_at = now()
-WHERE idempotency_key = $1
+_FAIL_LUA = """
+if redis.call('HGET', KEYS[1], 'status') ~= 'running'
+    or redis.call('HGET', KEYS[1], 'token') ~= ARGV[1] then
+    return 0
+end
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+redis.call('HSET', KEYS[1], 'status', 'failed', 'lease_until', 0, 'updated_at', now)
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
 """
 
-_FAIL_SQL = """
-UPDATE task_idempotency
-SET status = 'failed', updated_at = now()
-WHERE idempotency_key = $1
+_ACK_LUA = """
+if redis.call('HGET', KEYS[1], 'status') ~= 'running'
+    or redis.call('HGET', KEYS[1], 'token') ~= ARGV[1] then
+    return 0
+end
+local pending = redis.call('XPENDING', KEYS[2], ARGV[2], ARGV[4], ARGV[4], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[3] then
+    return 0
+end
+redis.call('XACK', KEYS[2], ARGV[2], ARGV[4])
+return 1
 """
 
+_ACK_COMPLETED_LUA = """
+if redis.call('HGET', KEYS[1], 'status') ~= 'completed' then
+    return 0
+end
+local pending = redis.call('XPENDING', KEYS[2], ARGV[1], ARGV[3], ARGV[3], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[2] then
+    return 0
+end
+redis.call('XACK', KEYS[2], ARGV[1], ARGV[3])
+return 1
+"""
 
-def key_for(task_type: str, task_id: str, explicit: str = "") -> str:
-    """幂等键：消息显式提供优先，否则回退 `{task_type}:{task_id}`。"""
-    if explicit:
-        return explicit
-    return f"{task_type}:{task_id}"
+_RENEW_LUA = """
+if redis.call('HGET', KEYS[1], 'status') ~= 'running'
+    or redis.call('HGET', KEYS[1], 'token') ~= ARGV[1] then
+    return 0
+end
+local pending = redis.call('XPENDING', KEYS[2], ARGV[2], ARGV[4], ARGV[4], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[3] then
+    return 0
+end
+local claimed = redis.call('XCLAIM', KEYS[2], ARGV[2], ARGV[3], 0, ARGV[4], 'JUSTID')
+if #claimed == 0 then
+    return 0
+end
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+redis.call('HSET', KEYS[1], 'lease_until', now + tonumber(ARGV[5]), 'updated_at', now)
+redis.call('PEXPIRE', KEYS[1], ARGV[6])
+return 1
+"""
 
-
-def _pool() -> Any:
-    """取 PG 池；不可用时抛异常（调用方 fail-open）。"""
-    from app.db import get_pool
-
-    return get_pool()
-
-
-async def claim(key: str, task_id: str, task_type: str, tenant_id: int) -> bool:
-    """抢占执行权。True=应执行；False=该键已 completed，调用方应跳过并 ACK。"""
-    try:
-        pool = _pool()
-    except Exception as e:  # noqa: BLE001 - 池未初始化/已关闭
-        logger.warning("idempotency disabled (db pool unavailable): %s", e)
-        return True
-    try:
-        row = await pool.fetchrow(_CLAIM_SQL, key, task_id, task_type, tenant_id)
-    except Exception as e:  # noqa: BLE001 - 表缺失/连接抖动：放行执行
-        logger.warning("idempotency claim failed (fail-open) key=%s: %s", key, e)
-        return True
-    if row is None:
-        logger.info("duplicate task skipped (already completed): key=%s", key)
-        return False
-    return True
-
-
-async def complete(key: str, result_ref: str = "") -> None:
-    """标记任务成功（幂等键终态）。"""
-    await _update(_COMPLETE_SQL, key, result_ref)
-
-
-async def fail(key: str) -> None:
-    """标记任务失败（仍可重试：claim 只拒绝 completed）。"""
-    await _update(_FAIL_SQL, key)
-
+_TRANSITION_LUA = """
+if redis.call('HGET', KEYS[1], 'status') ~= 'running'
+    or redis.call('HGET', KEYS[1], 'token') ~= ARGV[1] then
+    return 0
+end
+local pending = redis.call('XPENDING', KEYS[2], ARGV[2], ARGV[4], ARGV[4], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[3] then
+    return 0
+end
+if ARGV[5] == 'xadd' then
+    redis.call('XADD', KEYS[3], 'MAXLEN', ARGV[7], '*', unpack(ARGV, 11))
+elseif ARGV[5] == 'zadd' then
+    redis.call('ZADD', KEYS[3], ARGV[8], ARGV[11])
+elseif ARGV[5] ~= 'none' then
+    return redis.error_reply('unknown idempotency transition')
+end
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+redis.call('HSET', KEYS[1],
+    'status', ARGV[6],
+    'result_ref', ARGV[9],
+    'lease_until', 0,
+    'updated_at', now)
+redis.call('PEXPIRE', KEYS[1], ARGV[10])
+redis.call('XACK', KEYS[2], ARGV[2], ARGV[4])
+return 1
+"""
 
 _PURGE_SQL = """
 DELETE FROM task_idempotency
@@ -98,36 +143,355 @@ WHERE status <> 'running'
 """
 
 
-async def purge_older_than(days: int) -> int:
-    """删除保留期外已完结（completed/failed）的幂等记录，返回删除行数。
+class ClaimStatus(StrEnum):
+    ACQUIRED = "acquired"
+    BUSY = "busy"
+    COMPLETED = "completed"
 
-    running 不删：可能仍在执行或等待重试（claim 只拒绝 completed）。
-    A7/C1：该表每任务一行，长期运行必须清理，否则无限膨胀。
-    """
+
+@dataclass(frozen=True)
+class Attempt:
+    namespace: str
+    key: str
+    state_key: str
+    token: str
+    attempt: int
+
+
+@dataclass(frozen=True)
+class ClaimDecision:
+    status: ClaimStatus
+    claim: Attempt | None = None
+
+
+def key_for(task_type: str, task_id: str, explicit: str = "") -> str:
+    if explicit:
+        return explicit
+    return f"{task_type}:{task_id}"
+
+
+def state_key(namespace: str, key: str) -> str:
+    from app.redis_keys import rkey
+
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return rkey(f"queue:idempotency:{namespace}:{digest}")
+
+
+def _field_args(fields: dict[Any, Any]) -> list[str]:
+    return [
+        str(part)
+        for key, value in fields.items()
+        for part in (
+            key.decode() if isinstance(key, bytes) else key,
+            value.decode() if isinstance(value, bytes) else value,
+        )
+    ]
+
+
+async def claim(
+    redis: aioredis.Redis,
+    *,
+    namespace: str,
+    key: str,
+    task_id: str,
+    task_type: str,
+    tenant_id: int,
+    lease_seconds: int = 600,
+) -> ClaimDecision:
+    """Acquire an exclusive lease; Redis errors propagate rather than fail open."""
+    lease_ms = max(1, lease_seconds) * 1000
+    result = await redis.eval(
+        _CLAIM_LUA,
+        1,
+        state_key(namespace, key),
+        uuid.uuid4().hex,
+        task_id,
+        task_type,
+        str(tenant_id),
+        lease_ms,
+        RETENTION_SECONDS * 1000,
+    )
+    status = ClaimStatus(result[0].decode() if isinstance(result[0], bytes) else result[0])
+    attempt = int(result[1])
+    if status is not ClaimStatus.ACQUIRED:
+        return ClaimDecision(status)
+    token = result[2].decode() if isinstance(result[2], bytes) else str(result[2])
+    return ClaimDecision(
+        ClaimStatus.ACQUIRED,
+        Attempt(
+            namespace=namespace,
+            key=key,
+            state_key=state_key(namespace, key),
+            token=token,
+            attempt=attempt,
+        ),
+    )
+
+
+async def fail(redis: aioredis.Redis, claim: Attempt) -> bool:
+    """Release a failed current attempt so a retry can acquire the next one."""
+    result = await redis.eval(
+        _FAIL_LUA, 1, claim.state_key, claim.token, RETENTION_SECONDS * 1000
+    )
+    return bool(result)
+
+
+async def ack(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    stream: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+) -> bool:
+    result = await redis.eval(
+        _ACK_LUA,
+        2,
+        claim.state_key,
+        stream,
+        claim.token,
+        group,
+        consumer,
+        message_id,
+    )
+    return bool(result)
+
+
+async def ack_completed(
+    redis: aioredis.Redis,
+    *,
+    namespace: str,
+    key: str,
+    stream: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+) -> bool:
+    result = await redis.eval(
+        _ACK_COMPLETED_LUA,
+        2,
+        state_key(namespace, key),
+        stream,
+        group,
+        consumer,
+        message_id,
+    )
+    return bool(result)
+
+
+async def renew(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    *,
+    stream: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    lease_seconds: int,
+) -> bool:
+    """Renew the lease and PEL idle time only while token and consumer still match."""
+    result = await redis.eval(
+        _RENEW_LUA,
+        2,
+        claim.state_key,
+        stream,
+        claim.token,
+        group,
+        consumer,
+        message_id,
+        max(1, lease_seconds) * 1000,
+        RETENTION_SECONDS * 1000,
+    )
+    return bool(result)
+
+
+async def _transition(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    *,
+    source: str,
+    target: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    operation: str,
+    status: str,
+    fields: dict[Any, Any] | None = None,
+    maxlen: int = 0,
+    score: float = 0,
+    result_ref: str = "",
+) -> bool:
+    field_args = _field_args(fields or {})
+    if operation == "zadd":
+        field_args = [str(fields["member"] if fields and "member" in fields else "")]
+    result = await redis.eval(
+        _TRANSITION_LUA,
+        3,
+        claim.state_key,
+        source,
+        target,
+        claim.token,
+        group,
+        consumer,
+        message_id,
+        operation,
+        status,
+        maxlen,
+        score,
+        result_ref,
+        RETENTION_SECONDS * 1000,
+        *field_args,
+    )
+    return bool(result)
+
+
+async def complete(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    stream: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    result_ref: str = "",
+) -> bool:
+    return await _transition(
+        redis,
+        claim,
+        source=stream,
+        target=stream,
+        group=group,
+        consumer=consumer,
+        message_id=message_id,
+        operation="none",
+        status="completed",
+        result_ref=result_ref,
+    )
+
+
+async def retry(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    *,
+    source: str,
+    target: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    fields: dict[Any, Any],
+    maxlen: int,
+) -> bool:
+    return await _transition(
+        redis,
+        claim,
+        source=source,
+        target=target,
+        group=group,
+        consumer=consumer,
+        message_id=message_id,
+        operation="xadd",
+        status="failed",
+        fields=fields,
+        maxlen=maxlen,
+    )
+
+
+async def defer(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    *,
+    source: str,
+    target: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    member: str,
+    score: float,
+) -> bool:
+    return await _transition(
+        redis,
+        claim,
+        source=source,
+        target=target,
+        group=group,
+        consumer=consumer,
+        message_id=message_id,
+        operation="zadd",
+        status="failed",
+        fields={"member": member},
+        score=score,
+    )
+
+
+async def dead_letter(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    *,
+    source: str,
+    target: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    fields: dict[Any, Any],
+    maxlen: int,
+) -> bool:
+    return await _transition(
+        redis,
+        claim,
+        source=source,
+        target=target,
+        group=group,
+        consumer=consumer,
+        message_id=message_id,
+        operation="xadd",
+        status="failed",
+        fields=fields,
+        maxlen=maxlen,
+    )
+
+
+async def forward(
+    redis: aioredis.Redis,
+    claim: Attempt,
+    *,
+    source: str,
+    target: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    fields: dict[Any, Any],
+    maxlen: int,
+) -> bool:
+    return await _transition(
+        redis,
+        claim,
+        source=source,
+        target=target,
+        group=group,
+        consumer=consumer,
+        message_id=message_id,
+        operation="xadd",
+        status="completed",
+        fields=fields,
+        maxlen=maxlen,
+    )
+
+
+async def purge_older_than(days: int) -> int:
+    """Clean legacy PostgreSQL rows; Redis state expires via its retention TTL."""
     if days <= 0:
         return 0
     try:
-        pool = _pool()
-    except Exception:  # noqa: BLE001 - 无池（PG 未启用）时跳过
+        from app.db import get_pool
+
+        pool = get_pool()
+    except Exception:  # noqa: BLE001
         return 0
     try:
-        res = await pool.execute(_PURGE_SQL, days)
-    except Exception as e:  # noqa: BLE001 - 清理失败留待下一轮
-        logger.warning("idempotency purge failed: %s", e)
+        result = await pool.execute(_PURGE_SQL, days)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("legacy idempotency purge failed: %s", exc)
         return 0
-    # asyncpg / 统一客户端均返回 "DELETE <n>"
     try:
-        return int(str(res).split()[-1])
+        return int(str(result).split()[-1])
     except (ValueError, IndexError):
         return 0
-
-
-async def _update(sql: str, *args: Any) -> None:
-    try:
-        pool = _pool()
-    except Exception:  # noqa: BLE001 - 无池时无需记录状态
-        return
-    try:
-        await pool.execute(sql, *args)
-    except Exception as e:  # noqa: BLE001 - 状态更新失败不改变任务结果
-        logger.warning("idempotency update failed: %s", e)

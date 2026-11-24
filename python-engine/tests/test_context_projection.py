@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.agent.compaction import _apply_folds
+from app.agent.compaction import _apply_folds, make_fold_lineage
+
+LINEAGE_PROVIDER = "openai"
+LINEAGE_MODEL = "gpt-test"
+LINEAGE_WINDOW = 128_000
 
 
 def _m(role: str, content: str, seq: int | None = None, **extra: Any) -> dict[str, Any]:
@@ -41,6 +45,28 @@ def _fold(frm: int, to: int, digest: str = "- [user] 早前要点", body_suffix:
     }
 
 
+def _apply_trusted(
+    messages: list[dict[str, Any]], folds: list[dict[str, Any]], **kwargs: Any
+) -> list[dict[str, Any]] | None:
+    for fold in folds:
+        fold["lineage"] = make_fold_lineage(
+            messages,
+            int(fold["covered_from"]),
+            int(fold["covered_to"]),
+            provider=LINEAGE_PROVIDER,
+            model=LINEAGE_MODEL,
+            context_window=LINEAGE_WINDOW,
+        )
+    return _apply_folds(
+        messages,
+        folds,
+        provider=LINEAGE_PROVIDER,
+        model=str(kwargs.get("model") or ""),
+        lineage_model=LINEAGE_MODEL,
+        context_window=LINEAGE_WINDOW,
+    )
+
+
 # ── 正常路径 ──
 
 
@@ -48,7 +74,7 @@ def test_projection_replaces_covered_range_with_digest():
     """被折叠区间只剩摘要，尾部原样保留，system 提示仍在最前。"""
     messages = _conversation(6)
 
-    projected = _apply_folds(messages, [_fold(1, 4, body_suffix=3)])
+    projected = _apply_trusted(messages, [_fold(1, 4, body_suffix=3)])
 
     assert projected is not None
     assert projected[0]["role"] == "system", "冻结体（系统提示）必须留在最前"
@@ -69,8 +95,8 @@ def test_projection_is_idempotent():
     messages = _conversation(6)
     folds = [_fold(1, 4, body_suffix=3)]
 
-    first = _apply_folds(messages, folds)
-    second = _apply_folds(messages, folds)
+    first = _apply_trusted(messages, folds)
+    second = _apply_trusted(messages, folds)
 
     assert first == second
 
@@ -80,7 +106,7 @@ def test_multiple_contiguous_folds_are_all_summarized():
     messages = _conversation(8)
     folds = [_fold(1, 4, digest="- [user] 第一段", body_suffix=0), _fold(4, 7, digest="- [user] 第二段", body_suffix=2)]
 
-    projected = _apply_folds(messages, folds)
+    projected = _apply_trusted(messages, folds)
 
     assert projected is not None
     content = projected[1]["content"]
@@ -100,7 +126,7 @@ def test_gap_between_folds_fails_open():
     messages = _conversation(10)
     folds = [_fold(1, 4), _fold(5, 7)]  # 4 ≠ 5，断档
 
-    assert _apply_folds(messages, folds) is None
+    assert _apply_trusted(messages, folds) is None
 
 
 def test_tail_shorter_than_recorded_body_suffix_fails_open():
@@ -109,7 +135,7 @@ def test_tail_shorter_than_recorded_body_suffix_fails_open():
     # body_suffix=5 表示当时留了 5 条尾部，但 covered_to=6 之后只剩 1 条
     folds = [_fold(1, 6, body_suffix=5)]
 
-    assert _apply_folds(messages, folds) is None
+    assert _apply_trusted(messages, folds) is None
 
 
 def test_missing_seq_fails_open():
@@ -121,7 +147,26 @@ def test_missing_seq_fails_open():
         _m("user", "有坐标", seq=3),
     ]
 
-    assert _apply_folds(messages, [_fold(1, 2, body_suffix=2)]) is None
+    fold = _fold(1, 2, body_suffix=2)
+    fold["lineage"] = make_fold_lineage(
+        messages[1:2],
+        1,
+        2,
+        provider=LINEAGE_PROVIDER,
+        model=LINEAGE_MODEL,
+        context_window=LINEAGE_WINDOW,
+    )
+
+    assert (
+        _apply_folds(
+            messages,
+            [fold],
+            provider=LINEAGE_PROVIDER,
+            lineage_model=LINEAGE_MODEL,
+            context_window=LINEAGE_WINDOW,
+        )
+        is None
+    )
 
 
 def test_empty_digest_fails_open():
@@ -129,7 +174,7 @@ def test_empty_digest_fails_open():
     messages = _conversation(6)
     folds = [_fold(1, 4, digest="", body_suffix=3)]
 
-    assert _apply_folds(messages, folds) is None
+    assert _apply_trusted(messages, folds) is None
 
 
 def test_no_folds_returns_none():
@@ -147,7 +192,7 @@ def test_message_outside_any_fold_fails_open():
     # fold 只覆盖 1..3 和 5..7，seq=4 落在缝隙里
     folds = [_fold(1, 3, digest="- [user] 段一", body_suffix=0), _fold(5, 7, digest="- [user] 段二")]
 
-    assert _apply_folds(messages, folds) is None
+    assert _apply_trusted(messages, folds) is None
 
 
 def test_projection_that_is_not_smaller_returns_none():
@@ -159,4 +204,4 @@ def test_projection_that_is_not_smaller_returns_none():
 
     # model 为空时跳过预算比较，因此这里必须给出 model 才会触发该分支；
     # 用不存在的模型名时 estimator 会回落默认系数，仍能比较大小。
-    assert _apply_folds(messages, folds, model="gpt-4o") is None
+    assert _apply_trusted(messages, folds, model="gpt-4o") is None

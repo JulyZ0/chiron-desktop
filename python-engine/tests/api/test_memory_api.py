@@ -13,6 +13,7 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock, call
 
 import httpx
 import pytest
@@ -302,6 +303,23 @@ def seeded_app(seeded_svc, monkeypatch):
     return _make_app(seeded_svc)
 
 
+async def _create_conflict(client, *, tenant_id=1, user_id="u1", key="city"):
+    base = f"/v1/memory/profile?user_id={user_id}&tenant_id={tenant_id}"
+    await client.post(base, json={
+        "slot": "fact", "key": key, "value": "上海",
+        "confidence": 95, "source": "user_confirmed",
+    })
+    await client.post(base, json={
+        "slot": "fact", "key": key, "value": "北京",
+        "confidence": 50, "source": "derived",
+    })
+    response = await client.get(f"/v1/memory/conflicts?user_id={user_id}&tenant_id={tenant_id}")
+    assert response.status_code == 200
+    conflicts = response.json()["conflicts"]
+    assert len(conflicts) == 1
+    return conflicts[0]["conflict_id"]
+
+
 # ── L2 Profile API ────────────────────────────────────────────────────
 
 
@@ -582,6 +600,124 @@ class TestConflictAPI:
         async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
             r = await c.delete("/v1/memory/conflicts/nonexistent?user_id=u1&tenant_id=1")
             assert r.status_code == 404
+
+    async def test_conflict_calls_forward_tenant_and_user(self, app, svc, monkeypatch):
+        list_mock = AsyncMock(wraps=svc.list_conflicts_shared)
+        resolve_mock = AsyncMock(wraps=svc.resolve_conflict)
+        delete_mock = AsyncMock(wraps=svc.delete_conflict)
+        monkeypatch.setattr(svc, "list_conflicts_shared", list_mock)
+        monkeypatch.setattr(svc, "resolve_conflict", resolve_mock)
+        monkeypatch.setattr(svc, "delete_conflict", delete_mock)
+
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            conflict_id = await _create_conflict(c)
+            r = await c.post(
+                f"/v1/memory/conflicts/{conflict_id}/resolve?user_id=u1&tenant_id=1",
+                json={"resolution": "manual", "manual_value": "深圳"},
+            )
+            assert r.status_code == 200
+            conflict_id = await _create_conflict(c, key="language")
+            r = await c.delete(f"/v1/memory/conflicts/{conflict_id}?user_id=u1&tenant_id=1")
+            assert r.status_code == 200
+
+        assert list_mock.await_args_list == [call(1, "u1"), call(1, "u1")]
+        resolve_mock.assert_awaited_once()
+        assert resolve_mock.await_args is not None
+        resolved_id, *resolved_scope = resolve_mock.await_args.args
+        assert resolved_scope == [1, "u1", "manual", "深圳"]
+        delete_mock.assert_awaited_once_with(conflict_id, 1, "u1")
+        assert resolved_id != conflict_id
+
+    async def test_conflict_requires_verified_gateway_identity(self, app, svc, monkeypatch):
+        list_mock = AsyncMock(return_value=[])
+        monkeypatch.setattr(svc, "list_conflicts_shared", list_mock)
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.get(
+                "/v1/memory/conflicts?user_id=u1&tenant_id=1",
+                headers={"X-Internal-Token": ""},
+            )
+        assert r.status_code == 401
+        list_mock.assert_not_awaited()
+
+    async def test_conflict_scope_uses_authenticated_request_state(self, svc, monkeypatch):
+        import app.api.memory as mem_api
+        from app.config import settings
+        from app.middleware.auth import AuthMiddleware
+
+        monkeypatch.setattr(mem_api, "get_service", lambda: svc)
+        list_mock = AsyncMock(wraps=svc.list_conflicts_shared)
+        monkeypatch.setattr(svc, "list_conflicts_shared", list_mock)
+        authenticated_app = _make_app(svc)
+        authenticated_app.add_middleware(
+            AuthMiddleware,
+            internal_token=settings.internal_token,
+            jwt_secret=settings.jwt_secret,
+        )
+        async with httpx.AsyncClient(transport=ASGITransport(app=authenticated_app), base_url="http://t") as c:
+            r = await c.get("/v1/memory/conflicts?user_id=u1&tenant_id=7")
+            assert r.status_code == 200
+            list_mock.assert_awaited_once_with(7, "u1")
+            list_mock.reset_mock()
+            r = await c.get(
+                "/v1/memory/conflicts?user_id=u1&tenant_id=7",
+                headers={"X-Internal-Token": "wrong-token"},
+            )
+            assert r.status_code == 401
+            list_mock.assert_not_awaited()
+
+    @pytest.mark.parametrize("foreign_scope", ["u2&tenant_id=1", "u1&tenant_id=2"])
+    async def test_foreign_conflict_is_indistinguishable_from_missing(self, app, foreign_scope):
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            conflict_id = await _create_conflict(c)
+            foreign_list = await c.get(f"/v1/memory/conflicts?user_id={foreign_scope}")
+            assert foreign_list.status_code == 200
+            assert foreign_list.json()["conflicts"] == []
+
+            resolved = await c.post(
+                f"/v1/memory/conflicts/{conflict_id}/resolve?user_id={foreign_scope}",
+                json={"resolution": "manual", "manual_value": "攻击者值"},
+            )
+            deleted = await c.delete(f"/v1/memory/conflicts/{conflict_id}?user_id={foreign_scope}")
+            assert resolved.status_code == deleted.status_code == 404
+            assert "上海" not in resolved.text
+            assert "北京" not in resolved.text
+            assert "u1" not in resolved.text
+
+            owner_list = await c.get("/v1/memory/conflicts?user_id=u1&tenant_id=1")
+            assert owner_list.json()["count"] == 1
+            conflict = owner_list.json()["conflicts"][0]
+            assert conflict["conflict_id"] == conflict_id
+            assert conflict["old_value"] == "上海"
+            assert conflict["new_value"] == "北京"
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/v1/memory/conflicts"),
+            ("POST", "/v1/memory/conflicts/any/resolve"),
+            ("DELETE", "/v1/memory/conflicts/any"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "query",
+        ["", "?user_id=u1", "?tenant_id=1", "?user_id=u1&tenant_id=0", "?user_id=u1&tenant_id=invalid"],
+    )
+    async def test_conflict_missing_or_invalid_scope_fails_closed(
+        self, app, svc, monkeypatch, method, path, query
+    ):
+        list_mock = AsyncMock(return_value=[])
+        resolve_mock = AsyncMock(return_value={})
+        delete_mock = AsyncMock(return_value=False)
+        monkeypatch.setattr(svc, "list_conflicts_shared", list_mock)
+        monkeypatch.setattr(svc, "resolve_conflict", resolve_mock)
+        monkeypatch.setattr(svc, "delete_conflict", delete_mock)
+
+        async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.request(method, path + query, json={"resolution": "keep_old"})
+        assert r.status_code == 400
+        list_mock.assert_not_awaited()
+        resolve_mock.assert_not_awaited()
+        delete_mock.assert_not_awaited()
 
 
 # ── 错误处理 & 多租户 ────────────────────────────────────────────────

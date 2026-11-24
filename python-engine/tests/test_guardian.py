@@ -1,14 +1,16 @@
 """P2：guardian（工具执行前的 LLM 安全评审）单测。
 
-除了原有的"解析 / 放行底线"，本文件钉住三条 2026-11 的回归：
+除了原有的"解析 / 放行底线"，本文件钉住几条 2026-11 的回归：
 
-1. **标签不是证据**：`execute_python` 里只有 `print("hi")` 时，工具策略仍会保守地把它
-   标成 ``delete``；评审按代码内容说"没风险"时**必须放行**，不能因为标签 deny。
+1. **静态分级不可被内容评审覆盖**：解释器源码、复合命令、重定向和解析失败都保持
+   ``delete``；即使评审给出 allow + low，也必须回退人工审批。
 2. **理由与结论矛盾时不许 deny**：评审写"未发现删除/网络/凭据访问"却给 ``deny`` 时，
    归一为"未发现风险"（否则用户看到"理由说没问题，但还是被拒"）。
 3. **fail-open**：评审输出不可解析 ⇒ 回退人工审批，而不是 deny。
 4. **真实危险代码仍然过不去**：`rm -rf /`、读 `.env` 外传、反弹 shell 无论评审怎么说
    都不许被自动放行（参数级证据扫描）；评审明确 deny 时直接拒绝。
+5. **正常写操作不受影响**：静态可证明安全的单条 Shell 与普通 edit/write 仍按既有
+   write 级评审路径处理。
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from app.agent.guardian import (
     review_tool_call,
 )
 from app.agent.runtime import AgentRuntime
-from app.agent.tool_policy import DELETE, tool_level
+from app.agent.tool_policy import DELETE, WRITE, tool_level
 
 #: 用户报的原句（模型输出里的理由）—— 它自己承认"没风险"，却配了 deny。
 CONTRADICTORY_RAW = (
@@ -135,13 +137,22 @@ def test_may_release_never_releases_declared_delete_or_external() -> None:
     assert may_release("external", a) is False
 
 
-def test_may_release_inferred_delete_with_benign_content() -> None:
-    """推断级 delete（命令类工具）+ 代码干净 + 评审 low ⇒ 可免人工（标签误分类的正解）。"""
-    a = GuardianAssessment("allow", "low", "only prints a greeting")
-    assert may_release(DELETE, a, {"code": 'print("hello")'}, level_is_declared=False) is True
-    # 评审自己说 risk=high 则不自动放行（转人工）
+def test_may_release_never_releases_inferred_delete() -> None:
+    """内容推断的 delete 不是静态安全证明；评审 allow + low 也不能覆盖它。"""
+    low = GuardianAssessment("allow", "low", "only prints a greeting")
+    assert may_release(DELETE, low, {"code": 'print("hello")'}, level_is_declared=False) is False
     high = GuardianAssessment("allow", "high", "x")
     assert may_release(DELETE, high, {"code": 'print("hello")'}, level_is_declared=False) is False
+
+
+def test_may_release_inferred_write_requires_low_risk() -> None:
+    """静态解析已降为 write 的命令仍须评审 low；声明为 write 的普通工具保持原行为。"""
+    low = GuardianAssessment("allow", "low", "safe")
+    high = GuardianAssessment("allow", "high", "safe")
+    args = {"command": "ls -la"}
+    assert may_release(WRITE, low, args, level_is_declared=False) is True
+    assert may_release(WRITE, high, args, level_is_declared=False) is False
+    assert may_release(WRITE, high, args, level_is_declared=True) is True
 
 
 def test_may_release_refuses_real_danger_even_at_inferred_level() -> None:
@@ -213,14 +224,18 @@ def _task() -> Any:  # noqa: ANN401
     )
 
 
-def _exec_call(code: str) -> dict[str, Any]:
+def _tool_call(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
     import json
 
     return {
         "id": "tc-exec-1",
-        "name": "execute_python",
-        "arguments": json.dumps({"code": code}),
+        "name": tool_name,
+        "arguments": json.dumps(args),
     }
+
+
+def _exec_call(code: str) -> dict[str, Any]:
+    return _tool_call("execute_python", {"code": code})
 
 
 def _patch_broker(monkeypatch: pytest.MonkeyPatch, *, requires_user_approval: bool) -> None:
@@ -269,24 +284,118 @@ def _patch_runtime(
     return runtime
 
 
-async def test_greeting_with_stale_delete_label_is_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """用户报的原始场景：无隔离 + `execute_python` 只打印问候语 ⇒ 必须执行。"""
+async def test_python_source_requires_approval_despite_guardian_allow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """解释器源码不是静态安全单命令；即使代码只打印且评审 allow + low 也要人工确认。"""
     code = 'print("hello, world")'
-    # 先证明"历史/误分类标签"确实存在：工具策略把它标成 delete（命令无法归类 ⇒ 保守）
     assert tool_level("execute_python", {"code": code}) == DELETE
 
     _patch_broker(monkeypatch, requires_user_approval=False)
     executed: list[str] = []
     assessment = parse_assessment(CONTRADICTORY_RAW)
-    assert assessment.outcome == "allow", "自述无风险的 deny 必须先被归一"
+    assert assessment.outcome == "allow" and assessment.risk_level == "low"
     runtime = _patch_runtime(monkeypatch, assessment, executed=executed)
 
     result, approval = await runtime._guarded_execute_tool(
         _exec_call(code), _task(), allow_approval=True
     )
-    assert approval is None, "评审说没风险时不该再弹确认"
+    assert result is None
+    assert approval is not None and approval.type == "approval"
+    assert executed == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("shell_exec", {"command": "echo safe && touch owned.txt"}),
+        ("shell_exec", {"command": "echo safe > owned.txt"}),
+        ("shell_exec", {"command": "FOO=bar echo safe"}),
+        ("shell_exec", {"command": "echo $(touch owned.txt)"}),
+        ("shell_exec", {"command": "python -c \"print('hello')\""}),
+        ("shell_exec", {"command": "echo 'unterminated"}),
+        ("persistent_shell", {"command": "echo safe && touch owned.txt"}),
+        ("run_code", {"code": 'print("hello")'}),
+    ],
+)
+async def test_unproven_commands_require_approval_despite_guardian_allow(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    args: dict[str, Any],
+) -> None:
+    """复合/重定向/赋值/替换/解析失败/解释器源码均不能靠 LLM 的 low 判断降级。"""
+    assert tool_level(tool_name, args) == DELETE
+    assert evidence_risk(args) is None, "用例必须绕过旧证据正则，单独钉住本次断点"
+
+    _patch_broker(monkeypatch, requires_user_approval=False)
+    executed: list[str] = []
+    runtime = _patch_runtime(
+        monkeypatch, GuardianAssessment("allow", "low", "looks safe"), executed=executed
+    )
+
+    result, approval = await runtime._guarded_execute_tool(
+        _tool_call(tool_name, args), _task(), allow_approval=True
+    )
+    assert result is None
+    assert approval is not None and approval.type == "approval"
+    assert executed == []
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "command"),
+    [
+        ("shell_exec", "ls -la"),
+        ("shell_exec", "echo 'a; b'"),
+        ("shell_exec", "git status"),
+        ("shell_exec", "python --version"),
+        ("execute_command", "cat README.md"),
+        ("persistent_shell", "dir"),
+    ],
+)
+async def test_statically_safe_shell_commands_still_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    command: str,
+) -> None:
+    args = {"command": command}
+    assert tool_level(tool_name, args) == WRITE
+    executed: list[str] = []
+    runtime = _patch_runtime(
+        monkeypatch, GuardianAssessment("allow", "low", "safe"), executed=executed
+    )
+
+    result, approval = await runtime._guarded_execute_tool(
+        _tool_call(tool_name, args), _task(), allow_approval=True
+    )
+    assert approval is None
     assert result == {"ok": True}
-    assert executed == ["execute_python"]
+    assert executed == [tool_name]
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("edit_file", {"path": "notes.txt", "old_string": "old", "new_string": "new"}),
+        ("write_file", {"path": "notes.txt", "content": "hello"}),
+    ],
+)
+async def test_regular_edit_and_write_still_execute(
+    monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
+    args: dict[str, Any],
+) -> None:
+    assert tool_level(tool_name, args) == WRITE
+    executed: list[str] = []
+    runtime = _patch_runtime(
+        monkeypatch, GuardianAssessment("allow", "low", "safe"), executed=executed
+    )
+
+    result, approval = await runtime._guarded_execute_tool(
+        _tool_call(tool_name, args), _task(), allow_approval=True
+    )
+    assert approval is None
+    assert result == {"ok": True}
+    assert executed == [tool_name]
 
 
 async def test_rm_rf_is_denied_by_reviewer(monkeypatch: pytest.MonkeyPatch) -> None:

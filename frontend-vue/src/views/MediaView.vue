@@ -9,7 +9,7 @@ import {
   SearchOutlined, CloudUploadOutlined, FolderOutlined, FileOutlined,
   FolderAddOutlined, LeftOutlined, RightOutlined, TagOutlined, PictureOutlined,
 } from '@ant-design/icons-vue'
-import { api, resolveMediaUrl, API_URL } from '../api'
+import { api, resolveMediaUrl, invalidateMediaUrl, isMediaUrlExpired, API_URL } from '../api'
 import { serverErrorMessage } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
 import { useMediaUpload } from '../composables/useMediaUpload'
@@ -160,7 +160,7 @@ function absUrl(url: string): string {
 // ── 签名 URL 解析（安全改造：/media/ 公开路径 → 短时效签名 URL；非 /media/ 前缀原样）──
 const resolvedUrls = ref<Record<string, string>>({})
 const resolvingIds = new Set<string>()
-const fallbackIds = new Set<string>()
+const failedSignedUrls = new Set<string>()
 
 /** resolveMediaUrl 结果归一化：相对路径补 API_URL 前缀；失败回退原 file_url */
 function normalizeResolved(url: string, item: MediaItem): string {
@@ -171,14 +171,17 @@ function normalizeResolved(url: string, item: MediaItem): string {
   return url
 }
 
-async function resolveItemUrl(item: MediaItem) {
+async function resolveItemUrl(item: MediaItem, force = false) {
   if (resolvingIds.has(item.id)) return
   resolvingIds.add(item.id)
   try {
-    const url = await resolveMediaUrl({ id: item.id, file_url: item.file_url })
-    if (url) resolvedUrls.value[item.id] = normalizeResolved(url, item)
+    const url = await resolveMediaUrl({ id: item.id, file_url: item.file_url }, force)
+    const needsSignature = (item.file_url || '').startsWith('/media/')
+    if (url && (!needsSignature || url.includes('/media/s/'))) {
+      resolvedUrls.value[item.id] = normalizeResolved(url, item)
+    }
   } catch {
-    // 静默失败，使用原 file_url 回退
+    resolvedUrls.value[item.id] = ''
   } finally {
     resolvingIds.delete(item.id)
   }
@@ -191,26 +194,47 @@ function resolveAllUrls() {
   }
 }
 
-/** 渲染用 URL：签名 URL 优先；未解析时懒解析并以原路径占位；失败回退原 file_url */
+/** 渲染用 URL：签名 URL 就绪前不请求已移除的 /media/ 公开路径。 */
 function itemUrl(item: MediaItem): string {
-  const r = resolvedUrls.value[item.id]
-  if (r) {
-    return r
-  }
-  if (!fallbackIds.has(item.id) && (item.file_url || '').startsWith('/media/')) {
+  const resolved = resolvedUrls.value[item.id]
+  if (resolved) return resolved
+  if ((item.file_url || '').startsWith('/media/')) {
     void resolveItemUrl(item)
+    return ''
   }
-  // 如果还没有解析完成，暂时返回原 file_url（会在解析完成后重新渲染）
   return absUrl(item.file_url)
 }
 
-/** 图片加载失败回退：签名 URL 失效 → 回退公开路径原图；原图也失败 → 隐藏 */
-function onImgError(e: Event, item: MediaItem) {
+async function reSignExpiredUrl(item: MediaItem, failedUrl: string): Promise<boolean> {
+  if (!failedUrl || failedSignedUrls.has(failedUrl)) return false
+  failedSignedUrls.add(failedUrl)
+  let expired = isMediaUrlExpired(failedUrl)
+  if (!expired) {
+    try {
+      const response = await fetch(failedUrl, {
+        cache: 'no-store',
+        credentials: 'omit',
+        headers: { Range: 'bytes=0-0' },
+      })
+      const body = response.status === 403 ? await response.text() : ''
+      expired = response.status === 403 && body.includes('link expired')
+    } catch {
+      return false
+    }
+  }
+  if (!expired) return false
+  invalidateMediaUrl(item.id)
+  resolvedUrls.value[item.id] = ''
+  await resolveItemUrl(item, true)
+  return !!resolvedUrls.value[item.id]
+}
+
+/** 过期签名只重签一次；404、无效签名与永久加载失败不再回退公开路径。 */
+async function onImgError(e: Event, item: MediaItem) {
   const el = e.target as HTMLImageElement
-  const raw = absUrl(item.file_url)
-  if (resolvedUrls.value[item.id] && el.src !== raw) {
-    resolvedUrls.value[item.id] = ''
-    fallbackIds.add(item.id)
+  const failedUrl = resolvedUrls.value[item.id] || ''
+  if (await reSignExpiredUrl(item, failedUrl)) {
+    el.style.display = ''
     return
   }
   el.style.display = 'none'
@@ -1594,7 +1618,7 @@ onUnmounted(() => {
             />
             <div class="card-thumb">
               <img
-                v-if="isImage(item) && !isFolder(item)"
+                v-if="isImage(item) && !isFolder(item) && itemUrl(item)"
                 :src="itemUrl(item)"
                 :alt="item.name"
                 loading="lazy"
@@ -1684,7 +1708,7 @@ onUnmounted(() => {
       <template v-if="detailItem">
         <div class="detail-thumb">
           <img
-            v-if="isImage(detailItem) && !isFolder(detailItem)"
+            v-if="isImage(detailItem) && !isFolder(detailItem) && itemUrl(detailItem)"
             :src="itemUrl(detailItem)"
             :alt="detailItem.name"
             @error="onImgError($event, detailItem)"
@@ -1889,6 +1913,7 @@ onUnmounted(() => {
           <LeftOutlined />
         </button>
         <img
+          v-if="itemUrl(lightboxItem)"
           :src="itemUrl(lightboxItem)"
           :alt="lightboxItem.name"
           class="lb-img"

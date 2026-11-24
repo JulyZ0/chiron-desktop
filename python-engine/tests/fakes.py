@@ -401,6 +401,7 @@ class InMemoryConflictManager:
             "tenant_id": conflict.tenant_id,
             "user_id": conflict.user_id,
             "created_at": conflict.created_at,
+            "project": conflict.project,
         }
         return True
 
@@ -417,6 +418,7 @@ class InMemoryConflictManager:
             tenant_id=d["tenant_id"],
             user_id=d["user_id"],
             created_at=d["created_at"],
+            project=d.get("project", ""),
         )
 
     async def get_pending_conflicts(self, tenant_id, user_id):
@@ -426,15 +428,23 @@ class InMemoryConflictManager:
             if d["tenant_id"] == tenant_id and d["user_id"] == user_id
         ]
 
-    async def get_conflict(self, conflict_id):
+    async def get_conflict(self, conflict_id, tenant_id, user_id):
         d = self.by_id.get(conflict_id)
-        return self._as_conflict(d) if d else None
+        if d is None or d["tenant_id"] != tenant_id or d["user_id"] != user_id:
+            return None
+        return self._as_conflict(d)
 
-    async def resolve_conflict(self, conflict_id, resolution, manual_value=None):
-        d = self.by_id.pop(conflict_id, None)
-        if d is None:
+    async def resolve_conflict(
+        self, conflict_id, tenant_id, user_id, resolution, manual_value=None
+    ):
+        d = self.by_id.get(conflict_id)
+        if d is None or d["tenant_id"] != tenant_id or d["user_id"] != user_id:
             return False, None
+        self.by_id.pop(conflict_id, None)
         return True, {"conflict_id": conflict_id, "resolution": resolution}
 
-    async def delete_conflict(self, conflict_id) -> bool:
+    async def delete_conflict(self, conflict_id, tenant_id, user_id) -> bool:
+        d = self.by_id.get(conflict_id)
+        if d is None or d["tenant_id"] != tenant_id or d["user_id"] != user_id:
+            return False
         return self.by_id.pop(conflict_id, None) is not None

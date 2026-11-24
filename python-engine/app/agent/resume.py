@@ -98,11 +98,13 @@ async def load_resume_state(
     snapshot = await ckpt.load(tenant_id=tenant_id, session_id=session_id)
     #: 挂起现场的旧 token（非空 = 这次读到的就是"等人"的那一份）
     awaiting_token = ""
+    awaiting_generation = 0
     if snapshot is None and run_token:
         found = await ckpt.load_awaiting(tenant_id=tenant_id, session_id=session_id)
         if found:
             snapshot = found["checkpoint"]
             awaiting_token = str(found["run_token"] or "")
+            awaiting_generation = int(found.get("generation") or 0)
     if not snapshot:
         return None
 
@@ -113,7 +115,8 @@ async def load_resume_state(
             # `mark()` 的谓词只认活跃状态 ⇒ 对挂起行是 0 命中；不单独收尾就会永远停在
             # `awaiting_input`，之后每一次 run 都白读一遍这份超窗现场。
             await ckpt.release_awaiting(
-                tenant_id=tenant_id, session_id=session_id, run_token=awaiting_token
+                tenant_id=tenant_id, session_id=session_id, run_token=awaiting_token,
+                generation=awaiting_generation,
             )
         else:
             await ckpt.mark(
@@ -131,7 +134,8 @@ async def load_resume_state(
         # 快照损坏 / 空：同样回落现状（并把原因写清楚，别让"没续跑"看起来像"续跑了"）
         if awaiting_token:
             await ckpt.release_awaiting(
-                tenant_id=tenant_id, session_id=session_id, run_token=awaiting_token
+                tenant_id=tenant_id, session_id=session_id, run_token=awaiting_token,
+                generation=awaiting_generation,
             )
         logger.warning("checkpoint for session=%s is unusable (empty) — falling back", session_id)
         return None
@@ -140,7 +144,8 @@ async def load_resume_state(
         # 接手：`awaiting_input → resuming`。抢不到说明有别的回合已经拿了这份现场
         # （或会话上已有活跃 run 撞了唯一索引）⇒ 这一轮**不**拿它续跑，走普通路径。
         if not await ckpt.claim_awaiting(
-            tenant_id=tenant_id, session_id=session_id, new_run_token=run_token
+            tenant_id=tenant_id, session_id=session_id, new_run_token=run_token,
+            expected_run_token=awaiting_token, expected_generation=awaiting_generation,
         ):
             logger.info(
                 "awaiting checkpoint not claimed (session=%s) — another run took it over",
@@ -428,7 +433,8 @@ async def sweep_once(
     try:
         rows = await pool.fetch(
             """
-            SELECT session_id, tenant_id, status, checkpoint, run_token
+            SELECT session_id, tenant_id, status, checkpoint, run_token,
+                   COALESCE((checkpoint->>'generation')::int, 0) AS generation
               FROM agent_runs
              WHERE status IN ('running', 'checkpointed', 'resuming')
                AND COALESCE(checkpoint_at, updated_at, created_at)
@@ -449,18 +455,23 @@ async def sweep_once(
         tenant_id = to_tenant_int(row["tenant_id"])
         if not session_id:
             continue
+        scanned_token = str(row["run_token"] or "")
+        scanned_generation = int(row.get("generation") or 0)
         # `resuming` 是 claim() 的交接中间态：写它的进程要么在同一轮把它推成
         # checkpointed/终态，要么崩在这里。跨进程崩溃后 run_token 已随进程消失，
         # 而 claim() 只接受 running/checkpointed ⇒ 这行永远无法再被接管。
         # 直接标 abandoned（可见），否则它会一直占着同会话的唯一活跃位。
         if str(row["status"]) == ckpt.STATUS_RESUMING:
-            await ckpt.mark(
+            marked = await ckpt.mark(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 status=ckpt.STATUS_ABANDONED,
+                run_token=scanned_token,
+                generation=scanned_generation,
             )
-            stats["abandoned"] += 1
-            _count("abandoned")
+            if marked:
+                stats["abandoned"] += 1
+                _count("abandoned")
             logger.warning(
                 "reconciler: session=%s 停在 resuming（交接进程已死）→ abandoned", session_id
             )
@@ -475,13 +486,16 @@ async def sweep_once(
             window = ckpt.resume_window(cast("RunCheckpoint", parsed)) if parsed else "abandoned"
 
             if window == "abandoned":
-                await ckpt.mark(
+                marked = await ckpt.mark(
                     tenant_id=tenant_id,
                     session_id=session_id,
                     status=ckpt.STATUS_ABANDONED,
+                    run_token=scanned_token,
+                    generation=scanned_generation,
                 )
-                stats["abandoned"] += 1
-                _count("abandoned")
+                if marked:
+                    stats["abandoned"] += 1
+                    _count("abandoned")
                 logger.warning(
                     "reconciler: session=%s 快照已超冷窗口 → abandoned（可见）", session_id
                 )
@@ -492,7 +506,8 @@ async def sweep_once(
                 claimed = await ckpt.claim(
                     tenant_id=tenant_id,
                     session_id=session_id,
-                    expected_run_token=str(row["run_token"] or ""),
+                    expected_run_token=scanned_token,
+                    expected_generation=scanned_generation,
                     new_run_token=new_token,
                 )
                 if claimed:
@@ -526,6 +541,7 @@ async def sweep_once(
                             session_id=session_id,
                             status=ckpt.STATUS_CHECKPOINTED,
                             run_token=new_token,
+                            generation=scanned_generation + 1,
                         )
                         if released:
                             stats["released"] += 1
@@ -543,13 +559,16 @@ async def sweep_once(
                         "reconciler: session=%s 快照缺 task_meta，无法自动续跑 → 标记可续跑",
                         session_id,
                     )
-                    await ckpt.mark(
+                    released = await ckpt.mark(
                         tenant_id=tenant_id,
                         session_id=session_id,
                         status=ckpt.STATUS_CHECKPOINTED,
+                        run_token=new_token,
+                        generation=scanned_generation + 1,
                     )
-                    stats["revived"] += 1
-                    _count("revived")
+                    if released:
+                        stats["revived"] += 1
+                        _count("revived")
                     continue
                 # CAS 没抢到：说明**另一个实例正在接管** —— 这里必须什么都不做。
                 # （`mark()` 的条件包含 `resuming`，此时再标记会把对方刚抢到的现场覆盖掉。）
@@ -559,13 +578,20 @@ async def sweep_once(
 
             # 冷窗口 / 未开启自动续跑 / 没提供 runner：交给**用户重试**走入口恢复
             if str(row["status"]) == ckpt.STATUS_RUNNING and parsed is not None:
-                await ckpt.mark(
+                marked = await ckpt.mark(
                     tenant_id=tenant_id,
                     session_id=session_id,
                     status=ckpt.STATUS_CHECKPOINTED,
+                    run_token=scanned_token,
+                    generation=scanned_generation,
                 )
-            stats["revived"] += 1
-            _count("revived")
+                if marked:
+                    stats["revived"] += 1
+                    _count("revived")
+                continue
+            if str(row["status"]) == ckpt.STATUS_CHECKPOINTED:
+                stats["revived"] += 1
+                _count("revived")
             logger.info(
                 "reconciler: session=%s 旧主已不在 → 标记为可续跑（等用户重试）", session_id
             )

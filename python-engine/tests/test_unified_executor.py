@@ -6,10 +6,17 @@
 """
 from __future__ import annotations
 
+from copy import deepcopy
+from unittest.mock import AsyncMock
+from uuid import UUID
+
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 import app.main  # noqa: F401 — 初始化 app 包，避免循环导入
-from app.api.unified_executor import UnifiedChatHandler, get_chat_handler
+from app.api import unified_executor
+from app.api.unified_executor import ChatSession, UnifiedChatHandler, get_chat_handler
+from app.config import settings
 
 TENANT = "tenant-exec-test"
 
@@ -72,7 +79,7 @@ async def test_submit_creates_session_and_records_history():
     assert res["success"] is True
     assert res["trace_id"], "未提供 trace_id 时必须自动生成"
     session_id = res["session_id"]
-    session = handler.sessions[session_id]
+    session = handler.sessions[_cache_key(TENANT, TENANT, session_id)]
     assert session.tenant_id == TENANT
     assert session.title == user_input[:50]
     assert [m["role"] for m in session.messages] == ["user", "assistant"]
@@ -88,7 +95,7 @@ async def test_submit_reuses_existing_session():
     )
     assert second["session_id"] == first["session_id"]
     # 两次对话都应留在同一会话历史中 (2 轮 user+assistant)
-    assert len(handler.sessions[first["session_id"]].messages) == 4
+    assert len(handler.sessions[_cache_key(TENANT, TENANT, first["session_id"])].messages) == 4
 
 
 async def test_get_session_messages_not_found():
@@ -171,6 +178,444 @@ async def test_get_session_messages_cross_user_db_path_blocked():
     query = pool.fetchrow.call_args[0][0]
     assert "tenant_id = $2" in query
     assert "user_id = $3" in query, "DB 路径缺少 user 归属条件"
+
+
+# ── H26 session owner enforcement ──────────────────────────────────
+
+
+OWNER_SESSION_ID = str(UUID("2d48966d-8494-4d9d-bd1c-3f5c0bb38e8a"))
+OWNER_USER_ID = str(UUID("0f8fad5b-d9cb-469f-a165-0ddeb9fca4b2"))
+OTHER_USER_ID = str(UUID("7a6a35b2-18b4-4e8f-a4f6-29d5567b624d"))
+OWNER_TENANT_ID = 17
+OTHER_TENANT_ID = 18
+
+
+def _cache_key(tenant_id, user_id, session_id):
+    return (str(tenant_id), str(user_id or tenant_id), session_id)
+
+
+class _SessionPool:
+    def __init__(self, rows, *, fetchrow_error: Exception | None = None):
+        self._rows = list(rows)
+        self._default_row = self._rows[-1] if self._rows else None
+        self._fetchrow_error = fetchrow_error
+        self.fetchrow_calls: list[tuple[str, tuple]] = []
+        self.execute_calls: list[tuple[str, tuple]] = []
+        self.fetch_calls: list[tuple[str, tuple]] = []
+
+    async def fetchrow(self, query, *args):
+        self.fetchrow_calls.append((query, args))
+        if self._fetchrow_error is not None:
+            raise self._fetchrow_error
+        if self._rows:
+            result = self._rows.pop(0)
+        else:
+            result = self._default_row
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    async def execute(self, query, *args):
+        self.execute_calls.append((query, args))
+        return "INSERT 0 1"
+
+    async def fetch(self, query, *args):
+        self.fetch_calls.append((query, args))
+        return []
+
+
+def _owned_session_row(*, tenant_id=OWNER_TENANT_ID, user_id=OWNER_USER_ID):
+    return {
+        "id": OWNER_SESSION_ID,
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "title": "private session",
+        "mode": "auto",
+        "shared_context": {"private": "context"},
+        "created_at": 1.0,
+        "updated_at": 2.0,
+    }
+
+
+def _successful_router_result():
+    return {
+        "task_id": "task-owner-test",
+        "status": "completed",
+        "total_duration_ms": 1,
+        "subtasks": [],
+        "output": {"outputs": [{"output": {"answer": "ok"}}]},
+    }
+
+
+def _mock_session_writes(handler, monkeypatch):
+    writes = {
+        name: AsyncMock()
+        for name in ("_db_ensure_session", "_db_append_message", "_db_touch_session")
+    }
+    for name, mock in writes.items():
+        monkeypatch.setattr(handler, name, mock)
+    return writes
+
+
+@pytest.mark.parametrize(
+    ("tenant_id", "user_id"),
+    [
+        (OTHER_TENANT_ID, OWNER_USER_ID),
+        (OWNER_TENANT_ID, OTHER_USER_ID),
+    ],
+)
+async def test_submit_rejects_cached_session_for_other_owner(monkeypatch, tenant_id, user_id):
+    handler = UnifiedChatHandler()
+    session = ChatSession(
+        session_id=OWNER_SESSION_ID,
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OWNER_USER_ID,
+        mode="auto",
+        messages=[{"role": "user", "content": "private message"}],
+        updated_at=123.0,
+        shared_context={"private": "context"},
+    )
+    handler.sessions[_cache_key(OWNER_TENANT_ID, OWNER_USER_ID, OWNER_SESSION_ID)] = session
+    before = deepcopy((session.messages, session.shared_context, session.mode, session.updated_at))
+    handler.router.route_task = AsyncMock(return_value=_successful_router_result())
+    writes = _mock_session_writes(handler, monkeypatch)
+
+    result = await handler.submit_task(
+        "attacker input",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=OWNER_SESSION_ID,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "not_found"
+    assert result["error"] == "Session not found"
+    assert (session.messages, session.shared_context, session.mode, session.updated_at) == before
+    handler.router.route_task.assert_not_awaited()
+    for write in writes.values():
+        write.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("row", "tenant_id", "user_id"),
+    [
+        (_owned_session_row(tenant_id=OTHER_TENANT_ID), OWNER_TENANT_ID, OWNER_USER_ID),
+        (_owned_session_row(user_id=OTHER_USER_ID), OWNER_TENANT_ID, OWNER_USER_ID),
+    ],
+)
+async def test_submit_rejects_restored_session_for_other_owner(
+    monkeypatch, row, tenant_id, user_id
+):
+    pool = _SessionPool([row])
+    monkeypatch.setattr(unified_executor, "get_pool", lambda: pool)
+    handler = UnifiedChatHandler()
+    handler.router.route_task = AsyncMock(return_value=_successful_router_result())
+    writes = _mock_session_writes(handler, monkeypatch)
+
+    result = await handler.submit_task(
+        "attacker input",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        session_id=OWNER_SESSION_ID,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "not_found"
+    assert pool.fetchrow_calls[0][1] == (OWNER_SESSION_ID, tenant_id, user_id)
+    assert "tenant_id = $2" in pool.fetchrow_calls[0][0]
+    assert "user_id = $3" in pool.fetchrow_calls[0][0]
+    assert _cache_key(tenant_id, user_id, OWNER_SESSION_ID) not in handler.sessions
+    handler.router.route_task.assert_not_awaited()
+    for write in writes.values():
+        write.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("recheck_result", "error_code"),
+    [(None, "not_found"), (RuntimeError("db unavailable"), "session_unavailable")],
+)
+async def test_submit_rechecks_restored_owner_before_any_write(
+    monkeypatch, recheck_result, error_code
+):
+    pool = _SessionPool([_owned_session_row(), recheck_result])
+    monkeypatch.setattr(unified_executor, "get_pool", lambda: pool)
+    handler = UnifiedChatHandler()
+    handler.router.route_task = AsyncMock(return_value=_successful_router_result())
+    writes = _mock_session_writes(handler, monkeypatch)
+
+    result = await handler.submit_task(
+        "input after ownership change",
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OWNER_USER_ID,
+        session_id=OWNER_SESSION_ID,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == error_code
+    assert len(pool.fetchrow_calls) == 2
+    assert all(call[1] == (OWNER_SESSION_ID, OWNER_TENANT_ID, OWNER_USER_ID) for call in pool.fetchrow_calls)
+    assert _cache_key(OWNER_TENANT_ID, OWNER_USER_ID, OWNER_SESSION_ID) not in handler.sessions
+    handler.router.route_task.assert_not_awaited()
+    for write in writes.values():
+        write.assert_not_awaited()
+
+
+async def test_submit_restores_owned_uuid_and_scopes_every_db_write(monkeypatch):
+    pool = _SessionPool([_owned_session_row()])
+    monkeypatch.setattr(unified_executor, "get_pool", lambda: pool)
+    monkeypatch.setattr(unified_executor, "publish_result", AsyncMock())
+    handler = UnifiedChatHandler()
+    handler.router.route_task = AsyncMock(return_value=_successful_router_result())
+
+    result = await handler.submit_task(
+        "continue my session",
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OWNER_USER_ID,
+        session_id=OWNER_SESSION_ID,
+    )
+
+    assert result["success"] is True
+    session = handler.sessions[_cache_key(OWNER_TENANT_ID, OWNER_USER_ID, OWNER_SESSION_ID)]
+    assert session.user_id == OWNER_USER_ID
+    assert [message["role"] for message in session.messages] == ["user", "assistant"]
+    write_calls = [
+        call
+        for call in [*pool.execute_calls, *pool.fetchrow_calls]
+        if call[0].startswith("INSERT INTO unified_messages")
+        or call[0].startswith("UPDATE unified_sessions")
+    ]
+    assert len(write_calls) == 3
+    for query, args in write_calls:
+        assert "tenant_id = $2" in query
+        assert "user_id = $3" in query
+        assert args[:3] == (OWNER_SESSION_ID, OWNER_TENANT_ID, OWNER_USER_ID)
+
+
+async def test_submit_foreign_session_conflict_writes_nothing(monkeypatch):
+    pool = _SessionPool([None, None])
+    monkeypatch.setattr(unified_executor, "get_pool", lambda: pool)
+    handler = UnifiedChatHandler()
+    handler.router.route_task = AsyncMock(return_value=_successful_router_result())
+
+    result = await handler.submit_task(
+        "take over an existing foreign id",
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OWNER_USER_ID,
+        session_id=OWNER_SESSION_ID,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "not_found"
+    assert handler.sessions == {}
+    assert len(pool.fetchrow_calls) == 2
+    assert len(pool.execute_calls) == 1
+    assert pool.execute_calls[0][0].startswith("INSERT INTO unified_sessions")
+    handler.router.route_task.assert_not_awaited()
+
+
+async def test_submit_db_failure_uses_owner_scoped_memory_session(monkeypatch):
+    def _db_unavailable():
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(unified_executor, "get_pool", _db_unavailable)
+    monkeypatch.setattr(unified_executor, "publish_result", AsyncMock())
+    handler = UnifiedChatHandler()
+    handler.router.route_task = AsyncMock(return_value=_successful_router_result())
+
+    owned = await handler.submit_task(
+        "input while db is unavailable",
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OWNER_USER_ID,
+        session_id=OWNER_SESSION_ID,
+    )
+    assert owned["success"] is True
+    owner_key = _cache_key(OWNER_TENANT_ID, OWNER_USER_ID, OWNER_SESSION_ID)
+    session = handler.sessions[owner_key]
+    before = deepcopy((session.messages, session.shared_context))
+
+    blocked = await handler.submit_task(
+        "cross-user input with the same uuid",
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OTHER_USER_ID,
+        session_id=OWNER_SESSION_ID,
+    )
+
+    assert blocked["success"] is False
+    assert blocked["error_code"] == "not_found"
+    assert (session.messages, session.shared_context) == before
+    assert _cache_key(OWNER_TENANT_ID, OTHER_USER_ID, OWNER_SESSION_ID) not in handler.sessions
+    assert handler.router.route_task.await_count == 1
+
+    owned_history = await handler.get_session_messages(
+        OWNER_SESSION_ID,
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OWNER_USER_ID,
+    )
+    blocked_history = await handler.get_session_messages(
+        OWNER_SESSION_ID,
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OTHER_USER_ID,
+    )
+    assert owned_history["success"] is True
+    assert len(owned_history["messages"]) == 2
+    assert blocked_history["success"] is False
+    assert blocked_history["error_code"] == "not_found"
+    assert (session.messages, session.shared_context) == before
+
+
+@pytest.mark.parametrize("operation", ["message", "context"])
+async def test_db_message_and_context_writes_require_owner(monkeypatch, operation):
+    pool = _SessionPool([None])
+    monkeypatch.setattr(unified_executor, "get_pool", lambda: pool)
+    handler = UnifiedChatHandler()
+
+    with pytest.raises(unified_executor._SessionNotFoundError):
+        if operation == "message":
+            await handler._db_append_message(
+                OWNER_SESSION_ID,
+                OWNER_TENANT_ID,
+                OWNER_USER_ID,
+                "user",
+                "private input",
+                {},
+            )
+        else:
+            await handler._db_touch_session(
+                OWNER_SESSION_ID,
+                OWNER_TENANT_ID,
+                OWNER_USER_ID,
+                "auto",
+                {"private": "context"},
+            )
+
+    query, args = pool.fetchrow_calls[0]
+    assert "tenant_id = $2" in query
+    assert "user_id = $3" in query
+    assert args[:3] == (OWNER_SESSION_ID, OWNER_TENANT_ID, OWNER_USER_ID)
+
+
+@pytest.mark.parametrize(
+    ("tenant_id", "user_id"),
+    [
+        (OTHER_TENANT_ID, OWNER_USER_ID),
+        (OWNER_TENANT_ID, OTHER_USER_ID),
+    ],
+)
+async def test_load_uuid_for_other_owner_is_uniform_not_found(monkeypatch, tenant_id, user_id):
+    pool = _SessionPool([None])
+    monkeypatch.setattr(unified_executor, "get_pool", lambda: pool)
+    handler = UnifiedChatHandler()
+
+    result = await handler.get_session_messages(
+        OWNER_SESSION_ID,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+
+    assert result["success"] is False
+    assert result["error_code"] == "not_found"
+    assert result["error"] == "Session not found"
+    assert pool.fetchrow_calls[0][1] == (OWNER_SESSION_ID, tenant_id, user_id)
+    assert pool.fetch_calls == []
+
+
+async def test_load_message_query_keeps_owner_scope(monkeypatch):
+    row = _owned_session_row()
+    pool = _SessionPool([row])
+    monkeypatch.setattr(unified_executor, "get_pool", lambda: pool)
+    handler = UnifiedChatHandler()
+
+    result = await handler.get_session_messages(
+        OWNER_SESSION_ID,
+        tenant_id=OWNER_TENANT_ID,
+        user_id=OWNER_USER_ID,
+    )
+
+    assert result["success"] is True
+    query, args = pool.fetch_calls[0]
+    assert "JOIN unified_sessions" in query
+    assert "tenant_id = $2" in query
+    assert "user_id = $3" in query
+    assert args[:3] == (OWNER_SESSION_ID, OWNER_TENANT_ID, OWNER_USER_ID)
+
+
+async def test_submit_chat_rejects_query_body_user_mismatch(monkeypatch):
+    class _Request:
+        query_params = {"tenant_id": str(OWNER_TENANT_ID), "user_id": OWNER_USER_ID}
+
+        async def json(self):
+            return {
+                "message": "input",
+                "tenant_id": OWNER_TENANT_ID,
+                "user_id": OTHER_USER_ID,
+            }
+
+    handler = AsyncMock()
+    monkeypatch.setattr(unified_executor, "get_chat_handler", lambda: handler)
+
+    result = await unified_executor.submit_chat(_Request())
+
+    assert result["success"] is False
+    assert result["error"] == "user_id mismatch"
+    handler.submit_task.assert_not_awaited()
+
+
+async def test_http_cross_user_session_access_writes_nothing(monkeypatch):
+    def _db_unavailable():
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(unified_executor, "get_pool", _db_unavailable)
+    monkeypatch.setattr(unified_executor, "publish_result", AsyncMock())
+    handler = UnifiedChatHandler()
+    handler.router.route_task = AsyncMock(return_value=_successful_router_result())
+    monkeypatch.setattr(unified_executor, "get_chat_handler", lambda: handler)
+    headers = {"X-Internal-Token": settings.internal_token}
+    owner_params = {"tenant_id": str(OWNER_TENANT_ID), "user_id": OWNER_USER_ID}
+    other_params = {**owner_params, "user_id": OTHER_USER_ID}
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app.main.create_app()),
+        base_url="http://test",
+        headers=headers,
+    ) as client:
+        owned = await client.post(
+            "/v1/chat/submit",
+            params=owner_params,
+            json={"session_id": OWNER_SESSION_ID, "message": "private message"},
+        )
+        assert owned.status_code == 200
+        assert owned.json()["success"] is True
+        session = handler.sessions[_cache_key(OWNER_TENANT_ID, OWNER_USER_ID, OWNER_SESSION_ID)]
+        before = deepcopy((session.messages, session.shared_context, session.mode, session.updated_at))
+
+        blocked_submit = await client.post(
+            "/v1/chat/submit",
+            params=other_params,
+            json={"session_id": OWNER_SESSION_ID, "message": "must not be written"},
+        )
+        assert blocked_submit.status_code == 200
+        assert blocked_submit.json()["success"] is False
+        assert blocked_submit.json()["error_code"] == "not_found"
+        assert blocked_submit.json()["error"] == "Session not found"
+
+        blocked_history = await client.get(
+            f"/v1/chat/sessions/{OWNER_SESSION_ID}/messages", params=other_params
+        )
+        assert blocked_history.status_code == 200
+        assert blocked_history.json()["success"] is False
+        assert blocked_history.json()["error_code"] == "not_found"
+        assert "messages" not in blocked_history.json()
+
+        owned_history = await client.get(
+            f"/v1/chat/sessions/{OWNER_SESSION_ID}/messages", params=owner_params
+        )
+        assert owned_history.status_code == 200
+        assert owned_history.json()["success"] is True
+        assert owned_history.json()["messages"] == session.messages
+
+    assert (session.messages, session.shared_context, session.mode, session.updated_at) == before
+    assert _cache_key(OWNER_TENANT_ID, OTHER_USER_ID, OWNER_SESSION_ID) not in handler.sessions
+    assert handler.router.route_task.await_count == 1
 
 
 # ── auto 模式 (TaskRouter,已实现) ───────────────────────────────────
@@ -283,7 +728,7 @@ async def test_all_subtasks_failed_must_not_become_success():
     assert "empty response" in res["error"]
     # 失败前真实花掉的用量仍要带回，不能因为失败就整笔丢掉
     assert res["usage"]["model"] == "deepseek-chat"
-    last = handler.sessions[res["session_id"]].messages[-1]
+    last = handler.sessions[_cache_key(TENANT, TENANT, res["session_id"])].messages[-1]
     assert last["role"] == "assistant"
     assert "执行失败" in last["content"]
 
@@ -352,7 +797,7 @@ async def test_agent_mode_llm_error_fails_loud(monkeypatch):
     assert res["success"] is False
     assert "Agent execution failed" in res["error"]
     # 失败必须进入会话历史,便于用户看到原因
-    session = handler.sessions[res["session_id"]]
+    session = handler.sessions[_cache_key(TENANT, TENANT, res["session_id"])]
     assert session.messages[-1].get("error")
 
 

@@ -9,9 +9,12 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -102,6 +105,10 @@ class CompactionConfig:
     #: 本次压缩针对的模型名（C4）：非空时 token 估算走该模型的**校准系数**，
     #: 空则用历史近似（4 chars ≈ 1 token）。
     model: str = ""
+    #: Provider lineage is explicit; an unknown provider makes a fold untrusted for projection.
+    provider: str = ""
+    #: Raw model context window, not the input budget after output/error reserves.
+    context_window: int = 0
     threshold_ratio: float = PRUNE_THRESHOLD
     snipe_ratio: float = SNIP_THRESHOLD
     tool_result_max_chars: int = TOOL_RESULT_MAX_CHARS
@@ -117,6 +124,116 @@ class CompactionConfig:
     #: 由调用方（`runtime._compact_with_notice`）按同一套估算器算出后填入；直接调
     #: `_compact_messages` 的调用方（含测试）保持 0，行为不变。
     tools_tokens: int = 0
+
+
+FOLD_LINEAGE_VERSION = 1
+_PREFIX_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_PROJECTION_INSTALL_LOCK = threading.RLock()
+
+
+def _digest_payload(payload: Any) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(b"chiron:compaction:v1\0" + encoded).hexdigest()
+
+
+def _ordered_non_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        (message for message in messages if message.get("role") != "system"),
+        key=lambda message: int(message["seq"]),
+    )
+
+
+def covered_prefix_digest(
+    messages: list[dict[str, Any]], covered_from: int, covered_to: int
+) -> str:
+    """Hash the exact half-open message range that a fold replaces."""
+    covered = [
+        message
+        for message in _ordered_non_system(messages)
+        if covered_from <= int(message["seq"]) < covered_to
+    ]
+    return _digest_payload(covered)
+
+
+def projection_source_digest(messages: list[dict[str, Any]]) -> str:
+    """Hash the complete source snapshot used as a projection CAS token."""
+    return _digest_payload(messages)
+
+
+def _resolve_lineage_context(
+    *, provider: str = "", model: str = "", context_window: int = 0
+) -> tuple[str, str, int]:
+    if not provider or not model or context_window <= 0:
+        from app.tools.context import get_tool_context
+
+        provider = provider or str(get_tool_context("llm_provider", "") or "").strip()
+        model = model or str(get_tool_context("llm_model", "") or "").strip()
+    if context_window <= 0 and model:
+        from app.agent.model_window import cached_window
+
+        context_window = int(cached_window(model) or 0)
+    return provider, model, context_window
+
+
+def make_fold_lineage(
+    messages: list[dict[str, Any]],
+    covered_from: int,
+    covered_to: int,
+    *,
+    provider: str,
+    model: str,
+    context_window: int,
+) -> dict[str, Any]:
+    """Create the lineage binding persisted alongside a fold summary."""
+    if covered_to <= covered_from:
+        raise ValueError("fold range must be non-empty")
+    return {
+        "version": FOLD_LINEAGE_VERSION,
+        "provider": str(provider or ""),
+        "model": str(model or ""),
+        "context_window": int(context_window or 0),
+        "covered_from": int(covered_from),
+        "covered_to": int(covered_to),
+        "covered_prefix_digest": covered_prefix_digest(
+            messages, int(covered_from), int(covered_to)
+        ),
+    }
+
+
+def _fold_lineage_matches(
+    fold: dict[str, Any],
+    messages: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+    context_window: int,
+) -> bool:
+    lineage = fold.get("lineage")
+    if not isinstance(lineage, dict) or not provider or not model or context_window <= 0:
+        return False
+    if lineage.get("version") != FOLD_LINEAGE_VERSION:
+        return False
+    digest = lineage.get("covered_prefix_digest")
+    if not isinstance(digest, str) or not _PREFIX_DIGEST_RE.fullmatch(digest):
+        return False
+    try:
+        expected = make_fold_lineage(
+            messages,
+            int(fold["covered_from"]),
+            int(fold["covered_to"]),
+            provider=provider,
+            model=model,
+            context_window=context_window,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    return lineage == expected
 
 
 def _to_chat_messages(messages: list[dict[str, Any]]) -> list[ChatMessage]:
@@ -775,6 +892,7 @@ def _prune_messages(
     *,
     dropped: list[tuple[str, str]] | None = None,
     folds: list[dict[str, Any]] | None = None,
+    lineage_messages: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Prune 阶段：不区分消息类型，保留系统提示 + 最近非系统消息
 
@@ -1014,11 +1132,18 @@ def _prune_messages(
     # 库里就无从判断"这段原文是被哪次摘要覆盖而离开上下文的"。跨副本重建
     # 上下文时也依赖它才知道该拼多少条原样尾部（body_suffix）。
     if folds is not None and dropped_count > 0 and seq_range_ok:
+        provider, lineage_model, context_window = _resolve_lineage_context(
+            provider=cfg.provider,
+            model=cfg.model,
+            context_window=cfg.context_window,
+        )
+        covered_from = int(min(covered_seqs))
+        covered_to = int(max(covered_seqs)) + 1
         folds.append(
             {
                 # 半开区间 [min, max+1)：seq 单调，所以首尾就够定界。
-                "covered_from": int(min(covered_seqs)),
-                "covered_to": int(max(covered_seqs)) + 1,
+                "covered_from": covered_from,
+                "covered_to": covered_to,
                 "covered_ids": covered_ids,
                 # 折叠发生**之后**仍在上下文里的尾部条数。投影 =
                 # [冻结体][活动摘要][原样尾部]，缺了它拼接就会错位。
@@ -1030,6 +1155,14 @@ def _prune_messages(
                 "digest": _extractive_digest(processed[:start]),
                 "digest_model": "extractive",
                 "digest_prompt": "prune",
+                "lineage": make_fold_lineage(
+                    lineage_messages or messages,
+                    covered_from,
+                    covered_to,
+                    provider=provider,
+                    model=lineage_model,
+                    context_window=context_window,
+                ),
                 # 区间原文**只在内存里**带出去：同步层算不了模型摘要（`_prune_messages`
                 # 还被当作 `on_overflow` 回调传入，接不了 await），但原文在这里之后
                 # 就只剩 `covered_ids`，async 层再也取不回来。调用方用完后必须 pop 掉
@@ -1149,6 +1282,9 @@ def _apply_folds(
     folds: list[dict[str, Any]],
     *,
     model: str = "",
+    provider: str = "",
+    context_window: int = 0,
+    lineage_model: str = "",
 ) -> list[dict[str, Any]] | None:
     """把已折叠区间换成摘要，返回投影 `[冻结体(系统提示)][活动摘要][原样尾部]`。
 
@@ -1166,6 +1302,9 @@ def _apply_folds(
        也没留在尾部，会凭空消失；
     3. 尾部条数不少于最后一次折叠记录的 `body_suffix` —— 该字段是当时留下的
        原样条数，少于它说明数据比记录时还少，投影不可信。
+
+    每条 fold 还必须完整绑定当前 provider/model/window 与 covered-prefix digest；
+    缺 lineage 的旧记录可继续读取和排查，但不能作为可信投影安装。
     """
     system_msgs = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
@@ -1181,6 +1320,21 @@ def _apply_folds(
 
     ordered = sorted(rest, key=lambda m: int(m["seq"]))
     ordered_folds = sorted(folds, key=lambda f: int(f["covered_from"]))
+    savings_model = model
+    provider, model, context_window = _resolve_lineage_context(
+        provider=provider, model=lineage_model or model, context_window=context_window
+    )
+    if any(
+        not _fold_lineage_matches(
+            fold,
+            ordered,
+            provider=provider,
+            model=model,
+            context_window=context_window,
+        )
+        for fold in ordered_folds
+    ):
+        return None
 
     # 校验 2：首尾相接
     for prev, cur in zip(ordered_folds, ordered_folds[1:], strict=False):
@@ -1272,11 +1426,57 @@ def _apply_folds(
     projected = system_msgs + [summary] + progress_msgs + tail
 
     # 投影必须真的更省，否则用全量（避免摘要质量差时反而变长）
-    if model and _estimate_tokens(projected, model=model) >= _estimate_tokens(
-        messages, model=model
+    if savings_model and _estimate_tokens(projected, model=savings_model) >= _estimate_tokens(
+        messages, model=savings_model
     ):
         return None
     return projected
+
+
+def build_fold_projection(
+    messages: list[dict[str, Any]],
+    folds: list[dict[str, Any]],
+    *,
+    expected_source_digest: str,
+    model: str = "",
+    provider: str = "",
+    context_window: int = 0,
+) -> list[dict[str, Any]] | None:
+    """Validate and build a projection without mutating the source snapshot."""
+    if not expected_source_digest or projection_source_digest(messages) != expected_source_digest:
+        return None
+    return _apply_folds(
+        copy.deepcopy(messages),
+        folds,
+        model=model,
+        provider=provider,
+        context_window=context_window,
+    )
+
+
+def install_fold_projection(
+    messages: list[dict[str, Any]],
+    folds: list[dict[str, Any]],
+    *,
+    expected_source_digest: str,
+    model: str = "",
+    provider: str = "",
+    context_window: int = 0,
+) -> list[dict[str, Any]] | None:
+    """Install a validated projection in place only if its source snapshot still matches."""
+    with _PROJECTION_INSTALL_LOCK:
+        projected = build_fold_projection(
+            messages,
+            folds,
+            expected_source_digest=expected_source_digest,
+            model=model,
+            provider=provider,
+            context_window=context_window,
+        )
+        if projected is None or projection_source_digest(messages) != expected_source_digest:
+            return None
+        messages[:] = projected
+        return messages
 
 
 def _compact_messages(
@@ -1300,17 +1500,23 @@ def _compact_messages(
 
     from app.agent.media_offload import truncate_tool_call_arguments
 
+    # The lineage digest must cover persisted bytes, not request-only argument truncation.
+    lineage_messages = messages
     # C2 段 c：先截断历史工具调用参数（保留 JSON 骨架 + 标注）。放在 `strategy` 判定之后，
     # 是因为"显式声明不压缩"应当被尊重；而它本身不是压缩 —— 是"别把明知没用的字节反复发出去"。
     messages = truncate_tool_call_arguments(messages, cfg)
     if cfg.strategy == "snipe":
         return _snip_tool_results(messages, cfg, dropped=dropped)
     if cfg.strategy == "prune":
-        return _prune_messages(messages, cfg, dropped=dropped, folds=folds)
+        return _prune_messages(
+            messages, cfg, dropped=dropped, folds=folds, lineage_messages=lineage_messages
+        )
 
     # auto：硬上限（无论 token 使用率多少，消息数不能超过 cfg.max_messages）
     if len(messages) > cfg.max_messages:
-        return _prune_messages(messages, cfg, dropped=dropped, folds=folds)
+        return _prune_messages(
+            messages, cfg, dropped=dropped, folds=folds, lineage_messages=lineage_messages
+        )
 
     # Token-based 压缩
     #
@@ -1346,7 +1552,9 @@ def _compact_messages(
             cfg.max_context_tokens,
             trigger_ratio * 100,
         )
-        return _prune_messages(messages, cfg, dropped=dropped, folds=folds)
+        return _prune_messages(
+            messages, cfg, dropped=dropped, folds=folds, lineage_messages=lineage_messages
+        )
     elif ratio >= snipe_ratio:
         logger.info(
             "Compact SNIP at %.0f%% (%d/%d tokens)",

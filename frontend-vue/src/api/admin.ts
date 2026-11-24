@@ -110,11 +110,10 @@ export interface PerformanceStats {
 export interface ApiKey {
   id: string
   provider: string
+  /** 网关返回的截断哈希指纹（固定为五个掩码字符 + 八位十六进制），不是明文 Key。 */
   key_preview: string
   status: 'active' | 'rate_limited' | 'circuit_open'
   weight: number
-  failures: number
-  last_used: string
   remark: string
 }
 

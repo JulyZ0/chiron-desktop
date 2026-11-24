@@ -701,10 +701,13 @@ export async function uploadFile(file: File): Promise<{
     const { createChunkUpload } = await import('../utils/uploader')
     const handle = await createChunkUpload(file, { purpose: 'media' })
     const done = await handle.done
-    const id = done.asset_id || done.upload_id
+    if (!done || typeof done.asset_id !== 'string' || !done.asset_id
+      || typeof done.file_url !== 'string' || !done.file_url) {
+      throw new Error('invalid chunk upload response')
+    }
     return {
-      id,
-      url: done.file_url || `/v1/media/${id}/download`,
+      id: done.asset_id,
+      url: done.file_url,
       name: file.name,
       size: done.size || file.size,
       mimeType: file.type,
@@ -716,17 +719,23 @@ export async function uploadFile(file: File): Promise<{
   // S 修复：不要手动设 multipart Content-Type（会丢 boundary 致 "invalid form"），
   // 让浏览器/axios 自动生成带 boundary 的正确头。
   const resp = await api.post('/v1/media/upload', form)
-  const d = resp.data?.asset || resp.data || {}
-  const id = d.id || d.asset_id || String(Date.now())
-  // 后端返回字段 file_url；兜底 /v1/media/{id}/download
-  const url = d.file_url || d.url || d.download_url || `/v1/media/${id}/download`
+  const envelope = resp.data as { success?: boolean; data?: Record<string, unknown> }
+  const d = envelope?.success === true ? envelope.data : undefined
+  const id = typeof d?.id === 'string' ? d.id : ''
+  const url = typeof d?.file_url === 'string' ? d.file_url : ''
+  if (!d || !id || !url) throw new Error('invalid media upload response')
+  const name = typeof d.name === 'string' && d.name
+    ? d.name
+    : typeof d.filename === 'string' && d.filename ? d.filename : file.name
+  const mimeType = typeof d.mime_type === 'string' && d.mime_type
+    ? d.mime_type
+    : typeof d.contentType === 'string' && d.contentType ? d.contentType : file.type
   return {
     id,
     url,
-    name: d.name || d.filename || file.name,
+    name,
     size: Number(d.size) || file.size,
-    // 后端不返回 mime_type，用客户端声明的 file.type 兜底
-    mimeType: d.mime_type || d.contentType || file.type,
+    mimeType,
   }
 }
 
@@ -1030,6 +1039,25 @@ export default api
 
 // ── 媒体签名 URL（短时效，防裸公开猜测）──
 const signedMediaCache = new Map<string, { url: string; exp: number }>()
+const SIGNED_URL_EXPIRY_MARGIN_MS = 30_000
+
+function signedUrlExpiry(url: string): number {
+  try {
+    const exp = Number(new URL(url, window.location.origin).searchParams.get('exp'))
+    return Number.isFinite(exp) && exp > 0 ? exp * 1000 : 0
+  } catch {
+    return 0
+  }
+}
+
+export function invalidateMediaUrl(id: string): void {
+  signedMediaCache.delete(id)
+}
+
+export function isMediaUrlExpired(url: string): boolean {
+  const expiry = signedUrlExpiry(url)
+  return expiry > 0 && expiry - SIGNED_URL_EXPIRY_MARGIN_MS <= Date.now()
+}
 
 export async function signMediaUrl(id: string): Promise<string> {
   const resp = await api.post(`/v1/media/${id}/sign`)
@@ -1041,29 +1069,35 @@ export async function signMediaUrl(id: string): Promise<string> {
  * 解析媒体资源为可访问 URL：非 /media/ 前缀(绝对/签名/data:)直接返回；
  * /media/ 公开路径统一改走签名 URL（带 12 分钟本地缓存）。
  */
-export async function resolveMediaUrl(asset: { id?: string; file_url?: string }): Promise<string> {
+export async function resolveMediaUrl(
+  asset: { id?: string; file_url?: string },
+  force = false,
+): Promise<string> {
   const f = asset?.file_url || ''
   if (f && !f.startsWith('/media/')) return f
   if (!asset?.id) return f
-  
-  // 清除过期缓存
+
   const now = Date.now()
   for (const [key, value] of signedMediaCache.entries()) {
-    if (value.exp <= now) {
+    if (value.exp - SIGNED_URL_EXPIRY_MARGIN_MS <= now) {
       signedMediaCache.delete(key)
     }
   }
-  
+
   const cached = signedMediaCache.get(asset.id)
-  if (cached && cached.exp > Date.now()) {
+  if (!force && cached && cached.exp - SIGNED_URL_EXPIRY_MARGIN_MS > Date.now()) {
     return cached.url
   }
-  
+
   try {
     const url = await signMediaUrl(asset.id)
-    signedMediaCache.set(asset.id, { url, exp: Date.now() + 12 * 60 * 1000 })
+    if (!url) throw new Error('empty signed media URL')
+    const expiry = signedUrlExpiry(url) || Date.now() + 12 * 60 * 1000
+    signedMediaCache.set(asset.id, { url, exp: expiry })
     return url
-  } catch {
+  } catch (error) {
+    invalidateMediaUrl(asset.id)
+    if (force) throw error
     return f
   }
 }

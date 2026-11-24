@@ -343,7 +343,7 @@ class TestConflictDetection:
         await svc.upsert(1, "u1", "fact", "city", "上海", confidence=95, source="user_confirmed")
         r = await svc.upsert(1, "u1", "fact", "city", "北京", confidence=50, source="derived")
         conflict_id = r["conflict"]["conflict_id"]
-        result = await svc.resolve_conflict(conflict_id, "keep_old")
+        result = await svc.resolve_conflict(conflict_id, 1, "u1", "keep_old")
         assert result["status"] == "resolved"
         assert result["resolution"] == "keep_old"
         assert result["resolved_value"] == "上海"
@@ -358,7 +358,7 @@ class TestConflictDetection:
         await svc.upsert(1, "u1", "fact", "city", "上海", confidence=95, source="user_confirmed")
         r = await svc.upsert(1, "u1", "fact", "city", "北京", confidence=50, source="derived")
         conflict_id = r["conflict"]["conflict_id"]
-        result = await svc.resolve_conflict(conflict_id, "adopt_new")
+        result = await svc.resolve_conflict(conflict_id, 1, "u1", "adopt_new")
         assert result["resolved_value"] == "北京"
         entry = await svc._store.get_by_key(1, "u1", "fact", "city")
         assert entry.item_value == "北京"
@@ -368,7 +368,7 @@ class TestConflictDetection:
         await svc.upsert(1, "u1", "fact", "city", "上海", confidence=95, source="user_confirmed")
         r = await svc.upsert(1, "u1", "fact", "city", "北京", confidence=50, source="derived")
         conflict_id = r["conflict"]["conflict_id"]
-        result = await svc.resolve_conflict(conflict_id, "manual", manual_value="深圳")
+        result = await svc.resolve_conflict(conflict_id, 1, "u1", "manual", manual_value="深圳")
         assert result["resolved_value"] == "深圳"
         entry = await svc._store.get_by_key(1, "u1", "fact", "city")
         assert entry.item_value == "深圳"
@@ -376,7 +376,7 @@ class TestConflictDetection:
     async def test_resolve_conflict_not_found(self):
         svc = _profile_svc()
         with pytest.raises(ValueError, match="conflict not found"):
-            await svc.resolve_conflict("nonexistent", "keep_old")
+            await svc.resolve_conflict("nonexistent", 1, "u1", "keep_old")
 
     async def test_resolve_conflict_invalid_resolution(self):
         svc = _profile_svc()
@@ -384,7 +384,7 @@ class TestConflictDetection:
         r = await svc.upsert(1, "u1", "fact", "city", "北京", confidence=50, source="derived")
         conflict_id = r["conflict"]["conflict_id"]
         with pytest.raises(ValueError, match="invalid resolution"):
-            await svc.resolve_conflict(conflict_id, "invalid_option")
+            await svc.resolve_conflict(conflict_id, 1, "u1", "invalid_option")
 
 
 # ── API 层（summaries / conflicts / resolve）──────────────

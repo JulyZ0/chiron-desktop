@@ -149,7 +149,10 @@ jobs:
 
       - name: Typecheck
         working-directory: frontend-vue
-        run: pnpm exec vue-tsc -b
+        # 与 PR / ci-smoke 同一入口、同一参数；任何非零退出都阻止打包。
+        run: |
+          node --test scripts/ci-typecheck.test.cjs
+          bash scripts/ci-typecheck.sh
 
       - name: Unit tests
         working-directory: frontend-vue

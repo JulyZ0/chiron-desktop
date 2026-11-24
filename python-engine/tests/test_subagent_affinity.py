@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import uuid
 
 import pytest
+import redis.asyncio as aioredis
 
 from app.subagent import affinity, registry
 
@@ -52,24 +55,75 @@ class FakeRedis:
         return len(self.lists[key])
 
     async def eval(self, script, numkeys, *args):
-        """只实现 affinity 的 release Lua：token 匹配才删。"""
-        key, token = args[0], args[-1]
-        raw = self.kv.get(key)
-        if raw is None:
-            return 0
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return 0
-        if data.get("token") == token:
-            del self.kv[key]
+        """Emulate the atomic owner claim, heartbeat, release and ack scripts."""
+        if "LPUSH" in script:
+            owner_key, ack_key = args[0], args[1]
+            token, generation = args[2], args[3]
+            raw = self.kv.get(owner_key)
+            data = json.loads(raw) if raw else None
+            if not data or data.get("token") != token or data.get("generation") != generation:
+                return 0
+            self.lists.setdefault(ack_key, []).insert(0, "1")
+            self.expires[ack_key] = args[4]
             return 1
-        return 0
+        key = args[0]
+        raw = self.kv.get(key)
+        data = json.loads(raw) if raw else None
+        token, generation = args[-2], args[-1]
+        if "redis.call('DEL'" in script:
+            if data and data.get("token") == token and data.get("generation") == generation:
+                del self.kv[key]
+                return 1
+            return 0
+        if data is None and "if not cur then return 0" in script:
+            return 0
+        if data is not None and (
+            data.get("token") != token or data.get("generation") != generation
+        ):
+            return 0
+        self.kv[key] = args[1]
+        self.expires[key] = args[2]
+        return 1
+
+
+@pytest.fixture(autouse=True)
+def clean_owned():
+    affinity._OWNED.clear()
+    yield
+    affinity._OWNED.clear()
 
 
 @pytest.fixture
 def fake_redis() -> FakeRedis:
     return FakeRedis()
+
+
+_REDIS_URL = (
+    os.getenv("CHIRON_TEST_REDIS_URL")
+    or os.getenv("REDIS_URL")
+    or "redis://127.0.0.1:6379/0"
+)
+
+
+@pytest.fixture
+async def real_redis():
+    client = aioredis.from_url(
+        _REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=1,
+        socket_timeout=2,
+    )
+    try:
+        await client.ping()
+    except Exception as exc:  # noqa: BLE001
+        await client.aclose()
+        if (os.getenv("CHIRON_TEST_REDIS_URL") or os.getenv("REDIS_URL") or "").strip():
+            pytest.fail(f"Redis was declared but is unavailable at {_REDIS_URL}: {exc}")
+        pytest.skip(f"Redis is unavailable at {_REDIS_URL}")
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 # ── 归属登记 ──
@@ -85,6 +139,7 @@ async def test_publish_owner_writes_identity_and_context(fake_redis):
     assert data["instance_id"], "必须写明是哪个实例在跑（网关据此判定可达性）"
     assert data["session_id"] == "s1" and data["tenant_id"] == "t1"
     assert data["token"] == lease._token
+    assert data["generation"] == lease._generation == 1
     assert fake_redis.expires[affinity.owner_key("rs_1")] == affinity.owner_ttl()
     await lease.stop()
 
@@ -131,13 +186,13 @@ async def test_stop_releases_only_with_matching_token(fake_redis):
     # 迟到的清理不得删掉后继登记（token 不同）
     other = affinity.OwnerLease("rs_2", redis=fake_redis)
     await other.start()
-    await affinity.release_owner(fake_redis, "rs_2", token="stale-token")
+    await affinity.release_owner(fake_redis, "rs_2", token="stale-token", generation=1)
     assert affinity.owner_key("rs_2") in fake_redis.kv
     await other.stop()
 
 
 @pytest.mark.asyncio
-async def test_release_owners_deletes_all(fake_redis, monkeypatch):
+async def test_release_owners_deletes_only_owned_fences(fake_redis, monkeypatch):
     async def _fake_get():
         return fake_redis
 
@@ -150,9 +205,99 @@ async def test_release_owners_deletes_all(fake_redis, monkeypatch):
     lease = affinity.OwnerLease("rs_1", redis=fake_redis)
     await lease.start()
     released = await affinity.release_owners(["rs_1", "rs_2"])
-    assert released == 2
+    assert released == 1
     assert affinity.owner_key("rs_1") not in fake_redis.kv
+    assert affinity.owner_key("rs_2") not in fake_redis.kv
     await lease.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_owner_cannot_heartbeat_release_or_ack(fake_redis):
+    stale = affinity.OwnerLease("rs_race", redis=fake_redis, generation=1)
+    assert await stale.start()
+    current = affinity.OwnerLease("rs_race", redis=fake_redis, generation=2)
+    assert await current.start() is False
+    fake_redis.kv[affinity.owner_key("rs_race")] = json.dumps(
+        {"token": "rt-new", "generation": 2}
+    )
+
+    assert await affinity.publish_owner(
+        fake_redis, "rs_race", token=stale._token, generation=1
+    ) is False
+    assert await affinity.release_owner(
+        fake_redis, "rs_race", stale._token, 1
+    ) is False
+    assert await affinity.ack_cancel(
+        fake_redis, "rs_race", stale._token, 1
+    ) is False
+    assert json.loads(fake_redis.kv[affinity.owner_key("rs_race")])["generation"] == 2
+    assert fake_redis.lists == {}
+    await stale.stop()
+
+
+async def test_shutdown_release_preserves_successor_owner(fake_redis, monkeypatch):
+    async def _fake_get():
+        return fake_redis
+
+    monkeypatch.setattr(affinity, "get_owner_redis", _fake_get)
+    lease = affinity.OwnerLease("rs-successor", redis=fake_redis, generation=1)
+    assert await lease.start()
+    key = affinity.owner_key("rs-successor")
+    fake_redis.kv[key] = json.dumps({"token": "rt-new", "generation": 2})
+
+    assert await affinity.release_owners(["rs-successor"]) == 0
+    assert json.loads(fake_redis.kv[key])["generation"] == 2
+    await lease.stop()
+    assert json.loads(fake_redis.kv[key])["generation"] == 2
+
+
+@pytest.mark.live
+async def test_real_redis_owner_claim_heartbeat_ack_and_release(real_redis):
+    run_id = f"h8-owner-{uuid.uuid4().hex}"
+    key = affinity.owner_key(run_id)
+    ack = affinity.ack_key(run_id)
+    lease = affinity.OwnerLease(run_id, redis=real_redis, generation=1)
+    try:
+        assert await lease.start() is True
+        assert await affinity.publish_owner(
+            real_redis, run_id, token=lease._token, generation=1
+        ) is True
+        assert await affinity.ack_cancel(
+            real_redis, run_id, token=lease._token, generation=1
+        ) is True
+        assert await real_redis.lrange(ack, 0, -1) == ["1"]
+        assert await lease.stop() is None
+        assert await real_redis.get(key) is None
+    finally:
+        await real_redis.delete(key, ack)
+
+
+@pytest.mark.live
+async def test_real_redis_stale_owner_cannot_mutate_or_release_successor(real_redis, monkeypatch):
+    run_id = f"h8-stale-owner-{uuid.uuid4().hex}"
+    key = affinity.owner_key(run_id)
+    ack = affinity.ack_key(run_id)
+    stale = affinity.OwnerLease(run_id, redis=real_redis, generation=1)
+
+    async def _fake_get():
+        return real_redis
+
+    monkeypatch.setattr(affinity, "get_owner_redis", _fake_get)
+    try:
+        assert await stale.start() is True
+        await real_redis.set(key, json.dumps({"token": stale._token, "generation": 2}))
+        assert await affinity.publish_owner(
+            real_redis, run_id, token=stale._token, generation=1
+        ) is False
+        assert await affinity.release_owner(real_redis, run_id, stale._token, 1) is False
+        assert await affinity.ack_cancel(real_redis, run_id, stale._token, 1) is False
+        assert await affinity.release_owners([run_id]) == 0
+        assert json.loads(await real_redis.get(key))["generation"] == 2
+        assert await real_redis.exists(ack) == 0
+        await stale.stop()
+        assert json.loads(await real_redis.get(key))["generation"] == 2
+    finally:
+        await real_redis.delete(key, ack)
 
 
 # ── 取消回执 ──
@@ -160,6 +305,9 @@ async def test_release_owners_deletes_all(fake_redis, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ack_cancel_writes_short_lived_receipt(fake_redis):
+    assert await affinity.claim_owner(
+        fake_redis, "rs_1", token="tok", generation=1
+    ) is True
     assert await affinity.ack_cancel(fake_redis, "rs_1") is True
     key = affinity.ack_key("rs_1")
     assert fake_redis.lists[key] == ["1"]
@@ -173,6 +321,9 @@ async def test_cancel_hit_writes_receipt(fake_redis):
     task = asyncio.create_task(asyncio.sleep(3600))
     registry.register("rs_1", task, session_id="s1", tenant_id="t1")
     try:
+        assert await affinity.claim_owner(
+            fake_redis, "rs_1", token="tok", generation=1
+        ) is True
         assert await registry._cancel_and_ack(fake_redis, "rs_1", registry.REASON_USER) is True
         assert fake_redis.lists[affinity.ack_key("rs_1")] == ["1"]
         assert registry.reason_of("rs_1") == registry.REASON_USER

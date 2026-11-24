@@ -232,8 +232,9 @@ async def guarded_execute_tool(
             if runtime._current_mode == SESSION_MODE_ASK
             else await runtime._guardian_review(tool_call, task, verdict, targs)
         )
-        # 动作级别是从**内容**推断的（命令类工具），还是从注册表**声明**的？
-        # 只有前者能靠"本次代码的评审结论"覆盖标签（见 guardian.may_release 第 4 条）。
+        # 命令类工具由 `tool_policy` 静态解析分级：只有单条安全命令能降为 write，
+        # 且 Guardian 还要求 allow + low；复合命令、重定向与解释器源码保持 delete，
+        # 必须人工审批。普通 edit/write 的名字声明级别仍走原有 write 放行路径。
         from app.agent.tool_policy import COMMAND_TOOLS
 
         level_is_declared = tool_name not in COMMAND_TOOLS

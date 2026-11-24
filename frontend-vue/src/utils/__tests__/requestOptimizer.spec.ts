@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import type { AxiosRequestConfig, CancelToken } from 'axios'
 
 /**
  * `utils/requestOptimizer.ts` 的测试（2026-10-09）—— 此前零测试 ✗。
@@ -22,7 +23,10 @@ const axiosMocks = vi.hoisted(() => ({
     return Promise.resolve({ data: 'ok' })
   }),
   CancelToken: {
-    source: () => ({ token: 'tok', cancel: vi.fn() }),
+    source: () => ({
+      token: { promise: Promise.resolve(), subscribe: vi.fn(() => vi.fn()) },
+      cancel: vi.fn(),
+    }),
   },
   isCancel: (e: unknown) => Boolean((e as { __cancel?: boolean })?.__cancel),
 }))
@@ -110,25 +114,77 @@ describe('utils/requestOptimizer', () => {
 
   it('★★ cancelAll 必须放过 __retainAcrossNavigation 的请求（会话请求被取消 = 全场 401）', () => {
     const m = requestManager
-    m.addRequest({ method: 'post', url: '/v1/auth/session', __retainAcrossNavigation: true })
-    m.addRequest({ method: 'get', url: '/v1/conversations' })
+    const sessionConfig: AxiosRequestConfig = { method: 'post', url: '/v1/auth/session', __retainAcrossNavigation: true }
+    const listConfig: AxiosRequestConfig = { method: 'get', url: '/v1/conversations' }
+    m.addRequest(sessionConfig)
+    m.addRequest(listConfig)
     expect(m.pendingCount).toBe(2)
 
-    // key 由 `getKey` 生成：GET 会带上 `params` 序列化结果（空对象 ⇒ `{}`），POST 不带
-    const session = m.pendingRequests.get('POST:/v1/auth/session')
-    const list = m.pendingRequests.get('GET:/v1/conversations{}')
+    const session = [...m.pendingRequests.values()].find(entry => entry.config === sessionConfig)
+    const list = [...m.pendingRequests.values()].find(entry => entry.config === listConfig)
     expect(session).toBeDefined()
     expect(list).toBeDefined()
 
     m.cancelAll()
 
-    // 页面数据该取消 ⇒ 取消
     expect(list?.cancel).toHaveBeenCalledTimes(1)
-    // 会话请求**不能**取消，且要留在表里等响应拦截器清理
     expect(session?.cancel).not.toHaveBeenCalled()
     expect(m.pendingCount).toBe(1)
-    expect(m.pendingRequests.has('POST:/v1/auth/session')).toBe(true)
-    expect(m.pendingRequests.has('GET:/v1/conversations{}')).toBe(false)
+    expect(m.pendingRequests.get(sessionConfig.__requestId!)).toBe(session)
+  })
+
+  it('★★ 同一 URL 的并发请求各自独立，完成一个不会清掉另一个', () => {
+    const m = requestManager
+    const first = { method: 'post', url: '/v1/things', data: { value: 1 } }
+    const second = { method: 'post', url: '/v1/things', data: { value: 2 } }
+    const firstId = m.addRequest(first)
+    const secondId = m.addRequest(second)
+
+    expect(firstId).not.toBe(secondId)
+    expect(m.pendingCount).toBe(2)
+    m.removeRequest(first)
+    expect(m.pendingCount).toBe(1)
+    expect(m.pendingRequests.has(secondId)).toBe(true)
+    expect(m.pendingRequests.has(firstId)).toBe(false)
+  })
+
+  it('★★ 调用方的 cancelToken 仍然有效，且请求完成后解除订阅', () => {
+    const m = requestManager
+    let notify: ((reason?: string) => void) | undefined
+    const unsubscribe = vi.fn()
+    const callerToken = {
+      promise: Promise.resolve(),
+      throwIfRequested: vi.fn(),
+      subscribe: vi.fn((listener: (reason?: string) => void) => {
+        notify = listener
+      }),
+      unsubscribe,
+    }
+    const config: AxiosRequestConfig = {
+      method: 'get', url: '/v1/list', cancelToken: callerToken as unknown as CancelToken,
+    }
+    m.addRequest(config)
+    const entry = m.pendingRequests.get(config.__requestId!)!
+
+    expect(config.cancelToken).not.toBe(callerToken)
+    notify?.('caller cancelled')
+    expect(entry.cancel).toHaveBeenCalledWith('caller cancelled')
+
+    m.removeRequest(config)
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(unsubscribe).toHaveBeenCalledWith(notify)
+  })
+
+  it('★★ 使用真实 Axios CancelToken 时完成后调用 unsubscribe', async () => {
+    const actual = await vi.importActual<typeof import('axios')>('axios')
+    const caller = actual.default.CancelToken.source()
+    const unsubscribe = vi.spyOn(caller.token, 'unsubscribe')
+    const config: AxiosRequestConfig = { method: 'get', url: '/v1/list', cancelToken: caller.token }
+
+    requestManager.addRequest(config)
+    requestManager.removeRequest(config)
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
   })
 
   it('★ isSlowNetwork：弱网/省流量为 true，4g 与"没有该 API"为 false', () => {

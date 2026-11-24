@@ -72,6 +72,7 @@ function mountView(currentUserId?: string) {
     // 直接写 store 的 ref：不进 login 流程，避免多打一次接口
     useAuthStore().user = {
       id: currentUserId, email: '', name: 'me', role: 'user', tenant_id: 1,
+      password_set: true, must_change_password: false,
     }
   }
   return mount(AgentsView, { global: { plugins: [router, pinia] } })

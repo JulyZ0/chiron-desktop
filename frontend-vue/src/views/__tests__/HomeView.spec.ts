@@ -104,7 +104,10 @@ function mountView() {
   const pinia = createPinia()
   setActivePinia(pinia)
   // 直接写 store 的 ref：不进登录流程，避免多打一次接口
-  useAuthStore().user = { id: 'u-1', email: '', name: 'me', role: 'user', tenant_id: 1 }
+  useAuthStore().user = {
+    id: 'u-1', email: '', name: 'me', role: 'user', tenant_id: 1,
+    password_set: true, must_change_password: false,
+  }
   return mount(HomeView, {
     global: {
       plugins: [router, pinia],

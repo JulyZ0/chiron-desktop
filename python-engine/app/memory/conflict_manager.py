@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 from typing import Any
 
@@ -76,17 +77,65 @@ class ConflictManager:
             raise RuntimeError("ConflictManager: Redis unavailable")
         return redis
 
-    async def _audit(self, event: str, conflict: dict[str, Any]) -> None:
+    async def _audit(
+        self,
+        event: str,
+        conflict: dict[str, Any],
+        *,
+        actor_tenant_id: int | None = None,
+        actor_user_id: str | None = None,
+    ) -> None:
         """把一条冲突事件交给审计器（**旁路**，绝不向调用方抛出）。
 
-        所有「登记 / 裁决 / 删除」都汇到这一个出口，保证两条冲突来源
-        （``register_conflict`` 的 L2 条目、``detect_and_handle_conflict`` 的档案卡）
-        留下同样的审计流水。审计失败只记 warning：用户动作不该因为账本写不了而失败。
+        审计列记录操作者，所有者单独保留在 ``owner_*`` 字段中。
         """
+        owner_tenant_id = conflict.get("tenant_id")
+        owner_user_id = conflict.get("user_id")
+        audit_record = {
+            **conflict,
+            "tenant_id": owner_tenant_id if actor_tenant_id is None else actor_tenant_id,
+            "user_id": owner_user_id if actor_user_id is None else actor_user_id,
+            "actor_tenant_id": (
+                owner_tenant_id if actor_tenant_id is None else actor_tenant_id
+            ),
+            "actor_user_id": owner_user_id if actor_user_id is None else actor_user_id,
+            "owner_tenant_id": owner_tenant_id,
+            "owner_user_id": owner_user_id,
+        }
         try:
-            await self._auditor.record(event, conflict)
+            await self._auditor.record(event, audit_record)
         except Exception as e:  # noqa: BLE001
             logger.warning("Conflict auditor failed (%s): %s", event, e)
+
+    @staticmethod
+    def _matches_scope(
+        conflict: dict[str, Any], tenant_id: int, user_id: str
+    ) -> bool:
+        return (
+            tenant_id is not None
+            and bool(user_id)
+            and conflict.get("tenant_id") == tenant_id
+            and conflict.get("user_id") == user_id
+        )
+
+    async def _load_scoped_conflict(
+        self, conflict_id: str, tenant_id: int, user_id: str
+    ) -> dict[str, Any] | None:
+        redis = self._require_redis()
+        data = await redis.get(self._pending_key(conflict_id))
+        if not data:
+            return None
+        try:
+            conflict = json.loads(data)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if (
+            not isinstance(conflict, dict)
+            or conflict.get("conflict_id") != conflict_id
+            or not self._matches_scope(conflict, tenant_id, user_id)
+        ):
+            return None
+        return conflict
 
     # ── Redis 键生成 ──────────────────────────────────────────────────────
 
@@ -221,7 +270,7 @@ class ConflictManager:
     ) -> MemoryConflict:
         """创建冲突事件。"""
         now = time.time()
-        conflict_id = f"conf_{int(now)}_{hash(f'{tenant_id}:{user_id}:{slot.value}:{item_key}') % 10000}"
+        conflict_id = f"conf_{secrets.token_urlsafe(32)}"
 
         return MemoryConflict(
             conflict_id=conflict_id,
@@ -323,6 +372,12 @@ class ConflictManager:
             if data:
                 try:
                     item = json.loads(data)
+                    if (
+                        not isinstance(item, dict)
+                        or item.get("conflict_id") != cid
+                        or not self._matches_scope(item, tenant_id, user_id)
+                    ):
+                        continue
                     conflicts.append(
                         MemoryConflict(
                             conflict_id=item["conflict_id"],
@@ -338,7 +393,7 @@ class ConflictManager:
                             project=str(item.get("project") or ""),
                         )
                     )
-                except (json.JSONDecodeError, KeyError) as e:
+                except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, ValueError) as e:
                     logger.warning("Failed to parse conflict %s: %s", cid, e)
 
         return conflicts
@@ -346,6 +401,8 @@ class ConflictManager:
     async def resolve_conflict(
         self,
         conflict_id: str,
+        tenant_id: int,
+        user_id: str,
         resolution: str,
         manual_value: Any | None = None,
     ) -> tuple[bool, dict[str, Any] | None]:
@@ -353,22 +410,18 @@ class ConflictManager:
 
         Args:
             conflict_id: 冲突 ID。
+            tenant_id: 当前调用者租户。
+            user_id: 当前调用者用户。
             resolution: 裁决方式 ("keep_old", "use_new", "manual")
             manual_value: 手动修改的值（仅当 resolution == "manual"）
 
         Returns:
             (是否成功, 裁决详情)
         """
-        redis = self._require_redis()
         key = self._pending_key(conflict_id)
-        data = await redis.get(key)
-        if not data:
+        conflict = await self._load_scoped_conflict(conflict_id, tenant_id, user_id)
+        if conflict is None:
             logger.warning("Conflict %s not found", conflict_id)
-            return False, None
-
-        try:
-            conflict = json.loads(data)
-        except json.JSONDecodeError:
             return False, None
 
         # 根据裁决方式确定最终值
@@ -386,6 +439,7 @@ class ConflictManager:
             return False, {"error": f"Unknown resolution: {resolution}"}
 
         # 删除 pending 记录
+        redis = self._require_redis()
         await redis.delete(key)
         list_key = self._pending_list_key(conflict["tenant_id"], conflict["user_id"])
         await redis.srem(list_key, conflict_id)
@@ -400,6 +454,8 @@ class ConflictManager:
         await self._audit(
             EVENT_RESOLVED,
             {**conflict, "resolution": resolution, "final_value": final_value},
+            actor_tenant_id=tenant_id,
+            actor_user_id=user_id,
         )
 
         return True, {
@@ -410,51 +466,56 @@ class ConflictManager:
             "item_key": conflict["item_key"],
         }
 
-    async def delete_conflict(self, conflict_id: str) -> bool:
+    async def delete_conflict(
+        self, conflict_id: str, tenant_id: int, user_id: str
+    ) -> bool:
         """删除冲突记录（用户否认时调用）。
 
         Args:
             conflict_id: 冲突 ID。
+            tenant_id: 当前调用者租户。
+            user_id: 当前调用者用户。
 
         Returns:
             是否成功删除。
         """
-        redis = self._require_redis()
         key = self._pending_key(conflict_id)
-        data = await redis.get(key)
-        if not data:
+        conflict = await self._load_scoped_conflict(conflict_id, tenant_id, user_id)
+        if conflict is None:
             return False
 
-        try:
-            conflict = json.loads(data)
-        except json.JSONDecodeError:
-            return False
-
+        redis = self._require_redis()
         await redis.delete(key)
         list_key = self._pending_list_key(conflict["tenant_id"], conflict["user_id"])
         await redis.srem(list_key, conflict_id)
 
         logger.info("Conflict %s deleted (user denied)", conflict_id)
-        await self._audit(EVENT_DISMISSED, conflict)
+        await self._audit(
+            EVENT_DISMISSED,
+            conflict,
+            actor_tenant_id=tenant_id,
+            actor_user_id=user_id,
+        )
         return True
 
-    async def get_conflict(self, conflict_id: str) -> MemoryConflict | None:
-        """获取单个冲突详情。
+    async def get_conflict(
+        self, conflict_id: str, tenant_id: int, user_id: str
+    ) -> MemoryConflict | None:
+        """在调用者 scope 内获取单个冲突详情。
 
         Args:
             conflict_id: 冲突 ID。
+            tenant_id: 当前调用者租户。
+            user_id: 当前调用者用户。
 
         Returns:
             冲突事件或 None。
         """
-        redis = self._require_redis()
-        key = self._pending_key(conflict_id)
-        data = await redis.get(key)
-        if not data:
+        item = await self._load_scoped_conflict(conflict_id, tenant_id, user_id)
+        if item is None:
             return None
 
         try:
-            item = json.loads(data)
             return MemoryConflict(
                 conflict_id=item["conflict_id"],
                 slot=SlotType(item["slot"]),
@@ -468,6 +529,6 @@ class ConflictManager:
                 # 兼容本字段出现之前写入的旧记录（那时只有"未分组"）
                 project=str(item.get("project") or ""),
             )
-        except (json.JSONDecodeError, KeyError) as e:
+        except (KeyError, TypeError, ValueError) as e:
             logger.warning("Failed to parse conflict %s: %s", conflict_id, e)
             return None

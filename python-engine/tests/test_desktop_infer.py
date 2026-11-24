@@ -658,12 +658,24 @@ def test_exact_key_is_unchanged_without_response_format() -> None:
 
 
 async def test_store_and_lookup_keep_positional_compatibility() -> None:
-    """``store`` 的 response_format 在 response **之后**：旧的 6 位置参数调用必须还能用。"""
+    """原位置参数保持不变，新增缓存域参数只能显式通过关键字开启。"""
     cache = _cache()
+    scope = {
+        "user_id": "user-a",
+        "private": False,
+        "policy_digest": "policy-v1",
+        "model_lineage": {"provider": "provider-a", "revision": "1"},
+    }
     await cache.store(
-        1, "m", _CACHE_MSGS, None, 0.0, ChatResponse(content="压缩结果", finish_reason="stop")
+        1,
+        "m",
+        _CACHE_MSGS,
+        None,
+        0.0,
+        ChatResponse(content="压缩结果", finish_reason="stop"),
+        **scope,
     )
-    hit = await cache.lookup(1, "m", _CACHE_MSGS, None, 0.0)
+    hit = await cache.lookup(1, "m", _CACHE_MSGS, None, 0.0, **scope)
     assert hit is not None and hit.content == "压缩结果"
 
 
@@ -684,22 +696,16 @@ class _CountingProvider:
         raise AssertionError("本用例只走非流式路径")
 
 
-async def test_router_does_not_serve_text_cache_to_json_request() -> None:
-    """端到端：同一 prompt 先文本、后 JSON，第二次必须真的打上游。"""
+async def test_router_without_cache_scope_does_not_read_or_write_cache() -> None:
+    """旧 router 调用未提供 user/策略/lineage 时必须 fail-closed。"""
     from app.gateway.router import GatewayRouter
 
     provider = _CountingProvider()
-    router = GatewayRouter({"counting": provider}, cache=_cache())  # type: ignore[arg-type]
+    redis = _FakeRedis()
+    router = GatewayRouter({"counting": provider}, cache=_cache(redis))  # type: ignore[arg-type]
 
     first = await router.chat([{"role": "user", "content": "把这段文本压成两行"}], "plain-model")
     again = await router.chat([{"role": "user", "content": "把这段文本压成两行"}], "plain-model")
-    assert again.content == first.content
-    assert provider.calls == 1, "同一形状的第二次请求没有命中缓存（缓存白加了）"
-
-    as_json = await router.chat(
-        [{"role": "user", "content": "把这段文本压成两行"}],
-        "plain-model",
-        response_format={"type": "json_object"},
-    )
-    assert provider.calls == 2, "JSON 请求命中了纯文本缓存条目（形状会是错的）"
-    assert as_json.content != first.content
+    assert again.content != first.content
+    assert provider.calls == 2
+    assert redis.store == {}

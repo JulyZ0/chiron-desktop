@@ -17,13 +17,16 @@ DLQ 与延迟重试键也**按队列分开**：否则 kb 任务的重试会落�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+import redis.asyncio as aioredis
 
 from app.redis_keys import rkey
 
 
 @dataclass(frozen=True)
 class QueueSpec:
-    """一条队列的完整键集合。``key`` 只用于日志/指标标签（不含环境前缀）。"""
+    """一条队列的完整键集合。``key`` 是队列身份，用于日志、指标和幂等命名空间。"""
 
     key: str
     stream: str
@@ -74,4 +77,86 @@ def queue_for_task(task_type: str) -> QueueSpec:
 
 def is_foreign(task_type: str, current: QueueSpec) -> bool:
     """任务是否属于**别的**队列（滚动升级期间出现在本队列里 = 需要转发）。"""
-    return queue_for_task(task_type) is not current
+    return queue_for_task(task_type).key != current.key
+
+
+_XADD_ACK_LUA = """
+local pending = redis.call('XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 1)
+if #pending == 0 or pending[1][2] ~= ARGV[2] then
+    return false
+end
+local added = redis.call('XADD', KEYS[2], 'MAXLEN', ARGV[4], '*', unpack(ARGV, 5))
+redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
+return added
+"""
+
+_PROMOTE_LUA = """
+local message = cjson.decode(ARGV[2])
+local fields = {'MAXLEN', ARGV[1], '*'}
+for key, value in pairs(message) do
+    fields[#fields + 1] = key
+    fields[#fields + 1] = tostring(value)
+end
+local kind = redis.call('TYPE', KEYS[2])['ok']
+if kind ~= 'none' and kind ~= 'stream' then
+    return redis.error_reply('WRONGTYPE delayed promotion target is not a stream')
+end
+if redis.call('ZREM', KEYS[1], ARGV[2]) == 0 then
+    return false
+end
+return redis.call('XADD', KEYS[2], unpack(fields))
+"""
+
+
+def _field_args(fields: dict[Any, Any]) -> list[str]:
+    return [
+        str(part)
+        for key, value in fields.items()
+        for part in (
+            key.decode() if isinstance(key, bytes) else key,
+            value.decode() if isinstance(value, bytes) else value,
+        )
+    ]
+
+
+async def atomic_xadd_ack(
+    redis: aioredis.Redis,
+    *,
+    source: str,
+    target: str,
+    group: str,
+    consumer: str,
+    message_id: str,
+    fields: dict[Any, Any],
+    maxlen: int,
+) -> str | None:
+    """Append a copy and ACK its owned PEL entry in one Redis script."""
+    result = await redis.eval(
+        _XADD_ACK_LUA,
+        2,
+        source,
+        target,
+        group,
+        consumer,
+        message_id,
+        maxlen,
+        *_field_args(fields),
+    )
+    if not result:
+        return None
+    return result.decode() if isinstance(result, bytes) else str(result)
+
+
+async def atomic_promote_delayed(
+    redis: aioredis.Redis,
+    *,
+    delayed: str,
+    target: str,
+    member: str,
+    maxlen: int,
+) -> str | None:
+    """Remove a delayed member and append it without a crash-loss window."""
+    result = await redis.eval(_PROMOTE_LUA, 2, delayed, target, maxlen, member)
+    if not result:
+        return None
+    return result.decode() if isinstance(result, bytes) else str(result)

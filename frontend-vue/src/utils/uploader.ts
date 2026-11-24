@@ -11,6 +11,7 @@
  * （localStorage 记录 upload_id，重进页面查询已收分片后续传）。
  */
 import { api } from '../api'
+import { privateKey } from './privateStorage'
 
 export type UploadPurpose = 'media' | 'kb_doc' | 'generic'
 
@@ -38,6 +39,15 @@ const DEFAULT_CONCURRENCY = 3
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
+function currentUserId(): string {
+  try {
+    const stored = JSON.parse(localStorage.getItem('user') || '{}') as { id?: unknown }
+    return typeof stored.id === 'string' ? stored.id : ''
+  } catch {
+    return ''
+  }
+}
+
 async function uploadChunk(uploadId: string, index: number, blob: Blob): Promise<void> {
   await api.put(`/v1/uploads/${uploadId}/chunks/${index}`, blob, {
     headers: { 'Content-Type': 'application/octet-stream' },
@@ -55,7 +65,10 @@ export async function createChunkUpload(file: File, opts: ChunkUploadOptions): P
   //（导出文件、重复下载、批量截图很常见）复用同一个 upload_id，
   // 把一个文件的分片写进另一个的上传会话。补入 lastModified 与分片大小。
   const fileFingerprint = `${file.name}:${file.size}:${file.lastModified}:${chunkSize}`
-  const storageKey = `chunk-upload:${opts.purpose}:${opts.parentId || ''}:${fileFingerprint}`
+  const storageKey = privateKey(
+    `chunk-upload:${opts.purpose}:${opts.parentId || ''}:${fileFingerprint}`,
+    currentUserId(),
+  )
   let uploadId = localStorage.getItem(storageKey) || ''
   let received: number[] = []
   if (uploadId) {

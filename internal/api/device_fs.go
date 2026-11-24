@@ -556,9 +556,9 @@ func DeviceFSHandler(hub *deviceHub, authenticator *auth.Authenticator) http.Han
 			http.Error(w, "device_id required", http.StatusBadRequest)
 			return
 		}
-		claims, err := authenticator.ValidateToken(token)
-		if err != nil || claims == nil {
-			http.Error(w, "invalid or missing token", http.StatusUnauthorized)
+		claims, authErr := validateWebSocketToken(r.Context(), authenticator, token, r.URL.Path)
+		if authErr != nil {
+			writeWebSocketAuthError(w, authErr)
 			return
 		}
 		conn, err := deviceFSUpgrader.Upgrade(w, r, nil)
@@ -566,6 +566,8 @@ func DeviceFSHandler(hub *deviceHub, authenticator *auth.Authenticator) http.Han
 			slog.Warn("device fs upgrade failed", "error", err)
 			return
 		}
+		stopAuthMonitor := monitorWebSocketAuth(conn, claims, authenticator, token, r.URL.Path)
+		defer stopAuthMonitor()
 		dc := &deviceConn{
 			tenant:  smTenant(claims),
 			user:    claims.UserID,

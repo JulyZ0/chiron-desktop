@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from typing import Any
 
 READ = "read"
@@ -114,20 +113,15 @@ COMMAND_TOOLS: frozenset[str] = frozenset(
     {"shell_exec", "execute_command", "persistent_shell", "execute_python", "run_code"}
 )
 
-#: 无害命令白名单：命中即把命令类工具降为 write（仍需确认，但不走二次校验）。
-_SAFE_CMD_RE = re.compile(
-    r"^\s*(ls|dir|cat|type|head|tail|wc|pwd|echo|which|where|whoami|git\s+(status|log|diff|show)|"
-    r"python\s+--version|go\s+version|node\s+--version|npm\s+--version)\b",
-    re.IGNORECASE,
+#: Only a parsed, single read-only invocation may be downgraded. A matching prefix is not evidence.
+_SAFE_SIMPLE_EXECUTABLES = frozenset(
+    {"ls", "dir", "cat", "type", "head", "tail", "wc", "pwd", "echo", "which", "where", "whoami"}
 )
-
-#: 破坏性命令：命中即**升级**为 delete（即使工具名中性）
-_DESTRUCTIVE_CMD_RE = re.compile(
-    r"(\brm\b|\brmdir\b|\bdel\b|\berase\b|\bunlink\b|\bshutdown\b|\bkill\b|"
-    r"\bdrop\s+(table|database|schema)\b|\btruncate\b|\bdelete\s+from\b|"
-    r"git\s+(reset\s+--hard|clean\s+-[a-z]*f|push\s+--force)|"
-    r"format\b|mkfs\b|>\s*/dev/sd)",
-    re.IGNORECASE,
+_SAFE_VERSION_ARGV = frozenset(
+    {
+        ("python", "--version"), ("python3", "--version"), ("go", "version"),
+        ("node", "--version"), ("npm", "--version"),
+    }
 )
 
 _COMMAND_ARG_KEYS = ("command", "cmd", "script", "code", "source")
@@ -142,13 +136,36 @@ def tool_level(name: str, args: dict[str, Any] | None = None) -> str:
     base = _declared_level(name)
     if name in COMMAND_TOOLS:
         command = _command_text(args)
-        if command and _DESTRUCTIVE_CMD_RE.search(command):
+        if name in {"execute_python", "run_code"}:
             return DELETE
-        if command and _SAFE_CMD_RE.search(command):
+        dialect = "cmd" if name == "persistent_shell" else "posix"
+        if command and _is_safe_simple_shell_command(command, dialect=dialect):
             return WRITE
-        # 命令为空（如 execute_python 只传 code 走别的键）或无法判定：保守停在 DELETE
         return DELETE
     return base
+
+
+def _is_safe_simple_shell_command(command: str, dialect: str) -> bool:
+    from app.tools.sandbox import parse_shell_program
+
+    try:
+        program = parse_shell_program(command, dialect=dialect)
+    except ValueError:
+        return False
+    if program.operators or program.grouped or program.asynchronous or len(program.commands) != 1:
+        return False
+    parsed = program.commands[0]
+    if parsed.assignments or parsed.redirections or not parsed.argv:
+        return False
+    argv = tuple(arg.lower() for arg in parsed.argv)
+    exe = argv[0]
+    if "/" in exe or "\\" in exe:
+        return False
+    if exe in _SAFE_SIMPLE_EXECUTABLES:
+        return True
+    if argv in _SAFE_VERSION_ARGV:
+        return True
+    return exe == "git" and len(argv) == 2 and argv[1] in {"status", "log", "diff", "show"}
 
 
 def _declared_level(name: str) -> str:

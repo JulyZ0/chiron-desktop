@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -22,8 +23,53 @@ logger = logging.getLogger(__name__)
 #: 信号存活时间（秒）。够一轮跑完即可；过期自动消失，避免"上一次的取消"误伤下一次会话。
 INTERRUPT_TTL_SECONDS = 300
 
-#: 进程内快路径：session_id → 置位时间。**同副本**的 run 不必为每次检查付一次 Redis 往返。
-_LOCAL: dict[str, float] = {}
+#: 进程内快路径：session_id → (run_token, generation, 置位时间)。
+_LOCAL: dict[str, tuple[str, int, float]] = {}
+
+
+def _fence_for(session_id: str, run_token: str, generation: int) -> tuple[str, int]:
+    from app import run_registry
+
+    current = run_registry.current_run_fence()
+    if current is not None and (not run_token or current.run_token == run_token):
+        if generation in (0, current.generation):
+            return current.run_token, current.generation
+        return "", 0
+    if run_token:
+        if generation < 1:
+            fence = run_registry.resolve_run_fence(run_token)
+            generation = fence.generation if fence is not None else 0
+        return run_token, generation
+    return "", 0
+
+
+def _matches(value: Any, run_token: str, generation: int) -> bool:
+    if isinstance(value, tuple) and len(value) == 3:
+        value = value[:2]
+    if isinstance(value, tuple) and len(value) == 2:
+        return value == (run_token, generation)
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    if value == "1":
+        return not run_token and generation == 0
+    if value in (None, ""):
+        return False
+    try:
+        data = json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return bool(
+        run_token
+        and generation > 0
+        and data.get("run_token") == run_token
+        and data.get("generation") == generation
+    )
+
+
+def _is_legacy_local(value: tuple[str, int, float] | None) -> bool:
+    return value is not None and value[0] == "" and value[1] == 0
 
 
 def interrupt_key(session_id: str) -> str:
@@ -45,13 +91,23 @@ async def _resolve_redis(redis: Any = None) -> Any:
         return None
 
 
-def request_interrupt_local(session_id: str) -> None:
+def request_interrupt_local(
+    session_id: str, *, run_token: str = "", generation: int = 0
+) -> None:
     """只置本地标志（同副本快速路径 / 测试用）。"""
     if session_id:
-        _LOCAL[session_id] = time.time()
+        token, gen = _fence_for(session_id, run_token, generation)
+        if run_token and (not token or gen < 1):
+            return
+        local = _LOCAL.get(session_id)
+        if not token and local is not None and not _is_legacy_local(local):
+            return
+        _LOCAL[session_id] = (token, gen, time.time())
 
 
-async def request_interrupt(session_id: str, *, redis: Any = None) -> bool:
+async def request_interrupt(
+    session_id: str, *, redis: Any = None, run_token: str = "", generation: int = 0
+) -> bool:
     """置位中断信号（本地 + Redis）。
 
     返回 **Redis 是否置位成功**。Redis 失败**不影响**本地置位 —— 同副本的 run 照样能停下来；
@@ -59,19 +115,62 @@ async def request_interrupt(session_id: str, *, redis: Any = None) -> bool:
     """
     if not session_id:
         return False
-    request_interrupt_local(session_id)
+    token, gen = _fence_for(session_id, run_token, generation)
+    if run_token and (not token or gen < 1):
+        return False
+    if not token and redis is not None:
+        from app.run_registry import owner_of
+
+        owner = await owner_of(redis, session_id)
+        if owner is not None:
+            token = str(owner.get("run_token") or "")
+            gen = int(owner.get("generation") or 0)
+            if not token or gen < 1:
+                return False
+    local = _LOCAL.get(session_id)
+    if not token and local is not None and not _is_legacy_local(local):
+        return False
+    request_interrupt_local(session_id, run_token=token, generation=gen)
     client = await _resolve_redis(redis)
     if client is None:
         return False
+    value = json.dumps({"run_token": token, "generation": gen}) if token else "1"
     try:
-        await client.setex(interrupt_key(session_id), INTERRUPT_TTL_SECONDS, "1")
+        if token:
+            from app.run_registry import run_key
+
+            result = await client.eval(
+                _REQUEST_LUA,
+                2,
+                run_key(session_id),
+                interrupt_key(session_id),
+                token,
+                gen,
+                value,
+                INTERRUPT_TTL_SECONDS,
+            )
+        else:
+            result = await client.eval(
+                _REQUEST_LEGACY_LUA,
+                1,
+                interrupt_key(session_id),
+                value,
+                INTERRUPT_TTL_SECONDS,
+            )
+        if int(result) != 1:
+            local = _LOCAL.get(session_id)
+            if local is not None and local[:2] == (token, gen):
+                _LOCAL.pop(session_id, None)
+            return False
         return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("interrupt: failed to set redis flag: %s", exc)
         return False
 
 
-async def is_interrupted(session_id: str, *, redis: Any = None) -> bool:
+async def is_interrupted(
+    session_id: str, *, redis: Any = None, run_token: str = "", generation: int = 0
+) -> bool:
     """查中断信号：**先本地**（免费），未置位才查 Redis（跨副本）。
 
     顺序有意如此：绝大多数取消来自同一副本（用户在同一个连接上点了取消），本地命中时不必付
@@ -80,10 +179,20 @@ async def is_interrupted(session_id: str, *, redis: Any = None) -> bool:
     **读不到等于没被取消**（`None` 折成 `False`）：run 循环不该因为 Redis 抽风就停下。
     需要区分"确认没有信号"与"读不到"的调用方（收尾判据）用 :func:`probe_interrupt`。
     """
-    return bool(await probe_interrupt(session_id, redis=redis))
+    return bool(
+        await probe_interrupt(
+            session_id, redis=redis, run_token=run_token, generation=generation
+        )
+    )
 
 
-async def probe_interrupt(session_id: str, *, redis: Any = None) -> bool | None:
+async def probe_interrupt(
+    session_id: str,
+    *,
+    redis: Any = None,
+    run_token: str = "",
+    generation: int = 0,
+) -> bool | None:
     """三态查中断信号：`True` 被叫停 / `False` 确认没有信号 / `None` 读不到。
 
     为什么要三态：run 收尾时要判断"这次中断是不是用户下的令" —— 有令写终态
@@ -94,31 +203,106 @@ async def probe_interrupt(session_id: str, *, redis: Any = None) -> bool | None:
     """
     if not session_id:
         return False
-    if session_id in _LOCAL:
+    token, gen = _fence_for(session_id, run_token, generation)
+    if run_token and (not token or gen < 1):
+        return None
+    local = _LOCAL.get(session_id)
+    if local is not None and _matches(local[:2], token, gen):
         return True
     client = await _resolve_redis(redis)
     if client is None:
         return None
     try:
-        return bool(await client.get(interrupt_key(session_id)))
+        value = await client.get(interrupt_key(session_id))
+        return _matches(value, token, gen)
     except Exception as exc:  # noqa: BLE001 — 读失败是"不知道"，不是"没有"
         logger.warning("interrupt: failed to read redis flag: %s", exc)
         return None
 
 
-async def clear_interrupt(session_id: str, *, redis: Any = None) -> None:
+async def clear_interrupt(
+    session_id: str, *, redis: Any = None, run_token: str = "", generation: int = 0
+) -> None:
     """清除信号（run 收尾时调用）。
 
     **不清会误伤下一次会话** —— 同一个 `session_id` 的下一次 run 会在第一轮就"被取消"，
     而用户会以为自己什么都没做。这是本模块最容易漏的一步。
     """
-    if not session_id:
+    token, gen = _fence_for(session_id, run_token, generation)
+    if run_token and (not token or gen < 1):
         return
-    _LOCAL.pop(session_id, None)
+    local = _LOCAL.get(session_id)
+    if local is not None and (
+        (token and gen > 0 and _matches(local, token, gen)) or _is_legacy_local(local)
+    ):
+        _LOCAL.pop(session_id, None)
     client = await _resolve_redis(redis)
     if client is None:
         return
     try:
-        await client.delete(interrupt_key(session_id))
+        if token and gen > 0:
+            from app.run_registry import run_key
+
+            await client.eval(
+                _CLEAR_LUA,
+                2,
+                run_key(session_id),
+                interrupt_key(session_id),
+                token,
+                gen,
+            )
+        elif not token:
+            await client.eval(_CLEAR_LEGACY_LUA, 1, interrupt_key(session_id))
     except Exception as exc:  # noqa: BLE001
         logger.warning("interrupt: failed to clear redis flag: %s", exc)
+
+
+# Only the current owner may create a cancellation signal.
+_REQUEST_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if not cur then return 0 end
+local ok, data = pcall(cjson.decode, cur)
+if not ok or type(data) ~= 'table' or data['run_token'] ~= ARGV[1]
+   or data['generation'] ~= tonumber(ARGV[2]) then
+  return 0
+end
+redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[4])
+return 1
+"""
+
+# Legacy callers may create/refresh a legacy signal, but never replace a fenced one.
+_REQUEST_LEGACY_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if cur and cur ~= '1' then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+"""
+
+# Clear only a matching signal while the same owner is still registered.
+_CLEAR_LUA = """
+local owner = redis.call('GET', KEYS[1])
+if owner then
+  local ok, data = pcall(cjson.decode, owner)
+  if not ok or type(data) ~= 'table' or data['run_token'] ~= ARGV[1]
+     or data['generation'] ~= tonumber(ARGV[2]) then
+    return 0
+  end
+end
+local cur = redis.call('GET', KEYS[2])
+if not cur then return 0 end
+local ok, data = pcall(cjson.decode, cur)
+if ok and type(data) == 'table' and data['run_token'] == ARGV[1]
+   and data['generation'] == tonumber(ARGV[2]) then
+  return redis.call('DEL', KEYS[2])
+end
+return 0
+"""
+
+# An unfenced cleanup may remove only the legacy value, atomically.
+_CLEAR_LEGACY_LUA = """
+local cur = redis.call('GET', KEYS[1])
+if cur == '1' then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""

@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -1069,11 +1069,8 @@ class MemoryService:
         进程内那份不是缓存，而是**降级路径** —— Redis 不可用或未配置时，
         当前实例至少仍能看见并裁决自己产生的冲突，而不是整块能力消失。
         """
-        # 冲突 ID 必须**跨副本**唯一：此前用 `f"cfl_{毫秒}_{len(self._conflicts)}"`，
-        # 而本副本计数与时钟在两个副本间都可能相同 —— 两个副本在同一毫秒各自产生第一条
-        # 冲突时会算出同一个 ID，落进 Redis 就是同一个 key（后写覆盖先写），
-        # 表现为「另一副本的冲突在列表里消失」。故后缀改用随机片段。
-        cid = conflict_id or f"cfl_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+        # 冲突 ID 必须跨副本唯一且不可预测；显式 ID 仅用于迁移兼容和测试。
+        cid = conflict_id or f"cfl_{secrets.token_urlsafe(32)}"
         record = {
             "conflict_id": cid,
             "slot": slot,
@@ -1140,21 +1137,26 @@ class MemoryService:
             )
             return self.list_conflicts(tenant_id, user_id)
 
-        merged: dict[str, dict[str, Any]] = {
-            c.conflict_id: {
-                "conflict_id": c.conflict_id,
-                "slot": c.slot.value,
-                "key": c.item_key,
-                "old_value": c.old_value,
-                "new_value": c.new_value,
-                "source": c.source.value,
+        merged: dict[str, dict[str, Any]] = {}
+        for conflict in remote:
+            if (
+                conflict.tenant_id != tenant_id
+                or conflict.user_id != user_id
+            ):
+                continue
+            merged[conflict.conflict_id] = {
+                "conflict_id": conflict.conflict_id,
+                "slot": conflict.slot.value,
+                "key": conflict.item_key,
+                "old_value": conflict.old_value,
+                "new_value": conflict.new_value,
+                "source": conflict.source.value,
                 "status": "pending",
-                "tenant_id": c.tenant_id,
-                "user_id": c.user_id,
-                "created_at": c.created_at,
+                "tenant_id": conflict.tenant_id,
+                "user_id": conflict.user_id,
+                "project": str(getattr(conflict, "project", "") or ""),
+                "created_at": conflict.created_at,
             }
-            for c in remote
-        }
         # 只补「没能落到共享存储」的那些（persisted=False）。已落盘的一律以 Redis
         # 为准 —— 否则别的副本裁决/忽略之后，本副本仍会把它当作待办展示，
         # 而用户在该副本上无论怎么点都不会让它消失。
@@ -1163,16 +1165,25 @@ class MemoryService:
                 merged.setdefault(local["conflict_id"], local)
         return list(merged.values())
 
-    async def _load_conflict(self, conflict_id: str) -> dict[str, Any] | None:
-        """从 Redis 取回冲突（可能是其他副本登记的）。"""
+    async def _load_conflict(
+        self, conflict_id: str, tenant_id: int, user_id: str
+    ) -> dict[str, Any] | None:
+        """从 Redis 取回调用者 scope 内的冲突（可能是其他副本登记的）。"""
         if self._conflict_manager is None:
             return None
         try:
-            c = await self._conflict_manager.get_conflict(conflict_id)
+            c = await self._conflict_manager.get_conflict(
+                conflict_id, tenant_id, user_id
+            )
         except Exception as e:
             logger.warning("Failed to load conflict %s from Redis: %s", conflict_id, e)
             return None
-        if c is None:
+        if (
+            c is None
+            or c.conflict_id != conflict_id
+            or c.tenant_id != tenant_id
+            or c.user_id != user_id
+        ):
             return None
         return {
             "conflict_id": c.conflict_id,
@@ -1184,6 +1195,7 @@ class MemoryService:
             "status": "pending",
             "tenant_id": c.tenant_id,
             "user_id": c.user_id,
+            "project": str(getattr(c, "project", "") or ""),
             "created_at": c.created_at,
         }
 
@@ -1205,16 +1217,30 @@ class MemoryService:
             and c["user_id"] == user_id
         ]
 
+    @staticmethod
+    def _conflict_matches_scope(
+        record: dict[str, Any] | None, conflict_id: str, tenant_id: int, user_id: str
+    ) -> bool:
+        return (
+            record is not None
+            and tenant_id is not None
+            and bool(user_id)
+            and record.get("conflict_id") == conflict_id
+            and record.get("tenant_id") == tenant_id
+            and record.get("user_id") == user_id
+        )
+
     async def resolve_conflict(
         self,
         conflict_id: str,
+        tenant_id: int,
+        user_id: str,
         resolution: str,
         manual_value: Any = None,
     ) -> dict[str, Any]:
-        """裁决冲突：``keep_old`` / ``adopt_new``（``use_new`` 同义）/ ``manual``。
+        """在调用者 scope 内裁决冲突：keep_old / adopt_new / manual。
 
-        裁决后把结果写回 L2，并把该值提升为「用户确认」—— 人已经看过并拍板，
-        再让后续派生值悄悄覆盖它就没有意义了。
+        裁决后把结果写回 L2，并把该值提升为「用户确认」。
         """
         # 兼容两种命名：早期 API 用 adopt_new，前端曾用 use_new。
         if resolution == "use_new":
@@ -1225,8 +1251,8 @@ class MemoryService:
         record = self._conflicts.get(conflict_id)
         if record is None and self._conflict_manager is not None:
             # 可能是别的副本登记的 —— 取回来，否则用户在这个副本上裁决不了
-            record = await self._load_conflict(conflict_id)
-        if record is None:
+            record = await self._load_conflict(conflict_id, tenant_id, user_id)
+        if not self._conflict_matches_scope(record, conflict_id, tenant_id, user_id):
             raise ValueError(f"conflict not found: {conflict_id}")
 
         store = self._require_store()
@@ -1269,6 +1295,8 @@ class MemoryService:
             try:
                 await self._conflict_manager.resolve_conflict(
                     conflict_id,
+                    tenant_id,
+                    user_id,
                     "use_new" if resolution == "adopt_new" else resolution,
                     manual_value,
                 )
@@ -1287,12 +1315,22 @@ class MemoryService:
             "key": record["key"],
         }
 
-    async def delete_conflict(self, conflict_id: str) -> bool:
-        """用户否认该冲突（不改变记忆内容）。"""
+    async def delete_conflict(
+        self, conflict_id: str, tenant_id: int, user_id: str
+    ) -> bool:
+        """在调用者 scope 内否认冲突（不改变记忆内容）。"""
+        record = self._conflicts.get(conflict_id)
+        if record is None and self._conflict_manager is not None:
+            record = await self._load_conflict(conflict_id, tenant_id, user_id)
+        if not self._conflict_matches_scope(record, conflict_id, tenant_id, user_id):
+            return False
+
         local = self._conflicts.pop(conflict_id, None) is not None
         if self._conflict_manager is not None:
             try:
-                remote = await self._conflict_manager.delete_conflict(conflict_id)
+                remote = await self._conflict_manager.delete_conflict(
+                    conflict_id, tenant_id, user_id
+                )
                 return bool(remote or local)
             except Exception as e:
                 logger.warning(

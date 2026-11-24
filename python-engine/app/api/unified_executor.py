@@ -29,6 +29,50 @@ from app.db import get_pool
 logger = logging.getLogger(__name__)
 
 
+class _SessionNotFoundError(Exception):
+    """The session does not exist in the caller's owner scope."""
+
+
+SessionOwnerKey = tuple[str, str, str]
+
+
+def _session_owner_key(tenant_id: int, user_id: str, session_id: str) -> SessionOwnerKey:
+    return (str(tenant_id), user_id, session_id)
+
+
+def _session_not_found(session_id: str, trace_id: str = "") -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "success": False,
+        "error_code": "not_found",
+        "error": "Session not found",
+        "session_id": session_id,
+    }
+    if trace_id:
+        result["trace_id"] = trace_id
+    return result
+
+
+def _session_unavailable(session_id: str, trace_id: str = "") -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "success": False,
+        "error_code": "session_unavailable",
+        "error": "Session unavailable",
+        "session_id": session_id,
+    }
+    if trace_id:
+        result["trace_id"] = trace_id
+    return result
+
+
+def _session_matches_owner(
+    row: dict[str, Any], tenant_id: int, user_id: str
+) -> bool:
+    return (
+        str(row.get("tenant_id")) == str(tenant_id)
+        and str(row.get("user_id") or "") == user_id
+    )
+
+
 @dataclass
 class ChatSession:
     """对话会话"""
@@ -68,9 +112,7 @@ class UnifiedChatHandler:
     """
 
     def __init__(self) -> None:
-        self.sessions: dict[str, ChatSession] = (
-            {}
-        )  # session_id -> Session (L1 缓存,有界)
+        self.sessions: dict[SessionOwnerKey, ChatSession] = {}
         self.router = TaskRouter()
         self._db_warned = False  # DB 降级仅告警一次
 
@@ -98,19 +140,20 @@ class UnifiedChatHandler:
                 exc,
             )
 
-    async def _db_get_session(self, session_id: str) -> dict[str, Any] | None:
-        """按 id 读取会话行;DB 不可用或会话不存在返回 None。"""
-        try:
-            pool = get_pool()
-            row = await pool.fetchrow(
-                "SELECT id, tenant_id, user_id, title, mode, shared_context, "
-                "created_at, updated_at FROM unified_sessions WHERE id = $1",
-                session_id,
-            )
-            return dict(row) if row else None
-        except Exception as e:  # noqa: BLE001
-            self._warn_db(e)
-            return None
+    async def _db_get_session(
+        self, session_id: str, tenant_id: int, user_id: str
+    ) -> dict[str, Any] | None:
+        """Read a session only within the caller's complete owner scope."""
+        pool = get_pool()
+        row = await pool.fetchrow(
+            "SELECT id, tenant_id, user_id, title, mode, shared_context, "
+            "created_at, updated_at FROM unified_sessions "
+            "WHERE id = $1 AND tenant_id = $2 AND user_id = $3",
+            session_id,
+            tenant_id,
+            user_id,
+        )
+        return dict(row) if row else None
 
     async def _db_ensure_session(
         self,
@@ -121,10 +164,9 @@ class UnifiedChatHandler:
         mode: str,
         shared_context: dict[str, Any],
     ) -> bool:
-        """确保会话行存在 (INSERT ... ON CONFLICT DO NOTHING,幂等)。
+        """Ensure the session row exists in the caller's owner scope.
 
-        多实例并发创建同一会话时,后到者冲突被忽略,行必然存在。
-        返回 True 表示 DB 可用;False 表示降级为内存模式。
+        Return False for DB degradation and raise on a foreign ID conflict.
         """
         try:
             pool = get_pool()
@@ -138,7 +180,18 @@ class UnifiedChatHandler:
                 mode,
                 dict(shared_context),
             )
+            row = await pool.fetchrow(
+                "SELECT tenant_id, user_id FROM unified_sessions "
+                "WHERE id = $1 AND tenant_id = $2 AND user_id = $3",
+                session_id,
+                tenant_id,
+                user_id,
+            )
+            if row is None:
+                raise _SessionNotFoundError
             return True
+        except _SessionNotFoundError:
+            raise
         except Exception as e:  # noqa: BLE001
             self._warn_db(e)
             return False
@@ -146,43 +199,62 @@ class UnifiedChatHandler:
     async def _db_append_message(
         self,
         session_id: str,
+        tenant_id: int,
+        user_id: str,
         role: str,
         content: str,
         metadata: dict[str, Any],
         error: str = "",
     ) -> None:
-        """追加一条消息到 unified_messages (写库失败不阻断主流程)。"""
+        """Append a message only when the session still belongs to the caller."""
         try:
             pool = get_pool()
-            await pool.execute(
+            row = await pool.fetchrow(
                 "INSERT INTO unified_messages (session_id, role, content, metadata, error) "
-                "VALUES ($1, $2, $3, $4, $5)",
+                "SELECT $1, $4, $5, $6::json, $7 WHERE EXISTS ("
+                "SELECT 1 FROM unified_sessions "
+                "WHERE id = $1 AND tenant_id = $2 AND user_id = $3) RETURNING id",
                 session_id,
+                tenant_id,
+                user_id,
                 role,
                 content,
                 dict(metadata),
                 error,
             )
+            if row is None:
+                raise _SessionNotFoundError
+        except _SessionNotFoundError:
+            raise
         except Exception as e:  # noqa: BLE001
             self._warn_db(e)
 
     async def _db_touch_session(
         self,
         session_id: str,
+        tenant_id: int,
+        user_id: str,
         mode: str,
         shared_context: dict[str, Any],
     ) -> None:
-        """更新会话 mode / shared_context (jsonb 顶层键合并) / updated_at。"""
+        """Update context only when the session still belongs to the caller."""
         try:
             pool = get_pool()
-            await pool.execute(
+            row = await pool.fetchrow(
                 "UPDATE unified_sessions "
-                "SET mode = $2, shared_context = shared_context || $3::jsonb, "
-                "updated_at = NOW() WHERE id = $1",
+                "SET mode = $4, shared_context = shared_context || $5::jsonb, "
+                "updated_at = NOW() WHERE id = $1 AND tenant_id = $2 AND user_id = $3 "
+                "RETURNING id",
                 session_id,
+                tenant_id,
+                user_id,
                 mode,
                 dict(shared_context),
             )
+            if row is None:
+                raise _SessionNotFoundError
+        except _SessionNotFoundError:
+            raise
         except Exception as e:  # noqa: BLE001
             self._warn_db(e)
 
@@ -222,6 +294,10 @@ class UnifiedChatHandler:
         """
         import uuid
 
+        owner_user_id = str(user_id or tenant_id)
+        session_id = str(session_id) if session_id else ""
+        has_requested_session = bool(session_id)
+
         if not trace_id:
             # R9：优先复用网关传下来的 trace id（X-Chiron-Trace-Id → contextvar），
             # 否则才自行生成；两条链路的日志/事件因此可对齐。
@@ -240,7 +316,7 @@ class UnifiedChatHandler:
         if not ctx_agent:
             agent_ids = context_ids(context, "agent")
             if agent_ids:
-                payload = await load_agent_payload(agent_ids[0], tenant_id, user_id)
+                payload = await load_agent_payload(agent_ids[0], tenant_id, owner_user_id)
                 if payload:
                     ctx_agent = payload
                     context["agent"] = payload
@@ -267,11 +343,29 @@ class UnifiedChatHandler:
         # 仅透传模型/provider 仍会导致 OpenCode 请求缺少 x-opencode-session。
         context["session_id"] = session_id
 
-        session = self.sessions.get(session_id)
-        if session is None:
-            # 先尝试从 DB 恢复 (多实例场景: 其他实例可能已创建该会话)
-            db_row = await self._db_get_session(session_id)
+        owner_key = _session_owner_key(tenant_id, owner_user_id, session_id)
+        session = self.sessions.get(owner_key)
+        restored_from_db = False
+        created_session = False
+        if session is not None:
+            if (
+                str(session.tenant_id) != str(tenant_id)
+                or session.user_id != owner_user_id
+            ):
+                return _session_not_found(session_id, trace_id)
+        elif any(cached.session_id == session_id for cached in self.sessions.values()):
+            return _session_not_found(session_id, trace_id)
+        elif has_requested_session:
+            try:
+                db_row = await self._db_get_session(
+                    session_id, tenant_id, owner_user_id
+                )
+            except Exception as e:  # noqa: BLE001
+                self._warn_db(e)
+                db_row = None
             if db_row is not None:
+                if not _session_matches_owner(db_row, tenant_id, owner_user_id):
+                    return _session_not_found(session_id, trace_id)
                 session = ChatSession(
                     session_id=session_id,
                     tenant_id=db_row["tenant_id"],
@@ -282,34 +376,73 @@ class UnifiedChatHandler:
                     updated_at=_dt_to_ts(db_row.get("updated_at")),
                     shared_context=dict(db_row.get("shared_context") or {}),
                 )
+                restored_from_db = True
             else:
                 session = ChatSession(
                     session_id=session_id,
                     tenant_id=tenant_id,
-                    # 与写库时的兜底一致（见 _db_ensure_session 的 user_id or tenant_id）
-                    user_id=str(user_id or tenant_id),
+                    user_id=owner_user_id,
                     title=user_input[:50],
                     mode=mode,
-                    # 初始 shared_context = 请求注入的跨工作台上下文
                     shared_context=dict(context),
                 )
-            self.sessions[session_id] = session
-            self._evict_l1_sessions()
+                created_session = True
+        else:
+            session = ChatSession(
+                session_id=session_id,
+                tenant_id=tenant_id,
+                user_id=owner_user_id,
+                title=user_input[:50],
+                mode=mode,
+                shared_context=dict(context),
+            )
+            created_session = True
 
+        # Restored and cached sessions require a fresh owner check before writing.
+        if not created_session:
+            try:
+                current_row = await self._db_get_session(
+                    session_id, tenant_id, owner_user_id
+                )
+            except Exception as e:  # noqa: BLE001
+                self._warn_db(e)
+                if restored_from_db:
+                    return _session_unavailable(session_id, trace_id)
+            else:
+                if current_row is None or not _session_matches_owner(
+                    current_row, tenant_id, owner_user_id
+                ):
+                    return _session_not_found(session_id, trace_id)
+
+        try:
+            db_ok = await self._db_ensure_session(
+                session_id=session_id,
+                tenant_id=tenant_id,
+                user_id=owner_user_id,
+                title=session.title,
+                mode=mode,
+                shared_context=session.shared_context,
+            )
+        except _SessionNotFoundError:
+            return _session_not_found(session_id, trace_id)
+
+        self.sessions[owner_key] = session
+        self._evict_l1_sessions()
         session.updated_at = time.time()
         session.mode = mode
 
-        # 写穿透: 确保会话行存在 (幂等; DB 不可用时静默降级为内存模式)
-        db_ok = await self._db_ensure_session(
-            session_id=session_id,
-            tenant_id=tenant_id,
-            user_id=str(user_id or tenant_id),
-            title=session.title,
-            mode=mode,
-            shared_context=session.shared_context,
-        )
-
-        # 添加用户消息到历史 (先写库,再更新内存缓存)
+        if db_ok:
+            try:
+                await self._db_append_message(
+                    session_id,
+                    tenant_id,
+                    owner_user_id,
+                    "user",
+                    user_input,
+                    {},
+                )
+            except _SessionNotFoundError:
+                return _session_not_found(session_id, trace_id)
         session.messages.append(
             {
                 "role": "user",
@@ -317,8 +450,6 @@ class UnifiedChatHandler:
                 "timestamp": time.time(),
             }
         )
-        if db_ok:
-            await self._db_append_message(session_id, "user", user_input, {})
 
         logger.info(
             "User submitted task (session=%s, tenant=%s, mode=%s, trace_id=%s)",
@@ -467,7 +598,31 @@ class UnifiedChatHandler:
                     "name"
                 ) or "unified_chat_agent"
 
-            # 添加到会话历史 (assistant 消息 metadata 同带引用/来源字段,供前端展示)
+            next_shared_context = {
+                **session.shared_context,
+                "last_output": final_output,
+                "last_trace_id": trace_id,
+            }
+            if db_ok:
+                try:
+                    await self._db_append_message(
+                        session_id,
+                        tenant_id,
+                        owner_user_id,
+                        "assistant",
+                        final_output,
+                        dict(meta),
+                    )
+                    await self._db_touch_session(
+                        session_id,
+                        tenant_id,
+                        owner_user_id,
+                        mode,
+                        next_shared_context,
+                    )
+                except _SessionNotFoundError:
+                    return _session_not_found(session_id, trace_id)
+
             session.messages.append(
                 {
                     "role": "assistant",
@@ -476,17 +631,7 @@ class UnifiedChatHandler:
                     "metadata": dict(meta),
                 }
             )
-
-            # 更新共享上下文 (供后续任务使用)
-            session.shared_context["last_output"] = final_output
-            session.shared_context["last_trace_id"] = trace_id
-
-            # 写穿透: 落库 assistant 消息 + 更新会话共享上下文
-            if db_ok:
-                await self._db_append_message(
-                    session_id, "assistant", final_output, dict(meta)
-                )
-                await self._db_touch_session(session_id, mode, session.shared_context)
+            session.shared_context.update(next_shared_context)
 
             # 发布结果到 ContextBus (publish_result 默认即 RESULT_PUBLISH)
             await publish_result(
@@ -524,27 +669,40 @@ class UnifiedChatHandler:
                 },
             }
 
+        except _SessionNotFoundError:
+            return _session_not_found(session_id, trace_id)
         except Exception as e:
             logger.error(f"Task execution failed: {e}", exc_info=True)
 
-            # 记录错误到会话历史 (失败同样落库,便于跨实例恢复)
+            error_content = f"抱歉,执行失败: {str(e)}"
+            if db_ok:
+                try:
+                    await self._db_append_message(
+                        session_id,
+                        tenant_id,
+                        owner_user_id,
+                        "assistant",
+                        error_content,
+                        {},
+                        error=str(e),
+                    )
+                    await self._db_touch_session(
+                        session_id,
+                        tenant_id,
+                        owner_user_id,
+                        mode,
+                        session.shared_context,
+                    )
+                except _SessionNotFoundError:
+                    return _session_not_found(session_id, trace_id)
             session.messages.append(
                 {
                     "role": "assistant",
-                    "content": f"抱歉,执行失败: {str(e)}",
+                    "content": error_content,
                     "timestamp": time.time(),
                     "error": str(e),
                 }
             )
-            if db_ok:
-                await self._db_append_message(
-                    session_id,
-                    "assistant",
-                    f"抱歉,执行失败: {str(e)}",
-                    {},
-                    error=str(e),
-                )
-                await self._db_touch_session(session_id, mode, session.shared_context)
 
             return {
                 "success": False,
@@ -903,6 +1061,7 @@ class UnifiedChatHandler:
         # 会话归属是用户级的，租户只是它的外边界。
         if not user_id:
             return {"success": False, "error": "user_id is required"}
+        owner_key = _session_owner_key(tenant_id, user_id, session_id)
 
         # 1) DB 优先: 读库为准,保证多实例一致
         try:
@@ -921,12 +1080,16 @@ class UnifiedChatHandler:
                     user_id,
                 )
                 if row is None:
-                    return {"success": False, "error": "Session not found"}
+                    return _session_not_found(session_id)
                 rows = await pool.fetch(
-                    "SELECT role, content, metadata, error, created_at "
-                    "FROM unified_messages WHERE session_id = $1 "
-                    "ORDER BY created_at, id LIMIT $2",
+                    "SELECT m.role, m.content, m.metadata, m.error, m.created_at "
+                    "FROM unified_messages AS m "
+                    "JOIN unified_sessions AS s ON s.id = m.session_id "
+                    "WHERE m.session_id = $1 AND s.tenant_id = $2 AND s.user_id = $3 "
+                    "ORDER BY m.created_at, m.id LIMIT $4",
                     session_id,
+                    tenant_id,
+                    user_id,
                     limit,
                 )
                 messages: list[dict[str, Any]] = []
@@ -943,8 +1106,12 @@ class UnifiedChatHandler:
                     messages.append(msg)
                 shared_context = dict(row["shared_context"] or {})
                 # 回填 L1 缓存 (DB 不可用时内存兜底仍可读到最新)
-                cache = self.sessions.get(session_id)
-                if cache is not None:
+                cache = self.sessions.get(owner_key)
+                if (
+                    cache is not None
+                    and str(cache.tenant_id) == str(tenant_id)
+                    and cache.user_id == user_id
+                ):
                     cache.messages = messages
                     cache.shared_context = shared_context
                 return {
@@ -957,14 +1124,14 @@ class UnifiedChatHandler:
                 self._warn_db(e)
 
         # 2) 内存兜底 (DB 不可用,维持旧版行为)
-        session = self.sessions.get(session_id)
+        session = self.sessions.get(owner_key)
         # 与 DB 路径保持同一套归属规则：tenant 与 user 都要匹配。
         if (
             not session
             or getattr(session, "tenant_id", None) != tenant_id
             or getattr(session, "user_id", None) != user_id
         ):
-            return {"success": False, "error": "Session not found"}
+            return _session_not_found(session_id)
 
         return {
             "success": True,
@@ -1142,6 +1309,8 @@ async def submit_chat(request: Request) -> dict[str, Any]:
     # 同 tenant_id 逻辑:query 可信优先,防止客户端伪造 user_id 冒充他人。
     query_uid = str(request.query_params.get("user_id") or "")
     body_uid = str(body.get("user_id") or "")
+    if query_uid and body_uid and query_uid != body_uid:
+        return {"success": False, "error": "user_id mismatch"}
     user_id = query_uid or body_uid
     # P1-d：此前完全忽略 body.llm_config → 界面上切换模型/模式对这条链路
     # （ChatView 的 sendUnified 走的正是它）完全无效。这里读出来交给 ChatHandler

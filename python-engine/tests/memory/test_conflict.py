@@ -398,7 +398,7 @@ class TestPendingConfirmation:
         )
 
         assert conflict is not None
-        retrieved = await manager.get_conflict(conflict.conflict_id)
+        retrieved = await manager.get_conflict(conflict.conflict_id, "t1", "u1")
         assert retrieved is not None
         assert retrieved.item_key == "lang"
         assert retrieved.new_value == "中文"
@@ -430,7 +430,7 @@ class TestConflictResolution:
 
         assert conflict is not None
         success, result = await manager.resolve_conflict(
-            conflict.conflict_id, "keep_old"
+            conflict.conflict_id, "t1", "u1", "keep_old"
         )
 
         assert success is True
@@ -438,7 +438,7 @@ class TestConflictResolution:
         assert result["resolution"] == "keep_old"
 
         # 冲突应该被删除
-        retrieved = await manager.get_conflict(conflict.conflict_id)
+        retrieved = await manager.get_conflict(conflict.conflict_id, "t1", "u1")
         assert retrieved is None
 
     @pytest.mark.asyncio
@@ -464,7 +464,7 @@ class TestConflictResolution:
 
         assert conflict is not None
         success, result = await manager.resolve_conflict(
-            conflict.conflict_id, "use_new"
+            conflict.conflict_id, "t1", "u1", "use_new"
         )
 
         assert success is True
@@ -494,7 +494,7 @@ class TestConflictResolution:
 
         assert conflict is not None
         success, result = await manager.resolve_conflict(
-            conflict.conflict_id, "manual", manual_value="日本語"
+            conflict.conflict_id, "t1", "u1", "manual", manual_value="日本語"
         )
 
         assert success is True
@@ -524,7 +524,7 @@ class TestConflictResolution:
 
         assert conflict is not None
         success, result = await manager.resolve_conflict(
-            conflict.conflict_id, "manual"
+            conflict.conflict_id, "t1", "u1", "manual"
         )
 
         assert success is False
@@ -552,7 +552,7 @@ class TestConflictResolution:
 
         assert conflict is not None
         success, result = await manager.resolve_conflict(
-            conflict.conflict_id, "invalid_choice"
+            conflict.conflict_id, "t1", "u1", "invalid_choice"
         )
 
         assert success is False
@@ -561,7 +561,7 @@ class TestConflictResolution:
     async def test_resolve_nonexistent_conflict_fails(self, manager):
         """裁决不存在的冲突失败。"""
         success, result = await manager.resolve_conflict(
-            "nonexistent_id", "keep_old"
+            "nonexistent_id", "t1", "u1", "keep_old"
         )
 
         assert success is False
@@ -593,17 +593,17 @@ class TestConflictDeletion:
         )
 
         assert conflict is not None
-        success = await manager.delete_conflict(conflict.conflict_id)
+        success = await manager.delete_conflict(conflict.conflict_id, "t1", "u1")
         assert success is True
 
         # 冲突应该被删除
-        retrieved = await manager.get_conflict(conflict.conflict_id)
+        retrieved = await manager.get_conflict(conflict.conflict_id, "t1", "u1")
         assert retrieved is None
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_conflict(self, manager):
         """删除不存在的冲突返回 False。"""
-        success = await manager.delete_conflict("nonexistent_id")
+        success = await manager.delete_conflict("nonexistent_id", "t1", "u1")
         assert success is False
 
 

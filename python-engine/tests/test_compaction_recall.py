@@ -24,6 +24,7 @@ from app.agent.compaction import (
     _merge_progress,
     _prune_messages,
     _serialize_for_recall,
+    make_fold_lineage,
 )
 
 
@@ -482,10 +483,29 @@ def test_projection_carries_progress_from_folded_ranges():
         _msg("assistant", "好的", id="m5", seq=5),
     ]
     folds = [
-        {"covered_from": 1, "covered_to": 4, "body_suffix": 2, "digest": "- 用户要求改 a.py"}
+        {
+            "covered_from": 1,
+            "covered_to": 4,
+            "body_suffix": 2,
+            "digest": "- 用户要求改 a.py",
+            "lineage": make_fold_lineage(
+                messages,
+                1,
+                4,
+                provider="openai",
+                model="gpt-test",
+                context_window=128_000,
+            ),
+        }
     ]
 
-    out = _apply_folds(messages, folds)
+    out = _apply_folds(
+        messages,
+        folds,
+        provider="openai",
+        model="gpt-test",
+        context_window=128_000,
+    )
 
     assert out is not None
     joined = "\n".join(str(m.get("content") or "") for m in out)

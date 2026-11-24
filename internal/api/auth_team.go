@@ -21,6 +21,22 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+func currentPasswordError(storedHash, oldPassword, newPassword string, passwordSet bool) string {
+	if !passwordSet {
+		return ""
+	}
+	if oldPassword == "" {
+		return "current password is required"
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(oldPassword)); err != nil {
+		return "current password is incorrect"
+	}
+	if oldPassword == newPassword {
+		return "new password must be different from the current password"
+	}
+	return ""
+}
+
 // ChangePassword POST /v1/auth/password —— 已登录用户自助改密。
 //
 // 首登（`must_change_password=true`）也走这里：AuthMiddleware 只放行本端点、
@@ -39,8 +55,8 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, ErrInvalidReq)
 		return
 	}
-	if body.OldPassword == "" || body.NewPassword == "" {
-		BadRequest(w, "old_password and new_password are required")
+	if body.NewPassword == "" {
+		BadRequest(w, "new_password is required")
 		return
 	}
 	if len(body.NewPassword) > 128 {
@@ -75,20 +91,9 @@ func (h *AuthHandler) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		Unauthorized(w, ErrAuthRequired)
 		return
 	}
-	if passwordSet {
-		if body.OldPassword == "" {
-			BadRequest(w, "current password is required")
-			return
-		}
-		if err := bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(body.OldPassword)); err != nil {
-			BadRequest(w, "current password is incorrect")
-			return
-		}
-		// 新旧相同是常见的"改了个寂寞"：不拦的话，用户以为换过了，旧密码仍然有效。
-		if body.OldPassword == body.NewPassword {
-			BadRequest(w, "new password must be different from the current password")
-			return
-		}
+	if msg := currentPasswordError(storedHash, body.OldPassword, body.NewPassword, passwordSet); msg != "" {
+		BadRequest(w, msg)
+		return
 	}
 	// password_set=false 是本地 owner 的"首次设置密码"：它此前的 hash 是随机值，
 	// 没人知道，要求旧密码等于把账号锁死。
@@ -323,7 +328,7 @@ func (h *AdminHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	Created(w, map[string]interface{}{
 		"user": UserResponse{
 			ID: userID, Email: email, Username: username, Name: nickname, Nickname: nickname,
-			Role: role, MustChangePassword: true,
+			Role: role, PasswordSet: true, MustChangePassword: true,
 		},
 		// 只返回这一次；不落日志、不写库（库里只有 bcrypt 摘要）。
 		"initial_password": password,

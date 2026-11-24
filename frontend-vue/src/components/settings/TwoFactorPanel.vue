@@ -22,7 +22,7 @@
  *    那样这道防线等于不存在。
  */
 import { copyTextOrThrow } from '../../utils/clipboard'
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { message } from 'ant-design-vue'
 import { SafetyCertificateOutlined } from '@ant-design/icons-vue'
 import QRCode from 'qrcode'
@@ -35,6 +35,7 @@ const device = useDeviceStore()
 
 const loading = ref(false)
 const busy = ref(false)
+const enrollConfirming = ref(false)
 const status = ref<TwoFactorStatus | null>(null)
 /** 外壳不支持这些 IPC（老 preload） */
 const unsupported = ref(false)
@@ -59,6 +60,44 @@ const passwordOpen = ref(false)
 const passwordAction = ref<'disable' | 'regenerate'>('disable')
 const passwordInput = ref('')
 const passwordError = ref('')
+let mounted = true
+let enrollGeneration = 0
+
+function clearEnrollment() {
+  enrollGeneration++
+  enrollSecret.value = ''
+  enrollQr.value = ''
+  enrollToken.value = ''
+  enrollError.value = ''
+}
+
+function clearRecovery() {
+  recoveryCodes.value = []
+  copied.value = false
+}
+
+function clearPassword() {
+  passwordInput.value = ''
+  passwordError.value = ''
+}
+
+watch(enrollOpen, open => {
+  if (open) return
+  if (enrollConfirming.value) {
+    enrollOpen.value = true
+    return
+  }
+  clearEnrollment()
+})
+watch(recoveryOpen, open => { if (!open) clearRecovery() })
+watch(passwordOpen, open => { if (!open) clearPassword() })
+
+onUnmounted(() => {
+  mounted = false
+  clearEnrollment()
+  clearRecovery()
+  clearPassword()
+})
 
 const enabled = computed(() => status.value?.enabled === true)
 
@@ -78,9 +117,11 @@ async function load() {
 
 async function startEnroll() {
   busy.value = true
-  enrollError.value = ''
+  clearEnrollment()
+  const generation = enrollGeneration
   try {
     const started = await device.beginTwoFactor()
+    if (!mounted || generation !== enrollGeneration) return
     if (!started.ok) {
       if (started.reason === 'unsupported') unsupported.value = true
       else enrollError.value = started.message || started.reason || ''
@@ -104,10 +145,15 @@ async function startEnroll() {
         /* 画不出来就走手动输入 */
       }
     }
+    if (!mounted || generation !== enrollGeneration) {
+      enrollSecret.value = ''
+      enrollQr.value = ''
+      return
+    }
     enrollToken.value = ''
     enrollOpen.value = true
   } finally {
-    busy.value = false
+    if (mounted) busy.value = false
   }
 }
 
@@ -115,23 +161,27 @@ async function confirmEnroll() {
   const token = enrollToken.value.trim()
   if (!token || busy.value) return
   busy.value = true
+  enrollConfirming.value = true
   enrollError.value = ''
+  const generation = enrollGeneration
   try {
     const result = await device.confirmTwoFactor(token)
+    if (!mounted || generation !== enrollGeneration) return
     if (!result.ok) {
+      enrollToken.value = ''
       enrollError.value = t('settings.two_factor_confirm_failed')
       return
     }
+    clearEnrollment()
+    enrollConfirming.value = false
     enrollOpen.value = false
-    enrollSecret.value = ''
-    enrollQr.value = ''
-    enrollToken.value = ''
     recoveryCodes.value = result.recoveryCodes || []
     recoveryOpen.value = true
     message.success(t('settings.two_factor_enabled_ok'))
     await load()
   } finally {
-    busy.value = false
+    enrollConfirming.value = false
+    if (mounted) busy.value = false
   }
 }
 
@@ -148,15 +198,13 @@ async function copyRecovery() {
 
 function closeRecovery() {
   recoveryOpen.value = false
-  recoveryCodes.value = []
-  copied.value = false
+  clearRecovery()
 }
 
 /** 停用 / 重新生成都先要密码 —— 见模块头第 3 条 */
 function askPassword(action: 'disable' | 'regenerate') {
   passwordAction.value = action
-  passwordInput.value = ''
-  passwordError.value = ''
+  clearPassword()
   passwordOpen.value = true
 }
 
@@ -168,6 +216,7 @@ async function submitPassword() {
   try {
     if (passwordAction.value === 'disable') {
       const result = await device.disableTwoFactor(password)
+      if (!mounted) return
       if (!result.ok) {
         passwordError.value =
           result.reason === 'bad-credential'
@@ -181,6 +230,7 @@ async function submitPassword() {
       return
     }
     const result = await device.regenerateRecoveryCodes(password)
+    if (!mounted) return
     if (!result.ok) {
       passwordError.value =
         result.reason === 'bad-credential'
@@ -195,7 +245,8 @@ async function submitPassword() {
     message.success(t('settings.two_factor_regenerated_ok'))
     await load()
   } finally {
-    busy.value = false
+    passwordInput.value = ''
+    if (mounted) busy.value = false
   }
 }
 
@@ -296,7 +347,10 @@ onMounted(() => {
       :title="$t('settings.two_factor_enable')"
       :footer="null"
       :mask-closable="false"
+      :closable="!enrollConfirming"
+      :keyboard="!enrollConfirming"
       :width="420"
+      data-test="tfa-enroll-modal"
     >
       <p class="tfa-modal-hint">
         {{ $t('settings.two_factor_scan_hint') }}
@@ -342,7 +396,11 @@ onMounted(() => {
       </p>
 
       <div class="tfa-modal-actions">
-        <a-button @click="enrollOpen = false">
+        <a-button
+          data-test="tfa-enroll-cancel"
+          :disabled="enrollConfirming"
+          @click="enrollOpen = false"
+        >
           {{ $t('common.cancel') }}
         </a-button>
         <a-button
@@ -364,6 +422,7 @@ onMounted(() => {
       :footer="null"
       :mask-closable="false"
       :width="420"
+      data-test="tfa-recovery-modal"
     >
       <a-alert
         type="warning"
@@ -403,6 +462,7 @@ onMounted(() => {
       :footer="null"
       :mask-closable="false"
       :width="400"
+      data-test="tfa-password-modal"
     >
       <a-input-password
         v-model:value="passwordInput"

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/athenavi/chiron/internal/auth"
+	"github.com/athenavi/chiron/internal/db"
 	"github.com/gorilla/websocket"
 )
 
@@ -31,6 +32,9 @@ type deviceFSTestEnv struct {
 // 时间参数只影响测试 hub，生产默认值（30s/90s/10s）不受影响。
 func newDeviceFSTestEnv(t *testing.T, timings deviceFSTimings) *deviceFSTestEnv {
 	t.Helper()
+	previousRedis := db.Redis
+	db.Redis = newWSAuthTestRedis(t)
+	t.Cleanup(func() { db.Redis = previousRedis })
 	hub := newDeviceHub()
 	if timings != (deviceFSTimings{}) {
 		hub.timings = timings

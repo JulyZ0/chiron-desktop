@@ -15,6 +15,7 @@ import re
 import shlex
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -329,30 +330,274 @@ def _normalize_exe(name: str) -> str:
     return name
 
 
-def _parse_command(command: str) -> tuple[list[str], str | None]:
-    """将命令字符串解析为 [executable, *args]，校验白名单。
+@dataclass(frozen=True)
+class ShellCommand:
+    argv: tuple[str, ...] = ()
+    assignments: tuple[str, ...] = ()
+    redirections: tuple[tuple[str, str], ...] = ()
 
-    返回 (args, error_reason)。error_reason 非 None 表示被拒绝。
-    """
-    command = command.strip()
-    if not command:
-        return [], "empty command"
 
+@dataclass(frozen=True)
+class ShellProgram:
+    commands: tuple[ShellCommand, ...] = ()
+    operators: tuple[str, ...] = ()
+    grouped: bool = False
+    asynchronous: bool = False
+
+
+@dataclass(frozen=True)
+class _ShellToken:
+    kind: str
+    raw: str
+
+
+_POSIX_OPERATORS = ("&>>", "<<<", "&&", "||", ">>", "<<", ">&", "<&", "<>", ">|", "&>", ";", "&", "|", "<", ">", "(", ")")
+_CMD_OPERATORS = ("&&", "||", ">>", ">&", "<&", ">", "<", "&", "|", ";", "(", ")")
+_RESERVED_WORDS = frozenset(
+    {"if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "case", "esac", "function", "select", "time", "coproc", "!"}
+)
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_DANGEROUS_ENV_NAMES = frozenset(
+    {
+        "PATH", "PATHEXT", "HOME", "USERPROFILE", "CDPATH", "COMSPEC", "SYSTEMROOT", "WINDIR",
+        "ENV", "BASH_ENV", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONINSPECT",
+        "PYTHONWARNINGS", "PYTHONBREAKPOINT", "PYTHONUSERBASE",
+    }
+)
+
+
+def _lex_shell(command: str, dialect: str) -> list[_ShellToken]:
+    operators = _CMD_OPERATORS if dialect == "cmd" else _POSIX_OPERATORS
+    tokens: list[_ShellToken] = []
+    buf: list[str] = []
+    quote = ""
+    index = 0
+
+    def flush() -> None:
+        if buf:
+            tokens.append(_ShellToken("word", "".join(buf)))
+            buf.clear()
+
+    while index < len(command):
+        char = command[index]
+        if dialect == "posix" and char == "\\":
+            if index + 1 >= len(command):
+                raise ValueError("trailing escape")
+            buf.extend((char, command[index + 1]))
+            index += 2
+            continue
+        if dialect == "posix" and char in ("'", '"'):
+            buf.append(char)
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+            index += 1
+            continue
+        if dialect == "cmd" and char == '"':
+            buf.append(char)
+            quote = "" if quote else '"'
+            index += 1
+            continue
+        if not quote and char.isspace():
+            flush()
+            if dialect == "posix" and char in "\r\n":
+                tokens.append(_ShellToken("op", ";"))
+            index += 1
+            continue
+        if not quote and char == "#" and not buf:
+            break
+        operator = next((op for op in operators if command.startswith(op, index)), None)
+        if operator and not quote:
+            flush()
+            tokens.append(_ShellToken("op", operator))
+            index += len(operator)
+            continue
+        buf.append(char)
+        index += 1
+    if quote:
+        raise ValueError("unterminated quote")
+    flush()
+    return tokens
+
+
+def _word_value(raw: str, dialect: str) -> str:
+    if dialect == "cmd":
+        if "!" in raw:
+            raise ValueError("delayed environment expansion is not inspectable")
+        if "%" in raw and raw != "%CD%":
+            raise ValueError("environment expansion is not inspectable")
+        return raw.replace('"', "")
+    quote = ""
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char in ("'", '"'):
+            if not quote:
+                quote = char
+            elif quote == char:
+                quote = ""
+        elif char == "$" and quote != "'":
+            raise ValueError("parameter expansion is not inspectable")
+        index += 1
     try:
-        parts = shlex.split(command)
-    except ValueError as e:
-        return [], f"invalid command syntax: {e}"
+        parts = shlex.split(raw, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"invalid word: {exc}") from exc
+    if len(parts) != 1:
+        raise ValueError("invalid shell word")
+    return parts[0]
 
-    if not parts:
-        return [], "empty command"
 
+class _ShellParser:
+    def __init__(self, tokens: list[_ShellToken], dialect: str) -> None:
+        self.tokens = tokens
+        self.dialect = dialect
+        self.index = 0
+        self.operators: list[str] = []
+        self.grouped = False
+        self.asynchronous = False
+
+    def parse(self) -> ShellProgram:
+        commands = self._list(set())
+        if self._peek() is not None:
+            raise ValueError(f"unexpected token: {self._peek()}")
+        if not commands:
+            raise ValueError("empty command")
+        return ShellProgram(tuple(commands), tuple(self.operators), self.grouped, self.asynchronous)
+
+    def _peek(self) -> str | None:
+        return self.tokens[self.index].raw if self.index < len(self.tokens) else None
+
+    def _take(self) -> _ShellToken:
+        token = self.tokens[self.index]
+        self.index += 1
+        return token
+
+    def _list(self, stops: set[str]) -> list[ShellCommand]:
+        commands: list[ShellCommand] = []
+        while self._peek() not in stops and self._peek() is not None:
+            if self._peek() == ";":
+                if not commands:
+                    raise ValueError("leading command separator")
+                self._take()
+                if self._peek() == ";":
+                    raise ValueError("consecutive command separators")
+                continue
+            commands.extend(self._and_or())
+            if self._peek() == ";":
+                self._take()
+                if self._peek() == ";":
+                    raise ValueError("consecutive command separators")
+                continue
+            if self._peek() == "&":
+                self._take()
+                self.operators.append("&")
+                self.asynchronous = True
+                if self._peek() in {";", "&"}:
+                    raise ValueError("invalid background command separator")
+                continue
+            break
+        return commands
+
+    def _and_or(self) -> list[ShellCommand]:
+        commands = self._pipeline()
+        while self._peek() in {"&&", "||"}:
+            self.operators.append(self._take().raw)
+            commands.extend(self._pipeline())
+        return commands
+
+    def _pipeline(self) -> list[ShellCommand]:
+        commands = self._simple()
+        while self._peek() == "|":
+            self.operators.append(self._take().raw)
+            commands.extend(self._simple())
+        return commands
+
+    def _simple(self) -> list[ShellCommand]:
+        if self._peek() == "(":
+            self._take()
+            self.grouped = True
+            commands = self._list({")"})
+            if self._peek() != ")" or not commands:
+                raise ValueError("unclosed or empty subshell")
+            self._take()
+            return commands
+        if self._peek() == "{":
+            self._take()
+            self.grouped = True
+            commands = self._list({"}"})
+            if self._peek() != "}" or not commands:
+                raise ValueError("unclosed or empty command group")
+            self._take()
+            return commands
+        argv: list[str] = []
+        assignments: list[str] = []
+        redirections: list[tuple[str, str]] = []
+        while self._peek() is not None:
+            token = self._take()
+            if token.kind == "op":
+                if token.raw in {")", "}"}:
+                    self.index -= 1
+                    break
+                if token.raw in {";", "&", "&&", "||", "|"}:
+                    self.index -= 1
+                    break
+                if token.raw in {"<<", "<<<", "<>"}:
+                    raise ValueError("heredoc and complex redirection are not inspectable")
+                if self.index >= len(self.tokens) or self.tokens[self.index].kind != "word":
+                    raise ValueError("redirection missing target")
+                target_raw = self._take().raw
+                target = _word_value(target_raw, self.dialect)
+                if token.raw in {">&", "<&"}:
+                    if not target.isdigit():
+                        raise ValueError("dynamic file descriptor redirection is not inspectable")
+                elif argv and argv[-1].isdigit() and token.raw in {"<", ">", ">>", "&>", "&>>", ">|"}:
+                    argv.pop()
+                redirections.append((token.raw, target))
+                continue
+            if not argv and not redirections and _ASSIGNMENT_RE.match(token.raw):
+                assignments.append(token.raw)
+                continue
+            value = _word_value(token.raw, self.dialect)
+            if not argv and value in _RESERVED_WORDS:
+                raise ValueError(f"shell control construct is not inspectable: {value}")
+            if not argv and value == "{" and token.raw == "{":
+                raise ValueError("invalid command group")
+            argv.append(value)
+        if not argv and not assignments and not redirections:
+            raise ValueError("missing command")
+        return [ShellCommand(tuple(argv), tuple(assignments), tuple(redirections))]
+
+
+def parse_shell_program(command: str, dialect: str | None = None) -> ShellProgram:
+    """Parse shell lists without executing expansions; unsupported grammar fails closed."""
+    dialect = dialect or ("cmd" if sys.platform == "win32" else "posix")
+    if dialect not in {"posix", "cmd"}:
+        raise ValueError(f"unsupported shell dialect: {dialect}")
+    return _ShellParser(_lex_shell(command, dialect), dialect).parse()
+
+
+def _parse_command(command: str) -> tuple[list[str], str | None]:
+    """Parse one direct-exec command; shell operators require explicit rejection."""
+    try:
+        program = parse_shell_program(command, dialect="posix")
+    except ValueError as exc:
+        return [], f"invalid command syntax: {exc}"
+    if program.operators or program.grouped or program.asynchronous:
+        return [], "shell operators require a shell-aware execution entrypoint"
+    if len(program.commands) != 1:
+        return [], "expected exactly one command"
+    parsed = program.commands[0]
+    if parsed.assignments or parsed.redirections or not parsed.argv:
+        return [], "direct exec does not support assignments or redirections"
+    parts = list(parsed.argv)
     exe_name = _normalize_exe(parts[0])
-
-    # 白名单校验（python/python3 已在 _ALLOWED_EXECUTABLES 中，
-    # sys.executable 完整路径由 _normalize_exe 规范化后统一走白名单校验）
-    if exe_name not in _ALLOWED_EXECUTABLES:
+    if "/" in parts[0] or "\\" in parts[0] or exe_name not in _ALLOWED_EXECUTABLES:
         return [], f"executable not allowed: {exe_name}"
-
     return parts, None
 
 
@@ -420,31 +665,27 @@ def _python_code_operand(args: list[str]) -> tuple[str, str | None]:
 _SCRIPT_INSPECT_MAX_BYTES = 1024 * 1024
 
 
-async def _read_workspace_script(name: str) -> tuple[str | None, str | None]:
-    """读出 workspace 内脚本的文本，供 `check_static` 使用；返回 (内容, 拒绝原因)。
+def _read_workspace_script_sync(name: str) -> tuple[str | None, str | None]:
+    try:
+        path = safe_join(name)
+    except ValueError as exc:
+        return None, f"script path rejected: {exc}"
+    if not path.is_file():
+        return None, f"script not found in workspace: {name}"
+    size = path.stat().st_size
+    if size > _SCRIPT_INSPECT_MAX_BYTES:
+        return None, f"script too large to inspect ({size} bytes)"
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except (UnicodeDecodeError, OSError) as exc:
+        return None, f"script not readable as utf-8 source: {exc}"
 
-    读不到一律拦下（fail-closed）：静态层唯一的绕过方式就是"让它别看这份代码"，
-    而脚本文件执行正是此前完全没有被检查的那条路（`python 脚本.py` 的内容零检查，
-    逃逸正则只看命令文本）。路径同样过 `safe_join`，越界即拒。
-    """
+
+async def _read_workspace_script(name: str) -> tuple[str | None, str | None]:
+    """Read inspectable workspace source without hiding read failures."""
     import asyncio
 
-    def _read() -> tuple[str | None, str | None]:
-        try:
-            path = safe_join(name)
-        except ValueError as exc:
-            return None, f"script path rejected: {exc}"
-        if not path.is_file():
-            return None, f"script not found in workspace: {name}"
-        size = path.stat().st_size
-        if size > _SCRIPT_INSPECT_MAX_BYTES:
-            return None, f"script too large to inspect ({size} bytes)"
-        try:
-            return path.read_text(encoding="utf-8"), None
-        except (UnicodeDecodeError, OSError) as exc:
-            return None, f"script not readable as utf-8 source: {exc}"
-
-    return await asyncio.to_thread(_read)
+    return await asyncio.to_thread(_read_workspace_script_sync, name)
 
 
 def _has_escape(command: str) -> str | None:
@@ -459,87 +700,100 @@ def _has_escape(command: str) -> str | None:
 
 
 def _split_segments(command: str) -> list[str]:
-    """按**未加引号**的分隔符（`|` / `;` / `&&` / `||`）切分命令文本。
-
-    必须尊重引号：`python -c "import time; time.sleep(1)"` 里的 `;` 属于参数而不是
-    命令分隔符。朴素正则会误切，进而把 `time.sleep(1)"` 当成可执行名而拒绝 —— 这正是
-    S5-1 实现时踩到的坑（实测打挂 3 个既有 persistent_shell 测试）。
-    """
-    segments: list[str] = []
-    buf: list[str] = []
-    quote = ""
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if quote:
-            buf.append(char)
-            if char == quote:
-                quote = ""
-            index += 1
-            continue
-        if char in ("'", '"'):
-            quote = char
-            buf.append(char)
-            index += 1
-            continue
-        if char in "|;":
-            segments.append("".join(buf))
-            buf = []
-            # `||` / `&&` 是双字符分隔符，一起跳过
-            index += 2 if (index + 1 < len(command) and command[index + 1] == char) else 1
-            continue
-        if char == "&" and index + 1 < len(command) and command[index + 1] == "&":
-            segments.append("".join(buf))
-            buf = []
-            index += 2
-            continue
-        buf.append(char)
-        index += 1
-    segments.append("".join(buf))
-    return segments
+    """Compatibility projection of the parsed program, including single ampersands."""
+    return [shlex.join(cmd.argv) for cmd in parse_shell_program(command).commands if cmd.argv]
 
 
 def _iter_executables(command: str) -> list[str]:
-    """从命令文本中提取每个子命令的首个可执行名（按未加引号的分隔符分段）。
+    return [_normalize_exe(cmd.argv[0]) for cmd in parse_shell_program(command).commands if cmd.argv]
 
-    语法不完整的分段直接跳过 —— 语法错误由调用方的解析负责报错，这里只做准入判断。
-    """
-    names: list[str] = []
-    for segment in _split_segments(command):
-        segment = segment.strip()
-        if not segment:
+
+def _assignment_reason(assignments: tuple[str, ...]) -> str | None:
+    for assignment in assignments:
+        name = assignment.strip('"\'').split("=", 1)[0].upper()
+        if name in _DANGEROUS_ENV_NAMES:
+            return f"environment assignment is not allowed: {name}"
+    return None
+
+
+def _command_text_reason(program: ShellProgram) -> str | None:
+    for cmd in program.commands:
+        reason = _assignment_reason(cmd.assignments)
+        if reason:
+            return reason
+        for operator, target in cmd.redirections:
+            if operator in {">&", "<&"}:
+                continue
+            try:
+                safe_join(target)
+            except ValueError as exc:
+                return f"redirection target rejected: {exc}"
+        if not cmd.argv:
             continue
-        try:
-            parts = shlex.split(segment)
-        except ValueError:
-            continue
-        if parts:
-            names.append(_normalize_exe(parts[0]))
-    return names
+        exe_name = _normalize_exe(cmd.argv[0])
+        if "/" in cmd.argv[0] or "\\" in cmd.argv[0] or exe_name not in _TEXT_ALLOWED:
+            return f"executable not allowed: {exe_name}"
+        if exe_name in {"source", ".", "alias", "unalias"}:
+            return f"shell builtin cannot be inspected safely: {exe_name}"
+        if exe_name in {"export", "set"} and _assignment_reason(tuple(cmd.argv[1:])):
+            return "environment assignment is not allowed"
+        if exe_name in {"python", "python3"}:
+            return _python_source_reason(cmd.argv, cmd.assignments)
+    return None
 
 
-def check_command_text(command: str) -> str | None:
-    """命令**文本**准入检查，供"命令交给 shell 执行"的入口复用（persistent shell）。
-
-    与 :func:`run_in_sandbox` 的 `_parse_command` **同源**（逃逸拦截 + 可执行名白名单），
-    区别是**不把命令拆成 argv**：持久 shell 需要保留管道/重定向语义，因此按
-    `|` / `;` / `&&` / `||` 分段后逐段校验首个可执行名。
-
-    S5-1/S5-2：此前 persistent shell 只做逃逸拦截、**没有白名单校验**，于是
-    `persistent_shell("rm -rf ...")` 与 `shell_exec` 的判定不一致。
-
-    Returns:
-        拒绝原因；`None` 表示放行。
-    """
+def check_command_text(command: str, dialect: str | None = None) -> str | None:
+    """Check every parsed command, nested group, assignment and redirection."""
     escape = _has_escape(command)
     if escape:
         return f"escape pattern blocked: {escape}"
-    executables = _iter_executables(command)
-    if not executables:
-        return "empty command"
-    for exe in executables:
-        if exe not in _TEXT_ALLOWED:
-            return f"executable not allowed: {exe}"
+    try:
+        program = parse_shell_program(command, dialect=dialect)
+    except ValueError as exc:
+        return f"invalid command syntax: {exc}"
+    return _command_text_reason(program)
+
+
+def _python_invocation_reason(argv: tuple[str, ...], assignments: tuple[str, ...]) -> str | None:
+    if assignments:
+        return "python environment assignments cannot be inspected"
+    if tuple(arg.lower() for arg in argv) in {("python", "--version"), ("python3", "--version")}:
+        return None
+    args = list(argv[1:])
+    if any(arg == "-X" or (arg.startswith("-X") and not arg.startswith("--")) for arg in args):
+        return "python -X options can load code before static inspection"
+    if any(arg == "-W" or (arg.startswith("-W") and not arg.startswith("--")) for arg in args):
+        return "python -W options can import warning categories before static inspection"
+    if any(arg == "-i" or (arg.startswith("-") and not arg.startswith("--") and "i" in arg[1:]) for arg in args):
+        return "interactive python entrypoints cannot be inspected"
+    kind, operand = _python_code_operand(args)
+    if kind == "module":
+        return "python module source cannot be inspected in the sandbox"
+    if kind in {"stdin", "none"}:
+        return "python code source cannot be inspected in the sandbox"
+    if kind == "inline" and not operand:
+        return "python missing inline code operand"
+    return None
+
+
+def _python_source_reason(argv: tuple[str, ...], assignments: tuple[str, ...]) -> str | None:
+    from app.tools.code_guard import check_static
+
+    reason = _python_invocation_reason(argv, assignments)
+    if reason:
+        return reason
+    kind, operand = _python_code_operand(list(argv[1:]))
+    code = operand if kind == "inline" else None
+    if kind == "script":
+        if not operand:
+            return "python missing script operand"
+        code, read_reason = _read_workspace_script_sync(operand)
+        if code is None:
+            return str(read_reason)
+    if code:
+        blocked = check_static(code)
+        if blocked:
+            return f"python code rejected — {blocked}"
     return None
 
 
@@ -561,39 +815,7 @@ async def check_shell_command(command: str) -> str | None:
     Returns:
         拒绝原因；`None` 表示放行。
     """
-    reason = check_command_text(command)
-    if reason:
-        return reason
-
-    from app.tools.code_guard import check_static
-
-    for segment in _split_segments(command):
-        segment = segment.strip()
-        if not segment:
-            continue
-        try:
-            parts = shlex.split(segment)
-        except ValueError:
-            continue
-        if not parts or _normalize_exe(parts[0]) not in ("python", "python3"):
-            continue
-        kind, operand = _python_code_operand(parts[1:])
-        if kind == "stdin":
-            return "python reads code from stdin, which the sandbox cannot inspect"
-        code: str | None = None
-        if kind == "inline":
-            code = operand
-        elif kind == "script":
-            if not operand:
-                return "python missing script operand"
-            code, read_reason = await _read_workspace_script(operand)
-            if code is None:
-                return f"{read_reason}"
-        if code:
-            blocked = check_static(code)
-            if blocked:
-                return f"python code rejected — {blocked}"
-    return None
+    return check_command_text(command)
 
 
 # ── 统一的资源限制（S5-2：三个执行入口共用，避免各写一套常量后漂移）──
@@ -852,13 +1074,12 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
     if _normalize_exe(prog) in ("python", "python3"):
         from app.tools.code_guard import check_static
 
+        invocation_reason = _python_invocation_reason((prog, *rest), ())
+        if invocation_reason:
+            return {"error": f"command blocked: {invocation_reason}"}
         kind, operand = _python_code_operand(rest)
-        if kind == "stdin":
-            return {"error": "command blocked: python reads code from stdin, which the sandbox cannot inspect"}
-        code: str | None = None
-        if kind == "inline":
-            code = operand
-        elif kind == "script":
+        code: str | None = operand if kind == "inline" else None
+        if kind == "script":
             if not operand:
                 return {"error": "command blocked: python missing script operand"}
             code, read_reason = await _read_workspace_script(operand)

@@ -16,9 +16,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
+from app.api.deps import require_internal_token
 from app.memory.layers import SLOT_LABELS, SLOTS
 from app.memory.service import get_memory_init_error, get_service
 
@@ -28,18 +29,29 @@ router = APIRouter(tags=["memory"])
 
 
 def _scope(request: Request) -> tuple[int, str]:
-    """从网关注入的 query 参数解析 (tenant_id, user_id)。
-
-    tenant_id 在库里是 smallint，网关透传过来是字符串 —— 在这里转成 int，
-    缺省用 0（"无租户"）而不是 "default" 这种字符串占位，否则下游拿到的是 str，
-    查询会走到错误的租户分支。
-    """
-    user_id = (request.query_params.get("user_id") or "").strip()
-    raw_tenant = (request.query_params.get("tenant_id") or "").strip()
+    """Resolve gateway identity, preferring the tenant validated by middleware."""
+    raw_tenant = getattr(request.state, "tenant_id", None)
+    if raw_tenant in (None, ""):
+        raw_tenant = request.query_params.get("tenant_id")
     try:
-        tenant_id = int(raw_tenant) if raw_tenant else 0
-    except ValueError:
+        tenant_id = int(raw_tenant) if raw_tenant not in (None, "") else 0
+    except (TypeError, ValueError):
         tenant_id = 0
+    user_id = str(
+        getattr(request.state, "user_id", None)
+        or request.query_params.get("user_id")
+        or ""
+    ).strip()
+    return tenant_id, user_id
+
+
+def _conflict_scope(request: Request) -> tuple[int, str]:
+    """Require a complete scope; tenant zero must never select a fallback bucket."""
+    tenant_id, user_id = _scope(request)
+    if not user_id:
+        raise ValueError("user_id is required")
+    if tenant_id <= 0:
+        raise ValueError("tenant_id is required")
     return tenant_id, user_id
 
 
@@ -315,56 +327,68 @@ async def list_summaries(request: Request) -> Any:
 # ── 冲突裁决 ─────────────────────────────────────────
 
 
-@router.get("/v1/memory/conflicts")
+@router.get("/v1/memory/conflicts", dependencies=[Depends(require_internal_token)])
 async def list_conflicts(request: Request) -> Any:
     """列出待裁决的记忆冲突。"""
     svc = get_service()
     if svc is None:
         return _unavailable()
-    tenant_id, user_id = _scope(request)
-    if not user_id:
-        return _bad_request("user_id is required")
+    try:
+        tenant_id, user_id = _conflict_scope(request)
+    except ValueError as e:
+        return _bad_request(str(e))
     conflicts = await svc.list_conflicts_shared(tenant_id, user_id)
     return {"success": True, "conflicts": conflicts, "count": len(conflicts)}
 
 
-@router.post("/v1/memory/conflicts/{conflict_id}/resolve")
+@router.post(
+    "/v1/memory/conflicts/{conflict_id}/resolve",
+    dependencies=[Depends(require_internal_token)],
+)
 async def resolve_conflict(conflict_id: str, request: Request) -> Any:
     """裁决冲突：keep_old / adopt_new（use_new 同义）/ manual。"""
     svc = get_service()
     if svc is None:
         return _unavailable()
-    tenant_id, user_id = _scope(request)
-    if not user_id:
-        return _bad_request("user_id is required")
+    try:
+        tenant_id, user_id = _conflict_scope(request)
+    except ValueError as e:
+        return _bad_request(str(e))
     body = await request.json()
     resolution = str(body.get("resolution") or "")
     manual_value = body.get("manual_value")
     # 裁决方式的合法性交给 MemoryService 判定（它同时兼容 adopt_new / use_new 两种
     # 命名）：在路由层再维护一份白名单，只会让两处口径迟早分叉。
     try:
-        result = await svc.resolve_conflict(conflict_id, resolution, manual_value)
+        result = await svc.resolve_conflict(
+            conflict_id, tenant_id, user_id, resolution, manual_value
+        )
     except ValueError as e:
         # 冲突不存在 → 404，裁决方式非法 → 400。两者的 ValueError 语义不同，
         # 一律返回 404 会让前端把「参数打错」误判成「冲突已不存在」。
         msg = str(e)
         status = 404 if "not found" in msg else 400
+        error = "conflict not found" if status == 404 else msg
         return JSONResponse(
-            status_code=status, content={"success": False, "error": msg}
+            status_code=status, content={"success": False, "error": error}
         )
     return {"success": True, "conflict": result}
 
 
-@router.delete("/v1/memory/conflicts/{conflict_id}")
+@router.delete(
+    "/v1/memory/conflicts/{conflict_id}",
+    dependencies=[Depends(require_internal_token)],
+)
 async def delete_conflict(conflict_id: str, request: Request) -> Any:
     """删除冲突（用户否认时调用）。"""
     svc = get_service()
     if svc is None:
         return _unavailable()
-    tenant_id, user_id = _scope(request)
-    if not user_id:
-        return _bad_request("user_id is required")
-    deleted = await svc.delete_conflict(conflict_id)
+    try:
+        tenant_id, user_id = _conflict_scope(request)
+    except ValueError as e:
+        return _bad_request(str(e))
+    deleted = await svc.delete_conflict(conflict_id, tenant_id, user_id)
     if not deleted:
         return JSONResponse(
             {"success": False, "error": "conflict not found"}, status_code=404

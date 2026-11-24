@@ -17,6 +17,11 @@ const apiMocks = vi.hoisted(() => ({
   put: vi.fn(),
   delete: vi.fn(),
   resolveMediaUrl: vi.fn(async (a: { id?: string; file_url?: string }) => a?.file_url || ''),
+  invalidateMediaUrl: vi.fn(),
+  isMediaUrlExpired: vi.fn((url: string) => {
+    const exp = Number(new URL(url, 'http://api.test').searchParams.get('exp'))
+    return Number.isFinite(exp) && exp * 1000 <= Date.now()
+  }),
 }))
 
 // antd 的 Table / Segmented 走 responsiveObserve，jsdom 没有 matchMedia。
@@ -41,6 +46,8 @@ vi.mock('../../api', () => ({
     delete: apiMocks.delete,
   },
   resolveMediaUrl: apiMocks.resolveMediaUrl,
+  invalidateMediaUrl: apiMocks.invalidateMediaUrl,
+  isMediaUrlExpired: apiMocks.isMediaUrlExpired,
   // `MediaView` 从 `../api` 拿 `API_URL`（它合并了桌面壳注入的 `chironDesktop.apiUrl`
   // 与构建期 `VITE_API_URL`，见 `src/api/index.ts:20`），组件里的 `absUrl` 直接拼它。
   // mock 是**整模块替换**，不补这一项就等于把该导出抹掉：渲染到第一张卡片时
@@ -97,6 +104,53 @@ async function mountView() {
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
+  apiMocks.resolveMediaUrl.mockImplementation(async (a: { id?: string; file_url?: string }) => a?.file_url || '')
+  apiMocks.invalidateMediaUrl.mockImplementation(() => {})
+  apiMocks.isMediaUrlExpired.mockImplementation((url: string) => {
+    const exp = Number(new URL(url, 'http://api.test').searchParams.get('exp'))
+    return Number.isFinite(exp) && exp * 1000 <= Date.now()
+  })
+  vi.unstubAllGlobals()
+})
+
+describe('MediaView 签名 URL 生命周期', () => {
+  it('签名过期时重签，不回退已移除的 /media/ 公开路径', async () => {
+    const expired = 'http://api.test/media/s/m1.png?exp=1&sig=old'
+    const fresh = 'http://api.test/media/s/m1.png?exp=4102444800&sig=new'
+    apiMocks.get.mockResolvedValue(listResponse([image]))
+    apiMocks.resolveMediaUrl
+      .mockResolvedValueOnce(expired)
+      .mockResolvedValueOnce(fresh)
+    const wrapper = await mountView()
+    const img = wrapper.find('.card-thumb img')
+    expect(img.attributes('src')).toBe(expired)
+
+    await img.trigger('error')
+    await flushPromises()
+
+    expect(apiMocks.invalidateMediaUrl).toHaveBeenCalledWith('m1')
+    expect(apiMocks.resolveMediaUrl).toHaveBeenLastCalledWith(
+      { id: 'm1', file_url: '/media/a.png' },
+      true,
+    )
+    expect(wrapper.find('.card-thumb img').attributes('src')).toBe(fresh)
+    expect(wrapper.find('.card-thumb img').attributes('src')).not.toContain('/media/a.png')
+  })
+
+  it('永久 404 不重签，也不回退公开路径', async () => {
+    const signed = 'http://api.test/media/s/m1.png?exp=4102444800&sig=valid'
+    apiMocks.get.mockResolvedValue(listResponse([image]))
+    apiMocks.resolveMediaUrl.mockResolvedValue(signed)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('', { status: 404 })))
+    const wrapper = await mountView()
+
+    await wrapper.find('.card-thumb img').trigger('error')
+    await flushPromises()
+
+    expect(apiMocks.resolveMediaUrl).toHaveBeenCalledTimes(1)
+    expect(apiMocks.invalidateMediaUrl).not.toHaveBeenCalled()
+    expect(wrapper.find('.card-thumb img').attributes('src')).not.toContain('/media/a.png')
+  })
 })
 
 describe('MediaView 加载与三态', () => {

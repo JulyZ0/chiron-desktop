@@ -34,6 +34,21 @@ var sanitizeDeliveryFields = map[string]struct{}{
 	"initial_password":   {},
 }
 
+// isSafeKeyPreview 只放行 Provider Key 列表生成的固定格式指纹：五个掩码字符 + 八位哈希。
+// 不能仅按字段名放行 key_preview，否则误传的明文或完整哈希也会绕过脱敏。
+func isSafeKeyPreview(value string) bool {
+	const hexDigits = "0123456789abcdef"
+	if len(value) != len(llmKeyPreviewMask)+llmKeyPreviewHashSize || !strings.HasPrefix(value, llmKeyPreviewMask) {
+		return false
+	}
+	for _, ch := range value[len(llmKeyPreviewMask):] {
+		if !strings.ContainsRune(hexDigits, ch) {
+			return false
+		}
+	}
+	return true
+}
+
 // sanitizeSensitivePaths 需要脱敏的路径前缀白名单。
 // 只有匹配这些前缀的响应才会被全量缓冲和脱敏，其他路径零开销透传。
 var sanitizeSensitivePaths = []string{
@@ -116,7 +131,16 @@ func sanitizeMap(data interface{}) {
 	switch v := data.(type) {
 	case map[string]interface{}:
 		for key, val := range v {
-			if _, deliver := sanitizeDeliveryFields[strings.ToLower(key)]; deliver {
+			lower := strings.ToLower(key)
+			if _, deliver := sanitizeDeliveryFields[lower]; deliver {
+				continue
+			}
+			if lower == "key_preview" {
+				if preview, ok := val.(string); ok && isSafeKeyPreview(preview) {
+					continue
+				}
+				// 格式不合法的 key_preview 一律星号化，不能因空串或非字符串而绕过。
+				v[key] = "********"
 				continue
 			}
 			if isSensitiveField(key) {

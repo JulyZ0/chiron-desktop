@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import random
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
@@ -240,6 +243,208 @@ class GatewayRouter:
         except Exception:  # noqa: BLE001
             return ""
 
+    @staticmethod
+    def _runtime_cache_identity(
+        tenant_id: int, private: bool | None
+    ) -> tuple[int, str, bool]:
+        """Resolve the cache owner and fail closed when session visibility is unknown."""
+        try:
+            from app.tools.context import (
+                get_tenant_id_int,
+                get_tool_context,
+                to_tenant_int,
+            )
+
+            cache_tenant = to_tenant_int(tenant_id) or get_tenant_id_int()
+            raw_user = get_tool_context("user_id", "")
+            user_id = (
+                str(raw_user).strip()
+                if raw_user is not None and not isinstance(raw_user, bool)
+                else ""
+            )
+            visibility = get_tool_context("session_visibility")
+            if visibility is None:
+                visibility = get_tool_context("cache_scope")
+            if isinstance(visibility, Mapping):
+                visibility = visibility.get("visibility", "")
+            normalized = str(visibility or "").strip().lower()
+        except Exception:  # noqa: BLE001
+            return 0, "", True
+
+        if normalized:
+            # An explicit caller flag may narrow a shared scope, never widen a private one.
+            cache_private = normalized not in {"public", "shared", "tenant"}
+            if private is True:
+                cache_private = True
+        else:
+            # Internal callers can explicitly declare a shared scope. Missing scope stays private.
+            cache_private = private is not False
+        return cache_tenant, user_id, cache_private
+
+    @staticmethod
+    def _cache_runtime_policy() -> dict[str, Any]:
+        """Snapshot serializable runtime controls that can change a no-tool response."""
+        try:
+            from app.tools.context import get_all
+
+            context = get_all()
+        except Exception:  # noqa: BLE001
+            return {}
+        policy: dict[str, Any] = {}
+        for key in (
+            "project",
+            "project_locator",
+            "plugin_names",
+            "activated_tools",
+            "tools_mode",
+            "approval_mode",
+            "cache_policy",
+            "unattended",
+            "takeover",
+            "subagent_depth",
+        ):
+            if key not in context:
+                continue
+            value = context[key]
+            if isinstance(value, (set, frozenset)):
+                value = sorted(str(item) for item in value)
+            elif isinstance(value, tuple):
+                value = list(value)
+            policy[key] = value
+        return policy
+
+    @classmethod
+    def _cache_policy_digest(
+        cls,
+        messages: list[ChatMessage],
+        model: str,
+        provider: LLMProvider,
+        max_tokens: int,
+        temperature: float,
+        tools: list[dict[str, Any]] | None,
+        response_format: dict[str, Any] | None,
+        caller_policy_digest: str,
+    ) -> str:
+        """Hash every effective request control, including controls outside cache.py's key."""
+        payload = {
+            "schema": 1,
+            "messages": [message.to_dict() for message in messages],
+            "model": model,
+            "provider": provider.name,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "tools": tools,
+            "response_format": response_format,
+            "runtime_policy": cls._cache_runtime_policy(),
+            "caller_policy_digest": (
+                caller_policy_digest.strip()
+                if isinstance(caller_policy_digest, str)
+                else ""
+            ),
+        }
+        try:
+            raw = json.dumps(
+                payload,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.debug("Cache policy digest computation failed: %s", exc)
+            return ""
+        return hashlib.sha256(raw).hexdigest()
+
+    def _model_lineage(self, provider: LLMProvider, model: str) -> dict[str, Any]:
+        """Describe the selected route without copying credentials into the cache domain."""
+        preset = self._catalog.get(provider.name) or {}
+        base_kwargs = getattr(provider, "_base_kwargs", {})
+        endpoint = ""
+        if isinstance(base_kwargs, Mapping):
+            endpoint = str(base_kwargs.get("base_url") or "")
+        if not endpoint:
+            endpoint = str(getattr(provider, "_base", "") or "")
+        if not endpoint:
+            try:
+                from app.providers.catalog import provider_base_url
+
+                endpoint = provider_base_url(
+                    {**preset, "id": str(preset.get("id") or provider.name)}
+                )
+            except Exception:  # noqa: BLE001
+                endpoint = str(preset.get("base_url") or "")
+        if endpoint:
+            try:
+                parts = urlsplit(endpoint)
+                # Drop URL userinfo, query credentials, and fragments; keep host/port/path identity.
+                endpoint = urlunsplit(
+                    (parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", "")
+                )
+            except ValueError:
+                endpoint = ""
+
+        implementation = f"{type(provider).__module__}.{type(provider).__qualname__}"
+        lowered = implementation.lower()
+        if "responses" in lowered:
+            protocol = "responses"
+        elif "anthropic" in lowered:
+            protocol = "anthropic"
+        else:
+            try:
+                from app.providers.catalog import provider_kind
+
+                protocol = provider_kind(preset)
+            except Exception:  # noqa: BLE001
+                protocol = str(preset.get("kind") or "openai")
+        revision = (
+            preset.get("revision")
+            or preset.get("model_revision")
+            or preset.get("version")
+            or ""
+        )
+        return {
+            "provider": provider.name,
+            "model": model,
+            "protocol": protocol,
+            "endpoint": endpoint,
+            "catalog_revision": revision,
+            "implementation": implementation,
+        }
+
+    def _cache_domain_kwargs(
+        self,
+        *,
+        user_id: str,
+        private: bool,
+        messages: list[ChatMessage],
+        model: str,
+        provider: LLMProvider,
+        max_tokens: int,
+        temperature: float,
+        tools: list[dict[str, Any]] | None,
+        extra_kwargs: dict[str, Any],
+        caller_policy_digest: str,
+    ) -> dict[str, Any]:
+        effective_response_format = extra_kwargs.get("response_format")
+        digest = self._cache_policy_digest(
+            messages,
+            model,
+            provider,
+            max_tokens,
+            temperature,
+            tools,
+            effective_response_format,
+            caller_policy_digest,
+        )
+        if not digest:
+            return {}
+        return {
+            "user_id": user_id,
+            "private": private,
+            "policy_digest": digest,
+            "model_lineage": self._model_lineage(provider, model),
+        }
+
     async def _model_rate_reason(self, tenant_id: int) -> str:
         """返回超限层级（tenant/user）；空串表示放行。
 
@@ -295,20 +500,67 @@ class GatewayRouter:
         temperature: float = 0.7,
         tools: list[dict[str, Any]] | None = None,
         response_format: dict[str, Any] | None = None,
+        private: bool | None = None,
+        policy_digest: str = "",
     ) -> AsyncIterator[ChatResponse]:
-        """流式推理 — 前置缓存检查 + 预算扣减"""
+        """Stream a response, consulting only an explicitly shared cache domain."""
         messages = normalize_messages(messages)
-        # ── 缓存查找（仅无工具时） ──
+        provider: LLMProvider | None = None
+        extra_kwargs: dict[str, Any] | None = None
+        effective_response_format: dict[str, Any] | None = None
+        cache_tenant = 0
+        cache_kwargs: dict[str, Any] = {}
+
         if self._cache and not tools:
-            # `response_format` 现在是缓存 key 的一部分：同一 prompt 先文本、后 JSON 请求时，
-            # 后者不会命中前者拿到错形状的结果（见 cache.py::_exact_key）。
-            cached = await self._cache.lookup(
-                tenant_id, model, messages, tools, temperature, response_format
+            cache_tenant, cache_user, cache_private = self._runtime_cache_identity(
+                tenant_id, private
             )
-            if cached:
-                logger.info("Stream cache HIT for model=%s", model)
-                yield cached
-                return
+            if not cache_private and cache_tenant and cache_user and model:
+                # The final route is part of the domain, so resolve it before reading cache.
+                provider = await self._select(
+                    model, provider_hint, tenant_id=tenant_id or cache_tenant
+                )
+                if not provider:
+                    yield ChatResponse(
+                        content="",
+                        finish_reason="error",
+                        provider="none",
+                        model=model,
+                        message=self._no_provider_message(model),
+                    )
+                    return
+                extra_kwargs = self._provider_extra_kwargs(provider, response_format)
+                effective_response_format = extra_kwargs.get("response_format")
+                cache_kwargs = self._cache_domain_kwargs(
+                    user_id=cache_user,
+                    private=cache_private,
+                    messages=messages,
+                    model=model,
+                    provider=provider,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    tools=tools,
+                    extra_kwargs=extra_kwargs,
+                    caller_policy_digest=policy_digest,
+                )
+                if cache_kwargs:
+                    cached = await self._cache.lookup(
+                        cache_tenant,
+                        model,
+                        messages,
+                        tools,
+                        temperature,
+                        effective_response_format,
+                        **cache_kwargs,
+                    )
+                    if cached:
+                        logger.info(
+                            "Stream cache HIT for model=%s provider=%s",
+                            model,
+                            provider.name,
+                        )
+                        yield cached
+                        return
 
         rate_scope = await self._model_rate_reason(tenant_id)
         if rate_scope:
@@ -322,7 +574,8 @@ class GatewayRouter:
             )
             return
 
-        provider = await self._select(model, provider_hint, tenant_id=tenant_id)
+        if provider is None:
+            provider = await self._select(model, provider_hint, tenant_id=tenant_id)
         if not provider:
             yield ChatResponse(
                 content="",
@@ -358,8 +611,9 @@ class GatewayRouter:
         finish_reason = ""
         total_input = 0
         total_output = 0
-        # 结构化输出：只在 provider 声明支持时下发，不支持就**置空**（见辅助方法）
-        extra_kwargs = self._provider_extra_kwargs(provider, response_format)
+        # Structured output is dropped per provider; shared cache keys use that effective value.
+        if extra_kwargs is None:
+            extra_kwargs = self._provider_extra_kwargs(provider, response_format)
         try:
             async for chunk in provider.chat_stream(
                 messages,
@@ -386,8 +640,14 @@ class GatewayRouter:
 
             self._breakers[provider.name].record_success()
 
-            # ── 流完成后存入缓存（仅无工具时） ──
-            if self._cache and not tools and finish_reason != "error" and full_content:
+            # Store only into the exact shared domain used by lookup.
+            if (
+                self._cache
+                and cache_kwargs
+                and not tools
+                and finish_reason != "error"
+                and full_content
+            ):
                 resp = ChatResponse(
                     content=full_content,
                     finish_reason=finish_reason,
@@ -397,13 +657,14 @@ class GatewayRouter:
                     output_tokens=total_output,
                 )
                 await self._cache.store(
-                    tenant_id,
+                    cache_tenant,
                     model,
                     messages,
                     tools,
                     temperature,
                     resp,
-                    response_format,
+                    effective_response_format,
+                    **cache_kwargs,
                 )
 
             # 缓存正常路径仅存结果；预算扣减统一在 finally 处理（见下）
@@ -474,18 +735,62 @@ class GatewayRouter:
         temperature: float = 0.7,
         tools: list[dict[str, Any]] | None = None,
         response_format: dict[str, Any] | None = None,
+        private: bool | None = None,
+        policy_digest: str = "",
     ) -> ChatResponse:
-        """非流式推理 — 自动缓存 + 预算扣减"""
+        """Return a response, consulting only an explicitly shared cache domain."""
         messages = normalize_messages(messages)
-        # 缓存查找
+        provider: LLMProvider | None = None
+        extra_kwargs: dict[str, Any] | None = None
+        effective_response_format: dict[str, Any] | None = None
+        cache_tenant = 0
+        cache_kwargs: dict[str, Any] = {}
+
         if self._cache and not tools:
-            # 同 `chat_stream`：`response_format` 是 key 的一部分，文本与 JSON 互不命中。
-            cached = await self._cache.lookup(
-                tenant_id, model, messages, tools, temperature, response_format
+            cache_tenant, cache_user, cache_private = self._runtime_cache_identity(
+                tenant_id, private
             )
-            if cached:
-                logger.info("Cache hit for model=%s", model)
-                return cached
+            if not cache_private and cache_tenant and cache_user and model:
+                provider = await self._select(
+                    model, provider_hint, tenant_id=tenant_id or cache_tenant
+                )
+                if not provider:
+                    return ChatResponse(
+                        content="",
+                        finish_reason="error",
+                        message=self._no_provider_message(model),
+                        provider="none",
+                        model=model,
+                    )
+                extra_kwargs = self._provider_extra_kwargs(provider, response_format)
+                effective_response_format = extra_kwargs.get("response_format")
+                cache_kwargs = self._cache_domain_kwargs(
+                    user_id=cache_user,
+                    private=cache_private,
+                    messages=messages,
+                    model=model,
+                    provider=provider,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    tools=tools,
+                    extra_kwargs=extra_kwargs,
+                    caller_policy_digest=policy_digest,
+                )
+                if cache_kwargs:
+                    cached = await self._cache.lookup(
+                        cache_tenant,
+                        model,
+                        messages,
+                        tools,
+                        temperature,
+                        effective_response_format,
+                        **cache_kwargs,
+                    )
+                    if cached:
+                        logger.info(
+                            "Cache hit for model=%s provider=%s", model, provider.name
+                        )
+                        return cached
 
         rate_scope = await self._model_rate_reason(tenant_id)
         if rate_scope:
@@ -498,7 +803,8 @@ class GatewayRouter:
                 message=f"model calls rate limited for this {rate_scope}",
             )
 
-        provider = await self._select(model, provider_hint, tenant_id=tenant_id)
+        if provider is None:
+            provider = await self._select(model, provider_hint, tenant_id=tenant_id)
         if not provider:
             return ChatResponse(
                 content="",
@@ -527,8 +833,9 @@ class GatewayRouter:
         span = start_model_span(
             model=model, provider=provider.name, tenant_id=tenant_id, stream=False
         )
-        # 结构化输出：provider 不支持时置空（见辅助方法）
-        extra_kwargs = self._provider_extra_kwargs(provider, response_format)
+        # Structured output is dropped per provider; shared cache keys use that effective value.
+        if extra_kwargs is None:
+            extra_kwargs = self._provider_extra_kwargs(provider, response_format)
         try:
             resp = await provider.chat(
                 messages,
@@ -554,16 +861,17 @@ class GatewayRouter:
 
             self._breakers[provider.name].record_success()
 
-            # 存缓存
-            if self._cache and not tools and resp.finish_reason != "error":
+            # Store only into the exact shared domain used by lookup.
+            if self._cache and cache_kwargs and not tools and resp.finish_reason != "error":
                 await self._cache.store(
-                    tenant_id,
+                    cache_tenant,
                     model,
                     messages,
                     tools,
                     temperature,
                     resp,
-                    response_format,
+                    effective_response_format,
+                    **cache_kwargs,
                 )
 
             # 预算扣减
@@ -603,6 +911,59 @@ class GatewayRouter:
                 self._latencies[provider.name] * 0.8 + elapsed * 0.2
             )
             end_model_span(span)
+
+    async def delete_cache(
+        self,
+        messages: list[Any],
+        model: str,
+        *,
+        tenant_id: int = 0,
+        provider_hint: str = "",
+        max_tokens: int = 0,
+        temperature: float = 0.7,
+        tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
+        private: bool | None = None,
+        policy_digest: str = "",
+    ) -> int:
+        """Delete one shared request domain from L1/L2/L3; return removed tier count."""
+        if not self._cache or tools or not model:
+            return 0
+        messages = normalize_messages(messages)
+        cache_tenant, cache_user, cache_private = self._runtime_cache_identity(
+            tenant_id, private
+        )
+        if cache_private or not cache_tenant or not cache_user:
+            return 0
+        provider = await self._select(
+            model, provider_hint, tenant_id=tenant_id or cache_tenant
+        )
+        if not provider:
+            return 0
+        extra_kwargs = self._provider_extra_kwargs(provider, response_format)
+        cache_kwargs = self._cache_domain_kwargs(
+            user_id=cache_user,
+            private=cache_private,
+            messages=messages,
+            model=model,
+            provider=provider,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=tools,
+            extra_kwargs=extra_kwargs,
+            caller_policy_digest=policy_digest,
+        )
+        if not cache_kwargs:
+            return 0
+        return await self._cache.delete(
+            cache_tenant,
+            model,
+            messages,
+            tools,
+            temperature,
+            extra_kwargs.get("response_format"),
+            **cache_kwargs,
+        )
 
     def _provider_extra_kwargs(
         self, provider: LLMProvider, response_format: dict[str, Any] | None

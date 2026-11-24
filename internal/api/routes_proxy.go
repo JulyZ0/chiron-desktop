@@ -60,6 +60,39 @@ func decodeOptionalJSON(w http.ResponseWriter, r *http.Request) (map[string]inte
 // 这正好是拼 path 段所需的最小集合。
 func escSeg(s string) string { return url.PathEscape(s) }
 
+// Engine denials use HTTP 200, so only an explicit top-level failure contract may
+// override the proxy status; untyped or successful payloads remain unchanged.
+func writeTypedProxyError(w http.ResponseWriter, payload interface{}) bool {
+	body, ok := payload.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	success, ok := body["success"].(bool)
+	if !ok || success {
+		return false
+	}
+	errorCode, ok := body["error_code"].(string)
+	if !ok {
+		return false
+	}
+	status := 0
+	fallback := ""
+	switch errorCode {
+	case CodeNotFound:
+		status, fallback = http.StatusNotFound, ErrNotFound
+	case CodeForbidden:
+		status, fallback = http.StatusForbidden, "insufficient permissions"
+	default:
+		return false
+	}
+	message, _ := body["error"].(string)
+	if message == "" {
+		message = fallback
+	}
+	JSONWithCode(w, status, errorCode, nil, message)
+	return true
+}
+
 // ── Python engine proxy routes (knowledge base / sessions) ──
 
 func registerProxyRoutes(
@@ -182,6 +215,9 @@ func registerProxyRoutes(
 				if err != nil {
 					slog.Error(opt.logTag+" proxy error", "path", proxiedPath, "error", err)
 					logAndRespond(w, err, http.StatusInternalServerError, "internal error")
+					return
+				}
+				if writeTypedProxyError(w, resp) {
 					return
 				}
 				// 旁路记账（只有需要的路由注册了钩子）：写法见 unified_usage.go。

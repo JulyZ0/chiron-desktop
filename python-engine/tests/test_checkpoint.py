@@ -20,9 +20,12 @@ from app.agent import checkpoint as cp
 class _FakePool:
     """替身池：记录调用并模拟 asyncpg 的 `UPDATE n` 状态串。"""
 
-    def __init__(self, *, update_rowcount: int = 1, raise_on: str = "") -> None:
+    def __init__(
+        self, *, update_rowcount: int = 1, insert_rowcount: int = 1, raise_on: str = ""
+    ) -> None:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self.update_rowcount = update_rowcount
+        self.insert_rowcount = insert_rowcount
         self.raise_on = raise_on
 
     async def execute(self, sql: str, *args: Any) -> str:
@@ -31,7 +34,7 @@ class _FakePool:
             raise RuntimeError("db down")
         if sql.strip().startswith("UPDATE"):
             return f"UPDATE {self.update_rowcount}"
-        return "INSERT 0 1"
+        return f"INSERT 0 {self.insert_rowcount}"
 
     async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
         self.calls.append((sql, args))
@@ -213,12 +216,13 @@ async def test_load_parses_checkpoint(fake_pool: _FakePool):
 async def test_mark_with_run_token_adds_ownership_guard(fake_pool: _FakePool):
     """A4 防踩踏：带 run_token 的终态写入必须校验归属，避免旧 run 标掉新 run 的行。"""
     ok = await cp.mark(
-        tenant_id=1, session_id="s1", status=cp.STATUS_COMPLETED, run_token="rt-1"
+        tenant_id=1, session_id="s1", status=cp.STATUS_COMPLETED, run_token="rt-1", generation=3
     )
     assert ok is True
     sql, args = fake_pool.calls[0]
-    assert "AND ($4 = '' OR run_token = $4)" in sql
+    assert "AND ($4 = '' OR (run_token = $4 AND COALESCE((checkpoint->>'generation')::int, 0) = $5))" in sql
     assert args[3] == "rt-1"
+    assert args[4] == 3
 
 
 @pytest.mark.asyncio
@@ -228,6 +232,150 @@ async def test_mark_without_run_token_keeps_legacy_semantics(fake_pool: _FakePoo
     assert ok is True
     _, args = fake_pool.calls[0]
     assert args[3] == ""
+    assert args[4] == 0
+
+
+@pytest.mark.asyncio
+async def test_fenced_save_rejects_stale_worker_without_insert(fake_pool: _FakePool):
+    fake_pool.update_rowcount = 0
+
+    ok = await cp.save(
+        tenant_id=1,
+        session_id="s1",
+        checkpoint=cp.build_snapshot(messages=[], turn_index=1, generation=1),
+        run_token="rt-old",
+        generation=1,
+    )
+
+    assert ok is False
+    assert len(fake_pool.calls) == 1
+    sql, args = fake_pool.calls[0]
+    assert "run_token = $5" in sql
+    assert "COALESCE((checkpoint->>'generation')::int, 0) = $7" in sql
+    assert args[4] == "rt-old" and args[6] == 1
+
+
+@pytest.mark.asyncio
+async def test_save_resolves_generation_from_bound_context(fake_pool: _FakePool):
+    from app import run_registry
+
+    token = run_registry.activate_run_fence(run_registry.bind_run_fence("rt-context", 4))
+    try:
+        assert await cp.save(
+            tenant_id=1,
+            session_id="s1",
+            checkpoint=cp.build_snapshot(messages=[], turn_index=1),
+            run_token="rt-context",
+        )
+    finally:
+        run_registry.deactivate_run_fence(token)
+    assert fake_pool.calls[0][1][6] == 4
+
+
+@pytest.mark.asyncio
+async def test_fenced_save_rejects_unknown_generation(fake_pool: _FakePool):
+    assert await cp.save(
+        tenant_id=1,
+        session_id="s1",
+        checkpoint={},
+        run_token="rt-unbound",
+    ) is False
+    assert fake_pool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_claim_advances_generation_and_binds_new_fence(fake_pool: _FakePool):
+    from app import run_registry
+
+    assert await cp.claim(
+        tenant_id=1,
+        session_id="s1",
+        expected_run_token="rt-old",
+        expected_generation=2,
+        new_run_token="rt-new",
+    )
+    sql, args = fake_pool.calls[0]
+    assert "run_token = $3" in sql
+    assert "COALESCE((checkpoint->>'generation')::int, 0) = $4" in sql
+    assert "jsonb_set" in sql
+    assert args[2:7] == ("rt-old", 2, cp.STATUS_RESUMING, "rt-new", 3)
+    assert run_registry.resolve_run_fence("rt-new") == run_registry.RunFence("rt-new", 3)
+
+
+@pytest.mark.asyncio
+async def test_claim_rejects_stale_generation(fake_pool: _FakePool):
+    from app import run_registry
+
+    run_registry._FENCES.pop("rt-new", None)
+    fake_pool.update_rowcount = 0
+    assert await cp.claim(
+        tenant_id=1,
+        session_id="s1",
+        expected_run_token="rt-old",
+        expected_generation=1,
+        new_run_token="rt-new",
+    ) is False
+    assert run_registry.resolve_run_fence("rt-new") is None
+
+
+@pytest.mark.asyncio
+async def test_claim_new_creates_owned_row(fake_pool: _FakePool):
+    assert await cp.claim_new(
+        tenant_id=1, session_id="s1", run_token="rt-new", generation=1
+    )
+    sql, args = fake_pool.calls[0]
+    assert sql.strip().startswith("INSERT")
+    assert args[3] == "rt-new" and args[4] == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_new_rejects_foreign_owner_without_binding_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import run_registry
+
+    pool = _FakePool(insert_rowcount=0)
+    monkeypatch.setattr(cp, "_pool", lambda: pool)
+    run_registry._FENCES.pop("rt-conflict", None)
+
+    assert await cp.claim_new(
+        tenant_id=1, session_id="s1", run_token="rt-conflict", generation=1
+    ) is False
+    assert run_registry.resolve_run_fence("rt-conflict") is None
+
+
+@pytest.mark.asyncio
+async def test_release_awaiting_requires_token_and_generation(fake_pool: _FakePool):
+    assert await cp.release_awaiting(
+        tenant_id=1,
+        session_id="s-awaiting",
+        run_token="rt-awaiting",
+        generation=5,
+    )
+    sql, args = fake_pool.calls[0]
+    assert "run_token = $3" in sql
+    assert "COALESCE((checkpoint->>'generation')::int, 0) = $4" in sql
+    assert args[2:] == ("rt-awaiting", 5)
+
+
+@pytest.mark.asyncio
+async def test_claim_awaiting_advances_generation_and_binds_fence(fake_pool: _FakePool):
+    from app import run_registry
+
+    assert await cp.claim_awaiting(
+        tenant_id=1,
+        session_id="s-awaiting",
+        expected_run_token="rt-old",
+        expected_generation=5,
+        new_run_token="rt-awaiting",
+    )
+    sql, args = fake_pool.calls[0]
+    assert "run_token = $3" in sql
+    assert "COALESCE((checkpoint->>'generation')::int, 0) = $4" in sql
+    assert args[2:] == ("rt-old", 5, "rt-awaiting", 6)
+    assert run_registry.resolve_run_fence("rt-awaiting") == run_registry.RunFence(
+        "rt-awaiting", 6
+    )
 
 
 @pytest.mark.asyncio
@@ -244,6 +392,108 @@ async def test_mark_moves_row_out_of_active_set(fake_pool: _FakePool):
 def test_active_statuses_match_index_predicate():
     """活跃集合必须与唯一索引 `ux_agent_runs_session_active` 的谓词一致。"""
     assert set(cp.ACTIVE_STATUSES) == {"running", "checkpointed", "resuming"}
+
+
+def _stub_sweep_dependencies(monkeypatch: pytest.MonkeyPatch, rows: list[dict[str, Any]]) -> None:
+    from app.agent import interactions, resume
+
+    class _ScanPool:
+        async def fetch(self, _sql: str, *_args: Any) -> list[dict[str, Any]]:
+            return rows
+
+    async def _noop() -> int:
+        return 0
+
+    async def _unlocked(_session_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(cp, "_pool", lambda: _ScanPool())
+    monkeypatch.setattr(cp, "abandon_stale_awaiting", _noop)
+    monkeypatch.setattr(interactions, "expire_stale", _noop)
+    monkeypatch.setattr(resume, "_lock_is_held", _unlocked)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_status"),
+    [(cp.STATUS_RUNNING, cp.STATUS_CHECKPOINTED), (cp.STATUS_RESUMING, cp.STATUS_ABANDONED)],
+)
+async def test_reconciler_marks_only_the_scanned_fence(
+    monkeypatch: pytest.MonkeyPatch, status: str, expected_status: str
+) -> None:
+    from app.agent import resume
+
+    snapshot = cp.build_snapshot(messages=[{"role": "user", "content": "hi"}], turn_index=1)
+    row = {
+        "session_id": "s-scan",
+        "tenant_id": 1,
+        "status": status,
+        "checkpoint": snapshot,
+        "run_token": "rt-scanned",
+        "generation": 7,
+    }
+    _stub_sweep_dependencies(monkeypatch, [row])
+    marked: list[dict[str, Any]] = []
+
+    async def _mark(**kwargs: Any) -> bool:
+        marked.append(kwargs)
+        return True
+
+    monkeypatch.setattr(cp, "mark", _mark)
+    monkeypatch.setattr(resume, "_auto_resume_enabled", lambda: False)
+
+    await resume.sweep_once()
+
+    assert marked == [{
+        "tenant_id": 1,
+        "session_id": "s-scan",
+        "status": expected_status,
+        "run_token": "rt-scanned",
+        "generation": 7,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_rebuild_failure_releases_only_its_claimed_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.agent import resume
+
+    snapshot = cp.build_snapshot(messages=[{"role": "user", "content": "hi"}], turn_index=1)
+    row = {
+        "session_id": "s-rebuild",
+        "tenant_id": 1,
+        "status": cp.STATUS_RUNNING,
+        "checkpoint": snapshot,
+        "run_token": "rt-old",
+        "generation": 3,
+    }
+    _stub_sweep_dependencies(monkeypatch, [row])
+    claimed: dict[str, Any] = {}
+    marked: list[dict[str, Any]] = []
+
+    async def _claim(**kwargs: Any) -> bool:
+        claimed.update(kwargs)
+        return True
+
+    async def _mark(**kwargs: Any) -> bool:
+        marked.append(kwargs)
+        return True
+
+    monkeypatch.setattr(cp, "claim", _claim)
+    monkeypatch.setattr(cp, "mark", _mark)
+    monkeypatch.setattr(resume, "rebuild_task", lambda **_kwargs: None)
+    monkeypatch.setattr(resume, "_auto_resume_enabled", lambda: True)
+
+    await resume.sweep_once(runner=object())
+
+    assert marked == [{
+        "tenant_id": 1,
+        "session_id": "s-rebuild",
+        "status": cp.STATUS_CHECKPOINTED,
+        "run_token": claimed["new_run_token"],
+        "generation": 4,
+    }]
 
 
 # ── runtime 接线 ──────────────────────────────────────────────────────────

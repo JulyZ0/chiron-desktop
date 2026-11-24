@@ -15,6 +15,7 @@
 
 const fs = require('node:fs')
 const fsp = fs.promises
+const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { spawn } = require('node:child_process')
@@ -31,6 +32,50 @@ const RECONNECT_MAX_MS = 30000
 const WS_OPEN = 1
 const NOISE_DIRS = new Set([
   'node_modules', 'dist', 'build', 'target', '__pycache__', 'vendor', '.next', 'coverage',
+])
+const GIT_NULL = process.platform === 'win32' ? 'NUL' : os.devNull
+const DEVICE_GIT_SAFE_CONFIG = [
+  ['core.hooksPath', GIT_NULL],
+  ['core.fsmonitor', 'false'],
+  ['core.pager', 'cat'],
+  ['core.quotepath', 'false'],
+  ['core.alternateRefsCommand', ''],
+  ['credential.helper', ''],
+  ['diff.external', ''],
+  ['commit.gpgSign', 'false'],
+  ['tag.gpgSign', 'false'],
+  ['log.showSignature', 'false'],
+  ['gpg.program', ''],
+  ['core.sshCommand', ''],
+  ['core.gitProxy', ''],
+  ['core.askPass', ''],
+  ['protocol.allow', 'never'],
+]
+const DEVICE_GIT_SERVER_PREFIX = [
+  '--no-optional-locks',
+  '-c', 'core.quotepath=false',
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.alternateRefsCommand=',
+  '-c', 'diff.external=',
+  '-c', 'core.pager=cat',
+]
+const DEVICE_GIT_COMMANDS = new Map([
+  ['rev-parse', [
+    ['rev-parse', '--is-inside-work-tree'],
+    ['rev-parse', '--show-toplevel'],
+    ['rev-parse', '--short', 'HEAD'],
+    ['rev-parse', '--short=8', 'HEAD'],
+    ['rev-parse', '--abbrev-ref', 'HEAD'],
+  ]],
+  ['status', [
+    ['status', '--porcelain=v1', '-z'],
+    ['status', '--porcelain=v1', '-z', '--untracked-files=normal'],
+  ]],
+  ['symbolic-ref', [['symbolic-ref', '--short', '-q', 'HEAD']]],
+  ['init', [['init', '-q']]],
+])
+const DEVICE_GIT_ENV_KEYS = new Set([
+  'PATH', 'PATHEXT', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'TMPDIR',
 ])
 
 function isMirrorSecretFile(name) {
@@ -96,6 +141,87 @@ function ensureInside(root, target) {
   if (within(rootReal, targetReal)) return targetAbs
   if (within(rootAbs, targetAbs)) return targetAbs
   return null
+}
+
+function sameArgs(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function validateDeviceGitArgs(args) {
+  if (!Array.isArray(args) || args.length === 0 || args.length > 64) {
+    throw new Error('invalid git args')
+  }
+  if (args.some(arg => typeof arg !== 'string' || arg.length > 2048 || arg.includes('\u0000'))) {
+    throw new Error('invalid git args')
+  }
+  // Strip the gateway's exact reviewed prefix; refuse every other -c.
+  const commandArgs = sameArgs(args.slice(0, DEVICE_GIT_SERVER_PREFIX.length), DEVICE_GIT_SERVER_PREFIX)
+    ? args.slice(DEVICE_GIT_SERVER_PREFIX.length)
+    : args
+  const shapes = DEVICE_GIT_COMMANDS.get(commandArgs[0])
+  if (!shapes || !shapes.some(shape => sameArgs(commandArgs, shape))) {
+    throw new Error('invalid git args: disallowed git command or option')
+  }
+  return commandArgs
+}
+
+function deviceGitEnvironment() {
+  const env = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (DEVICE_GIT_ENV_KEYS.has(key.toUpperCase())) env[key] = value
+  }
+  return {
+    ...env,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: GIT_NULL,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_PAGER: 'cat',
+    PAGER: 'cat',
+    GIT_OPTIONAL_LOCKS: '0',
+    GIT_ALLOW_PROTOCOL: '',
+    GIT_PROTOCOL_FROM_USER: '0',
+    LC_ALL: 'C',
+    LANG: 'C',
+  }
+}
+
+function deviceGitPrefix() {
+  const prefix = ['--no-pager', '--no-optional-locks']
+  for (const [key, value] of DEVICE_GIT_SAFE_CONFIG) prefix.push('-c', `${key}=${value}`)
+  return prefix
+}
+
+function deviceGitConfigOverrides(stdout) {
+  const filters = new Set()
+  const diffDrivers = new Set()
+  for (const entry of stdout.split('\0')) {
+    if (!entry) continue
+    const separator = entry.indexOf('\n')
+    if (separator <= 0) throw new Error('malformed git configuration listing')
+    const key = entry.slice(0, separator)
+    const lowered = key.toLowerCase()
+    const attribute = lowered.slice(lowered.lastIndexOf('.') + 1)
+    if (lowered.startsWith('filter.') && ['clean', 'smudge', 'process'].includes(attribute)) {
+      const driver = key.slice('filter.'.length, -(attribute.length + 1))
+      if (!driver) throw new Error('malformed git filter configuration')
+      filters.add(driver)
+    } else if (lowered.startsWith('diff.') && ['textconv', 'command'].includes(attribute)) {
+      const driver = key.slice('diff.'.length, -(attribute.length + 1))
+      if (!driver) throw new Error('malformed git diff configuration')
+      diffDrivers.add(driver)
+    }
+  }
+  const overrides = []
+  for (const driver of [...filters].sort()) {
+    for (const attribute of ['clean', 'smudge', 'process']) {
+      overrides.push('-c', `filter.${driver}.${attribute}=`)
+    }
+    overrides.push('-c', `filter.${driver}.required=false`)
+  }
+  for (const driver of [...diffDrivers].sort()) {
+    overrides.push('-c', `diff.${driver}.textconv=`, '-c', `diff.${driver}.command=`)
+  }
+  return overrides
 }
 
 /** 执行一条设备 op。纯函数化便于单测（不依赖连接状态）。 */
@@ -194,12 +320,10 @@ async function handleDeviceOp(msg) {
     return {}
   }
 
-  // git：完整允许（含写操作）。参数由服务端构造，渲染层无法直接下发。
-  // 安全边界：cwd 必须在项目根内；参数数量/长度受限；输出限 8MB、超时 30s。
+  // Git accepts only the fixed commands used by the gateway; the device adds its own safeguards.
   if (op === 'git') {
-    const args = Array.isArray(msg.args) ? msg.args.map(String) : []
-    if (args.length === 0 || args.length > 64) throw new Error('invalid git args')
-    if (args.some(a => a.length > 2048 || a.includes('\u0000'))) throw new Error('invalid git args')
+    const args = Array.isArray(msg.args) ? msg.args : []
+    validateDeviceGitArgs(args)
     const timeout = Math.max(1000, Math.min(Number(msg.timeout_ms) || GIT_TIMEOUT_MS, 120000))
     return await runDeviceGit(abs, args, timeout)
   }
@@ -294,72 +418,117 @@ async function sha256File(abs) {
   })
 }
 
-/**
- * 在项目根内执行 git 子命令。
- *
- * 非零退出码不是错误：git 的 "not a git repository" 等语义靠 code/stderr 表达，
- * 由服务端解释。只有 git 缺失（ENOENT）才用 127 标记，避免和普通失败混淆。
- * 输出截断时仍返回已有内容并置 truncated，服务端据此拒绝解析。
- */
-function runDeviceGit(cwd, args, timeoutMs) {
+function runGitProcess(cwd, args, timeoutMs, spawnGit) {
   return new Promise(resolve => {
     let child
     try {
-      child = spawn('git', args, {
+      child = spawnGit('git', args, {
         cwd,
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          ...process.env,
-          GIT_TERMINAL_PROMPT: '0',
-          GIT_PAGER: 'cat',
-          GIT_OPTIONAL_LOCKS: '0',
-          LC_ALL: 'C',
-        },
+        env: deviceGitEnvironment(),
       })
     } catch (err) {
-      resolve({ code: 127, stdout: '', stderr: String(err.message || err), truncated: false })
+      const missing = err && err.code === 'ENOENT'
+      resolve({
+        code: missing ? 127 : -1,
+        stdout: '',
+        stderr: missing ? 'git not found' : String(err.message || err),
+        truncated: false,
+      })
       return
     }
-    let stdout = ''
-    let stderr = ''
+    let stdout = []
+    let stderr = []
+    let stdoutBytes = 0
+    let stderrBytes = 0
     let truncated = false
     let done = false
     let timer = null
+    const outputText = chunks => Buffer.concat(chunks).toString('utf8')
     const finish = payload => {
       if (done) return
       done = true
       if (timer) clearTimeout(timer)
-      resolve(payload)
+      resolve({ ...payload, stdout: outputText(stdout), stderr: outputText(stderr) })
     }
     timer = setTimeout(() => {
       try {
         child.kill()
       } catch {
-        /* 已退出 */
+        /* Already exited. */
       }
-      finish({ code: -1, stdout, stderr: `${stderr}\ngit timeout after ${timeoutMs}ms`.trim(), truncated })
+      stderr.push(Buffer.from(`git timeout after ${timeoutMs}ms`))
+      finish({ code: -1, truncated })
     }, timeoutMs)
     child.stdout.on('data', chunk => {
-      if (stdout.length >= MAX_GIT_OUTPUT) {
+      if (stdoutBytes >= MAX_GIT_OUTPUT) {
         truncated = true
         return
       }
-      stdout += chunk.toString('utf8')
-      if (stdout.length > MAX_GIT_OUTPUT) {
-        stdout = stdout.slice(0, MAX_GIT_OUTPUT)
-        truncated = true
-      }
+      const data = chunk.length > MAX_GIT_OUTPUT - stdoutBytes
+        ? chunk.subarray(0, MAX_GIT_OUTPUT - stdoutBytes)
+        : chunk
+      stdout.push(data)
+      stdoutBytes += data.length
+      if (data.length < chunk.length) truncated = true
     })
     child.stderr.on('data', chunk => {
-      if (stderr.length < 64 * 1024) stderr += chunk.toString('utf8')
+      if (stderrBytes >= 64 * 1024) return
+      const data = chunk.length > 64 * 1024 - stderrBytes
+        ? chunk.subarray(0, 64 * 1024 - stderrBytes)
+        : chunk
+      stderr.push(data)
+      stderrBytes += data.length
     })
     child.on('error', err => {
       const missing = err && err.code === 'ENOENT'
-      finish({ code: missing ? 127 : -1, stdout, stderr: missing ? 'git not found' : String(err.message || err), truncated })
+      stderr.push(Buffer.from(missing ? 'git not found' : String(err.message || err)))
+      finish({ code: missing ? 127 : -1 })
     })
-    child.on('close', code => finish({ code: code == null ? -1 : code, stdout, stderr, truncated }))
+    child.on('close', code => finish({ code: code == null ? -1 : code }))
   })
+}
+
+/** Probe effective configuration before executing; an unreadable repository is never run unprotected. */
+async function runDeviceGit(cwd, args, timeoutMs, deps = {}) {
+  const commandArgs = validateDeviceGitArgs(args)
+  const spawnGit = deps.spawnGit || spawn
+  const prefix = deviceGitPrefix()
+  const deadline = Date.now() + timeoutMs
+  const probe = await runGitProcess(
+    cwd,
+    [...prefix, 'config', '--includes', '--null', '--list'],
+    Math.min(timeoutMs, 10000),
+    spawnGit,
+  )
+  if (probe.code === 127 && probe.stderr === 'git not found') return probe
+  if (probe.code !== 0 || probe.truncated) {
+    const detail = probe.stderr.trim() || `exit ${probe.code}`
+    return {
+      code: -1,
+      stdout: '',
+      stderr: `git repository configuration probe failed: ${detail}`,
+      truncated: false,
+    }
+  }
+  let overrides
+  try {
+    overrides = deviceGitConfigOverrides(probe.stdout)
+  } catch (err) {
+    return {
+      code: -1,
+      stdout: '',
+      stderr: `git repository configuration probe failed: ${String(err.message || err)}`,
+      truncated: false,
+    }
+  }
+  return runGitProcess(
+    cwd,
+    [...prefix, ...overrides, ...commandArgs],
+    Math.max(1, deadline - Date.now()),
+    spawnGit,
+  )
 }
 
 function toWsUrl(apiUrl) {
@@ -617,6 +786,7 @@ function createDeviceFSBridge({
 module.exports = {
   createDeviceFSBridge,
   handleDeviceOp,
+  runDeviceGit,
   canonicalRootKey,
   ensureInside,
   toWsUrl,

@@ -20,6 +20,7 @@ export const PRIVATE_KEY_PREFIXES: readonly string[] = [
   'chiron:ui-sounds',        // 交互音效开关（见 utils/uiSounds.ts）
   // 快捷键键位：记录的是用户**改过哪些键**，属于行为数据而非 UI 偏好，因此同样按账号隔离
   'chiron:shortcuts',
+  'chunk-upload',          // 分片上传 upload_id（含服务端上传会话标识）
 ]
 
 /** 构造带账号命名空间的私有键；无账号时退化为 `:anonymous`（登出态本就不应写入）。 */

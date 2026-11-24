@@ -180,7 +180,7 @@ def test_call_tool_uses_registered_local_name(monkeypatch):
     recorded: dict[str, object] = {}
 
     class _Conn:
-        async def send_jsonrpc(self, method, params=None):
+        async def send_jsonrpc(self, method, params=None, *, timeout=30.0):
             recorded["method"] = method
             recorded["params"] = params
             return {"ok": True}

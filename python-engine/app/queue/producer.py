@@ -68,9 +68,9 @@ class QueueProducer:
                 本方法每次生成新 task_id，回退键 `{task_type}:{task_id}` 因此每次不同，
                 覆盖的是重投/认领场景（消息字段原样重投）。只有"同一业务动作必须只执行
                 一次"时才传稳定键（如 tool_job 用 job_id）。
-                注意 worker 的 claim 只拒绝 `completed`：传稳定键会让**用户再次主动发起
-                的同一操作**被跳过，因此不可用于可重复发起的动作（如"重建索引"——
-                该场景由 `_handle_kb_index` 的自身幂等负责）。
+                worker 在保留窗口内拒绝 `completed` 的重复投递，并用 lease 隔离并发
+                attempt：传稳定键会让**用户再次主动发起的同一操作**被跳过，因此不可
+                用于可重复发起的动作（如"重建索引"——该场景由处理器自身幂等负责）。
 
         Returns:
             task_id

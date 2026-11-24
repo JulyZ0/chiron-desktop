@@ -31,13 +31,12 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.skill.store import ORIGIN_LOCAL, SkillDef, SkillStore
+from app.skill.store import ORIGIN_LOCAL, SkillDef, SkillStore, validate_skill_name
 
 router = APIRouter(tags=["skills"])
 
@@ -51,6 +50,20 @@ def _valid_scope(scope: str = "") -> str:
     raise HTTPException(
         status_code=400, detail="invalid scope: must be 'tenant' or 'private'"
     )
+
+
+def _validate_skill_name(name: str) -> str:
+    try:
+        return validate_skill_name(name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _save_skill(store: SkillStore, skill: SkillDef) -> None:
+    try:
+        store.save(skill)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _store_for(user_id: str = "", tenant_id: int = 0, scope: str = "") -> SkillStore:
@@ -102,6 +115,7 @@ async def register_skill(
     from app.core.capabilities import get_registry
 
     store = _store_for(user_id, tenant_id, _valid_scope(scope))
+    name = _validate_skill_name(name)
 
     cap = await get_registry().get_by_id(name, tenant_id=tenant_id)
     if cap is None:
@@ -117,13 +131,13 @@ async def register_skill(
         }
 
     skill = SkillDef(
-        name=cap.name or name,
+        name=_validate_skill_name(cap.name or name),
         description=cap.description or f"Skill {name}",
         version="0.1.0",
         exec_type="prompt",
         source=f"Use the {name} capability. {cap.description or ''}".strip(),
     )
-    store.save(skill)
+    _save_skill(store, skill)
     return {
         "success": True,
         "skill": skill.name,
@@ -170,9 +184,7 @@ async def install_skill(
         ) from e
 
     exec_cfg = data.get("exec", {})
-    skill_name = data.get("name", "")
-    if not skill_name:
-        raise HTTPException(status_code=400, detail="skill definition missing 'name'")
+    skill_name = _validate_skill_name(data.get("name", ""))
     # P1-2：来源标记。请求体优先，其次定义自带，最后按"本地安装"处理。
     # 用 `url` 安装时把安装地址记进 metadata.source_url —— 升级端点靠它找到源清单，
     # 否则用户装完就只能重装才能升级。
@@ -192,7 +204,7 @@ async def install_skill(
         metadata=metadata,
         origin=origin,
     )
-    store.save(skill)
+    _save_skill(store, skill)
     payload = skill.to_dict()
     payload["source"] = store.write_scope
     return {
@@ -252,9 +264,7 @@ async def delete_skill(
     """
     if scope not in ("", "private", "tenant"):
         raise HTTPException(status_code=400, detail=f"invalid scope: {scope}")
-    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
-        raise HTTPException(status_code=400, detail="invalid skill name")
-
+    _validate_skill_name(name)
     store = _store_for(user_id, tenant_id, scope)
 
     found = store.get(name)
@@ -301,8 +311,7 @@ async def patch_skill_meta(
     """
     store = _store_for(user_id, tenant_id)
 
-    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
-        raise HTTPException(status_code=400, detail="invalid skill name")
+    _validate_skill_name(name)
     if body.auto_inject is None:
         raise HTTPException(status_code=400, detail="nothing to update: provide auto_inject")
 
@@ -347,8 +356,7 @@ async def upgrade_skill_endpoint(
     """
     store = _store_for(user_id, tenant_id)
 
-    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
-        raise HTTPException(status_code=400, detail="invalid skill name")
+    _validate_skill_name(name)
     if store.get(name) is None:
         raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
 
@@ -405,13 +413,12 @@ async def toggle_skill(
     """
     store = _store_for(user_id, tenant_id)
 
-    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
-        raise HTTPException(status_code=400, detail="invalid skill name")
+    _validate_skill_name(name)
     skill = store.get(name)
     if not skill:
         raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
     skill.enabled = body.enabled
-    store.save(skill)
+    _save_skill(store, skill)
     return {
         "skill": _skill_payload(skill),
         "message": f"Skill '{name}' {'已启用' if body.enabled else '已停用'}",
@@ -434,8 +441,7 @@ async def run_skill(
     """
     store = _store_for(user_id, tenant_id)
 
-    if not re.match(r"^[a-zA-Z0-9_.-]+$", name):
-        raise HTTPException(status_code=400, detail="invalid skill name")
+    _validate_skill_name(name)
     skill = store.get(name)
     if not skill:
         raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")

@@ -101,7 +101,7 @@ type UserResponse struct {
 	PasswordSet bool `json:"password_set"`
 	// MustChangePassword：首登/重置后必须改密。前端据此跳改密页；
 	// 后端 AuthMiddleware 也按 claims 里同一标志拦截其它接口。
-	MustChangePassword bool `json:"must_change_password,omitempty"`
+	MustChangePassword bool `json:"must_change_password"`
 }
 
 // SetTokenCookie sets the JWT as an HTTP-only secure cookie.
@@ -434,7 +434,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	SetTokenCookie(w, token, int(h.cfg.JWTExpiration.Seconds()), h.cfg.CookieSecure)
 	Created(w, map[string]interface{}{
 		"token": token,
-		"user":  UserResponse{ID: userID, Email: req.Email, Name: req.Name, Role: role},
+		"user":  UserResponse{ID: userID, Email: req.Email, Name: req.Name, Role: role, PasswordSet: true},
 	})
 }
 

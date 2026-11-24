@@ -5,13 +5,32 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.memory.layers import SlotType, SourceType
+from app.queue import idempotency
 from app.queue import worker as worker_module
 from app.queue.streams import DLQ_STREAM, TASK_STREAM
 from app.queue.worker import MAX_RETRIES, QueueWorker
 
+_REAL_CLAIM = idempotency.claim
+
 
 def make_worker(redis=None):
     return QueueWorker(redis=redis or AsyncMock())
+
+
+@pytest.fixture(autouse=True)
+def _mock_fenced_transitions(monkeypatch):
+    claim = idempotency.Attempt("engine", "tool_job:t1", "state", "token", 1)
+    monkeypatch.setattr(
+        idempotency,
+        "claim",
+        AsyncMock(return_value=idempotency.ClaimDecision(idempotency.ClaimStatus.ACQUIRED, claim)),
+    )
+    monkeypatch.setattr(idempotency, "complete", AsyncMock(return_value=True))
+    monkeypatch.setattr(idempotency, "ack_completed", AsyncMock(return_value=True))
+    monkeypatch.setattr(idempotency, "retry", AsyncMock(return_value=True))
+    monkeypatch.setattr(idempotency, "defer", AsyncMock(return_value=True))
+    monkeypatch.setattr(idempotency, "dead_letter", AsyncMock(return_value=True))
+    monkeypatch.setattr(idempotency, "forward", AsyncMock(return_value=True))
 
 
 def _session_pool(rows, owner="t1"):
@@ -38,13 +57,14 @@ def fields(task_type="tool_job", task_id="t1", payload="{}", retry_count=0):
 class TestProcessMessage:
     """消息处理：ACK / 重试 / DLQ"""
 
-    async def test_success_acks(self):
+    async def test_success_uses_fenced_completion(self):
         redis = AsyncMock()
         worker = make_worker(redis)
         worker._dispatch = AsyncMock()
         await worker._process_message("1-0", fields())
         worker._dispatch.assert_awaited_once()
-        redis.xack.assert_awaited_once_with(TASK_STREAM, "engine-workers", "1-0")
+        idempotency.complete.assert_awaited_once()
+        redis.xack.assert_not_awaited()
         redis.xadd.assert_not_awaited()
 
     async def test_failure_requeues_with_increment(self):
@@ -52,32 +72,57 @@ class TestProcessMessage:
         worker = make_worker(redis)
         worker._dispatch = AsyncMock(side_effect=RuntimeError("boom"))
         await worker._process_message("1-0", fields(retry_count=0))
-        # 重投到任务流，retry_count 递增
-        redis.xadd.assert_awaited_once()
-        stream, message, *_ = redis.xadd.await_args.args
-        assert stream == TASK_STREAM
-        assert message["task_type"] == "tool_job"
-        assert message["retry_count"] == "1"
-        redis.xack.assert_awaited()
+        idempotency.retry.assert_awaited_once()
+        args = idempotency.retry.await_args.kwargs
+        assert args["target"] == TASK_STREAM
+        assert args["fields"]["task_type"] == "tool_job"
+        assert args["fields"]["retry_count"] == "1"
+        redis.xadd.assert_not_awaited()
+        redis.xack.assert_not_awaited()
 
     async def test_dlq_after_max_retries(self):
         redis = AsyncMock()
         worker = make_worker(redis)
         worker._dispatch = AsyncMock(side_effect=RuntimeError("boom"))
         await worker._process_message("1-0", fields(retry_count=MAX_RETRIES))
-        # 进 DLQ，不再重投
-        redis.xadd.assert_awaited_once()
-        assert redis.xadd.await_args.args[0] == DLQ_STREAM
-        dlq_message = redis.xadd.await_args.args[1]
-        assert dlq_message["task_id"] == "t1"
-        assert "boom" in dlq_message["error"]
-        redis.xack.assert_awaited()
+        idempotency.dead_letter.assert_awaited_once()
+        args = idempotency.dead_letter.await_args.kwargs
+        assert args["target"] == DLQ_STREAM
+        assert args["fields"]["task_id"] == "t1"
+        assert "boom" in args["fields"]["error"]
+        redis.xadd.assert_not_awaited()
+        redis.xack.assert_not_awaited()
 
-    async def test_unknown_task_type_logs_only(self):
+    async def test_unknown_task_type_is_retried(self):
         redis = AsyncMock()
         worker = make_worker(redis)
         await worker._process_message("1-0", fields(task_type="bogus"))
-        redis.xack.assert_awaited_once()  # 未知类型不算失败
+        idempotency.retry.assert_awaited_once()
+        redis.xack.assert_not_awaited()
+
+    async def test_completion_failure_does_not_immediately_retry_side_effect(self):
+        redis = AsyncMock()
+        worker = make_worker(redis)
+        worker._dispatch = AsyncMock()
+        idempotency.complete.side_effect = ConnectionError("completion unknown")
+        with pytest.raises(ConnectionError, match="completion unknown"):
+            await worker._process_message("1-0", fields())
+        worker._dispatch.assert_awaited_once()
+        idempotency.retry.assert_not_awaited()
+        idempotency.dead_letter.assert_not_awaited()
+
+    async def test_claim_redis_failure_does_not_fail_open(self):
+        redis = AsyncMock()
+        redis.eval.side_effect = ConnectionError("redis unavailable")
+        with pytest.raises(ConnectionError, match="redis unavailable"):
+            await _REAL_CLAIM(
+                redis,
+                namespace="engine",
+                key="tool_job:t1",
+                task_id="t1",
+                task_type="tool_job",
+                tenant_id=0,
+            )
 
 
 class TestHandleMemorySave:
@@ -281,15 +326,15 @@ async def test_foreign_task_is_forwarded_to_its_queue():
         },
     )
 
-    assert redis.xadd.await_args.args[0] == KB_QUEUE.stream
-    redis.xack.assert_awaited()
+    idempotency.forward.assert_awaited_once()
+    assert idempotency.forward.await_args.kwargs["target"] == KB_QUEUE.stream
+    redis.xadd.assert_not_awaited()
+    redis.xack.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_own_task_is_not_forwarded():
     """本队列自己的任务不会被转发到知识库队列（无论它后续成功还是重投）。"""
-    from app.queue.streams import KB_QUEUE
-
     redis = AsyncMock()
     redis.xadd = AsyncMock()
     redis.xack = AsyncMock()
@@ -303,5 +348,5 @@ async def test_own_task_is_not_forwarded():
             b"payload": b'{"job_id": "j1"}',
         },
     )
-    forwarded = [call.args[0] for call in redis.xadd.await_args_list]
-    assert KB_QUEUE.stream not in forwarded
+    idempotency.forward.assert_not_awaited()
+    redis.xadd.assert_not_awaited()
