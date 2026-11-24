@@ -1,7 +1,17 @@
 import axios from 'axios'
 import { describeApiError, serverErrorDetail } from '../utils/apiError'
 import { toToolList, type ToolInfo } from '../utils/toolList'
-import { canAutoRetry, readRetryable, resolveResponseWaitMs, shouldRetryResponse } from '../utils/rateLimitBackoff'
+import {
+  canAutoRetry,
+  isUploadPayload,
+  readHeader,
+  readRetryable,
+  replayVerdict,
+  resolveResponseWaitMs,
+  shouldRetryResponse,
+  IDEMPOTENCY_KEY_HEADER,
+  type ReplayVerdict,
+} from '../utils/rateLimitBackoff'
 import { isNewerStreamId } from '../utils/streamId'
 import type { WorkstationType } from '../types/workstation'
 
@@ -114,6 +124,80 @@ function requestToken(): string {
   return bearerToken
 }
 
+// ── 认证代次（generation）围栏 — PRD 9.10 / H68 ────────────────────────────
+//
+// 缺陷形态（三处，都是"迟到的旧账号回调"）：A 登出后 B 登录，A 那条还在飞的请求
+// 401 回来 → 拦截器把**B 的**登录态清掉并跳登录页；A 的 `/v1/auth/profile` 晚到 →
+// 把 B 的 `user` 覆盖成 A；一次延迟重试会把 B 的 token 附到 A 发出的请求上。
+//
+// 治法：给"认证状态"一个单调递增的代次。**每次切换（登录/登出/换账号/API Key 换绑/
+// 会话失效）递增**；请求发出时把代次与所用 token 一起记在 `config` 上；所有迟到的
+// 写回（401 处理、重试、profile、守卫）先比对，不一致就**整条丢弃**。
+//
+// 递增同时做两件必要的收尾：
+//   · 取消在途请求 —— 它们属于旧账号的上下文，继续跑只会把旧数据混进新账号；
+//   · 清掉账号域缓存 —— SSE 续传点位、媒体签名 URL 都是"某个账号看过的数据"。
+let authGeneration = 0
+
+/** 当前认证代次。守卫/调用方在等待异步身份之前抓一份，写回前比对。 */
+export function currentAuthGeneration(): number {
+  return authGeneration
+}
+
+/**
+ * 取消所有在途请求（认证切换时用，见 `bumpAuthGeneration`）。
+ *
+ * 为什么是**动态** import：`utils/requestOptimizer` 在模块加载时会起一个周期清理定时器；
+ * 静态引入等于让每个只用到 `api` 的地方（含大量单测）都吃下这个副作用 ——
+ * 已经实际踩到过：SSE 用例用假时钟推进重连，"顺手"被那个定时器带成无限循环。
+ */
+let cancelInFlightLoader: Promise<{ requestManager: { cancelAll: () => void } } | null> | null = null
+
+function cancelInFlightRequests(): void {
+  cancelInFlightLoader ??= import('../utils/requestOptimizer').catch(() => null)
+  void cancelInFlightLoader.then((mod) => {
+    try {
+      mod?.requestManager.cancelAll()
+    } catch {
+      /* 请求管理器不可用时只是少了"取消"这一步，代次比对仍然拦得住迟到回调 */
+    }
+  })
+}
+
+/**
+ * 认证切换：递增代次 + 取消在途请求 + 清账号域缓存。
+ *
+ * 返回新的代次，便于调用方在同一次切换里继续使用（例如 `login` 用它校验自己的响应）。
+ */
+export function bumpAuthGeneration(reason = 'auth-switch'): number {
+  authGeneration += 1
+  // 在途请求属于旧账号：取消掉，它们的迟到回调会被下面的代次比对拦下。
+  cancelInFlightRequests()
+  try {
+    // 账号域缓存：断线续传点位与签名 URL 都只对原账号有意义。
+    sseLastIdBySession.clear()
+    signedMediaCache.clear()
+  } catch {
+    /* 同上 */
+  }
+  // 401 提示闸门随账号重置：新账号第一次失效必须能提示出来。
+  lastAuthExpiredAt = 0
+  if (reason) {
+    // 只留痕不抛出：切换本身必须成功，日志是排查用的旁证。
+    void reason
+  }
+  return authGeneration
+}
+
+/** 这次失败请求是否来自**上一个**认证代次（或另一份凭据）—— 是则任何写回都必须放弃。 */
+function isStaleAuthRequest(config: unknown): boolean {
+  const cfg = (config ?? {}) as { __authGeneration?: number; __authToken?: string }
+  if (typeof cfg.__authGeneration === 'number' && cfg.__authGeneration !== authGeneration) return true
+  // 同一代次内 token 变了（改密重签等）：把旧凭据的失败当成新凭据的失败会误伤。
+  if (typeof cfg.__authToken === 'string' && cfg.__authToken !== requestToken()) return true
+  return false
+}
+
 /**
  * 写入本次请求使用的 Bearer token；`scope` 标明这份凭据属于哪一侧。
  *
@@ -173,6 +257,10 @@ api.interceptors.request.use((config) => {
   // 本地模式带设备 token（preload 注入），云端模式带登录 token；都没有就不设头
   const token = requestToken()
   if (token) config.headers.set('Authorization', `Bearer ${token}`)
+  // H68：把"这一笔请求属于哪个账号 / 哪一份凭据"钉在 config 上。
+  // 之后无论是 401、重放还是 profile 写回，都先拿它和当前代次比对。
+  config.__authGeneration = authGeneration
+  config.__authToken = token
   return config
 })
 
@@ -296,7 +384,9 @@ export async function listAgents(): Promise<Agent[]> {
 }
 
 export async function createAgent(body: Partial<Agent>): Promise<Agent> {
-  const { data } = await api.post('/v1/agents', body)
+  // H66：建 Agent 是一次**不可去重**的写（服务端没有按请求键去重）。
+  // 显式禁止自动重放，避免 503 时凭空多出一个同名 Agent。
+  const { data } = await api.post('/v1/agents', body, { __noRetry: true })
   return data?.data
 }
 
@@ -310,7 +400,10 @@ export async function deleteAgent(id: string): Promise<void> {
 }
 
 export async function runAgent(id: string, task: string): Promise<AgentSession> {
-  const { data } = await api.post(`/v1/agents/${encodeURIComponent(id)}/run`, { task })
+  // H66：一次派发 = 服务端建一个 AgentSession 并启动执行（`internal/api/agents.go`），
+  // 响应还没回来时副作用就已经落库。限流自动重放会让同一条任务跑两遍（并计费两次），
+  // 因此这里显式拒绝自动重试 —— 由用户决定要不要再发一次。
+  const { data } = await api.post(`/v1/agents/${encodeURIComponent(id)}/run`, { task }, { __noRetry: true })
   return data?.data
 }
 
@@ -502,7 +595,40 @@ declare module 'axios' {
   export interface AxiosRequestConfig {
     /** 置 true 时拦截器不派发 `api:error`（错误仍原样 reject 给调用方） */
     __silent?: boolean
+    /**
+     * 置 true 时**禁止**自动重放（H66）。用于调用方已知「这次副作用无法靠幂等键去重」的写请求
+     * —— 例如 `POST /v1/agents/{id}/run`（一个请求建一个 AgentSession）。
+     */
+    __noRetry?: boolean
+    /**
+     * 请求发出时的认证代次（H68）。拦截器自动写入，调用方不要手改：
+     * 迟到的响应拿它与当前代次比对，不一致即说明账号已经换过，写回必须放弃。
+     */
+    __authGeneration?: number
+    /** 本次请求实际使用的 Bearer token（H68）；重放前比对，避免把 B 的凭据发给 A 的请求。 */
+    __authToken?: string
   }
+}
+
+/**
+ * 这个失败请求能不能安全地自动重发（H66）。判据在 `replayVerdict`（纯函数，可单测）。
+ *
+ * 这里只做 `config → ReplayInput` 的搬运：方法、`Idempotency-Key` 头、是否上传、
+ * 以及调用方的 `__noRetry`。
+ */
+function requestReplayVerdict(config: unknown): ReplayVerdict {
+  const cfg = (config ?? {}) as {
+    method?: string
+    headers?: unknown
+    data?: unknown
+    __noRetry?: boolean
+  }
+  return replayVerdict({
+    method: cfg.method,
+    idempotencyKey: readHeader(cfg.headers, IDEMPOTENCY_KEY_HEADER),
+    isUpload: isUploadPayload(cfg.data, readHeader(cfg.headers, 'content-type')),
+    retryDisabled: cfg.__noRetry === true,
+  })
 }
 
 /**
@@ -556,9 +682,16 @@ api.interceptors.response.use(
       // 从 5s 起指数退避到几十秒。次数用完仍不就绪，就如实报原因 ——
       // 组件真没起来时，前端再怎么等也没用。
       const delayMs = LOCAL_NOT_READY_RETRY_DELAYS_MS[localAttempt - 1]
-      if (localConfig && delayMs !== undefined) {
+      // H66：只有**可重放**的请求才走这段等待。本地 503 表示"组件还没起来"，
+      // 读请求重试是纯收益；但一条 `POST /submit`/派发/上传重放会真的再建一次
+      // session 或再传一遍文件 —— 宁可立刻把"No ready"如实报出来让用户自己重发。
+      const localReplay = requestReplayVerdict(error.config)
+      // H68：等这段间隔的时候账号可能已经换了（登出 → 另一个账号登录），
+      // 此时重放等于把新账号的凭据接到旧账号的请求上，直接放弃。
+      if (localConfig && localReplay.safe && delayMs !== undefined && !isStaleAuthRequest(error.config)) {
         localConfig.__localReadyRetry = localAttempt
         await new Promise(resolve => setTimeout(resolve, delayMs))
+        if (isStaleAuthRequest(error.config)) return Promise.reject(error)
         return api.request(localConfig)
       }
       const base = t('errors.local_service_not_ready')
@@ -583,7 +716,13 @@ api.interceptors.response.use(
     if (shouldRetryResponse(status, retryable)) {
       const config = error.config as (typeof error.config & { __rateLimitRetry?: number }) | undefined
       const attempt = (config?.__rateLimitRetry ?? 0) + 1
-      if (config && canAutoRetry(attempt)) {
+      // H66：`retryable`/状态码只说"再发一次**可能有用**"，不证明"再发一次**没有副作用**"。
+      // 只有 GET/HEAD/OPTIONS 或带 `Idempotency-Key` 的非上传请求才真去重放；
+      // 其余写请求一律不重放，直接把错误交回调用方（提示仍是"服务繁忙，请稍后再试"，
+      // 但**没有**替用户偷偷再派发一次 Agent / 再建一个 session / 再传一遍文件）。
+      const replay = requestReplayVerdict(error.config)
+      // H68：退避期间若发生认证切换，同样不得重放（旧账号的请求不能带着新账号的 token 出去）。
+      if (config && replay.safe && canAutoRetry(attempt) && !isStaleAuthRequest(error.config)) {
         config.__rateLimitRetry = attempt
         const waitMs = resolveResponseWaitMs(
           attempt,
@@ -598,6 +737,8 @@ api.interceptors.response.use(
           }))
         }
         await new Promise(resolve => setTimeout(resolve, waitMs))
+        // H68：退避结束后再比对一次 —— 这段等待正是"账号被换掉"最可能的窗口。
+        if (isStaleAuthRequest(error.config)) return Promise.reject(error)
         return api.request(config)
       }
       window.dispatchEvent(new CustomEvent('api:error', {
@@ -622,6 +763,10 @@ api.interceptors.response.use(
     }
 
     if (status === 401) {
+      // H68：这是**上一代**凭据的迟到 401（A 已登出、B 已登录）。它的结论只对 A 成立：
+      // 既不能清掉 B 的登录态，也不能把 B 送进登录页；连提示都要吞掉 ——
+      // 用户刚登录成功却看到"登录已过期"，只会以为自己没登上。
+      if (isStaleAuthRequest(error.config)) return Promise.reject(error)
       // 开发环境登录绕过：`?devAuthBypass=1` 会尝试用开发凭据真登录（见 auth.ts
       // initToken）。真的登录失败时这里**保持静默** —— 绕过模式下守卫已放宽、不会
       // 跳转，再弹"登录已失效"只会在一个页面并发十几个请求时刷出十几条同样的提示，
@@ -647,6 +792,10 @@ api.interceptors.response.use(
       }
       if (alreadyNoticed) return Promise.reject(error)
       // Cookie/token 过期：清本地登录态并跳登录页（团队 Web 模式）。
+      //
+      // H68：会话失效本身就是一次认证切换 —— 递增代次，让仍在途的请求连同它们的
+      // 回调一起作废（否则清完 token 又被一堆并发 401 重复清、重复跳）。
+      const expiredGeneration = bumpAuthGeneration('session-expired')
       localStorage.removeItem('user')
       setAuthToken('')
       window.dispatchEvent(new CustomEvent('api:error', {
@@ -656,6 +805,8 @@ api.interceptors.response.use(
       // 桌面壳是 file:// + hash 路由：写 '/' 会变成 file:///X:/，整页导航会丢 SPA
       // 上下文。Hash 路由必须改 hash。
       setTimeout(() => {
+        // 这 500ms 里用户可能已经重新登录：那就不能再把他甩到登录页。
+        if (authGeneration !== expiredGeneration) return
         if (window.location.protocol === 'file:') {
           window.location.hash = '#/'
           return
@@ -718,7 +869,9 @@ export async function uploadFile(file: File): Promise<{
   form.append('file', file)
   // S 修复：不要手动设 multipart Content-Type（会丢 boundary 致 "invalid form"），
   // 让浏览器/axios 自动生成带 boundary 的正确头。
-  const resp = await api.post('/v1/media/upload', form)
+  // H66：上传**不自动重放**。既不用 `__noRetry` 兜底（FormData 本身也会被判为不可重放），
+  // 也让"限流时悄悄再传一遍 50MB"这条路径彻底不存在。
+  const resp = await api.post('/v1/media/upload', form, { __noRetry: true })
   const envelope = resp.data as { success?: boolean; data?: Record<string, unknown> }
   const d = envelope?.success === true ? envelope.data : undefined
   const id = typeof d?.id === 'string' ? d.id : ''

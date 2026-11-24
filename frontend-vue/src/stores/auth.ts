@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { api, desktopDeviceToken, loadDesktopToken, setAuthToken } from '../api'
+import { api, bumpAuthGeneration, currentAuthGeneration, desktopDeviceToken, loadDesktopToken, setAuthToken } from '../api'
 import { clearPrivateStorage } from '../utils/privateStorage'
 import { useDeviceStore, isDevAuthBypassEnabled, devAuthCredentials } from './device'
 import type { LockVerifyResult } from './device'
@@ -145,6 +145,34 @@ export const useAuthStore = defineStore('auth', () => {
     setAuthToken(t, isLocalMode() ? 'local' : 'cloud')
   }
 
+  // ── 认证代次（H68）─────────────────────────────────────────────────────
+  //
+  // 每次登录 / 登出 / 换账号 / 会话失效都递增。请求层会把代次钉在每一笔请求上
+  // （见 api/index.ts 的 `bumpAuthGeneration` / `isStaleAuthRequest`），这里的
+  // `generation` 是给**组件与路由守卫**读的那一份：
+  // 凡是要"等一个异步身份回来再写回"的地方，写回前都要比对。
+  const generation = ref(currentAuthGeneration())
+
+  /** 开启一次认证切换：递增代次（并取消在途请求 / 清账号域缓存），返回新代次。 */
+  function beginAuthTransition(reason: string): number {
+    generation.value = bumpAuthGeneration(reason)
+    return generation.value
+  }
+
+  /** 这次异步操作开始时的那一代认证是否仍是当前代（false ⇒ 结果作废，不得写回）。 */
+  function stillCurrent(gen: number): boolean {
+    return generation.value === gen && currentAuthGeneration() === gen
+  }
+
+  /**
+   * 换账号时清掉账号域本地缓存（输入历史、会话列表…）：它们是**上一个账号**的私有数据。
+   * 键本身带账号命名空间（见 utils/privateStorage），但历史遗留的裸键只能按前缀整体清。
+   */
+  function dropAccountScopedCache(nextUserId: string) {
+    const prevId = user.value?.id
+    if (prevId && nextUserId && prevId !== nextUserId) clearPrivateStorage()
+  }
+
   /**
    * 桌面端 token 由 safeStorage 异步解密。main.ts 在挂载前 await，路由守卫再兜底；
    * 幂等，多次调用只读一次加密文件。Web 端立即返回。
@@ -231,6 +259,8 @@ export const useAuthStore = defineStore('auth', () => {
    */
   async function ensureLocalSession(force = false): Promise<boolean> {
     if (!force && user.value && token.value) return true
+    // H68：这次建会话期间若发生过认证切换（登出/换账号），结果作废。
+    const gen = generation.value
     try {
       // `__retainAcrossNavigation`：首屏路由导航会 `requestManager.cancelAll()`，
       // 而这次导航往往正好赶在这个请求还没回来的时候（打包版 file:// 冷启动必现）。
@@ -242,10 +272,12 @@ export const useAuthStore = defineStore('auth', () => {
       const d = response.data?.data
       if (!d?.user) return false
       // token 以**设备 token**（preload 注入）为准：core 校验的就是它
-      //（CHIRON_DEVICE_TOKEN 优先于落盘文件，见 desktop-local/app/api/auth.py）。
+      //（CHIRON_DEVICE_TOKEN 优先于落盘文件，见 desktop-local/api/auth.py）。
       // 两者不一致（注入值被 core 落盘值盖住）时，用错那个在开了鉴权的 core 上全场 401。
       const localToken = desktopDeviceToken() || d.token || ''
       if (!localToken) return false
+      // 迟到的本地会话：用户已经登出/换账号了，不能把旧身份写回来。
+      if (!stillCurrent(gen)) return false
       applyToken(localToken)
       setAuthMethod('session')
       user.value = normalizeAuthUser(d.user)
@@ -335,6 +367,9 @@ export const useAuthStore = defineStore('auth', () => {
   /** 登录：`identifier` 可以是邮箱或用户名（团队模式两者都支持）。 */
   async function login(identifier: string, password: string, captcha?: { token: string; randstr?: string }) {
     loading.value = true
+    // H68：登录是一次认证切换。**先**递增代次（并取消旧账号的在途请求），
+    // 之后旧请求的迟到响应/401 都会被请求层挡掉，不会把刚登录的账号清出去。
+    const gen = beginAuthTransition('login')
     try {
       // `__silent`：密码错误的 401 由登录页就地展示，不能被全局拦截器
       // 当成"会话过期"再弹一次 toast / 跳转。
@@ -347,6 +382,9 @@ export const useAuthStore = defineStore('auth', () => {
       }, { __silent: true })
       const d = response.data?.data
       if (!d) throw new Error('invalid login response')
+      // 期间又切换过（连点登录 / 先登出再登录）：以最后一次为准，本次响应不写身份。
+      if (!stillCurrent(gen)) return d
+      dropAccountScopedCache(d.user?.id || '')
       // Web 走 httpOnly cookie；桌面端 file:// 跨站拿不到 cookie，applyToken 同时
       // 把 token 交给请求层走 Bearer（仅桌面端持久化）。
       applyToken(d.token)
@@ -370,11 +408,15 @@ export const useAuthStore = defineStore('auth', () => {
     const key = rawKey.trim()
     if (!key) throw new Error('api key is required')
     loading.value = true
+    // H68：换绑凭据 = 认证切换。
+    const gen = beginAuthTransition('login-api-key')
     try {
       applyToken(key)
       const response = await api.get('/v1/auth/profile', { __silent: true })
       const data = response.data?.data
       if (!data || !data.user_id) throw new Error('invalid api key')
+      if (!stillCurrent(gen)) throw new Error('stale api key login response')
+      dropAccountScopedCache(data.user_id)
       user.value = {
         id: data.user_id,
         email: data.email || '',
@@ -392,8 +434,11 @@ export const useAuthStore = defineStore('auth', () => {
       persistUserToStorage(user.value)
       return user.value
     } catch (err) {
-      applyToken('')
-      setAuthMethod(null)
+      // H68：只有"这次换绑仍是当前认证"时才回滚凭据 —— 否则会把**新账号**的 token 清掉。
+      if (stillCurrent(gen)) {
+        applyToken('')
+        setAuthMethod(null)
+      }
       throw err
     } finally {
       loading.value = false
@@ -408,6 +453,8 @@ export const useAuthStore = defineStore('auth', () => {
     emailCode?: string,
   ) {
     loading.value = true
+    // H68：注册成功即登录 = 认证切换。
+    const gen = beginAuthTransition('register')
     try {
       const response = await api.post('/v1/auth/register', {
         email,
@@ -420,6 +467,8 @@ export const useAuthStore = defineStore('auth', () => {
       })
       const d = response.data?.data
       if (!d) throw new Error('invalid register response')
+      if (!stillCurrent(gen)) return d
+      dropAccountScopedCache(d.user?.id || '')
       applyToken(d.token)
       user.value = normalizeAuthUser(d.user)
       persistUserToStorage(user.value)
@@ -438,11 +487,16 @@ export const useAuthStore = defineStore('auth', () => {
       return
     }
     if (!user.value) return
+    // H68：这次 profile 属于哪一代认证。晚到的 profile 不得覆盖新账号的身份，
+    // 也不能因为它 401 就把新账号登出（见下面的 catch）。
+    const gen = generation.value
     try {
       const response = await api.get('/v1/auth/profile')
       const data = response.data?.data as AuthProfile | undefined
       if (!data) throw new Error('invalid profile response')
+      if (!stillCurrent(gen)) return
       const authMethod = data.auth_method === 'api_key' ? 'api_key' : 'session'
+      dropAccountScopedCache(data.user_id)
       user.value = normalizeAuthUser({
         id: data.user_id,
         email: data.email,
@@ -463,19 +517,25 @@ export const useAuthStore = defineStore('auth', () => {
       // 「不同设备上语言一致」，而非覆盖用户当下的选择。
       applyServerLocale(data.settings)
     } catch {
-      // Cookie 无效，清除本地态
-      await logout()
+      // Cookie 无效，清除本地态。
+      // H68：**只**在仍是同一代认证时登出 —— A 的 profile 迟到 401 把 B 登出，
+      // 正是这条围栏要防的最典型形态。
+      if (stillCurrent(gen)) await logout()
     }
   }
 
   /** SSO 回跳引导：凭 httpOnly cookie 换取会话信息（SSO 登录后建立本地 user 态） */
   async function bootstrapSession(): Promise<boolean> {
+    // H68：拿到 SSO 会话 = 认证切换。
+    const gen = beginAuthTransition('bootstrap-session')
     try {
       // `__silent`：匿名访客没有 cookie 时这里必然 401，静默失败即可，
       // 由调用方决定去登录页还是继续。
       const response = await api.get('/v1/auth/session', { withCredentials: true, __silent: true })
       const d = response.data?.data
       if (!d?.token) return false
+      if (!stillCurrent(gen)) return false
+      dropAccountScopedCache(d.user?.id || '')
       // 桌面端同样走 Bearer：SSO 回跳的 cookie 在 file:// 下也不会被带上
       applyToken(d.token)
       setAuthMethod('session')
@@ -490,12 +550,15 @@ export const useAuthStore = defineStore('auth', () => {
   /** 自助改密（含首登强制）。成功后服务端会重签 Cookie，旧会话全部失效。 */
   async function changePassword(oldPassword: string, newPassword: string) {
     loading.value = true
+    // H68：服务端重签凭据 ⇒ 旧 token 立即作废，这是一次认证切换。
+    const gen = beginAuthTransition('change-password')
     try {
       const response = await api.post('/v1/auth/password', {
         old_password: oldPassword,
         new_password: newPassword,
       }, { __silent: true })
       const d = response.data?.data
+      if (!stillCurrent(gen)) return d
       if (d?.token) applyToken(d.token)
       if (d?.user) {
         user.value = normalizeAuthUser(d.user)
@@ -513,6 +576,9 @@ export const useAuthStore = defineStore('auth', () => {
   /** 建立/覆盖本地会话（短信登录等直接拿到 {token, user} 的入口复用） */
   function applySession(t: string, u: User) {
     if (!t) throw new Error('invalid session: empty token')
+    // H68：换会话 = 认证切换；旧账号的在途请求随即作废。
+    beginAuthTransition('apply-session')
+    dropAccountScopedCache(u.id)
     applyToken(t)
     setAuthMethod('session')
     user.value = normalizeAuthUser(u)
@@ -534,6 +600,9 @@ export const useAuthStore = defineStore('auth', () => {
       locked.value = true
       return
     }
+    // H68：登出是认证切换 —— **先**递增代次并作废在途请求，再打后端。
+    // 否则 A 的登出请求还在飞的时候 B 已经登录，A 那条迟到的 401/响应仍会写回。
+    beginAuthTransition('logout')
     try {
       await api.post('/v1/auth/logout', undefined, { __silent: true })
     } catch {
@@ -569,6 +638,15 @@ export const useAuthStore = defineStore('auth', () => {
     user,
     token,
     loading,
+    /**
+     * 认证代次（H68）：登录/登出/换账号/会话失效时递增。
+     *
+     * 路由守卫与任何"等异步身份再写回"的调用方在等待前抓一份、写回前比对：
+     * 不一致说明这期间换过账号，基于旧身份的结论必须整条丢弃。
+     */
+    generation,
+    /** 在认证代次围栏内判断：`false` ⇒ 结果属于上一个账号，不得写回 */
+    stillCurrent,
     /** 本地模式「锁定」状态：为 true 时界面被全屏遮罩挡住，只能用 OS 凭据解锁 */
     locked,
     isAuthenticated,

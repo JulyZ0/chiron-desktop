@@ -32,6 +32,101 @@ export function readRetryable(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined
 }
 
+// ── 重放安全性：哪些请求**允许**被自动重发（PRD 9.10 / H66）────────────────
+//
+// 旧实现把「429/503 或 retryable=true」当成**充分条件**，直接 `api.request(config)`
+// 重放原请求。对读接口没问题；对写接口是一场事故：
+//   · `POST /submit` 会在响应回来之前就建 session 并启动引擎；
+//   · `POST /v1/agents/{id}/run` 同理，一次派发 = 一个 AgentSession + 一份计费；
+//   · `POST /v1/media/upload`（multipart）会把文件再传一遍。
+// 用户看到的却只是一句"服务繁忙，正在自动重试"。
+//
+// 所以判据从「状态码」换成「**请求本身**能不能重放」：
+//   1. GET / HEAD / OPTIONS —— 语义上可证明幂等，直接放行（读路径行为不变）；
+//   2. 其它方法 —— 必须带 `Idempotency-Key`（服务端按键去重，同键重放不产生第二份副作用）；
+//   3. multipart / FormData 上传 —— 一律不自动重放：请求体流可能已被消费，
+//      而且再传一遍大文件不是"重试"而是"再打一次后端"；
+//   4. 调用方显式 `__noRetry` —— 已经知道这次副作用无法去重。
+
+/** 幂等键请求头名（服务端与调用方共用的字面量）。 */
+export const IDEMPOTENCY_KEY_HEADER = 'Idempotency-Key'
+
+/** 不区分大小写地读一个请求头；兼容 axios 的 AxiosHeaders 与普通对象。 */
+export function readHeader(headers: unknown, name: string): string {
+  if (!headers || typeof headers !== 'object') return ''
+  const target = name.toLowerCase()
+  const holder = headers as Record<string, unknown> & {
+    get?: (key: string) => unknown
+    toJSON?: () => Record<string, unknown>
+  }
+  if (typeof holder.get === 'function') {
+    const direct = holder.get(name)
+    if (typeof direct === 'string' && direct.trim()) return direct.trim()
+    const lower = holder.get(target)
+    if (typeof lower === 'string' && lower.trim()) return lower.trim()
+  }
+  const flat = typeof holder.toJSON === 'function' ? holder.toJSON() : holder
+  for (const [key, value] of Object.entries(flat || {})) {
+    if (key.toLowerCase() !== target) continue
+    if (typeof value === 'string' && value.trim()) return value.trim()
+  }
+  return ''
+}
+
+/** 语义上可证明幂等的方法（重放不会多出一次效果）。 */
+export function isIdempotentMethod(method?: string | null): boolean {
+  const m = String(method ?? 'get').trim().toLowerCase()
+  return m === 'get' || m === 'head' || m === 'options'
+}
+
+/** 这次请求体是不是"上传"（multipart / FormData）—— 这类请求体不可重放。 */
+export function isUploadPayload(data: unknown, contentType?: unknown): boolean {
+  const ct = typeof contentType === 'string' ? contentType.toLowerCase() : ''
+  if (ct.includes('multipart/form-data')) return true
+  if (typeof FormData !== 'undefined' && data instanceof FormData) return true
+  return false
+}
+
+/** 重放判定的依据（全部来自 axios 的 `config`，便于纯函数单测）。 */
+export interface ReplayInput {
+  method?: string | null
+  /** `Idempotency-Key` 头的值（没有就是空串） */
+  idempotencyKey?: string | null
+  /** 请求体是 multipart / FormData */
+  isUpload?: boolean
+  /** 调用方显式要求不重试 */
+  retryDisabled?: boolean
+}
+
+export type ReplayReason =
+  | 'idempotent_method'
+  | 'idempotency_key'
+  | 'retry_disabled'
+  | 'upload_not_replayable'
+  | 'unsafe_method'
+
+export interface ReplayVerdict {
+  /** true = 允许自动重放 */
+  safe: boolean
+  reason: ReplayReason
+}
+
+/**
+ * 这次失败请求能不能安全地自动重发一次。
+ *
+ * 顺序即优先级：调用方的显式否决与上传否决**先于**方法/幂等键，
+ * 否则一个"带了幂等键的 POST 上传"会被误判成可重放。
+ */
+export function replayVerdict(input: ReplayInput): ReplayVerdict {
+  if (input.retryDisabled) return { safe: false, reason: 'retry_disabled' }
+  if (input.isUpload) return { safe: false, reason: 'upload_not_replayable' }
+  if (isIdempotentMethod(input.method)) return { safe: true, reason: 'idempotent_method' }
+  if (typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim()) {
+    return { safe: true, reason: 'idempotency_key' }
+  }
+  return { safe: false, reason: 'unsafe_method' }
+}
+
 /**
  * 重试决策：**服务端契约字段优先，状态码回退**（后向兼容）。
  *
