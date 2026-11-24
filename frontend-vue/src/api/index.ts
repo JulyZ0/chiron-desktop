@@ -1018,7 +1018,34 @@ export interface SSEConnectionOptions {
   maxAutoReconnects?: number
   /** 收到带 id 的事件时回调最新 last event id（供调用方持久化以跨轮续传） */
   onLastEventId?: (id: string) => void
+  /**
+   * 静默看门狗（H69）：超过这么久**一个字节都没收到**（含 `:` 心跳注释）就判定链路已死并重连。
+   *
+   * 为什么必须有：半开连接（NAT 超时、代理掐长连接、笔记本合盖唤醒）**不会抛错、也不会 EOF** ——
+   * `reader.read()` 就那么一直挂着，界面停在"思考中"且没有任何提示。此前只有 EOF/异常会重连，
+   * 心跳帧又被 `parseSSEFrame` 当注释丢掉，所以"这段流其实早死了"无从发现。
+   * `0`（默认）= 关闭；网关每 15s 发一次 `: ping`（internal/api/events.go），
+   * 会话流取 3× 心跳（`SSE_SILENT_TIMEOUT_MS`）即可容忍一次丢包。
+   */
+  heartbeatTimeoutMs?: number
+  /** 后台回来 / 网络恢复时，若已静默超过阈值就**立刻**重连（默认 true，仅看门狗开启时生效） */
+  reconnectOnResume?: boolean
 }
+
+/**
+ * 网关心跳间隔（`internal/api/events.go` 的 pingTimer：15s）。
+ *
+ * 前端不自己发明节奏：静默阈值是它的整数倍，网关一改这里跟着改。
+ */
+export const SSE_HEARTBEAT_MS = 15_000
+
+/**
+ * 会话流的静默上限：3× 心跳。
+ *
+ * 2× 就够发现半开连接，但留 1× 余量给"客户端刚好在处理一帧"的那一刻 ——
+ * 阈值调得太紧会在健康链路上重连，而每次重连都意味着一次补发与一次 loading 抖动。
+ */
+export const SSE_SILENT_TIMEOUT_MS = SSE_HEARTBEAT_MS * 3
 
 /** `createSSEConnection` 的返回句柄：调用方只需要 `close()`，且可重复调用。 */
 export interface SSEHandle {
@@ -1073,7 +1100,10 @@ export function openEventStream(
   onError?: () => void,
   opts: SSEConnectionOptions = {},
 ): SSEHandle {
-  const { initialLastEventId = '', autoReconnect = false, maxAutoReconnects = 3 } = opts
+  const {
+    initialLastEventId = '', autoReconnect = false, maxAutoReconnects = 3,
+    heartbeatTimeoutMs = 0, reconnectOnResume = true,
+  } = opts
   const onLastEventId = opts.onLastEventId
 
   let lastEventId = initialLastEventId
@@ -1081,6 +1111,35 @@ export function openEventStream(
   let controller: AbortController | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let failedReconnects = 0
+  /** 最近一次**收到字节**的时刻（心跳注释也算）—— 看门狗的唯一依据 */
+  let lastActivityAt = Date.now()
+  let watchdogTimer: ReturnType<typeof setInterval> | null = null
+  /** 看门狗节拍：阈值的三分之一（至少 500ms、至多 5s），既不漏判也不空转 */
+  const WATCHDOG_TICK_MS = heartbeatTimeoutMs > 0
+    ? Math.max(500, Math.min(Math.floor(heartbeatTimeoutMs / 3), 5000))
+    : 0
+
+  /** 静默超时：期间一个字节都没到（半开连接的典型形态） */
+  const isSilent = () => heartbeatTimeoutMs > 0 && Date.now() - lastActivityAt >= heartbeatTimeoutMs
+
+  const stopWatchdog = () => {
+    if (watchdogTimer !== null) {
+      clearInterval(watchdogTimer)
+      watchdogTimer = null
+    }
+  }
+
+  const startWatchdog = () => {
+    if (heartbeatTimeoutMs <= 0 || watchdogTimer !== null) return
+    watchdogTimer = setInterval(() => {
+      if (closed || !isSilent()) return
+      // 半开连接不会抛错、也不会 EOF —— 只有"一直收不到字节"能发现它。
+      // 走 retry()：重连带 Last-Event-ID，次数上限与既有语义完全一致。
+      controller?.abort()
+      controller = null
+      retry()
+    }, WATCHDOG_TICK_MS)
+  }
 
   const requestHeaders = (): Record<string, string> => {
     const headers: Record<string, string> = { Accept: 'text/event-stream' }
@@ -1092,9 +1151,16 @@ export function openEventStream(
 
   const stop = () => {
     closed = true
+    stopWatchdog()
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer)
       reconnectTimer = null
+    }
+    if (reconnectOnResume && heartbeatTimeoutMs > 0 && typeof window !== 'undefined') {
+      window.removeEventListener('online', onResume)
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', onVisibility)
+      }
     }
     controller?.abort()
     controller = null
@@ -1110,6 +1176,7 @@ export function openEventStream(
 
   const retry = () => {
     if (closed) return
+    stopWatchdog() // 这条连接的活性探测到此为止；下一次 connect 会重新开
     if (autoReconnect && failedReconnects < maxAutoReconnects) {
       failedReconnects++
       controller = null
@@ -1148,6 +1215,8 @@ export function openEventStream(
 
   const connect = async () => {
     if (closed) return
+    // 新连接从现在开始计时：刚连上不该被判定为"静默太久"
+    lastActivityAt = Date.now()
     controller = new AbortController()
     const active = controller
     let response: Response
@@ -1173,6 +1242,8 @@ export function openEventStream(
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    // 连上了才开始看门狗：连接阶段的失败由 fetch 自己的错误路径处理
+    startWatchdog()
     try {
       for (;;) {
         const { done, value } = await reader.read()
@@ -1180,7 +1251,12 @@ export function openEventStream(
         // 连上**并且真的收到过字节**才算成功：只看响应头的话，一个"接受连接就立刻收尾、
         // 什么都不发"的端点会把重连上限每次清零 ⇒ 无限重连，而 loading 一直挂着
         // （2026-11-01 写用例时暴露；旧 EventSource 靠浏览器原生重连，同样没有上限）。
-        if (value && value.byteLength > 0) failedReconnects = 0
+        if (value && value.byteLength > 0) {
+          failedReconnects = 0
+          // 心跳帧（`: ping`）也是"链路还活着"的证据 —— 它在 parseSSEFrame 里被当注释丢掉，
+          // 所以活性判定必须做在**字节**这一层（H69）。
+          lastActivityAt = Date.now()
+        }
         // 在**累计缓冲**上归一 CRLF：跨块的 `\r` + `\n` 也能拼回正确的帧边界
         buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, '\n')
         for (;;) {
@@ -1198,6 +1274,35 @@ export function openEventStream(
     }
     if (closed) return
     retry() // 服务端收尾/流断开：与 EventSource 的 onerror 同语义（要么续上，要么报错）
+  }
+
+  /**
+   * 后台回来 / 网络恢复时**立刻**重连。
+   *
+   * 为什么不能只靠看门狗的那一拍：笔记本合盖 30 分钟后回来，看门狗要等到下一拍才发现；
+   * 而 `online` 事件本来就告诉我们"链路换过了"，此刻立刻重连能把这段空窗压到一个往返。
+   * 判据仍然是**静默时长**，不是事件本身 —— 健康链路被切前台不该无谓重连（会丢一帧的补发）。
+   */
+  const onResume = () => {
+    if (closed || heartbeatTimeoutMs <= 0) return
+    if (!isSilent()) return
+    if (reconnectTimer !== null) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+    stopWatchdog()
+    controller?.abort()
+    controller = null
+    void connect()
+  }
+  const onVisibility = () => {
+    if (typeof document === 'undefined') return
+    if (document.visibilityState === 'visible') onResume()
+  }
+
+  if (heartbeatTimeoutMs > 0 && reconnectOnResume && typeof window !== 'undefined') {
+    window.addEventListener('online', onResume)
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
   }
 
   void connect()

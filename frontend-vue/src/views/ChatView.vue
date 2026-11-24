@@ -5,7 +5,7 @@ import { MenuOutlined, CopyOutlined, LinkOutlined, CloseOutlined } from '@ant-de
 import {
   api, createSSEConnection, submitApproval, submitAnswer, steerRun,
   getChatSessionMessages, resolveMediaUrl, listModels,
-  createAgent, interruptAgentRun, registerAuthScopedReset,
+  createAgent, interruptAgentRun, registerAuthScopedReset, SSE_SILENT_TIMEOUT_MS,
 } from '../api'
 import type { LlmModel, SSEHandle } from '../api'
 import { requestTurnStop, type TurnRef, type TurnStopState } from '../composables/useTurnStop'
@@ -481,6 +481,14 @@ interface SessionRunState {
   /** 代际号：该会话运行时被重建时 +1（用于丢弃旧回调） */
   gen: number
   /**
+   * 回合序号（H69）：每提交一轮 +1。
+   *
+   * 为什么除了 `gen` 还要它：`gen` 说的是"运行时被重建"，而 gap 重拉要防的是
+   * "拉取期间又开跑了一轮（**并且已经跑完**）"。那种情形下 `loading` 已是 false、
+   * `gen` 也没变，只有回合序号能证明"这份快照是上一轮的"。
+   */
+  turnSeq: number
+  /**
    * 该会话的**子 Agent 实时事件**（有界缓冲）。
    *
    * 此前它是模块级单值 `ref`，于是会话 A 的子 Agent 进度会**串到会话 B** 的
@@ -535,6 +543,7 @@ function runOf(sid: string): SessionRunState {
       items: [],
       loading: false,
       gen: 1,
+      turnSeq: 0,
       subagentEvents: [],
       streamBuf: '',
       streamTextId: '',
@@ -2872,6 +2881,9 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
   const userItemId = items.value[items.value.length - 1]?.id
   // 会话已在上面确保存在 ⇒ 这里**不再自己编 UUID**（编出来的 id 不属于任何侧栏会话）
   const sessionId = activeSessionId.value
+  // H69：本轮的回合序号。gap 重拉提交前拿它做 CAS —— 即使新一轮**已经跑完**
+  // （loading 回到 false），这个数也变了，旧快照不会把这一轮的产出盖掉。
+  runOf(sessionId).turnSeq += 1
   currentTraceId.value = ''
   try {
     // H59：只替换**本会话**的流（别的会话仍在跑的流不受影响）
@@ -2893,6 +2905,9 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
         initialLastEventId: sseLastIdBySession.get(sessionId) || '',
         // 流断了交给 openEventStream 自己重连（带 Last-Event-ID，最多 3 次），用尽才回调 onError
         autoReconnect: true,
+        // H69：静默看门狗。半开连接不会抛错也不会 EOF —— 只有"一直收不到字节"
+        // （连网关每 15s 的 `: ping` 都没到）能发现它，否则界面永远停在"思考中"。
+        heartbeatTimeoutMs: SSE_SILENT_TIMEOUT_MS,
         onLastEventId: (id) => { sseLastIdBySession.set(sessionId, id) },
       },
     ))
