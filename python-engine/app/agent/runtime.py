@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -2143,7 +2143,7 @@ class AgentRuntime:
         tools: list[dict[str, Any]] | None,
         on_overflow: Callable[[], list[dict[str, Any]]],
         overflow_flags: list[dict[str, Any]],
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any, None]:
         """流式调用 LLM；遇**上下文溢出**时强制压缩并重试一次（C2 段 b）。
 
         两个刻意的设计：
@@ -3285,7 +3285,7 @@ class AgentRuntime:
                 overflow_dropped: list[tuple[str, str]] = []
                 overflow_folds: list[dict[str, Any]] = []
 
-                async for chunk in self._chat_stream_with_retry(
+                _llm_stream = self._chat_stream_with_retry(
                     messages,
                     model=model,
                     # P1-d：显式 provider（会话运行时状态解析结果）。此前完全不传 →
@@ -3311,7 +3311,20 @@ class AgentRuntime:
                         folds=overflow_folds,
                     ),
                     overflow_flags=overflow_flags,
-                ):
+                )
+                # H9：取消要传到**模型请求本身**。只在轮次边界查信号，意味着用户点了停止
+                # 之后还要把这一段流听完（长思考/长正文可以是几十秒），期间照旧烧 token。
+                # 这里按收敛口径（见 `app/agent/cancellation.py`）轮询，命中即断开这段流。
+                from app.agent.cancellation import poll_interval_seconds as _cancel_poll
+
+                _cancel_probe_at = time.monotonic() + _cancel_poll()
+                _cancelled_mid_stream = False
+                async for chunk in _llm_stream:
+                    if time.monotonic() >= _cancel_probe_at:
+                        if await is_interrupted(task.session_id):
+                            _cancelled_mid_stream = True
+                            break
+                        _cancel_probe_at = time.monotonic() + _cancel_poll()
                     # DeepSeek thinking mode 思考过程
                     if chunk.reasoning_content:
                         reasoning_content += chunk.reasoning_content
@@ -3404,6 +3417,38 @@ class AgentRuntime:
                             trace_id=trace_id,
                         )
                         break
+
+                # H9：流中途观测到取消 ⇒ 这一轮**没有终态**。已经下发过的正文增量是真发生过的
+                # （前端看得见，不撤回），但绝不能继续收集 tool_calls 去执行，也不能把半截
+                # 内容当成"说完了"。收尾与轮次边界完全同形：cancelled + done（只发 cancelled
+                # 会让下游 SSE 挂住），然后标 cancelled 终态。
+                if _cancelled_mid_stream:
+                    try:
+                        await _llm_stream.aclose()
+                    except Exception as exc:  # noqa: BLE001 - 关流失败不阻断取消收尾
+                        logger.debug("cancel: closing model stream failed: %s", exc)
+                    logger.info(
+                        "Agent run cancelled during model stream (task=%s, turn=%d)",
+                        task.id,
+                        turn + 1,
+                    )
+                    yield AgentEvent(type="cancelled", trace_id=trace_id)
+                    yield AgentEvent(
+                        type="done",
+                        input_tokens=total_input_tokens,
+                        output_tokens=total_output_tokens,
+                        cached_tokens=total_cached_tokens,
+                        model=model,
+                        budget=self._budget_snapshot(
+                            budget,
+                            turns_used=turn,
+                            tokens_used=_tokens_spent(),
+                            cost_used=_cost_spent(),
+                        ),
+                        trace_id=trace_id,
+                    )
+                    await self._mark_run_status(task, "cancelled")
+                    return
 
                 # C2 段 b：溢出恢复发生过 → 让前端看得见（与常规压缩同一事件类型，
                 # 但 `strategy=forced` 表明它是"被迫"的，不是按阈值择机的）
