@@ -81,8 +81,8 @@ const apiMocks = vi.hoisted(() => {
       else net.subagent.push(entry)
       return { close: entry.close }
     }),
-    submitApproval: vi.fn(() => Promise.resolve({ data: { success: true } })),
-    submitAnswer: vi.fn(() => Promise.resolve({ data: { success: true } })),
+    submitApproval: vi.fn(() => Promise.resolve(true)),
+    submitAnswer: vi.fn(() => Promise.resolve(true)),
     updateConversation: vi.fn(emptyList),
     createShare: vi.fn(emptyList),
     getActiveShare: vi.fn(emptyList),
@@ -208,7 +208,7 @@ describe('ChatView 会话隔离（H59）', () => {
     apiMocks.listModels.mockImplementation(() => Promise.resolve([
       { provider: 'test-provider', name: 'test-model', display_name: 'Test Model', context_window: 8192 },
     ]))
-    apiMocks.submitApproval.mockImplementation(() => Promise.resolve({ data: { success: true } }))
+    apiMocks.submitApproval.mockImplementation(() => Promise.resolve(true))
   })
 
   it('★ 终态事件只关**来源流**：s-1 收尾不会掐断 s-2 仍在跑的流', async () => {
@@ -321,5 +321,24 @@ describe('ChatView 审批失败不丢票（H61）', () => {
     } finally {
       errSpy.mockRestore()
     }
+  })
+
+  it('★ 服务端答了"这个决定不生效"（ok=false）⇒ 也不算确认：票留着、可重试', async () => {
+    const { wrapper, vm } = await mountChat()
+    await send(wrapper)
+    feedTurn('s-1', 'approval', { id: 'call_b', name: 'run_command', arguments: '{}' })
+    await flushPromises()
+    const ticket = vm.interactionScope.approvalsOf('s-1')[0]!
+
+    // HTTP 200 但引擎说"票已超时 / 该调用已不在等待"：`submitApproval` 解析出 false
+    apiMocks.submitApproval.mockImplementationOnce(() => Promise.resolve(false))
+    const accepted = await vm.resolveApproval(ticket, true)
+    await flushPromises()
+
+    expect(accepted).toBe(false)
+    const kept = vm.interactionScope.approvalsOf('s-1')
+    expect(kept).toHaveLength(1)              // 假成功会让这张票凭空消失
+    expect(String(kept[0]!.error || '')).not.toBe('')
+    expect(kept[0]!.busy).toBe(false)
   })
 })

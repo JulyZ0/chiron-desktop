@@ -765,8 +765,9 @@ async function resolveApproval(
     return false
   }
   interactionScope.setBusy('approval', ticket.id, true)
+  let acknowledged = false
   try {
-    await submitApproval({
+    acknowledged = await submitApproval({
       session_id: ownerSession,
       tool_call_id: ticket.id,
       approved: editedArguments ? true : approved,
@@ -778,7 +779,17 @@ async function resolveApproval(
     notify.error(t('errors.approval_submission_failed_please_retry'))
     return false
   }
-  // 只有服务端确认（无异常）才摘票
+  if (!acknowledged) {
+    // 网关答了，但引擎说"这个决定不生效"（票已超时 / 该调用已不在等待）。
+    // 这不是成功：票留着、原因写在卡上 —— 与 `catch` 同一条纪律（不做假成功）。
+    interactionScope.markFailed(
+      'approval',
+      ticket.id,
+      t('errors.approval_not_effective_may_have_timed_out'),
+    )
+    return false
+  }
+  // 只有服务端确认（无异常且 ok）才摘票
   interactionScope.settle('approval', ticket.id)
   clearApprovalEdit(ticket.id)
   settleInteractionViews()
@@ -871,8 +882,9 @@ async function submitQuestionTicket(
     return false
   }
   interactionScope.setBusy('question', question.id, true)
+  let acknowledged = false
   try {
-    await submitAnswer({
+    acknowledged = await submitAnswer({
       session_id: ownerSession,
       tool_call_id: question.id,
       ...payload,
@@ -880,6 +892,15 @@ async function submitQuestionTicket(
   } catch (e) {
     interactionScope.markFailed('question', question.id, describeApiError(e))
     notify.error(t('errors.answer_submission_failed_please_retry'))
+    return false
+  }
+  if (!acknowledged) {
+    // 网关答了但引擎不收（票已超时/已被取走）：票留着、原因写在旁边，用户可再答一次
+    interactionScope.markFailed(
+      'question',
+      question.id,
+      t('errors.answer_not_delivered_may_have_timed_out'),
+    )
     return false
   }
   interactionScope.settle('question', question.id)
@@ -2615,7 +2636,7 @@ function onSSEMessage(raw: unknown, sid: string, frameId = '') {
     // `done` 是**引擎一段**的终态，不是整条任务的终态。
     //
     // Goal FSM 判定本段未完成（撞预算墙 / 清单没做完 / 被单轮 deadline 截断）后，
-    // 网关会自动续跑下一段 —— 所以这里**不能**收尾：一旦 `loading` 收起、`activeSSE`
+    // 网关会自动续跑下一段 —— 所以这里**不能**收尾：一旦 `loading` 收起、这条流
     // 关掉，续跑段的 text / tool_call 就全送进一条无人订阅的流，用户看到的是
     // "长任务跑到一半就停"，而刷新后结果又在（都已落库）。
     // 链级收尾信号是 `turn_done`（见 HandleSubmit 的 defer）。
