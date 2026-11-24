@@ -79,22 +79,28 @@ def test_parse_failures_fail_open(raw: str) -> None:
     assert a.outcome != "deny", "解析失败不能变成 deny（那会把评审故障当成风险）"
 
 
-def test_parse_deny_but_no_risk_reported_becomes_allow() -> None:
-    """用户报的矛盾：理由承认无风险，结论却是 deny。"""
+def test_parse_deny_but_no_risk_reported_is_inconclusive() -> None:
+    """用户报的矛盾：理由承认无风险，结论却是 deny。
+
+    旧口径把它归一为 allow（矛盾判词 ⇒ 免人工执行）；PRD 9.7 / H37 改为 **fail-safe**：
+    证据链自相矛盾时只能"没评成"（回退人工审批），既不 allow 也不 deny。
+    """
     a = parse_assessment('{"outcome":"deny","risk_level":"low","danger_found":false,'
                          '"rationale":"prints a greeting"}')
-    assert a.outcome == "allow"
+    assert a.outcome == "unknown"
+    assert a.failed
     assert a.contradictory
 
 
-def test_parse_deny_with_no_risk_rationale_becomes_allow() -> None:
-    """没有结构化字段时，按理由里的事实归一（模型不回 danger_found 的老格式）。"""
+def test_parse_deny_with_no_risk_rationale_is_inconclusive() -> None:
+    """没有结构化字段时同理：矛盾判词不得升级为 allow（模型不回 danger_found 的老格式）。"""
     a = parse_assessment(
         '{"outcome":"deny","risk_level":"low","rationale":"The code only prints a '
         'greeting; it performs no deletion, network, credential, or system access '
         "despite the 'delete' label.\"}"
     )
-    assert a.outcome == "allow"
+    assert a.outcome == "unknown"
+    assert a.failed
     assert a.contradictory
 
 
@@ -287,14 +293,20 @@ def _patch_runtime(
 async def test_python_source_requires_approval_despite_guardian_allow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """解释器源码不是静态安全单命令；即使代码只打印且评审 allow + low 也要人工确认。"""
+    """解释器源码不是静态安全单命令；即使评审倾向放行也要人工确认。
+
+    用 `CONTRADICTORY_RAW`（理由说没风险、结论却 deny）作探针：H37 之后这种**自相矛盾**
+    的判词不再归一为 allow，而是"没评成"（回退人工审批）—— 本条仍然要人确认，
+    只是不再假装评审已经放行过。
+    """
     code = 'print("hello, world")'
     assert tool_level("execute_python", {"code": code}) == DELETE
 
     _patch_broker(monkeypatch, requires_user_approval=False)
     executed: list[str] = []
     assessment = parse_assessment(CONTRADICTORY_RAW)
-    assert assessment.outcome == "allow" and assessment.risk_level == "low"
+    assert assessment.outcome != "allow" and assessment.contradictory
+    assert "low" == assessment.risk_level
     runtime = _patch_runtime(monkeypatch, assessment, executed=executed)
 
     result, approval = await runtime._guarded_execute_tool(

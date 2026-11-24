@@ -24,8 +24,42 @@ MAX_CHARS = 2000
 #: 队列长度上限，防止一条失控的 run 把 Redis 撑爆。
 MAX_QUEUE = 20
 
-#: 进程内快路径：session_id → [(置入时刻, 文本, 来源)]，同副本时零网络往返。
-_LOCAL: dict[str, list[tuple[float, str, str]]] = {}
+#: 进程内快路径：session_id → [(置入时刻, 代数, 文本, 来源)]，同副本时零网络往返。
+#:
+#: 为什么每条都带**置入时刻**与**代数**（PRD 9.7 / H37）：
+#: 本地副本只是一份**没有落 Redis 的临时副本**。没有 TTL 时，一条 `push_steer` 之后
+#: 若 Redis 一直不可用，这条文本会永远留在进程里，等下一次同 session 的 run 起来时被
+#: 当成"新指令"注入（跨会话误伤）；没有代数时，run 收尾 `clear_steer_local` 之后仍在
+#: 队列里的旧副本会被下一次 drain 取走（顺序错乱、来源标错）。
+_LOCAL: dict[str, list[tuple[float, int, str, str]]] = {}
+
+#: 每个 session 的代数：`clear_steer_local` 自增 ⇒ 旧代数的本地副本全部作废。
+_GENERATION: dict[str, int] = {}
+
+
+def _generation(session_id: str) -> int:
+    return _GENERATION.get(session_id, 0)
+
+
+def _prune_local(session_id: str, now: float | None = None) -> None:
+    """丢弃过期（超过 :data:`STEER_TTL_SECONDS`）与旧代数的本地副本。"""
+    entries = _LOCAL.get(session_id)
+    if not entries:
+        _LOCAL.pop(session_id, None)
+        return
+    current = _generation(session_id)
+    now = _now() if now is None else now
+    fresh = [
+        entry for entry in entries
+        if entry[1] == current and now - entry[0] <= STEER_TTL_SECONDS
+    ]
+    if fresh:
+        _LOCAL[session_id] = fresh
+    else:
+        _LOCAL.pop(session_id, None)
+
+#: 只投递到本副本时的原因前缀：调用方据此告诉用户"跨副本投递没有得到保证"。
+LOCAL_ONLY_PREFIX = "local-only"
 
 
 def _encode(text: str, source: str) -> str:
@@ -82,7 +116,12 @@ def _validate(text: str) -> str | None:
 
 async def push_steer(session_id: str, text: str, *, source: str = "user",
                      redis: Any = None) -> tuple[bool, str]:
-    """入队一条指导；返回 (是否成功, 失败原因)。
+    """入队一条指导；返回 (是否成功, 原因)。
+
+    成功语义（PRD 9.7 / H37）：``ok=True`` 只承诺"已进入**本副本**的投递队列"。
+    Redis 写入成功时原因为空（跨副本投递已落实）；Redis 不可用或写入失败时原因以
+    :data:`LOCAL_ONLY_PREFIX` 开头 —— **不得**在 Redis 成功之前承诺跨副本投递，
+    否则用户会以为话已经带到另一个副本上的 run 了。
 
     失败必须让调用方看见：静默丢弃会让用户以为话已经带到了正在跑的 Agent 那里。
     """
@@ -107,20 +146,23 @@ async def push_steer(session_id: str, text: str, *, source: str = "user",
                 return False, f"rate limited ({MAX_PER_MINUTE}/min)"
         except Exception as exc:  # noqa: BLE001 — 计数失败不阻断投递，本地队列仍可用
             logger.warning("steer: rate counter failed: %s", exc)
-    else:
-        logger.warning("steer: redis unavailable, message queued locally only")
 
     # 本地快路径与 Redis 都要写：同副本读本地零往返，跨副本读 Redis。
-    _LOCAL.setdefault(session_id, []).append((_now(), text, source))
+    # 本地副本带**时刻 + 代数**：TTL 到期或代数翻转（run 收尾 clear）后不再被 drain 到。
+    _prune_local(session_id)
+    _LOCAL.setdefault(session_id, []).append((_now(), _generation(session_id), text, source))
     _LOCAL[session_id] = _LOCAL[session_id][-MAX_QUEUE:]
-    if client is not None:
-        try:
-            key = steer_key(session_id)
-            await client.lpush(key, _encode(text, source))
-            await client.ltrim(key, 0, MAX_QUEUE - 1)
-            await client.expire(key, STEER_TTL_SECONDS)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("steer: redis push failed (local copy kept): %s", exc)
+
+    if client is None:
+        return True, f"{LOCAL_ONLY_PREFIX}: redis unavailable, queued on this replica only"
+    try:
+        key = steer_key(session_id)
+        await client.lpush(key, _encode(text, source))
+        await client.ltrim(key, 0, MAX_QUEUE - 1)
+        await client.expire(key, STEER_TTL_SECONDS)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("steer: redis push failed (local copy kept): %s", exc)
+        return True, f"{LOCAL_ONLY_PREFIX}: redis push failed ({exc}), queued on this replica only"
     return True, ""
 
 
@@ -132,12 +174,16 @@ async def drain_steer(session_id: str, *, redis: Any = None) -> list[tuple[str, 
 
     先本地后 Redis：本地命中通常是同副本（用户在同一个连接上），往 Redis 再查一遍
     会把同一条文本取到两次 —— 所以**两者取并集去重**没有意义，改为"本地非空就只信本地"。
+
+    本地只交出**未过期且属于当前代数**的副本（见 :data:`_LOCAL`）；过期/旧代数的条目
+    直接丢弃，绝不注入到别的 run 里。
     """
     if not session_id:
         return []
+    _prune_local(session_id)
     local = _LOCAL.pop(session_id, [])
     if local:
-        return [(text, source) for _, text, source in local]
+        return [(text, source) for _, _, text, source in local]
 
     client = await _resolve_redis(redis)
     if client is None:
@@ -168,9 +214,15 @@ async def drain_steer(session_id: str, *, redis: Any = None) -> list[tuple[str, 
 
 
 def clear_steer_local(session_id: str) -> None:
-    """清理本地队列（run 收尾时调用，避免残留误伤下一次会话）。"""
-    if session_id:
-        _LOCAL.pop(session_id, None)
+    """清理本地队列并**翻转代数**（run 收尾时调用，避免残留误伤下一次会话）。
+
+    只 `pop` 是不够的：如果还有一条 push 与 clear 并发（或 clear 之后 Redis 才恢复），
+    旧副本会重新出现的 drain 结果里。自增代数让"clear 之前的本地条目"永久作废。
+    """
+    if not session_id:
+        return
+    _LOCAL.pop(session_id, None)
+    _GENERATION[session_id] = _generation(session_id) + 1
 
 
 def _now() -> float:

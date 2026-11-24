@@ -2635,8 +2635,10 @@ async def agent_steer(request: Request) -> Any:
     )
     if not ok:
         return {"ok": False, "error": reason}
-    logger.info("Steer accepted (session=%s caller=%s)", session_id, caller)
-    return {"ok": True, "session_id": session_id}
+    logger.info("Steer accepted (session=%s caller=%s delivery=%s)", session_id, caller, reason or "shared")
+    # `delivery` 把"只落到本副本"这件事告诉调用方（PRD 9.7 / H37）：Redis 写入没成功时
+    # `ok=True` 只代表本副本已入队，跨副本投递**没有得到保证**，不能让界面当成"话已带到"。
+    return {"ok": True, "session_id": session_id, "delivery": reason or "shared"}
 
 
 async def agent_interrupt(
