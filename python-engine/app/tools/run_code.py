@@ -39,6 +39,7 @@ from app.tools.code_guard import (
 from app.tools.code_guard import (
     safe_builtins as _safe_builtins,
 )
+from app.tools.nested_scope import authorize_nested_call, scoped_tool_names
 from app.tools.registry import registry
 
 # 这两个符号以 ``_`` 前缀从 code_guard 转出，供 app/skill/manager.py 与本模块共用
@@ -68,7 +69,14 @@ class ToolCallError(Exception):
 
 
 async def _dispatch(name: str, args: dict[str, Any]) -> Any:
-    """调用一个已注册工具，失败抛 ToolCallError。"""
+    """调用一个**作用域内**的工具，失败抛 ToolCallError。
+
+    H4：同进程构造的 `tools` 命名空间（`_build_sdk`，目前仅供外部复用/单测）与子进程
+    走**同一条**授权判定 —— 否则"换个入口"就又绕开了作用域。
+    """
+    denial = authorize_nested_call(name, args)
+    if denial:
+        raise ToolCallError(name, denial)
     result = await registry.execute(name, args)
     if isinstance(result, dict) and result.get("error"):
         raise ToolCallError(name, str(result["error"]))
@@ -76,7 +84,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
 
 
 def _build_sdk() -> types.SimpleNamespace:
-    """构造 tools 命名空间：每个注册工具一个 async 方法（同进程降级模式用）。"""
+    """构造 tools 命名空间：每个**作用域内**工具一个 async 方法（非子进程模式用）。"""
     ns = types.SimpleNamespace()
 
     async def _make_tool(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -87,22 +95,23 @@ def _build_sdk() -> types.SimpleNamespace:
             params = kwargs
         return await _dispatch(name, params)
 
-    for tool_name in registry.list_names():
+    for tool_name in sorted(scoped_tool_names()):
         setattr(ns, tool_name, _make_tool.__get__(tool_name, None))
     return ns
 
 
 def sdk_usage_text() -> str:
-    """生成注入 prompt 的 SDK 用法说明（确定性、按当前注册表）。"""
-    names = ", ".join(sorted(registry.list_names()))
+    """生成注入 prompt 的 SDK 用法说明（确定性、按当前**作用域**而不是全注册表）。"""
+    names = ", ".join(sorted(scoped_tool_names()))
     return (
         "In the run_code program, a `tools` namespace is available: "
-        "each registered tool is an async callable, e.g. "
+        "each scoped tool is an async callable, e.g. "
         "`result = await tools.read_file(path='src/main.py')` or "
         "`result = await tools.grep_files(pattern='import', path='src')`. "
         "Tool failures raise ToolCallError(name, message). "
         "Return a JSON-serializable value from the program; captured stdout "
-        "appears in logs. Available tools: " + names
+        "appears in logs. Only explicitly scoped capabilities are injected — "
+        "calls to anything else are refused (and audited). Available tools: " + names
     )
 
 
@@ -419,7 +428,13 @@ def _run_subprocess_sync(
 
                 # 调度 async registry.execute 到主 asyncio loop（带 contextvar 快照）
                 future = asyncio.run_coroutine_threadsafe(
-                    _safe_tool_call(name, args, context_snapshot, str(call_id or "")),
+                    _safe_tool_call(
+                        name,
+                        args,
+                        context_snapshot,
+                        str(call_id or ""),
+                        frozenset(tool_names),
+                    ),
                     loop,
                 )
                 try:
@@ -540,6 +555,7 @@ async def _safe_tool_call(
     args: dict[str, Any],
     context_snapshot: dict[str, Any] | None,
     call_id: str = "",
+    allowed: frozenset[str] | None = None,
 ) -> Any:
     """异步包装 registry.execute，供 run_coroutine_threadsafe 调度。
 
@@ -551,6 +567,11 @@ async def _safe_tool_call(
     `_dispatch_tool` 压入、`_run_in_subprocess` 捕获），所以这里能算出子节点该挂在
     谁下面。子调用会在自己的作用域里执行 —— 它再调 `run_code` 时，父指针就指向它
     而不是更外层的那次调用，多层嵌套不会串味。
+
+    H4：这里是嵌套调用**唯一**的执行入口，因此重新授权也放在这里 ——
+    `authorize_nested_call` 用本次 run 真正注入的作用域复核工具名，再按副作用等级
+    复核参数；拒绝时先写审计（`outcome=blocked`）再回结构化错误。之所以在**主进程**
+    判定而不是子进程：子进程跑的是不可信代码，它的"我检查过了"不构成证据。
     """
     if context_snapshot is not None:
         from app.tools.context import restore_context
@@ -566,6 +587,31 @@ async def _safe_tool_call(
     span_id = f"{parent_span_id}:call:{call_id}" if parent_span_id and call_id else ""
 
     started = time.monotonic()
+
+    denial = authorize_nested_call(name, args, allowed=allowed)
+    if denial:
+        from app.tools.exec_audit import OUTCOME_BLOCKED, record_execution
+
+        # 审计字段：谁（tenant/user/session，从刚 restore 的上下文取）、在哪个 run_code
+        # 的哪次子调用（tool 名带前缀 + call_id 进 command）、被哪条规则拒绝（reason）。
+        record_execution(
+            tool=f"run_code:nested:{name}",
+            command=json.dumps(
+                {"call_id": call_id, "args": args}, ensure_ascii=False, default=str
+            ),
+            outcome=OUTCOME_BLOCKED,
+            reason=denial,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        await _record_nested_span(
+            name, call_id, parent_call_id, span_id, parent_span_id, started, success=False
+        )
+        return {
+            "error": denial,
+            "denied": True,
+            "code": "nested_call_denied",
+        }
+
     try:
         with tool_call_scope(call_id, span_id=span_id):
             result = await registry.execute(name, args)
@@ -699,7 +745,10 @@ async def run_code(
         return {"error": "code is required"}
     timeout = max(1, min(timeout, 300))
 
-    tool_names = registry.list_names()
+    # H4：注入的是**显式 scoped capabilities**，不是整张注册表。子进程看到什么、
+    # 主进程允许什么，都由同一份 `tool_names` 决定（子进程侧 ToolProxy 用名字集合
+    # 兜第一道，`_safe_tool_call` 用同一集合兜第二道）—— 两份口径必须同源。
+    tool_names = sorted(scoped_tool_names())
 
     # S 安全修复：必须走 subprocess 隔离执行,不再降级到主进程 exec 用户代码。
     # 同进程模式无 OS 级隔离,`__class__.__subclasses__()` 等逃逸可达主进程
@@ -745,8 +794,9 @@ registry.register(
     description=(
         "Write a Python async program that composes multiple tool calls into one step. "
         "The program body runs as `async def _main()`, with an injected `tools` namespace: "
-        "`await tools.<name>(**args)` calls any registered tool and returns its JSON result; "
-        "tool failures raise ToolCallError. Capture stdout goes to logs; `return` a "
+        "`await tools.<name>(**args)` calls a **scoped** tool and returns its JSON result; "
+        "tool failures raise ToolCallError. Calls outside the scope are refused and audited. "
+        "Capture stdout goes to logs; `return` a "
         "JSON-serializable value as the result. Use this to batch several file/shell/search "
         "operations into a single round trip.\n\n" + sdk_usage_text()
     ),

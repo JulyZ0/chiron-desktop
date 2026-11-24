@@ -1105,10 +1105,32 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
 
     # 对 git 命令额外限制：禁止 clone/fetch/pull/push 等网络操作，仅允许本地操作
     git_restricted = {"clone", "fetch", "pull", "push", "remote", "submodule", "archive", "ls-remote"}
-    if _normalize_exe(prog) == "git" and rest:
+    is_git = _normalize_exe(prog) == "git"
+    if is_git and rest:
         subcmd = rest[0] if rest and not rest[0].startswith("-") else ""
         if subcmd in git_restricted:
             return {"error": f"git command blocked: '{subcmd}' is not allowed in sandbox"}
+        # H25：`git` 在白名单里，但它读的是**仓库自带配置** —— `core.fsmonitor` /
+        # `core.pager` / `filter.*` / hooks 都能让一条只读的 `git status` 执行程序。
+        # 因此 git 走与 `git_status` 等工具**同一条**硬化路径：固定安全 flags +
+        # 动态 filter 覆盖 + 探测失败拒绝执行（此处不再有"裸跑 git"的入口）。
+        from app.tools.git_tools import harden_shell_git
+
+        hardened, git_error = await harden_shell_git(list(rest))
+        if git_error is not None:
+            return git_error
+        assert hardened is not None  # git_error 为 None 时必然给出 argv
+        args = hardened
+        prog, rest = args[0], args[1:]
+
+    # git 子进程用 git 专用环境（钉住 GIT_CONFIG_* / 禁 prompt / 禁协议），
+    # 其余命令仍用清理后的沙箱环境 —— 两者都不含宿主密钥。
+    if is_git:
+        from app.tools.git_tools import _git_environment
+
+        child_env = _git_environment()
+    else:
+        child_env = sandboxed_env()
 
     # Windows: echo/dir/type 等是 cmd.exe 内置命令，无独立可执行文件，
     # create_subprocess_exec 直执会 WinError 2；用 cmd /c 包裹执行。
@@ -1154,7 +1176,7 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
             launcher,
             [prog, *rest],
             cwd=str(workspace_dir()),
-            env=sandboxed_env(),
+            env=child_env,
             timeout=float(timeout),
         )
         if not result.started:
@@ -1203,7 +1225,7 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
     proc = await asyncio.create_subprocess_exec(
         *exec_argv,
         cwd=str(workspace_dir()),
-        env=sandboxed_env(),
+        env=child_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **_rlimit_kwargs(),
