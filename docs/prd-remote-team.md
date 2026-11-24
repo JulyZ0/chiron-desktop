@@ -283,7 +283,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 - 下表 22 项在本轮按"行为改造 + 自动化回归"完成，且**已从 9.1–9.10 的待办表删除**（编号空洞保留，其它问题不重排）。
 - 判定口径：每条都有能证明"修复前会失败"的回归用例；没有真实主机的项（S3/PG/团队域名/Electron GUI）不计入本条验收，另行留在 §8。
-- 合并后统一门禁：`go build ./...`、`go test ./... -parallel 1`（全包通过）、`python -m pytest` 相关子集 216 项、前端 15 个 spec/133 项、`gofmt`/`ruff`/`vue-tsc` 变更文件。
+- 合并后统一门禁：`go build ./...`、`go test ./... -parallel 1`（全包通过）、`python -m pytest` 相关子集 374 项（`test_*` 与 `tests/memory` 邻域）、前端 15 个 spec/133 项、`pnpm run check:ui`、`vue-tsc -b --noEmit`、`vite build --mode desktop`、`gofmt`/`ruff`/变更文件 ESLint（0 error）。
 
 | ID | 落点 | 回归证据 |
 |---|---|---|
