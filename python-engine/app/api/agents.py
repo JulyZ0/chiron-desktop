@@ -143,16 +143,39 @@ async def _workbench_binding(body: AgentDispatchRequest, gateway: Any) -> str:
             from app.db import get_pool
             from app.knowledge.service import answer_question
 
-            # provider 解析用 **KB 所有者**（Cloud key 是用户级的，只有属主配过）；
-            # 检索范围由 service 按"已就绪文档"收敛 —— 不传文档等于在空集上推理
+            # H77：先授权，再检索。
+            #
+            # 此前这里按 kb_id 直接查库、拿**库主**的 user_id 去 `answer_question`：
+            # 于是 Agent 的 `kb_id` 可以填任意人的私有库，派发时用库主身份检索，
+            # 答案与引用原样注入到调用者的对话里 —— 授权被"以所有者身份调用"绕过去了。
+            # 现在：库主的 user_id 只用于**解析 provider（Cloud key 是用户级的）**，
+            # 调用者身份单独传入 `answer_question`，由 service 层统一校验可见性。
             pool = get_pool()
             kb_row = await pool.fetchrow(
-                "SELECT user_id FROM knowledge_bases WHERE id = $1", body.kb_id
+                "SELECT id, tenant_id, user_id, COALESCE(visibility, '') AS visibility "
+                "FROM knowledge_bases WHERE id = $1",
+                body.kb_id,
             )
             if kb_row is not None:
-                answer, _provider = await answer_question(
-                    kb_id=body.kb_id, user_id=str(kb_row["user_id"]), question=body.task
-                )
+                from app.kb_access import kb_access_allowed
+
+                caller_tenant = int(body.tenant_id or 0)
+                if not kb_access_allowed(kb_row, str(body.user_id or ""), caller_tenant):
+                    # 不区分"没有这个库"与"无权访问"：两者都只能看到同一句话，
+                    # 否则 kb_id 就成了一个存在性探针。
+                    logger.warning(
+                        "agent binding: knowledge base not accessible (kb_id=%s caller=%s)",
+                        body.kb_id,
+                        body.user_id,
+                    )
+                else:
+                    answer, _provider = await answer_question(
+                        kb_id=body.kb_id,
+                        user_id=str(kb_row["user_id"]),
+                        question=body.task,
+                        caller_user_id=str(body.user_id or ""),
+                        caller_tenant_id=caller_tenant,
+                    )
                 text = (answer.answer or "").strip()
                 if text:
                     if len(text) > 1500:

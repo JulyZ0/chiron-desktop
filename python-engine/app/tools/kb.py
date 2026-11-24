@@ -24,11 +24,28 @@ from typing import Any
 from app.config import DEFAULT_TENANT_ID
 from app.kb_access import kb_access_allowed
 from app.knowledge.errors import KnowledgeError
-from app.knowledge.service import answer_question
 from app.tools.context import get_tenant_id_int, get_user_id
 from app.tools.registry import registry
 
 logger = logging.getLogger(__name__)
+
+
+async def answer_question(*args: Any, **kwargs: Any) -> Any:
+    """惰性转发到 ``app.knowledge.service.answer_question``（H77）。
+
+    为什么要有这一层而不是模块级直接 import：
+    ``app.knowledge.service`` 的导入链会回到 ``app.tools`` 包（
+    service → providers.registry → settings_store → tools.context → tools/__init__
+    → tools.kb → service 半初始化），模块级导入会成环，表现是"直接 import 服务层
+    就 ImportError"。
+
+    为什么不能干脆删掉这个模块属性：既有单测用
+    ``patch("app.tools.kb.answer_question", ...)`` 打桩，删掉就等于让这条路径
+    从"有覆盖"退回"没人守"。
+    """
+    from app.knowledge.service import answer_question as _impl
+
+    return await _impl(*args, **kwargs)
 
 
 async def _pool() -> Any:
@@ -118,7 +135,12 @@ async def kb_search(kb_id: str, query: str, top_k: int = 5) -> dict[str, Any]:
     owner_id = str(kb_row["user_id"] or "")
     try:
         result, provider_name = await answer_question(
-            kb_id=kb_id, user_id=owner_id, question=query
+            kb_id=kb_id,
+            user_id=owner_id,
+            question=query,
+            # H77：库主身份只用于解析 provider；授权判据用**调用者**身份。
+            caller_user_id=str(user_id or ''),
+            caller_tenant_id=int(get_tenant_id_int()),
         )
     except KnowledgeError as exc:
         logger.warning("kb_search failed (kb_id=%s): %s", kb_id, exc)

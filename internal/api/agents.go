@@ -285,6 +285,11 @@ func (h *AgentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		logAndRespond(w, err, http.StatusInternalServerError, "generate id failed")
 		return
 	}
+	// H77：创建时同样校验 kb_id 归属（与 Update 同一判据，避免"建的时候能绑、改的时候不能"）。
+	if err := validateAgentKBID(r.Context(), kbStore(), body.KbID, claims.UserID, claims.TenantID); err != nil {
+		BadRequest(w, err.Error())
+		return
+	}
 	_, err = db.GlobalDBManager.Exec(r.Context(),
 		// created_at / updated_at 必须显式写：DDL 里这两列没有默认值，省略即 NULL，
 		// 而 List/Get 把 NULL 扫进 time.Time 会报错 —— 表现是"建了但列表里没有"。
@@ -380,6 +385,12 @@ func (h *AgentHandler) Update(w http.ResponseWriter, r *http.Request) {
 		push("enabled = $"+itoa(len(args)+1), *body.Enabled)
 	}
 	if body.KbID != nil {
+		// H77：绑定的知识库必须对**调用者**可见（自己的 / public / 同租户共享）。
+		// 不做这一步等于允许把别人的私有库 UUID 绑上来，派发时用库主身份检索。
+		if err := validateAgentKBID(r.Context(), kbStore(), *body.KbID, claims.UserID, claims.TenantID); err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
 		push("kb_id = $"+itoa(len(args)+1), *body.KbID)
 	}
 	if len(body.Skills) > 0 && string(body.Skills) != "null" {

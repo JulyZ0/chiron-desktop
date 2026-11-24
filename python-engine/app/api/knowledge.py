@@ -1149,7 +1149,12 @@ async def query_knowledge_base(
 
     try:
         result, provider_name = await answer_question(
-            kb_id=kb_id, user_id=user_id, question=query.strip()
+            kb_id=kb_id,
+            user_id=user_id,
+            question=query.strip(),
+            # H77：调用者身份显式传入（此处调用者即库主本人，仍要走同一条授权判据）。
+            caller_user_id=str(user_id),
+            caller_tenant_id=int(tenant_id or 0),
         )
     except ProviderUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

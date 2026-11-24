@@ -84,7 +84,8 @@ async def _load_kb(pool: Any, kb_id: str) -> Any:
     dict 取不会）—— 于是"停用"退化成纯展示字段。
     """
     kb = await pool.fetchrow(
-        """SELECT id, tenant_id, user_id, provider, index_ref, config, status, enabled
+        """SELECT id, tenant_id, user_id, provider, index_ref, config, status, enabled,
+                  COALESCE(visibility, '') AS visibility
              FROM knowledge_bases WHERE id = $1""",
         kb_id,
     )
@@ -115,6 +116,30 @@ class KnowledgeBaseDisabledError(KnowledgeError):
     """
 
 
+class KnowledgeAccessDeniedError(KnowledgeError):
+    """调用者无权使用这个知识库（H77）。
+
+    独立类型：调用方要能把"没权限"与"库不存在"分开处理（前者 403/明确文案，后者 404），
+    但**对外文案必须一致**地不泄露库是否存在 —— 具体映射由 API 层决定。
+    """
+
+
+def _require_caller_access(kb: Any, *, caller_user_id: str, caller_tenant_id: int) -> None:
+    """校验调用者对该知识库的读权限（H77）。
+
+    口径复用 `app/kb_access.py`（与列表/详情/工具层同一份）：自己的 / public / 同租户共享。
+    **调用者身份缺失即拒绝**：`answer_question` 曾允许调用方直接把库主 id 传进来当
+    "调用者"，于是"知道 kb_id" 就能越过授权拿到别人的答案与引用。现在没有调用者身份
+    就没有授权依据，宁可让未改造的调用点先失败（build 期就会暴露），也不静默放行。
+    """
+    if not str(caller_user_id or "").strip():
+        raise KnowledgeAccessDeniedError("knowledge access requires a caller identity")
+    from app.kb_access import kb_access_allowed
+
+    if not kb_access_allowed(kb, str(caller_user_id).strip(), int(caller_tenant_id or 0)):
+        raise KnowledgeAccessDeniedError("knowledge base is not accessible to this caller")
+
+
 def kb_enabled(kb_row: Any) -> bool:
     """行里的 ``enabled``；缺列时按启用处理（见 ``app/api/knowledge.py::_row_enabled``）。"""
     try:
@@ -141,9 +166,15 @@ def _require_enabled(kb: Any) -> None:
 
 
 async def answer_question(
-    *, kb_id: str, user_id: str, question: str
+    *, kb_id: str, user_id: str, question: str,
+    caller_user_id: str = "",
+    caller_tenant_id: int = 0,
 ) -> tuple[AnswerResult, str]:
     """在知识库内提问。返回 (答案, provider 名)。
+
+    ``user_id`` 是**provider 归属**（Cloud key 是用户级的，必须用库主的 key 解析）；
+    ``caller_user_id`` / ``caller_tenant_id`` 是**调用者身份**，用于授权。
+    两者必须分开传：把库主 id 当调用者用，等于用资源所有者身份替代授权（H77）。
 
     检索范围 = 该库中**已就绪**文档的 provider doc_id 集合：PageIndex 没有"整库"隐式范围，
     不传文档就等于让模型在空集上推理。
@@ -159,6 +190,14 @@ async def answer_question(
         pool = await _pool()
         kb = await _load_kb(pool, kb_id)
         _require_enabled(kb)
+        # H77：**先授权，再用库主身份解析 provider**。
+        #
+        # 此前这里只按 ID 取库，不看调用者 —— 于是"知道别人的 kb_id" 就能拿到对方
+        # 私有库的答案与引用；更糟的是调用方（`app/api/agents.py` 的对话注入）直接把
+        # **库主** 的 user_id 传进来，等于用资源所有者身份代替了授权。
+        # 现在：调用者身份必须显式给出（caller_*），否则拒绝 —— 传空会让每个未改造的
+        # 调用点立刻暴露，而不是静默沿用旧行为。
+        _require_caller_access(kb, caller_user_id=caller_user_id, caller_tenant_id=caller_tenant_id)
 
         provider, _settings, health = await registry.resolve_for_user(
             user_id, folder_id=str(kb["index_ref"] or "")

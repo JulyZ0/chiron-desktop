@@ -116,7 +116,14 @@ async def _default_retriever(kb_id: str, query: str, user_id: str, tenant_id: in
         raise PermissionError("无权访问该知识库")
     owner_id = str(kb_row["user_id"] or "")
     # provider 解析必须用**库所有者**的身份（Cloud key 是用户级的）；调用者身份只做鉴权
-    result, _provider = await answer_question(kb_id=kb_id, user_id=owner_id, question=query)
+    result, _provider = await answer_question(
+        kb_id=kb_id,
+        user_id=owner_id,
+        question=query,
+        # H77：库主身份只用于解析 provider；授权判据用**调用者**身份。
+        caller_user_id=str(user_id or ''),
+        caller_tenant_id=int(tenant_id or 0),
+    )
     return {
         "answer": result.answer or "",
         "citations": [
