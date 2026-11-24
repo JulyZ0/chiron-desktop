@@ -699,6 +699,19 @@ def _has_escape(command: str) -> str | None:
     return None
 
 
+def text_escape_reason(command: str) -> str | None:
+    """命令**文本**是否命中"不可静态审查"的逃逸模式；命中返回模式串，否则 ``None``。
+
+    为什么要把这条判据公开给分级层（`app/agent/tool_policy.py`）：分级
+    （能否降为 write / 是否免确认）与执行准入必须用**同一套**文本判据。此前分级只看
+    "解析后是不是单条命令"，于是 `echo `id``、`cat /etc/shadow`、`echo '(换行) rm -rf x'`
+    这类文本照样被降为 write —— 在 auto 模式下就是**免确认放行**，而执行侧随后又
+    因为逃逸模式拒绝。结果是"分级说安全、执行说不行"的分裂，且中间那条免确认的路
+    已经走完了。
+    """
+    return _has_escape(command)
+
+
 def _split_segments(command: str) -> list[str]:
     """Compatibility projection of the parsed program, including single ampersands."""
     return [shlex.join(cmd.argv) for cmd in parse_shell_program(command).commands if cmd.argv]
