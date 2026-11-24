@@ -55,10 +55,11 @@ func withLiveSessionManager(t *testing.T) (*session.Manager, *pgxpool.Pool) {
 // `name` 打上可检索的标记，便于核对"跑完没有残留"。
 func liveUser(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
-	// ⚠ `CreateSession` 写的 `sessions.tenant_id` 是**常量 `DefaultTenantID`**（见
-	// `internal/session/manager_crud.go` 的 INSERT），**不是** user 的 tenant ⇒
-	// `sessions_tenant_id_fkey` 要求那行 tenant 存在；CI 的库没有它就会撞外键
-	// （本机没设 `CHIRON_TEST_POSTGRES_DSN`，这些 live 用例一直 skip，所以从没暴露）。
+	// ⚠ `CreateSession` 写的 `sessions.tenant_id` 来自调用方（H33 起不再硬编码
+	// `DefaultTenantID`），**不是** user 的 tenant ⇒ `sessions_tenant_id_fkey`
+	// 要求那行 tenant 存在；CI 的库没有它就会撞外键（本机没设
+	// `CHIRON_TEST_POSTGRES_DSN`，这些 live 用例一直 skip，所以从没暴露）。
+	// 这里显式传默认租户，与下面 users 行的 tenant 保持一致。
 	// **不删它**：默认租户是共享的，别处也可能依赖。
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO tenants (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`,
@@ -95,7 +96,7 @@ func liveUser(t *testing.T, pool *pgxpool.Pool) string {
 func liveSession(t *testing.T, mgr *session.Manager, owner string) string {
 	t.Helper()
 	sid := uuid.NewString()
-	if _, err := mgr.CreateSession(context.Background(), sid, owner, "cancel live test"); err != nil {
+	if _, err := mgr.CreateSession(context.Background(), sid, owner, "cancel live test", db.DefaultTenantID); err != nil {
 		t.Fatalf("建会话失败: %v", err)
 	}
 	t.Cleanup(func() {
