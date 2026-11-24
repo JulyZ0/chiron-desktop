@@ -1058,7 +1058,9 @@ class UnifiedChatHandler:
         if not tenant_id:
             return {"success": False, "error": "tenant_id is required"}
         # 只校验 tenant 不够：同租户的其他用户拿到 session_id 就能读别人的消息。
-        # 会话归属是用户级的，租户只是它的外边界。
+        # 会话归属是用户级的，租户只是它的外边界。空白身份（"   "）不是身份：
+        # 它会把不同调用者塞进同一个"空白"域，因此先规约再判空。
+        user_id = str(user_id or "").strip()
         if not user_id:
             return {"success": False, "error": "user_id is required"}
         owner_key = _session_owner_key(tenant_id, user_id, session_id)
@@ -1305,13 +1307,23 @@ async def submit_chat(request: Request) -> dict[str, Any]:
     context = body.get("context")
     if context is not None and not isinstance(context, dict):
         return {"success": False, "error": "context must be an object"}
-    # user_id 持久化标识 (Go 网关代理时追加 ?user_id=<claims.UserID>;缺省以 tenant_id 兜底)。
+    # user_id 持久化标识 (Go 网关代理时追加 ?user_id=<claims.UserID>)。
     # 同 tenant_id 逻辑:query 可信优先,防止客户端伪造 user_id 冒充他人。
     query_uid = str(request.query_params.get("user_id") or "")
     body_uid = str(body.get("user_id") or "")
     if query_uid and body_uid and query_uid != body_uid:
         return {"success": False, "error": "user_id mismatch"}
-    user_id = query_uid or body_uid
+    # H26：鉴权中间件把"完全不带 query 身份"的请求当作 body 身份端点放行
+    # （见 app/middleware/auth.py 分支①）—— 于是本入口此前只凭 body 里的
+    # tenant_id 就能进 submit_task，而 submit_task 在 user_id 为空时把所有者
+    # 退化成 tenant_id（"同租户公共域"）。结果：所有不带身份的调用者共享一个
+    # owner 域，可以互相续写/读取对方的会话。写入路径必须 fail-closed：
+    # 身份只从可信来源取（query、body；两者一致性已校验，middleware 已验证的
+    # request.state 兜底），取不到就拒绝，绝不退化成 tenant 级公共会话。
+    state_uid = str(getattr(request.state, "user_id", "") or "")
+    user_id = (query_uid or body_uid or state_uid).strip()
+    if not user_id:
+        return {"success": False, "error": "user_id is required"}
     # P1-d：此前完全忽略 body.llm_config → 界面上切换模型/模式对这条链路
     # （ChatView 的 sendUnified 走的正是它）完全无效。这里读出来交给 ChatHandler
     # 落进会话 shared_context 并透传给 TaskRouter（意图理解等步骤的模型/provider 由此决定）。
@@ -1326,9 +1338,15 @@ async def submit_chat(request: Request) -> dict[str, Any]:
     # tenant_id 列已收窄为 smallint（int），在请求边界把字符串规约到整数域。
     from app.tools.context import to_tenant_int
 
+    # tenant 0 不是有效归属（DB 里是"无租户"桶），与 app/api/memory.py 的
+    # _conflict_scope 同口径：没有可信租户时拒绝写入，而不是落进公共桶。
+    tenant = to_tenant_int(tenant_id)
+    if tenant <= 0:
+        return {"success": False, "error": "tenant_id is required"}
+
     return await handler.submit_task(
         user_input=user_input,
-        tenant_id=to_tenant_int(tenant_id),
+        tenant_id=tenant,
         session_id=body.get("session_id"),
         mode=str(body.get("mode", "auto")),
         context=context,
@@ -1353,10 +1371,11 @@ async def get_messages(
     except (TypeError, ValueError):
         tenant_id = 0
     # 会话归属是用户级的：网关注入的 ?user_id= 与 tenant 一样必须透传下来，
-    # 否则同租户内可跨用户读取他人会话消息。
-    user_id = str(request.query_params.get("user_id") or "") or str(
-        getattr(request.state, "user_id", "") or ""
-    )
+    # 否则同租户内可跨用户读取他人会话消息。空白值等同缺失（见 handler 侧判定）。
+    user_id = (
+        str(request.query_params.get("user_id") or "")
+        or str(getattr(request.state, "user_id", "") or "")
+    ).strip()
     handler = get_chat_handler()
     return await handler.get_session_messages(
         session_id, tenant_id=tenant_id, user_id=user_id, limit=limit
