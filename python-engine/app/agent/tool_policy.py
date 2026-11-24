@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from typing import Any
 
 READ = "read"
@@ -114,6 +115,10 @@ COMMAND_TOOLS: frozenset[str] = frozenset(
 )
 
 #: Only a parsed, single read-only invocation may be downgraded. A matching prefix is not evidence.
+#:
+#: 这些名字**不是**"前缀放行名单"：`tool_level` 要求整条命令解析后恰好是**一条**简单命令
+#: （无操作符、无分组、无异步、无重定向、无环境赋值），并且文本没有命中沙箱的逃逸模式
+#: （绝对路径 / `..` / 换行 / `$()` / 反引号 …），否则一律停在 delete（要人工 + 二次校验）。
 _SAFE_SIMPLE_EXECUTABLES = frozenset(
     {"ls", "dir", "cat", "type", "head", "tail", "wc", "pwd", "echo", "which", "where", "whoami"}
 )
@@ -138,16 +143,33 @@ def tool_level(name: str, args: dict[str, Any] | None = None) -> str:
         command = _command_text(args)
         if name in {"execute_python", "run_code"}:
             return DELETE
-        dialect = "cmd" if name == "persistent_shell" else "posix"
+        dialect = _shell_dialect(name)
         if command and _is_safe_simple_shell_command(command, dialect=dialect):
             return WRITE
         return DELETE
     return base
 
 
-def _is_safe_simple_shell_command(command: str, dialect: str) -> bool:
-    from app.tools.sandbox import parse_shell_program
+def _shell_dialect(tool_name: str) -> str:
+    """命令类工具真正会用的 shell 方言。
 
+    `persistent_shell` 只在 **Windows** 上走 cmd.exe；POSIX 部署（生产镜像 alpine）上它
+    仍是 `/bin/sh`。此前按工具名硬编码成 `cmd`，于是 POSIX 上 `echo ok\\nrm -rf x`
+    这类文本会被 cmd 词法器当成"一条命令 + 若干参数"——换行在 POSIX 是**命令分隔符**。
+    """
+    if tool_name == "persistent_shell" and sys.platform == "win32":
+        return "cmd"
+    return "posix"
+
+
+def _is_safe_simple_shell_command(command: str, dialect: str) -> bool:
+    from app.tools.sandbox import parse_shell_program, text_escape_reason
+
+    # 文本级逃逸（绝对路径 / `..` / 换行 / `$(...)` / 反引号 / UNC…）命中即**不再**降级：
+    # "解析成单条命令"只说明结构简单，不说明目标在沙箱内。执行侧本来就拒这些文本，
+    # 分级侧必须同样拒 —— 否则 auto 模式下它们会先被免确认放行。
+    if text_escape_reason(command):
+        return False
     try:
         program = parse_shell_program(command, dialect=dialect)
     except ValueError:

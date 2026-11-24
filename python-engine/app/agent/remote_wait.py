@@ -4,7 +4,7 @@
 
 审批与提问的等待方可能**不是**收到 HTTP 决策的那个副本：网关多副本部署、会话无亲和
 路由、副本扩缩容，都会让"用户点了批准"落在 A 副本，而正在 `await` 的 run 在 B 副本。
-仲裁者必须是一个**跨进程**的共享点，于是用 Redis 键承载决策（GET+DEL 单次消费 =
+仲裁者必须是一个**跨进程**的共享点，于是用 Redis 键承载决策（GETDEL / Lua 单次消费 =
 仲裁），再用一条 per-tc 唤醒频道把它变成"能立刻认领"（否则就是忙轮询）。
 
 ## 为什么唤醒不是正确性依赖
@@ -36,6 +36,57 @@ logger = logging.getLogger(__name__)
 #: 即时性反而更好（正常路径靠 wake 秒级认领，不再等下一轮 0.15s）。
 REMOTE_WAIT_POLL_INTERVAL_SECONDS = 1.5
 
+#: 单次消费的 Lua 实现（Redis < 6.2 没有 GETDEL 时用它，语义相同：读+删在同一脚本里原子完成）。
+#: 为什么不能用 `GET` 再 `DEL` 两步：两个等待者（两个副本、或同一副本的两个协程）都会在
+#: `GET` 时读到同一个值，随后各自 `DEL` —— 于是**同一条审批被消费两次**，一次点击批准了
+#: 两个动作。键本身就是仲裁者，仲裁必须是一次操作。
+_TAKE_KEY_LUA = """
+local value = redis.call('GET', KEYS[1])
+if value then
+  redis.call('DEL', KEYS[1])
+end
+return value
+"""
+
+
+def _take_key_script():
+    """把 Lua 交给客户端执行（`eval`/`evalsha` 的调用形态差异在 `_take_once` 里适配）。"""
+    return _TAKE_KEY_LUA
+
+
+async def _take_once(redis: Any, key: str) -> Any | None:
+    """**原子**取走并删除 `key`，返回取到的值（未命中返回 ``None``）。
+
+    三级降级，全部以"一次操作"为目标：
+    1. ``GETDEL``（Redis 6.2+，语义最直白）；
+    2. ``EVAL`` + Lua（读+删在同一脚本里，原子性等价）；
+    3. 客户端两者都没有时退回 ``GET``+``DEL``，并**显式告警** —— 这条路径不保证单次消费，
+       只有在桩/老客户端上才会走到，不能悄悄降级（PRD 9.7 / H37）。
+    """
+    getdel = getattr(redis, "getdel", None)
+    if callable(getdel):
+        try:
+            return await getdel(key)
+        except Exception as e:  # noqa: BLE001 - 老服务端不认识 GETDEL ⇒ 用 Lua 兜底
+            logger.debug("remote wait: GETDEL unavailable (%s), falling back to Lua", e)
+
+    evaluate = getattr(redis, "eval", None)
+    if callable(evaluate):
+        try:
+            return await evaluate(_TAKE_KEY_LUA, 1, key)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("remote wait: atomic take via Lua failed (%s), degrading", e)
+
+    logger.warning(
+        "remote wait: client has neither GETDEL nor EVAL for %s — single-consumption is NOT "
+        "guaranteed on this path (upgrade the Redis client)",
+        key,
+    )
+    raw = await redis.get(key)
+    if raw is not None:
+        await redis.delete(key)
+    return raw
+
 
 def approval_scope(user_id: str) -> str:
     """审批键的用户作用域段（JWT/网关注入）。非空时把审批隔离到该用户。"""
@@ -65,12 +116,13 @@ def approval_wake_channel(tc_id: str, user_id: str = "") -> str:
 async def take_key_with_wake(
     key: str, channel: str, timeout: float, interval: float
 ) -> Any | None:
-    """等待某 Redis 键出现并**原子取走**（GET+DEL 单次消费是仲裁，不可动摇）。
+    """等待某 Redis 键出现并**原子取走**（GETDEL / Lua 单次消费是仲裁，不可动摇）。
 
     hybrid：唤醒频道只是加速器。写入方 SET 后 PUBLISH `channel`（per-tc），这里先订阅
-    再进循环 —— 每轮先 GET（覆盖"订阅建立前键已写入"的竞态），未命中就等唤醒或兜底
-    `interval` 超时，二者先到即回到顶部再 GET。唤醒丢失（订阅端断连）时兜底轮询仍收口。
-    因此最坏退化=纯轮询（间隔 `interval`），绝不双消费、deadline 到即返回 None 不卡死。
+    再进循环 —— 每轮先**原子取走**（GETDEL / Lua，见 :func:`_take_once`，覆盖"订阅建立前
+    键已写入"的竞态），未命中就等唤醒或兜底 `interval` 超时，二者先到即回到顶部再取。
+    唤醒丢失（订阅端断连）时兜底轮询仍收口。因此最坏退化=纯轮询（间隔 `interval`），
+    绝不双消费、deadline 到即返回 None 不卡死。
     """
     try:
         from app.redis_client import aclose_pubsub, get_redis
@@ -100,10 +152,9 @@ async def take_key_with_wake(
     try:
         while True:
             try:
-                raw = await redis.get(key)
+                raw = await _take_once(redis, key)
                 if raw is not None:
-                    await redis.delete(key)  # 单次消费：只有一个副本能取走
-                    return raw
+                    return raw  # 单次消费已由 _take_once 保证（GETDEL / Lua）
             except Exception as e:  # noqa: BLE001 - 取键失败不致命，继续等待
                 logger.debug("remote wait poll error: %s", e)
             remain = deadline - loop.time()

@@ -25,8 +25,11 @@ for 'ask' permission decisions"）。语义映射到 Chiron：
   误分类（典型：`execute_python` 里只有 `print()`，命令类工具无法归类时保守停在 delete）。
   标签因此只是**上下文**，不是证据 —— 评审必须按 ``ARGUMENTS``（真实命令 / 代码 / 路径）
   判，不能"因为标签是 delete 所以 deny"。
-* **自相矛盾不许 deny**：评审自己说"未发现删除/网络/凭据访问"（`danger_found=false`）却给
-  `deny` 时，按"未发现风险"处理 —— 理由与结论矛盾时以**理由里的事实**为准。
+* **自相矛盾的判词不许归一成 allow**（PRD 9.7 / H37 修正）：评审说"未发现删除/网络/凭据
+  访问"（`danger_found=false`）却给 `deny` 时，旧实现按"理由里的事实"归一为 **allow** ——
+  那等于让一条**内部矛盾**的判词换来"免人工执行"，评审的任何一个字段出错都会变成放行。
+  矛盾判词现在的语义是 ``outcome="unknown"`` + ``failed=True``（回退人工审批）：既不
+  allow，也不 deny。理由与结论一致时照旧（真 deny 保留 deny，真 allow 才是 allow）。
 * **参数级风险证据扫描**（:func:`evidence_risk`）是"不许免人工"的硬闸：命中即保持人工审批
   （或由评审 deny），即使评审说 allow。真正的删除 / 外传 / 反弹 shell 无论标签怎么写
   都过不了自动放行；最终是否免人工仍由动作级别白名单决定。
@@ -217,12 +220,13 @@ def evidence_risk(args: dict[str, Any] | None) -> str | None:
 class GuardianAssessment:
     """一次评审的结果。
 
-    ``failed=True`` 表示**评审本身**没做成（调用异常 / 无法解析）—— 调用方应当据此
-    回退到人工审批，而不是把 failed 当成 deny 直接拒掉用户的操作（fail-open）。
+    ``failed=True`` 表示**评审本身**没做成（调用异常 / 无法解析 / 判词自相矛盾）—— 调用方
+    应当据此回退到人工审批，而不是把 failed 当成 deny 直接拒掉用户的操作（fail-open），
+    更不能当成 allow（fail-safe）。
     ``outcome`` 在失败时是 ``"unknown"``：它既不是 allow 也不是 deny，任何按字符串
-    比对的调用方都不会误判成"拒绝"。
-    ``contradictory=True`` 表示评审**自述未发现风险却给出了 deny** —— 结论已按理由里
-    的事实归一为 allow（见 :func:`parse_assessment`）。
+    比对的调用方都不会误判成"拒绝"，也不会误判成"放行"。
+    ``contradictory=True`` 表示评审**自述未发现风险却给出了 deny** —— 判词内部矛盾，
+    结论降级为 ``unknown``（回退人工审批），**不得**归一为 allow（PRD 9.7 / H37）。
     """
 
     outcome: str  # "allow" | "deny" | "unknown"
@@ -241,9 +245,11 @@ def parse_assessment(text: str) -> GuardianAssessment:
     **fail-open**：解析不出来 ⇒ ``outcome="unknown"`` + ``failed=True``。调用方据此
     回退人工审批，而不是 deny —— "评审没做成"不等于"这次调用有风险"。
 
-    **消除自相矛盾**：``danger_found=false``（或理由里明说未发现风险）却给 ``deny`` 时，
-    以理由里的事实为准归一为 ``allow``（``contradictory=True`` 留痕）。真正的危险代码
-    另有 :func:`evidence_risk` 硬闸，不依赖这一条归一。
+    **矛盾判词不归一为 allow（fail-safe）**：``danger_found=false``（或理由里明说未发现
+    风险）却给 ``deny`` 时，判词内部矛盾，**证据链已经不可信** —— 结论降级为
+    ``outcome="unknown"`` + ``failed=True``（回退人工审批，``contradictory=True`` 留痕）。
+    旧实现把它归一为 ``allow``，于是"评审自相矛盾"直接换来免人工执行。
+    真正的危险代码另有 :func:`evidence_risk` 硬闸，不依赖这一条。
     """
     text = (text or "").strip()
     if not text:
@@ -272,11 +278,20 @@ def parse_assessment(text: str) -> GuardianAssessment:
         danger_found is None and bool(_NO_RISK_SELF_REPORT_RE.search(rationale))
     )
     if raw_outcome == "deny" and self_reported_no_risk:
+        # 判词自相矛盾 ⇒ **不猜**：既不按 deny 拒掉用户，也绝不归一为 allow 直接放行。
+        # 证据链已不可信，唯一安全结论是"没评成"（回退人工审批）。
         logger.warning(
-            "guardian contradiction (deny but no risk reported) -> treated as allow: %s",
+            "guardian contradiction (deny but no risk reported) -> inconclusive, "
+            "falling back to human approval: %s",
             summarize_reason(rationale),
         )
-        return GuardianAssessment("allow", risk, rationale, contradictory=True)
+        return GuardianAssessment(
+            "unknown",
+            risk,
+            rationale or "guardian verdict was self-contradictory",
+            failed=True,
+            contradictory=True,
+        )
 
     return GuardianAssessment(raw_outcome, risk, rationale)
 

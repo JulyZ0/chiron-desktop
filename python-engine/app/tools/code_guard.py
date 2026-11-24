@@ -13,8 +13,13 @@ from __future__ import annotations
 
 import ast
 import builtins as _b
+import types as _types
 from collections.abc import Callable
 from typing import Any, NoReturn
+
+#: 守卫能力版本。`plugin_runner.py` 按文件路径加载本模块时校验它 —— 旧副本（缺少
+#: 属性链/再导出拦截）必须 **fail-closed** 拒绝执行插件，而不是静默用弱守卫跑。
+GUARD_API_VERSION = 2
 
 # ── 静态安全检查：禁止沙箱代码直接访问宿主 ─────────────────────────────
 DANGEROUS_MODULES = {
@@ -49,7 +54,67 @@ DANGEROUS_MODULES = {
     "smtplib",
     "imaplib",
     "poplib",  # 防止协议攻击
+    # 再导出（re-export）类逃逸的落地点：白名单模块通过 `mod.os` / `mod.sys` 之类的
+    # 属性把宿主模块递出来。这些名字本身也不该被沙箱代码 import。
+    "builtins",
+    "gc",
+    "inspect",
+    "types",
+    "_thread",
+    "fcntl",
+    "pty",
+    "resource",
+    "mmap",
+    "runpy",
 }
+
+#: 属性链里出现即视为"取到了危险模块"的**段名**（再导出拦截用）。
+#:
+#: `asyncio.base_events.os.system(...)` 之所以能逃逸：`asyncio` 是白名单模块，
+#: 但 `asyncio.base_events` 自己 `import os`，于是点分属性链的**中间段**就是 `os`。
+#: 静态层只看 `Name.attr(...)` 两段（`asyncio.base_events` 的 value 已是 Attribute，
+#: 不是 Name ⇒ 整条链被跳过）。运行时层把真模块直接交给沙箱代码 ⇒ 同样拿到 `os`。
+DANGEROUS_MODULE_ROOTS = frozenset(
+    {
+        "os",
+        "sys",
+        "subprocess",
+        "socket",
+        "importlib",
+        "ctypes",
+        "shutil",
+        "pathlib",
+        "tempfile",
+        "multiprocessing",
+        "pickle",
+        "marshal",
+        "signal",
+        "atexit",
+    }
+)
+
+#: 属性链**末段**命中即拦的"能力名"（换个模块再导出也照样拦）。
+BLOCKED_REEXPORT_NAMES = frozenset(
+    {
+        "system",
+        "popen",
+        "spawn",
+        "spawnl",
+        "spawnv",
+        "spawnve",
+        "execv",
+        "execve",
+        "execl",
+        "fork",
+        "forkpty",
+        "posix_spawn",
+        "__import__",
+        "import_module",
+        "load_module",
+        "open_code",
+    }
+)
+
 DANGEROUS_CALLS = {
     "open",
     "exec",
@@ -100,6 +165,47 @@ BLOCKED_SUBCLASS_ATTRS = frozenset(
         "__build_class__",
     }
 )
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    """把 `a.b.c` 形式的属性链还原成点分名；含下标/调用/复杂表达式时返回 None。
+
+    存在理由：旧实现只认 `Name.attr`（两段），于是**任意长链**都被静默跳过 ——
+    `asyncio.base_events.os.system(...)` 的 `func.value` 是 Attribute 而不是 Name，
+    静态检查看不见它。
+    """
+    parts: list[str] = []
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if isinstance(current, ast.Name):
+        parts.append(current.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def _attribute_chain_reason(node: ast.Attribute) -> str | None:
+    """属性链级判定：链上哪些段说明"取到了危险能力"。
+
+    首段是沙箱代码自己的变量/模块别名（无法静态判定来源），因此只看**其后**的段；
+    但首段本身若就是被禁模块的别名，import 检查已经拦下了。
+    """
+    dotted = _dotted_name(node)
+    if not dotted:
+        return None
+    parts = dotted.split(".")
+    for segment in parts[1:]:
+        if segment in DANGEROUS_MODULE_ROOTS:
+            return (
+                f"attribute path '{dotted}' reaches blocked module '{segment}' "
+                "(re-export escape)"
+            )
+    if len(parts) > 1 and parts[-1] in BLOCKED_REEXPORT_NAMES:
+        return f"attribute path '{dotted}' exposes blocked capability '{parts[-1]}'"
+    if dotted in DANGEROUS_ATTR_PATHS:
+        return f"call '{dotted}()' is not allowed — use tools.* instead"
+    return None
 
 
 def _module_blocked(name: str) -> bool:
@@ -154,6 +260,10 @@ def check_static(code: str) -> str | None:
         if isinstance(node, ast.Attribute):
             if node.attr in BLOCKED_SUBCLASS_ATTRS:
                 return f"attribute '{node.attr}' is not allowed (object introspection)"
+            # 再导出逃逸：任意长度的属性链都要还原判定（`asyncio.base_events.os.system`）
+            chain_reason = _attribute_chain_reason(node)
+            if chain_reason:
+                return chain_reason
 
     # 注：混淆访问(字符串拼接/'__builtins__' 索引等)不被静态层识别,由运行时
     # _safe_builtins stub 兜底;而 __class__/__subclasses__ 等对象属性访问不经
@@ -203,6 +313,68 @@ def _make_blocked_builtin(name: str) -> Callable[..., Any]:
     return _blocked
 
 
+def capability_reason(name: str, value: Any) -> str | None:
+    """**运行时能力校验**：判断"从白名单模块属性上取到的这个对象"是否越界。
+
+    AST 层能拦住的只有**写死**的属性链；动态形态（`getattr` 被 stub 之外的花样、
+    `vars()`/`__dict__` 已被拦，但 `import` 出来的对象本身仍可被逐层点开）需要运行时
+    按**对象事实**再判一次 —— 这正是"AST + 运行时 capability 双重校验"的第二半：
+    不看代码怎么写的，只看**实际拿到的对象**是不是危险模块 / 危险模块里的可调用物。
+
+    Returns:
+        拒绝原因；``None`` 表示该属性可以交出去。
+    """
+    if name in BLOCKED_REEXPORT_NAMES:
+        return f"attribute '{name}' exposes a blocked capability"
+    if isinstance(value, _types.ModuleType):
+        module_name = getattr(value, "__name__", "") or ""
+        root = module_name.split(".")[0]
+        if root not in SAFE_IMPORTS or _module_blocked(module_name):
+            return f"module '{module_name}' is not allowed (re-export of blocked module)"
+        return None
+    owner = getattr(value, "__module__", None)
+    if isinstance(owner, str) and owner:
+        # 只看**根名**：`asyncio.sleep` 的 __module__ 是 `asyncio.tasks`（点分条目本身
+        # 被禁的是"import 这个模块"，不是"用它的函数"），按整名比较会把白名单能力一起封掉。
+        if owner.split(".")[0] in DANGEROUS_MODULE_ROOTS:
+            return f"object from blocked module '{owner}' is not allowed"
+    return None
+
+
+class _GuardedModule:
+    """白名单模块的**受控代理**：每次属性访问都过一次 :func:`capability_reason`。
+
+    为什么必须代理而不是直接交真模块：`asyncio.base_events.os` 里的 `os` 是**真模块
+    对象**，交出去就等于把 `os.system` 一并交出去（子模块 / `__dict__` 都够不着守卫）。
+    代理层让"取到危险对象"这个动作本身在运行时失败，且与 AST 层同一套判据（同一份
+    白名单），所以两层不会各自漂移。
+    """
+
+    __slots__ = ("_guarded_target",)
+
+    def __init__(self, module: _types.ModuleType) -> None:
+        object.__setattr__(self, "_guarded_target", module)
+
+    def __getattr__(self, name: str) -> Any:
+        target = object.__getattribute__(self, "_guarded_target")
+        value = getattr(target, name)  # 不存在时照常抛 AttributeError
+        reason = capability_reason(name, value)
+        if reason:
+            raise RuntimeError(
+                f"blocked by runtime guard: {target.__name__}.{name} — {reason}"
+            )
+        if isinstance(value, _types.ModuleType):
+            return _GuardedModule(value)
+        return value
+
+    def __setattr__(self, name: str, value: Any) -> NoReturn:
+        raise RuntimeError(f"blocked by runtime guard: cannot set attribute {name!r}")
+
+    def __repr__(self) -> str:
+        target = object.__getattribute__(self, "_guarded_target")
+        return f"<guarded module {target.__name__!r}>"
+
+
 def safe_builtins() -> dict[str, Any]:
     """构造受控 builtins：安全库白名单导入 + 危险 builtin 全部 stub。"""
     orig = vars(_b).copy()
@@ -219,7 +391,11 @@ def safe_builtins() -> dict[str, Any]:
         # 两层都要判：根在白名单里、**且**没有命中禁用的点分条目 —— 否则
         # `import asyncio.subprocess` 会因为根是合法的 asyncio 而一路放行（能起进程）。
         if root in SAFE_IMPORTS and not _module_blocked(name):
-            return real_import(name, globals, locals, fromlist, level)
+            module = real_import(name, globals, locals, fromlist, level)
+            # 交出去的是**受控代理**而不是真模块：白名单模块自己 `import os` 之后，
+            # `asyncio.base_events.os` 仍能取到真 `os`（再导出逃逸）。代理层用与 AST
+            # 同一套判据在**取用那一刻**拒绝（见 capability_reason）。
+            return _GuardedModule(module) if isinstance(module, _types.ModuleType) else module
         raise RuntimeError(f"blocked by runtime guard: import '{name}'")
 
     # 阻塞危险内置函数
