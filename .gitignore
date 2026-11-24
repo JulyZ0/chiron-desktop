@@ -161,3 +161,6 @@ Thumbs.db
 # 每轮 JSON 与 summary.md 只对本机排查有意义，不入库。
 /.artifacts/
 /frontend-vue/vitest-report.json
+*.pytest-h25-final/*
+/python-engine/.h8-pytest-tmp/*
+
