@@ -68,26 +68,15 @@ func validateWebSocketToken(ctx context.Context, a *auth.Authenticator, token, p
 }
 
 func validateWebSocketClaims(ctx context.Context, claims *auth.Claims, path string) error {
-	epoch, err := sessionEpoch(ctx, claims.UserID)
-	if err != nil {
-		return &wsAuthError{status: http.StatusUnauthorized, message: "authentication service unavailable", cause: err}
-	}
-	if epoch > 0 && claims.IssuedAt != nil && epoch >= claims.IssuedAt.Unix() {
-		return &wsAuthError{status: http.StatusUnauthorized, message: "token has been revoked"}
-	}
-	if claims.ID != "" {
-		blacklisted, err := checkJWTBlacklisted(ctx, claims.ID)
-		if err != nil {
-			return &wsAuthError{status: http.StatusUnauthorized, message: "authentication service unavailable", cause: err}
-		}
-		if blacklisted {
-			return &wsAuthError{status: http.StatusUnauthorized, message: "token has been revoked"}
-		}
-	}
-	if claims.MustChangePassword && !allowBeforePasswordChange(path) {
+	// 与 HTTP 中间件**同一套**判定（见 session_revocation.go）：
+	// 纪元（改密/禁用/撤销/强制下线）、jti 黑名单（登出）、强制改密、存储不可用时 fail-close。
+	// 这里刻意不再自己实现比较逻辑 —— 两边各写一份必然漂移，那头破的就是"撤销"。
+	if revocation := evaluateSessionRevocation(ctx, claims, path); revocation != nil {
 		return &wsAuthError{
-			status: http.StatusForbidden, code: "password_change_required",
-			message: "password change required before using this service",
+			status:  revocation.status,
+			code:    revocation.code,
+			message: revocation.message,
+			cause:   revocation.cause,
 		}
 	}
 	return nil
@@ -148,18 +137,18 @@ func monitorWebSocketAuth(conn *websocket.Conn, claims *auth.Claims, a *auth.Aut
 }
 
 func startWebSocketBlacklistWatcher() {
+	if db.Redis == nil {
+		return
+	}
 	wsAuthPubSubOnce.Do(func() {
-		if db.Redis == nil {
-			return
-		}
 		go func() {
 			rdb := db.Redis
-			pubsub := rdb.Subscribe(context.Background(), db.RedisKey("jwt:blacklist:sync"))
+			pubsub := rdb.Subscribe(context.Background(), authRevocationChannel())
 			defer pubsub.Close()
 			for {
 				msg, err := pubsub.ReceiveMessage(context.Background())
 				if err != nil {
-					slog.Warn("websocket blacklist subscription stopped", "error", err)
+					slog.Warn("websocket revocation subscription stopped", "error", err)
 					return
 				}
 				handleWebSocketBlacklistEvent(msg.Payload)
@@ -197,6 +186,10 @@ func handleWebSocketEpochEvent(userID string, epoch int64) {
 	if userID == "" || epoch <= 0 {
 		return
 	}
+	// 主动断开刻意比握手判定更**严格**（握手用 epoch > iat，这里用 iat <= epoch）：
+	// 纪元精度是秒，撤销那一秒内签发的 token 无法与新登录区分。握手侧容忍这一秒
+	// 是因为改密响应里新发的 token 就落在这秒内；断开侧宁可多断一条在连会话，
+	// 也不能让"撤销时刻已经在线的会话"复活 —— 重连会重新走握手判定。
 	wsAuthConnections.Range(func(key, _ any) bool {
 		entry := key.(*wsAuthConnection)
 		if entry.userID == userID && entry.issuedAtUnix <= epoch {

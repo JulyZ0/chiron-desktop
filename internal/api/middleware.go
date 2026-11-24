@@ -147,8 +147,10 @@ func StartBlacklistCleaner(ctx context.Context) {
 	}()
 }
 
-// StartBlacklistPubSub 启动 Redis Pub/Sub 监听器，实现跨实例黑名单同步。
-// 当任一实例将 token 加入黑名单时，通过 Redis channel 广播给所有其他实例。
+// StartBlacklistPubSub 启动 Redis Pub/Sub 监听器，实现跨实例撤销同步。
+// 当任一实例将 token 加入黑名单、或撤销某个用户的全部会话时，通过 Redis channel
+// 广播给所有其他实例。事件解析统一走 handleWebSocketBlacklistEvent：纯 jti 是单次
+// 登出，JSON 的 epoch_revoked 是批量撤销（后者除了写纪元，还要立刻断开本地 WS）。
 func StartBlacklistPubSub(ctx context.Context) {
 	if db.Redis == nil {
 		slog.Warn("Redis not available, JWT blacklist cross-instance sync disabled")
@@ -156,7 +158,7 @@ func StartBlacklistPubSub(ctx context.Context) {
 	}
 
 	go func() {
-		pubsub := db.Redis.Subscribe(ctx, db.RedisKey("jwt:blacklist:sync"))
+		pubsub := db.Redis.Subscribe(ctx, authRevocationChannel())
 		defer pubsub.Close()
 
 		ch := pubsub.Channel()
@@ -171,12 +173,7 @@ func StartBlacklistPubSub(ctx context.Context) {
 					slog.Warn("JWT blacklist Pub/Sub channel closed")
 					return
 				}
-				// 消息格式: "jti"
-				jti := msg.Payload
-				if jti != "" {
-					slog.Debug("received cross-instance blacklist notification", "jti", jti)
-					markJWTBlacklisted(jti)
-				}
+				handleWebSocketBlacklistEvent(msg.Payload)
 			}
 		}
 	}()
@@ -190,7 +187,7 @@ func broadcastBlacklistSync(jti string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	if err := db.Redis.Publish(ctx, db.RedisKey("jwt:blacklist:sync"), jti).Err(); err != nil {
+	if err := db.Redis.Publish(ctx, authRevocationChannel(), jti).Err(); err != nil {
 		slog.Warn("failed to broadcast JWT blacklist sync", "jti", jti, "error", err)
 	}
 }
@@ -474,42 +471,20 @@ func AuthMiddleware(a *auth.Authenticator) func(http.Handler) http.Handler {
 				return
 			}
 
-			// ── 会话纪元检查（改密/密码重置后旧 token 立即失效）──
-			// 与黑名单同为 fail-close：Redis 不可用时拒绝请求，避免撤销在故障期间失效。
-			// 纪元 > token.iat ⇒ 该 token 签发于撤销之前 ⇒ 拒绝。
-			epoch, epochErr := sessionEpoch(r.Context(), claims.UserID)
-			if epochErr != nil {
-				slog.Warn("session epoch check failed (fail-close)", "error", epochErr)
-				Unauthorized(w, "authentication service unavailable")
-				return
-			}
-			if epoch > 0 && claims.IssuedAt != nil && epoch > claims.IssuedAt.Unix() {
-				Unauthorized(w, "token has been revoked")
-				return
-			}
-
-			// ── JWT 黑名单检查（登出后的 token 立即失效）──
-			// fail-close：Redis 不可用/检查失败时拒绝请求（安全优先），
-			// 避免故障期间登出 token 被复用。
-			if claims.ID != "" {
-				blacklisted, err := checkJWTBlacklisted(r.Context(), claims.ID)
-				if err != nil {
-					slog.Warn("jwt blacklist check failed (fail-close)", "error", err)
-					Unauthorized(w, "authentication service unavailable")
+			// ── 会话撤销判定（纪元 / 黑名单 / 强制改密）──
+			// 与 /ws/rpa、/ws/device-fs 共用 evaluateSessionRevocation，
+			// 保证"HTTP 拒绝的凭据也开不了长连接"。任一存储不可用时 fail-close：
+			// Redis 故障期间撤销必须继续生效，不能退化成放行。
+			if revocation := evaluateSessionRevocation(r.Context(), claims, r.URL.Path); revocation != nil {
+				if revocation.cause != nil {
+					slog.Warn("session revocation check failed (fail-close)",
+						"path", r.URL.Path, "error", revocation.cause)
+				}
+				if revocation.code != "" {
+					JSONWithCode(w, revocation.status, revocation.code, nil, revocation.message)
 					return
 				}
-				if blacklisted {
-					Unauthorized(w, "token has been revoked")
-					return
-				}
-			}
-
-			// ── 首登/重置后强制改密 ──
-			// 只放行改密、登出、profile 与刷新会话；其余业务端点一律 403。
-			// 只在前端拦截是不够的：拿到初始密码的人完全可以绕过页面直接调 API。
-			if claims.MustChangePassword && !allowBeforePasswordChange(r.URL.Path) {
-				JSONWithCode(w, http.StatusForbidden, "password_change_required", nil,
-					"password change required before using this service")
+				Unauthorized(w, revocation.message)
 				return
 			}
 
