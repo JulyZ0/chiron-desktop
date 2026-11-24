@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestConn(gateway string) (*conn, *bytes.Buffer) {
@@ -33,6 +34,23 @@ func decodeLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
 		out = append(out, m)
 	}
 	return out
+}
+
+// waitLines 等**异步**分发的回复落盘后再解析（H42 把 session/prompt 放到了 goroutine 里）。
+//
+// 为什么必须有它：`dispatch` 现在不在调用线程上跑完 prompt，测试若不等待就会读到空
+// 缓冲区 —— 那不是"实现错了"，而是"测试还在用旧契约（同步回复）"。
+func waitLines(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.TrimSpace(buf.String()) != "" {
+			return decodeLines(t, buf)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("等待 ACP 回复超时：缓冲区仍为空")
+	return nil
 }
 
 func TestInitializeReportsCapabilities(t *testing.T) {
@@ -79,7 +97,7 @@ func TestParseError(t *testing.T) {
 func TestPromptRequiresNonEmptyText(t *testing.T) {
 	c, buf := newTestConn("http://127.0.0.1:1")
 	c.dispatch(nil, []byte(`{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"s1","prompt":[]}}`))
-	msgs := decodeLines(t, buf)
+	msgs := waitLines(t, buf)
 	if _, ok := msgs[0]["error"].(map[string]any); !ok {
 		t.Fatalf("empty prompt must be rejected, got %+v", msgs[0])
 	}

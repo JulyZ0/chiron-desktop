@@ -395,8 +395,46 @@ func (c *conn) streamPrompt(ctx context.Context, sessionID, content string) (str
 		return "", fmt.Errorf("submit rejected: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
+	// ── H42：严格区分 SSE / 202-JSON / 其它 ────────────────────────────────
+	//
+	// 此前只判断"不是 3xx 就当事件流扫"。而网关的 `/v1/agent/submit` 既可能回
+	// `text/event-stream`，也可能回 **202 + JSON 回执**（本仓 routes_agent.go 就是后者）。
+	// 回执里没有任何 `data:` 行 ⇒ 扫描循环一次都不进 ⇒ 函数返回默认的 `end_turn`，
+	// 编辑器于是显示"回答完成"，可实际上这一轮根本没有内容。这是**假成功**。
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	body := bufio.NewReaderSize(resp.Body, 64*1024)
+	isSSE := strings.Contains(contentType, "text/event-stream")
+	if !isSSE {
+		// 头不可信时看**内容形态**：真实网关可能漏设 Content-Type（或经代理被改写），
+		// 此时 `data:` 帧仍然说明这是事件流。判据只看开头几行，不读整包。
+		if head, _ := body.Peek(4096); looksLikeSSE(head) {
+			isSSE = true
+		}
+	}
+	if !isSSE {
+		raw, _ := io.ReadAll(io.LimitReader(body, 64*1024))
+		text := strings.TrimSpace(string(raw))
+		// 202 + JSON：网关只接受了任务，并没有把这一轮的事件流交出来。
+		// 没有事件流就拿不到 assistant 终态 ⇒ 如实失败，而不是假装 end_turn。
+		if resp.StatusCode == http.StatusAccepted {
+			return "", fmt.Errorf(
+				"gateway accepted the turn (202) but returned no event stream (%s); "+
+					"cannot report an assistant terminal state — body: %s",
+				contentType, truncateForLog(text))
+		}
+		// 少数实现会在 JSON 里直接给出终态；只有在**明确**属于助手输出时才认。
+		if stop, ok := terminalStopFromJSON(text); ok {
+			return stop, nil
+		}
+		return "", fmt.Errorf("submit returned %s (status %d) without an event stream: %s",
+			contentType, resp.StatusCode, truncateForLog(text))
+	}
+
 	stop := stopEndTurn
-	scanner := bufio.NewScanner(resp.Body)
+	// sawAnyEvent：这一轮到底有没有**任何**助手侧产物（文本/思考/工具调用/结果）。
+	// 没有产物却有 done，只能说明网关这一侧什么都没做成 —— 不能报"答完了"。
+	sawAnyEvent := false
+	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -422,6 +460,7 @@ func (c *conn) streamPrompt(ctx context.Context, sessionID, content string) (str
 		switch ev.Type {
 		case "text":
 			if ev.Content != "" {
+				sawAnyEvent = true
 				c.notifySessionUpdate(sessionID, map[string]any{
 					"sessionUpdate": updateAgentMessage,
 					"content":       map[string]any{"type": "text", "text": ev.Content},
@@ -429,12 +468,14 @@ func (c *conn) streamPrompt(ctx context.Context, sessionID, content string) (str
 			}
 		case "thinking":
 			if ev.Content != "" {
+				sawAnyEvent = true
 				c.notifySessionUpdate(sessionID, map[string]any{
 					"sessionUpdate": updateAgentThought,
 					"content":       map[string]any{"type": "text", "text": ev.Content},
 				})
 			}
 		case "tool_call":
+			sawAnyEvent = true
 			c.notifySessionUpdate(sessionID, map[string]any{
 				"sessionUpdate": updateToolCall,
 				"toolCallId":    ev.ID,
@@ -444,6 +485,7 @@ func (c *conn) streamPrompt(ctx context.Context, sessionID, content string) (str
 				"rawInput":      ev.Arguments,
 			})
 		case "tool_result":
+			sawAnyEvent = true
 			status := "completed"
 			if strings.Contains(ev.Content, `"error"`) {
 				status = "failed"
@@ -466,6 +508,17 @@ func (c *conn) streamPrompt(ctx context.Context, sessionID, content string) (str
 		case "cancelled":
 			return stopCancelled, nil
 		case "done":
+			// 段级 done 是引擎的终态标记。但**一个助手侧产物都没有**且没带 stop 时
+			// 不能当成"答完了"（空转的 done），继续等 turn_done。
+			if !sawAnyEvent && ev.Stop == "" {
+				continue
+			}
+			return stop, nil
+		case "turn_done":
+			// 网关的整轮终态：权威的"这轮结束了"。仍然要求这一轮真的产出过东西。
+			if !sawAnyEvent {
+				return "", fmt.Errorf("turn finished without any assistant output (session=%s)", sessionID)
+			}
 			return stop, nil
 		}
 	}
@@ -475,7 +528,86 @@ func (c *conn) streamPrompt(ctx context.Context, sessionID, content string) (str
 		}
 		return "", fmt.Errorf("stream read failed: %w", err)
 	}
-	return stop, nil
+	// ── H42：流结束但**没有终态事件** ⇒ 必须失败 ────────────────────────────
+	//
+	// 此前无论扫到什么（甚至一条都没有）都返回 `end_turn`。于是"网关半路断开"
+	// 与"模型确实答完了"在编辑器里长得一模一样。
+	return "", fmt.Errorf("event stream ended without a terminal turn event (session=%s)", sessionID)
+}
+
+// truncateForLog 把网关回执截短，避免把整页 HTML/JSON 塞进 ACP 错误里。
+func truncateForLog(s string) string {
+	const limit = 512
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "…"
+}
+
+// looksLikeSSE 只看开头几行判断是不是事件流（`data:` / `event:` / `:` 注释 / `id:`）。
+//
+// 为什么不能只信 Content-Type：经反代、或在测试桩里，这个头经常缺失或被改写。
+// 只看"开头是不是 JSON 对象"也不够 —— SSE 的第一行也可能恰好以 `{` 开头的注释。
+func looksLikeSSE(head []byte) bool {
+	if len(head) == 0 {
+		return false
+	}
+	for _, line := range strings.Split(string(head), "\n") {
+		line = strings.TrimRight(line, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "data:"),
+			strings.HasPrefix(trimmed, "event:"),
+			strings.HasPrefix(trimmed, "id:"),
+			strings.HasPrefix(trimmed, "retry:"),
+			strings.HasPrefix(trimmed, ":"):
+			return true
+		default:
+			return false // 第一行有内容且不是 SSE 帧 ⇒ 按普通响应处理
+		}
+	}
+	return false
+}
+
+// terminalStopFromJSON 只在 JSON 回执**明确**表达助手终态时才接受。
+//
+// 判据刻意保守：必须有非空 `stop_reason`（或 `stopReason`）且不是错误 envelope。
+// "有个 200 和一个 JSON" 不等于"这一轮答完了" —— 那正是 H42 要消灭的假成功。
+func terminalStopFromJSON(body string) (string, bool) {
+	if body == "" {
+		return "", false
+	}
+	var probe struct {
+		OK        *bool  `json:"ok"`
+		Success   *bool  `json:"success"`
+		Error     string `json:"error"`
+		Stop      string `json:"stop_reason"`
+		StopCamel string `json:"stopReason"`
+	}
+	if err := json.Unmarshal([]byte(body), &probe); err != nil {
+		return "", false
+	}
+	if probe.Error != "" {
+		return "", false
+	}
+	if probe.OK != nil && !*probe.OK {
+		return "", false
+	}
+	if probe.Success != nil && !*probe.Success {
+		return "", false
+	}
+	stop := probe.Stop
+	if stop == "" {
+		stop = probe.StopCamel
+	}
+	switch stop {
+	case stopEndTurn, stopMaxTokens, stopCancelled, stopRefusal, stopMaxTurns:
+		return stop, true
+	}
+	return "", false
 }
 
 // ── 主循环 ──────────────────────────────────────────────────────────────────
@@ -499,7 +631,23 @@ func (c *conn) dispatch(ctx context.Context, raw []byte) {
 	case "session/new":
 		c.handleSessionNew(req.ID, req.Params)
 	case "session/prompt":
-		c.handleSessionPrompt(req.ID, req.Params)
+		// ── H42：一轮 prompt 可能跑几分钟，**不能**在这里同步等 ──────────────
+		//
+		// 此前 `dispatch` 是同步调用的，于是 stdin 循环被这一轮堵住：
+		// `session/cancel` 与「审批/权限」回执都得排队——用户点了取消，编辑器
+		// 却要等模型自己跑完才被读到；而取消的价值恰恰是"立刻停"。
+		// 这里改成独立 goroutine：阅读循环继续收报文，取消与回执即时生效。
+		// 写回路径本来就在 `c.write` 的互斥量里，多协程并发输出是安全的。
+		go func(id json.RawMessage, params json.RawMessage) {
+			// 单个请求崩掉不能带走整个进程（否则编辑器侧表现为"agent 突然消失"）。
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("chiron-acp: session/prompt panic: %v", r)
+					c.reply(id, nil, &rpcError{Code: codeInternalError, Message: "internal error"})
+				}
+			}()
+			c.handleSessionPrompt(id, params)
+		}(req.ID, req.Params)
 	case "session/cancel":
 		c.handleSessionCancel(req.Params)
 	default:
