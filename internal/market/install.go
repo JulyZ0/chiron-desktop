@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 )
 
@@ -65,11 +66,29 @@ type Installer interface {
 	Uninstall(ctx context.Context, item Item, ref map[string]any) error
 }
 
+// Updater 是**可选**落点能力：用新内容原地更新已经装好的那条（保持同一身份）。
+//
+// 为什么是独立接口而不是塞进 Installer：`Install` 的语义是"新建"，对 agent 落点
+// 意味着**再插一行**。外部条目内容变了（manifest 摘要变化）时若复用 Install，
+// 用户会得到两个同名 agent；只有实现方明确知道"怎么按 ref 原地替换"，才允许走更新。
+//
+// 未实现该接口的落点遇到内容变化时返回 ErrUpdateUnavailable（HTTP 409），
+// 让用户显式卸载重装，而不是让编排层猜一个"大概安全"的做法。
+type Updater interface {
+	Update(ctx context.Context, item Item, ref map[string]any) (newRef map[string]any, err error)
+}
+
 // InstallOptions 是安装策略开关（来自环境变量，见 config.Config 的 MARKET_* ）。
 type InstallOptions struct {
 	// AllowRemoteMCP 决定**外部源**的 mcp 条目能否安装（MARKET_ALLOW_REMOTE_MCP）。
 	// 默认 false：外部 MCP 意味着让一个来路不明的命令在本机执行，这必须是显式决定。
 	AllowRemoteMCP bool
+	// Verifier 是外部内容的完整性/信任链校验端口（H5：manifest fetch + sha256 +
+	// Ed25519）。**在落点动作之前**执行，不通过就一个字节都不写。
+	//
+	// 为 nil 表示"不校验"：只有内置目录、没有外部源的部署形态才是合法的 nil
+	// （生产路径由 api 层无条件注入，见 market_install.go 的 NewMarketInstallHandler）。
+	Verifier Verifier
 }
 
 // 安装链路上的稳定错误。HTTP 层按 errors.Is 映射状态码。
@@ -82,6 +101,10 @@ var (
 	ErrInstallerUnavailable = errors.New("no installer registered for kind")
 	// ErrBadRequest 是一类「调用方参数问题」的包装，便于 HTTP 层统一映射 400。
 	ErrBadRequest = errors.New("invalid install request")
+	// ErrUpdateUnavailable 表示该 kind 的落点不支持原地更新（只能卸载重装）。
+	ErrUpdateUnavailable = errors.New("installer does not support in-place update")
+	// ErrNotInstalled 表示要操作（启用/停用/更新）的条目本机没装过。
+	ErrNotInstalled = errors.New("market item is not installed")
 )
 
 // Result 是一次安装的结果。字段与前端契约一一对应（见 market_install.go 的响应体）。
@@ -95,6 +118,9 @@ type Result struct {
 	// AlreadyInstalled 表示这次**没有**重新落地（幂等命中）。前端据此显示
 	// 「已安装」而不是再弹一次成功提示。
 	AlreadyInstalled bool `json:"already_installed,omitempty"`
+	// Updated 表示这次是**原地更新**（外部条目 manifest 摘要变了，落点被替换）。
+	// 它同时意味着 quarantined：内容换过就必须重新信任（Enabled 保持 false）。
+	Updated bool `json:"updated,omitempty"`
 }
 
 // InstallService 编排安装/卸载/列表。
@@ -162,12 +188,52 @@ func (s *InstallService) Install(ctx context.Context, tenantID, userID string, i
 		return Result{}, errors.New("install store unavailable")
 	}
 
+	// H5：**先校验、后落地**。校验不通过时这里直接返回，installer 不会被调用，
+	// 安装记录也不会写 —— digest / 签名不匹配不可能落盘。
+	item, verification, verr := s.verify(ctx, item)
+	if verr != nil {
+		return Result{}, verr
+	}
+
 	probe := InstalledRecord{Source: item.Source, Kind: kind, MarketID: item.ID}
 	existing, found, err := s.store.Get(ctx, tenantID, userID, probe)
 	if err != nil {
 		return Result{}, err
 	}
 	if found {
+		// 外部条目的 manifest 摘要变了 ⇒ 目录里发布的是新内容。原地更新（保持同一
+		// 落点身份）而不是再装一份；落点不支持更新时明确报错，让用户卸载重装。
+		if needsUpdate(existing, verification) {
+			up, ok := inst.(Updater)
+			if !ok {
+				return Result{}, fmt.Errorf("%w: %s", ErrUpdateUnavailable, kind)
+			}
+			newRef, uerr := up.Update(ctx, item, nonNilRef(existing.Ref))
+			if uerr != nil {
+				return Result{}, uerr
+			}
+			updated := InstalledRecord{
+				Source:   existing.Source,
+				Kind:     existing.Kind,
+				MarketID: existing.MarketID,
+				Ref:      mergeVerification(newRef, verification),
+				// 内容换过 ⇒ 重新进入不可用状态：新内容必须重新被信任。
+				Enabled:   false,
+				CreatedAt: existing.CreatedAt,
+			}
+			if err := s.store.Upsert(ctx, tenantID, userID, updated); err != nil {
+				return Result{}, err
+			}
+			return Result{
+				Source:           updated.Source,
+				Kind:             updated.Kind,
+				ID:               updated.MarketID,
+				Ref:              updated.Ref,
+				Enabled:          false,
+				RequiresApproval: requiresApproval(item, external),
+				Updated:          true,
+			}, nil
+		}
 		// 幂等命中：不重新落地（重复安装同一条目不该产生第二份 agent/插件/知识库）。
 		return Result{
 			Source:           existing.Source,
@@ -184,6 +250,7 @@ func (s *InstallService) Install(ctx context.Context, tenantID, userID string, i
 	if err != nil {
 		return Result{}, err
 	}
+	ref = mergeVerification(ref, verification)
 
 	rec := InstalledRecord{
 		Source:   item.Source,
@@ -290,4 +357,41 @@ func refString(ref map[string]any, key string) string {
 		return v
 	}
 	return ""
+}
+
+// verify 执行安装前置校验。未注入验证器的部署（只有内置目录）原样放行。
+func (s *InstallService) verify(ctx context.Context, item Item) (Item, Verification, error) {
+	if s.opts.Verifier == nil {
+		return item, Verification{}, nil
+	}
+	return s.opts.Verifier.Verify(ctx, item)
+}
+
+// needsUpdate 判断已装记录是否需要按新的 manifest 摘要原地更新。
+//
+// 只在**本次校验真的发生了**（verification.Verified）时成立：内置条目没有 manifest，
+// 幂等语义保持与引入更新前完全一致。
+func needsUpdate(existing InstalledRecord, verification Verification) bool {
+	if !verification.Verified || verification.ManifestSHA256 == "" {
+		return false
+	}
+	recorded := refString(existing.Ref, "manifest_sha256")
+	return !strings.EqualFold(recorded, verification.ManifestSHA256)
+}
+
+// mergeVerification 把校验结果写进落点引用（ref 是 map，落点实现不需要认识信任链）。
+//
+// 记进 ref 而不是新列：ref 已经是"落点事实"的载体，且记录表结构不由本包拥有
+// （迁移文件不在本项范围内）。升级判定与审计都从这三个键读。
+func mergeVerification(ref map[string]any, verification Verification) map[string]any {
+	out := nonNilRef(ref)
+	if !verification.Verified {
+		return out
+	}
+	out["manifest_verified"] = true
+	out["manifest_sha256"] = verification.ManifestSHA256
+	if verification.KeyID != "" {
+		out["signature_key_id"] = verification.KeyID
+	}
+	return out
 }

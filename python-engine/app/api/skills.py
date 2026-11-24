@@ -30,6 +30,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from typing import Any
 
@@ -100,6 +102,47 @@ class SkillInstallRequest(BaseModel):
     #: 市场安装流水线（internal/api/market_install.go）显式传 `market:<source>/<id>`；
     #: 其它调用方缺省按 `local` 处理。
     origin: str = ""
+    #: H5：内容摘要（inline 字节的 hex sha256）。市场安装流水线在网关侧校验完
+    #: manifest 之后把摘要一并带下来，引擎再复核**收到的字节**没有被中间环节改写。
+    sha256: str = ""
+    #: H5：是否**强制**要求摘要。网关路径恒为 true（外部内容必须带摘要），
+    #: 缺摘要直接拒绝且不落盘；老调用方缺省 false，行为与引入前完全一致。
+    integrity_required: bool = False
+
+
+def _verify_inline_integrity(raw: bytes, req: "SkillInstallRequest") -> None:
+    """复核 inline 字节的 sha256（H5 的第二道闸）。
+
+    两种失败语义分开：
+
+    * **缺摘要**：`integrity_required` 为真时是硬失败（发布方/网关路径必须带摘要），
+      否则按老行为放行 —— 老调用方（本地导入、测试）不因为多了个字段就不能用；
+    * **摘要不匹配**：无论是否强制，只要声明了摘要就必须对得上（声明的意思就是
+      "我保证是这个内容"）。
+
+    两种失败都在 `store.save` 之前抛出，因此**不落盘**。
+    """
+    declared = (req.sha256 or "").strip().lower()
+    if not declared:
+        if req.integrity_required:
+            raise HTTPException(
+                status_code=400,
+                detail="skill install requires a sha256 integrity digest",
+            )
+        return
+    if len(declared) != 64 or any(c not in "0123456789abcdef" for c in declared):
+        raise HTTPException(
+            status_code=400, detail="sha256 must be 64 hex characters"
+        )
+    actual = hashlib.sha256(raw).hexdigest()
+    if not hmac.compare_digest(actual, declared):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "skill install integrity check failed: sha256 mismatch "
+                f"(declared {declared[:12]}…, got {actual[:12]}…)"
+            ),
+        )
 
 
 @router.post("/v1/skills/{name}/register")
@@ -159,6 +202,9 @@ async def install_skill(
 
     try:
         if body.inline:
+            raw_inline = body.inline.encode("utf-8")
+            # H5：先校验摘要，再解析内容 —— 校验失败时连 JSON 都不解析，更不会落盘。
+            _verify_inline_integrity(raw_inline, body)
             data = json.loads(body.inline)
         elif body.file:
             from app.tools.core import _safe_path
@@ -178,6 +224,10 @@ async def install_skill(
                 resp = await fetch_url_safe(client, body.url)
                 resp.raise_for_status()
                 data = resp.json()
+    except HTTPException:
+        # 完整性校验的拒绝必须原样透出（400 + 具体原因）：
+        # 被下面那个兜底的 500 覆盖会让"内容不可信"看起来像"引擎坏了"。
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"failed to load skill definition: {e}"

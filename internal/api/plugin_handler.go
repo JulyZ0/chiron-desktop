@@ -537,19 +537,45 @@ func (h *PluginHandler) readPlugins(userID string) ([]MCPPlugin, error) {
 	return pf.MCPServers, nil
 }
 
+// savePluginsFile 原子写 plugins.json（临时文件 + Rename，权限 0600）。
+//
+// 为什么必须原子（H5 的"原子安装/更新"）：市场安装与插件页配置写的是**同一份文件**。
+// 直接 os.WriteFile 在截断与写满之间崩溃会留下半截 JSON —— 用户看到的是"插件全没了"，
+// 而市场侧还会以为"记录在、配置也在"。临时文件 + Rename 让读侧永远看到完整的一代。
 func (h *PluginHandler) savePluginsFile(userID string, pf pluginsFile) error {
 	if pf.MCPServers == nil {
 		pf.MCPServers = []MCPPlugin{}
 	}
 	path := h.userPluginPath(userID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(pf, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	tmp, err := os.CreateTemp(dir, "plugins.json.tmp*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		// Rename 成功后是幂等 no-op；失败路径上它负责清理残片。
+		_ = os.Remove(tmpName)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		// Windows 上 Chmod 语义有限，失败不致命（文件仍在用户私有目录下）。
+		slog.Debug("plugin config: chmod failed", "error", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (h *PluginHandler) writePlugins(userID string, plugins []MCPPlugin) error {
