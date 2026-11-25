@@ -1,8 +1,8 @@
 # PRD：Chiron 远程执行与团队服务模式
 
 - 状态：S0–S4、R1/R3/R4/R5 已实现；R6/R7 观测告警、R9 span/trace、R10 数据生命周期在推进。
-- 加固来源：H1–H86 为 2026-11-24 全量审计（前端/桌面壳/后端）。**已完成 74 项**（9.5）、
-  **待办 8 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
+- 加固来源：H1–H86 为 2026-11-24 全量审计（前端/桌面壳/后端）。**已完成 75 项**（9.5）、
+  **待办 7 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
 - **推进只看第 9 章**：9.1 顺序、9.2 待办与可执行判据、9.3 退出条件、9.4 待决策、9.5 证据。
 - 当前：W1/W2 已完成，**W3 进行中**（剩 H38/H44/H51/H16）；W4（H2/H20/H19/H22）等外部条件。
 - 待团队主机：R2 实测切换、R6 压测、Web E2E；未覆盖：LiteLLM/Langfuse 实例级、租户删除闭环、S5 演练。
@@ -125,10 +125,10 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 |---|---|---|
 | W1 | H45、H48、H50、H73、H76、H11（对外风险 + 单点改动） | ✅ 完成 |
 | W2 | H7、H36、H41、H17、H15、H60（加"身份/代次/预占"中间层） | ✅ 完成 |
-| W3 | H46、H47、H24、H14 已完成；剩 **H38、H44、H51、H16**（体量大，按 9.2 切片） | 进行中 |
+| W3 | H46、H47、H24、H14、H38 已完成；剩 **H44、H51、H16** | 进行中 |
 | W4 | H2、H20、H19、H22（外部条件/产品决策未定） | 暂缓（见 9.4） |
 
-### 9.2 待办清单（8 项）
+### 9.2 待办清单（7 项）
 
 "完成定义"一栏是**可执行判据**：满足它即可从本表删除，并把证据登记进 9.5。
 "切片"一栏给出单项可独立验收的第一步，避免"一次改到底、谁也无法证明它对"。
@@ -136,7 +136,6 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | ID | P | 目标 | 完成定义（可执行判据） | 切片 / 前置 | 波次 |
 |---|---|---|---|---|---|
 | H16 | P2 | 版本化 Go/Python 契约 | 为 submit/run event、tool call/approval、checkpoint、queue payload、MCP config、error/terminal state 建立版本化 schema 与**双端 conformance 测试**；不兼容变更必须升版本，旧版本读取方要显式拒绝而非按缺省猜 | ①先做 error/terminal 与 run event 两族（影响面最大）②再做 tool/approval ③最后 checkpoint/queue/MCP | W3 |
-| H38 | P1 | 子 Agent 复用完整执行链 | 子 Agent 走与主 Agent 相同的 ToolGuard/Broker/审批/副作用账本；undo 先验证快照哈希与路径再替换，失败可恢复且不损坏二进制 | ①统一 execute 入口 ②副作用账本 ③undo 校验 | W3 |
 | H44 | P2 | 审计/导出/留存与引用完整性 | 审计写入与 ACK 有明确 outbox/事务语义（不再丢）；导出有行/字节/并发上限；用量与留存操作原子可恢复；引用解析失败**拒绝**而非放行；`no_retention` 全链路不落盘 | ①审计语义 ②导出上限 ③用量原子 ④PageIndex fail-closed ⑤no_retention | W3 |
 | H51 | P1 | 运行时与组件供应链 | 依赖与 artifact 全量 hash 锁定；组件 manifest 用内嵌公钥验签；仅允许 HTTPS 与批准主机（不静默切镜像）；安装后与执行前复验 | ①uv hash lock ②manifest 验签 ③主机白名单 ④复验；验签根依赖发布基础设施 | W3 |
 | H2 | P0 | Linux 内核级隔离 | 默认无网络、工作区外只读、读不到引擎凭证、进程树可回收；bwrap/gVisor 不可用时**拒绝执行**而非降级 setrlimit | 需要 Linux 真机；本机只能做"拒绝降级"的开关与探针 | W4 |
@@ -151,7 +150,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | M1 对外安全门禁 ✅ | W1 六项全部有回归；`go build/test`、`vue-tsc`、`check:ui`、electron `node --test` 全绿 |
 | M2 执行可靠性 ✅ | 并发/竞态探针可复现"修复前失败"（fakeredis 真跑 Lua）；H7 由 CI 真 Redis 复核 |
 | M3 契约与设备 ✅ | 设备桥票据为唯一凭据；renderer 特权面为"主框架 + 登记窗口 + 能力表"且有回归 |
-| M4 数据与授权收口 | H38/H44/H51/H16：授权、审计、供应链、契约各自有"未授权即拒绝"的探针 |
+| M4 数据与授权收口 | H44/H51/H16：审计、供应链、契约各自有"未授权即拒绝"的探针 |
 
 ### 9.4 待确认决策
 
@@ -241,6 +240,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H82 | 收紧保留期改为先预览再确认：新增只读端点 `POST /v1/admin/retenti… | `retention_settings_test.go` |
 | H83 | 平台 Owner 专属后台入口三处同口径… | `platformOwnerNav.spec.ts` |
 | H86 | 受管 CPython 固定到补丁版本（3.14.4），构建期/运行期两处常量由测试守住… | `runtime-version-pin.test.cjs` |
+| H38 | 子 Agent 不再绕过执行链：`SubAgent` 支持注入 `tool_executor`，生产调度器（`AgentDispatcher(runtime=…)`）注入**走 guard 链**的执行器，与主 Agent 同口径的 ToolGuard / 服务端授权 / 副作用账本；后台不可交互，「需要确认」降级为**显式拒绝**。undo 三处收口：快照存 **base64 原始字节**（二进制不再被替换坏）、`pop_and_restore` 失败**回栈可重试**、写入用 `O_NOFOLLOW` 关掉 TOCTOU 窗口 | `test_subagent_chain_undo_h38.py`（10 项）、子 Agent/undo 相关 39 项 |
 
 ## 10. 参考
 
