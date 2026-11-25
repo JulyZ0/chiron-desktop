@@ -62,6 +62,9 @@ _READ_TOOLS: frozenset[str] = frozenset(
         # 名字必须先在镜像里挂号，否则未注册的调用会 fail-closed 到 write）。
         "graph_templates",
         "read_subagent_result", "read_tool_result", "read_archive", "list_subagent_runs", "job_output", "stderr_drain",
+        # LSP 查询（G23）：只读工作区文件、不写盘、不连外网 ⇒ read 级。
+        # 不登记就会被 fail-closed 到 write，每跳一次定义都要人确认。
+        "lsp_definition", "lsp_diagnostics",
         "requirement_validate", "task_decompose", "tech_design", "prd_generate",
         "vision_analyze", "speech_to_text", "video_analyze",
         "tool",

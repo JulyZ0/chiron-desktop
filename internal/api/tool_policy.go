@@ -70,7 +70,9 @@ var toolLevelTable = func() map[string]ToolLevel {
 		// 不碰文件、不触外部 ⇒ read 级。与 python-engine/app/agent/tool_policy.py 同构。
 		"compact_conversation",
 		"graph_templates",
-		"read_subagent_result", "read_tool_result", "read_archive", "list_subagent_runs", "job_output", "stderr_drain",
+		"read_subagent_result", "read_tool_result", "read_archive", "list_subagent_runs", "job_output",
+		// LSP 查询（G23）：只读查询，与 Python 镜像逐级别一致。
+		"lsp_definition", "lsp_diagnostics", "stderr_drain",
 		"requirement_validate", "task_decompose", "tech_design", "prd_generate",
 		"vision_analyze", "speech_to_text", "video_analyze",
 		"tool",
