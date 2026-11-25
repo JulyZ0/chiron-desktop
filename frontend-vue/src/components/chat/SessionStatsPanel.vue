@@ -9,6 +9,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { getSessionMetrics, type SessionMetrics } from '../../api/sessionRuntime'
+import { createKeyedGuard } from '../../utils/staleGuard'
 
 const props = defineProps<{ sessionId?: string }>()
 
@@ -16,21 +17,33 @@ const metrics = ref<SessionMetrics | null>(null)
 const loading = ref(false)
 const failed = ref(false)
 
+// G5：代次票据。面板是**唯一**没接 `staleGuard` 的异步面板（KB 预览 / InteractionInbox /
+// MediaView / workbench 都已接），而它显示的 token 与费用恰好是最容易被当作"精确数字"
+// 相信的内容 —— 快速切会话时旧响应覆盖新数据，用户看到的是**另一个会话的账**。
+const guard = createKeyedGuard(() => props.sessionId || '')
+
 async function load() {
   if (!props.sessionId) {
+    guard.ticket('') // 让在飞请求失效
     metrics.value = null
+    loading.value = false
+    failed.value = false
     return
   }
+  const ticket = guard.ticket(props.sessionId)
   loading.value = true
   failed.value = false
   try {
-    metrics.value = await getSessionMetrics(props.sessionId)
+    const data = await getSessionMetrics(props.sessionId)
+    if (!guard.isValid(ticket)) return // 已经切走了：这份数据属于上一个会话
+    metrics.value = data
   } catch {
+    if (!guard.isValid(ticket)) return
     // 指标不可用不该打断阅读：面板自己降级成一行提示
     failed.value = true
     metrics.value = null
   } finally {
-    loading.value = false
+    if (guard.isValid(ticket)) loading.value = false
   }
 }
 watch(() => props.sessionId, load, { immediate: true })
