@@ -42,6 +42,7 @@ else:
     import app.tools.glob_tools  # noqa: F401
     import app.tools.jobs  # noqa: F401
     import app.tools.kb  # noqa: F401
+    import app.tools.lsp  # noqa: F401 — G23：lsp_definition / lsp_diagnostics（常驻语言服务器）
     import app.tools.media  # noqa: F401
     import app.tools.memory  # noqa: F401
     import app.tools.pm  # noqa: F401
