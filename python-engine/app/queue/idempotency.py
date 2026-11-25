@@ -123,7 +123,10 @@ if ARGV[5] == 'xadd' then
     -- 它）时才用 `MAXLEN ~`。
     local summary = redis.call('XPENDING', KEYS[2], ARGV[2])
     local others = tonumber(summary[1] or 0) or 0
-    if others > 1 then
+    -- maxlen<=0 视为"不裁剪"。否则 `MAXLEN ~ 0` 会把**刚写进去的这条**也裁掉 ——
+    -- 转移成功、消息消失，任务既不在队列也不在 DLQ，是最难查的一种丢件。
+    local maxlen = tonumber(ARGV[7]) or 0
+    if others > 1 or maxlen <= 0 then
         redis.call('XADD', KEYS[3], '*', unpack(ARGV, 11))
     else
         redis.call('XADD', KEYS[3], 'MAXLEN', '~', ARGV[7], '*', unpack(ARGV, 11))
