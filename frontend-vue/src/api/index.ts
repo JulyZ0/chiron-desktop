@@ -18,6 +18,11 @@ import type { WorkstationType } from '../types/workstation'
 import { t } from '../i18n'
 import { currentDeviceMode, isDevAuthBypassEnabled, type ChironMode } from '../stores/device'
 import { sanitizeAttachmentUrl } from '../utils/safeAttachmentUrl'
+import {
+  MEDIA_CACHE_EXPIRY_MARGIN_MS,
+  MediaUrlCache,
+  canRenderFileUrlDirectly,
+} from '../utils/mediaUrlCache'
 /** 桌面壳（Electron）在 preload 里注入 chironDesktop.apiUrl；Web 端回落到构建期变量 */
 type DesktopHost = {
   apiUrl?: string
@@ -1361,8 +1366,41 @@ export default api
 // ─────────────────────────────────────────────────────────────
 
 // ── 媒体签名 URL（短时效，防裸公开猜测）──
-const signedMediaCache = new Map<string, { url: string; exp: number }>()
-const SIGNED_URL_EXPIRY_MARGIN_MS = 30_000
+// H67：缓存必须**按身份作用域**隔离（user/tenant/mode/origin）。旧实现只有
+// `Map<assetId, {url,exp}>`：换账号后仍然命中上一个身份的签名 URL（签名里带着那个
+// 身份的授权主体），登出也不清 —— 已经无权访问的资产会"看起来还能看"。
+const signedMediaCache = new MediaUrlCache()
+const SIGNED_URL_EXPIRY_MARGIN_MS = MEDIA_CACHE_EXPIRY_MARGIN_MS
+
+/** 刷新缓存作用域：登出/换账号会立刻改变它，从而整体作废缓存。 */
+function refreshMediaCacheScope(): void {
+  let userId = ''
+  let tenantId = ''
+  try {
+    const stored = JSON.parse(localStorage.getItem('user') || '{}') as {
+      id?: unknown
+      tenant_id?: unknown
+      tenantId?: unknown
+    }
+    if (typeof stored.id === 'string') userId = stored.id
+    const tenant = stored.tenant_id ?? stored.tenantId
+    if (typeof tenant === 'string') tenantId = tenant
+    else if (typeof tenant === 'number') tenantId = String(tenant)
+  } catch {
+    // 解析失败 = 没有可信身份：作用域留空，缓存随之清空（宁可重签）。
+  }
+  signedMediaCache.setScope({
+    userId,
+    tenantId,
+    mode: String((globalThis as { __chironDeviceMode?: string }).__chironDeviceMode || ''),
+    origin: API_URL,
+  })
+}
+
+// 登出/切账号：与 H68 的认证代次围栏共用同一个重置钩子（缓存必须一起作废）。
+registerAuthScopedReset(() => {
+  signedMediaCache.clear()
+})
 
 function signedUrlExpiry(url: string): number {
   try {
@@ -1374,7 +1412,7 @@ function signedUrlExpiry(url: string): number {
 }
 
 export function invalidateMediaUrl(id: string): void {
-  signedMediaCache.delete(id)
+  signedMediaCache.invalidate(id)
 }
 
 export function isMediaUrlExpired(url: string): boolean {
@@ -1392,36 +1430,57 @@ export async function signMediaUrl(id: string): Promise<string> {
  * 解析媒体资源为可访问 URL：非 /media/ 前缀(绝对/签名/data:)直接返回；
  * /media/ 公开路径统一改走签名 URL（带 12 分钟本地缓存）。
  */
+/**
+ * 解析媒体资源为可访问 URL。
+ *
+ * H67 之后的口径是**默认拒绝**：
+ *   1. 站内相对路径（`/media/…`、`/v1/…`）、同源或显式受信任 origin 的 https、
+ *      `blob:`、图片类 `data:` —— 可以直接渲染；
+ *   2. 其它绝对 URL（典型：**裸 S3 对象 URL**）—— 一律**不交给 renderer**：
+ *      私桶里它加载不出来，公开桶里它绕过授权语义（对象地址泄漏即永久可读）。
+ *      有资产 id 就走服务端 owner-bound 签名；没有 id 就返回空串（界面按不可用处理）。
+ *
+ * 签名结果还要过与附件相同的来源校验；缓存按身份作用域隔离（见 utils/mediaUrlCache.ts）。
+ */
 export async function resolveMediaUrl(
   asset: { id?: string; file_url?: string },
   force = false,
 ): Promise<string> {
-  const f = asset?.file_url || ''
-  if (f && !f.startsWith('/media/')) return f
-  if (!asset?.id) return f
+  const f = String(asset?.file_url || '')
+  const id = String(asset?.id || '')
+  refreshMediaCacheScope()
 
-  const now = Date.now()
-  for (const [key, value] of signedMediaCache.entries()) {
-    if (value.exp - SIGNED_URL_EXPIRY_MARGIN_MS <= now) {
-      signedMediaCache.delete(key)
-    }
+  const trustedOrigins = String(import.meta.env.VITE_MEDIA_TRUSTED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean)
+  const selfOrigin = typeof window !== 'undefined' ? window.location?.origin : ''
+  const renderDirectly = canRenderFileUrlDirectly(f, { selfOrigin, trustedOrigins })
+
+  // 可直接渲染、且不是"需要签名的 /media/ 公开路径" ⇒ 原样返回。
+  if (renderDirectly && !f.startsWith('/media/')) return f
+  if (!id) {
+    // 没有资产 id 就无法兑换签名：给空串，别把裸对象地址发出去。
+    return ''
   }
 
-  const cached = signedMediaCache.get(asset.id)
-  if (!force && cached && cached.exp - SIGNED_URL_EXPIRY_MARGIN_MS > Date.now()) {
-    return cached.url
-  }
+  signedMediaCache.prune()
+
+  const cached = force ? null : signedMediaCache.get(id)
+  if (cached) return cached.url
 
   try {
-    const url = await signMediaUrl(asset.id)
+    const url = await signMediaUrl(id)
     if (!url) throw new Error('empty signed media URL')
-    const expiry = signedUrlExpiry(url) || Date.now() + 12 * 60 * 1000
-    signedMediaCache.set(asset.id, { url, exp: expiry })
-    return url
+    const safe = sanitizeAttachmentUrl(url, { selfOrigin, trustedOrigins })
+    if (!safe) throw new Error('untrusted signed media URL')
+    const expiry = signedUrlExpiry(safe) || Date.now() + 12 * 60 * 1000
+    signedMediaCache.set(id, safe, expiry)
+    return safe
   } catch (error) {
-    invalidateMediaUrl(asset.id)
+    invalidateMediaUrl(id)
     if (force) throw error
-    return f
+    return renderDirectly ? f : ''
   }
 }
 
