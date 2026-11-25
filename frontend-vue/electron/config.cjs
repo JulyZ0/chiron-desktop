@@ -14,6 +14,7 @@
  */
 const fs = require('node:fs')
 const path = require('node:path')
+const apiUrlPolicy = require('./api-url-policy.cjs')
 
 let electronApp = null
 try {
@@ -366,8 +367,18 @@ function resolveApiUrl(settings = readDeviceSettings()) {
   }
 }
 
-function saveApiUrl(raw) {
-  return saveDeviceSettings({ apiUrl: normalizeApiUrl(raw) }).apiUrl
+function saveApiUrl(raw, options = {}) {
+  // H50：保存时校验传输安全 —— 非 loopback 的明文地址默认拒绝。
+  // 只在"连接建立前"校验是不够的：配置一旦落盘，后续每次启动都会用它发 token。
+  const verdict = apiUrlPolicy.classifyApiUrl(raw, {
+    allowInsecure: options.allowInsecure === true,
+  })
+  if (!verdict.ok) {
+    const err = new Error(verdict.message || verdict.reason)
+    err.reason = verdict.reason
+    throw err
+  }
+  return saveDeviceSettings({ apiUrl: verdict.url }).apiUrl
 }
 
 /**

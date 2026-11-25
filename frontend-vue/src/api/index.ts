@@ -19,6 +19,7 @@ import { t } from '../i18n'
 import { currentDeviceMode, isDevAuthBypassEnabled, type ChironMode } from '../stores/device'
 import { sanitizeAttachmentUrl } from '../utils/safeAttachmentUrl'
 import { redactText, summarizeApiError } from '../utils/redact'
+import { canSendCredentials, classifyApiUrl } from '../utils/apiUrlPolicy'
 import {
   MEDIA_CACHE_EXPIRY_MARGIN_MS,
   MediaUrlCache,
@@ -284,10 +285,44 @@ export const api = axios.create({
   withCredentials: !isDesktop,
 })
 
+/**
+ * H50：判断当前服务地址能否携带凭据。
+ *
+ * **不抛错**，只回答"能不能带凭据"。理由：
+ *   · 拦截器抛错会让每一次请求都变成"服务地址不安全"，而首启时 base URL 本来就是空的
+ *     （地址在配置页才填），那时所有请求都会被这条守卫打死 —— 守卫把可用性问题
+ *     变成了不可用；
+ *   · 真正该抛错的是**保存配置**那一侧（主进程 `config.cjs`），那里才是用户输入的时刻。
+ *
+ * 结论只有三态：
+ *   · 无法判定（空/不可解析）→ 允许（请求本来也发不出去，axios 会给出准确错误）；
+ *   · https / 回环 → 允许；
+ *   · 明文 + 非回环 → **不允许携带凭据**（请求照发，token/Cookie 一概不带）。
+ */
+function assertTransportSafe(url: string): { sendCredentials: boolean } {
+  const verdict = classifyApiUrl(url, { allowInsecure: true })
+  if (!verdict.ok) return { sendCredentials: true }
+  return { sendCredentials: canSendCredentials(url).ok }
+}
+
 api.interceptors.request.use((config) => {
   // 本地模式带设备 token（preload 注入），云端模式带登录 token；都没有就不设头
   const token = requestToken()
-  if (token) config.headers.set('Authorization', `Bearer ${token}`)
+  if (token) {
+    // H50：**连接建立前**再校验服务地址。
+    //
+    // 配置保存时已经校验过一次（`electron/config.cjs`），但 `config.json` 是用户可
+    // 手改的，进程启动时也可能带着旧地址 —— 所以两个出口各校验一次：
+    //   · 明文 + 非回环 ⇒ 允许请求但**不带任何凭据**（明文下再"允许"等于主动泄漏）；
+    //   · 其它（https / 回环）⇒ 正常携带。
+    const transport = assertTransportSafe(String(config.baseURL || API_URL || ''))
+    if (transport.sendCredentials) {
+      config.headers.set('Authorization', `Bearer ${token}`)
+    } else {
+      // 让调用方知道"这次是匿名请求"，否则 401 会被误读成登录过期。
+      ;(config as { __anonymous?: boolean }).__anonymous = true
+    }
+  }
   // H68：把"这一笔请求属于哪个账号 / 哪一份凭据"钉在 config 上。
   // 之后无论是 401、重放还是 profile 写回，都先拿它和当前代次比对。
   config.__authGeneration = authGeneration
