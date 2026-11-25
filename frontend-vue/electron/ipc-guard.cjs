@@ -74,33 +74,53 @@ function checkSender(event, options = {}) {
  * 辅助页（setup/error）不在表里 ⇒ 一律拒绝，即使它拿到了通道。
  */
 const WINDOW_CAPABILITIES = {
-  // 主界面：整套特权（token、设备桥、破坏性操作、后端生命周期、打开路径）。
+  // 主界面：除辅助页专属之外的**全部**特权通道（显式列出，能力面一眼可读）。
   main: new Set([
-    'desktop:get-device-id',
-    'desktop:get-device-bridge-status',
-    'desktop:save-token',
-    'desktop:clear-token',
-    'desktop:get-two-factor-status',
     'desktop:begin-two-factor',
-    'desktop:confirm-two-factor',
-    'desktop:disable-two-factor',
-    'desktop:reset-two-factor',
-    'desktop:verify-lock-password',
-    'desktop:save-engine-env-settings',
-    'desktop:copy-text',
     'desktop:check-update',
+    'desktop:clear-token',
+    'desktop:confirm-two-factor',
+    'desktop:copy-text',
+    'desktop:disable-two-factor',
+    'desktop:get-device-bridge-status',
+    'desktop:get-device-id',
+    'desktop:get-engine-env-settings',
+    'desktop:get-hello-availability',
+    'desktop:get-model-config',
+    'desktop:get-os-account',
+    'desktop:get-token',
+    'desktop:get-two-factor-status',
+    'desktop:grant-project-root',
+    'desktop:install-mount-dep',
     'desktop:install-update',
-    'desktop:open-subagent-dock',
+    'desktop:mount-deps-status',
+    'desktop:open-path',
+    'desktop:open-setup',
+    'desktop:pick-directory',
+    'desktop:pick-document',
+    'desktop:project-roots',
+    'desktop:regenerate-recovery-codes',
+    'desktop:reset-two-factor',
+    'desktop:restart-component',
+    'desktop:restart-local-backend',
+    'desktop:revoke-project-root',
+    'desktop:save-engine-env-settings',
+    'desktop:save-model-config',
+    'desktop:save-token',
+    'desktop:update-status',
+    'desktop:verify-lock-password',
+    'desktop:wipe-local-data',
   ]),
-  // 辅助页：只够"配地址 / 切模式 / 自检 / 重启"。
+  // 辅助页（setup/error）：只够"配地址 / 切模式 / 自检 / 重启"。
   setup: new Set([
     'desktop:get-app-info',
     'desktop:get-device-settings',
+    'desktop:restart',
     'desktop:set-api-url',
     'desktop:set-mode',
     'desktop:test-api-url',
-    'desktop:restart',
   ]),
+  // error 页比 setup 更窄：只要版本信息与重启（它没有输入框）。
   error: new Set(['desktop:get-app-info', 'desktop:restart']),
 }
 
