@@ -22,24 +22,30 @@ export interface ApiUrlVerdict {
   url?: string
   isLoopback?: boolean
   reason?: string
-  message?: string
+  /**
+   * 失败原因的 **i18n key**（`apiUrl.*`）。
+   *
+   * 刻意不在这里拼中文：本仓的 i18n 契约（`scripts/check-i18n.mjs`）要求用户可见
+   * 文案走 `t()`，工具模块里的字面量过不了门禁，也无法被翻译。
+   */
+  messageKey?: string
 }
 
 export function classifyApiUrl(raw: string, options: { allowInsecure?: boolean } = {}): ApiUrlVerdict {
   const text = String(raw || '').trim()
-  if (!text) return { ok: false, reason: 'empty', message: '服务地址为空' }
+  if (!text) return { ok: false, reason: 'empty', messageKey: 'apiUrl.empty' }
 
   let url: URL
   try {
     url = new URL(text)
   } catch {
-    return { ok: false, reason: 'unparsable', message: `无法解析的服务地址：${text}` }
+    return { ok: false, reason: 'unparsable', messageKey: 'apiUrl.unparsable' }
   }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    return { ok: false, reason: 'scheme', message: `只接受 http(s) 地址，收到 ${url.protocol}` }
+    return { ok: false, reason: 'scheme', messageKey: 'apiUrl.scheme' }
   }
   if (url.username || url.password) {
-    return { ok: false, reason: 'credentials-in-url', message: '服务地址不能内嵌用户名/密码' }
+    return { ok: false, reason: 'credentials-in-url', messageKey: 'apiUrl.credentialsInUrl' }
   }
 
   const loopback = isLoopbackHostname(url.hostname)
@@ -48,7 +54,7 @@ export function classifyApiUrl(raw: string, options: { allowInsecure?: boolean }
       ok: false,
       reason: 'insecure-scheme',
       isLoopback: false,
-      message: '远程服务必须使用 HTTPS；如确需明文，请显式开启「允许不安全连接」',
+      messageKey: 'apiUrl.insecure',
     }
   }
   return { ok: true, url: url.origin, isLoopback: loopback }

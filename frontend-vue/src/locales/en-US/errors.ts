@@ -3,6 +3,13 @@
  * 键与 internal/api/error_codes.go 的 Code* 常量一一对应，勿改键名。
  */
 export default {
+  apiUrl: {
+    empty: "Service address is empty",
+    unparsable: "Cannot parse the service address",
+    scheme: "Only http(s) addresses are accepted",
+    credentialsInUrl: "The service address must not embed a username or password",
+    insecure: "Remote services must use HTTPS; enable “allow insecure” explicitly if you really need plaintext",
+  },
   // Authentication / authorization
   auth_required: 'Your session has expired. Please sign in again.',
   forbidden: 'You do not have permission to perform this action.',

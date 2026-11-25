@@ -8,6 +8,13 @@
  * 改文案只改这里；不要改键名 —— 键是与后端约定的契约。
  */
 export default {
+  apiUrl: {
+    empty: "服务地址为空",
+    unparsable: "无法解析的服务地址",
+    scheme: "只接受 http(s) 地址",
+    credentialsInUrl: "服务地址不能内嵌用户名/密码",
+    insecure: "远程服务必须使用 HTTPS；如确需明文，请显式开启「允许不安全连接」",
+  },
   // 认证 / 授权
   auth_required: '登录状态已失效，请重新登录',
   forbidden: '没有权限执行该操作',
