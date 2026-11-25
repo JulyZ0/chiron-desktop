@@ -33,6 +33,7 @@ const os = require('node:os')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const { spawn } = require('node:child_process')
+const { killProcessTree, killOptions } = require('./proc-tree.cjs')
 
 const { isWithin, isUncPath, stripWindowsVerbatim } = require('./approved-roots.cjs')
 const {
@@ -573,6 +574,8 @@ function runGitProcess(cwd, args, timeoutMs, spawnGit) {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
         env,
+        // H56：POSIX 下自成进程组，超时时才能整组杀掉（Windows 走 taskkill /T）。
+        ...killOptions(),
       })
     } catch (err) {
       const missing = err && err.code === 'ENOENT'
@@ -599,11 +602,13 @@ function runGitProcess(cwd, args, timeoutMs, spawnGit) {
       resolve({ ...payload, stdout: outputText(stdout), stderr: outputText(stderr) })
     }
     timer = setTimeout(() => {
-      try {
-        child.kill()
-      } catch {
-        /* Already exited. */
-      }
+      // H56：git 会派生 credential helper / ssh / fsmonitor 等子进程。
+      // 只 kill 直接子进程时它们会继续持有仓库锁（index.lock），
+      // 于是"超时后重试"永远失败，用户看到的是"仓库坏了"。
+      // runGitProcess 没有 logger 参数（它只 resolve 结果），终止失败也没人可报；
+      // 这里显式传空操作，而不是引用一个作用域外的 `log`（那会在超时分支抛
+      // ReferenceError，把"超时返回 -1"变成"未捕获异常"）。
+      void killProcessTree(child, {})
       stderr.push(Buffer.from(`git timeout after ${timeoutMs}ms`))
       finish({ code: -1, truncated })
     }, timeoutMs)

@@ -38,6 +38,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
 const childProcess = require('node:child_process')
+const { killProcessTree, killOptions } = require('./proc-tree.cjs')
 const { probeRuntime } = require('./runtime-probe.cjs')
 const { PIP_INDEX_MIRRORS } = require('./shared.cjs')
 
@@ -656,6 +657,8 @@ function runCommand(command, args, options = {}) {
         env: { ...process.env, ...(options.env || {}) },
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // H56：POSIX 上让子进程自成进程组，取消/超时时才能整组杀掉。
+        ...killOptions(),
       })
     } catch (err) {
       reject(new Error(`无法执行 ${path.basename(command)}：${err && err.message ? err.message : err}`))
@@ -665,12 +668,11 @@ function runCommand(command, args, options = {}) {
     let settled = false
     let idleTimer = null
 
+    // H56：必须杀**进程树**。只 kill 直接子进程时，它派生的 pip / git helper
+    // 会活下来继续写盘 —— 紧接着的"清理临时目录/覆盖安装"就会因为文件被占用而失败，
+    // 而错误信息指向的是删目录，不是那个残留进程。
     const stopChild = () => {
-      try {
-        child.kill()
-      } catch {
-        /* 杀不掉也要走失败分支 */
-      }
+      void killProcessTree(child, { log: options.log })
     }
 
     const bail = error => {
