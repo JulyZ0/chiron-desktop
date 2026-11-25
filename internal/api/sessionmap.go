@@ -73,13 +73,13 @@ type SessionMapNode struct {
 
 // SessionMapWorkspace 是一个 workspace：项目（RootPath 非空）或画布（RootPath 为空）。
 type SessionMapWorkspace struct {
-	ID        string                 `json:"id"`
-	Name      string                 `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 	// RootPath 是项目绑定的本地文件夹。空串 = 旧形态的画布。
 	//
 	// 判定「这是项目还是画布」只能看这个字段：非空即项目。不设第三种形态，
 	// 因为「既像项目又像画布」的中间态会让侧边栏与画布语义同时含糊。
-	RootPath  string                 `json:"root_path"`
+	RootPath string `json:"root_path"`
 	// SortIndex 供侧边栏排序；同值时按 name 兜底，避免顺序抖动。
 	SortIndex int                    `json:"sort_index"`
 	Viewport  map[string]interface{} `json:"viewport"`
@@ -397,6 +397,10 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 		ws = smPruneMissingSessions(ctx, ws)
 		return nil
 	}
+	if ws.TenantID == "" || ws.UserID == "" {
+		// 没有归属就不落库：宁可这次保存失败，也不能把一条"说不清是谁的"画布写进 PG。
+		return fmt.Errorf("sessionmap: refuse to persist workspace %q without owner", ws.ID)
+	}
 	viewport, _ := json.Marshal(ws.Viewport)
 	// 必须整体在**一个事务**里：先 DELETE 全部节点、再逐条 INSERT。
 	// 此前每条语句各自提交，于是"DELETE 成功、第 7 条 INSERT 失败"时，画布在 PG 里
@@ -404,11 +408,23 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 	// 用户看到的是"地图上的节点凭空少了一半"，而日志里只有一行 flush failed。
 	// 事务化之后失败即整体回滚，dirty 重试拿到的仍是完整快照。
 	return db.GlobalDBManager.WithTransaction(ctx, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx,
+		// H78：**落库必须带归属谓词**。
+		//
+		// 此前只按 `id`：只要热层里存在一个不属于调用者的快照（冷缓存时 SaveWorkspace
+		// 会把调用者身份刻进 body），后台 flusher 就会把别人的画布整体覆盖掉。
+		// 这里把 owner 放进 WHERE，并检查影响行数：0 行 = 这条记录不归你（或已不存在），
+		// 必须显式失败，而不是静默当成"保存成功"。
+		tag, err := tx.Exec(ctx,
 			`UPDATE session_map_workspaces
 			    SET name = $2, viewport = $3::jsonb, root_path = $4, sort_index = $5, updated_at = NOW()
-			  WHERE id = $1`, ws.ID, ws.Name, string(viewport), ws.RootPath, ws.SortIndex); err != nil {
+			  WHERE id = $1 AND tenant_id = $6 AND user_id = $7`,
+			ws.ID, ws.Name, string(viewport), ws.RootPath, ws.SortIndex, ws.TenantID, ws.UserID)
+		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("sessionmap: workspace %q is not owned by caller (tenant=%s user=%s)",
+				ws.ID, ws.TenantID, ws.UserID)
 		}
 		// 节点全量替换：先删后插，天然处理"节点被移除"的情况。
 		// 节点量有上限（smMaxNodes），一次 DELETE + 批量 INSERT 比逐节点 diff 简单且不易出错。
@@ -416,9 +432,14 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 		// **`edge_kind <> 'project'` 不是可选优化，是数据安全边界**：
 		// 归属记录与画布节点共用这张表，若这里不过滤，用户拖一次画布就会把
 		// 该项目的全部会话归属删光，侧边栏项目瞬间变空且无日志可循。
+		// 节点删除同样带 owner 子查询：即便上面的 UPDATE 被并发改过归属，这一步也不会
+		// 误删他人节点（少删一个节点只是脏数据，误删是数据丢失）。
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM session_map_nodes
-			  WHERE workspace_id = $1 AND edge_kind <> 'project'`, ws.ID); err != nil {
+			`DELETE FROM session_map_nodes n
+			  USING session_map_workspaces w
+			  WHERE n.workspace_id = $1 AND n.edge_kind <> 'project'
+			    AND w.id = n.workspace_id AND w.tenant_id = $2 AND w.user_id = $3`,
+			ws.ID, ws.TenantID, ws.UserID); err != nil {
 			return err
 		}
 		for _, n := range ws.Nodes {
@@ -440,6 +461,32 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 		}
 		return nil
 	})
+}
+
+// smWorkspaceOwner 是画布的权威归属（H78）。
+type smWorkspaceOwner struct {
+	Tenant string
+	User   string
+}
+
+// smLoadWorkspaceOwner 从**PG**读画布归属；不存在返回 found=false。
+//
+// 刻意不看 Redis：缓存可能被淘汰、可能过期、也可能是上一次进程留下的 ——
+// 授权判定不能建立在一个"可能没有"的层上。
+func smLoadWorkspaceOwner(ctx context.Context, workspaceID string) (smWorkspaceOwner, bool, error) {
+	if db.GlobalDBManager == nil {
+		return smWorkspaceOwner{}, false, fmt.Errorf("sessionmap: database unavailable")
+	}
+	row, err := db.GlobalDBManager.FetchOne(ctx,
+		`SELECT COALESCE(tenant_id,'') AS tenant_id, COALESCE(user_id,'') AS user_id
+		   FROM session_map_workspaces WHERE id = $1`, workspaceID)
+	if err != nil {
+		return smWorkspaceOwner{}, false, err
+	}
+	if row == nil {
+		return smWorkspaceOwner{}, false, nil
+	}
+	return smWorkspaceOwner{Tenant: stringOf(row["tenant_id"]), User: stringOf(row["user_id"])}, true, nil
 }
 
 func smLoadFromPG(ctx context.Context, workspaceID, tenant, userID string) (*SessionMapWorkspace, error) {
@@ -726,13 +773,22 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 	if body.Viewport == nil {
 		body.Viewport = map[string]interface{}{}
 	}
-	// 归属校验：热层若已有同 ID 画布且不属于当前用户，拒绝覆盖 —— 否则攻击者用他人 wsID
-	// 保存即可污染他人热层，并经 flusher 落库覆盖（smPersist 的 UPDATE 只按 id）。
-	if existing, ok := smCacheGet(r.Context(), wsID); ok {
-		if existing.TenantID != smTenant(claims) || existing.UserID != claims.UserID {
-			JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "workspace not found"})
-			return
-		}
+	// 归属校验（H78）：**权威存储说了算**，热层只是缓存。
+	//
+	// 旧实现只在热层命中时校验 owner：冷缓存（重启 / Redis 淘汰 / 无 Redis）下等于不校验，
+	// 于是攻击者拿他人 wsID 发一次 PUT 就能把调用者身份刻进 body、写进热层，再由后台
+	// flusher 落库覆盖对方画布（smPersist 的 UPDATE 当时只按 id）。现在：
+	//   1. 先按 PG 读归属（不看缓存）；
+	//   2. 存在且不归你 ⇒ 404（与"不存在"同一句话，不泄露存在性）；
+	//   3. 不存在 ⇒ 也 404：保存不是创建，创建走 POST /v1/session-map/workspaces。
+	owner, found, err := smLoadWorkspaceOwner(r.Context(), wsID)
+	if err != nil {
+		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "save failed"})
+		return
+	}
+	if !found || owner.Tenant != smTenant(claims) || owner.User != claims.UserID {
+		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "workspace not found"})
+		return
 	}
 	body.TenantID = smTenant(claims)
 	body.UserID = claims.UserID
@@ -744,23 +800,22 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 	// 若这里直接信任 body，客户端只要发一个 PUT 就能把项目指向 `C:\Windows`，
 	// 绕过全部校验，后续 P3 接通执行 cwd 时这会是直接的越权入口。
 	// 因此一律沿用库里的现值。
-	if existing, ok := smCacheGet(r.Context(), wsID); ok {
-		body.RootPath = existing.RootPath
-	} else if row, err := db.GlobalDBManager.FetchOne(r.Context(),
+	// root_path / sort_index 一律以**权威存储**为准（归属已在上面确认）：
+	// 用热层值会让"缓存里的旧快照"替用户做决定，而缓存本来就可能过期。
+	if row, err := db.GlobalDBManager.FetchOne(r.Context(),
 		// AS root_path 不可省：无别名时列名是 `coalesce`，row["root_path"] 取不到。
-		`SELECT COALESCE(root_path,'') AS root_path FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
+		`SELECT COALESCE(root_path,'') AS root_path, COALESCE(sort_index,0) AS sort_index
+		   FROM session_map_workspaces
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
+		wsID, smTenant(claims), claims.UserID); err == nil && row != nil {
 		body.RootPath = stringOf(row["root_path"])
+		body.SortIndex = intOf(row["sort_index"])
 	}
 	// **sort_index 同样不接受客户端提交**：它与 root_path 是同一类字段 ——
 	// 排序是项目树（侧边栏）的属性，由 `PATCH /v1/session-map/projects/{id}` 维护。
 	// 若这里信任 body，「保存画布」这个动作就能顺手改项目顺序，而画布保存是
 	// 前端高频自动调用，用户拖动一下卡片就把别人的排序覆盖掉。
-	if existing, ok := smCacheGet(r.Context(), wsID); ok {
-		body.SortIndex = existing.SortIndex
-	} else if row, err := db.GlobalDBManager.FetchOne(r.Context(),
-		`SELECT COALESCE(sort_index,0) AS sort_index FROM session_map_workspaces WHERE id = $1`, wsID); err == nil && row != nil {
-		body.SortIndex = intOf(row["sort_index"])
-	}
+	// sort_index 已在上面与 root_path 一并按权威存储读取（见上一段注释）。
 	if db.Redis == nil {
 		// 降级：没有热层就直写 PG（可用性优先，不丢用户拖动）
 		if err := smPersist(r.Context(), &body); err != nil {

@@ -204,6 +204,7 @@ func projectRootAllowed(tenant, userID, root string) bool {
 // 桌面模式（未配 PROJECTS_ROOT）直接通过；团队模式下：
 //   - 路径不在 `<root>/<tenant>/<user>/` 内 ⇒ 拒绝（防止指向别人的项目/系统目录）；
 //   - 路径不存在 ⇒ 创建（Web 用户没法像桌面那样浏览服务器目录，给一个可写落点）。
+//
 // projectRootNotAllowedError 表示路径越出了该用户被允许的项目目录。
 // 单独成类型是为了让 handler 返回可本地化的 code 与允许根，而不是一句通用 403。
 type projectRootNotAllowedError struct {
@@ -919,6 +920,16 @@ func (h *SessionMapHandler) BindProjectSession(w http.ResponseWriter, r *http.Re
 		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "project not found"})
 		return
 	}
+	// H78：绑定的**另一端**也要校验归属 —— 会话必须属于调用者。
+	//
+	// 旧实现只校验目标 workspace：于是 A 可以把自己项目的 `force=true` 用在本会话
+	// 别人的 session 上，DELETE 会按 session_id 删掉 B 的归属（"移动"语义变成了
+	// 跨用户抢绑定），同时把 B 的会话标题/状态暴露进 A 的项目列表。
+	// 未知与越权统一 404（不泄露 session 是否存在）。
+	if !smOwnsSession(r.Context(), sessionID, claims) {
+		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "session not found"})
+		return
+	}
 	force := r.URL.Query().Get("force") == "true"
 
 	var existingWS string
@@ -949,10 +960,14 @@ func (h *SessionMapHandler) BindProjectSession(w http.ResponseWriter, r *http.Re
 	err = db.GlobalDBManager.WithTransaction(r.Context(), func(tx pgx.Tx) error {
 		// 先删旧归属（force 才可能非空），再插新的。
 		// 顺序不能反：唯一索引 I1 在 INSERT 那一刻就要成立。
+		// 删除旧归属时再带一层 owner 收敛（H78）：`workspace_id <> $2` 只保证"不是本项目"，
+		// 不保证"这条归属属于同一个人"。归属若在两次查询之间被并发改动，这一步就不会误删。
 		if _, err := tx.Exec(r.Context(),
-			`DELETE FROM session_map_nodes
-			  WHERE session_id = $1 AND edge_kind = 'project' AND workspace_id <> $2`,
-			sessionID, wsID); err != nil {
+			`DELETE FROM session_map_nodes n
+			  USING session_map_workspaces w
+			  WHERE n.session_id = $1 AND n.edge_kind = 'project' AND n.workspace_id <> $2
+			    AND w.id = n.workspace_id AND w.tenant_id = $3 AND w.user_id = $4`,
+			sessionID, wsID, smTenant(claims), claims.UserID); err != nil {
 			return err
 		}
 		_, err := tx.Exec(r.Context(),
@@ -1090,6 +1105,21 @@ func (h *SessionMapHandler) ListUnassignedSessions(w http.ResponseWriter, r *htt
 // smOwnsWorkspace 校验 workspace 属于当前用户/租户。
 //
 // 项目端点的每条路径都要过这一关：`id` 来自 URL，是用户可以任意构造的值。
+// smOwnsSession 判定会话是否属于调用者（H78）。
+//
+// 与 `smOwnsWorkspace` 同一套判据（tenant + user），同样"查不到即否" ——
+// 与 HTTP 层的 404 语义一致，避免"能区分存在与无权"的探针。
+func smOwnsSession(ctx context.Context, sessionID string, claims *auth.Claims) bool {
+	if db.GlobalDBManager == nil || sessionID == "" || claims == nil {
+		return false
+	}
+	row, err := db.GlobalDBManager.FetchOne(ctx,
+		`SELECT 1 AS ok FROM sessions
+		  WHERE id = $1 AND user_id = $2 AND ($3 = '' OR tenant_id = $3)`,
+		sessionID, claims.UserID, smTenant(claims))
+	return err == nil && row != nil
+}
+
 func smOwnsWorkspace(r *http.Request, wsID string, claims *auth.Claims) bool {
 	if db.GlobalDBManager == nil {
 		return false

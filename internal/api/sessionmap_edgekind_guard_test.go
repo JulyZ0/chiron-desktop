@@ -70,10 +70,12 @@ func TestSessionMapProjectBindingPathIsSeparate(t *testing.T) {
 		t.Fatal("归属边类型常量缺失")
 	}
 	// SaveWorkspace 必须拒收客户端提交的 root_path（否则 PUT 即可把项目指向 C:\\Windows）。
-	if !strings.Contains(src, "body.RootPath = existing.RootPath") {
+	// H78 之后取值来源从「热层优先」改成「权威存储优先」（热层可能过期、也可能不存在）：
+	// 断言的是**语义** —— body.RootPath 只能被「从库里读到的值」覆盖，不能来自请求体。
+	if !strings.Contains(src, "body.RootPath = stringOf(row[\"root_path\"])") {
 		t.Fatal("SaveWorkspace 必须沿用库里的 root_path，不能接受客户端提交的值")
 	}
-	if !strings.Contains(src, "body.SortIndex = existing.SortIndex") {
+	if !strings.Contains(src, "body.SortIndex = intOf(row[\"sort_index\"])") {
 		t.Fatal("SaveWorkspace 必须沿用库里的 sort_index，不能接受客户端提交的值")
 	}
 }
