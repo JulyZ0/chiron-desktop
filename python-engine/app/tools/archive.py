@@ -98,4 +98,6 @@ registry.register(
         "required": ["ref"],
     },
     handler=read_archive,
+    # G15：只读取回，不写任何状态 ⇒ 可并发。
+    concurrency_safe=True,
 )

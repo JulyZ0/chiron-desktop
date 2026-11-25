@@ -79,4 +79,6 @@ registry.register(
         "required": ["result_ref"],
     },
     handler=read_tool_result,
+    # G15：只读取回 ⇒ 可并发（它同时是 spill 的豁免工具，理由见 spill.py）。
+    concurrency_safe=True,
 )

@@ -408,6 +408,8 @@ registry.register(
     description="List all installed skills with their descriptions and versions.",
     parameters={"type": "object", "properties": {}},
     handler=skill_list,
+    # G15：只读技能清单；同文件的 skill_run 会真的执行技能，故不声明。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -460,6 +462,8 @@ registry.register(
         },
     },
     handler=skill_discover,
+    # G15：只读技能发现 ⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(

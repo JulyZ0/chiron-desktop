@@ -63,6 +63,8 @@ registry.register(
         "required": [],
     },
     handler=list_dir,
+    # G15：只读目录列举；同文件的 delete_file 有副作用，故不声明。
+    concurrency_safe=True,
 )
 
 

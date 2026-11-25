@@ -141,4 +141,6 @@ registry.register(
         "required": ["run_id"],
     },
     handler=read_subagent_result,
+    # G15：只读取回子 Agent 结果 ⇒ 可并发。
+    concurrency_safe=True,
 )

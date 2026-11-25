@@ -465,6 +465,8 @@ registry.register(
     description="Show working-tree status inside the sandbox workspace (modified/added/deleted files).",
     parameters={"type": "object", "properties": {}, "required": []},
     handler=git_status,
+    # G15：只读 git 查询（不动工作树/索引）⇒ 可并发。修前这类"能不能并发"由 runtime 按"分级=read"推断，工具自己没有表态。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -482,6 +484,8 @@ registry.register(
         "required": [],
     },
     handler=git_diff,
+    # G15：只读 diff 查询（不动工作树/索引）⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -499,6 +503,8 @@ registry.register(
         "required": [],
     },
     handler=git_log,
+    # G15：只读 log 查询（不动工作树/索引）⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(

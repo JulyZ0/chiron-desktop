@@ -371,6 +371,8 @@ registry.register(
         },
     },
     handler=recall,
+    # G15：只读记忆检索（remember/forget 才写库）⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -413,4 +415,6 @@ registry.register(
         "required": ["query"],
     },
     handler=memory_search,
+    # G15：只读记忆检索 ⇒ 可并发。
+    concurrency_safe=True,
 )
