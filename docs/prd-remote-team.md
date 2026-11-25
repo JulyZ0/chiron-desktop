@@ -59,6 +59,27 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 | **H19** | P3 | ACP 完整 Agent 协议 | 编辑器侧拿到工具调用/审批/终态 | 需产品决策（3.4） |
 | **H22** | P3 | 只读子 Agent 强隔离 | **构造性**禁止写（非提示词），越权返回明确错误 | 需产品决策（3.4） |
 
+
+### 2.3 并行推进计划（worktree + 多 agent）
+
+剩余 16 个 `G*` 按**文件所有权互斥**分组，每组一个 git worktree 并行推进；
+合并顺序按"冲突面从小到大"。未列出的 `H*` 依赖外部条件（见 §3）。
+
+| 波次 | worktree / 分支 | 项 | 独占文件 | 状态 |
+|---|---|---|---|---|
+| W-A | `wt-g13` / `task/g13-g16` | G13 job 进会话流水、G16 任务心跳 | `app/queue/**`、`internal/api/**`(新增)、`metrics.py`(追加) | 进行中 |
+| W-A | `wt-g14` / `task/g14-g15` | G14 结果 spill 统一、G15 并发显式声明 | `app/tools/**` | 进行中 |
+| W-A | `wt-g10` / `task/g10-g12` | G10 调用链上限/折叠、G12 轨迹分页+虚拟化 | `CallChainTimeline.vue`、`chat/traceWindow.ts` | 进行中 |
+| W-A | `wt-g17` / `task/g17-g18` | G17 预览 offset 分页、G18 布局断点纯函数化 | `KBDocumentPreview.vue`、`composables/layout*`、`api/knowledge.py` | 进行中 |
+| W-A | `wt-g21` / `task/g21` | G21 PDF/大文件解析进 Worker | `MediaView.vue`、`workers/**` | 进行中 |
+| W-A | `wt-h16` / `task/h16b` | H16b 契约 v2 四族 | `contracts/**`、`internal/contract/**`、`app/contract/**` | 进行中 |
+| W-B | 待建 | G11 子副作用并入父账本、G20 子 Agent 可挂起 | `app/agent/undo_stack.py`、`side_effect_ledger.py`、`interactions.py` | 排队 |
+| W-C | 待建 | G19 父→子 steer、G23 常驻 LSP | `app/agent/steer.py`、`app/tools/lsp/**`(新) | 排队 |
+
+合并纪律：① 每个分支自己跑完窄回归；② 合并后我在 main 上跑跨包回归（Go `./internal/...`、
+Python 相关套件、前端 `src/components` + `check:ui`）；③ 冲突时以"语义正确"优先，不保留两套实现；
+④ 每项合入后**立即**从本文件删除对应行。
+
 ## 3. 待确认决策
 
 1. **H51 签名根**：发布签名私钥谁持有、公钥如何内嵌进安装包？（决定组件/更新清单验签
