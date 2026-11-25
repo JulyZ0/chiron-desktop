@@ -610,6 +610,38 @@ export async function saveLlmProviderBaseURL(id: string, baseUrl: string): Promi
 
 // ── Settings ──
 
+/** H82：保留期变更的逐项差异（旧值/新值/是否收紧）。 */
+export interface RetentionChange {
+  field: 'usage_days' | 'share_days' | 'checkpoint_days'
+  old: number
+  new: number
+  tightened: boolean
+}
+
+/** H82：收紧保留期前的**只读**预览（不动数据，只 COUNT）。 */
+export interface RetentionPreview {
+  current: RetentionConfig
+  proposed: RetentionConfig
+  changes: RetentionChange[]
+  requires_confirm: boolean
+  reason_required: boolean
+  impact: Record<string, number>
+  max_days: number
+  changes_effective: string
+}
+
+/**
+ * H82：预览保留期变更的影响。
+ *
+ * 为什么要有这一步：`saveSettings('retention', …)` 之后，下一轮清理就会按新截止时间
+ * 删数据。收紧（把 180 天改成 7 天）与放宽在接口上长得一模一样，所以界面必须先在
+ * **不写任何东西**的前提下拿到"旧值 → 新值 + 会删多少"，让用户看到再点头。
+ */
+export async function previewRetention(config: RetentionConfig): Promise<RetentionPreview> {
+  const { data } = await api.post('/v1/admin/retention/preview', { config })
+  return data.data as RetentionPreview
+}
+
 export async function saveSettings(category: string, config: Record<string, unknown>): Promise<void> {
   await api.put('/v1/admin/settings', { category, config })
 }

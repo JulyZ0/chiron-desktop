@@ -173,6 +173,11 @@ func registerAdminRoutes(
 	mux.Handle("GET /v1/admin/retention", authMW(rlMW(platformReadMW(adminStrip))))
 	mux.Handle("POST /v1/admin/retention/run", authMW(rlMW(platformWriteMW(adminStrip))))
 
+	// H82：收紧保留期的**只读预览** —— 旧值/新值/按类型的待删行数。
+	// 用 platformReadMW（只读）而不是 write：看一眼影响面不该要求写权限。
+	mux.Handle("POST /v1/admin/retention/preview",
+		authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.RetentionPreviewHandler)))))
+
 	// LLM 熔断读数 / 手动恢复。
 	// 读用 platformReadMW（回的是全局运行状态，租户 admin 不该看见别家的 provider 熔断）；
 	// 重置用 platformWriteMW —— 它会把一个被判熔断的 provider **立刻重新放流量**，

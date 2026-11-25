@@ -1,5 +1,9 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
+  unavailable_gone: "文件已不存在",
+  unavailable_unauthorized: "无权访问该文件",
+  unavailable_expired: "链接已过期",
+  unavailable_transient: "暂时无法加载",
   file_descriptors: "# 文件描述符",
   matched_matches_files_files: "{matched} 个匹配 {files} 个文件",
   n_files: "{n} 个文件",

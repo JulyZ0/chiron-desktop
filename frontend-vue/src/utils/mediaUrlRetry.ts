@@ -140,18 +140,23 @@ export function recordMediaFailure(
   }
 }
 
-/** 界面上该显示什么（空串 = 正常渲染）。 */
-export function mediaUnavailableLabel(kind: MediaFailureKind | undefined): string {
+/**
+ * 界面上该显示什么：返回 **i18n key**（空串 = 正常渲染）。
+ *
+ * 刻意不在这里拼中文：本仓的 i18n 契约（`scripts/check-i18n.mjs`）要求新增的
+ * 用户可见文案走 `t()`，工具模块里的字面量既过不了门禁，也无法被翻译。
+ */
+export function mediaUnavailableKey(kind: MediaFailureKind | undefined): string {
   switch (kind) {
     case 'gone':
-      return '文件已不存在'
+      return 'media.unavailable_gone'
     case 'unauthorized':
-      return '无权访问该文件'
+      return 'media.unavailable_unauthorized'
     case 'expired':
-      return '链接已过期'
+      return 'media.unavailable_expired'
     case 'transient':
     case 'unknown':
-      return '暂时无法加载'
+      return 'media.unavailable_transient'
     default:
       return ''
   }

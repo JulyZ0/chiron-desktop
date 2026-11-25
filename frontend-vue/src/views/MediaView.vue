@@ -12,7 +12,7 @@ import {
 import { api, resolveMediaUrl, invalidateMediaUrl, isMediaUrlExpired, API_URL } from '../api'
 import {
   classifyMediaFailure,
-  mediaUnavailableLabel,
+  mediaUnavailableKey,
   nextMediaAction,
   recordMediaFailure,
   type MediaFailureKind,
@@ -27,6 +27,8 @@ import PageSkeleton from '../components/common/PageSkeleton.vue'
 import EmptyState from '../components/common/EmptyState.vue'
 
 import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
 import { documentDir, nextRovingIndex, resolveRovingIntent, rovingTabIndex } from '../composables/useRovingFocus'
 import { splitFileName, type SplitName } from '../utils/fileName'
 import { useAuthStore } from '../stores/auth'
@@ -174,6 +176,11 @@ const resolvingIds = new Set<string>()
 //   `transient` → 按 1s/2s/4s 退避重试，**永不**变成永久失败
 const mediaRetryStates = ref<Record<string, MediaRetryState>>({})
 const mediaUnavailable = ref<Record<string, MediaFailureKind>>({})
+/** H70：失败原因用 i18n key 渲染（工具模块只给 key，不给字面量）。 */
+function mediaUnavailableLabel(kind: MediaFailureKind | undefined): string {
+  const key = mediaUnavailableKey(kind)
+  return key ? t(key) : ''
+}
 // H70：退避重试定时器（按资源 id 去重）。声明必须在 `handleMediaFailure` 之前 ——
 // 否则 `const` 的暂时性死区会让首次失败抛 ReferenceError，而那个异常会被
 // 图片的 onerror 吞掉，表现为"点了没反应"。
@@ -2340,8 +2347,8 @@ onUnmounted(() => {
   padding: 2px 6px;
   font-size: 11px;
   line-height: 16px;
-  color: #fff;
-  background: rgba(0, 0, 0, 0.55);
+  color: var(--scrim-text, var(--text-inverse));
+  background: var(--bg-overlay);
   border-radius: 4px;
   pointer-events: auto;
 }
@@ -2355,7 +2362,7 @@ onUnmounted(() => {
   cursor: pointer;
 }
 .detail-error {
-  color: var(--color-warning, #d48806);
+  color: var(--color-warning);
 }
 .media-page { padding: 72px 24px 16px; display: flex; flex-direction: column; gap: 12px; height: 100%; overflow: hidden; }
 .media-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }

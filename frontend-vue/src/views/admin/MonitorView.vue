@@ -12,11 +12,12 @@ import QueuePanel from '@/components/admin/monitor/QueuePanel.vue'
 import CachePanel from '@/components/admin/monitor/CachePanel.vue'
 import { fmtDateTime, fmtNum, seriesOf } from '@/components/admin/monitor/format'
 import { useMonitorOverview } from '@/composables/useMonitorOverview'
-import { getMonitorHistory, getRetention, saveSettings } from '@/api/admin'
+import { getMonitorHistory, getRetention, previewRetention, saveSettings } from '@/api/admin'
 import type {
   AdminRetentionInfo,
   MonitorHistory,
   MonitorWindow,
+  RetentionChange,
   RetentionConfig,
 } from '@/api/admin'
 
@@ -101,19 +102,105 @@ async function loadRetention() {
   }
 }
 
+// H82：收紧保留期 = 下一轮清理会多删一批历史数据。所以保存**必须**分两步：
+//   1. 先预览（只读）：拿到"旧值 → 新值"和按类型的待删行数；
+//   2. 收紧时要求用户明确勾选确认并填写原因，才真正写配置。
+// 取消预览不会调用 saveSettings —— "取消"在旧实现里等于"已经保存过了"，
+// 因为保存与展示是同一个动作。
+const retentionPreview = ref<{
+  changes: RetentionChange[]
+  impact: Record<string, number>
+  requiresConfirm: boolean
+  effective: string
+} | null>(null)
+const retentionConfirmOpen = ref(false)
+const retentionConfirmChecked = ref(false)
+const retentionReason = ref('')
+const retentionPreviewing = ref(false)
+
+function retentionImpactEntries(): Array<{ key: string, label: string, value: number }> {
+  const impact = retentionPreview.value?.impact ?? {}
+  const labelOf = (key: string) => {
+    switch (key) {
+      case 'usage_events': return t('admin.retention_impact_usage')
+      case 'conversation_shares': return t('admin.retention_impact_shares')
+      case 'checkpoints': return t('admin.retention_impact_checkpoints')
+      default: return key
+    }
+  }
+  return Object.entries(impact).map(([key, value]) => ({ key, label: labelOf(key), value }))
+}
+
+/** 第一步：只读预览（不写配置）。 */
+async function previewRetentionChange(): Promise<boolean> {
+  retentionPreviewing.value = true
+  retentionError.value = ''
+  try {
+    const preview = await previewRetention({ ...retentionForm.value })
+    retentionPreview.value = {
+      changes: preview.changes ?? [],
+      impact: preview.impact ?? {},
+      requiresConfirm: Boolean(preview.requires_confirm),
+      effective: preview.changes_effective || '',
+    }
+    retentionConfirmChecked.value = false
+    retentionReason.value = ''
+    return true
+  } catch (e) {
+    retentionError.value = e instanceof Error ? e.message : String(e)
+    return false
+  } finally {
+    retentionPreviewing.value = false
+  }
+}
+
+/** 第二步：真正保存。收紧时带上 confirm 与 reason（后端缺任一项都会拒绝）。 */
 async function saveRetention() {
+  if (!(await previewRetentionChange())) return
+  const needsConfirm = Boolean(retentionPreview.value?.requiresConfirm)
+  if (needsConfirm) {
+    // 打开确认框，等用户勾选 + 填原因；此时**尚未**写入任何配置。
+    retentionConfirmOpen.value = true
+    return
+  }
+  await commitRetentionSave()
+}
+
+/** 用户确认后提交（或放宽时直接提交）。 */
+async function commitRetentionSave() {
+  const needsConfirm = Boolean(retentionPreview.value?.requiresConfirm)
+  if (needsConfirm && (!retentionConfirmChecked.value || !retentionReason.value.trim())) {
+    retentionError.value = t('admin.retention_confirm_required')
+    return
+  }
   retentionSaving.value = true
   retentionSaved.value = false
   retentionError.value = ''
   try {
-    await saveSettings('retention', { ...retentionForm.value })
+    const payload: Record<string, unknown> = { ...retentionForm.value }
+    if (needsConfirm) {
+      payload.confirm = true
+      payload.reason = retentionReason.value.trim()
+    }
+    await saveSettings('retention', payload)
     retentionSaved.value = true
+    retentionConfirmOpen.value = false
     await loadRetention()
   } catch (e) {
+    // 保存失败：不动表单，让用户看到原因后重试（后端是先校验后落库，不会半写）。
     retentionError.value = e instanceof Error ? e.message : String(e)
   } finally {
     retentionSaving.value = false
   }
+}
+
+function cancelRetentionConfirm() {
+  retentionConfirmOpen.value = false
+  retentionConfirmChecked.value = false
+  retentionReason.value = ''
+  // 取消 = 什么都没写：把表单恢复成服务器当前值，避免"看起来改了但没保存"的错觉。
+  const current = retention.value?.config
+  if (current) retentionForm.value = { ...current }
 }
 
 function refreshAll() {
@@ -399,7 +486,95 @@ function rangeLabel(r: MonitorWindow): string {
           class="retention-saved"
           data-test="retention-saved"
         >{{ t('admin.retention_saved') }}</span>
+        <span
+          v-if="retentionPreviewing"
+          class="retention-meta"
+          data-test="retention-previewing"
+        >{{ t('admin.retention_previewing') }}</span>
       </div>
+
+      <!-- H82：预览结果（只读，尚未写任何配置） -->
+      <div
+        v-if="retentionPreview && retentionPreview.changes.length"
+        class="retention-preview"
+        data-test="retention-preview"
+      >
+        <div class="retention-preview__title">
+          {{ t('admin.retention_preview_title') }}
+          <span
+            v-if="retentionPreview.requiresConfirm"
+            class="retention-preview__warn"
+          >{{ t('admin.retention_requires_confirm') }}</span>
+        </div>
+        <ul class="retention-preview__changes">
+          <li
+            v-for="c in retentionPreview.changes"
+            :key="c.field"
+            :class="{ tightened: c.tightened }"
+          >
+            {{ t(`admin.retention_${c.field}`) }}: {{ c.old }} → {{ c.new }}
+            <span v-if="c.tightened">（{{ t('admin.retention_tightened') }}）</span>
+          </li>
+        </ul>
+        <div class="retention-preview__impact">
+          <span>{{ t('admin.retention_impact_title') }}</span>
+          <span
+            v-for="entry in retentionImpactEntries()"
+            :key="entry.key"
+            class="retention-preview__impact-item"
+          >
+            {{ entry.label }}: {{ entry.value < 0 ? t('admin.retention_impact_unknown') : entry.value }}
+          </span>
+        </div>
+        <div class="retention-preview__effective">{{ retentionPreview.effective }}</div>
+      </div>
+
+      <!-- H82：收紧必须显式确认 + 原因 -->
+      <div
+        v-if="retentionConfirmOpen"
+        class="retention-confirm"
+        data-test="retention-confirm"
+      >
+        <label class="retention-confirm__check">
+          <input
+            v-model="retentionConfirmChecked"
+            type="checkbox"
+            data-test="retention-confirm-check"
+          >
+          <span>{{ t('admin.retention_confirm_label') }}</span>
+        </label>
+        <input
+          v-model="retentionReason"
+          class="retention-confirm__reason"
+          :placeholder="t('admin.retention_reason_placeholder')"
+          maxlength="200"
+          data-test="retention-reason"
+        >
+        <div class="retention-confirm__actions">
+          <Button
+            size="small"
+            type="primary"
+            danger
+            :loading="retentionSaving"
+            data-test="retention-confirm-submit"
+            @click="commitRetentionSave"
+          >
+            {{ t('admin.retention_confirm_submit') }}
+          </Button>
+          <Button
+            size="small"
+            data-test="retention-confirm-cancel"
+            @click="cancelRetentionConfirm"
+          >
+            {{ t('common.cancel') }}
+          </Button>
+        </div>
+      </div>
+      <div
+        v-if="retentionError"
+        class="retention-error"
+        data-test="retention-error"
+      >{{ retentionError }}</div>
       <div class="history-meta">
         {{ retention?.note || t('admin.retention_note') }}
       </div>
@@ -414,6 +589,70 @@ function rangeLabel(r: MonitorWindow): string {
 </template>
 
 <style scoped>
+/* H82：保留期预览与确认区 */
+.retention-preview {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.retention-preview__title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.retention-preview__warn {
+  margin-inline-start: 8px;
+  color: var(--color-warning);
+}
+.retention-preview__changes {
+  margin: 0 0 4px;
+  padding-inline-start: 18px;
+}
+.retention-preview__changes .tightened {
+  color: var(--color-warning);
+}
+.retention-preview__impact-item {
+  margin-inline-end: 12px;
+}
+.retention-preview__effective {
+  color: var(--text-secondary);
+}
+.retention-confirm {
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--color-warning);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.retention-confirm__check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.retention-confirm__reason {
+  padding: 4px 6px;
+  font-size: 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: transparent;
+}
+.retention-confirm__actions {
+  display: flex;
+  gap: 8px;
+}
+.retention-error {
+  margin-top: 4px;
+  color: var(--color-error);
+  font-size: 12px;
+}
+.retention-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
 .monitor-toolbar {
   display: flex;
   flex-wrap: wrap;

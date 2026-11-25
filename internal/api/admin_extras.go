@@ -290,8 +290,8 @@ type GatewayBreaker struct {
 	Provider string `json:"provider"`
 	// Chat / Embed 取 closed / half_open / open；引擎没报该表时为空串（不是 "closed"，
 	// 空串才表示"没有这一项"，否则会把"没采集到"显示成"健康"）。
-	Chat      string  `json:"chat"`
-	Embed     string  `json:"embed"`
+	Chat         string  `json:"chat"`
+	Embed        string  `json:"embed"`
 	AvgLatencyMs float64 `json:"avg_latency_ms"`
 }
 
@@ -560,6 +560,21 @@ func (h *AdminHandler) SaveSettings(w http.ResponseWriter, r *http.Request) {
 		userID = claims.ID
 	}
 
+	// H82：retention 分组必须**先校验再落库** —— 收紧保留期会删历史数据，
+	// 不能等到"下一轮清理跑完"才让用户发现。
+	var retentionOld, retentionNew retentionConfig
+	var retentionReason string
+	if body.Category == "retention" {
+		current := loadRetentionConfig(ctx)
+		proposed, err := validateRetentionSave(ctx, body.Config)
+		if err != nil {
+			BadRequest(w, err.Error())
+			return
+		}
+		retentionOld, retentionNew = current, proposed
+		retentionReason = strFromValue(body.Config["reason"])
+	}
+
 	if err := s.SaveConfig(ctx, body.Category, body.Config, userID); err != nil {
 		slog.Error("save settings failed", "category", body.Category, "error", err)
 		if err == settings.ErrEncryptedKeyNotFound {
@@ -598,6 +613,16 @@ func (h *AdminHandler) SaveSettings(w http.ResponseWriter, r *http.Request) {
 	// 其余分类（redis/storage/s3/agent）在副本侧告警提示滚动重启。
 	if err := PublishSettingsChanged(ctx, body.Category, body.Config); err != nil {
 		slog.Warn("publish settings changed failed", "category", body.Category, "error", err)
+	}
+
+	// H82：审计"谁在什么时候把保留期改成什么、为什么"。
+	// ip 取真实来源，便于和登录审计对齐。
+	if body.Category == "retention" {
+		ip := r.Header.Get("X-Forwarded-For")
+		if ip == "" {
+			ip = r.RemoteAddr
+		}
+		auditRetentionChange(ctx, nil, retentionOld, retentionNew, retentionReason, ip)
 	}
 
 	slog.Info("settings saved", "category", body.Category, "keys", len(body.Config))

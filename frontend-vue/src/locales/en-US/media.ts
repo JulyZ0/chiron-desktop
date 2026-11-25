@@ -1,5 +1,9 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
+  unavailable_gone: "File no longer exists",
+  unavailable_unauthorized: "No access to this file",
+  unavailable_expired: "Link has expired",
+  unavailable_transient: "Temporarily unavailable",
   file_descriptors: "# File descriptors",
   matched_matches_files_files: "{matched} matches {files} files",
   n_files: "{n} files",

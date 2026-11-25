@@ -1,5 +1,9 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
+  unavailable_gone: "الملف لم يعد موجودًا",
+  unavailable_unauthorized: "لا تملك صلاحية الوصول",
+  unavailable_expired: "انتهت صلاحية الرابط",
+  unavailable_transient: "تعذّر التحميل مؤقتًا",
   file_descriptors: "# واصفات الملفات",
   matched_matches_files_files: "{matched} تطابق {files} ملف",
   n_files: "{n} ملف",

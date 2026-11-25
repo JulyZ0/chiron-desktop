@@ -17,7 +17,7 @@ import {
   MEDIA_TRANSIENT_BACKOFF_MAX_MS,
   MEDIA_TRANSIENT_BACKOFF_MS,
   classifyMediaFailure,
-  mediaUnavailableLabel,
+  mediaUnavailableKey,
   mediaUrlExpiry,
   nextMediaAction,
   recordMediaFailure,
@@ -124,12 +124,13 @@ describe('recordMediaFailure', () => {
   })
 })
 
-describe('mediaUnavailableLabel', () => {
-  it('每种失败都有可读说明；没有失败时返回空串', () => {
-    expect(mediaUnavailableLabel('gone')).toContain('不存在')
-    expect(mediaUnavailableLabel('unauthorized')).toContain('无权')
-    expect(mediaUnavailableLabel('expired')).toContain('过期')
-    expect(mediaUnavailableLabel('transient')).toBeTruthy()
-    expect(mediaUnavailableLabel(undefined)).toBe('')
+describe('mediaUnavailableKey', () => {
+  it('每种失败都给 i18n key（不返回中文字面量，否则过不了 i18n 契约）', () => {
+    expect(mediaUnavailableKey('gone')).toBe('media.unavailable_gone')
+    expect(mediaUnavailableKey('unauthorized')).toBe('media.unavailable_unauthorized')
+    expect(mediaUnavailableKey('expired')).toBe('media.unavailable_expired')
+    expect(mediaUnavailableKey('transient')).toBe('media.unavailable_transient')
+    expect(mediaUnavailableKey('unknown')).toBe('media.unavailable_transient')
+    expect(mediaUnavailableKey(undefined)).toBe('')
   })
 })
