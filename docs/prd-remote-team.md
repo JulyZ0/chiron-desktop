@@ -2,7 +2,7 @@
 
 - 状态：S0–S4、R1/R3/R4/R5 已实现；R6/R7 的观测与告警、R9 span/trace、R10 数据生命周期仍在推进。
 - 加固来源：H1–H86 是 2026-11-24 的全量审计结论（前端/桌面壳/后端），后经七轮推进：
-  **已完成 72 项**（逐条登记在 9.5）、**待办 10 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
+  **已完成 73 项**（逐条登记在 9.5）、**待办 9 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
 - **推进方式（唯一入口）**：只看第 9 章。9.1 决定顺序，9.2 是待办清单与可执行判据，
   9.3 是里程碑退出条件，9.4 是待确认决策，9.5 是已完成项的证据索引。
   历次「本轮做了什么」的逐条叙述已压缩，不再按轮次重复。
@@ -133,10 +133,10 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 |---|---|---|---|
 | W1 ✅ | ~~H45、H48、H50、H73、H76、H11~~ **已完成**（证据见 9.5） | 单点改动 + 纯函数/探针即可证明；H45/H50/H48 是**对外**风险（更新、传输、二因素） | 本机已闭环（H48 的非 Windows 分支用注入桩） |
 | W2 ✅ | ~~H7、H36、H41、H17、H15、H60~~ **已完成**（证据见 9.5） | 需要在既有链路上加"身份/代次/预占"这类中间层，改动中等但都可测 | H7 的并发场景需真 Redis → 由 CI 的 redis service 闭环；其余能 |
-| W3 | ~~H46（服务端）、H47~~ ✅、H38、H14、H24、H44、H51 | 体量大、跨语言，必须拆片推进（见 9.2 的"切片"列） | 能，但每片都要单独验收 |
+| W3 | ~~H46、H47、H24~~ ✅、H38、H14、H44、H51 | 体量大、跨语言，必须拆片推进（见 9.2 的"切片"列） | 能，但每片都要单独验收 |
 | W4 | H2、H20、H19、H22 | 外部条件或产品决策未定，做了也无法验收 | 不能（见 9.4） |
 
-### 9.2 待办清单（10 项）
+### 9.2 待办清单（9 项）
 
 "完成定义"一栏是**可执行判据**：满足它即可从本表删除，并把证据登记进 9.5。
 "切片"一栏给出单项可独立验收的第一步，避免"一次改到底、谁也无法证明它对"。
@@ -146,7 +146,6 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H16 | P2 | 版本化 Go/Python 契约 | 为 submit/run event、tool call/approval、checkpoint、queue payload、MCP config、error/terminal state 建立版本化 schema 与**双端 conformance 测试**；不兼容变更必须升版本，旧版本读取方要显式拒绝而非按缺省猜 | ①先做 error/terminal 与 run event 两族（影响面最大）②再做 tool/approval ③最后 checkpoint/queue/MCP | W3 |
 | H38 | P1 | 子 Agent 复用完整执行链 | 子 Agent 走与主 Agent 相同的 ToolGuard/Broker/审批/副作用账本；undo 先验证快照哈希与路径再替换，失败可恢复且不损坏二进制 | ①统一 execute 入口 ②副作用账本 ③undo 校验 | W3 |
 | H14 | P2 | 状态事务与 CAS | 消息写入事务化；checkpoint 主记录与 manifest 原子提交；taskboard 用 revision CAS；todo ID 稳定且 `depends_on` 不因 child merge 失效 | ①messages 事务 ②checkpoint 原子 ③taskboard CAS | W3 |
-| H24 | P0 | 插件配置与执行授权一致 | 任一执行路径（Go 端点、Python active_servers、broker）都校验总开关 + 每插件授权 + 规范化配置摘要；改 Args/Env/ReadOnly 使旧授权失效；未授权配置不得起进程/连网/注册工具；撤销授权立即断连 | ①Python 侧校验 ②broker 入口 ③配置变更失效 ④撤销断连 | W3 |
 | H44 | P2 | 审计/导出/留存与引用完整性 | 审计写入与 ACK 有明确 outbox/事务语义（不再丢）；导出有行/字节/并发上限；用量与留存操作原子可恢复；引用解析失败**拒绝**而非放行；`no_retention` 全链路不落盘 | ①审计语义 ②导出上限 ③用量原子 ④PageIndex fail-closed ⑤no_retention | W3 |
 | H51 | P1 | 运行时与组件供应链 | 依赖与 artifact 全量 hash 锁定；组件 manifest 用内嵌公钥验签；仅允许 HTTPS 与批准主机（不静默切镜像）；安装后与执行前复验 | ①uv hash lock ②manifest 验签 ③主机白名单 ④复验；验签根依赖发布基础设施 | W3 |
 | H2 | P0 | Linux 内核级隔离 | 默认无网络、工作区外只读、读不到引擎凭证、进程树可回收；bwrap/gVisor 不可用时**拒绝执行**而非降级 setrlimit | 需要 Linux 真机；本机只能做"拒绝降级"的开关与探针 | W4 |
@@ -250,6 +249,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H60 | 重连：`switchSession(id, {force})` 绕开"同 ID 直接返回"，并把 SSE 装配抽成 `attachSessionStream(id, {sinceEventId})`，断线时有回合在跑就按 `Last-Event-ID` 续传（不重放整轮）；异步写回：新增 `utils/staleGuard.ts`（代次 + 复合键），`InteractionInbox`（切会话不再显示上一会话的待办）、`ToolResultBlock`（旧片段不拼到当前块）、`SubAgentPanel`（轮询结果不跨会话）、`WorkbenchPanel`（改项目后不显示上个项目内容）、`KBDocumentPreview`（连开两个文档不串内容）、`MediaView`（签名 URL 不写进错的条目） ｜ 证据：`src/utils/__tests__/streamReattach.spec.ts`（5 项）、`src/utils/__tests__/staleGuard.spec.ts`（9 项，含组件接入的源码守卫）+ `src/components`/`src/utils` 共 869 项回归 |
 | H46 | 设备桥服务端半补全：`POST /v1/device-fs/ticket` 校验 Ed25519 **设备归属证明**（证明文本与客户端逐字符一致、±5min 时间窗防重放）→ 签发 ≤60s **一次性**票据；`device_id → 公钥指纹` 首次信任绑定，换公钥一律 403（防顶替原设备）；`GET /ws/device-fs` **只认 `?ticket=`**（带 `?token=` 的旧路径恒定 401，兼容路径已删除）；撤销仍与 HTTP 一致：设备连接登记进 `wsAuthConnections`，用户级代次撤销即关连接，读不到撤销状态时 **fail-close** ｜ 证据：`internal/api/device_fs_ticket.go`、`device_fs_ticket_test.go`（8 项：证明文本/篡改/过期、票据一次性与换公钥、旧 query token 401）、`ws_revocation_parity_test.go`（撤销一致性改走换票口径）、`internal/api` 全套通过 |
 | H47 | renderer 特权面收敛：IPC 来源判定改为**三道**（必须是主框架 → URL 白名单 → 已登记窗口，`electron/ipc-guard.cjs`），iframe 与"别处 new BrowserWindow"都拿不到特权；新增**每窗口能力表**（主界面 34 条、setup 6 条、error 2 条，按真实通道名生成，不在表里即拒绝）；setup/error 改用**窄 preload**（`aux-preload.cjs`，只暴露配地址/切模式/自检/重启，不含 token 读写、清空数据、开任意路径、2FA 管理） ｜ 证据：`electron/__tests__/ipc-guard-h47.test.cjs`（12 项：senderFrame 缺失/iframe/坏 URL/未登记窗口、能力表正反向、preload 分流与 aux-preload 不含敏感通道）+ electron 全套 610 项 |
+| H24 | 授权不再只看"有没有点过同意"，而是**绑定到具体执行参数**：`pluginApprovalDigest` 覆盖 command/args/env/read_only（description/version/status 不影响，避免逼用户反复确认）；改任一项即清空 `approved`+`approval_digest`；`/test` 入口用 `pluginApprovedFor()` 核对摘要（老数据"有 approved 无 digest"判为未授权）；引擎侧 `active_servers()` 现在要求**用户总开关** + **每插件授权**两闸都过，未授权配置不进池子 ⇒ 不起进程、不连网、不注册工具 ｜ 证据：`internal/api/plugin_approval.go`、`plugin_approval_test.go`（9 项：五项执行输入变更各自失效、装饰性字段不影响、老数据拒绝、Python 判据的源码守卫）、`python-engine/tests/test_plugin_authorization_h24.py`（8 项：未授权/总开关关/状态停用/缺字段/坏文件各自不执行）+ 插件全套 62 项 |
 
 ## 10. 参考
 
