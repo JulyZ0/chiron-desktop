@@ -18,3 +18,8 @@ boto3>=1.40.0
 # 跨实例演练（tests/drills/multi_instance_drill.py）要自签一枚**网关认可的** JWT（HS256）。
 # 明确声明，而不是依赖某个传递依赖碰巧装了 pyjwt —— 演练是 CI 的一步，缺它就红。
 PyJWT>=2.9.0
+
+# 队列 claim / fencing 的本地回归（H7）：`tests/test_queue_h7_fakeredis.py` 需要
+# **真的执行 Lua**，所以必须带 [lua] 额外依赖（底层是 lupa）。不带它时 EVAL 不可用，
+# 那批用例会退化成"什么都没验证"。
+fakeredis[lua]>=2.31.0
