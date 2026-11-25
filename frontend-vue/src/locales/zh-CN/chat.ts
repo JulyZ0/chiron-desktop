@@ -493,6 +493,13 @@ export default {
   trace_view_timeline: "时间线",
   trace_view_toggle_tooltip: "在时间线与执行图之间切换（执行图显示每一步的父节点）",
   trace_graph_empty: "暂无执行图数据（该 trace 可能早于本版本，或 span 尚未落库）",
+  // ── G10/G12：轨迹窗格的轮次折叠、向前翻页与进行中标注 ──
+  trace_capped_recent_turns: "只显示最近 {n} 轮（共 {total} 轮，更早的轮次已折叠）",
+  trace_show_all_turns: "展开全部 {total} 轮",
+  trace_collapse_to_recent: "只看最近 {n} 轮",
+  trace_load_earlier: "加载更早的 {n} 行",
+  trace_row_in_progress: "已开始",
+  trace_timeline_empty: "暂无 trace 记录",
   // ── D2：思考语言（与"回复语言"分开设置） ──
   reasoning_language: "思考语言",
   think_lang_auto: "跟随模型",

@@ -491,6 +491,13 @@ export default {
   trace_view_timeline: "Timeline",
   trace_view_toggle_tooltip: "Switch between the timeline and the execution graph (the graph shows each step's parent)",
   trace_graph_empty: "No execution graph data yet (this trace may predate the feature, or spans are not stored)",
+  // ── G10/G12: turn collapsing, earlier-page loading and in-progress labels in the trace pane ──
+  trace_capped_recent_turns: "Showing only the last {n} of {total} turns (earlier turns are collapsed)",
+  trace_show_all_turns: "Show all {total} turns",
+  trace_collapse_to_recent: "Show only the last {n} turns",
+  trace_load_earlier: "Load {n} earlier rows",
+  trace_row_in_progress: "Started",
+  trace_timeline_empty: "No trace records yet",
   // ── D2: reasoning language (separate from reply language) ──
   reasoning_language: "Reasoning language",
   think_lang_auto: "Model default",

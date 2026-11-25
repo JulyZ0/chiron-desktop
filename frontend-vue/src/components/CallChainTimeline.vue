@@ -42,7 +42,11 @@
 
       <div
         v-if="isExpanded"
+        ref="bodyRef"
         class="timeline-body"
+        data-testid="trace-body"
+        :data-follow="stickToTail ? 'true' : 'false'"
+        @scroll.passive="onScroll"
       >
         <!-- 差距C：执行图（父子连通）。时间线回答"有哪些步骤"，执行图回答"从哪来"。 -->
         <div
@@ -53,11 +57,11 @@
             v-for="(row, idx) in graphRows"
             :key="idx"
             class="graph-node"
-            :style="{ paddingLeft: (row.depth * 18 + 8) + 'px' }"
+            :style="{ paddingInlineStart: (row.depth * 18 + 8) + 'px' }"
           >
             <span class="graph-kind">{{ row.node.kind || 'span' }}</span>
             <span class="node-name">{{ getSpanDisplayName(row.node) }}</span>
-            <span class="node-duration">{{ row.node.duration_ms }}ms</span>
+            <span class="node-duration">{{ durationLabel(row.node) }}</span>
           </div>
           <div
             v-if="!graphRows.length"
@@ -66,47 +70,112 @@
             {{ $t('chat.trace_graph_empty') }}
           </div>
         </div>
-        <!-- 时间线渲染 -->
+        <!-- 时间线渲染（G10 轮次折叠 + G12 尾部窗口） -->
         <template v-else>
-        <div
-          v-for="(span, idx) in displaySpans"
-          :key="idx"
-          class="timeline-node"
-        >
+          <!-- G10：轮数超上限时的折叠提示。修前：整份 trace 一次渲染，没有上限也没有提示。 -->
           <div
-            class="node-line"
-            :class="getNodeClass(span)"
+            v-if="hiddenTurnCount > 0"
+            class="cap-notice"
+            data-testid="trace-cap-notice"
           >
-            <span class="node-icon">{{ getNodeIcon(span) }}</span>
-            <div class="node-content">
-              <div class="node-header">
-                <span class="node-name">{{ getSpanDisplayName(span) }}</span>
-                <span class="node-duration">{{ span.duration_ms }}ms</span>
-              </div>
-              
-              <!-- 展开详情 -->
-              <div
-                v-if="span.showDetails"
-                class="node-details"
-              >
-                <pre class="metadata-json">{{ formatMetadata(span.metadata) }}</pre>
-              </div>
-            </div>
-            
+            <span class="cap-text">{{ $t('chat.trace_capped_recent_turns', { n: DEFAULT_VISIBLE_TURNS, total: turnGroups.length }) }}</span>
             <button
-              class="details-toggle"
-              @click.stop="span.showDetails = !span.showDetails"
+              type="button"
+              class="cap-action"
+              data-testid="trace-show-all"
+              @click="showAllTurns = true"
             >
-              {{ span.showDetails ? $t('common.collapse') : $t('common.details') }}
+              {{ $t('chat.trace_show_all_turns', { total: turnGroups.length }) }}
             </button>
           </div>
-        </div>
+          <div
+            v-else-if="showAllTurns && turnGroups.length > DEFAULT_VISIBLE_TURNS"
+            class="cap-notice"
+          >
+            <button
+              type="button"
+              class="cap-action"
+              data-testid="trace-collapse-recent"
+              @click="showAllTurns = false"
+            >
+              {{ $t('chat.trace_collapse_to_recent', { n: DEFAULT_VISIBLE_TURNS }) }}
+            </button>
+          </div>
 
-        <!-- 完成事件 -->
-        <div class="timeline-node complete">
-          <CheckCircleOutlined style="color: var(--success)" />
-          <span>{{ $t('chat.inference_complete_total_ms_ms', { ms: totalDurationMs }) }}</span>
-        </div>
+          <!-- G12：向前翻页入口。修前：没有分页，历史越长渲染越多。 -->
+          <button
+            v-if="hasEarlierRows"
+            type="button"
+            class="load-earlier"
+            data-testid="trace-load-earlier"
+            @click="loadEarlier"
+          >
+            {{ $t('chat.trace_load_earlier', { n: earlierRowPageSize }) }}
+          </button>
+
+          <div
+            v-for="(span, idx) in windowedRows"
+            :key="rowKey(span, idx)"
+            class="timeline-node"
+            data-testid="trace-row"
+            :data-span-name="span.span_name"
+          >
+            <div
+              class="node-line"
+              :class="getNodeClass(span)"
+            >
+              <span class="node-icon">{{ getNodeIcon(span) }}</span>
+              <div class="node-content">
+                <div class="node-header">
+                  <span class="node-name">{{ getSpanDisplayName(span) }}</span>
+                  <!-- 进行中的 span 只标"已开始"：修前照抄后端 0 值渲染成 "0ms"，那是虚构耗时 -->
+                  <span
+                    class="node-duration"
+                    data-testid="trace-duration"
+                  >{{ durationLabel(span) }}</span>
+                </div>
+
+                <!-- 展开详情 -->
+                <div
+                  v-if="span.showDetails"
+                  class="node-details"
+                >
+                  <pre class="metadata-json">{{ formatMetadata(span.metadata) }}</pre>
+                </div>
+              </div>
+
+              <button
+                class="details-toggle"
+                @click.stop="span.showDetails = !span.showDetails"
+              >
+                {{ span.showDetails ? $t('common.collapse') : $t('common.details') }}
+              </button>
+            </div>
+          </div>
+
+          <div
+            v-if="!windowedRows.length"
+            class="graph-empty"
+            data-testid="trace-empty"
+          >
+            {{ $t('chat.trace_timeline_empty') }}
+          </div>
+
+          <!-- 完成事件 -->
+          <div
+            v-if="windowedRows.length"
+            class="timeline-node complete"
+          >
+            <CheckCircleOutlined style="color: var(--success)" />
+            <span>{{ $t('chat.inference_complete_total_ms_ms', { ms: totalDurationMs }) }}</span>
+          </div>
+
+          <!-- 跟随尾部哨兵：流式新增行时滚到这里（不直接写 scrollTop，滚动写入归 transcriptViewport） -->
+          <div
+            ref="tailRef"
+            class="tail-sentinel"
+            aria-hidden="true"
+          />
         </template>
       </div>
     </CollapseTransition>
@@ -114,18 +183,28 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { CheckCircleOutlined } from '@ant-design/icons-vue'
 import CollapseTransition from '@/components/CollapseTransition.vue'
 import { api } from '../api'
 import { useI18n } from 'vue-i18n'
+import {
+  DEFAULT_PAGE_SIZE,
+  DEFAULT_VISIBLE_TURNS,
+  capToRecentTurns,
+  groupSpansByTurn,
+  isInProgressSpan,
+  sumTopLevelDurationMs,
+  tailWindow,
+} from './chat/traceWindow'
 
 const { t } = useI18n()
 
 interface TraceSpan {
   trace_id: string
   span_name: string
-  duration_ms: number
+  /** 进行中的 span 没有时长（后端可能给 null，也可能整字段缺席） */
+  duration_ms?: number | null
   timestamp: string
   tenant_id: number
   metadata?: Record<string, unknown>
@@ -134,6 +213,10 @@ interface TraceSpan {
   span_id?: string
   parent_span_id?: string
   kind?: string
+  // G10/G12：轮次归属与状态（老数据可能没有）
+  turn_id?: string
+  turn_index?: number
+  status?: string
 }
 
 /** 执行图节点（含子节点，递归）。 */
@@ -222,7 +305,95 @@ function flatten(nodes: TraceGraphNode[], depth = 0, out: GraphRow[] = []): Grap
 const graphRows = computed<GraphRow[]>(() => flatten(graphRoots.value))
 
 const spanCount = computed(() => displaySpans.value.filter(s => s.span_name.startsWith('tool:')).length)
-const totalDurationMs = computed(() => displaySpans.value.reduce((sum, s) => sum + s.duration_ms, 0))
+
+/**
+ * 总耗时：只累加顶层 span。
+ * 修前：`reduce((sum, s) => sum + s.duration_ms, 0)` —— 父 span 已含子 span，父子重复计入。
+ */
+const totalDurationMs = computed(() => sumTopLevelDurationMs(displaySpans.value))
+
+// ── G10：按轮折叠 ──
+//
+// 修前：整份 trace 一次性 `v-for` 渲染，40 轮任务要渲染上千行。
+// 现在默认只展开最近 DEFAULT_VISIBLE_TURNS 轮，并给出"只看最近 N 轮"的提示 + 展开全部。
+const showAllTurns = ref(false)
+
+const turnGroups = computed(() => groupSpansByTurn(displaySpans.value))
+
+const cappedTurns = computed(() =>
+  showAllTurns.value
+    ? { groups: turnGroups.value, hiddenTurns: 0 }
+    : capToRecentTurns(turnGroups.value, DEFAULT_VISIBLE_TURNS)
+)
+
+const hiddenTurnCount = computed(() => cappedTurns.value.hiddenTurns)
+
+// ── G12：尾部窗口 + 向前翻页 ──
+//
+// 单轮也可能有上百次工具调用：窗口只挂载尾部 N 页，翻页时向前追加一页。
+// 挂载行数因此与"加载了几页"成正比，不随历史线性增长。
+const pages = ref(1)
+
+const scopedSpans = computed<TraceSpan[]>(() => cappedTurns.value.groups.flatMap(g => g.spans))
+
+const tailResult = computed(() => tailWindow(scopedSpans.value, DEFAULT_PAGE_SIZE, pages.value))
+
+const windowedRows = computed<TraceSpan[]>(() => tailResult.value.rows)
+
+const hasEarlierRows = computed(() => tailResult.value.hasMore)
+
+const earlierRowPageSize = computed(() => Math.min(DEFAULT_PAGE_SIZE, tailResult.value.hiddenCount))
+
+function loadEarlier() {
+  pages.value += 1
+}
+
+// 换 trace（或 spans 换成另一份）时回到"最近 N 轮 + 第一页"，避免沿用上一条 trace 的翻页深度
+watch(() => props.traceId, () => {
+  pages.value = 1
+  showAllTurns.value = false
+  stickToTail.value = true
+})
+
+// ── G12：流式跟随尾部（用户上滑即停止） ──
+const bodyRef = ref<HTMLElement | null>(null)
+const tailRef = ref<HTMLElement | null>(null)
+const stickToTail = ref(true)
+/** 距底多少像素内仍算"在尾部"：给亚像素与滚动惯性留余量。 */
+const FOLLOW_THRESHOLD_PX = 24
+
+function onScroll() {
+  const el = bodyRef.value
+  if (!el) return
+  const distance = el.scrollHeight - el.clientHeight - el.scrollTop
+  // 修前：没有"跟随"概念，流式新增行只能用户自己往下滚
+  stickToTail.value = distance <= FOLLOW_THRESHOLD_PX
+}
+
+/**
+ * 跟随尾部：滚到哨兵处，而不是直接写 `scrollTop`。
+ * 滚动位置的单一写者是 `transcriptViewport`（见 scripts/check-transcript-scroll.mjs），
+ * 这里的目标容器是轨迹窗格自己的滚动框，用 scrollIntoView 表达"停在末尾"这个意图。
+ */
+async function followTail() {
+  if (!stickToTail.value) return
+  await nextTick()
+  const el = tailRef.value
+  if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'end' })
+}
+
+watch([() => windowedRows.value.length, isExpanded], () => { void followTail() })
+watch(stickToTail, () => { void followTail() })
+
+function rowKey(span: TraceSpan, idx: number): string {
+  return span.span_id || `${span.span_name}#${tailResult.value.start + idx}`
+}
+
+function durationLabel(span: TraceSpan | TraceGraphNode): string {
+  if (isInProgressSpan(span)) return t('chat.trace_row_in_progress')
+  const ms = Number(span.duration_ms ?? 0)
+  return `${Number.isFinite(ms) ? Math.round(ms) : 0}ms`
+}
 
 function getNodeClass(span: TraceSpan): string {
   if (span.span_name === 'llm_call') return 'type-llm'
@@ -304,6 +475,52 @@ function capitalize(str: string): string {
 .graph-empty {
   padding: 8px;
   font-size: 12px;
+}
+/* G10/G12：折叠提示与向前翻页入口 */
+.cap-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border: var(--hairline-width) solid var(--border);
+  border-radius: var(--radius-md);
+}
+.cap-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cap-action,
+.load-earlier {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--primary);
+  background: none;
+  border: var(--hairline-width) solid var(--primary);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) ease, color var(--dur-fast) ease;
+}
+.cap-action:hover,
+.load-earlier:hover {
+  background: var(--primary);
+  color: var(--on-solid);
+}
+.load-earlier {
+  display: block;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 4px 8px;
+}
+.tail-sentinel {
+  height: 1px;
 }
 .callchain-timeline {
   margin-top: 12px;
@@ -459,7 +676,9 @@ function capitalize(str: string): string {
 }
 
 .details-toggle:focus-visible,
-.timeline-header:focus-visible {
+.timeline-header:focus-visible,
+.cap-action:focus-visible,
+.load-earlier:focus-visible {
   outline: var(--focus-ring-width) solid var(--focus-ring-color);
   outline-offset: var(--focus-ring-offset);
 }
@@ -469,12 +688,15 @@ function capitalize(str: string): string {
   .timeline-body { padding: 10px; }
   .node-line { gap: 8px; padding: 8px 10px; }
   .details-toggle { min-height: 32px; }
+  .cap-action, .load-earlier { min-height: 32px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .timeline-header,
   .node-line,
-  .details-toggle {
+  .details-toggle,
+  .cap-action,
+  .load-earlier {
     transition: none;
   }
 }
