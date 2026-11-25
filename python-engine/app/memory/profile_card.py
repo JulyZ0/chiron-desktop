@@ -181,6 +181,11 @@ class ProfileCard:
         Returns:
             ProfileUpdateResult 包含更新结果和可能的冲突。
         """
+        # H44：隐私模式下不落盘（与 history_writer 同一口径）。
+        from app.memory.retention_guard import memory_writes_allowed
+
+        if not memory_writes_allowed():
+            return None
         now = time.time()
 
         # 查询现有条目

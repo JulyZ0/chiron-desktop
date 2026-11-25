@@ -188,6 +188,11 @@ class SummaryStore:
         Returns:
             摘要 ID 或 None（失败时）。
         """
+        # H44：隐私模式下不落盘（与 history_writer 同一口径）。
+        from app.memory.retention_guard import memory_writes_allowed
+
+        if not memory_writes_allowed():
+            return None
         import hashlib as hl
         import uuid
 

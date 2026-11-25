@@ -256,6 +256,11 @@ class ProfileStore:
     # ── 写 ──────────────────────────────────────────────
 
     async def insert(self, entry: MemoryEntry) -> MemoryEntry:
+        # H44：隐私模式下不落盘（与 history_writer 同一口径）。
+        from app.memory.retention_guard import memory_writes_allowed
+
+        if not memory_writes_allowed():
+            return entry
         sql = (
             "INSERT INTO user_memory_entries "
             "(id, tenant_id, user_id, slot, item_key, item_value, confidence, source, "
