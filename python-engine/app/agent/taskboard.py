@@ -134,31 +134,110 @@ def _merge(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> li
         # 去重 —— 两条 t3 会让面板渲染出两个"第 3 项"。
         order.append(sid)
 
+    # H14：**不再按位置重编号**。
+    #
+    # 旧实现遍历时给每条重新分配 `t{len(result)+1}`：子 Agent 合并一次，已有条目的
+    # id 就全变（`t2` 可能变成 `t1`），而 `depends_on` 存的是 id 字符串 —— 依赖关系
+    # 于是整片失效或指错。现在只做两件事：
+    #   · 已在板上的条目：保持原 id；
+    #   · 新条目：取"最大编号 +1"的未占用 id（模型自报的编号一律不采信）。
     result: list[dict[str, Any]] = []
     seen: set[str] = set()
+
+    # 先按板上既有顺序落既有条目（id 原样）
     for sid in order:
-        item: dict[str, Any] | None = by_id.get(sid)
+        item = by_id.get(sid)
         if item is None:
-            # 新条目：从 incoming 里找出来
-            item = next(
-                (dict(i) for i in incoming if str(i.get("id", "")) == sid), None
-            )
-            if item is None:
-                continue
-        # host 重编号：保证 id 唯一且连续
-        new_id = f"t{len(result) + 1}"
-        item["id"] = new_id
-        seen.add(new_id)
+            continue
+        if sid in seen:
+            # 板上本就有重复 id（历史数据）：给后来者换一个新号，但不改先到者的
+            sid = _next_free_id(seen)
+            item = {**item, "id": sid}
+        item["id"] = sid
+        seen.add(sid)
         result.append(item)
+
+    # 再追加 incoming 里的新条目（id 缺失或与板上撞号时由 host 分配）
+    for entry in incoming:
+        sid = str(entry.get("id", "") or "").strip()
+        if sid and sid in seen:
+            # 已经通过 by_id 更新过（上面的合并规则 1），这里跳过
+            continue
+        if not sid or sid in seen:
+            sid = _next_free_id(seen)
+        item = dict(entry)
+        item["id"] = sid
+        seen.add(sid)
+        result.append(item)
+
     return result
 
 
+def _id_number(value: Any) -> int:
+    """把 `t12` 解析成 12；不是这个形状返回 0。"""
+    text = str(value or "").strip()
+    if len(text) < 2 or text[0] != "t":
+        return 0
+    try:
+        return int(text[1:])
+    except ValueError:
+        return 0
+
+
+def _next_free_id(taken: set[str]) -> str:
+    """取一个未被占用的编号（`t{max+1}`）。
+
+    H14：旧实现的合并路径按**位置**重编号（`t{len(result)+1}`），于是子 Agent 一合并，
+    已有条目的 id 全变 —— 而 `depends_on` 里存的是 id 字符串，一旦重编号就全部指向
+    不存在或指向别人。现在编号只增不改：新条目拿最大编号 +1，老条目保持原样。
+    """
+    highest = max((_id_number(i) for i in taken), default=0)
+    candidate = highest + 1
+    while f"t{candidate}" in taken:
+        candidate += 1
+    return f"t{candidate}"
+
+
 def _renumber(todos: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """整份替换时也统一编号：编号是 host 的，不能让模型自己挑。"""
+    """整份替换时统一编号，并**按映射重写 depends_on**。
+
+    编号是 host 的，不能让模型自己挑；但重编号必须同步改写依赖关系，否则
+    "整份替换"这一下就会把 `depends_on` 全部弄失效。
+    """
+    mapping: dict[str, str] = {}
     out: list[dict[str, Any]] = []
     for index, item in enumerate(todos):
         copy = dict(item)
-        copy["id"] = f"t{index + 1}"
+        old_id = str(copy.get("id", "") or "").strip()
+        new_id = f"t{index + 1}"
+        if old_id:
+            mapping[old_id] = new_id
+        copy["id"] = new_id
+        out.append(copy)
+    return _remap_depends_on(out, mapping)
+
+
+def _remap_depends_on(
+    todos: list[dict[str, Any]], mapping: dict[str, str]
+) -> list[dict[str, Any]]:
+    """把 depends_on 里的旧 id 换成新 id；换不到的丢掉（不留悬空引用）。
+
+    保留顺序、去重：`depends_on` 是集合语义，顺序只是展示。
+    """
+    if not mapping:
+        return todos
+    out: list[dict[str, Any]] = []
+    for item in todos:
+        copy = dict(item)
+        deps = copy.get("depends_on")
+        if isinstance(deps, list):
+            rewritten: list[str] = []
+            for dep in deps:
+                key = str(dep or "").strip()
+                target = mapping.get(key)
+                if target and target not in rewritten:
+                    rewritten.append(target)
+            copy["depends_on"] = rewritten
         out.append(copy)
     return out
 
@@ -206,6 +285,47 @@ async def _write_redis(key: str, payload: dict[str, Any]) -> bool:
         return False
 
 
+#: 原子"版本相符才写"：读-比-写在同一段 Lua 里完成（Redis 单线程执行）。
+#:
+#: 为什么不能只靠 Python 侧的 `load()` → 比较 → 写入：那中间有一个窗口，两个写者
+#: 都能读到 revision=n 并各自写回 n+1 —— 后写者静默覆盖先写者（"某条待办凭空消失"）。
+_CAS_WRITE_LUA = """
+local current = redis.call('GET', KEYS[1])
+local current_revision = 0
+if current then
+    local ok, parsed = pcall(cjson.decode, current)
+    if ok and type(parsed) == 'table' then
+        current_revision = tonumber(parsed['revision']) or 0
+    end
+end
+if tonumber(ARGV[1]) ~= current_revision then
+    return {0, current_revision}
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return {1, current_revision + 1}
+"""
+
+
+async def _write_redis_cas(
+    key: str, payload: dict[str, Any], expected_revision: int
+) -> tuple[bool, int]:
+    """返回 `(写入成功, 当前版本)`；Redis 不可用/报错时抛异常由调用方回退。"""
+    from app.redis_client import get_redis
+
+    redis = await get_redis()
+    result = await redis.eval(
+        _CAS_WRITE_LUA,
+        1,
+        key,
+        str(int(expected_revision)),
+        json.dumps(payload, ensure_ascii=False),
+        str(BOARD_TTL_SECONDS),
+    )
+    wrote = bool(int(result[0]))
+    revision = int(result[1])
+    return wrote, revision
+
+
 async def load() -> dict[str, Any]:
     """读回当前板子（`{"todos": [...], "revision": n, "owner": ...}`）。"""
     from app.tools.context import get_session_id, get_tenant_id, get_tool_context
@@ -223,7 +343,9 @@ async def load() -> dict[str, Any]:
     return {"todos": [], "revision": 0}
 
 
-async def write(todos: list[dict[str, Any]]) -> dict[str, Any]:
+async def write(
+    todos: list[dict[str, Any]], *, expected_revision: int | None = None
+) -> dict[str, Any]:
     """写入板子，返回落库后的完整状态（含 revision）。
 
     主/子 agent 的语义差异见模块文档：主 agent 整份替换，子 agent 按 id 合并。
@@ -238,18 +360,62 @@ async def write(todos: list[dict[str, Any]]) -> dict[str, Any]:
     existing: list[dict[str, Any]] = (
         _current_todos if isinstance(_current_todos, list) else []
     )
-    revision = int(current.get("revision") or 0) + 1
+    current_revision = int(current.get("revision") or 0)
+
+    # H14：**revision CAS**。
+    #
+    # 旧实现是"读到什么就基于什么写"：两个写者（主 agent 与子 agent，或同一 agent 的
+    # 两次并发调用）都从 revision=n 读到同一份，各自 +1 写回 —— 后写的那次把先写的
+    # 静默覆盖，表现为"某条待办凭空消失"。现在支持调用方带上"我基于哪一版改的"，
+    # 版本不符就**不写**，并把当前版本原样返回，让调用方重新读后重试。
+    if expected_revision is not None and int(expected_revision) != current_revision:
+        return {
+            "todos": existing,
+            "revision": current_revision,
+            "owner": str(current.get("owner") or ""),
+            "conflict": True,
+            "expected_revision": int(expected_revision),
+        }
+
+    revision = current_revision + 1
 
     if depth > 0:
         merged = _merge([dict(i) for i in existing], todos)
     else:
         merged = _renumber(todos)
 
-    payload = {"todos": merged, "revision": revision, "owner": owner}
+    payload = {
+        "todos": merged,
+        "revision": revision,
+        "owner": owner,
+        "conflict": False,
+    }
 
     from app.tools.context import get_session_id, get_tenant_id
 
-    if not await _write_redis(board_key(get_tenant_id(), get_session_id()), payload):
+    board_key_value = board_key(get_tenant_id(), get_session_id())
+    wrote_redis = False
+    try:
+        wrote_redis, landed_revision = await _write_redis_cas(
+            board_key_value, payload, current_revision
+        )
+    except Exception as exc:  # noqa: BLE001 - Redis 不可用 ⇒ 回退到进程内
+        logger.warning("taskboard: cas write failed (%s); falling back to context", exc)
+        wrote_redis = False
+        landed_revision = revision
+
+    if wrote_redis and landed_revision != revision:
+        # 另一个写者在同一瞬间先写成功了：本次**没有落盘**，如实回报冲突。
+        latest = await load()
+        latest_todos = latest.get("todos")
+        return {
+            "todos": latest_todos if isinstance(latest_todos, list) else existing,
+            "revision": int(latest.get("revision") or landed_revision),
+            "owner": str(latest.get("owner") or owner),
+            "conflict": True,
+            "expected_revision": current_revision,
+        }
+    if not wrote_redis:
         set_tool_context(**{_FALLBACK_CONTEXT_KEY: payload})
     else:
         # Redis 写成功时也同步一份到 context：同进程内的读（`current_todos`）不必
