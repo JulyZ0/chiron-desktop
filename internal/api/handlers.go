@@ -40,6 +40,10 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 		deps["redis"] = "down"
 		ready = false
 	}
+	// H54：本地模式下附带实例标识（实例 ID / 协议版本 / data dir 指纹）。
+	// 云端不设这些环境变量 ⇒ 响应体保持原样，不多暴露任何东西。
+	mergeInstanceIdentity(deps)
+
 	if !ready {
 		JSON(w, http.StatusServiceUnavailable, APIResponse{
 			Success: false,

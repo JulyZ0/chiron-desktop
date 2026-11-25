@@ -451,6 +451,23 @@ function buildGatewayEnv(info, options = {}) {
   // 网关的 StorageRoot 是"本地存储根"，媒体落 `<StorageRoot>/media`（`gateway_router.go:354`），
   // 所以这两项给的是数据根本身，而不是引擎那份 media 子目录。
   const gatewayDataDir = String(options.dataDir || '').trim()
+
+  // H54：把"这次部署是谁"注入网关，`/ready` 会原样回显。
+  //
+  // 没有它，外壳判断"本机栈还在跑"只能看 loopback `/ready` 是否 200 + 依赖 up ——
+  // 于是端口被另一个 data dir 的实例（或任何恰好连了 PG/Redis 的服务）占着时，
+  // 外壳会接管一个不属于本次部署的后端，用户的本地数据就写进了别人的库。
+  //
+  // 三项一起给：实例 ID（本次启动唯一）、协议版本（语义变更时升）、
+  // data dir 指纹（绑定"这个目录的栈"，`/ready` 无鉴权所以只给哈希）。
+  const instanceId = String(options.instanceId || '').trim()
+  if (instanceId) {
+    env.CHIRON_INSTANCE_ID = instanceId
+    env.CHIRON_INSTANCE_PROTOCOL = String(options.instanceProtocol || 1)
+    const dataDirKey = String(options.dataDirKey || '').trim()
+    if (dataDirKey) env.CHIRON_DATA_DIR_KEY = dataDirKey
+  }
+
   const dataPaths = localDataPaths(gatewayDataDir)
   if (dataPaths.PLUGIN_DATA_DIR) {
     env.CHIRON_DATA_DIR = gatewayDataDir
@@ -749,6 +766,20 @@ async function startGateway(info, options = {}) {
   err.attempts = tried
   err.portConflict = Boolean(last && last.portConflict)
   throw err
+}
+
+/**
+ * data dir 指纹（H54）：与服务端 `internal/api/instance_identity.go` 的
+ * `localDataDirKey` **同口径**（小写、正斜杠、sha256 前 8 字节十六进制）。
+ *
+ * 为什么要这么绑：`/ready` 无鉴权，只能给哈希；而"同一个 data dir"才是
+ * "该接管的那套栈"的准确定义 —— 同一台机器上可能有多个部署目录。
+ */
+function dataDirKeyOf(dataDir) {
+  const text = String(dataDir || '').trim()
+  if (!text) return ''
+  const normalized = text.replace(/\\/g, '/').toLowerCase()
+  return require('node:crypto').createHash('sha256').update(normalized).digest('hex').slice(0, 16)
 }
 
 /** 单次尝试：端口冲突的判定与换号重试由 `startGateway` 负责。 */
@@ -2165,6 +2196,11 @@ async function startLocalStack(options = {}) {
   // 这条路径覆盖 Electron 单实例锁管不到的情况：手动起的 CLI 引导器、上次被强杀后
   // 仍活着的网关。判活不只看状态文件——那个文件在进程被强杀时来不及删，所以还要
   // 实际打一次 /ready，确认 PG 与 Redis 都 up 才算数（见 runtime-state.cjs）。
+  // H54：本次启动的实例身份。既有状态文件里也有一个 —— 探测时逐项比对，
+  // 只有"同一个实例"才允许接管（见 runtime-state.probeExistingStack）。
+  const instanceId = runtimeState.newInstanceId()
+  const dataDirKey = dataDirKeyOf(dataDir)
+
   if (dataDir && options.reuseExisting !== false) {
     const existing = runtimeState.readRuntimeState(dataDir)
     const probe = await runtimeState.probeExistingStack(existing, { fetch: options.fetch })
@@ -2274,6 +2310,10 @@ ${tail}` : ''}`,
       ...options,
       port: gatewayPort,
       pythonEngineAddress: engineResult.address,
+      // H54：网关把这些原样回显在 /ready 上，外壳据此确认"这是我的栈"。
+      instanceId,
+      instanceProtocol: runtimeState.INSTANCE_PROTOCOL,
+      dataDirKey,
     })
 
     // 网关也挂自愈：它崩了比引擎崩了更彻底 —— 界面所有 API 一起失效，而此前
@@ -2302,6 +2342,10 @@ ${tail}` : ''}`,
     }, extraEnginePorts)
     if (dataDir) {
       runtimeState.writeRuntimeState(dataDir, {
+        // H54：身份必须写进状态文件，否则下次启动无法证明"这端口上的栈是我的"。
+        instanceId,
+        instanceProtocol: runtimeState.INSTANCE_PROTOCOL,
+        dataDirKey,
         gatewayPort: gatewayResult.port,
         enginePort: engineResult.port,
         enginePorts: [engineResult.port, ...extraEnginePorts],

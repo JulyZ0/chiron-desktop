@@ -21,6 +21,19 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 /** 状态文件格式版本。字段变了就加一，读到旧版本一律当作"不可接管"。 */
+/**
+ * 外壳 ↔ 本地栈的握手协议版本（H54）。与服务端 `internal/api/instance_identity.go`
+ * 的 `instanceProtocolVersion` 对应：任何一侧语义变化都要升它，老外壳遇到新版本
+ * 应**拒绝接管**而不是猜。
+ */
+const INSTANCE_PROTOCOL = 1
+
+/** 生成一次部署的实例 ID（32 位十六进制，无依赖）。 */
+function newInstanceId() {
+  const { randomBytes } = require('node:crypto')
+  return randomBytes(16).toString('hex')
+}
+
 const STATE_SCHEMA = 1
 
 /** 状态文件名（落在 dataDir 之下，与其他运行时数据同级）。 */
@@ -60,6 +73,10 @@ function writeRuntimeState(dataDir, payload) {
   const tmp = `${target}.${process.pid}.tmp`
   const body = {
     schema: STATE_SCHEMA,
+    // H54：把"这次部署是谁"写进状态文件，探测时才有东西可比。
+    // instanceId 每次启动重新生成；protocol 用于拒绝不兼容的外壳/服务端组合。
+    instanceId: (payload && payload.instanceId) || newInstanceId(),
+    instanceProtocol: INSTANCE_PROTOCOL,
     pid: process.pid,
     startedAt: new Date().toISOString(),
     ...payload,
@@ -121,6 +138,23 @@ async function probeExistingStack(runtimeState, options = {}) {
     if (data.postgres !== 'up' || data.redis !== 'up') {
       return { alive: false, reason: 'dependencies-down' }
     }
+
+    // H54：**身份挑战** —— 只凭 200 + 依赖 up 会把"另一个实例 / 第三方服务"当成我们的栈。
+    // 逐项比对，任一项不符即拒绝接管：
+    //   · 状态文件里没有 instanceId ⇒ 旧版状态，无法证明归属 ⇒ 不认；
+    //   · 服务端没回显 instanceId ⇒ 旧版网关，同样不认；
+    //   · protocol 不一致 ⇒ 语义可能已变，交给用户（重启本地栈）而不是猜。
+    const expectedId = String(runtimeState.instanceId || '')
+    const expectedProtocol = Number(runtimeState.instanceProtocol) || INSTANCE_PROTOCOL
+    const actualId = String(data.instance_id || '')
+    if (!expectedId) return { alive: false, reason: 'state-without-instance-id' }
+    if (!actualId) return { alive: false, reason: 'identity-not-echoed' }
+    if (actualId !== expectedId) return { alive: false, reason: 'instance-mismatch' }
+    const actualProtocol = Number(data.protocol)
+    if (Number.isFinite(actualProtocol) && actualProtocol !== expectedProtocol) {
+      return { alive: false, reason: 'protocol-mismatch' }
+    }
+
     return { alive: true, baseUrl: `http://127.0.0.1:${gatewayPort}`, port: gatewayPort }
   } catch (err) {
     return { alive: false, reason: 'unreachable', message: (err && err.message) || String(err) }
@@ -130,6 +164,8 @@ async function probeExistingStack(runtimeState, options = {}) {
 }
 
 module.exports = {
+  INSTANCE_PROTOCOL,
+  newInstanceId,
   STATE_SCHEMA,
   STATE_FILENAME,
   statePathFor,

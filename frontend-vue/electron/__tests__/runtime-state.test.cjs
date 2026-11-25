@@ -85,13 +85,28 @@ test('状态里没有网关端口时不可接管', async () => {
   assert.equal(result.reason, 'no-gateway-port')
 })
 
-test('网关 /ready 说 PG 与 Redis 都 up 才算活着', async () => {
+test('网关 /ready 说 PG 与 Redis 都 up **且身份一致**才算活着', async () => {
+  // H54 之后多了身份挑战：只凭 200 + 依赖 up 会把"别的服务的 /ready"也当成我们的栈。
+  // 这里补上状态文件里的实例身份与服务端的回显，验证"该活的仍然活"。
   const result = await rs.probeExistingStack(
-    { schema: rs.STATE_SCHEMA, gatewayPort: 18900 },
+    {
+      schema: rs.STATE_SCHEMA,
+      gatewayPort: 18900,
+      instanceId: 'inst-1',
+      instanceProtocol: rs.INSTANCE_PROTOCOL,
+    },
     {
       fetch: async () => ({
         ok: true,
-        json: async () => ({ success: true, data: { postgres: 'up', redis: 'up' } }),
+        json: async () => ({
+          success: true,
+          data: {
+            postgres: 'up',
+            redis: 'up',
+            instance_id: 'inst-1',
+            protocol: rs.INSTANCE_PROTOCOL,
+          },
+        }),
       }),
     },
   )
