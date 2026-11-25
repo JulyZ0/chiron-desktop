@@ -1,7 +1,7 @@
 {
   "contract": "chiron.contract",
-  "version": 1,
-  "note": "Go 网关与 Python 引擎共享的线上契约。这里只放**跨语言**的族；单侧内部结构不进契约。",
+  "version": 2,
+  "note": "Go 网关与 Python 引擎共享的线上契约。这里只放**跨语言 / 跨进程**的族；单侧内部结构不进契约 —— 每族的 `excluded` 段落逐条写清为什么排除。",
   "families": {
     "error": {
       "description": "HTTP/SSE 失败载荷。网关产出、引擎也产出（工具/子 Agent 失败），前端与 SDK 消费。",
@@ -110,6 +110,309 @@
         "seq 若出现必须是非负整数；回退由消费方按 id 去重处理",
         "data 里放该事件自己的字段；未识别的 data 字段必须被忽略（forward-compat）"
       ]
+    },
+    "tool_approval": {
+      "description": "工具审批的**决定**载荷：前端确认卡 → 网关 POST /v1/agent/approval（internal/api/submit_handler.go 做字段级校验）→ 引擎 parse_approval_payload（python-engine/app/agent/runtime.py 做语义校验）→ 落 pending_interactions.decision。三态由 decision 表达，approved 只为已发布的前端保留。",
+      "fields": {
+        "session_id": {
+          "type": "string",
+          "required": true,
+          "note": "网关据此把决定路由到承载该 run 的引擎实例（engine:run:{session}），否则会打到没有该 run 的副本"
+        },
+        "tool_call_id": {
+          "type": "string",
+          "required": true,
+          "note": "审批票据主键：同一会话同一调用只有一张待办（pending_interactions 唯一约束）"
+        },
+        "decision": {
+          "type": "string",
+          "required": false,
+          "enum": [
+            "approve",
+            "reject",
+            "edit"
+          ],
+          "note": "与 approved 至少给一个"
+        },
+        "approved": {
+          "type": "boolean",
+          "required": false,
+          "note": "旧前端兼容：缺 decision 时由它推导 approve / reject（显式 false 必须与'没发'区分）"
+        },
+        "arguments": {
+          "type": "string",
+          "required": false,
+          "note": "仅 decision=edit 有意义：编辑后的**完整参数对象**（JSON 字符串）；引擎用它重跑 tool_policy 分级，级别升高则不执行"
+        },
+        "reason": {
+          "type": "string",
+          "required": false,
+          "note": "给人看的理由；落库时截断到 2000 字节，故不做长度判罚"
+        }
+      },
+      "rules": [
+        "decision 与 approved 至少要有一个；两者都缺必须判违约 —— 缺字段不得等同于放行",
+        "decision 出现时只能是 approve / reject / edit；未知取值一律判违约（不存在'大概是同意'）",
+        "decision=edit 必须带 arguments，且解析结果必须是 JSON 对象（字符串或已解析对象皆可）",
+        "approved 出现时必须是布尔：它直接决定放行与否，\"true\" 这种字符串不得被当真",
+        "session_id 与 tool_call_id 必填：缺了决定无法路由、票据也对不上",
+        "未知字段必须被忽略（forward-compat）"
+      ],
+      "excluded": [
+        {
+          "field": "request.question / request.level / request.risk / request.arguments",
+          "reason": "审批**请求**的内层展示字段按 kind 各自不同（approval / question / budget 三种形状共用一张表，见 frontend-vue/src/api/interactions.ts）：冻结它等于把引擎的展示细节写进契约。跨语言且有枚举语义的是决定这一层。"
+        },
+        {
+          "field": "user_id",
+          "reason": "身份由网关从已验证的 JWT claims 写入请求体，属于**信任链**的一部分，不该由载荷自证。契约不把它当作可校验字段（引擎只比对 owner，不做格式判据）。"
+        },
+        {
+          "field": "run_token",
+          "reason": "网关从 Redis 归属映射（engine:run:{session}）读出后注入，供引擎拒绝陈旧 run 的审批；它是路由/防陈旧投递的注入参数，不是对外载荷。"
+        }
+      ]
+    },
+    "checkpoint": {
+      "description": "检查点**上报**载荷：引擎在回合边界建完快照后 POST /v1/internal/checkpoints（python-engine/app/agent/checkpoint_hooks.py::report_checkpoint）→ 网关落 project_checkpoints + checkpoint_untracked（internal/api/project_checkpoints.go）→ 前端还原点时间线消费。",
+      "fields": {
+        "session_id": {
+          "type": "string",
+          "required": true,
+          "note": "归属不由请求体声明：网关按它反查 session_map_nodes → session_map_workspaces 得到 workspace / tenant / user"
+        },
+        "seq": {
+          "type": "integer",
+          "required": true,
+          "note": "会话内递增序号；主键由 (session_id, seq, kind) 派生"
+        },
+        "kind": {
+          "type": "string",
+          "required": true,
+          "note": "回合节点（当前 pre_turn / post_turn）；不设枚举 —— 新增节点类型是 additive 的"
+        },
+        "state": {
+          "type": "string",
+          "required": false,
+          "enum": [
+            "ok",
+            "failed"
+          ],
+          "note": "缺省按 ok：老引擎不发明它"
+        },
+        "commit_sha": {
+          "type": "string",
+          "required": false,
+          "note": "state=ok 时必填"
+        },
+        "tree_sha": {
+          "type": "string",
+          "required": false,
+          "note": "state=ok 时必填"
+        },
+        "ref_name": {
+          "type": "string",
+          "required": false,
+          "note": "state=ok 时必填"
+        },
+        "parent_sha": {
+          "type": "string",
+          "required": false
+        },
+        "head_sha": {
+          "type": "string",
+          "required": false
+        },
+        "file_count": {
+          "type": "integer",
+          "required": false
+        },
+        "skipped_count": {
+          "type": "integer",
+          "required": false,
+          "note": "因体积/密钥被跳过的文件数：非 0 意味着这个点还原得**不完整**"
+        },
+        "byte_size": {
+          "type": "integer",
+          "required": false
+        },
+        "error": {
+          "type": "string",
+          "required": false,
+          "note": "state=failed 时的可读原因"
+        },
+        "error_code": {
+          "type": "string",
+          "required": false,
+          "enum": [
+            "git",
+            "io",
+            "unknown"
+          ],
+          "note": "稳定错误码供前端分类（checkpoint_service._classify_error 只产出这三类）"
+        },
+        "untracked": {
+          "type": "array",
+          "required": false,
+          "max_items": 5000,
+          "note": "未跟踪文件清单 [{path, sha256, size}]；回滚按 sha256 从 CAS 取内容，缺条目等于文件回不来"
+        }
+      },
+      "rules": [
+        "state 只能是 ok / failed；缺省按 ok（老引擎不带它，读取侧按成功处理是刻意的后向兼容）",
+        "state=ok 时 commit_sha / tree_sha / ref_name 必须非空：缺任何一个这份快照都没有可回滚的目标",
+        "state=failed 时不要求 commit / tree / ref：它们为空正是失败的原因，而失败记录同样必须能上报（否则时间线'什么都不缺'）",
+        "seq 必须是正整数：主键由 (session_id, seq, kind) 派生，0 或负数会让两个不同的检查点互相覆盖",
+        "error_code 出现时只能是 git / io / unknown：前端按它分类，自由文本只会变成'未知错误'",
+        "untracked 若出现必须是数组且不超过 5000 条，每条必须是对象且带非空 path 与 sha256",
+        "file_count / skipped_count / byte_size 若出现必须是非负整数",
+        "未知字段必须被忽略（forward-compat）"
+      ],
+      "excluded": [
+        {
+          "field": "agent_runs.checkpoint（RunCheckpoint：messages / done_tools / replay_pending / task_meta / usage / turn_ids / generation / saved_at …）",
+          "reason": "这是引擎与**自己的**恢复路径之间的私有结构（python-engine/app/agent/checkpoint.py::build_snapshot）：Go 侧从不解析其中任何字段（只按 status / generation 做行级 CAS），消费方只有引擎。收进契约会把尾部窗口条数、重放判定这类还在演进的内部决策冻结。跨语言的那一面是上面的上报载荷，不是快照本身。"
+        },
+        {
+          "field": "label / applied_at",
+          "reason": "网关与用户侧写入的展示字段：label 建点时恒为空串，applied_at 只有被回滚过才有；引擎既不读也不写。"
+        }
+      ]
+    },
+    "queue": {
+      "description": "Redis Stream 任务消息载荷：生产者（python-engine/app/queue/producer.py，QueueProducer.enqueue）写入 engine:tasks / engine:tasks:kb，消费方是引擎 worker 与独立的 pageindex-worker 容器（跨进程、跨部署）。",
+      "fields": {
+        "task_id": {
+          "type": "string",
+          "required": true,
+          "note": "幂等键与日志主键（每次入队新生成）"
+        },
+        "task_type": {
+          "type": "string",
+          "required": true,
+          "note": "决定投哪条流、调哪个 handler"
+        },
+        "tenant_id": {
+          "type": "integer",
+          "required": true,
+          "note": "按租户隔离；Redis 里字段一律是字符串，故数字与十进制数字串都收"
+        },
+        "payload": {
+          "type": "string",
+          "required": true,
+          "note": "业务数据的 JSON **对象**字符串编码（消费方 json.loads 后当 dict 用）"
+        },
+        "retry_count": {
+          "type": "integer",
+          "required": false,
+          "note": "重试次数；进 DLQ 的唯一依据"
+        },
+        "idempotency_key": {
+          "type": "string",
+          "required": false,
+          "note": "业务幂等键；空串等价于未提供（消费方回落 {task_type}:{task_id}）"
+        },
+        "deadline": {
+          "type": "string",
+          "required": false,
+          "note": "截止时间 YYYY-MM-DDTHH:MM:SSZ；过期的任务被消费方送进 DLQ"
+        }
+      },
+      "rules": [
+        "task_id 与 task_type 必填非空：前者是幂等键与日志主键，后者决定投哪条流、调哪个 handler",
+        "payload 必须是 JSON **对象**的字符串编码：消费方直接 json.loads 后当 dict 用，数组/标量会在 dispatch 处炸",
+        "tenant_id 必填且必须是整数或十进制数字串：消费方 _as_int 会静默回落 0，脏字段会变成'无租户任务'",
+        "retry_count 若出现必须是非负整数（数字或数字串）：它是进 DLQ 的唯一依据",
+        "deadline 若出现必须能被 %Y-%m-%dT%H:%M:%SZ 解析：解析失败的消息会被当作'没有截止时间'直接执行",
+        "task_type 不设枚举：新增任务类型是 additive 的，未知类型由消费方转发到目标队列或送 DLQ，不在此判违约",
+        "未知字段必须被忽略（forward-compat）"
+      ],
+      "excluded": [
+        {
+          "field": "priority",
+          "reason": "生产者写入但消费方从不读（队列在入队时已按 task_type 选好），冻结它只会让一个没人消费的字段也变成契约。"
+        },
+        {
+          "field": "created_at / trace_id",
+          "reason": "只用于日志与链路排查，没有任何判据依赖它们；搬运到契约里只会增加两端同步负担。"
+        },
+        {
+          "field": "stream 键名 / 消费组 / DLQ 键 / MAXLEN",
+          "reason": "部署参数（QueueSpec），不是消息载荷字段；改了不影响已有消息的可读性。"
+        }
+      ]
+    },
+    "mcp": {
+      "description": "MCP server 配置条目（{PluginDataDir}/{user_id}/plugins.json 的 mcp_servers[i]）：Go 网关写入与校验（internal/api/plugin_handler.go）、Python 引擎读取并据此起进程/注册工具（python-engine/app/plugins/store.py）。",
+      "fields": {
+        "name": {
+          "type": "string",
+          "required": true,
+          "note": "引擎按它分流内置/用户插件，并做同名校验"
+        },
+        "command": {
+          "type": "string",
+          "required": true,
+          "note": "要起的子进程；受运维级 PLUGIN_COMMAND_ALLOWLIST 约束"
+        },
+        "args": {
+          "type": "array",
+          "required": false,
+          "note": "字符串数组；同一命令的不同参数往往是完全不同的行为"
+        },
+        "env": {
+          "type": "object",
+          "required": false,
+          "note": "{字符串: 字符串}；凭据/端点都在这，类型漂移会让引擎拼环境变量时行为不一致"
+        },
+        "status": {
+          "type": "string",
+          "required": false,
+          "enum": [
+            "active",
+            "inactive"
+          ],
+          "note": "缺省按 active（老配置没这个字段）"
+        },
+        "approved": {
+          "type": "boolean",
+          "required": false,
+          "note": "用户级一次性授权；缺省 false = 不可执行（连进程都不起）"
+        },
+        "approval_digest": {
+          "type": "string",
+          "required": false,
+          "note": "批准时那组执行参数（command/args/env/read_only）的摘要；配置一改就清空"
+        },
+        "read_only": {
+          "type": "boolean",
+          "required": false,
+          "note": "缺省 false（fail-closed）：未声明只读的 server 引擎不直连，改走独立 MCP broker"
+        }
+      },
+      "rules": [
+        "name 与 command 必填非空：引擎按 name 分流内置/用户插件、按 command 起子进程",
+        "status 只能是 active / inactive；缺省按 active（老配置没有这个字段，读侧不能因此判它不可用）",
+        "read_only 缺省按 false（fail-closed）：未声明只读的 server 引擎不直连，改走 broker",
+        "approved=true 时必须带非空 approval_digest：没有摘要的批准等于'不知道批了什么'，两端都按未授权处理",
+        "approved 缺省按 false：未授权的配置连进程都不起（H24 两级闸门之一）",
+        "args 若出现必须是字符串数组；env 若出现必须是 {字符串: 字符串}",
+        "未知字段必须被忽略（forward-compat）"
+      ],
+      "excluded": [
+        {
+          "field": "description / version",
+          "reason": "不影响执行语义（plugin_approval.go 的摘要刻意不含它们）：改了不该逼用户重新授权，否则用户很快就会闭眼点同意。"
+        },
+        {
+          "field": "source",
+          "reason": "市场授权叠加项，只是网关侧的来源标记（\"market\"），引擎不读。"
+        },
+        {
+          "field": "approval_digest 的具体算法",
+          "reason": "契约只要求'approved=true 时摘要非空'，不复算：跨语言的 JSON 规范化差异（键序/转义）会把正确的配置判成假违约。算法归网关（internal/api/plugin_approval.go），引擎只认 approved 这一位。"
+        }
+      ]
     }
   },
   "compat": {
@@ -117,12 +420,7 @@
     "note": "同一 version 内只允许新增可选字段；删改字段 = 升 version，两端必须同时升级。"
   },
   "deferred": {
-    "families": [
-      "tool_approval",
-      "checkpoint",
-      "queue",
-      "mcp"
-    ],
-    "reason": "这四族的边界一侧在 Go、一侧在 Python 内部实现细节，本版本先把**消费方最多**的三族（error / terminal / run_event）定为契约；其余族在字段稳定后再纳入，避免把还会变的内部结构提前冻结。"
+    "families": [],
+    "reason": "v2 已把 v1 的四个 deferred 族（tool_approval / checkpoint / queue / mcp）全部纳入：纳入口径是'跨语言或跨进程且消费方不止一个'，每族内部结构里不满足这条的字段已列进该族的 excluded 并写明理由。"
   }
 }

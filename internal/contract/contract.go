@@ -1,9 +1,11 @@
-// Package contract 是 Go 与 Python 之间的**版本化线上契约**（PRD 9.2 / H16）。
+// Package contract 是 Go 与 Python 之间的**版本化线上契约**（PRD 9.2 / H16 / H16b）。
 //
-// 为什么需要它：`error` 与 `terminal` 两族载荷由网关产出、引擎也产出，前端与 SDK
-// 消费。任何一侧悄悄加/改字段，另一侧都只会在运行时才发现（典型症状："前端显示
-// 未知错误"、"流结束了但界面还在转"）。契约把字段与判据写成**数据**，两端各有一份
-// 校验实现，并跑**同一组** conformance 夹具 —— 漂移会在测试里失败，而不是在用户那里。
+// 为什么需要它：`error` / `terminal` / `run_event` 这些载荷由网关产出、引擎也产出，
+// 前端与 SDK 消费；v2 又把 `tool_approval` / `checkpoint` / `queue` / `mcp` 四族纳入
+// （它们各自跨语言或跨进程，消费方不止一个）。任何一侧悄悄加/改字段，另一侧都只会在
+// 运行时才发现（典型症状："前端显示未知错误"、"流结束了但界面还在转"、"审批点了没
+// 反应"）。契约把字段与判据写成**数据**，两端各有一份校验实现，并跑**同一组**
+// conformance 夹具 —— 漂移会在测试里失败，而不是在用户那里。
 package contract
 
 import (
@@ -13,15 +15,23 @@ import (
 )
 
 // Version 是契约版本。改动**删/改**字段必须同时升版本并改两端；只加可选字段不用升。
-const Version = 1
+//
+// v1 = error / terminal / run_event；v2（H16b）= 再纳入 tool_approval / checkpoint /
+// queue / mcp 四族，`versioned.json` 的 deferred 段因此清空。
+const Version = 2
 
-// Family 是一族载荷（error / terminal）。
+// Family 是一族载荷。
 type Family string
 
 const (
 	FamilyError    Family = "error"
 	FamilyTerminal Family = "terminal"
 	FamilyRunEvent Family = "run_event"
+	// v2 新增四族（实现见 contract_v2.go）。
+	FamilyToolApproval Family = "tool_approval"
+	FamilyCheckpoint   Family = "checkpoint"
+	FamilyQueue        Family = "queue"
+	FamilyMCP          Family = "mcp"
 )
 
 // Violation 描述一处违约（带字段路径，便于定位）。
@@ -178,6 +188,9 @@ func ValidateRunEvent(payload map[string]any) []Violation {
 }
 
 // Validate 按族名分派。
+//
+// 未知族名**必须报错**：静默通过会让"写错的族名"变成"没有任何校验"的假绿灯，
+// 而这正是契约最该防的那类事故。
 func Validate(family string, payload map[string]any) ([]Violation, error) {
 	switch Family(strings.ToLower(family)) {
 	case FamilyError:
@@ -186,6 +199,14 @@ func Validate(family string, payload map[string]any) ([]Violation, error) {
 		return ValidateTerminal(payload), nil
 	case FamilyRunEvent:
 		return ValidateRunEvent(payload), nil
+	case FamilyToolApproval:
+		return ValidateToolApproval(payload), nil
+	case FamilyCheckpoint:
+		return ValidateCheckpoint(payload), nil
+	case FamilyQueue:
+		return ValidateQueue(payload), nil
+	case FamilyMCP:
+		return ValidateMCP(payload), nil
 	default:
 		return nil, fmt.Errorf("未知契约族：%q", family)
 	}
