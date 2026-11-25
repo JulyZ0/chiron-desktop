@@ -1747,8 +1747,16 @@ async function confirmSensitiveAction(options = {}) {
   const password = typeof options.password === 'string' ? options.password : ''
 
   if (process.platform !== 'win32') {
-    // 非 Windows 没有 Hello 也没有这份密码校验，只能依赖 OS 层面的账户隔离
-    return { ok: true, reason: 'verified', message: '' }
+    // H48：**不支持原生重认证的平台不得执行破坏性操作**。
+    //
+    // 旧实现直接返回 `{ok:true, verified}` —— 在 Linux/macOS 上，"清空本机数据"这类
+    // 不可逆动作**完全没有第二道确认**，而同一份界面文案却告诉用户"会再次验证身份"。
+    // 现在如实拒绝：宁可这条功能在非 Windows 上不可用，也不能让用户以为验证发生过。
+    return {
+      ok: false,
+      reason: 'verification-unavailable',
+      message: '当前平台没有可用的原生身份验证，已拒绝执行该操作（请改用设置页的显式确认）',
+    }
   }
 
   let availability = null
@@ -3028,9 +3036,21 @@ if (!gotLock) {
       // 没开第二因素就拒绝解锁（那会让升级上来的用户直接进不去）。
       const status = await twoFactor.getStatus()
       if (status.unreadable) {
-        // 配置密文读不出来：如实告知，而不是假装"没启用"。本机第一因素仍然有效，
-        // 所以这里**放行**（否则用户永远进不来），但界面必须看到这个事实。
-        logMain('warn', '2FA 配置不可读，按未启用放行')
+        // H48：**不可读 ≠ 未启用**。
+        //
+        // 旧行为是"记一条 warning 然后当没开 2FA 放行" —— 密文损坏 / 密钥轮换后
+        // 第二因素被**静默关闭**，而这次解锁还会成功，用户永远不会知道。
+        // 现在直接拒绝解锁，并把"重置 2FA"作为显式恢复路径交给用户选择
+        // （`desktop:two-factor-reset`），而不是我们替他决定把第二因素关掉。
+        logMain('error', '2FA 配置不可读：拒绝解锁，要求显式重置')
+        return {
+          ok: false,
+          reason: 'second-factor-unreadable',
+          recoverable: 'reset-two-factor',
+          message:
+            '第二因素配置无法读取（密钥损坏或被系统重置）。已拒绝解锁；请在 2FA 面板重置后重试。',
+          account,
+        }
       }
       if (status.enabled) {
         if (!secondFactor) {
@@ -3113,6 +3133,20 @@ if (!gotLock) {
 
     /** 停用：删掉配置。需要密码 —— 否则旁人拿到未锁的窗口就能把第二因素关掉。 */
     ipcMain.handle('desktop:disable-two-factor', async (event, payload) => {
+
+    /**
+     * H48：重置**不可读**的 2FA 配置（唯一合法用途）。
+     *
+     * 解锁在密文不可读时会被拒绝（fail-closed），所以必须有一条用户可走的恢复路径，
+     * 否则等于把用户永久锁死 —— 那只是把"静默关闭第二因素"换成了"永久不可用"。
+     * 状态可读时本接口拒绝，避免用它绕过正常的「停用（需密码）」流程。
+     */
+    ipcMain.handle('desktop:reset-two-factor', async event => {
+      assertTrustedSender(event)
+      const result = await twoFactor.reset()
+      logMain(result.ok ? 'warn' : 'info', `2FA reset: ${result.reason}`)
+      return { ...result, status: await twoFactor.getStatus() }
+    })
       assertTrustedSender(event)
       if (currentMode !== 'local') {
         return { ok: false, reason: 'not-local', message: '只有本地模式支持第二因素' }

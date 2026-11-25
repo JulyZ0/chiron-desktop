@@ -266,6 +266,34 @@ async function disable() {
  * 未启用时直接放行（`{ ok:true, skipped:true }`）：调用方按"没有第二因素"处理，
  * 不要因为用户没开 2FA 就拒绝解锁。
  */
+/**
+ * 显式重置第二因素（H48）。
+ *
+ * 使用场景只有一个：**密文不可读**。此时 `getStatus()` 返回 `unreadable: true`，
+ * 解锁会被拒绝（fail-closed），用户必须自己确认"我知道 2FA 用不了了，重置它"。
+ *
+ * 与 `disable()` 的区别：`disable()` 需要用户输入密码且要求状态可读；
+ * `reset()` 恰恰是在状态不可读时才用得上 —— 它删掉那份坏密文并清空状态，
+ * 让用户重新注册。**它不返回任何秘密**，也不能用来绕过已启用且可读的 2FA。
+ */
+async function reset() {
+  const status = await getStatus()
+  if (!status.unreadable) {
+    // 状态可读时走正常的 disable（需要密码确认），不允许用"重置"绕过第二因素。
+    return {
+      ok: false,
+      reason: 'not-unreadable',
+      message: '2FA 状态正常，重置请走「停用」并输入密码',
+    }
+  }
+  try {
+    await fs.promises.rm(filePath(), { force: true })
+  } catch (err) {
+    return { ok: false, reason: 'reset-failed', message: (err && err.message) || String(err) }
+  }
+  return { ok: true, reason: 'reset', message: '已清除无法读取的 2FA 配置，请重新启用' }
+}
+
 async function verify(token) {
   const state = await readState()
   if (!state.enabled) return { ok: true, skipped: true }
@@ -313,6 +341,7 @@ function _resetDeps() {
 }
 
 module.exports = {
+  reset,
   FILE,
   VERSION,
   RECOVERY_CODE_COUNT,
