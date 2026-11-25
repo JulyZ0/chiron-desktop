@@ -89,13 +89,13 @@
 
 **结论**：状态 = append-only `SessionEvent` 日志；模型历史只是派生视图。"可恢复"的粒度是 **turn 边界**：重启后 `resume()` 重新拿写句柄、读日志、把断掉的尾部 turn 用合成事件封口，再重建 agent；**不恢复**半截 step / 半截流。
 
-- 单一事实源：`docs/architecture.md:138` "Model-visible means logged"；`agent.ts:718` 每次请求都从日志派生。
+- 单一事实源：`deepseek-harness/docs/architecture.md:138` "Model-visible means logged"；`agent.ts:718` 每次请求都从日志派生。
 - 写句柄获取：`packages/core/agent-loop/src/index.ts:694-698`（create）、`796-801`（resume，先 `persistence.open(id,'write')` 抢占，避免并发恢复）。
 - 恢复即修复：`index.ts:806-810` 读全量事件 → `interruptedTurnClosers(persisted)` → 以普通批次 append；实现见 `packages/core/session/src/repair.ts:53-98`（补 `tool/result` → `step/end` → `turn/end{kind:'interrupted'}`），`repair.ts:105-198` 按 `tool/call` 是否记录过区分 `TOOL_OUTCOME_UNKNOWN` / `TOOL_NOT_STARTED`。
 - 耐久点：`packages/session/session-checkpoint-policy/src/index.ts:64-68`（派发前 flush 请求前缀）、`70-75`（顶层工具体前 flush `tool/call`）、`79-82`（下一请求前 flush 上一步）。
 - 待办入队也持久：inbox 是 durable projection（`agent-loop/src/inbox.ts:215-231` 每次 splice 落 `agent/inbox/spliced`），所以重启后 pending 输入会重放。
-- 恢复边界（明确限制）：`agent-loop/README.md:234` 根上下文关闭时最后一个 `turn/end` 可能只在内存；`docs/architecture.md:134` 硬进程丢失在 settlement 之前不留 attempt 流；`agent.ts:201-222` 的 `runMaintenance` 是"非 turn"任务，压缩不会续跑未完 turn。
-- 格式演进：`docs/architecture.md:136` 相邻 `vN→vN+1` 迁移链、只写后继代、从不改写已提交代（`packages/session/session-format-*`）。
+- 恢复边界（明确限制）：`agent-loop/README.md:234` 根上下文关闭时最后一个 `turn/end` 可能只在内存；`deepseek-harness/docs/architecture.md:134` 硬进程丢失在 settlement 之前不留 attempt 流；`agent.ts:201-222` 的 `runMaintenance` 是"非 turn"任务，压缩不会续跑未完 turn。
+- 格式演进：`deepseek-harness/docs/architecture.md:136` 相邻 `vN→vN+1` 迁移链、只写后继代、从不改写已提交代（`packages/session/session-format-*`）。
 
 ## 8. 核心循环明确不做的事（边界）
 
@@ -106,7 +106,7 @@
 - 不做审批决策：循环只 `tools.execute()`；ask→allow/deny 在 `user-approval`（`index.ts:243-334`）。
 - 不做并发调度：`ctx.tools.execute()` 后面是 executor 的 `batch.ts`；循环只传 `maxParallelToolCalls`（`agent.ts:578`）。
 - 不做请求重试：`llm-retry` 监听 `agent/request-error`（`packages/llm/llm-retry/src/index.ts:241`），策略定义在 `packages/llm/llm/src/retry-policy.ts:15-58`（默认 5 次、500ms 起、指数退避+抖动）。
-- 不做持久化分帧/迁移：`session-persistence{-jsonl,-sqlite}` 拥有（`docs/architecture.md:136`）。
+- 不做持久化分帧/迁移：`session-persistence{-jsonl,-sqlite}` 拥有（`deepseek-harness/docs/architecture.md:136`）。
 - 不做迭代/预算上限：`agent-loop/README.md:238`；也没有"停止策略"——停止点是 `agent/turn-stopping`（`agent.ts:392`），由 hooks（`packages/experimental/hooks-claude-code/src/index.ts:284`）等实现。
 - 不做会话历史检索：`session-query` 是独立查询服务（`packages/session-query/session-query/README.md:10`），不在循环路径上。
 - 不做 todo/plan/skill/goal：各自包通过工具与 `agent/*` 事件接入（如 goal 的轮次预算在 `packages/goal/goal/src/fold.ts:235`）。
@@ -115,7 +115,7 @@
 
 ## 这个核心循环的设计取舍
 
-1. **"日志即状态"胜过"内存即状态"**：模型可见的一切都必须先落 `SessionEvent`，请求每次从日志派生并深冻结（`agent.ts:718-733`）。换来可重放、可冷读、可迁移（`docs/architecture.md:136-138`），代价是每步重推导 + 写放大 + 一个"派生必须与日志一致"的强约束。
+1. **"日志即状态"胜过"内存即状态"**：模型可见的一切都必须先落 `SessionEvent`，请求每次从日志派生并深冻结（`agent.ts:718-733`）。换来可重放、可冷读、可迁移（`deepseek-harness/docs/architecture.md:136-138`），代价是每步重推导 + 写放大 + 一个"派生必须与日志一致"的强约束。
 2. **"终态唯一"胜过"错误可抛"**：适配器异常被归一成唯一 `finish` chunk（`llm/index.ts:1170-1178`），中断只保留文本前缀、丢弃 tool-call（`assembler.ts:169-179`），缺失结果用合成事件补齐（`repair.ts:105-198`）。历史永远可配对、可重放，代价是语义上的"结果未知"要模型自己判断是否重试。
 3. **策略外置到四个切点**：`agent/pre-step`、`agent/request`、`agent/request-error`、`agent/turn-stopping` 是循环唯一的策略面（`packages/core/agent/src/runtime-types.ts:351/374/390/418`）。压缩、重试、超时、重复调用提醒、停止钩子全是监听器，组合极其灵活；代价是"循环行为"取决于装了哪些 bundle，理解与排障必须看组合而不是看循环。
 4. **无硬上限、以"步边界输入"驱动收敛**：steer/inject 在同 turn 内续步（`agent.ts:391-396`），turn 只在无 owed work 时关闭。长任务不会被硬阈值截断，代价是失控 turn 只能靠 `turn-stopping` 策略或用户 cancel 兜住（这正是 `agent-loop/README.md:238` 自陈的缺口）。

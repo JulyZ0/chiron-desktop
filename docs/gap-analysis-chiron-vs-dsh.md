@@ -14,13 +14,13 @@ Chiron 强在**分布式可靠性**（队列 fencing/幂等/DLQ、五轴预算�
 | 轴 | DSH 领先 | Chiron 领先 | 关键证据 |
 |---|---|---|---|
 | 核心循环 | 契约/实现分离 + 四策略切点；终态两层保证；steer 落点在**步**边界 | `max_turns` + 五轴预算 + 续段（长任务不被静默截断） | `agent-loop/README.md:238`、`runtime.py:3067,3091-3132` |
-| 长线调度 | job 生命周期写进**会话日志**；恢复"不发明事实" | Redis Streams + fencing + 幂等 + DLQ + takeover；cron 之外有延迟/死信 | `docs/subsystems/jobs.md:35`、`app/queue/{idempotency,worker}.py` |
+| 长线调度 | job 生命周期写进**会话日志**；恢复"不发明事实" | Redis Streams + fencing + 幂等 + DLQ + takeover；cron 之外有延迟/死信 | `deepseek-harness/docs/subsystems/jobs.md:35`、`app/queue/{idempotency,worker}.py` |
 | 工具交互 | 三来源同一 `ToolDefinition` + 同一条 pipeline；guard **类型上**只减权；沙箱 fail-closed | **服务端授权**（Tool Broker）+ 票据绑定 `args_hash/turn_id/scope` + 参数级硬拦 + SSRF 钉 IP + 出口脱敏 | `pipeline.ts:63-234`、`internal/api/tool_broker.go:102-158`、`runtime.py:194-238` |
 
 ### 0.1 修正一处口径
 
 DSH **有**审批留痕（`approval/asked` + `approval/decided` 成对写进日志，`packages/interaction/user-approval/src/index.ts:243-262`），
-缺的是**队列**：单决策槽、无审批专用超时、无"记住该工具"、子 Agent 不能弹审批（`docs/subsystems/approval.md:21,53`）。
+缺的是**队列**：单决策槽、无审批专用超时、无"记住该工具"、子 Agent 不能弹审批（`deepseek-harness/docs/subsystems/approval.md:21,53`）。
 Chiron 有 `pending_interactions` 状态机（`pending→answered→consumed`，24h 过期）与票据单次消费，能支撑"人不在也要排队等"。
 
 ## 1. 核心循环
@@ -32,7 +32,7 @@ Chiron 有 `pending_interactions` 状态机（`pending→answered→consumed`，
 | 结构 | `packages/core` 是**子包目录**：`agent-loop`（驱动）/ `agent`（公共契约）/ `tools` / `session` / `system-prompt` / `scope`；`agent-loop` 只是 `agent` 契约的**默认实现**，扩展插件从不依赖它 | `packages/core/README.md:38` |
 | 入口 | `kick()` = `while (await this.turn()) {}`；`turn()` 内 `while(true)` 逐步推进 | `packages/core/agent-loop/src/agent.ts:271-273,340` |
 | 迭代上限 | **没有**（全仓无 maxSteps/maxTurns；README 自陈 "No built-in turn budget"） | `packages/core/agent-loop/README.md:238` |
-| 终止分支 | completed / blocked（pre-step 整体 reject，**不消耗 step**）/ max-tokens（sticky，优先于后续继续）/ error / aborted；`turn/end` 在 finally 必写 | `agent.ts:344-347,364-369,366-418,574`、`docs/agent-lifecycle.md:37` |
+| 终止分支 | completed / blocked（pre-step 整体 reject，**不消耗 step**）/ max-tokens（sticky，优先于后续继续）/ error / aborted；`turn/end` 在 finally 必写 | `agent.ts:344-347,364-369,366-418,574`、`deepseek-harness/docs/agent-lifecycle.md:37` |
 | 流与终态 | 适配器抛错被**归一成一个 finish chunk**；`AssistantStreamAttempt` 另有 terminal 标志 ⇒ "终态唯一"是两层保证 | `packages/llm/src/index.ts:1104-1138`、`agent-loop/src/assistant-stream.ts:23,79-110` |
 | 半截参数 | 装配层只拼字符串；max-tokens 时**丢弃 tool-call 块**，中断只保留 text/reasoning；非法 JSON 原样保留给执行期拒 | `packages/llm/src/assembler.ts:69-75,135-150,169-179`、`core/tools/src/batch.ts:99-106` |
 | 工具编排 | 整批交给 `ctx.tools.execute()`，默认并发 10；exclusive 屏障 vs 并行滚动池；**只有工具本体并行**，pre-execute/审批/结果提交按模型顺序串行 | `agent.ts:580-583`、`core/tools/src/constants.ts:6`、`batch.ts:76-91,138-150,186-218` |
@@ -81,21 +81,21 @@ Chiron 有 `pending_interactions` 状态机（`pending→answered→consumed`，
 | 面 | 事实 | 证据 |
 |---|---|---|
 | 托管形态 | `ctx.jobs` 是**进程内**后台任务 seam（`LocalJobRegistry`），没有持久队列、没有调度守护进程 | `packages/jobs/README.md:14`、`packages/jobs/jobs-local/README.md:12` |
-| 状态机 | `running → stopping → completed(killed|failed)`；kill 先把状态置 `stopping` 再落终态 | `packages/jobs/jobs/src/view.ts:19`、`packages/jobs/jobs-local/src/index.ts:500-509` |
+| 状态机 | `running → stopping → completed（killed 或 failed）`；kill 先把状态置 `stopping` 再落终态 | `packages/jobs/jobs/src/view.ts:19`、`packages/jobs/jobs-local/src/index.ts:500-509` |
 | 推进者 | 每个 job 一个 `setTimeout` 轮询（`pumpPollMs=150`），生命周期与进程绑定 | `packages/jobs/jobs-local/src/pump.ts:98`、`README.md:57,61` |
 | 背压 | **硬拒绝不排队**（默认 10 个/owner，超限直接拒） | `packages/jobs/jobs-local/src/index.ts:234-237` |
-| 会话记账 | job 生命周期作为 `job/registered` / `job/settled` 写进**原 owner 会话日志** | `docs/subsystems/jobs.md:35` |
-| 断点恢复 | 不恢复 job 与输出环；恢复靠"日志重放 + 语义检查点 + 合成闭包" | `docs/subsystems/persistence.md:108-112`、`packages/core/session/src/repair.ts:209` |
+| 会话记账 | job 生命周期作为 `job/registered` / `job/settled` 写进**原 owner 会话日志** | `deepseek-harness/docs/subsystems/jobs.md:35` |
+| 断点恢复 | 不恢复 job 与输出环；恢复靠"日志重放 + 语义检查点 + 合成闭包" | `deepseek-harness/docs/subsystems/persistence.md:108-112`、`packages/core/session/src/repair.ts:209` |
 | 防重复副作用 | **不重试**：已开始未完成 → `TOOL_OUTCOME_UNKNOWN`，未开始 → `TOOL_NOT_STARTED` | `repair.ts:166-193` |
-| 定时 | 7 种 timing（after/at/every/daily/weekly/cron/rrule），单 Host timer + latest-only catch-up，语义明确 **at-least-once** | `docs/subsystems/schedule.md:5,24,26-34,127,131` |
+| 定时 | 7 种 timing（after/at/every/daily/weekly/cron/rrule），单 Host timer + latest-only catch-up，语义明确 **at-least-once** | `deepseek-harness/docs/subsystems/schedule.md:5,24,26-34,127,131` |
 | 触发落点 | 写入目标 Session 的 durable inbox 并 flush；receipt ≠ 模型已执行 | `schedule.md:118,131`、`packages/schedule/schedule/src/index.ts:222` |
-| plan / todo | **都没有 revision/CAS**：plan 是 log-only 模式状态，todo 整表覆盖 last-write-wins | `docs/subsystems/plan.md:11`、`docs/subsystems/todo.md:16-27` |
+| plan / todo | **都没有 revision/CAS**：plan 是 log-only 模式状态，todo 整表覆盖 last-write-wins | `deepseek-harness/docs/subsystems/plan.md:11`、`deepseek-harness/docs/subsystems/todo.md:16-27` |
 | 有 CAS 的地方 | `goal` 与 `team` 的 task board | `packages/goal/goal/src/index.ts:458-464`、`packages/team/agent-team/src/task-board.ts:129-131` |
-| 隔离单位 | **Session**，不是 worktree；team 明写 no worktree/lock/merge | `packages/team/agent-team/README.md:196-197,215`、`docs/subsystems/worktrees.md:13` |
+| 隔离单位 | **Session**，不是 worktree；team 明写 no worktree/lock/merge | `packages/team/agent-team/README.md:196-197,215`、`deepseek-harness/docs/subsystems/worktrees.md:13` |
 | 配额 | job 10/owner、subagent 槽位池 + 深度、goal 轮数、workflow `maxTotalAgents`；**无 token/货币预算** | `packages/subagent/subagent/src/activation.ts:28-31` |
-| 上下文 | pre-step 按 pressure/overflow 压缩；工具结果超 `maxInlineTokens` 落盘（spill）只留头尾 + locator | `docs/subsystems/compaction.md:11,19,101`、`docs/subsystems/spill.md:92` |
-| 人机协作 | **无审批队列**：waterfall 单决策槽、无审批专用超时、fail-closed，但 `approval/asked`+`approval/decided` 成对留痕；超时问答返回 `{pending,callId}` 可事后补答；子 Agent 不能弹审批 | `docs/subsystems/approval.md:21,86`、`docs/subsystems/user-questions.md:149-158,206` |
-| 可观测 | `JobView` 统一投影 + `job.list/follow/kill` 流；进度单行 `progress`、原因 `detail`、`cause=producer|kill|teardown`；**无任务级心跳** | `docs/subsystems/jobs.md:275-320,422-447`、`packages/jobs/jobs/src/types.ts:253,261-287` |
+| 上下文 | pre-step 按 pressure/overflow 压缩；工具结果超 `maxInlineTokens` 落盘（spill）只留头尾 + locator | `deepseek-harness/docs/subsystems/compaction.md:11,19,101`、`deepseek-harness/docs/subsystems/spill.md:92` |
+| 人机协作 | **无审批队列**：waterfall 单决策槽、无审批专用超时、fail-closed，但 `approval/asked`+`approval/decided` 成对留痕；超时问答返回 `{pending,callId}` 可事后补答；子 Agent 不能弹审批 | `deepseek-harness/docs/subsystems/approval.md:21,86`、`deepseek-harness/docs/subsystems/user-questions.md:149-158,206` |
+| 可观测 | `JobView` 统一投影 + `job.list/follow/kill` 流；进度单行 `progress`、原因 `detail`、`cause = producer / kill / teardown`；**无任务级心跳** | `deepseek-harness/docs/subsystems/jobs.md:275-320,422-447`、`packages/jobs/jobs/src/types.ts:253,261-287` |
 | 明确局限 | job 契约进程内且不恢复；workflow 无 journal/resume；subagent 崩溃丢"已接受未落日志"的消息；goal 无 evaluator/自动重试；plan pending 进程内易失；schedule Host 必须常驻；spill 无保留策略 | 见上述各 README，及 `packages/jobs/tool-jobs/src/index.ts:478,499`（FIXME） |
 
 ### 2.2 Chiron 的做法
@@ -157,15 +157,15 @@ Chiron 有 `pending_interactions` 状态机（`pending→answered→consumed`，
 |---|---|---|
 | 来源同构 | 只有**一个**注册表 `ctx.tools`：内置（插件在 `apply()` 里注册）、MCP（`tools/list` → `createMcpToolDefinition` → 同一个 `register`）、动态插件全部产出同一个 `ToolDefinition`，走**同一条** pipeline | `packages/core/tools/src/index.ts:128-153`、`packages/mcp/mcp-client/src/tools.ts:225,340-362`、`packages/fs/tool-fs/src/index.ts:71-102` |
 | 可见性 | per-step `resolve()` 的 `when` 准入 + scoped 遮蔽 + `restrict({allow,deny})`；on-demand MCP 工具**不受** `restrict` 约束（只能靠 guard 挡） | `index.ts:162-227,264-307`、`packages/mcp/mcp-client/README.md`（Known Limitations） |
-| 执行链 | 参数解析 → **无损快照冻结** → `tools/pre-execute`（allow/deny/cancel/ask）→ 审批 → **单调 guard（只减权）** → `tools/execute`（超时/信号）→ 工具体 → output schema 校验 + `render` → `projectContent` → `tools/post-execute` → `finalizeContent` → 冻结 → `tools/result` | `packages/core/tools/src/pipeline.ts:63-234,356-417,557-588`、`docs/tool-execution-pipeline.md:9-62` |
+| 执行链 | 参数解析 → **无损快照冻结** → `tools/pre-execute`（allow/deny/cancel/ask）→ 审批 → **单调 guard（只减权）** → `tools/execute`（超时/信号）→ 工具体 → output schema 校验 + `render` → `projectContent` → `tools/post-execute` → `finalizeContent` → 冻结 → `tools/result` | `packages/core/tools/src/pipeline.ts:63-234,356-417,557-588`、`deepseek-harness/docs/tool-execution-pipeline.md:9-62` |
 | 失败码 | `UNKNOWN_TOOL` / `INVALID_ARGS` / `INVALID_TOOL_OUTPUT` / `TOOL_TIMEOUT` / `ABORTED` vs `ABORTED_BEFORE_DISPATCH` / `APPROVAL_*`，全部归一成 `isError` | `pipeline.ts:732-805`、`contracts.ts:292-337` |
-| 权限粒度 | 工具可见性 + 调用级 allow/deny/ask/cancel + 会话级两个旋钮（`sandbox/mode`、`approval/policy`）；**没有** per-参数/路径 ACL，**没有**"记住选择" | `packages/interaction/permission-presets/src/index.ts:91-107`、`docs/subsystems/approval.md:21` |
+| 权限粒度 | 工具可见性 + 调用级 allow/deny/ask/cancel + 会话级两个旋钮（`sandbox/mode`、`approval/policy`）；**没有** per-参数/路径 ACL，**没有**"记住选择" | `packages/interaction/permission-presets/src/index.ts:91-107`、`deepseek-harness/docs/subsystems/approval.md:21` |
 | 审批 | 必须处于 open turn；先 `approval/asked` 再 waterfall 再 `approval/decided`（**成对审计进日志**）；请求只带 `toolName/callId/reason`，**不复制参数**；无审批专用超时（一直挂到被取消）；`allowed-once` 一次性 | `packages/interaction/user-approval/src/index.ts:243-262,129-150,294-334`、`approval.md:53` |
 | 并发 | 并行 **opt-in**：只有 `isConcurrencySafe(args) === true` 才进并行池，未声明/抛错一律 exclusive；exclusive 断组；滚动池上限 = batch 覆盖 > executor 配置 > 默认 10；审批发生在**有序 prepare 阶段**，会卡住"下一个开始"但不打断已派发 | `pipeline.ts:106-115`、`batch.ts:76-91,139-201,186-218` |
 | 沙箱 | 纯策略 + 同内核受限进程（Linux bwrap→Landlock、macOS Seatbelt、Windows 受限令牌+DACL），**非容器**；后端不可用即 **fail closed**（`SANDBOX_UNAVAILABLE`，"refusing to run the command unconfined"）；windows-acl 只 partial，`additionalWritableRoots` 对进程无效 | `packages/sandbox/sandbox/src/index.ts:32-161`、`sandbox-local/src/index.ts:174-206` |
 | 结果 | canonical value 出厂校验、**只留在执行内**不进 durable 事件；超 `maxInlineTokens` → head/tail + 落盘 locator（缺省关闭）；二进制进 attachment store；三处可重写点（`projectContent`/`post-execute`/`finalizeContent`） | `contracts.ts:340-350`、`packages/spill/spill-policy/src/index.ts:92-151` |
 | 常驻资源 | LSP 每 workspace 一实例 + 串行队列；terminal PTY 会话常驻；browser/computer 只有 seam（真身在 experimental，按 Agent 挂 stdio MCP client）；进程树用 Windows Job 对象 / Linux user-systemd scope | `packages/lsp/lsp-stdio/src/index.ts:136-239`、`terminal/terminal-bash/src/session.ts:1-20`、`subprocess-local/src/windows-job.ts` |
-| 安全面 | 命令**不做净化**（bash 就是 shell，防线是策略+审批+沙箱）；路径用 `fs.contains` 夹取；**SSRF 私网校验已移除**（v0.2.1-rc.2 起，要挡须自建 `tools/pre-execute`）；凭证只存引用；外部内容标注 untrusted，但 **MCP 结果没有统一包装** | `packages/sandbox/sandbox/src/index.ts:214-225`、`docs/upgrade-guide/v0.2.1-rc.2/web-fetch-private-destinations/guide.md:8-12`、`packages/web/tool-web/src/trust.ts:7` |
+| 安全面 | 命令**不做净化**（bash 就是 shell，防线是策略+审批+沙箱）；路径用 `fs.contains` 夹取；**SSRF 私网校验已移除**（v0.2.1-rc.2 起，要挡须自建 `tools/pre-execute`）；凭证只存引用；外部内容标注 untrusted，但 **MCP 结果没有统一包装** | `packages/sandbox/sandbox/src/index.ts:214-225`、`deepseek-harness/docs/upgrade-guide/v0.2.1-rc.2/web-fetch-private-destinations/guide.md:8-12`、`packages/web/tool-web/src/trust.ts:7` |
 
 ### 3.2 Chiron 的做法
 
@@ -173,7 +173,7 @@ Chiron 有 `pending_interactions` 状态机（`pending→answered→consumed`，
 |---|---|---|
 | 来源 | 三类（内置 / MCP / 插件）走**同一条执行链**，但 MCP 属 `HIDDEN_SOURCES`，不进可见清单，只能经 `use_capability` 代理 | `app/tools/registry.py:38-48,154-180`、`app/tools/use_capability.py:34-53` |
 | 执行链 | 参数 JSON → schema 归一/校验 → 动作分级 read/write/delete/external → ToolGuard（密钥/逃逸硬拦 + 模式裁决）→ **Tool Broker 服务端授权**（delete/external fail-closed）→ guardian LLM 评审 → 人工审批 → recovery 闸门 → PreToolUse hook（只收紧）→ 分发（写占用 + 沙箱槽）→ 结果压缩/落盘 → **副作用账本** → span/usage | `app/agent/tool_execution.py:1-27,118-500`、`internal/api/tool_broker.go:102-158` |
-| 权限粒度 | 会话三模式 `ask|auto|yolo`；**参数级硬拦不受模式影响**；审批票据绑定 `(tool_call_id, args_hash, turn_id, caller_id, resource_scope)`，缺字段 fail-closed，执行前二次校验，单次消费 + 跨副本 TTL | `app/agent/guards.py:97-100,300-314`、`runtime.py:194-238,556-601,5580` |
+| 权限粒度 | 会话三模式 `ask / auto / yolo`；**参数级硬拦不受模式影响**；审批票据绑定 `(tool_call_id, args_hash, turn_id, caller_id, resource_scope)`，缺字段 fail-closed，执行前二次校验，单次消费 + 跨副本 TTL | `app/agent/guards.py:97-100,300-314`、`runtime.py:194-238,556-601,5580` |
 | 沙箱 | 路径夹取 + 命令白名单（25 个）+ 逃逸正则（`$()`/反引号/换行）+ 文本级准入；Windows 隔离档 `none/job/low_il/restricted/appcontainer`（默认 `restricted`，硬底线 `low_il`）；**POSIX 只有 `setrlimit`**（无命名空间）；可选 `sandbox-service` 明示**无命名空间/seccomp**，不可达且非降级模式则拒绝启动 | `app/tools/sandbox.py:227-292,758,973-1002`、`app/isolation/__init__.py:56-103`、`sandbox-service/README.md:5-8` |
 | 结果 | `INLINE_LIMIT` 以上生成结构摘要 + `result_ref` 落 `result_store`，`read_tool_result` **分段取回**（32000/次） | `app/tools/tool_result.py:18-54` |
 | 常驻 | 会话级 `persistent_shell`（失败不回退）；浏览器经网关 `/v1/rpa/exec` 转发到用户已连接 Chrome 扩展（未绑定 fail-loud）；**无 LSP** | `app/tools/terminal.py:43,108-230`、`app/tools/browser.py:53-68` |
