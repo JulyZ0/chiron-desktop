@@ -70,6 +70,7 @@ import {
   shouldPreventDefault,
 } from './media/shortcuts'
 import { createKeyedGuard } from '../utils/staleGuard'
+import { parsePdfSummary, type PdfSummary } from '../utils/pdfWorker'
 const { t: tr } = useI18n()
 // API_URL 必须取 `src/api/index.ts` 的那一份：它合并了**桌面壳注入的
 // `chironDesktop.apiUrl`** 与构建期 `VITE_API_URL`。这里原先自己算
@@ -443,10 +444,46 @@ const shareLoading = ref(false)
 const previewUrl = ref('')
 const previewFailed = ref(false)
 
+// ── G21：PDF 预解析走 Worker ──
+// 页数 / 逐页尺寸是纯字节计算：修前这类活只能落在主线程上，大 PDF 打开时滚动掉帧、
+// 输入延迟。现在主线程只 `await`，算不动或环境不支持 Worker 时 `parsePdfSummary`
+// 返回 null，预览照旧交给 FileViewer —— 用户侧行为不变。
+const previewPdfSummary = ref<PdfSummary | null>(null)
+/** 若一次的预览请求过期，丢弃已经算完的旧结果（用户可能已经翻到另一个文件）。 */
+let previewSummarySeq = 0
+/** 超过这个体量就不再为了"页数"整份下载一遍：预览本身由 FileViewer 按需流式取。 */
+const PREVIEW_PDF_PARSE_MAX_BYTES = 32 * 1024 * 1024
+
+function isPdfItem(item: MediaItem): boolean {
+  if ((item.mime_type || '').toLowerCase() === 'application/pdf') return true
+  return /\.pdf$/i.test(item.name || '')
+}
+
+/**
+ * 取字节 → 交给 Worker 解析。任何一步失败都返回 null（不抛）：
+ * 调用方据此把页数标记留空，预览仍按原路径进行。
+ */
+async function loadPdfSummary(item: MediaItem, url: string): Promise<PdfSummary | null> {
+  if (!isPdfItem(item) || !url) return null
+  if (item.size > PREVIEW_PDF_PARSE_MAX_BYTES) return null
+  try {
+    const response = await fetch(url)
+    if (!response.ok) return null
+    const bytes = await response.arrayBuffer()
+    // bytes 的所有权转移给 Worker（parsePdfSummary 内部 transfer），这里不再复用
+    return await parsePdfSummary(bytes)
+  } catch {
+    return null
+  }
+}
+
 async function openPreview(item: MediaItem) {
   previewItem.value = item
   showPreview.value = true
   previewFailed.value = false
+  // 同步阶段只重置状态：取字节与解析都放到第一个 await 之后（主线程不当场算）
+  previewPdfSummary.value = null
+  const summarySeq = ++previewSummarySeq
   // 预览**必须等签名 URL 就绪**再渲染。
   // `/media/` 公开路径在后端已被移除（见 routes_media.go：只剩 /media/s/{assetID} 签名路径），
   // 而 `itemUrl()` 在未解析时回退到原 file_url = `/media/...` ⇒ FileViewer 拿到死链，
@@ -462,6 +499,11 @@ async function openPreview(item: MediaItem) {
     return
   }
   previewUrl.value = resolved
+
+  // G21：签名 URL 已经就绪、预览可以照常渲染，这里再补一次"页数/尺寸"的异步预解析。
+  // 顺序是有意的 —— 先让 FileViewer 拿到 URL，不让 Worker 这条路拖慢打开。
+  const summary = await loadPdfSummary(item, resolved)
+  if (summarySeq === previewSummarySeq) previewPdfSummary.value = summary
 }
 
 async function downloadItem(item: MediaItem) {
@@ -2115,9 +2157,12 @@ onUnmounted(() => {
       :footer="null"
       @cancel="showPreview = false"
     >
+      <!-- G21：`data-pdf-pages` 是 Worker 预解析结果的**非视觉**标记（页数/尺寸不进 UI
+           文案，所以视觉行为与修前一致）；Worker 不可用或解析失败时该属性不出现。 -->
       <div
         v-if="previewItem"
         class="preview-shell"
+        :data-pdf-pages="previewPdfSummary?.pages"
       >
         <!-- 只有拿到签名 URL 才渲染查看器；否则给可读提示，
              而不是让 FileViewer 去 fetch 已被移除的 /media/ 公开路径（表现为 Failed to fetch） -->
