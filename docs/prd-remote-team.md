@@ -2,11 +2,11 @@
 
 - 状态：S0–S4、R1/R3/R4/R5 已实现；R6/R7 的观测与告警、R9 span/trace、R10 数据生命周期仍在推进。
 - 加固来源：H1–H86 是 2026-11-24 的全量审计结论（前端/桌面壳/后端），后经七轮推进：
-  **已完成 69 项**（逐条登记在 9.5）、**待办 13 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
+  **已完成 70 项**（逐条登记在 9.5）、**待办 12 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
 - **推进方式（唯一入口）**：只看第 9 章。9.1 决定顺序，9.2 是待办清单与可执行判据，
   9.3 是里程碑退出条件，9.4 是待确认决策，9.5 是已完成项的证据索引。
   历次「本轮做了什么」的逐条叙述已压缩，不再按轮次重复。
-- 当前波次：**W1 已完成**；**W2 仅剩 H60 的异步写回守卫**，之后进 W3（H46/H47/H16/H38/H14/H24/H44/H51）。
+- 当前波次：**W1、W2 已完成**；下一步进 **W3**（H46/H47/H16/H38/H14/H24/H44/H51，按 9.2 的切片推进）。
 - 待团队主机：R2 实测切换、R6 压测、Web E2E。
 - 已知未覆盖：LiteLLM 与 Langfuse 实例级验证、R10 租户删除闭环、S5 多实例演练。
 - 关键落点：`internal/api/device_fs.go`、`internal/api/project_mirror.go`、
@@ -132,18 +132,17 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | 波次 | 范围 | 为什么排这里 | 本机能否闭环 |
 |---|---|---|---|
 | W1 ✅ | ~~H45、H48、H50、H73、H76、H11~~ **已完成**（证据见 9.5） | 单点改动 + 纯函数/探针即可证明；H45/H50/H48 是**对外**风险（更新、传输、二因素） | 本机已闭环（H48 的非 Windows 分支用注入桩） |
-| W2 | ~~H7、H36、H41、H17、H15~~ ✅、**H60（剩余切片）** | 需要在既有链路上加"身份/代次/预占"这类中间层，改动中等但都可测 | H7 的并发场景需真 Redis → 由 CI 的 redis service 闭环；其余能 |
+| W2 ✅ | ~~H7、H36、H41、H17、H15、H60~~ **已完成**（证据见 9.5） | 需要在既有链路上加"身份/代次/预占"这类中间层，改动中等但都可测 | H7 的并发场景需真 Redis → 由 CI 的 redis service 闭环；其余能 |
 | W3 | H46（服务端）、H47、H38、H14、H24、H44、H51 | 体量大、跨语言，必须拆片推进（见 9.2 的"切片"列） | 能，但每片都要单独验收 |
 | W4 | H2、H20、H19、H22 | 外部条件或产品决策未定，做了也无法验收 | 不能（见 9.4） |
 
-### 9.2 待办清单（13 项）
+### 9.2 待办清单（12 项）
 
 "完成定义"一栏是**可执行判据**：满足它即可从本表删除，并把证据登记进 9.5。
 "切片"一栏给出单项可独立验收的第一步，避免"一次改到底、谁也无法证明它对"。
 
 | ID | P | 目标 | 完成定义（可执行判据） | 切片 / 前置 | 波次 |
 |---|---|---|---|---|---|
-| H60 | P2 | 异步写回的代次守卫（重连恢复已完成） | **已完成**：重连后 `force` 重拉历史 + 有回合在跑时按 `Last-Event-ID` 重挂流（`utils/streamReattach.ts`）。**剩余**：`InteractionInbox`/`SubAgentPanel`/`ToolResultBlock`/`WorkbenchPanel`/`MediaView`/`KBDocumentPreview` 的 await 后写回未比对 session/file/run 与 request generation —— stale 响应与 finally 仍可能覆盖新视图 | 逐个视图加守卫：先做会写 items/预览的三处 | W2 |
 | H46 | P0 | 设备桥服务端授权 | `POST /v1/device-fs/ticket`：校验 Ed25519 设备签名、票据 ≤60s 且一次性；`/ws/device-fs` 只认票据（query token 一律拒）；撤销/登出后立即断开且 close 4401/4403 | 客户端已就绪 ⇒ ①票据端点 ②签名校验 ③WS 只认票据 ④撤销一致 | W3 |
 | H16 | P2 | 版本化 Go/Python 契约 | 为 submit/run event、tool call/approval、checkpoint、queue payload、MCP config、error/terminal state 建立版本化 schema 与**双端 conformance 测试**；不兼容变更必须升版本，旧版本读取方要显式拒绝而非按缺省猜 | ①先做 error/terminal 与 run event 两族（影响面最大）②再做 tool/approval ③最后 checkpoint/queue/MCP | W3 |
 | H47 | P1 | renderer 权限最小化 | 启用 sandbox 或拆分窄 preload；按窗口/能力授权；精确校验 `event.sender` 与 mainFrame；setup/error 页不加载特权 preload；保留 CSP/导航/window-open 限制并加回归 | ①能力表 ②窄 preload ③sender 校验 ④回归用例 | W3 |
@@ -162,7 +161,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | 里程碑 | 范围 | 退出条件 |
 |---|---|---|
 | M1 对外安全门禁 ✅ | W1 | 六项完成定义全部有回归（见 9.5）；`go build/test`、`vue-tsc`、`check:ui`、electron `node --test` 全绿 |
-| M2 执行可靠性 | W2 | 并发/竞态类探针可复现"修复前失败"；H7 由 CI（真 Redis）闭环 |
+| M2 执行可靠性 ✅ | W2 | 并发/竞态类探针可复现"修复前失败"（fakeredis 真执行 Lua）；H7 仍由 CI（真 Redis）复核 |
 | M3 契约与设备 | W3 前段（H46/H47） | 设备桥从 fail-closed 变为可用且票据为唯一凭据；renderer 特权面收敛并有回归 |
 | M4 数据与授权收口 | W3 后段（H24/H38/H14/H44/H51） | 授权/审计/供应链三条链各自有"未授权即拒绝"的探针 |
 | M5 暂缓 | W4 | 仅在外部条件或决策落地后启动 |
@@ -250,6 +249,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H41 | 双管道**并发**排空（顺序读会在子进程写满 4KB stderr 时死锁：父等 stdout EOF、子阻塞在 write）；提权 helper 拒绝从**用户可写**目录/盘符根加载代码（源码部署下 `-m app...` 靠 cwd 进 sys.path ⇒ 条件性本地提权），守卫在触发 UAC 之前 ｜ 证据：`tests/test_isolation_launch_h41.py`（9 项）+ 既有 isolation 套件 80 项 |
 | H17 | 复跑确认已满足完成定义：版本协商后发 `notifications/initialized`、未知版本拒绝且不发通知、并发 response/notification/progress/sampling 按 id 正确配对、超时与取消各自发出 `notifications/cancelled`、服务端取消只结算匹配请求、关闭时 pending 全部失败而非挂起 ｜ 证据：`tests/test_mcp_lifecycle.py`（12 项）+ MCP 全套 44 项 |
 | H15 | 复跑确认已满足完成定义：fold 记录 provider/model/context_window/covered_from/to/`covered_prefix_digest`；lineage 或前缀变化一律拒绝安装；projection 安装走 CAS（并发只有一个赢家，陈旧快照不改动原数据） ｜ 证据：`tests/test_compaction_digest.py`（35 项，含 `test_projection_rejects_lineage_mismatch` / `test_projection_rejects_changed_covered_prefix` / 两个 CAS 用例） |
+| H60 | 重连：`switchSession(id, {force})` 绕开"同 ID 直接返回"，并把 SSE 装配抽成 `attachSessionStream(id, {sinceEventId})`，断线时有回合在跑就按 `Last-Event-ID` 续传（不重放整轮）；异步写回：新增 `utils/staleGuard.ts`（代次 + 复合键），`InteractionInbox`（切会话不再显示上一会话的待办）、`ToolResultBlock`（旧片段不拼到当前块）、`SubAgentPanel`（轮询结果不跨会话）、`WorkbenchPanel`（改项目后不显示上个项目内容）、`KBDocumentPreview`（连开两个文档不串内容）、`MediaView`（签名 URL 不写进错的条目） ｜ 证据：`src/utils/__tests__/streamReattach.spec.ts`（5 项）、`src/utils/__tests__/staleGuard.spec.ts`（9 项，含组件接入的源码守卫）+ `src/components`/`src/utils` 共 869 项回归 |
 
 ## 10. 参考
 
