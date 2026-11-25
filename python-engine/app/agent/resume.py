@@ -26,6 +26,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
+from app.agent import tool_outcome
 from app.tools.context import to_tenant_int
 
 if TYPE_CHECKING:
@@ -40,10 +41,22 @@ RECONCILE_BATCH_LIMIT = 20
 #: 锁还在就说明旧主还活着，此时接管等于抢走活着的现场。
 STALE_AFTER_SECONDS = 6 * 60
 
-#: "已开始未结束"的调用在历史里的占位（**不自动重放**：那些调用可能已产生副作用）
-UNKNOWN_RESULT = (
-    "（本次调用已开始但未结束，结果未知；它可能已经产生了副作用，因此**没有**自动重放。"
-    "如需重做，请重新发起该调用。）"
+#: "已开始未完成"的调用在历史里的占位：**不自动重放**（可能已产生副作用）。
+UNKNOWN_RESULT = tool_outcome.with_tag(
+    "本次调用已开始、但结果未知（进程中断）。你可能已经产生了副作用，因此**没有**自动重放。"
+    "如确需执行，请重新发起调用。",
+    tool_outcome.OUTCOME_UNKNOWN,
+)
+
+#: "**没有开始**"的调用占位（G9）：可以**安全重试** —— 它从未触达工具本体。
+#:
+#: 与 `UNKNOWN_RESULT` 分开是这次修复的要点：两者都表现为"历史里缺一条 tool 结果"，
+#: 但一个冒副作用风险、一个完全不冒。混用会让恢复逻辑要么过度保守（放弃安全重试），
+#: 要么过度激进（重放一次已经生效的写）。
+NOT_STARTED_RESULT = tool_outcome.with_tag(
+    "本次调用**没有开始执行**（进程中断发生在派发之前），没有产生任何副作用。"
+    "如需继续，请重新发起调用。",
+    tool_outcome.OUTCOME_NOT_STARTED,
 )
 
 
@@ -216,32 +229,37 @@ def merge_user_message(
 
 
 def with_replay_pending(
-    messages: list[dict[str, Any]], pending_ids: tuple[str, ...]
+    messages: list[dict[str, Any]],
+    pending_ids: tuple[str, ...],
+    *,
+    all_call_ids: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
-    """给"已开始未结束"的调用补一条**结果未知**的 tool 消息。
+    """把"已开始未完成"的调用补一条**结果未知**的 tool 消息（G9 起区分两类）。
 
-    为什么不自动重放：那些调用可能**已经产生了副作用**（写文件、发请求），自动重放就是重复
-    副作用。所以只把"结果未知"明确摆到历史里，由模型（或用户）决定是否重做。
+    `pending_ids` = **已开始**（数据库里有 pending 行）；
+    `all_call_ids` = 历史上出现过的全部调用（assistant 消息里的 tool_call id）。
+    差集就是"**从未派发**"的调用 —— 它们可以安全重试，因此标 `not_started`，
+    而不是和"可能已产生副作用"的调用混成同一句"结果未知"。
     """
     wanted = [pid for pid in pending_ids if pid]
-    if not wanted:
-        return messages
     have = {
         str(msg.get("tool_call_id") or "")
         for msg in messages
         if msg.get("role") == "tool"
     }
     missing = [pid for pid in wanted if pid not in have]
-    if not missing:
-        return messages
-    # 追加在末尾；调用方随后会跑 `_ensure_valid_tool_sequence` 修配对（与既有历史同一处理）
-    return [
-        *messages,
-        *(
-            {"role": "tool", "tool_call_id": pid, "content": UNKNOWN_RESULT}
-            for pid in missing
-        ),
+    started = set(wanted)
+    never_started = [
+        pid for pid in (all_call_ids or ()) if pid and pid not in started and pid not in have
     ]
+    if not missing and not never_started:
+        return messages
+    out = list(messages)
+    for pid in missing:
+        out.append({"role": "tool", "tool_call_id": pid, "content": UNKNOWN_RESULT})
+    for pid in never_started:
+        out.append({"role": "tool", "tool_call_id": pid, "content": NOT_STARTED_RESULT})
+    return out
 
 
 # ── reconciler ──────────────────────────────────────────────────────────

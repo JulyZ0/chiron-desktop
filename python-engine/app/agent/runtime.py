@@ -2744,7 +2744,19 @@ class AgentRuntime:
                 # 本次用户消息通常**已经在快照里**（快照是回合末落的）→ 同内容不重复追加
                 messages = merge_user_message(messages, task.content)
                 # "已开始未结束"的调用只告知、**不自动重放**（它们可能已产生副作用）
-                messages = with_replay_pending(messages, resume.replay_pending)
+                # G9：把"历史里出现过的全部 tool_call id"一并传下去 —— 与数据库 pending 行
+                # 的差集就是"从未派发"的调用，那种可以安全重试（标 `not_started`）。
+                messages = with_replay_pending(
+                    messages,
+                    resume.replay_pending,
+                    all_call_ids=tuple(
+                        str(tc.get("id") or "")
+                        for msg in messages
+                        if isinstance(msg, dict)
+                        for tc in (msg.get("tool_calls") or [])
+                        if isinstance(tc, dict)
+                    ),
+                )
                 messages = _ensure_valid_tool_sequence(messages)
                 self._resumed_from_checkpoint = resume
                 self._record_resume_metric(resume)
