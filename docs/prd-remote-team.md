@@ -36,7 +36,6 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 | ID | 事项 | 完成定义 | 卡点 |
 |---|---|---|---|
 | **G22** | MCP 并入统一注册表 | MCP 工具与内置同形状（`output` schema + 渲染）走同一 pipeline，去掉 `use_capability` 代理双路径 | 见 3.7 |
-| **G23** | 常驻 LSP | 按项目根挂一个语言服务器 + 串行查询队列 + 进程回收 | 新常驻组件 |
 | **G24** | 定时触发原语 | cron/rrule → 写目标会话 durable inbox（at-least-once 写明） | 新组件 + 迁移 |
 | **G25** | 沙箱缺后端即拒跑 | POSIX 侧"无命名空间"标为不可用而非静默降级（与 H2 同一约束） | 见 3.3；会让现有 Linux 部署不可用，需开关 |
 
@@ -64,7 +63,7 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 | W-A | `wt-g21` / `task/g21` | ~~G21~~ ✅ 已合入（真实 PDF 结构解析） | — | 完成 |
 | W-A | `wt-h16` / `task/h16b` | ~~H16b 契约 v2 四族~~ ✅ 已合入（7 族 55 例） | — | 完成 |
 | W-B | `wt-g11` / `task/g11-g20` | G11 子副作用并入父账本、G20 子 Agent 可挂起 | `app/agent/undo_stack.py`、`side_effect_ledger.py`、`interactions.py` | 进行中 |
-| W-C | `wt-g23` / `task/g23-lsp` | G23 常驻 LSP（G19 待 W-B 合入后开，二者同改 agent/**） | `app/tools/lsp/**`(新) | 进行中 |
+| W-C | `wt-g23` / `task/g23-lsp` | ~~G23 常驻 LSP~~ ✅ 已合入（含 policy 分级） | — | 完成 |
 
 合并纪律：① 每个分支自己跑完窄回归；② 合并后我在 main 上跑跨包回归（Go `./internal/...`、
 Python 相关套件、前端 `src/components` + `check:ui`）；③ 冲突时以"语义正确"优先，不保留两套实现；
