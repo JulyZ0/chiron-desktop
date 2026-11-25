@@ -2,7 +2,7 @@
 
 - 状态：S0–S4、R1/R3/R4/R5 已实现；R6/R7 的观测与告警、R9 span/trace、R10 数据生命周期仍在推进。
 - 加固来源：H1–H86 是 2026-11-24 的全量审计结论（前端/桌面壳/后端），后经七轮推进：
-  **已完成 70 项**（逐条登记在 9.5）、**待办 12 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
+  **已完成 71 项**（逐条登记在 9.5）、**待办 11 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
 - **推进方式（唯一入口）**：只看第 9 章。9.1 决定顺序，9.2 是待办清单与可执行判据，
   9.3 是里程碑退出条件，9.4 是待确认决策，9.5 是已完成项的证据索引。
   历次「本轮做了什么」的逐条叙述已压缩，不再按轮次重复。
@@ -133,17 +133,16 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 |---|---|---|---|
 | W1 ✅ | ~~H45、H48、H50、H73、H76、H11~~ **已完成**（证据见 9.5） | 单点改动 + 纯函数/探针即可证明；H45/H50/H48 是**对外**风险（更新、传输、二因素） | 本机已闭环（H48 的非 Windows 分支用注入桩） |
 | W2 ✅ | ~~H7、H36、H41、H17、H15、H60~~ **已完成**（证据见 9.5） | 需要在既有链路上加"身份/代次/预占"这类中间层，改动中等但都可测 | H7 的并发场景需真 Redis → 由 CI 的 redis service 闭环；其余能 |
-| W3 | H46（服务端）、H47、H38、H14、H24、H44、H51 | 体量大、跨语言，必须拆片推进（见 9.2 的"切片"列） | 能，但每片都要单独验收 |
+| W3 | ~~H46（服务端）~~ ✅、H47、H38、H14、H24、H44、H51 | 体量大、跨语言，必须拆片推进（见 9.2 的"切片"列） | 能，但每片都要单独验收 |
 | W4 | H2、H20、H19、H22 | 外部条件或产品决策未定，做了也无法验收 | 不能（见 9.4） |
 
-### 9.2 待办清单（12 项）
+### 9.2 待办清单（11 项）
 
 "完成定义"一栏是**可执行判据**：满足它即可从本表删除，并把证据登记进 9.5。
 "切片"一栏给出单项可独立验收的第一步，避免"一次改到底、谁也无法证明它对"。
 
 | ID | P | 目标 | 完成定义（可执行判据） | 切片 / 前置 | 波次 |
 |---|---|---|---|---|---|
-| H46 | P0 | 设备桥服务端授权 | `POST /v1/device-fs/ticket`：校验 Ed25519 设备签名、票据 ≤60s 且一次性；`/ws/device-fs` 只认票据（query token 一律拒）；撤销/登出后立即断开且 close 4401/4403 | 客户端已就绪 ⇒ ①票据端点 ②签名校验 ③WS 只认票据 ④撤销一致 | W3 |
 | H16 | P2 | 版本化 Go/Python 契约 | 为 submit/run event、tool call/approval、checkpoint、queue payload、MCP config、error/terminal state 建立版本化 schema 与**双端 conformance 测试**；不兼容变更必须升版本，旧版本读取方要显式拒绝而非按缺省猜 | ①先做 error/terminal 与 run event 两族（影响面最大）②再做 tool/approval ③最后 checkpoint/queue/MCP | W3 |
 | H47 | P1 | renderer 权限最小化 | 启用 sandbox 或拆分窄 preload；按窗口/能力授权；精确校验 `event.sender` 与 mainFrame；setup/error 页不加载特权 preload；保留 CSP/导航/window-open 限制并加回归 | ①能力表 ②窄 preload ③sender 校验 ④回归用例 | W3 |
 | H38 | P1 | 子 Agent 复用完整执行链 | 子 Agent 走与主 Agent 相同的 ToolGuard/Broker/审批/副作用账本；undo 先验证快照哈希与路径再替换，失败可恢复且不损坏二进制 | ①统一 execute 入口 ②副作用账本 ③undo 校验 | W3 |
@@ -162,7 +161,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 |---|---|---|
 | M1 对外安全门禁 ✅ | W1 | 六项完成定义全部有回归（见 9.5）；`go build/test`、`vue-tsc`、`check:ui`、electron `node --test` 全绿 |
 | M2 执行可靠性 ✅ | W2 | 并发/竞态类探针可复现"修复前失败"（fakeredis 真执行 Lua）；H7 仍由 CI（真 Redis）复核 |
-| M3 契约与设备 | W3 前段（H46/H47） | 设备桥从 fail-closed 变为可用且票据为唯一凭据；renderer 特权面收敛并有回归 |
+| M3 契约与设备 | W3 前段（H46 ✅ / H47） | 设备桥已从 fail-closed 变为可用且票据是唯一凭据；剩 renderer 特权面收敛 |
 | M4 数据与授权收口 | W3 后段（H24/H38/H14/H44/H51） | 授权/审计/供应链三条链各自有"未授权即拒绝"的探针 |
 | M5 暂缓 | W4 | 仅在外部条件或决策落地后启动 |
 
@@ -250,6 +249,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H17 | 复跑确认已满足完成定义：版本协商后发 `notifications/initialized`、未知版本拒绝且不发通知、并发 response/notification/progress/sampling 按 id 正确配对、超时与取消各自发出 `notifications/cancelled`、服务端取消只结算匹配请求、关闭时 pending 全部失败而非挂起 ｜ 证据：`tests/test_mcp_lifecycle.py`（12 项）+ MCP 全套 44 项 |
 | H15 | 复跑确认已满足完成定义：fold 记录 provider/model/context_window/covered_from/to/`covered_prefix_digest`；lineage 或前缀变化一律拒绝安装；projection 安装走 CAS（并发只有一个赢家，陈旧快照不改动原数据） ｜ 证据：`tests/test_compaction_digest.py`（35 项，含 `test_projection_rejects_lineage_mismatch` / `test_projection_rejects_changed_covered_prefix` / 两个 CAS 用例） |
 | H60 | 重连：`switchSession(id, {force})` 绕开"同 ID 直接返回"，并把 SSE 装配抽成 `attachSessionStream(id, {sinceEventId})`，断线时有回合在跑就按 `Last-Event-ID` 续传（不重放整轮）；异步写回：新增 `utils/staleGuard.ts`（代次 + 复合键），`InteractionInbox`（切会话不再显示上一会话的待办）、`ToolResultBlock`（旧片段不拼到当前块）、`SubAgentPanel`（轮询结果不跨会话）、`WorkbenchPanel`（改项目后不显示上个项目内容）、`KBDocumentPreview`（连开两个文档不串内容）、`MediaView`（签名 URL 不写进错的条目） ｜ 证据：`src/utils/__tests__/streamReattach.spec.ts`（5 项）、`src/utils/__tests__/staleGuard.spec.ts`（9 项，含组件接入的源码守卫）+ `src/components`/`src/utils` 共 869 项回归 |
+| H46 | 设备桥服务端半补全：`POST /v1/device-fs/ticket` 校验 Ed25519 **设备归属证明**（证明文本与客户端逐字符一致、±5min 时间窗防重放）→ 签发 ≤60s **一次性**票据；`device_id → 公钥指纹` 首次信任绑定，换公钥一律 403（防顶替原设备）；`GET /ws/device-fs` **只认 `?ticket=`**（带 `?token=` 的旧路径恒定 401，兼容路径已删除）；撤销仍与 HTTP 一致：设备连接登记进 `wsAuthConnections`，用户级代次撤销即关连接，读不到撤销状态时 **fail-close** ｜ 证据：`internal/api/device_fs_ticket.go`、`device_fs_ticket_test.go`（8 项：证明文本/篡改/过期、票据一次性与换公钥、旧 query token 401）、`ws_revocation_parity_test.go`（撤销一致性改走换票口径）、`internal/api` 全套通过 |
 
 ## 10. 参考
 
