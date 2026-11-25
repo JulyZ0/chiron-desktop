@@ -493,6 +493,13 @@ export default {
   trace_view_timeline: "الخط الزمني",
   trace_view_toggle_tooltip: "التبديل بين الخط الزمني ومخطط التنفيذ (يعرض المخطط العقدة الأصلية لكل خطوة)",
   trace_graph_empty: "لا تتوفّر بيانات مخطط التنفيذ بعد (قد يكون هذا التتبّع أقدم من هذه الميزة، أو لم تُخزَّن المقاطع)",
+  // ── G10/G12: طيّ الجولات وتحميل الصفوف الأقدم ووسم السجلات الجارية في لوحة التتبّع ──
+  trace_capped_recent_turns: "يُعرض آخر {n} من {total} جولة فقط (الجولات الأقدم مطويّة)",
+  trace_show_all_turns: "عرض كل الجولات ({total})",
+  trace_collapse_to_recent: "عرض آخر {n} جولات فقط",
+  trace_load_earlier: "تحميل {n} صفوف أقدم",
+  trace_row_in_progress: "بدأ",
+  trace_timeline_empty: "لا توجد سجلات تتبّع بعد",
   // ── D2: لغة التفكير (منفصلة عن لغة الرد) ──
   reasoning_language: "لغة التفكير",
   think_lang_auto: "افتراضي النموذج",
