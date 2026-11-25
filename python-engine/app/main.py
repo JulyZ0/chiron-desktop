@@ -2367,6 +2367,7 @@ async def agent_submit(
                 context_token = activate_run_fence(run_lease.fence)
             assert pump is None
             pump = asyncio.create_task(_pump_runtime())
+            terminal_seen = False  # G1：本条流是否已发终态
             while True:
                 # 1) 先冲刷子 Agent 旁路（保证进度实时性）
                 async for frame in _sink_frames():
@@ -2388,8 +2389,26 @@ async def agent_submit(
                     total_in += event.input_tokens
                 if event.output_tokens:
                     total_out += event.output_tokens
+                if getattr(event, "type", "") in ("done", "error", "cancelled"):
+                    terminal_seen = True
                 yield _frame(_event_payload(event))
             # 收尾：把旁路中剩余的预览与唯一终态送出
+            # G1：走到这里说明运行时**没有**发出终态（被拦截的分支、未来新增的
+            # 早退路径，或异常吞掉了收尾）。补一个终态并告警 —— 否则消费方只能靠
+            # 连接关闭判断"结束了"，而这与"断了"无法区分。
+            if not terminal_seen:
+                logger.warning(
+                    "stream ended without a terminal event (session=%s); synthesizing",
+                    session_id,
+                )
+                yield _frame(
+                    {
+                        "type": "done",
+                        "error": "terminal_missing",
+                        "content": "",
+                        "session_id": session_id,
+                    }
+                )
             async for frame in _sink_frames():
                 yield frame
             # 正常收尾 → Webhook agent.complete（主对话收尾统一出口；失败不影响主流程）

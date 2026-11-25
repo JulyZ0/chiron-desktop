@@ -2337,6 +2337,21 @@ class AgentRuntime:
         )
         return injection.as_event()
 
+    def _blocked_terminal(self, reason: str, trace_id: str) -> AgentEvent:
+        """构造"本轮被策略拦下"的终态事件（G1）。
+
+        语义选择：用 `error` 而不是 `done` —— 这一轮**没有产出**，把它报成"正常完成"
+        会让上游统计（成功率、首 token 时延）把拦截算成成功。`error` 字段带稳定原因码，
+        前端据此显示"被安全策略拦下"，而不是一句无头无尾的失败。
+        """
+        return AgentEvent(
+            type="error",
+            content="",
+            error=reason,
+            trace_id=trace_id,
+            span_name="guardrail",
+        )
+
     async def run(self, task: AgentTask) -> AsyncIterator[AgentEvent]:
         """
         执行 Agent 推理循环
@@ -2469,6 +2484,8 @@ class AgentRuntime:
                 content="输入包含不允许的指令，已拒绝本次请求",
                 trace_id=trace_id,
             )
+            # G1：拦截分支也必须有**终态**（否则消费方只能靠连接关闭判断结束）。
+            yield self._blocked_terminal("guardrail_blocked", trace_id)
             return
 
         # ── 记忆会话上下文（用于 finally 中的 on_session_end）────────────
@@ -2502,6 +2519,8 @@ class AgentRuntime:
                     content=submitted,
                     trace_id=trace_id,
                 )
+                # G1：同上 —— hook 拦下也要有终态。
+                yield self._blocked_terminal("guardrail_blocked", trace_id)
                 return
 
             # ── 0. 解析运行模式（persona/工具集/上下文/压缩策略） ──
