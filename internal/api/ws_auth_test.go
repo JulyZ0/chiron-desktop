@@ -96,6 +96,10 @@ type wsAuthTestEnv struct {
 	claims    *auth.Claims
 	rpaHub    *RPAHub
 	deviceHub *deviceHub
+	tickets   *deviceTicketStore
+	// lastKeyID 是最近一次换票用过的公钥指纹：WS 握手签票时必须一致，
+	// 否则票据存储会把它判成"同一 device_id 换了公钥"从而拒绝签发。
+	lastKeyID string
 	server    *httptest.Server
 }
 
@@ -109,7 +113,12 @@ func newWSAuthTestEnv(t *testing.T) *wsAuthTestEnv {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /ws/rpa", RPAWebSocketHandler(env.rpaHub, a))
-	mux.HandleFunc("GET /ws/device-fs", DeviceFSHandler(env.deviceHub, a))
+	// H46：设备桥只认一次性票据（query token 已删除），测试也要按新流程走。
+	env.tickets = newDeviceTicketStore()
+	mux.HandleFunc("GET /ws/device-fs", DeviceFSHandler(env.deviceHub, env.tickets))
+	// H46：票据端点（覆盖 authMW 的撤销判定）
+	mux.Handle("POST /v1/device-fs/ticket", AuthMiddleware(a)(http.HandlerFunc(
+		DeviceFSTicketHandler(env.tickets, a))))
 	protected := AuthMiddleware(a)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -138,13 +147,35 @@ func (e *wsAuthTestEnv) issueTokenForUser(t *testing.T, userID string, mustChang
 }
 
 func (e *wsAuthTestEnv) wsURL(path string) string {
-	query := url.Values{"token": {e.token}}
+	query := url.Values{}
 	if path == "/ws/rpa" {
+		// RPA 桥仍是 query token（H46 只改设备桥）。
+		query.Set("token", e.token)
 		query.Set("client_id", "ws-client")
 	} else {
-		query.Set("device_id", "ws-device")
+		// 设备桥：一次性票据；device_id 已钉在票据里，不再走 query。
+		query.Set("ticket", e.deviceTicket("ws-device"))
 	}
 	return "ws" + strings.TrimPrefix(e.server.URL, "http") + path + "?" + query.Encode()
+}
+
+// ticketKeyID 返回本次测试使用的设备公钥指纹（换票时记录，未换票则用固定值）。
+func (e *wsAuthTestEnv) ticketKeyID() string {
+	if e.lastKeyID != "" {
+		return e.lastKeyID
+	}
+	return "ws-auth-test-key"
+}
+
+// deviceTicket 直接向票据存储签发一张（跳过 HTTP 换票：这里测的是 WS 侧）。
+func (e *wsAuthTestEnv) deviceTicket(deviceID string) string {
+	ticket, _ := e.tickets.issue(deviceTicket{
+		tenant: tenantStr(e.claims.TenantID),
+		user:   e.claims.UserID,
+		device: deviceID,
+		keyID:  e.ticketKeyID(),
+	}, deviceTicketTTL)
+	return ticket
 }
 
 func (e *wsAuthTestEnv) httpStatus(t *testing.T) int {
@@ -160,7 +191,10 @@ func (e *wsAuthTestEnv) httpStatus(t *testing.T) int {
 
 func assertWSHandshakeRejected(t *testing.T, env *wsAuthTestEnv, want int) {
 	t.Helper()
-	for _, path := range []string{"/ws/rpa", "/ws/device-fs"} {
+	// H46：设备桥的凭据是**一次性票据**，与登录 token 的撤销语义不同（票据 ≤60s 自然过期，
+	// 服务端要踢人是关连接）。所以这里只对仍用 token 的 /ws/rpa 断言握手被拒；
+	// 设备桥的"拒绝无效/过期票据"由 device_fs_ticket_test.go 覆盖。
+	for _, path := range []string{"/ws/rpa"} {
 		conn, resp, err := websocket.DefaultDialer.Dial(env.wsURL(path), nil)
 		if err == nil {
 			_ = conn.Close()
@@ -363,8 +397,10 @@ func TestWebSocketActiveConnectionsDisconnectOnEpochEvent(t *testing.T) {
 
 	env := newWSAuthTestEnv(t)
 	env.issueToken(t, false)
-	conns := make(map[string]*websocket.Conn, 2)
-	for _, path := range []string{"/ws/rpa", "/ws/device-fs"} {
+	// H46：jti 黑名单只对**持有 token 的桥**有意义；设备桥的凭据是一次性票据
+	// （没有 jti，≤60s 自然过期），它的撤销语义由用户级代次负责（见下一个用例）。
+	conns := make(map[string]*websocket.Conn, 1)
+	for _, path := range []string{"/ws/rpa"} {
 		conn := dialWSAuth(t, env, path)
 		readWSHello(t, conn, path)
 		conns[path] = conn
@@ -428,8 +464,10 @@ func TestWebSocketActiveConnectionsDisconnectOnBlacklistEvent(t *testing.T) {
 
 	env := newWSAuthTestEnv(t)
 	env.issueToken(t, false)
-	conns := make(map[string]*websocket.Conn, 2)
-	for _, path := range []string{"/ws/rpa", "/ws/device-fs"} {
+	// H46：jti 黑名单只对**持有 token 的桥**有意义。设备桥的凭据是一次性票据
+	// （没有 jti，≤60s 自然过期），它的撤销语义由用户级代次负责（见会话撤销用例）。
+	conns := make(map[string]*websocket.Conn, 1)
+	for _, path := range []string{"/ws/rpa"} {
 		conn := dialWSAuth(t, env, path)
 		readWSHello(t, conn, path)
 		conns[path] = conn

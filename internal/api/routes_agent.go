@@ -293,7 +293,11 @@ func registerAgentRoutes(
 	// 设备文件桥（S1，只读）：桌面端主动外连，供远程模式读写本机项目文件。
 	// 与 /ws/rpa 同一鉴权口径（query token + device_id），不做浏览器来源限制以外
 	// 的额外放行：checkWebSocketOrigin 仍是显式白名单。
-	mux.HandleFunc("GET /ws/device-fs", DeviceFSHandler(deviceHubSingleton, authenticator))
+	// H46：WS 只认**一次性票据**；票据由下面的 cockpit 端点用登录 token + Ed25519
+	// 设备归属证明换取（query token 的旧路径已删除）。
+	mux.HandleFunc("GET /ws/device-fs", DeviceFSHandler(deviceHubSingleton, deviceTicketSingleton))
+	mux.Handle("POST /v1/device-fs/ticket", authMW(rlMW(http.HandlerFunc(
+		DeviceFSTicketHandler(deviceTicketSingleton, authenticator)))))
 	// 浏览器 RPA 桥（Python engine → 网关 → 插件；仅共享 internal token 可调）
 	mux.Handle("POST /v1/rpa/exec", rlMW(http.HandlerFunc(RPAExecHandler(rpaHub, internalToken))))
 	mux.Handle("GET /v1/rpa/clients", rlMW(http.HandlerFunc(RPAClientsHandler(rpaHub, internalToken))))

@@ -9,9 +9,15 @@ package api
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,8 +143,24 @@ func TestSessionRevocationParityBetweenHTTPAndWebSocket(t *testing.T) {
 			if got := wsHandshakeStatus(t, env, "/ws/rpa"); got != tc.wsWant {
 				t.Fatalf("WS 握手状态=%d，want %d（与 HTTP 必须同口径）", got, tc.wsWant)
 			}
-			if got := wsHandshakeStatus(t, env, "/ws/device-fs"); got != tc.wsWant {
-				t.Fatalf("device-fs 握手状态=%d，want %d", got, tc.wsWant)
+			// H46：设备桥凭据是**一次性票据**，握手不再查撤销存储 —— 那一环挪到
+			// `POST /v1/device-fs/ticket`（走 authMW，与 HTTP 同口径）。
+			// 因此断言"换票状态"，并额外钉住"旧 query token 恒定 401"。
+			if got := deviceLegacyTokenStatus(t, env); got != http.StatusUnauthorized {
+				t.Fatalf("device-fs 旧 query token 应 401（该路径已删除），得到 %d", got)
+			}
+			ticketStatus := env.ticketExchangeStatus(t)
+			if tc.wsWant == wsUpgraded {
+				if ticketStatus != http.StatusOK {
+					t.Fatalf("device-fs 换票状态=%d, want 200", ticketStatus)
+				}
+				if got := wsHandshakeStatus(t, env, "/ws/device-fs"); got != wsUpgraded {
+					t.Fatalf("device-fs 握手状态=%d, want 101", got)
+				}
+				return
+			}
+			if ticketStatus != tc.wsWant {
+				t.Fatalf("device-fs 换票状态=%d, want %d（与 HTTP 必须同口径）", ticketStatus, tc.wsWant)
 			}
 		})
 	}
@@ -215,4 +237,70 @@ func TestEpochRevocationEventIsNotCachedAsJTI(t *testing.T) {
 	if entry, ok := jwtBlacklistCache.Load(raw); ok {
 		t.Fatalf("epoch 事件被当成 jti 写入黑名单缓存: %+v", entry)
 	}
+}
+
+// deviceLegacyTokenStatus 用旧路径（`?token=`）连一次，返回握手状态。
+//
+// H46 之后这条路径必须恒定 401：留着它等于把"token 进 URL"这个缺陷留在原地。
+func deviceLegacyTokenStatus(t *testing.T, env *wsAuthTestEnv) int {
+	t.Helper()
+	wsURL := "ws" + strings.TrimPrefix(env.server.URL, "http") +
+		"/ws/device-fs?token=" + url.QueryEscape(env.token) + "&device_id=ws-device"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("旧 query token 竟然连上了")
+	}
+	if resp == nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+// ticketExchangeStatus 换一次票据，返回 HTTP 状态。
+//
+// 关键点：带**真实**的 Ed25519 归属证明 —— 否则 handler 会以"证明不成立"401，
+// 那样测到的就不是 authMW 的撤销判定。撤销/改密用例里 authMW 先拒，压根走不到这里。
+func (e *wsAuthTestEnv) ticketExchangeStatus(t *testing.T) int {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("生成设备密钥: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		t.Fatalf("导出公钥: %v", err)
+	}
+	issuedAt := time.Now().UnixMilli()
+	nonce := "ws-parity-nonce"
+	proof := deviceTicketRequest{
+		DeviceID: "ws-device",
+		Version:  deviceProofVersion,
+		Nonce:    nonce,
+		IssuedAt: issuedAt,
+		Signature: base64.StdEncoding.EncodeToString(
+			ed25519.Sign(priv, []byte(deviceProofMessage("ws-device", issuedAt, nonce)))),
+		PublicKey: base64.StdEncoding.EncodeToString(der),
+		KeyID:     keyIDOf(pub),
+	}
+	// 记下指纹：随后 WS 握手签票要用同一个，否则会被判成"换公钥"。
+	e.lastKeyID = proof.KeyID
+	body, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatalf("序列化证明: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, e.server.URL+"/v1/device-fs/ticket",
+		strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatalf("构造换票请求: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+e.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("换票请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
 }

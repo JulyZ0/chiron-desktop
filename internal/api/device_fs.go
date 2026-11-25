@@ -424,6 +424,66 @@ func (h *deviceHub) Call(ctx context.Context, tenant, user, device string, req d
 // 保活链路：这里发 ping → 客户端协议栈自动回 pong → PongHandler 续期读超时。
 // 因此 deadline 只在"真的没有任何入站帧（含 pong）"时才会到期，空闲连接和
 // 正在跑大 walk/read 的连接都不会被误判离线。
+// monitorDeviceTicketRevocation 在**不持有 token** 的前提下实现"撤销即断开"。
+//
+// 判定用用户级代次（`tokenRevokedByEpoch`）：票据把 user 钉住了，撤销一个用户的会话
+// 就该让他名下所有设备桥一起断（否则被撤销的凭据仍能通过设备读本机文件）。
+// 间隔沿用 `wsAuthRevalidateInterval`，与 /ws/rpa 同频。
+func monitorDeviceTicketRevocation(conn *deviceConn, ticket deviceTicket) func() {
+	if conn == nil || conn.ws == nil {
+		return func() {}
+	}
+	// 登记进同一张表：撤销广播（`handleWebSocketEpochEvent` / 黑名单）遍历它来关连接。
+	// 不登记的话"撤销后连接不断"—— 表现为被撤销的凭据仍能通过设备读本机文件。
+	// `jti` 留空：票据没有 jti 语义（一次性、≤60s），登出黑名单不该按票据匹配。
+	entry := &wsAuthConnection{
+		userID:       ticket.user,
+		issuedAtUnix: ticket.issuedAt.Unix(),
+		conn:         conn.ws,
+	}
+	wsAuthConnections.Store(entry, struct{}{})
+	startWebSocketBlacklistWatcher()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	issuedAt := ticket.issuedAt.Unix()
+	go func() {
+		ticker := time.NewTicker(wsAuthRevalidateInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkCtx, stop := context.WithTimeout(context.Background(), wsAuthCheckTimeout)
+				revoked, err := tokenRevokedByEpoch(checkCtx, ticket.user, issuedAt, true)
+				stop()
+				if err != nil {
+					// **fail-close**：读不到撤销状态就当作"可能已撤销"。
+					//
+					// 与 HTTP 侧同一取舍（`evaluateSessionRevocation` 在存储不可用时也返回
+					// 401 而不是放行）：这台桥能读用户本机文件，宁可让用户在存储抖动时重连，
+					// 也不能让"已撤销但仍在线"这条缝存在。客户端收到 4401 会停止重连。
+					slog.Warn("device fs revocation check failed (fail-close)",
+						"device", ticket.device, "error", err)
+					closeWebSocketForAuth(conn.ws)
+					return
+				}
+				if revoked {
+					slog.Warn("device fs connection closed: session revoked", "device", ticket.device)
+					// 4401 语义（ClosePolicyViolation 的相邻取值由客户端按 4401/4403 识别）：
+					// 这里复用 /ws/rpa 同一套关连接实现，保证两条桥的语义一致。
+					closeWebSocketForAuth(conn.ws)
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		wsAuthConnections.Delete(entry)
+	}
+}
+
 func heartbeatDeviceConn(conn *deviceConn, interval, writeTimeout time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -548,34 +608,63 @@ var deviceFSUpgrader = websocket.Upgrader{
 }
 
 // DeviceFSHandler 是 /ws/device-fs 的入口（桌面端主动外连）。
-func DeviceFSHandler(hub *deviceHub, authenticator *auth.Authenticator) http.HandlerFunc {
+func DeviceFSHandler(hub *deviceHub, tickets *deviceTicketStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token := r.URL.Query().Get("token")
-		deviceID := r.URL.Query().Get("device_id")
-		if deviceID == "" {
-			http.Error(w, "device_id required", http.StatusBadRequest)
+		// H46：**只认票据**。
+		//
+		// 旧实现从 query 里取 `token` + `device_id`：token 会进代理日志/Referer/崩溃上报，
+		// 而 `device_id` 只是一句"我很确信"，任何拿到同一用户 token 的进程都能自称是那台
+		// 已批准目录的设备。现在凭据只能是一次性票据（`POST /v1/device-fs/ticket` 换），
+		// 票据里已经钉住 tenant/user/device/公钥指纹。
+		//
+		// 带 `token=` 的旧客户端一律 401：这条"兼容路径"正是缺陷本身，不能留。
+		if r.URL.Query().Get("token") != "" {
+			slog.Warn("device fs rejected a legacy query-token connection")
+			JSON(w, http.StatusUnauthorized, APIResponse{
+				Success: false, Code: CodeAuthRequired,
+				Error: "token in query is no longer accepted; exchange a ticket via POST /v1/device-fs/ticket",
+			})
 			return
 		}
-		claims, authErr := validateWebSocketToken(r.Context(), authenticator, token, r.URL.Path)
-		if authErr != nil {
-			writeWebSocketAuthError(w, authErr)
+		ticketValue := r.URL.Query().Get("ticket")
+		if ticketValue == "" {
+			JSON(w, http.StatusUnauthorized, APIResponse{
+				Success: false, Code: CodeAuthRequired,
+				Error: "ticket required",
+			})
 			return
 		}
+		ticket, ok := tickets.consume(ticketValue)
+		if !ok {
+			// 过期/已用/伪造统一处理：不要告诉调用方是哪一种（省得被用来试探）。
+			JSON(w, http.StatusUnauthorized, APIResponse{
+				Success: false, Code: CodeAuthRequired,
+				Error: "device ticket is invalid or expired",
+			})
+			return
+		}
+		deviceID := ticket.device
+		claims := &auth.Claims{UserID: ticket.user}
 		conn, err := deviceFSUpgrader.Upgrade(w, r, nil)
 		if err != nil {
 			slog.Warn("device fs upgrade failed", "error", err)
 			return
 		}
-		stopAuthMonitor := monitorWebSocketAuth(conn, claims, authenticator, token, r.URL.Path)
-		defer stopAuthMonitor()
+		// H46：不再持有 token，但**撤销仍要生效**（与 HTTP 一致）。
+		//
+		// 旧实现每 `wsAuthRevalidateInterval` 拿 token 重验一次；票据模型下没有 token，
+		// 于是改为只看**用户级代次**：`tokenRevokedByEpoch` 对 (user) 判断"撤销是否晚于
+		// 本票据签发"。撤销后关闭连接（4401），客户端据此停止重连。
 		dc := &deviceConn{
-			tenant:  smTenant(claims),
+			tenant:  ticket.tenant,
 			user:    claims.UserID,
 			device:  deviceID,
 			ws:      conn,
 			pending: map[string]chan deviceOpResponse{},
 			closed:  make(chan struct{}),
 		}
+		stopRevocation := monitorDeviceTicketRevocation(dc, ticket)
+		defer stopRevocation()
 		hub.register(dc)
 		defer hub.unregister(dc)
 

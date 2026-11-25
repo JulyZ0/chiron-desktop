@@ -23,9 +23,11 @@ import (
 // ── 测试脚手架：真实 WebSocket + 真实 DeviceFSHandler ──
 
 type deviceFSTestEnv struct {
-	hub   *deviceHub
-	srv   *httptest.Server
-	token string
+	hub     *deviceHub
+	srv     *httptest.Server
+	token   string
+	tickets *deviceTicketStore
+	tenant  string
 }
 
 // newDeviceFSTestEnv 用毫秒级时间参数起一个真实的 /ws/device-fs 端点。
@@ -44,9 +46,11 @@ func newDeviceFSTestEnv(t *testing.T, timings deviceFSTimings) *deviceFSTestEnv 
 	if err != nil {
 		t.Fatalf("签发测试 token: %v", err)
 	}
-	srv := httptest.NewServer(DeviceFSHandler(hub, a))
+	// H46：WS 只认票据（`?ticket=`），query token 已删除。
+	tickets := newDeviceTicketStore()
+	srv := httptest.NewServer(DeviceFSHandler(hub, tickets))
 	t.Cleanup(srv.Close)
-	return &deviceFSTestEnv{hub: hub, srv: srv, token: token}
+	return &deviceFSTestEnv{hub: hub, srv: srv, token: token, tickets: tickets, tenant: "1"}
 }
 
 // fakeDevice 是桌面端的替身：读请求、按 handler 回包（handler 为 nil 表示只收不回，
@@ -64,8 +68,13 @@ func (d *fakeDevice) write(resp deviceOpResponse) error {
 
 func (e *deviceFSTestEnv) dial(t *testing.T, deviceID string, handler func(deviceOpRequest) *deviceOpResponse) *fakeDevice {
 	t.Helper()
-	wsURL := "ws" + strings.TrimPrefix(e.srv.URL, "http") +
-		"/?device_id=" + url.QueryEscape(deviceID) + "&token=" + url.QueryEscape(e.token)
+	ticket, _ := e.tickets.issue(deviceTicket{
+		tenant: e.tenant,
+		user:   "u",
+		device: deviceID,
+		keyID:  "device-fs-test-key",
+	}, deviceTicketTTL)
+	wsURL := "ws" + strings.TrimPrefix(e.srv.URL, "http") + "/?ticket=" + url.QueryEscape(ticket)
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
