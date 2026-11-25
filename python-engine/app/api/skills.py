@@ -35,7 +35,7 @@ import hmac
 import json
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from app.skill.store import ORIGIN_LOCAL, SkillDef, SkillStore, validate_skill_name
@@ -114,7 +114,7 @@ class SkillInstallRequest(BaseModel):
     inert: bool = False
 
 
-def _verify_inline_integrity(raw: bytes, req: "SkillInstallRequest") -> None:
+def _verify_inline_integrity(raw: bytes, req: SkillInstallRequest) -> None:
     """复核 inline 字节的 sha256（H5 的第二道闸）。
 
     两种失败语义分开：
@@ -366,9 +366,23 @@ class SkillMetaRequest(BaseModel):
     auto_inject: bool | None = None
 
 
+def _is_tenant_admin(request: Request) -> bool:
+    """共享层写权限判据（H76）。
+
+    与知识库侧同一口径（`X-User-Role` ∈ {admin, owner}），由网关按 claims 注入。
+    宁可把"角色头缺失"当成非管理员：缺头时放行等于把共享层交给任何人。
+    """
+    role = request.headers.get("X-User-Role", "").strip().lower()
+    return role in ("admin", "owner")
+
+
 @router.patch("/v1/skills/{name}/meta")
 async def patch_skill_meta(
-    name: str, body: SkillMetaRequest, user_id: str = "", tenant_id: int = 0
+    request: Request,
+    name: str,
+    body: SkillMetaRequest,
+    user_id: str = "",
+    tenant_id: int = 0,
 ) -> dict[str, Any]:
     """更新技能元数据（P1-2 的触发策略开关）。
 
@@ -381,11 +395,49 @@ async def patch_skill_meta(
     if body.auto_inject is None:
         raise HTTPException(status_code=400, detail="nothing to update: provide auto_inject")
 
+    current = store.get(name)
+    if current is None:
+        raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
+
+    # H76：共享层的写入按角色分流。
+    #
+    # 旧行为：`update_meta()` 把元数据写回**技能原本所在的载体** —— 对来自
+    # 租户共享层的技能，那就是就地改共享文件：任何成员点一下开关，全租户看到的
+    # 那一份都变了；全局共享层（连 tenant 边界都没有）同理。
+    # 现在：
+    #   · admin/owner → 允许就地更新共享层（这是"管理员维护共享技能"的正规操作）；
+    #   · 普通成员     → 只允许写**私有 override**（共享层一个字节都不动）；
+    #   · 全局共享层   → 普通成员一律 403（它不属于任何租户，成员无从"覆盖"）。
+    shared = store.is_shared_scope(current.scope)
+    admin = _is_tenant_admin(request)
+    if shared and not admin and current.scope == "shared":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Skill '{name}' belongs to the global shared layer; "
+                "only a platform admin can modify it"
+            ),
+        )
+
+    if shared and not admin:
+        updated = store.write_private_override(name, {"auto_inject": bool(body.auto_inject)})
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
+        return {
+            "skill": _skill_payload(updated),
+            "override": True,
+            "message": (
+                f"Skill '{name}' was shared; saved a private override "
+                + ("(auto-injected every turn)" if updated.auto_inject else "(not auto-injected)")
+            ),
+        }
+
     skill = store.update_meta(name, auto_inject=body.auto_inject)
     if skill is None:
         raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
     return {
         "skill": _skill_payload(skill),
+        "override": False,
         "message": (
             f"Skill '{name}' will "
             + ("be injected into every turn" if skill.auto_inject else "not be auto-injected")

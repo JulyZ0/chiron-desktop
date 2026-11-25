@@ -509,6 +509,40 @@ class SkillStore:
             p, json.dumps(skill.to_dict(), ensure_ascii=False, indent=2)
         )
 
+    # ── H76：共享层不可由成员就地改写，改为私有 override ──
+    def is_shared_scope(self, scope: str) -> bool:
+        """共享层（租户/全局）指的是"别人也能看见"的那两层。"""
+        return scope in (SCOPE_TENANT, SCOPE_SHARED)
+
+    def write_private_override(
+        self, name: str, updates: dict[str, Any]
+    ) -> SkillDef | None:
+        """把**当前生效定义**复制进私有写目录并合并 `updates`（H76）。
+
+        用途：成员改共享技能的元数据时必须产生"我的覆盖"，而不是改共享文件。
+        与 `update_meta` 的区别是**写目标固定**：永远写 `self._root`（按身份解析出的
+        私有层），绝不追到共享层的载体上去。
+
+        返回覆盖后的定义；技能不存在返回 None。
+        """
+        skill = self.get(name)
+        if skill is None:
+            return None
+        overridden = skill.to_dict()
+        overridden.update(updates)
+        overridden["scope"] = SCOPE_USER
+        # 记录来源：读取时私有层优先，但列表仍能显示"这份是覆盖自共享层"。
+        overridden["override_of"] = skill.scope
+        try:
+            target = self._path(name)
+        except ValueError:
+            logger.warning("skill store: refuse private override path for %r", name)
+            return None
+        _atomic_write_text(target, json.dumps(overridden, ensure_ascii=False, indent=2))
+        return self.get(name) or SkillDef(**{k: v for k, v in overridden.items() if k in {
+            "name", "description", "version", "author", "tags", "exec_type",
+        }})
+
     # ── P1-2：元数据更新（auto_inject / origin / version）──
     def _flat_carrier(self, name: str) -> Path | None:
         """按搜索优先级找 `{dir}/{name}.skill.json` 的**物理位置**（找不到返回 None）。"""
