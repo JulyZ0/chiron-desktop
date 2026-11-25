@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "family": "error",
+      "name": "minimal",
+      "valid": true,
+      "payload": {"message": "工具执行失败"}
+    },
+    {
+      "family": "error",
+      "name": "with-code-and-retryable",
+      "valid": true,
+      "payload": {"code": "rate_limited", "message": "请求过快", "retryable": true, "params": {"limit": 20}}
+    },
+    {
+      "family": "error",
+      "name": "missing-message",
+      "valid": false,
+      "reason": "message 必填",
+      "payload": {"code": "x"}
+    },
+    {
+      "family": "error",
+      "name": "message-too-long",
+      "valid": false,
+      "reason": "message 超过 4096 字节",
+      "payload": {"message": "MESSAGE_TOO_LONG"}
+    },
+    {
+      "family": "error",
+      "name": "wrong-type-code",
+      "valid": false,
+      "reason": "code 必须是字符串",
+      "payload": {"message": "x", "code": 42}
+    },
+    {
+      "family": "terminal",
+      "name": "done",
+      "valid": true,
+      "payload": {"type": "done", "finish_reason": "stop"}
+    },
+    {
+      "family": "terminal",
+      "name": "error-with-body",
+      "valid": true,
+      "payload": {
+        "type": "error",
+        "error": {"code": "provider_error", "message": "上游 502"}
+      }
+    },
+    {
+      "family": "terminal",
+      "name": "cancelled",
+      "valid": true,
+      "payload": {"type": "cancelled"}
+    },
+    {
+      "family": "terminal",
+      "name": "unknown-type",
+      "valid": false,
+      "reason": "未知 type 必须判违约",
+      "payload": {"type": "maybe-done"}
+    },
+    {
+      "family": "terminal",
+      "name": "error-without-body",
+      "valid": false,
+      "reason": "type=error 必须带 error 对象",
+      "payload": {"type": "error"}
+    },
+    {
+      "family": "terminal",
+      "name": "done-with-error",
+      "valid": false,
+      "reason": "type=done 不得带 error",
+      "payload": {"type": "done", "error": {"message": "x"}}
+    },
+    {
+      "family": "terminal",
+      "name": "missing-type",
+      "valid": false,
+      "reason": "type 必填",
+      "payload": {"finish_reason": "stop"}
+    }
+  ]
+}

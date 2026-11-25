@@ -1,0 +1,40 @@
+{
+  "contract": "chiron.contract",
+  "version": 1,
+  "note": "Go 网关与 Python 引擎共享的线上契约。这里只放**跨语言**的族；单侧内部结构不进契约。",
+  "families": {
+    "error": {
+      "description": "HTTP/SSE 失败载荷。网关产出、引擎也产出（工具/子 Agent 失败），前端与 SDK 消费。",
+      "fields": {
+        "code": {"type": "string", "required": false, "note": "稳定错误码，客户端据此取本地化文案"},
+        "message": {"type": "string", "required": true, "max_bytes": 4096},
+        "retryable": {"type": "boolean", "required": false},
+        "params": {"type": "object", "required": false},
+        "trace_id": {"type": "string", "required": false}
+      },
+      "rules": [
+        "code 一旦发布不得改名；新增走新值",
+        "message 是**兜底**文案，不是 i18n 源（前端优先用 code）",
+        "retryable 缺省视为 false"
+      ]
+    },
+    "terminal": {
+      "description": "一次模型流/工具流的**终态**事件（收尾）。前端据此决定是否继续等。",
+      "fields": {
+        "type": {"type": "string", "required": true, "enum": ["done", "error", "cancelled"]},
+        "finish_reason": {"type": "string", "required": false},
+        "error": {"type": "object", "required": false, "note": "type=error 时必填，形如 error 族"},
+        "usage": {"type": "object", "required": false}
+      },
+      "rules": [
+        "terminal 事件**只能有一个**：流里出现第二个即为违约",
+        "type=error 必须带 error 对象；type=done 不得带 error",
+        "未知 type 一律按违约处理（不允许静默忽略）"
+      ]
+    }
+  },
+  "compat": {
+    "additive_only": true,
+    "note": "同一 version 内只允许新增可选字段；删改字段 = 升 version，两端必须同时升级。"
+  }
+}
