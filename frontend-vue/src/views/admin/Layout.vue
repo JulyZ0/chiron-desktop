@@ -63,6 +63,8 @@ function readCollapsed(): boolean {
     return false // 隐私模式：按默认展开
   }
 }
+// H83：菜单按 capability 收敛需要读平台 owner 判定（与守卫同口径）。
+const auth = useAuthStore()
 const collapsed = ref(readCollapsed())
 watch(collapsed, value => {
   try {
@@ -104,7 +106,7 @@ const menuGroups = computed(() => [
     key: 'g-monitor', label: t('admin.overview_monitoring'),
     children: [
       // 仪表盘与运行时监控已合并为一页（总览 / 性能 / 队列 / 缓存 Tabs）。
-      { key: '/admin/monitor', label: t('admin.runtime_monitoring'), icon: () => h(ThunderboltOutlined) },
+      { key: '/admin/monitor', platformOwnerOnly: true, label: t('admin.runtime_monitoring'), icon: () => h(ThunderboltOutlined) },
     ],
   },
   {
@@ -127,9 +129,9 @@ const menuGroups = computed(() => [
     children: [
       { key: '/admin/settings', label: t('settings.system_settings'), icon: () => h(SettingOutlined) },
       // 原「Redis 管理 + 数据库管理」合并为数据存储（Tabs）
-      { key: '/admin/datastores', label: t('common.data_storage'), icon: () => h(DatabaseOutlined) },
+      { key: '/admin/datastores', platformOwnerOnly: true, label: t('common.data_storage'), icon: () => h(DatabaseOutlined) },
       // D1：自诊断 —— 与设置/数据存储同属"系统"类：都是"让部署正确运转"的操作面。
-      { key: '/admin/diagnostics', label: t('admin.diagnostics'), icon: () => h(MedicineBoxOutlined) },
+      { key: '/admin/diagnostics', platformOwnerOnly: true, label: t('admin.diagnostics'), icon: () => h(MedicineBoxOutlined) },
       // 服务：这台机器对谁可见（仅本机 / 局域网、对外域名）。
       // 与设置/数据存储同理 —— 它改的是部署形态本身，不是某个业务功能。
       { key: '/admin/service', label: t('admin.service.page_title'), icon: () => h(CloudServerOutlined) },
@@ -138,14 +140,26 @@ const menuGroups = computed(() => [
       // 资源市场「外部源」：初装默认关闭；开启后本机才开始访问第三方 URL。
       { key: '/admin/market', label: t('admin.market.page_title'), icon: () => h(ShopOutlined) },
       // Python 依赖管理：装/卸的是**引擎解释器**里的包，同样属于"让系统正确运转"。
-      { key: '/admin/deps', label: t('admin.deps_title'), icon: () => h(DownloadOutlined) },
+      { key: '/admin/deps', platformOwnerOnly: true, label: t('admin.deps_title'), icon: () => h(DownloadOutlined) },
     ],
   },
 ])
 
+// H83：按 capability 收敛菜单 —— 与 `requiresPlatformOwner` 路由标记、
+// 后端 `RequirePlatformOwner` 三处同口径。菜单里出现却点不进去的项，
+// 比不出现更糟：用户只会认为功能坏了。
+const visibleMenuGroups = computed(() =>
+  menuGroups.value
+    .map(group => ({
+      ...group,
+      children: group.children.filter(item => !item.platformOwnerOnly || auth.isPlatformOwner),
+    }))
+    .filter(group => group.children.length > 0),
+)
+
 // 当前路由命中的菜单项（用于侧边栏 selectedKeys）
 const selectedKeys = computed(() => {
-  const hit = menuGroups.value
+  const hit = visibleMenuGroups.value
     .flatMap(g => g.children)
     .find(m => route.path === m.key || route.path.startsWith(m.key + '/'))
   return [hit?.key ?? route.path]
@@ -203,7 +217,7 @@ async function handleUserAction(info: MenuClickInfo) {
           @click="handleMenuClick"
         >
           <template
-            v-for="g in menuGroups"
+            v-for="g in visibleMenuGroups"
             :key="g.key"
           >
             <MenuItemGroup :title="collapsed ? '' : g.label">
@@ -258,7 +272,7 @@ async function handleUserAction(info: MenuClickInfo) {
           @click="handleMenuClick"
         >
           <template
-            v-for="g in menuGroups"
+            v-for="g in visibleMenuGroups"
             :key="g.key"
           >
             <MenuItemGroup :title="g.label">

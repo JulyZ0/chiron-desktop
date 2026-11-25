@@ -210,7 +210,7 @@ const routes = [
         path: 'monitor',
         name: 'AdminMonitor',
         component: () => import('../views/admin/MonitorView.vue'),
-        meta: { title: t('admin.runtime_monitoring') },
+        meta: { requiresPlatformOwner: true, title: t('admin.runtime_monitoring') },
       },
       // 旧入口保留重定向，避免书签 / 文档 / 告警链接失效
       {
@@ -272,14 +272,14 @@ const routes = [
         path: 'datastores',
         name: 'AdminDataStores',
         component: () => import('../views/admin/DataStoresView.vue'),
-        meta: { title: t('common.data_storage') },
+        meta: { requiresPlatformOwner: true, title: t('common.data_storage') },
       },
       // D1：自诊断（"配了但不生效"的自答清单）
       {
         path: 'diagnostics',
         name: 'AdminDiagnostics',
         component: () => import('../views/admin/DiagnosticsView.vue'),
-        meta: { title: t('admin.diagnostics') },
+        meta: { requiresPlatformOwner: true, title: t('admin.diagnostics') },
       },
       // 「服务」页：这台机器对谁可见（监听地址 / 对外域名）。
       // 与「系统设置」相邻 —— 它同样是决定部署形态的配置，而不是某个业务功能。
@@ -311,7 +311,7 @@ const routes = [
         path: 'deps',
         name: 'AdminDeps',
         component: () => import('../views/admin/DepsView.vue'),
-        meta: { title: t('admin.deps_title') },
+        meta: { requiresPlatformOwner: true, title: t('admin.deps_title') },
       },
       // ── 旧入口重定向（书签 / 文档 / 告警链接兼容）──
       { path: 'redis', redirect: { path: '/admin/datastores', query: { tab: 'redis' } } },

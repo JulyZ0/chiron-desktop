@@ -150,6 +150,21 @@ export async function authGuard(
       next('/')
       return
     }
+
+    // H83：`requiresPlatformOwner` 页面的**第二道**判定。
+    //
+    // 租户 admin 与平台 owner 在后台里是两种角色，后端那几页用的是
+    // `RequirePlatformOwner`（见 internal/api/routes_admin.go）。此前路由层不区分，
+    // 租户 admin 点进「运行时监控 / 数据存储 / 自诊断 / 依赖管理」只会得到一片 403 ——
+    // 用户看到的是"功能坏了"，而实际是"你没这个权限却被告知有这个入口"。
+    // 这里按**同一口径**（role === 'owner'，与 stores/auth 的 isPlatformOwner 一致）收敛，
+    // 并保持开发绕过与上面一致。
+    if (to.meta.requiresPlatformOwner && !isDevAuthBypassEnabled()) {
+      if (auth.isApiKeySession || !auth.isPlatformOwner) {
+        next('/')
+        return
+      }
+    }
   }
 
   // 首次运行引导（P1-10）：有登录、当前没有任何可用模型、且本账号还没走完引导时，
