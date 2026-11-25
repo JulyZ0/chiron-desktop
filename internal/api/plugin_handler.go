@@ -19,14 +19,6 @@ import (
 	"github.com/athenavi/chiron/internal/auth"
 )
 
-
-
-
-
-
-
-
-
 // PluginHandler manages per-user MCP plugin configurations.
 // 配置存储：{PluginDataDir}/{user_id}/plugins.json（用户级隔离，S 安全修复：
 // 原实现全局单文件，任何登录用户都可读写/修改其他用户的插件配置）。
@@ -48,8 +40,16 @@ type MCPPlugin struct {
 	Status      string            `json:"status"`
 	Source      string            `json:"source,omitempty"` // "market" = 市场授权叠加项（非用户本地配置）
 	// Approved：**用户级**「每插件一次性授权」——该插件是否已被用户确认可以执行。
-	// 默认 false（未授权，不可执行）；改 command 会重置为 false（旧授权不适用于新命令）。
+	// 默认 false（未授权，不可执行）。
+	//
+	// H24：**任何影响"执行什么"的改动都会重置它**（command / args / env / read_only），
+	// 不只是 command —— 用户当初同意的是那组参数，不是"任何参数组合"。
 	Approved bool `json:"approved,omitempty"`
+	// ApprovalDigest 是批准时那组执行参数的摘要（`pluginApprovalDigest`）。
+	//
+	// 它让"授权绑定到具体配置"这件事**可核对**：审批通过时写入，配置一改就清空。
+	// 引擎侧只看 `approved`（有摘要说明绑定成立），网关侧在 /test 与 broker 入口比对摘要。
+	ApprovalDigest string `json:"approval_digest,omitempty"`
 	// ReadOnly：该 server 是否**只提供只读操作**。默认 false = fail-closed。
 	//
 	// 引擎侧据此分流（python-engine/app/plugins/pool.py:331）：
@@ -311,6 +311,8 @@ func (h *PluginHandler) Update(w http.ResponseWriter, r *http.Request) {
 		if plugins[i].Name != name {
 			continue
 		}
+		// 授权输入快照：比较的是"用户当初批准的那组执行参数"。
+		before := pluginApprovalInput(plugins[i])
 		if body.Command != nil {
 			if strings.TrimSpace(*body.Command) == "" {
 				BadRequest(w, "command must not be empty")
@@ -348,6 +350,18 @@ func (h *PluginHandler) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		if body.ReadOnly != nil {
 			plugins[i].ReadOnly = *body.ReadOnly
+		}
+		// H24：**任何影响"到底执行什么"的改动都要让旧授权失效**。
+		//
+		// 旧实现只对 `Command` 重置 `Approved`：于是把 `args` 从 `["--read-only"]` 改成
+		// `["--exec", "rm -rf /"]`、或在 `env` 里塞进别的 token，都不需要重新授权 ——
+		// 用户当初同意的是"跑这个命令"，不是"跑任何参数组合"。
+		//
+		// `ReadOnly` 同样算：它决定引擎是**直连**还是走 broker，改它就是改执行面。
+		approvalInputChanged := pluginApprovalInput(plugins[i]) != before
+		if approvalInputChanged {
+			plugins[i].Approved = false
+			plugins[i].ApprovalDigest = ""
 		}
 		updated = true
 		break
@@ -408,6 +422,12 @@ func (h *PluginHandler) Test(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// 执行闸（deny-by-default）：命令形态 + 放行名单 + 用户总开关 + 该插件已授权
+	// H24：先按**摘要**判定"这份授权是否仍对应当前配置"，再走总开关/allowlist 检查。
+	// 老数据（approved 但没有 digest）在这里就判为未授权 —— 宁可让用户重按一次同意。
+	if !pluginApprovedFor(*plugin) {
+		Forbidden(w, "plugin is not approved for its current configuration")
+		return
+	}
 	if err := checkPluginExecutionAllowed(*plugin, pf.CommandsEnabled, h.cfg); err != nil {
 		resp := map[string]interface{}{
 			"ok": false, "message": err.Error(),
@@ -680,6 +700,13 @@ func (h *PluginHandler) Approve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		pf.MCPServers[i].Approved = approved
+		if approved {
+			// H24：把"批准了什么"落成摘要 —— 之后任何影响执行面的改动都会清空它，
+			// 于是"这份授权还成不成立"可以**核对**，而不是只信一个 bool。
+			pf.MCPServers[i].ApprovalDigest = pluginApprovalDigest(pf.MCPServers[i])
+		} else {
+			pf.MCPServers[i].ApprovalDigest = ""
+		}
 		found = true
 		break
 	}

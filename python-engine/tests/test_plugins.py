@@ -258,13 +258,22 @@ async def test_pool_shares_connection_by_fingerprint(tmp_path, monkeypatch):
     # 声明 read_only：这个用例测的是"连接共享按指纹复用"，属于**引擎直连**路径的逻辑。
     # 未声明的 server 会改走 MCP broker（凭据不出引擎进程），不建本地连接 —— 见
     # app/plugins/pool.py 的分支与 app/mcp/client.py 的连接守卫。
+    # H24：`active` 不再等于"可执行" —— 还需要**用户总开关**与**每插件授权**。
+    # 这两个用例测的是连接复用/停用语义，所以夹具要显式表达"用户已经批准"。
     cfg = [
         ServerConfig(
-            name="git", command="npx", args=["-y", "git-server"], status="active", read_only=True
+            name="git",
+            command="npx",
+            args=["-y", "git-server"],
+            status="active",
+            read_only=True,
+            approved=True,
         )
     ]
     store.save("u1", cfg)
     store.save("u2", cfg)  # 相同配置
+    store.set_commands_enabled("u1", True)
+    store.set_commands_enabled("u2", True)
 
     tracker = ActiveTracker()
     tracker.touch("u1")
@@ -308,10 +317,17 @@ async def test_deactivating_plugin_removes_its_tools(tmp_path, monkeypatch):
     monkeypatch.setattr("app.plugins.pool.MCPClient", _FakeMCPClient)
 
     store = PluginStore(tmp_path)
+    # H24：显式授权（`active` 不再等于"可执行"）
     active = ServerConfig(
-        name="git", command="npx", args=["-y", "git-server"], status="active", read_only=True
+        name="git",
+        command="npx",
+        args=["-y", "git-server"],
+        status="active",
+        read_only=True,
+        approved=True,
     )
     store.save("u1", [active])
+    store.set_commands_enabled("u1", True)
 
     tracker = ActiveTracker()
     tracker.touch("u1")
@@ -324,7 +340,7 @@ async def test_deactivating_plugin_removes_its_tools(tmp_path, monkeypatch):
         # 用户在插件页关掉开关：同一份配置，status 改成 inactive
         store.save("u1", [ServerConfig(
             name="git", command="npx", args=["-y", "git-server"],
-            status="inactive", read_only=True,
+            status="inactive", read_only=True, approved=True,
         )])
         await pool.reconcile()
 

@@ -46,6 +46,9 @@ class ServerConfig:
     description: str = ""
     version: str = ""
     status: str = "active"
+    #: 用户是否为**这个插件**做过一次性授权（`plugins.json` 的 `approved`）。
+    #: **未授权 = 不可执行**：连进程都不该起（见 `active_servers`）。
+    approved: bool = False
     #: 只读声明：引擎只直连 read_only 的 MCP server（见 app/mcp/client.py 的连接守卫）。
     #: 未声明 = False = **不直连** —— 宁可工具不可用，也不把高权限凭据留在 agent 可触达处。
     read_only: bool = False
@@ -86,6 +89,7 @@ class PluginStore:
                         description=s.get("description", ""),
                         version=s.get("version", ""),
                         status=s.get("status", "active"),
+                        approved=bool(s.get("approved", False)),
                         read_only=bool(s.get("read_only", False)),
                     )
                 )
@@ -93,9 +97,64 @@ class PluginStore:
                 continue
         return servers
 
+    def commands_enabled(self, user_id: str) -> bool:
+        """用户级总开关（`plugins.json` 的 `commands_enabled`，缺省 false = 未授权）。"""
+        try:
+            data = json.loads(self._path(user_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return bool(data.get("commands_enabled", False))
+
+    def set_commands_enabled(self, user_id: str, enabled: bool) -> None:
+        """写用户级总开关（`commands_enabled`）。
+
+        生产上这个字段由网关的用户设置页写；引擎侧只读。保留一个写入口是为了
+        让"未授权 ⇒ 不可执行"这条判据可被端到端演练（测试/演练脚本需要一个
+        合法方式把开关打开，而不是手改 JSON）。
+        """
+        path = self._path(user_id)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        data["commands_enabled"] = bool(enabled)
+        data.setdefault("mcp_servers", [])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def active_servers(self, user_id: str) -> list[ServerConfig]:
-        """仅返回 status=active 的服务器配置。"""
-        return [s for s in self.load(user_id) if s.status == "active"]
+        """可执行（= 已授权）的服务器配置。
+
+        **H24 的核心**：旧实现只过滤 `status == "active"`，于是 `active` 但
+        **从未授权**的配置照样会被拉起进程/建立连接 —— "用户没同意过"这条最关键的
+        闸门在引擎侧根本不存在（Go 只在 `/test` 端点查过一次）。现在两级都要过：
+          1. 用户级总开关 `commands_enabled` 打开；
+          2. 该插件自己 `approved`。
+        任一不满足 ⇒ 不返回 ⇒ 池子不会为它起进程、连网、注册工具。
+        """
+        if not self.commands_enabled(user_id):
+            skipped = [s.name for s in self.load(user_id) if s.status == "active"]
+            if skipped:
+                logger.info(
+                    "user %s 未开启插件执行总开关，跳过 %d 个 active 配置",
+                    user_id,
+                    len(skipped),
+                )
+            return []
+        servers = []
+        rejected = []
+        for s in self.load(user_id):
+            if s.status != "active":
+                continue
+            if not s.approved:
+                rejected.append(s.name)
+                continue
+            servers.append(s)
+        if rejected:
+            logger.info("user %s 有 %d 个 active 但未授权的插件，已跳过", user_id, len(rejected))
+        return servers
 
     def signature(self, user_id: str) -> str:
         """配置指纹（用于变更检测：内容 hash）。"""
