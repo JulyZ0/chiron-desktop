@@ -611,17 +611,37 @@ func (m *Manager) SaveMessages(ctx context.Context, sessionID, userID, userConte
 		return
 	}
 
+	// H14：这一轮的**三次写**放进同一个事务。
+	//
+	// 旧实现是三条独立语句、各自吞掉错误：用户消息写成功而助手消息失败时，库里留下
+	// "用户问了一句、模型没答"的半轮对话 —— 用户刷新后看到自己的问题孤零零挂着，
+	// 重新提问又会把同一轮再写一遍（历史里出现两条一样的问题）。
+	//
+	// 现在要么整轮落库，要么一条都不落；标题更新也一起（否则会出现"标题是这句，
+	// 消息里没有这句"）。
+	tx, err := m.pool.Begin(ctx)
+	if err != nil {
+		slog.Warn("save messages: begin tx failed", "session", sessionID, "error", err)
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
 	if userContent != "" {
 		msgID, err := genID()
 		if err != nil {
 			slog.Warn("generate message id", "error", err)
 			return
 		}
-		_, err = m.pool.Exec(ctx,
+		if _, err = tx.Exec(ctx,
 			`INSERT INTO messages (id, session_id, role, content, created_at) VALUES ($1, $2, 'user', $3, NOW())`,
-			msgID, sessionID, userContent)
-		if err != nil {
-			slog.Warn("save user message", "error", err)
+			msgID, sessionID, userContent); err != nil {
+			slog.Warn("save user message (rolled back)", "error", err)
+			return
 		}
 	}
 	if assistantContent != "" {
@@ -630,22 +650,27 @@ func (m *Manager) SaveMessages(ctx context.Context, sessionID, userID, userConte
 			slog.Warn("generate message id", "error", err)
 			return
 		}
-		_, err = m.pool.Exec(ctx,
+		if _, err = tx.Exec(ctx,
 			`INSERT INTO messages (id, session_id, role, content, created_at) VALUES ($1, $2, 'assistant', $3, NOW())`,
-			msgID, sessionID, assistantContent)
-		if err != nil {
-			slog.Warn("save assistant message", "error", err)
+			msgID, sessionID, assistantContent); err != nil {
+			slog.Warn("save assistant message (rolled back)", "error", err)
+			return
 		}
 	}
 
 	if userContent != "" {
-		_, err := m.pool.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`UPDATE sessions SET title = LEFT($1, 255), updated_at = NOW()
 			 WHERE id = $2 AND (title = '' OR title IS NULL)`,
-			truncateTitle(userContent), sessionID)
-		if err != nil {
-			slog.Warn("update session title", "error", err)
+			truncateTitle(userContent), sessionID); err != nil {
+			slog.Warn("update session title (rolled back)", "error", err)
+			return
 		}
 	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.Warn("save messages: commit failed", "session", sessionID, "error", err)
+		return
+	}
+	committed = true
 	m.evictCache(ctx, sessionID)
 }
