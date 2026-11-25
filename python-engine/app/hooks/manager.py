@@ -56,6 +56,14 @@ HANDLERS: frozenset[str] = frozenset({HANDLER_PYTHON, HANDLER_COMMAND, HANDLER_W
 DECISION_DENY = "deny"
 DECISION_ASK = "ask"
 
+#: 守卫允许做出的决定**只有这两种**（G8）。
+#:
+#: 为什么没有 `allow`：判定链是"层层收紧"的 —— 策略、护栏、服务端授权各自可以
+#: 拒绝或要求确认，但**谁都不能把一个拒绝翻回放行**。如果这里允许 `allow`，
+#: 任何一个后注册的 hook 都能把前面的 `deny` 覆盖掉，而执行侧只会看到"没有意见"。
+#: 这条约束在 DSH 里由**返回类型**保证；Python 里由"合法集合 + 构造断言"保证。
+GUARD_DECISIONS: frozenset[str] = frozenset({DECISION_DENY, DECISION_ASK})
+
 
 class HookDecision(str):
     """一次**可阻断事件**的判定结果：**是 `str` 的子类**（值 = 原因），另带 `kind`。
@@ -71,6 +79,13 @@ class HookDecision(str):
     kind: str
 
     def __new__(cls, reason: str, kind: str = DECISION_DENY) -> HookDecision:
+        # G8：只有 deny / ask 两种合法决定。写成 `allow` 之类的会在**构造时**炸掉，
+        # 而不是在若干层之后被当成"没有意见"静默放行。
+        if kind not in GUARD_DECISIONS:
+            raise ValueError(
+                f"守卫决定只有 {sorted(GUARD_DECISIONS)}；收到 {kind!r} —— "
+                "允许'放行'会让后注册的 hook 覆盖前面的拒绝"
+            )
         obj = str.__new__(cls, reason)
         obj.kind = kind
         return obj
