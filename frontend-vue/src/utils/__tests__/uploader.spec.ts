@@ -35,6 +35,7 @@ const apiMocks = vi.hoisted(() => ({
 vi.mock('../../api', () => ({ api: apiMocks }))
 
 import { createChunkUpload } from '../uploader'
+import { encodeUploadEnvelope, uploadStorageKey } from '../uploadIdentity'
 
 /** 造一个可 slice 的 File（jsdom 的 File 支持 slice ✓） */
 function makeFile(name: string, size: number, lastModified: number): File {
@@ -82,10 +83,27 @@ describe('utils/uploader（分片上传 / 断点续传）', () => {
       if (url === '/v1/uploads') return Promise.resolve({ data: { data: { upload_id: 'u-1' } } })
       return Promise.resolve({ data: { data: { file_url: '/f', upload_id: 'u-1', size: 250 } } })
     })
-    // 预置：这个文件已经建过会话，且服务端已收 0 与 1
+    // 预置：这个文件已经建过会话，且服务端已收 0 与 1。
+    //
+    // H72 之后续传状态是**带身份信封**的（`{v, uploadId, owner, fingerprint}`）：
+    // 裸 upload_id 不再可信（它无法证明属于哪个账号/部署）。这里按新格式预置，
+    // 校验的仍然是同一件事 —— 已收分片不该重传。
     const f = makeFile('a.bin', 250, 111)
-    const fingerprint = `chunk-upload:generic::a.bin:250:111:100:u1`
-    localStorage.setItem(fingerprint, 'u-1')
+    const fingerprint = 'a.bin:250:111:100'
+    const storageKey = uploadStorageKey({ purpose: 'generic', fingerprint })
+    localStorage.setItem(
+      storageKey,
+      encodeUploadEnvelope({
+        uploadId: 'u-1',
+        owner: {
+          userId: 'u1',
+          tenantId: '',
+          mode: '',
+          origin: window.location.origin,
+        },
+        fingerprint,
+      }),
+    )
     apiMocks.get.mockResolvedValue({ data: { data: { received_chunks: [0, 1] } } })
 
     const h = await createChunkUpload(f, baseOpts)

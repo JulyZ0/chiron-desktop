@@ -11,7 +11,14 @@
  * （localStorage 记录 upload_id，重进页面查询已收分片后续传）。
  */
 import { api } from '../api'
-import { privateKey } from './privateStorage'
+import {
+  canPersistUpload,
+  decodeUploadEnvelope,
+  encodeUploadEnvelope,
+  normalizeUploadOwner,
+  uploadStorageKey,
+  type UploadOwner,
+} from './uploadIdentity'
 
 export type UploadPurpose = 'media' | 'kb_doc' | 'generic'
 
@@ -39,13 +46,42 @@ const DEFAULT_CONCURRENCY = 3
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
-function currentUserId(): string {
+/**
+ * 当前上传身份（H72）：user + tenant + mode + origin。
+ *
+ * 只有 user id 是不够的：同一账号在「本地模式 ↔ 团队云」或两个不同部署之间，
+ * 服务端的 `upload_id` 毫无关系。把 mode/origin 也算进身份，续传状态才不会
+ * 跨实例复用。
+ */
+function currentUploadOwner(): UploadOwner {
+  let userId = ''
+  let tenantId = ''
   try {
-    const stored = JSON.parse(localStorage.getItem('user') || '{}') as { id?: unknown }
-    return typeof stored.id === 'string' ? stored.id : ''
+    const stored = JSON.parse(localStorage.getItem('user') || '{}') as {
+      id?: unknown
+      tenant_id?: unknown
+      tenantId?: unknown
+    }
+    if (typeof stored.id === 'string') userId = stored.id
+    const tenant = stored.tenant_id ?? stored.tenantId
+    if (typeof tenant === 'string') tenantId = tenant
+    else if (typeof tenant === 'number') tenantId = String(tenant)
   } catch {
-    return ''
+    // 解析失败 = 没有可信身份，按"不可持久化续传"处理。
   }
+  let mode = ''
+  try {
+    // 动态 require 避免把 deviceMode 的初始化副作用拉进纯函数单测。
+    mode = String((globalThis as { __chironDeviceMode?: string }).__chironDeviceMode || '')
+  } catch {
+    mode = ''
+  }
+  return normalizeUploadOwner({
+    userId,
+    tenantId,
+    mode,
+    origin: typeof window !== 'undefined' ? window.location?.origin || '' : '',
+  })
 }
 
 async function uploadChunk(uploadId: string, index: number, blob: Blob): Promise<void> {
@@ -65,11 +101,21 @@ export async function createChunkUpload(file: File, opts: ChunkUploadOptions): P
   //（导出文件、重复下载、批量截图很常见）复用同一个 upload_id，
   // 把一个文件的分片写进另一个的上传会话。补入 lastModified 与分片大小。
   const fileFingerprint = `${file.name}:${file.size}:${file.lastModified}:${chunkSize}`
-  const storageKey = privateKey(
-    `chunk-upload:${opts.purpose}:${opts.parentId || ''}:${fileFingerprint}`,
-    currentUserId(),
-  )
-  let uploadId = localStorage.getItem(storageKey) || ''
+  const owner = currentUploadOwner()
+  const storageKey = uploadStorageKey({
+    purpose: opts.purpose,
+    parentId: opts.parentId,
+    fingerprint: fileFingerprint,
+  })
+  // H72：值不再是裸 upload_id，而是带归属的信封；读时比对身份，
+  // 不一致就**丢弃**（宁可重传一次，也不要接着别人的会话写分片）。
+  const storedRaw = localStorage.getItem(storageKey)
+  const verdict = decodeUploadEnvelope(storedRaw, owner, fileFingerprint)
+  let uploadId = verdict.usable ? verdict.uploadId : ''
+  if (!verdict.usable && storedRaw) {
+    // 旧版裸字符串、别人的状态、或结构损坏：一律清掉，避免下次再撞同一把坏钥匙。
+    localStorage.removeItem(storageKey)
+  }
   let received: number[] = []
   if (uploadId) {
     try {
@@ -90,7 +136,12 @@ export async function createChunkUpload(file: File, opts: ChunkUploadOptions): P
       chunk_size: chunkSize,
     })
     uploadId = res.data?.data?.upload_id
-    localStorage.setItem(storageKey, uploadId)
+    if (uploadId && canPersistUpload(owner)) {
+      localStorage.setItem(
+        storageKey,
+        encodeUploadEnvelope({ uploadId, owner, fingerprint: fileFingerprint }),
+      )
+    }
   }
 
   const receivedSet = new Set(received)
