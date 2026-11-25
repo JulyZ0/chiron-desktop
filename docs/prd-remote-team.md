@@ -27,9 +27,7 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 
 | ID | 事项 | 完成定义 | 落点 |
 |---|---|---|---|
-| **G11** | 子副作用并入父账本 | 子 Agent 的写入同时记父会话键（或按 lineage 解析），整轮 `/undo` 覆盖子 Agent 写过的文件；有跨会话回滚测试 | `undo_stack.py`、`side_effect_ledger.py` |
 | **G19** | 父 → 子 steer | 父 Agent 能给运行中的子追加指令（现在 `no active agent for this session`）；有"父改子指令、子下一轮生效"的测试 | `app/agent/steer.py`、`subagent_runner.py` |
-| **G20** | 子 Agent 可挂起等人工 | 子会话补 `agent_runs` 行，审批/提问在超时前**可被回答**（现在合成会话没有 run 行 ⇒ 超时即失败）；待确认（见 3.6） | `app/agent/interactions.py` |
 
 **第三批：高（新组件 / 架构前提，需决策）**
 
@@ -62,8 +60,9 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 | W-A | `wt-g17` / `task/g17-g18` | ~~G17、G18~~ ✅ 已合入 | — | 完成 |
 | W-A | `wt-g21` / `task/g21` | ~~G21~~ ✅ 已合入（真实 PDF 结构解析） | — | 完成 |
 | W-A | `wt-h16` / `task/h16b` | ~~H16b 契约 v2 四族~~ ✅ 已合入（7 族 55 例） | — | 完成 |
-| W-B | `wt-g11` / `task/g11-g20` | G11 子副作用并入父账本、G20 子 Agent 可挂起 | `app/agent/undo_stack.py`、`side_effect_ledger.py`、`interactions.py` | 进行中 |
+| W-B | `wt-g11` / `task/g11-g20` | ~~G11、G20~~ ✅ 已合入（含巡检排除/读口/配置收尾） | — | 完成 |
 | W-C | `wt-g23` / `task/g23-lsp` | ~~G23 常驻 LSP~~ ✅ 已合入（含 policy 分级） | — | 完成 |
+| W-D | 待建 | G19 父→子 steer（含派发提示词格式对齐） | `app/agent/steer.py`、`app/tools/subagent.py` | 排队 |
 
 合并纪律：① 每个分支自己跑完窄回归；② 合并后我在 main 上跑跨包回归（Go `./internal/...`、
 Python 相关套件、前端 `src/components` + `check:ui`）；③ 冲突时以"语义正确"优先，不保留两套实现；
