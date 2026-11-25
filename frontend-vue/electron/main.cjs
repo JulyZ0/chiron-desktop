@@ -2202,7 +2202,19 @@ async function checkUpdateViaReleaseList(current) {
   let release = null
   try {
     const raw = await httpsGetBuffer(listUrl)
-    release = pickLatestRelease(JSON.parse(raw.toString('utf8')))
+    // H57：把渠道/撤回/钉版策略显式传给选择器。
+    //
+    // 三者的取值都来自**主进程自己的配置**（环境变量），不接受渲染层输入 ——
+    // 否则页面一句 \channel: stable\ 就能绕过运维的撤回决定。
+    release = pickLatestRelease(JSON.parse(raw.toString('utf8')), {
+      current,
+      channel: String(process.env.CHIRON_UPDATE_CHANNEL || '').trim() || undefined,
+      withdrawn: String(process.env.CHIRON_UPDATE_WITHDRAWN || '')
+        .split(',')
+        .map(t => t.trim())
+        .filter(Boolean),
+      pin: String(process.env.CHIRON_UPDATE_PIN || '').trim() || undefined,
+    })
   } catch (err) {
     return {
       ok: false,

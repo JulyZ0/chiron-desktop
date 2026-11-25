@@ -50,24 +50,96 @@ function parseLatestYml(text) {
 }
 
 /** 语义化版本比较（够用即可：只处理数字段与预发布后缀）。 */
+/**
+ * 解析 semver（H57）：`MAJOR.MINOR.PATCH[-prerelease][+build]`。
+ *
+ * 非法输入返回 `ok:false`，由调用方按"不可比较"处理 —— 绝不能把垃圾 tag 当成 0.0.0
+ * 参与比较（旧实现就是这么做的：`parseInt('beta') || 0` 让 `2.0.0-beta` 与 `2.0.0`
+ * 完全相等，于是**预发布版本永远拿不到更新**，而这是本仓的发版常态）。
+ */
+function parseSemver(input) {
+  const text = String(input || '').trim().replace(/^v/i, '')
+  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/.exec(text)
+  if (!m) {
+    // 容错：允许只有两位的版本（`1.2` → `1.2.0`），这是历史清单里真实存在的写法。
+    const loose = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?$/.exec(text)
+    if (!loose) return { ok: false, raw: text }
+    return {
+      ok: true,
+      raw: text,
+      major: Number(loose[1] || 0),
+      minor: Number(loose[2] || 0),
+      patch: Number(loose[3] || 0),
+      prerelease: loose[4] ? loose[4].split('.') : [],
+      build: loose[5] || '',
+    }
+  }
+  return {
+    ok: true,
+    raw: text,
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    prerelease: m[4] ? m[4].split('.') : [],
+    build: m[5] || '',
+  }
+}
+
+/** 单个 prerelease 标识符比较：数字段按数值，其余按字典序，数字 < 字母（semver 规范）。 */
+function comparePrereleaseIdentifier(a, b) {
+  const aNum = /^\d+$/.test(a)
+  const bNum = /^\d+$/.test(b)
+  if (aNum && bNum) {
+    const d = Number(a) - Number(b)
+    return d === 0 ? 0 : d > 0 ? 1 : -1
+  }
+  if (aNum) return -1
+  if (bNum) return 1
+  if (a === b) return 0
+  return a > b ? 1 : -1
+}
+
+/**
+ * 语义化版本优先级比较（H57）：返回 1 / 0 / -1。
+ *
+ * 规则（semver §11）：数字段逐位比较；然后
+ *   - 都是正式版 → 相等；
+ *   - 一方有 prerelease → 有 prerelease 的**更低**（`2.0.0-beta < 2.0.0`）；
+ *   - 都带 prerelease → 逐标识符比较，前缀相同则更长者更高。
+ * `+build` 不参与优先级（只做标识）。
+ */
 function compareVersions(a, b) {
-  const norm = v =>
-    String(v || '')
-      .trim()
-      .replace(/^v/i, '')
-      .split(/[+-]/)[0]
-      .split('.')
-      .map(n => parseInt(n, 10) || 0)
-  const x = norm(a)
-  const y = norm(b)
-  const len = Math.max(x.length, y.length)
-  for (let i = 0; i < len; i += 1) {
-    const d = (x[i] || 0) - (y[i] || 0)
+  const x = parseSemver(a)
+  const y = parseSemver(b)
+  if (!x.ok || !y.ok) {
+    // 不可解析：退化到"字符串不等即视为不同"，且**不声称谁更高**（返回 0）。
+    // 调用方 pickLatestRelease 会因此保留它已经选中的那个，而不是随机降级。
+    return 0
+  }
+  for (const key of ['major', 'minor', 'patch']) {
+    const d = x[key] - y[key]
     if (d !== 0) return d > 0 ? 1 : -1
+  }
+  const xp = x.prerelease
+  const yp = y.prerelease
+  if (!xp.length && !yp.length) return 0
+  if (!xp.length) return 1
+  if (!yp.length) return -1
+  const len = Math.max(xp.length, yp.length)
+  for (let i = 0; i < len; i += 1) {
+    if (i >= xp.length) return -1
+    if (i >= yp.length) return 1
+    const d = comparePrereleaseIdentifier(xp[i], yp[i])
+    if (d !== 0) return d
   }
   return 0
 }
 
+/** 是否是预发布版本（带 prerelease 段）。 */
+function isPrereleaseVersion(input) {
+  const parsed = parseSemver(input)
+  return parsed.ok && parsed.prerelease.length > 0
+}
 /**
  * 从 GitHub Releases API 的列表里挑最新的**可升级**版本。
  *
@@ -77,8 +149,23 @@ function compareVersions(a, b) {
  *   预发布（未签名），按 GitHub 的"稳定版优先"语义筛一次就等于"永远没有更新"。
  *   预发布标记只影响 `/releases/latest` 的指向，不影响它能不能装。
  */
-function pickLatestRelease(releases) {
+function pickLatestRelease(releases, options = {}) {
   const list = Array.isArray(releases) ? releases : []
+  // 默认渠道**接受** prerelease：本仓的发版常态就是预发布（见文件头注释），
+  // 默认设成 stable 等于"默认永远没有更新"。要只在正式版渠道时显式传 channel: 'stable'。
+  const channel = options.channel ? String(options.channel).toLowerCase() : ''
+  const allowPrerelease = channel === '' || channel === 'prerelease' || options.allowPrerelease === true
+  // 撤回名单按 **semver 规范化后**比较：`v2.2.0` 与 `2.2.0` 是同一个版本。
+  const normalizeTag = t => {
+    const parsed = parseSemver(t)
+    return parsed.ok ? parsed.raw.toLowerCase() : String(t || '').trim().toLowerCase()
+  }
+  const withdrawn = new Set(
+    (Array.isArray(options.withdrawn) ? options.withdrawn : []).map(normalizeTag),
+  )
+  const pinned = String(options.pin || '').trim()
+  const current = String(options.current || '').trim()
+
   const candidates = list
     .filter(r => r && r.draft !== true && typeof r.tag_name === 'string' && r.tag_name.trim())
     .map(r => ({
@@ -90,10 +177,30 @@ function pickLatestRelease(releases) {
         r.assets.some(a => a && typeof a.name === 'string' && a.name.toLowerCase() === 'latest.yml'),
     }))
     .filter(r => r.hasManifest)
-  if (!candidates.length) return null
-  return candidates.reduce((best, cur) => (compareVersions(cur.tag, best.tag) > 0 ? cur : best))
-}
+    // H57：撤回的版本绝不进候选 —— 撤回的语义是"这个包有问题"，
+    // 光靠 tag 排序永远绕不过它（旧实现只按版本号取最大）。
+    .filter(r => !withdrawn.has(normalizeTag(r.tag)))
+    // H57：channel 语义 —— stable 渠道不接受带 prerelease 段的版本。
+    // 默认仍是"接受"（本仓发布全是 prerelease，见文件头注释），
+    // 但显式传 channel=stable 时必须真的过滤，否则这个参数就是摆设。
+    .filter(r => allowPrerelease || !isPrereleaseVersion(r.tag))
 
+  if (!candidates.length) return null
+
+  // H57：pin 语义 —— 被 pin 的版本不自动"升级"到别的版本，也不自动降级。
+  // 只有当候选里**恰好**存在被 pin 的那个 tag 时才返回它，否则视为"没有可升级项"。
+  if (pinned) {
+    const exact = candidates.find(c => c.tag.toLowerCase() === pinned.toLowerCase())
+    return exact || null
+  }
+
+  const best = candidates.reduce((acc, cur) => (!acc || compareVersions(cur.tag, acc.tag) > 0 ? cur : acc), null)
+
+  // 不降级：候选不比当前版本新时，什么都不做（返回 null 由调用方当成"已是最新"）。
+  // 旧实现只取"最大"，在清单里混进旧 tag 时会把用户**降级**到旧包。
+  if (current && compareVersions(best.tag, current) <= 0) return null
+  return best
+}
 /** 指定 tag 的清单地址（草稿/预发布也能用，不经过 /releases/latest） */
 function manifestUrlForTag(repo, tag) {
   return `https://github.com/${repo}/releases/download/${encodeURIComponent(tag)}/latest.yml`
@@ -108,6 +215,9 @@ function installerUrlForTag(repo, tag, file) {
 }
 
 module.exports = {
+  parseSemver,
+  isPrereleaseVersion,
+  comparePrereleaseIdentifier,
   parseLatestYml,
   compareVersions,
   pickLatestRelease,

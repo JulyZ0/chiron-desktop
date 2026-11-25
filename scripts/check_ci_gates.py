@@ -34,6 +34,9 @@ GATES: list[tuple[str, str]] = [
     ("PageIndex 独立 job", r"^\s{2}pageindex:\s*$"),
     ("sandbox-service 独立 job", r"^\s{2}sandbox-service:\s*$"),
     ("沙箱隔离用例不许静默 skip", r"沙箱隔离用例出现 skip"),
+    # ── H21：文档必须被 CI 守住 ──
+    ("文档断链检查", r"run:\s*python scripts/check_doc_links\.py"),
+    ("Markdown 表格结构检查", r"run:\s*python scripts/check_md_tables\.py"),
 ]
 
 
