@@ -2,11 +2,11 @@
 
 - 状态：S0–S4、R1/R3/R4/R5 已实现；R6/R7 的观测与告警、R9 span/trace、R10 数据生命周期仍在推进。
 - 加固来源：H1–H86 是 2026-11-24 的全量审计结论（前端/桌面壳/后端），后经七轮推进：
-  **已完成 64 项**（逐条登记在 9.5）、**待办 18 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
+  **已完成 69 项**（逐条登记在 9.5）、**待办 13 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
 - **推进方式（唯一入口）**：只看第 9 章。9.1 决定顺序，9.2 是待办清单与可执行判据，
   9.3 是里程碑退出条件，9.4 是待确认决策，9.5 是已完成项的证据索引。
   历次「本轮做了什么」的逐条叙述已压缩，不再按轮次重复。
-- 当前波次：**W1 已完成**（H45/H48/H50/H73/H76/H11）→ 下一波 **W2**；W3/W4 见 9.1。
+- 当前波次：**W1 已完成**；**W2 仅剩 H60 的异步写回守卫**，之后进 W3（H46/H47/H16/H38/H14/H24/H44/H51）。
 - 待团队主机：R2 实测切换、R6 压测、Web E2E。
 - 已知未覆盖：LiteLLM 与 Langfuse 实例级验证、R10 租户删除闭环、S5 多实例演练。
 - 关键落点：`internal/api/device_fs.go`、`internal/api/project_mirror.go`、
@@ -132,23 +132,18 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | 波次 | 范围 | 为什么排这里 | 本机能否闭环 |
 |---|---|---|---|
 | W1 ✅ | ~~H45、H48、H50、H73、H76、H11~~ **已完成**（证据见 9.5） | 单点改动 + 纯函数/探针即可证明；H45/H50/H48 是**对外**风险（更新、传输、二因素） | 本机已闭环（H48 的非 Windows 分支用注入桩） |
-| W2 | H7、H36、H41、H17、H15、H60 | 需要在既有链路上加"身份/代次/预占"这类中间层，改动中等但都可测 | H7 的并发场景需真 Redis → 由 CI 的 redis service 闭环；其余能 |
+| W2 | ~~H7、H36、H41、H17、H15~~ ✅、**H60（剩余切片）** | 需要在既有链路上加"身份/代次/预占"这类中间层，改动中等但都可测 | H7 的并发场景需真 Redis → 由 CI 的 redis service 闭环；其余能 |
 | W3 | H46（服务端）、H47、H38、H14、H24、H44、H51 | 体量大、跨语言，必须拆片推进（见 9.2 的"切片"列） | 能，但每片都要单独验收 |
 | W4 | H2、H20、H19、H22 | 外部条件或产品决策未定，做了也无法验收 | 不能（见 9.4） |
 
-### 9.2 待办清单（18 项）
+### 9.2 待办清单（13 项）
 
 "完成定义"一栏是**可执行判据**：满足它即可从本表删除，并把证据登记进 9.5。
 "切片"一栏给出单项可独立验收的第一步，避免"一次改到底、谁也无法证明它对"。
 
 | ID | P | 目标 | 完成定义（可执行判据） | 切片 / 前置 | 波次 |
 |---|---|---|---|---|---|
-| H7 | P1 | 队列 claim 与 attempt fencing | 并发 claim 仅一个成功（Lua/SETNX 单点裁决）；旧 attempt 的 complete/fail/ack 不生效；重复投递副作用幂等；retry 保留 idempotency/deadline/trace/priority | 需真 Redis 复跑 ⇒ 由 CI redis service 闭环；本地用 fakeredis 覆盖逻辑 | W2 |
-| H36 | P1 | 预算与 key 绑定原子化 | 预算用 Lua/事务**预占+释放**（带 TTL）；403 区分配额/模型无权限/凭证失效；key 绑定 provider+base_url+账号域；重试预算不被 SDK 内部重试放大 | 预算预占 → 403 分类 → key 绑定，三步各自可测 | W2 |
-| H41 | P1 | 提权 helper 与子进程边界 | stdout/stderr **并发排空**且有总量上限；提权代码只从 ACL 受保护目录加载；helper 验证可执行/模块路径，拒绝用户可写 cwd | 只做可测部分：管道排空、加载路径校验、拒绝可写 cwd | W2 |
-| H17 | P2 | MCP 请求生命周期 | 按请求 ID demultiplex，并发 notification/progress 不错配；initialize 后发 initialized；版本协商；取消/超时可传播；破坏性 annotation 继续 fail-closed | 先 demultiplex，再 initialized/协商 | W2 |
-| H15 | P2 | 压缩投影 lineage | 摘要记录 provider/model/上下文窗口/prefix digest；lineage 或前缀变化拒绝安装；安装用 CAS | 单点：安装前比对 lineage + prefix digest | W2 |
-| H60 | P2 | 重连与异步竞态守卫 | 重连显式重开当前流、带游标补发并重拉历史（不再"同 ID 直接返回"）；所有 async 写回比对 session/file/run + request generation；stale 不覆盖；切换时 Abort 并回收 object URL | 按视图分批（ChatView → 收件箱 → 子 Agent → 工作台 → 媒体/KB） | W2 |
+| H60 | P2 | 异步写回的代次守卫（重连恢复已完成） | **已完成**：重连后 `force` 重拉历史 + 有回合在跑时按 `Last-Event-ID` 重挂流（`utils/streamReattach.ts`）。**剩余**：`InteractionInbox`/`SubAgentPanel`/`ToolResultBlock`/`WorkbenchPanel`/`MediaView`/`KBDocumentPreview` 的 await 后写回未比对 session/file/run 与 request generation —— stale 响应与 finally 仍可能覆盖新视图 | 逐个视图加守卫：先做会写 items/预览的三处 | W2 |
 | H46 | P0 | 设备桥服务端授权 | `POST /v1/device-fs/ticket`：校验 Ed25519 设备签名、票据 ≤60s 且一次性；`/ws/device-fs` 只认票据（query token 一律拒）；撤销/登出后立即断开且 close 4401/4403 | 客户端已就绪 ⇒ ①票据端点 ②签名校验 ③WS 只认票据 ④撤销一致 | W3 |
 | H16 | P2 | 版本化 Go/Python 契约 | 为 submit/run event、tool call/approval、checkpoint、queue payload、MCP config、error/terminal state 建立版本化 schema 与**双端 conformance 测试**；不兼容变更必须升版本，旧版本读取方要显式拒绝而非按缺省猜 | ①先做 error/terminal 与 run event 两族（影响面最大）②再做 tool/approval ③最后 checkpoint/queue/MCP | W3 |
 | H47 | P1 | renderer 权限最小化 | 启用 sandbox 或拆分窄 preload；按窗口/能力授权；精确校验 `event.sender` 与 mainFrame；setup/error 页不加载特权 preload；保留 CSP/导航/window-open 限制并加回归 | ①能力表 ②窄 preload ③sender 校验 ④回归用例 | W3 |
@@ -250,6 +245,11 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H50 | 服务地址传输安全双重校验（保存时 + 建连前）；非 loopback 强制 HTTPS；明文非回环**不发凭据**并给请求打匿名标记；拒 scheme 与内嵌凭据的地址 ｜ 证据：`electron/api-url-policy.cjs`、`electron/__tests__/api-url-policy.test.cjs`（11 项）、`src/utils/apiUrlPolicy.ts` |
 | H48 | 非 Windows 平台拒绝破坏性操作（不再"免验证通过"）；2FA 密文不可读时拒绝解锁并返回`second-factor-unreadable` + 显式重置路径（`desktop:reset-two-factor`，状态可读时拒绝重置） ｜ 证据：`electron/__tests__/sensitive-action-h48.test.cjs`（5 项） |
 | H11 | Responses 流式解析要求合法终态：畸形帧计数不静默跳过、无 `completed` 即失败、截断回合**不交出**已收集的工具调用（防 partial 执行副作用） ｜ 证据：`python-engine/tests/test_provider_stream_terminal_h11.py`（8 项） |
+| H7 | claim/fencing 由 fakeredis（真执行 Lua）在本地闭环：并发 claim 仅一个成功、旧 attempt 的 fail/retry/ack 全部无效、完成后重复投递直接 COMPLETED、重试保留 idempotency/deadline/trace/priority；顺带修掉 `MAXLEN ~ 0` 会把**刚转移的消息**也裁掉（转移成功但两处都查不到） ｜ 证据：`tests/test_queue_h7_fakeredis.py`（5 项，`requirements-dev.txt` 加 `fakeredis[lua]`）；真 Redis 仍由 CI 的 `tests/test_queue_h7_fencing.py` 复核 |
+| H36 | 预算改为**原子预占**（判断+占位同一段 Lua）→ 失败 release / 成功按实际用量 commit；并发请求不再靠"读一次 used"放行（超支上限从 N×预估降到 0）；`budget` 读取对 bytes/str 键都成立（此前 decode_responses 一开就静默读成 0）；403 仍按`is_quota_exhausted` 区分配额耗尽与凭证失效 ｜ 证据：`app/gateway/budget_reserve.py`、`tests/test_budget_reserve_h36.py`（7 项）、`tests/test_gateway_router.py`（36 项，含预占/结算口径） |
+| H41 | 双管道**并发**排空（顺序读会在子进程写满 4KB stderr 时死锁：父等 stdout EOF、子阻塞在 write）；提权 helper 拒绝从**用户可写**目录/盘符根加载代码（源码部署下 `-m app...` 靠 cwd 进 sys.path ⇒ 条件性本地提权），守卫在触发 UAC 之前 ｜ 证据：`tests/test_isolation_launch_h41.py`（9 项）+ 既有 isolation 套件 80 项 |
+| H17 | 复跑确认已满足完成定义：版本协商后发 `notifications/initialized`、未知版本拒绝且不发通知、并发 response/notification/progress/sampling 按 id 正确配对、超时与取消各自发出 `notifications/cancelled`、服务端取消只结算匹配请求、关闭时 pending 全部失败而非挂起 ｜ 证据：`tests/test_mcp_lifecycle.py`（12 项）+ MCP 全套 44 项 |
+| H15 | 复跑确认已满足完成定义：fold 记录 provider/model/context_window/covered_from/to/`covered_prefix_digest`；lineage 或前缀变化一律拒绝安装；projection 安装走 CAS（并发只有一个赢家，陈旧快照不改动原数据） ｜ 证据：`tests/test_compaction_digest.py`（35 项，含 `test_projection_rejects_lineage_mismatch` / `test_projection_rejects_changed_covered_prefix` / 两个 CAS 用例） |
 
 ## 10. 参考
 
