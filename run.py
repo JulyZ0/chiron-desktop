@@ -196,12 +196,33 @@ def is_windows() -> bool:
 
 
 def is_port_open(port: int, host: str = "localhost", timeout: float = 1.0) -> bool:
-    """检查端口是否在监听"""
+    """检查端口是否在监听（**只说明"有人在"**，不说明是不是我们起的那个）。"""
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except (ConnectionRefusedError, TimeoutError, OSError):
         return False
+
+
+def listener_pid(port: int) -> int | None:
+    """查询监听 `port` 的 PID（H43）。取不到返回 None：**未知 ≠ 通过**。"""
+    from scripts.service_identity import listener_pid as _listener_pid
+
+    return _listener_pid(port)
+
+
+def port_owned_by(port: int, pid: int) -> bool | None:
+    """`port` 是否由 `pid` 监听。三态（H43）：
+
+    - ``True``  能证明是它；
+    - ``False`` 能证明不是它（端口被别的进程占着 —— 技能上的"重启没停干净"）；
+    - ``None``  查不到（没有 netstat/lsof、权限不足）⇒ 调用方按"无法证明"处理，
+      既不能报成功，也不该判失败。
+    """
+    owner = listener_pid(port)
+    if owner is None:
+        return None
+    return owner == pid
 
 
 def find_free_port() -> int:
@@ -454,17 +475,26 @@ def remove_port(service: str):
 
 
 def is_process_running(pid: int) -> bool:
-    """检查进程是否在运行"""
+    """检查进程是否在运行 —— **按 PID 精确匹配**（H43）。
+
+    旧实现是 `str(pid) in tasklist_output`：PID `123` 会命中 `1234`，于是"我们的
+    进程早死了、PID 被系统复用给别人"也会报"运行中"。表格式输出又是按列对齐的，
+    窄终端里各列会挤成一行，子串匹配必然误判。这里改用 `-FO CSV` + 精确比较。
+    """
+    if pid <= 0:
+        return False
     try:
         if is_windows():
+            from scripts.service_identity import parse_tasklist_pid
+
             result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}"],
-                capture_output=True, text=True
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
             )
-            return str(pid) in result.stdout
-        else:
-            os.kill(pid, 0)
-            return True
+            return parse_tasklist_pid(result.stdout or "", pid) is not None
+        os.kill(pid, 0)
+        return True
     except (ProcessLookupError, PermissionError, OSError):
         return False
 
@@ -671,31 +701,48 @@ class ServiceManager:
         return True
 
     def _find_service_pid(self, key: str, port: int) -> int | None:
-        """找到监听指定端口的进程 PID"""
-        try:
-            if is_windows():
-                result = subprocess.run(
-                    ["netstat", "-ano"],
-                    capture_output=True, text=True
-                )
-                for line in result.stdout.splitlines():
-                    if f":{port}" in line and "LISTENING" in line:
-                        parts = line.split()
-                        if parts:
-                            try:
-                                return int(parts[-1])
-                            except ValueError:
-                                pass
-            else:
-                result = subprocess.run(
-                    ["lsof", "-i", f":{port}", "-t"],
-                    capture_output=True, text=True
-                )
-                if result.stdout.strip():
-                    return int(result.stdout.strip().split()[0])
-        except Exception:
-            pass
+        """找到监听指定端口的进程 PID（H43：**按端口精确匹配**）。
+
+        旧实现是 `f":{port}" in line`：端口 `8080` 会命中 `18080`、`80800`，
+        于是"端口已有人监听"的判定可能来自一个完全无关的服务。
+        """
+        owner = listener_pid(port)
+        if owner is not None:
+            return owner
+        # 拿不到归属时的兜底：先看我们记录的 PID 是否还活着（**不**等价于"它在监听"，
+        # 但比"随机挑一个 PID"强）。调用方要区分"未知"与"确认"，见 verify_service。
+        pid = read_pid(key)
+        if pid and is_process_running(pid):
+            return pid
         return None
+
+    def verify_service(self, key: str, *, port: int | None = None) -> tuple[bool, str]:
+        """校验服务**真的**起来了（H43）：PID 存活 **且** 端口归属一致。
+
+        返回 (ok, 说明)。三态语义：
+        - ok=True  ：PID 存活且能证明端口属于它；
+        - ok=False ：PID 不存活 / 端口被别的进程占着（重启没停干净的典型形态）；
+        - ok=True  + 说明里写 "unverified"：PID 存活但查不到端口归属
+          （没有 netstat/lsof）—— **无法证明**，既不报成功也不报失败，
+          由调用方决定是否升级为失败（`--strict` 时会）。
+        """
+        svc = SERVICES[key]
+        name = svc["name"]
+        if port is None:
+            port = read_port(key) or svc["port"]
+        pid = read_pid(key)
+        if not pid or not is_process_running(pid):
+            return False, f"{name}: 进程未运行（PID {pid or '-'}）"
+        owned = port_owned_by(port, pid)
+        if owned is True:
+            return True, f"{name}: PID {pid} 监听 {port}"
+        if owned is False:
+            owner = listener_pid(port)
+            return False, (
+                f"{name}: 端口 {port} 不属于本进程（监听者 PID {owner}，记录 PID {pid}）"
+                " —— 旧进程可能没停干净"
+            )
+        return True, f"{name}: PID {pid} 存活，端口 {port} 归属未验证（缺 netstat/lsof）"
 
     def setup(self):
         """首次安装依赖"""
@@ -985,11 +1032,39 @@ class ServiceManager:
                 self.stop_service(key)
         print()
 
-    def restart(self, services: list = None):
-        """重启服务"""
+    def restart(self, services: list = None, *, strict: bool = False) -> bool:
+        """重启服务，并**校验真的起来了**（H43）。
+
+        旧实现只做 `stop(); sleep(1); start()` 且**没有返回值** —— 于是 `run.py restart`
+        永远退出码 0。"重启失败"的两种真实形态（旧进程没停干净、新进程起来又立刻挂掉）
+        在旧实现里完全不可见：用户看到 "已重启"，实际连的还是旧进程或根本没人听。
+
+        返回：全部服务校验通过为 True。
+        """
         self.stop(services)
         time.sleep(1)
-        self.start(services=services)
+        started = self.start(services=services)
+        targets = services or list(SERVICES.keys())
+        ok = bool(started)
+        print(bold("\n重启后校验"))
+        for key in targets:
+            if key not in SERVICES:
+                continue
+            svc = SERVICES[key]
+            if svc.get("optional") and not _service_available(key, svc):
+                continue
+            healthy, detail = self.verify_service(key)
+            if healthy:
+                print(f"  {green('OK')} {detail}")
+                if "未验证" in detail:
+                    # 查不到归属：不能报成功，也不该静默 —— 显式提示取证方式。
+                    print(gray("       （无法证明端口归属：装 netstat/lsof 或用 --strict 失败）"))
+                    if strict:
+                        ok = False
+                continue
+            print(f"  {red('FAIL')} {detail}")
+            ok = False
+        return ok
 
     def status(self):
         """查看服务状态"""
@@ -1111,6 +1186,11 @@ def main():
     parser.add_argument("--fg", action="store_true", help="前台模式运行")
     parser.add_argument("--tail", type=int, default=50, help="日志行数")
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="重启后校验更严：端口归属查不到也算失败（默认只告警）",
+    )
+    parser.add_argument(
         "--env",
         default=os.environ.get("CHIRON_ENV") or None,
         metavar="NAME",
@@ -1145,7 +1225,9 @@ def main():
         mgr.stop(services)
 
     elif args.command == "restart":
-        mgr.restart(services)
+        # H43：重启必须有可验证的结论 —— 旧实现没有返回值也没有 `sys.exit`，
+        # 于是"重启失败"退出码 0（CI/脚本据此判定成功），这正是"假重启"。
+        sys.exit(0 if mgr.restart(services, strict=args.strict) else 1)
 
     elif args.command == "status":
         mgr.status()
