@@ -117,7 +117,11 @@ function onMediaPicked(atts: ChatAttachment[]) {
 // 允许的文件类型（图片 + 常见文档）
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml']
 const AUDIO_TYPES = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/flac', 'audio/webm', 'audio/mp4', 'audio/x-m4a', 'audio/aac']
-const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB
+// H65：这里曾经是 50MB 的**硬限制**，而 `uploadFile()` 明确支持 >50MB 走分片上传 ——
+// 结果分片路径在聊天里永远走不到（用户看到"超过 50MB"，其实系统能收）。
+// 现在这个常量只用于**提示**，真正的上限由上传层（分片）决定。
+const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB（超过后自动走分片）
+const CHUNK_UPLOAD_LIMIT = 2 * 1024 * 1024 * 1024 // 2GB：分片路径的实际上限
 
 // ── 模型路由选择器（GET /v1/models，仅 enabled） ──
 const models = ref<LlmModel[]>([])
@@ -793,7 +797,8 @@ async function handleFiles(files: FileList | File[]) {
   uploading.value = true
   try {
     for (const file of arr) {
-      if (file.size > MAX_FILE_SIZE) {
+      // 只有超过**分片上限**才拒绝；50MB~2GB 之间走分片（命中上传层的 chunked 分支）。
+      if (file.size > CHUNK_UPLOAD_LIMIT) {
         notify.error(tr('errors.name_exceeds_the_50mb_limit', { name: file.name }))
         continue
       }

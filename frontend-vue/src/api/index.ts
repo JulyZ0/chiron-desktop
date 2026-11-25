@@ -17,6 +17,7 @@ import type { WorkstationType } from '../types/workstation'
 
 import { t } from '../i18n'
 import { currentDeviceMode, isDevAuthBypassEnabled, type ChironMode } from '../stores/device'
+import { sanitizeAttachmentUrl } from '../utils/safeAttachmentUrl'
 /** 桌面壳（Electron）在 preload 里注入 chironDesktop.apiUrl；Web 端回落到构建期变量 */
 type DesktopHost = {
   apiUrl?: string
@@ -865,6 +866,28 @@ api.interceptors.response.use(
 // 由服务端合并后落 media_assets，避免超大文件被拒。
 const INLINE_UPLOAD_LIMIT = 50 * 1024 * 1024
 
+/**
+ * 上传响应里的 `file_url` 必须过**来源与协议**校验（H65）。
+ *
+ * 这个字段是服务端给的**字符串**，随后会被当成 `<img src>` / `<a href>`。
+ * 缺了这一步，"上传成功"就能换来一个 `javascript:` 或指向内网的地址 ——
+ * 服务端被攻破/被误配时，前端不该替它兜这个底。
+ */
+function assertTrustedUploadUrl(raw: unknown): string {
+  const url = typeof raw === 'string' ? raw.trim() : ''
+  const safe = sanitizeAttachmentUrl(url, {
+    selfOrigin: typeof window !== 'undefined' ? window.location?.origin : '',
+    trustedOrigins: String(import.meta.env.VITE_MEDIA_TRUSTED_ORIGINS || '')
+      .split(',')
+      .map(o => o.trim())
+      .filter(Boolean),
+  })
+  if (!safe) {
+    throw new Error('invalid media upload response')
+  }
+  return safe
+}
+
 export async function uploadFile(file: File): Promise<{
   id: string
   url: string
@@ -880,9 +903,12 @@ export async function uploadFile(file: File): Promise<{
       || typeof done.file_url !== 'string' || !done.file_url) {
       throw new Error('invalid chunk upload response')
     }
+    // H65：分片路径与单请求路径**同一套契约**。两条路各自校验一次，
+    // 是因为它们的响应体来自不同 handler，谁也不能替对方背书。
+    const chunkUrl = assertTrustedUploadUrl(done.file_url)
     return {
       id: done.asset_id,
-      url: done.file_url,
+      url: chunkUrl,
       name: file.name,
       size: done.size || file.size,
       mimeType: file.type,
@@ -901,6 +927,8 @@ export async function uploadFile(file: File): Promise<{
   const id = typeof d?.id === 'string' ? d.id : ''
   const url = typeof d?.file_url === 'string' ? d.file_url : ''
   if (!d || !id || !url) throw new Error('invalid media upload response')
+  // H65：缺 ID / file_url 立即失败（**不伪造** ID），且 URL 还要过来源校验。
+  const safeUrl = assertTrustedUploadUrl(url)
   const name = typeof d.name === 'string' && d.name
     ? d.name
     : typeof d.filename === 'string' && d.filename ? d.filename : file.name
@@ -909,7 +937,7 @@ export async function uploadFile(file: File): Promise<{
     : typeof d.contentType === 'string' && d.contentType ? d.contentType : file.type
   return {
     id,
-    url,
+    url: safeUrl,
     name,
     size: Number(d.size) || file.size,
     mimeType,
