@@ -837,17 +837,18 @@ def _split_tool_batch(
 
     其余一律进串行组：**宁可少并发，也不让顺序变得不可预测**。
     """
-    from app.agent.tool_policy import READ, tool_level
+    # G15：并发资格由**工具自己声明**（`registry.is_concurrency_safe`，默认 False）。
+    #
+    # 之前是按动作级 `tool_level(...) == READ` 推断的：那张表是给"要不要审批"用的，
+    # 拿它兼职决定并发有两个方向的错 —— 漏声明只读工具（白白串行），
+    # 或错标一个会碰外部状态的工具（并发执行不该并发的调用）。
+    from app.tools.registry import is_concurrency_safe
 
     candidates: list[dict[str, Any]] = []
     serial: list[dict[str, Any]] = []
     for call in tool_calls:
         name = str(call.get("name", ""))
-        if (
-            name == ASK_USER_TOOL
-            or name == COMPACT_TOOL
-            or tool_level(name, _parse_tool_args(call)) != READ
-        ):
+        if name == ASK_USER_TOOL or name == COMPACT_TOOL or not is_concurrency_safe(name):
             serial.append(call)
             continue
         candidates.append(call)
