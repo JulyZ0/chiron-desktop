@@ -874,8 +874,13 @@ def _launch_restricted_local(
         k32.CloseHandle(err_w)
         err_w = wt.HANDLE()
 
-        stdout = _drain(out_r, max_output)
-        stderr = _drain(err_r, max_output)
+        # H41：两根管道**并发**排空。
+        #
+        # 顺序读会死锁：管道缓冲区默认 4KB，子进程往 stderr 写满之后阻塞在 write 上，
+        # 而父进程此时正阻塞在 stdout 的 ReadFile 里等 EOF —— 双方都在等对方。
+        # 用两个线程各自阻塞读自己那根管道，是最省事且不会漏数据的做法
+        # （与长驻模式 `_drain_in_background` 同一思路）。
+        stdout, stderr = _drain_both(out_r, err_r, max_output)
 
         wait_ms = INFINITE if timeout <= 0 else int(timeout * 1000)
         waited = k32.WaitForSingleObject(pi.hProcess, wait_ms)
@@ -1248,6 +1253,39 @@ def appcontainer_exec_ready() -> bool:
 
 def appcontainer_exec_error() -> str:
     return _appcontainer_error
+
+
+def _drain_both(out_handle: Any, err_handle: Any, max_output: int) -> tuple[str, str]:
+    """并发读完 stdout 与 stderr（H41）。
+
+    为什么必须是两个线程：管道缓冲区默认 4KB。顺序读时，如果子进程先写满 stderr，
+    它会阻塞在 write 上不再产出 stdout —— 而父进程正在等 stdout 的 EOF。这是
+    教科书式的管道死锁，只在"输出量跨过缓冲区边界"时出现。
+    """
+    import threading
+
+    results: dict[str, str] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _read(name: str, handle: Any) -> None:
+        try:
+            results[name] = _drain(handle, max_output)
+        except BaseException as exc:  # noqa: BLE001 - 线程里不能让异常消失
+            errors[name] = exc
+
+    threads = [
+        threading.Thread(target=_read, args=("stdout", out_handle), daemon=True),
+        threading.Thread(target=_read, args=("stderr", err_handle), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    if errors:
+        first = next(iter(errors.values()))
+        raise first
+    return results.get("stdout", ""), results.get("stderr", "")
 
 
 def _drain(handle: Any, max_output: int) -> str:

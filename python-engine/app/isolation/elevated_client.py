@@ -440,6 +440,44 @@ def helper_argv(parent_pid: int, state_dir: str | None = None) -> list[str]:
     return argv
 
 
+#: 用户可写的顶层目录（用于判断"提权进程会不会从可写目录加载代码"）。
+_WRITABLE_ENV_KEYS = ("TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE")
+
+
+def helper_loading_dir_is_protected(working_dir: str) -> tuple[bool, str]:
+    r"""判断提权 helper 的加载目录是否可以放心 `-m app...`（H41）。
+
+    判据（从严）：
+      · 目录必须存在（否则 `-m` 必然失败，报错也会误导）；
+      · 不得位于**用户可写**位置：用户主目录、TEMP、以及任何带 `..` 的路径；
+      · 不得位于盘符根下（`D:\` 这种常见"随手放"的位置，权限通常是 Everyone 可写）。
+
+    返回 `(ok, 原因)`。ok=False 时调用方必须**拒绝启动**提权 helper。
+    """
+    path = os.path.abspath(working_dir or "")
+    if not path or not os.path.isdir(path):
+        return False, f"提权 helper 的加载目录不存在：{working_dir!r}"
+
+    lowered = path.lower()
+    for key in _WRITABLE_ENV_KEYS:
+        root = os.environ.get(key, "")
+        if not root:
+            continue
+        root_low = os.path.abspath(root).lower()
+        if root_low and (lowered == root_low or lowered.startswith(root_low + os.sep)):
+            return (
+                False,
+                f"提权 helper 拒绝从用户可写目录加载代码（{key}={root}）："
+                "请安装到受保护目录后重试",
+            )
+
+    drive, tail = os.path.splitdrive(lowered)
+    if drive and tail.strip("\\/") == "":
+        return False, f"提权 helper 拒绝从盘符根目录加载代码（{path}）"
+
+    return True, ""
+
+
 def spawn_elevated(parent_pid: int | None = None) -> tuple[bool, str, bool]:
     """以管理员权限启动 helper（触发 UAC）。返回 `(ok, 原因, 是否用户取消)`。
 
@@ -477,6 +515,14 @@ def spawn_elevated(parent_pid: int | None = None) -> tuple[bool, str, bool]:
     working_dir = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     )
+    # H41：源码部署时引擎根往往在**用户可写**目录（`D:\code\...`），
+    # 而 `-m` 是靠 cwd 进 `sys.path` 找 `app` 包的 —— 于是"能写那个目录"的人就能
+    # 让**提权**进程加载自己的 `elevated_helper.py`：条件性本地提权。
+    # 这里拒绝从可写目录启动提权 helper（宁可让 UAC 档不可用，也不提权外代码）。
+    safe_dir, reason = helper_loading_dir_is_protected(working_dir)
+    if not safe_dir:
+        logger.warning("拒绝启动提权 helper：%s", reason)
+        return False, reason, False
     # `lpParameters` 只放**参数**，可执行文件本身走 `lpFile`。`list2cmdline` 负责
     # 加引号 —— `C:\Program Files\Chiron` 这类带空格的路径必需。
     parameters = subprocess.list2cmdline(argv[1:])
@@ -544,6 +590,7 @@ __all__ = [
     "ensure_key",
     "exec_payload",
     "helper_argv",
+    "helper_loading_dir_is_protected",
     "helper_exec",
     "helper_protocol",
     "reset_probe",
