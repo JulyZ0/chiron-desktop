@@ -18,6 +18,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -234,6 +235,9 @@ type checkpointGcBody struct {
 	// WorkspaceID 可选：只看这一个项目的仓库（枚举其 checkpoint ref 做扫描统计）。
 	// 不传则扫平台内所有已绑定的项目根。
 	WorkspaceID string `json:"workspace_id"`
+	// PlanDigest 是 dry-run 时**服务端签发**的计划摘要（H73）。
+	// `dry_run=false` 时必须携带：服务端会先做一次只读重算并比对，不一致即 409。
+	PlanDigest string `json:"plan_digest"`
 }
 
 // resolveGcDryRun 决定"这次是不是真删"：**缺省一律 true**。
@@ -256,6 +260,37 @@ func resolveGcRetention(days int) int {
 		return 3650
 	}
 	return days
+}
+
+// gcPlanSnapshot 跑一次只读 dry-run 并返回摘要（H73）。
+//
+// 单独抽出来是为了让"执行前的重算"与"预览时的签发"走**同一个函数**：
+// 两处各写一遍，迟早会在某次字段调整后算出不同结果，那时所有执行都会被 409 拦住。
+func gcPlanSnapshot(
+	ctx context.Context,
+	python *engine.PythonClient,
+	workspaceID string,
+	roots []string,
+	retentionDays int,
+) (string, error) {
+	var plan map[string]interface{}
+	payload := map[string]interface{}{
+		"roots":          roots,
+		"retention_days": retentionDays,
+		"dry_run":        true,
+	}
+	if err := python.PostJSON(ctx, "/v1/internal/checkpoints/gc", payload, &plan); err != nil {
+		return "", err
+	}
+	if plan == nil {
+		return "", fmt.Errorf("checkpoint dry-run returned no plan")
+	}
+	return gcPlanDigest(workspaceID, retentionDays, plan), nil
+}
+
+// workspaceIDOf 统一空值口径："" 表示"平台内所有项目"，摘要里也必须体现这一点。
+func workspaceIDOf(id string) string {
+	return strings.TrimSpace(id)
 }
 
 // CheckpointGcHandler 是 POST /v1/admin/checkpoints/gc（平台 owner 写权限）。
@@ -284,10 +319,41 @@ func CheckpointGcHandler(python *engine.PythonClient) http.HandlerFunc {
 		// 太容易由一次手滑的 {} 请求触发，而代价是本机所有项目的未跟踪缓存。
 		retention := resolveGcRetention(body.RetentionDays)
 
+		// H73：执行路径必须绑定一份**服务端签发的计划**（fail fast，且不依赖 PG）。
+		//
+		// 旧实现完全不看调用方带了什么：任何请求都能在"用户已确认"的名义下删掉一份
+		// 没预览过的范围（前端钉住的是它自己的 UI 状态，服务端不认）。
+		if !dryRun && strings.TrimSpace(body.PlanDigest) == "" {
+			BadRequest(w, "plan_digest is required for a destructive run：先 dry-run 取摘要再执行")
+			return
+		}
+
 		roots, err := checkpointGcRoots(r.Context(), body.WorkspaceID)
 		if err != nil {
 			logAndRespond(w, err, http.StatusInternalServerError, "workspace roots lookup failed")
 			return
+		}
+
+		// H73：**执行前重算**。服务端再跑一次只读 dry-run，摘要不一致就 409 且什么都不删。
+		// 这一层挡的是"确认 A、删 B"：前端钉住的是它自己的 UI 状态，服务端必须独立复核。
+		if !dryRun {
+			latest, same, err := verifyGcPlanAgainstSnapshot(
+				r.Context(), python, workspaceIDOf(body.WorkspaceID), roots, retention, body.PlanDigest)
+			if err != nil {
+				logAndRespond(w, err, http.StatusServiceUnavailable, "checkpoint plan re-derivation failed")
+				return
+			}
+			if !same {
+				slog.Warn("checkpoint gc plan mismatch",
+					"workspace", body.WorkspaceID, "expected", body.PlanDigest, "actual", latest)
+				JSON(w, http.StatusConflict, APIResponse{
+					Success: false,
+					Code:    CodeRequestFailed,
+					Error:   "checkpoint plan changed since preview（plan_digest mismatch）",
+					Data:    map[string]interface{}{"plan_digest": latest},
+				})
+				return
+			}
 		}
 
 		payload := map[string]interface{}{
@@ -310,6 +376,11 @@ func CheckpointGcHandler(python *engine.PythonClient) http.HandlerFunc {
 		stats.StoreFiles = int64(intOf(result["store_files"]))
 		stats.StoreBytes = int64(intOf(result["store_bytes"]))
 		result["stats"] = stats
+		// 摘要随结果下发：dry-run 时前端据此绑定确认框，执行时原样回传。
+		// 执行阶段也回填（同一份计划算出来的值不变），便于调用方对账。
+		if _, ok := result["plan_digest"]; !ok {
+			result["plan_digest"] = gcPlanDigest(workspaceIDOf(body.WorkspaceID), retention, result)
+		}
 		OK(w, result)
 	}
 }

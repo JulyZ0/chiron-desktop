@@ -47,6 +47,23 @@ function fnv1a(text: string): string {
  * 故意包含 `workspaceId`：同一份计划内容打到不同 workspace 上，摘要必须不同，
  * 否则「切项目」这种最危险的漂移恰好不会被摘要发现。
  */
+/**
+ * 取"这次确认框要绑定"的摘要（H73）。
+ *
+ * 优先用**服务端签发**的 `plan.plan_digest`：只有它才是网关认得的那份计划；
+ * 本地 FNV 摘要只在老网关（不返回 digest）时作为**自检**回退 —— 那种情况下执行
+ * 请求会被新网关以"缺 plan_digest"拒绝，属于预期的版本错配，而不是静默放过。
+ */
+export function resolveGcPlanDigest(plan: CheckpointGcResult, workspaceId: string): string {
+  const serverDigest = typeof plan.plan_digest === 'string' ? plan.plan_digest.trim() : ''
+  return serverDigest || computeGcPlanDigest(plan, workspaceId)
+}
+
+/** 这份计划是否带有服务端签发的摘要（决定执行阶段能否通过网关校验）。 */
+export function hasServerSignedDigest(plan: CheckpointGcResult): boolean {
+  return typeof plan.plan_digest === 'string' && plan.plan_digest.trim().length > 0
+}
+
 export function computeGcPlanDigest(plan: CheckpointGcResult, workspaceId: string): string {
   const canonical = JSON.stringify({
     v: 1,

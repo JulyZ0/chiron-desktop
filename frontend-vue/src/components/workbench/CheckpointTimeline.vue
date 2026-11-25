@@ -40,7 +40,7 @@ import { formatSmart } from '../../utils/datetime'
 import { describeApiError } from '../../utils/apiError'
 import { notify } from '../../utils/notify'
 import {
-  computeGcPlanDigest,
+  resolveGcPlanDigest,
   verifyGcPlan,
   type GcPlanBinding,
 } from '../../utils/checkpointGcPlan'
@@ -292,7 +292,7 @@ async function previewGc() {
     binding = {
       workspaceId,
       generation: gen,
-      digest: computeGcPlanDigest(plan, workspaceId),
+      digest: resolveGcPlanDigest(plan, workspaceId),
       result: plan,
     }
     gcResult.value = plan

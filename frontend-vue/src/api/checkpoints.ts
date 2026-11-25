@@ -79,6 +79,14 @@ export interface CheckpointGcResult {
   dangling_refs: string[]
   planned: string[]
   retention_days: number
+  /**
+   * **服务端签发**的计划摘要（H73）。
+   *
+   * dry-run 时由网关按计划内容算出并下发；执行阶段必须原样回传，网关会重算比对，
+   * 不一致直接 409。老网关不返回该字段 ⇒ 前端回退到本地摘要，但那种情况下
+   * 执行请求也会被新网关以 400（缺摘要）拒绝 —— 两侧必须同版本。
+   */
+  plan_digest?: string
   stats: CheckpointStats
 }
 
@@ -277,6 +285,7 @@ export async function runCheckpointGc(options: {
     dangling_refs: strList(p.dangling_refs),
     planned: strList(p.planned),
     retention_days: num(p.retention_days) || 30,
+    plan_digest: typeof p.plan_digest === 'string' ? p.plan_digest : undefined,
     stats: normalizeStats(p.stats) ?? {
       sample_count: 0, avg_file_count: 0, avg_byte_size: 0, window_days: 30,
     },
