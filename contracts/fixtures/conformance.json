@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "cases": [
     {
       "family": "error",
@@ -146,6 +146,7 @@
       "family": "run_event",
       "name": "unknown-data-fields-ignored",
       "valid": true,
+      "forward_compat": true,
       "payload": {
         "type": "usage",
         "data": {
@@ -202,6 +203,463 @@
       "payload": {
         "type": "text",
         "data": "hello"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "approve-with-decision",
+      "valid": true,
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_1",
+        "decision": "approve",
+        "reason": "用户确认执行"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "edit-with-arguments",
+      "valid": true,
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_2",
+        "decision": "edit",
+        "arguments": "{\"command\":\"ls -la\"}",
+        "reason": "改小范围再执行"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "legacy-approved-flag",
+      "valid": true,
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_3",
+        "approved": false,
+        "reason": "旧前端只发 approved（显式 false = 拒绝，不是'没发'）"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "unknown-fields-ignored",
+      "valid": true,
+      "forward_compat": true,
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_4",
+        "decision": "approve",
+        "question": "要执行 shell_exec 吗？",
+        "level": "delete",
+        "risk": "high",
+        "future_field": 1
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "missing-decision-and-approved",
+      "valid": false,
+      "reason": "decision 与 approved 都缺：缺字段不得等同于放行",
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_5",
+        "reason": "忘了带决定"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "unknown-decision",
+      "valid": false,
+      "reason": "decision 只能是 approve/reject/edit（不是 approved/denied/edited）",
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_6",
+        "decision": "allow"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "edit-without-arguments",
+      "valid": false,
+      "reason": "decision=edit 必须带编辑后的参数对象",
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_7",
+        "decision": "edit"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "edit-with-non-object-arguments",
+      "valid": false,
+      "reason": "arguments 解析出来必须是 JSON 对象：数组会让重跑分级拿不到参数名",
+      "payload": {
+        "session_id": "sess_1",
+        "tool_call_id": "call_8",
+        "decision": "edit",
+        "arguments": "[1,2,3]"
+      }
+    },
+    {
+      "family": "tool_approval",
+      "name": "missing-tool-call-id",
+      "valid": false,
+      "reason": "tool_call_id 必填：票据对不上就取不回来",
+      "payload": {
+        "session_id": "sess_1",
+        "decision": "approve"
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "ok-minimal",
+      "valid": true,
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 1,
+        "kind": "pre_turn",
+        "state": "ok",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "tree_sha": "89abcdef0123456789abcdef0123456789abcdef",
+        "ref_name": "refs/chiron/checkpoints/sess_1/0001"
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "with-untracked-manifest",
+      "valid": true,
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 2,
+        "kind": "post_turn",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "tree_sha": "89abcdef0123456789abcdef0123456789abcdef",
+        "ref_name": "refs/chiron/checkpoints/sess_1/0002",
+        "file_count": 12,
+        "skipped_count": 1,
+        "byte_size": 4096,
+        "untracked": [
+          {
+            "path": "notes/scratch.md",
+            "sha256": "aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899",
+            "size": 42
+          }
+        ]
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "failed-state-without-shas",
+      "valid": true,
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 3,
+        "kind": "post_turn",
+        "state": "failed",
+        "error": "磁盘写满，写 ref 失败",
+        "error_code": "io"
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "unknown-fields-ignored",
+      "valid": true,
+      "forward_compat": true,
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 4,
+        "kind": "pre_turn",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "tree_sha": "89abcdef0123456789abcdef0123456789abcdef",
+        "ref_name": "refs/chiron/checkpoints/sess_1/0004",
+        "label": "",
+        "applied_at": null,
+        "future_field": {
+          "root_cause": "x"
+        }
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "ok-without-ref-name",
+      "valid": false,
+      "reason": "state=ok 时 ref_name 必填：没有 ref 就没有可回滚的目标",
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 5,
+        "kind": "pre_turn",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "tree_sha": "89abcdef0123456789abcdef0123456789abcdef"
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "seq-zero",
+      "valid": false,
+      "reason": "seq 必须是正整数：主键由 (session_id, seq, kind) 派生，0 会覆盖别的检查点",
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 0,
+        "kind": "pre_turn",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "tree_sha": "89abcdef0123456789abcdef0123456789abcdef",
+        "ref_name": "refs/chiron/checkpoints/sess_1/0000"
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "unknown-error-code",
+      "valid": false,
+      "reason": "error_code 只能是 git/io/unknown：自由文本会让前端分类失效",
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 6,
+        "kind": "post_turn",
+        "state": "failed",
+        "error": "网络抖动",
+        "error_code": "network"
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "unknown-state",
+      "valid": false,
+      "reason": "state 只能是 ok/failed：'partial' 在列表端既不算可用也不算失败",
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 7,
+        "kind": "post_turn",
+        "state": "partial"
+      }
+    },
+    {
+      "family": "checkpoint",
+      "name": "untracked-entry-without-path",
+      "valid": false,
+      "reason": "untracked 每条都必须带非空 path：清单不全时回滚会'成功'但文件不回来",
+      "payload": {
+        "session_id": "sess_1",
+        "seq": 8,
+        "kind": "post_turn",
+        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+        "tree_sha": "89abcdef0123456789abcdef0123456789abcdef",
+        "ref_name": "refs/chiron/checkpoints/sess_1/0008",
+        "untracked": [
+          {
+            "sha256": "aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899",
+            "size": 42
+          }
+        ]
+      }
+    },
+    {
+      "family": "queue",
+      "name": "minimal",
+      "valid": true,
+      "payload": {
+        "task_id": "a1b2c3d4e5f60718",
+        "task_type": "memory_save",
+        "tenant_id": 7,
+        "payload": "{\"session_id\":\"sess_1\"}"
+      }
+    },
+    {
+      "family": "queue",
+      "name": "redis-string-encodings",
+      "valid": true,
+      "payload": {
+        "task_id": "a1b2c3d4e5f60719",
+        "task_type": "tool_job",
+        "tenant_id": "7",
+        "payload": "{\"job_id\":\"job_1\"}",
+        "retry_count": "1",
+        "idempotency_key": "tool_job:job_1",
+        "deadline": "2026-11-26T00:00:00Z"
+      }
+    },
+    {
+      "family": "queue",
+      "name": "unknown-fields-ignored",
+      "valid": true,
+      "forward_compat": true,
+      "payload": {
+        "task_id": "a1b2c3d4e5f6071a",
+        "task_type": "kb_index",
+        "tenant_id": 7,
+        "payload": "{\"kb_id\":\"kb_1\"}",
+        "created_at": "2026-11-25T00:00:00Z",
+        "priority": "1",
+        "trace_id": "tr_1"
+      }
+    },
+    {
+      "family": "queue",
+      "name": "missing-payload",
+      "valid": false,
+      "reason": "payload 必填：消费方 json.loads 拿不到业务数据",
+      "payload": {
+        "task_id": "a1b2c3d4e5f6071b",
+        "task_type": "memory_save",
+        "tenant_id": 7
+      }
+    },
+    {
+      "family": "queue",
+      "name": "payload-not-json-object",
+      "valid": false,
+      "reason": "payload 必须是 JSON 对象的字符串编码：数组会让 _dispatch 拿不到关键字参数",
+      "payload": {
+        "task_id": "a1b2c3d4e5f6071c",
+        "task_type": "memory_save",
+        "tenant_id": 7,
+        "payload": "[1,2,3]"
+      }
+    },
+    {
+      "family": "queue",
+      "name": "tenant-id-not-numeric",
+      "valid": false,
+      "reason": "tenant_id 必须是整数或十进制数字串：脏字段会被 _as_int 静默读成'无租户任务'",
+      "payload": {
+        "task_id": "a1b2c3d4e5f6071d",
+        "task_type": "memory_save",
+        "tenant_id": "acme",
+        "payload": "{}"
+      }
+    },
+    {
+      "family": "queue",
+      "name": "negative-retry-count",
+      "valid": false,
+      "reason": "retry_count 必须非负：它是进 DLQ 的唯一依据，负数会让重试永不终止",
+      "payload": {
+        "task_id": "a1b2c3d4e5f6071e",
+        "task_type": "memory_save",
+        "tenant_id": 7,
+        "payload": "{}",
+        "retry_count": -1
+      }
+    },
+    {
+      "family": "queue",
+      "name": "bad-deadline-format",
+      "valid": false,
+      "reason": "deadline 必须能被 %Y-%m-%dT%H:%M:%SZ 解析：否则被当作没有截止时间直接执行",
+      "payload": {
+        "task_id": "a1b2c3d4e5f6071f",
+        "task_type": "memory_save",
+        "tenant_id": 7,
+        "payload": "{}",
+        "deadline": "2026-11-26 00:00:00"
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "minimal-active-server",
+      "valid": true,
+      "payload": {
+        "name": "xerj",
+        "command": "npx",
+        "args": ["-y", "xerj-mcp"],
+        "status": "active",
+        "read_only": true
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "approved-with-digest",
+      "valid": true,
+      "payload": {
+        "name": "remote-fs",
+        "command": "npx",
+        "args": ["-y", "remote-fs-mcp"],
+        "env": {
+          "REMOTE_FS_TOKEN": "tok_live"
+        },
+        "status": "active",
+        "approved": true,
+        "approval_digest": "0123456789abcdef0123456789abcdef",
+        "read_only": false
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "inactive-unapproved",
+      "valid": true,
+      "payload": {
+        "name": "draft-server",
+        "command": "uvx",
+        "status": "inactive",
+        "approved": false
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "unknown-fields-ignored",
+      "valid": true,
+      "forward_compat": true,
+      "payload": {
+        "name": "xerj",
+        "command": "npx",
+        "description": "只读检索",
+        "version": "1.2.3",
+        "source": "market",
+        "future_field": true
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "approved-without-digest",
+      "valid": false,
+      "reason": "approved=true 必须有 approval_digest：没有摘要的批准等于'不知道批了什么'",
+      "payload": {
+        "name": "remote-fs",
+        "command": "npx",
+        "approved": true
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "unknown-status",
+      "valid": false,
+      "reason": "status 只能是 active/inactive（网关更新时就按这两个值校验）",
+      "payload": {
+        "name": "xerj",
+        "command": "npx",
+        "status": "enabled"
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "missing-command",
+      "valid": false,
+      "reason": "command 必填：没有它引擎无从起子进程",
+      "payload": {
+        "name": "xerj",
+        "status": "active"
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "args-not-string-array",
+      "valid": false,
+      "reason": "args 必须是字符串数组（'npx -y x' 这种整串会在起进程时被当成单个参数）",
+      "payload": {
+        "name": "xerj",
+        "command": "npx",
+        "args": "npx -y xerj-mcp"
+      }
+    },
+    {
+      "family": "mcp",
+      "name": "env-non-string-value",
+      "valid": false,
+      "reason": "env 的值必须是字符串：凭据/端点类型漂移会让引擎拼环境变量时行为不一致",
+      "payload": {
+        "name": "remote-fs",
+        "command": "npx",
+        "env": {
+          "REMOTE_FS_TOKEN": 12345
+        }
       }
     }
   ]
