@@ -33,6 +33,7 @@ import ToolResultBlock from './ToolResultBlock.vue'
 import { projectSubagentOutput } from './subagentOutput'
 
 import { useI18n } from 'vue-i18n'
+import { createKeyedGuard } from '../../utils/staleGuard'
 const { t } = useI18n()
 
 /**
@@ -616,21 +617,29 @@ function toggleCollapse(runId: string) {
   collapsed.value = next
 }
 
+// H60：子 Agent 列表是**按会话**取的（3 秒轮询）。切会话时旧轮询回来会写
+// `runs/source` 并重新 `followActiveRun` —— 于是 A 的子 Agent 进度显示在 B 的面板里，
+// 用户还会对着它批准一条属于 A 的请求。
+const runsGuard = createKeyedGuard(() => props.sessionId || '')
+
 async function loadRuns() {
   if (!props.sessionId) {
     runs.value = []
     return
   }
+  const ticket = runsGuard.ticket(props.sessionId)
   loading.value = runs.value.length === 0
   try {
     const res = await listSubagentRuns({ sessionId: props.sessionId })
+    // 票失效（换了会话，或组件已卸载）⇒ 一个字都不写
+    if (!runsGuard.isValid(ticket)) return
     runs.value = res.runs
     source.value = res.source
     followActiveRun(res.runs)
   } catch {
     // 面板失败不打断对话；下一轮轮询会再试
   } finally {
-    loading.value = false
+    if (runsGuard.isValid(ticket)) loading.value = false
   }
 }
 

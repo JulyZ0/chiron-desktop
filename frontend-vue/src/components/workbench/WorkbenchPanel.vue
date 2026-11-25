@@ -39,6 +39,7 @@ import { notify } from '../../utils/notify'
 import { desktopHost } from '../../stores/device'
 import { useAuthStore } from '../../stores/auth'
 import { revealRequest, WORKBENCH_WIDTH_KEY } from './useWorkbench'
+import { createKeyedGuard } from '../../utils/staleGuard'
 
 const { t: tr } = useI18n()
 
@@ -319,17 +320,27 @@ const changeCount = computed(() => {
   return changeRows.value.filter(r => !r.agentOnly).length
 })
 
+// H60：改动列表与文件预览都按 (project, path) 取。切项目后旧响应回来会把
+// **上一个项目**的内容显示在当前项目里 —— 复制路径、编辑保存都会落错仓库。
+const changesGuard = createKeyedGuard(() => String(props.projectId || ''))
+const previewGuard = createKeyedGuard(
+  () => `${props.projectId || ''}\u0000${String(selected.value?.path || '')}`,
+)
+
 async function loadChanges() {
   if (!props.projectId || changesLoading.value) return
+  const ticket = changesGuard.ticket(String(props.projectId || ''))
   changesLoading.value = true
   changesError.value = ''
   try {
-    changesData.value = await listProjectChanges(props.projectId)
+    const fetched = await listProjectChanges(props.projectId)
+    if (!changesGuard.isValid(ticket)) return
+    changesData.value = fetched
   } catch (e) {
     // 错误留在页签里就地显示：用户正看着这块，弹到角落等于没说
     changesError.value = describeApiError(e)
   } finally {
-    changesLoading.value = false
+    if (changesGuard.isValid(ticket)) changesLoading.value = false
   }
 }
 
@@ -525,8 +536,11 @@ async function loadMorePreview() {
   if (!props.projectId || !entry || previewLoadingMore.value) return
   previewLoadingMore.value = true
   try {
+    const ticket = previewGuard.ticket(`${props.projectId}\u0000${entry.path}`)
     const nextOffset = previewOffset.value + previewShownLines.value
     const file = await readProjectFile(props.projectId, entry.path, nextOffset)
+    // 换了文件/项目：这段内容不属于当前预览，直接丢弃（否则会拼到别的文件末尾）
+    if (!previewGuard.isValid(ticket)) return
     if (file.binary) return
     const chunk = file.content ?? ''
     if (!chunk) {

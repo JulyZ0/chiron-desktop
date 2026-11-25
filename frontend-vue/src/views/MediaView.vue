@@ -69,6 +69,7 @@ import {
   resolveShortcut,
   shouldPreventDefault,
 } from './media/shortcuts'
+import { createKeyedGuard } from '../utils/staleGuard'
 const { t: tr } = useI18n()
 // API_URL 必须取 `src/api/index.ts` 的那一份：它合并了**桌面壳注入的
 // `chironDesktop.apiUrl`** 与构建期 `VITE_API_URL`。这里原先自己算
@@ -195,17 +196,25 @@ function normalizeResolved(url: string, item: MediaItem): string {
   return url
 }
 
+// H60：签名 URL 是**按条目**解析的。用户在解析途中切了列表/目录，旧响应回来会把
+// 一个过期或属于旧上下文的地址写进 `resolvedUrls` —— 缩略图串条目、或点了就 403。
+// 守卫键带上条目 id：不同条目的票天然互不干扰；同一条目被重新解析时旧票失效。
+const urlGuard = createKeyedGuard(() => 'media')
+
 async function resolveItemUrl(item: MediaItem, force = false) {
   if (resolvingIds.has(item.id)) return
   resolvingIds.add(item.id)
+  const ticket = urlGuard.ticket(String(item.id))
   try {
     const url = await resolveMediaUrl({ id: item.id, file_url: item.file_url }, force)
+    // 组件已卸载/作用域已重置 ⇒ 不写缓存（否则下次进来先用错地址）
+    if (!urlGuard.isValid(ticket)) return
     const needsSignature = (item.file_url || '').startsWith('/media/')
     if (url && (!needsSignature || url.includes('/media/s/'))) {
       resolvedUrls.value[item.id] = normalizeResolved(url, item)
     }
   } catch {
-    resolvedUrls.value[item.id] = ''
+    if (urlGuard.isValid(ticket)) resolvedUrls.value[item.id] = ''
   } finally {
     resolvingIds.delete(item.id)
   }
