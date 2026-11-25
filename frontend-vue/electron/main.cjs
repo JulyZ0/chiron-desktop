@@ -60,6 +60,7 @@ const { createSensitiveStoreGate } = require('./sensitive-store-gate.cjs')
 const windowsHello = require('./windows-hello.cjs')
 const accountVerify = require('./account-verify.cjs')
 const twoFactor = require('./two-factor.cjs')
+const ipcGuard = require('./ipc-guard.cjs')
 const {
   API_URL_ARG_PREFIX,
   MODE_ARG_PREFIX,
@@ -446,12 +447,51 @@ process.on('uncaughtException', err => logMain('error', `uncaughtException: ${er
 process.on('unhandledRejection', reason => logMain('error', `unhandledRejection: ${reason}`))
 
 /** IPC 只接受来自应用自身页面（或开发服务器）的调用 */
+/**
+ * H47：IPC 来源判定收紧为**三道**（见 `electron/ipc-guard.cjs`）：
+ *   1. 必须是**主框架**（iframe 也继承了 preload 的通道，但它不是我们的界面）；
+ *   2. URL 必须在本应用白名单内（沿用既有判定）；
+ *   3. 必须来自**登记过的窗口**（别处 new BrowserWindow 拿不到这套特权）。
+ *
+ * 旧实现只 `senderFrame?.url || getURL()` 比一次 URL：iframe、以及任何同源窗口
+ * 都能发特权调用；setup/error 这类辅助页还和主界面共用同一份 preload。
+ */
 function assertTrustedSender(event) {
-  const frameUrl = event.senderFrame?.url || event.sender.getURL()
-  if (!isTrustedUrl(frameUrl)) {
-    logMain('warn', `blocked IPC from ${frameUrl}`)
+  const verdict = ipcGuard.checkSender(event, {
+    isTrustedUrl,
+    allowedWebContents: trustedWebContents,
+  })
+  if (!verdict.ok) {
+    logMain('warn', `blocked IPC (${verdict.reason}) from ${verdict.url || '<unknown>'}`)
     throw new Error('forbidden')
   }
+  // 能力表：辅助页即使拿到通道也不许调特权 IPC（见 WINDOW_CAPABILITIES）。
+  const kind = windowKindOf(verdict.webContentsId)
+  const channel = String((event && event.channel) || '')
+  if (channel && kind && !ipcGuard.canCall(kind, channel)) {
+    logMain('warn', `blocked IPC channel=${channel} for window=${kind}`)
+    throw new Error('forbidden')
+  }
+  return verdict
+}
+
+//: 允许发特权 IPC 的 webContents（主窗口 + 主窗口的全部子窗口）。
+const trustedWebContents = new Set()
+//: webContents id → 窗口种类（main / setup / error），用于能力表。
+const webContentsKinds = new Map()
+
+function registerTrustedWebContents(contents, kind) {
+  if (!contents) return
+  trustedWebContents.add(contents.id)
+  webContentsKinds.set(contents.id, kind)
+  contents.once('destroyed', () => {
+    trustedWebContents.delete(contents.id)
+    webContentsKinds.delete(contents.id)
+  })
+}
+
+function windowKindOf(id) {
+  return webContentsKinds.get(Number(id)) || ''
 }
 
 /**
@@ -1866,7 +1906,13 @@ function createWindow() {
     // macOS 一律保留原生红绿灯，只让内容顶到标题栏区域。
     ...windowChrome,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.cjs'),
+      // H47：主界面用完整 preload；setup/error 这类辅助页用**窄 preload**
+      // （只给版本信息 / 开外链 / 重启 / 窗口状态）。旧实现共用一份，
+      // 于是辅助页的上下文里也有 token 读写、清空数据、开任意路径的能力。
+      preload: path.join(
+        __dirname,
+        target === 'app' ? 'preload.cjs' : 'aux-preload.cjs',
+      ),
       // 双模式各用一个持久分区：cookie / localStorage / IndexedDB 互不可见；
       // 切换模式时 mode-switch.cjs 清的就是「离开模式」的那个分区。
       partition,
@@ -1882,6 +1928,10 @@ function createWindow() {
       additionalArguments,
     },
   })
+
+  // H47：登记为本进程**可信**窗口，并按种类套能力表（`ipc-guard.cjs`）。
+  // 只有这里创建的窗口才有特权 IPC；别处 new BrowserWindow 拿不到。
+  registerTrustedWebContents(mainWindow.webContents, target === 'app' ? 'main' : target)
 
   mainWindow.once('ready-to-show', () => mainWindow.show())
 
