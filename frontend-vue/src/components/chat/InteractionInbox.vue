@@ -44,6 +44,8 @@ const emit = defineEmits<{ (e: 'wake'): void }>()
 
 const { t } = useI18n()
 
+import { createKeyedGuard } from '../../utils/staleGuard'
+
 const items = ref<PendingInteraction[]>([])
 const loadingList = ref(false)
 const submitting = ref<Record<string, boolean>>({})
@@ -53,14 +55,22 @@ const errors = ref<Record<string, string>>({})
  *  当字符串直接 `.trim()` 会在用户改过一次输入框后抛 TypeError。 */
 const capDraft = ref<Record<string, string | number>>({})
 
+// H60：列表按**会话**取。切会话时旧的 await 回来仍会写 `items`，于是 A 的待办
+// 会出现在 B 的收件箱里（点下去还会以 B 的身份提交）。用键守卫挡掉。
+const listGuard = createKeyedGuard(() => props.sessionId || '')
+
 async function refresh() {
   if (!props.sessionId) {
     items.value = []
     return
   }
+  const ticket = listGuard.ticket(props.sessionId)
   loadingList.value = true
   try {
-    items.value = await listPendingInteractions(props.sessionId)
+    const fetched = await listPendingInteractions(props.sessionId)
+    // 票失效（换了会话，或又发起了新一次刷新）⇒ 一个字都不写
+    if (!listGuard.isValid(ticket)) return
+    items.value = fetched
     // 预填建议值：那是引擎按当前上限算出来的起点，让用户有个数字可改，而不是面对空框猜量级
     for (const item of items.value) {
       if (item.kind === 'budget' && capDraft.value[item.id] === undefined) {
@@ -69,9 +79,10 @@ async function refresh() {
     }
   } catch {
     // 拉不到就什么都不显示：这是"补漏"的入口，实时卡片才是主路径，不该因为它反过来打断对话
-    items.value = []
+    if (listGuard.isValid(ticket)) items.value = []
   } finally {
-    loadingList.value = false
+    // 只有仍是当前那一代才清 loading：否则会把**新**请求的加载态一起清掉
+    if (listGuard.isValid(ticket)) loadingList.value = false
   }
 }
 

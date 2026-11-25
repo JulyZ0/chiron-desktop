@@ -63,6 +63,7 @@ import { Modal, Spin, Tag, Alert } from 'ant-design-vue'
 import EmptyState from './common/EmptyState.vue'
 import { api } from '../api'
 import { useI18n } from 'vue-i18n'
+import { createKeyedGuard } from '../utils/staleGuard'
 
 const { t } = useI18n()
 
@@ -117,8 +118,13 @@ watch(() => props.visible, async (val) => {
   }
 })
 
+// H60：预览按 (kb, document) 取。快速连续打开两个文档时，先发的那次可能**后**回来，
+// 于是界面显示 A 的内容而标题是 B —— 用户还会据此复制引文。
+const previewGuard = createKeyedGuard(() => `${props.kbId}\u0000${props.documentId}`)
+
 async function loadPreview() {
   if (!props.documentId) return
+  const ticket = previewGuard.ticket(`${props.kbId}\u0000${props.documentId}`)
   loading.value = true
   content.value = ''
   note.value = ''
@@ -126,18 +132,21 @@ async function loadPreview() {
 
   try {
     const res = await api.get(`/v1/kb/${props.kbId}/documents/${props.documentId}/preview`)
+    if (!previewGuard.isValid(ticket)) return
     const data = res.data?.data || res.data
     document.value = data
     content.value = data.content || ''
     note.value = data.preview_note || ''
     pageCount.value = data.page_count || 0
   } catch (e) {
+    if (!previewGuard.isValid(ticket)) return
     const data = (e as { response?: { data?: { detail?: unknown; error?: unknown } } }).response?.data
     const detail = typeof data?.detail === 'string' ? data.detail : ''
     const summary = typeof data?.error === 'string' ? data.error : ''
     error.value = detail || summary || t('errors.failed_to_load_preview')
   } finally {
-    loading.value = false
+    // 只清自己那一代的 loading：否则会把新文档的加载态清掉（表现为"点了没反应"）
+    if (previewGuard.isValid(ticket)) loading.value = false
   }
 }
 

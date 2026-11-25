@@ -5,6 +5,7 @@ import type { ToolResultItem } from './chat-types'
 import { formatSize } from './chat-types'
 import { looksLikeDiff, parseUnifiedDiff, type ParsedDiff } from './diffParse'
 import { useI18n } from 'vue-i18n'
+import { createKeyedGuard } from '../../utils/staleGuard'
 import { getToolCallOutput } from '../../api'
 import { subagentRunIdOf } from './subagentOutput'
 
@@ -236,15 +237,22 @@ function codePointLength(s: string): number {
   return [...s].length
 }
 
+// H60：分段拉取按 (session, toolCallId) 走。用户在加载途中切了会话时，旧响应回来
+// 会拼到**新**会话的块上（内容错位、offset 也被污染）。用键守卫挡掉。
+const chunkGuard = createKeyedGuard(() => `${props.sessionId}\u0000${props.item.toolCallId}`)
+
 async function loadFullChunk() {
   const sid = props.sessionId
   if (!sid || loadingFull.value) return
+  const ticket = chunkGuard.ticket(`${sid}\u0000${props.item.toolCallId}`)
   loadingFull.value = true
   loadError.value = false
   try {
     // 起点只认服务端给的 `next_offset`；首段用预览的码点数起步。
     const from = nextOffset.value ?? codePointLength(props.item.content)
     const chunk = await getToolCallOutput(sid, props.item.toolCallId, from, FETCH_CHUNK)
+    // 换了会话/换了工具调用 ⇒ 这段内容不属于当前视图，直接丢弃
+    if (!chunkGuard.isValid(ticket)) return
     if (chunk?.total_bytes) totalBytes.value = chunk.total_bytes
 
     // 首段要把预览一起拼上（服务端从 from 开始返回，预览之前的部分已在前端）。
