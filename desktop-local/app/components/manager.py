@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from app.components import manifest_signature
 from app.components.lockfile import ComponentDirLock
 
 # --------------------------------------------------------------------- 常量
@@ -959,6 +960,12 @@ class ComponentManager:
         source = self.require_source()
 
         raw_manifest = source.read_manifest(spec.name)
+        # H51：**先验签，再解析、再下载**。
+        #
+        # manifest 自带 sha256，但摘要与 manifest 同源 —— 换掉源的人顺手改摘要即可，
+        # 校验值只防传输损坏。组件会以用户身份长期运行，所以来源必须可验证：
+        # 签名不通过就在这里拒绝，一个字节都不落盘。
+        manifest_signature.verify_manifest_signature(raw_manifest)
         manifest = parse_manifest(raw_manifest, spec.name)
 
         staging_root = self.component_root / ".tmp"

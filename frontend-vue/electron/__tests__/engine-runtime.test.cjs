@@ -27,6 +27,10 @@ const components = require('../components.cjs')
 
 const OK_PROBE = { status: 0, stdout: '', stderr: '' }
 
+// H51：本文件测的是安装机制（装哪份清单 / 落哪个目录），不是供应链策略。
+// 无哈希锁的联网安装默认被拒绝，这里显式开允许；供应链另有一组专门用例。
+process.env.CHIRON_ALLOW_UNPINNED_DEPS = '1'
+
 function makeResources(t, { withEngine = true, withUv = false } = {}) {
   const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-res-'))
 

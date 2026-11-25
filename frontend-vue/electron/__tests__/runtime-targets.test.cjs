@@ -27,6 +27,10 @@ const { EventEmitter } = require('node:events')
 
 const installer = require('../runtime-install.cjs')
 
+// H51：本文件测的是安装机制（装哪份清单 / 落哪个目录），不是供应链策略。
+// 无哈希锁的联网安装默认被拒绝，这里显式开允许；供应链另有一组专门用例。
+process.env.CHIRON_ALLOW_UNPINNED_DEPS = '1'
+
 /**
  * 造一个"两套源码都随包"的 resources 目录。
  *

@@ -41,6 +41,7 @@ const childProcess = require('node:child_process')
 const { killProcessTree, killOptions } = require('./proc-tree.cjs')
 const { probeRuntime } = require('./runtime-probe.cjs')
 const { PIP_INDEX_MIRRORS } = require('./shared.cjs')
+const depLock = require('./dep-lock.cjs')
 
 /**
  * 受管 CPython 版本。desktop-local 的 `requires-python` 是 >=3.11。
@@ -89,6 +90,8 @@ const RUNTIME_TARGETS = Object.freeze({
     rootName: 'runtime',
     sourcesDir: 'desktop-local',
     manifest: 'pyproject.toml',
+    // H51：哈希锁清单（与 manifest 同目录）。缺失时由 dep-lock 策略拒绝联网安装。
+    lock: 'requirements.lock',
     label: '本地核心',
     entry: 'launcher.py',
   }),
@@ -96,6 +99,7 @@ const RUNTIME_TARGETS = Object.freeze({
     id: 'engine',
     rootName: 'engine',
     sourcesDir: 'python-engine',
+    lock: 'requirements.lock',
     manifest: 'requirements.txt',
     label: 'AI 引擎',
     entry: 'main.py',
@@ -769,17 +773,41 @@ function runCommand(command, args, options = {}) {
  * `requirements.txt`（引擎侧唯一的声明）。两边都不另存第二份清单 ——
  * 两份清单必然漂移，而漂移的代价就是漏装 httpx 那类事故。
  */
-function pipInstallArgs(vpython, sources, indexUrl, target = 'core') {
+/**
+ * 读 `requirements.lock`（哈希锁清单）。不存在返回空串 —— 由策略决定能不能继续。
+ *
+ * 文件名固定为 `requirements.lock` 而不是"随便找个 lock"：清单路径只有一个，
+ * 免得出现"改了 requirements.txt 但锁的是另一个文件"这种自欺。
+ */
+function readDepLock(sources, target) {
+  const file = path.join(sources, resolveTarget(target).lock || 'requirements.lock')
+  try {
+    return fs.readFileSync(file, 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+function pipInstallArgs(vpython, sources, indexUrl, target = 'core', policy = null) {
+  // H51：供应链参数由 `dep-lock.cjs` 决定 —— 有哈希锁就 `--require-hashes`，
+  // 没有锁则由调用方先拒绝（这里只负责拼参数，不做放行判断）。
+  //
+  // 旧实现在这里只拼 `-r 清单`：既不要求 hash，也会在失败后自动换第三方镜像 ——
+  // 于是装进 venv 的包既没被固定到确切字节，也可能来自没审计过的源，而那个 venv
+  // 随后会以用户身份跑模型生成的代码。
+  const manifestPath = path.join(sources, resolveTarget(target).manifest)
+  const lockPath = path.join(sources, resolveTarget(target).lock || 'requirements.lock')
+  const effectivePolicy = policy || { ok: true, requireHashes: false }
   const args = [
     'pip',
     'install',
     '--python',
     vpython,
-    '-r',
-    path.join(sources, resolveTarget(target).manifest),
+    ...depLock.supplyChainArgs(effectivePolicy, manifestPath, indexUrl),
+    ...(effectivePolicy.requireHashes && fs.existsSync(lockPath)
+      ? ['-r', lockPath]
+      : []),
   ]
-  // 镜像：国内网络下官方源常常超时。用环境变量显式覆盖，不写死任何第三方地址
-  if (indexUrl) args.push('--index-url', indexUrl)
   return args
 }
 
@@ -1031,9 +1059,39 @@ async function ensureRuntime(options = {}) {
    * 是网络问题还是依赖清单问题，而不是只看到"90s 无输出"。
    */
   const installWithSources = async (label, timeout) => {
+    // H51：先判"这次联网安装是否被允许"，再谈换源重试。
+    //
+    // 顺序很重要：如果先跑 uv 再补校验，用户会在一次失败后得到"已尝试的依赖源"这种
+    // 提示 —— 看起来像是网络问题，实际是供应链策略拒绝了（缺哈希锁 / 源未批准）。
+    const lockText = readDepLock(sources, target.id)
+    const policy = depLock.installPolicy({
+      lockText,
+      allowUnpinned: String(process.env.CHIRON_ALLOW_UNPINNED_DEPS || '') === '1',
+    })
+    if (!policy.ok) {
+      throw new Error(`${target.label} 依赖安装被拒绝：${policy.message}`)
+    }
+    if (policy.unpinned) {
+      // 放行但要**说出来**：这类安装在日志与界面里都必须可辨认。
+      notice(`[runtime] ${label}：${policy.message}`)
+    }
+
+    const candidates = indexCandidates(indexUrl).filter(candidate => {
+      if (!candidate) return true // 空 = uv 默认官方源
+      const verdict = depLock.approvedIndexUrl(candidate)
+      if (!verdict.ok) {
+        notice(`[runtime] 跳过未批准的依赖源（${verdict.reason}）：${candidate}`)
+        return false
+      }
+      return true
+    })
+    if (candidates.length === 0) {
+      throw new Error(`${target.label} 没有可用的依赖源（全部未通过批准名单）`)
+    }
+
     const tried = []
     let lastError = null
-    for (const candidate of indexCandidates(indexUrl)) {
+    for (const candidate of candidates) {
       const sourceName = candidate ? (PIP_INDEX_MIRRORS.find(m => m.url === candidate)?.label || candidate) : '官方源'
       tried.push(sourceName)
       try {
@@ -1042,7 +1100,7 @@ async function ensureRuntime(options = {}) {
         } else {
           notice(`[runtime] ${label}使用源：PyPI 官方`)
         }
-        await runUv(pipInstallArgs(vpython, sources, candidate, target.id), timeout, label)
+        await runUv(pipInstallArgs(vpython, sources, candidate, target.id, policy), timeout, label)
         return
       } catch (err) {
         lastError = err
@@ -1198,6 +1256,7 @@ module.exports = {
   _internal: {
     runCommand,
     pipInstallArgs,
+    readDepLock,
     indexCandidates,
     homeForRuntime,
     interpreterUnderHome,

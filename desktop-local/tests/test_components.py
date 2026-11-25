@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from manifest_signing import sign_manifest
 from app.components import (
     AlreadyRunningError,
     ComponentManager,
@@ -124,6 +126,8 @@ def build_source(
     }
     if manifest:
         payload.update(manifest)
+    # H51：安装路径要求发布者签名，夹具也要签（密钥由 conftest 注入环境变量）。
+    sign_manifest(payload)
     (component / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False), "utf-8")
     return payload
 

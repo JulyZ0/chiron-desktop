@@ -23,3 +23,22 @@ def make_settings(tmp_path: Path, **overrides: object) -> Settings:
     }
     defaults.update(overrides)
     return Settings(**defaults)
+
+
+# ── H51：组件 manifest 验签夹具 ─────────────────────────────────────────────
+# 安装路径现在强制验证发布者签名，所以测试要把测试密钥对的公钥注入环境变量；
+# 私钥在同目录的 `manifest_signing.py`（夹具用它签 manifest）。
+import pytest as _pytest  # noqa: E402
+
+from app.components import manifest_signature as _manifest_signature  # noqa: E402
+from manifest_signing import public_key_b64 as _public_key_b64  # noqa: E402
+
+
+@_pytest.fixture(autouse=True)
+def _component_pubkey(monkeypatch):  # type: ignore[no-untyped-def]
+    """公钥给安装端验签，私钥给构建器签名 —— 两边是同一对密钥。"""
+    from manifest_signing import private_key_b64
+
+    monkeypatch.setenv(_manifest_signature.ENV_PUBKEY, _public_key_b64())
+    monkeypatch.setenv(_manifest_signature.ENV_SIGNING_KEY, private_key_b64())
+    yield

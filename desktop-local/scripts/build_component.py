@@ -76,10 +76,23 @@ from typing import Any
 # --------------------------------------------------------------------- 路径 / 常量
 SCRIPT_DIR = Path(__file__).resolve().parent
 DESKTOP_LOCAL = SCRIPT_DIR.parent
+
+# H51：构建期要给 manifest 签名，而签名实现住在 `app/components/` 里（与安装端
+# 同一个规范化函数）。构建器是**脚本**，被 `python scripts/build_component.py` 直接
+# 调用时 `app` 不在 sys.path 上 —— 这里补一次，避免"同样的 manifest 两边各拼一份 JSON"。
+if str(DESKTOP_LOCAL) not in sys.path:
+    sys.path.insert(0, str(DESKTOP_LOCAL))
 REQUIREMENTS_DIR = SCRIPT_DIR / "components"
 DEFAULT_OUT = DESKTOP_LOCAL / "dist" / "components"
 
 MANIFEST_NAME = "manifest.json"
+
+
+def sign_manifest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """给 manifest 签名（H51）。延迟 import：构建器在"只做自检"的场景下不需要它。"""
+    from app.components.manifest_signature import sign_payload
+
+    return sign_payload(payload)
 BUNDLE_NAME = "bundle.zip"
 LAUNCHER_NAME = "run.py"
 RUNTIME_DIR = "runtime"
@@ -813,6 +826,9 @@ def build(
         out_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(bundle["path"], out_dir / BUNDLE_NAME)
         manifest = build_manifest(target, version, bundle)
+        # H51：产物必须签名 —— 安装端会验签，未签名的包装不进去。
+        # 没有签名私钥时这里直接失败（比产出一个装不进去的包更早暴露问题）。
+        manifest = sign_manifest_payload(manifest)
         (out_dir / MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )

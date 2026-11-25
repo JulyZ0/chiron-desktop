@@ -45,6 +45,8 @@ include = ["app*"]
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+# H51：`tests/manifest_signing.py` 是夹具共用的签名助手，需要能按名字 import。
+pythonpath = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
 

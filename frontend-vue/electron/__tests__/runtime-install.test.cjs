@@ -18,6 +18,10 @@ const path = require('node:path')
 
 const installer = require('../runtime-install.cjs')
 
+// H51：本文件测的是安装机制（装哪份清单 / 落哪个目录），不是供应链策略。
+// 无哈希锁的联网安装默认被拒绝，这里显式开允许；供应链另有一组专门用例。
+process.env.CHIRON_ALLOW_UNPINNED_DEPS = '1'
+
 /** 造一个临时 resources 目录：有 desktop-local 源码，uv 是否在由调用方决定 */
 function makeResources(t, { withUv = true, withPython = true } = {}) {
   const resources = fs.mkdtempSync(path.join(os.tmpdir(), 'chiron-inst-'))
@@ -364,19 +368,43 @@ test('ensureRuntime：镜像源通过环境变量显式覆盖，不写死任何�
   const { sources, uv } = makeResources(t)
   const { spawn, calls, progress } = fakeSpawn(t, { onVenv: () => createVenvPython(userData) })
 
+  // H51：源必须**已批准**（HTTPS + 主机白名单）才会被使用。这里用批准名单里的阿里云，
+  // 同时证明了"env 覆盖生效、没有写死地址"。
   await installer.ensureRuntime({
     pythonMirror: '',
     userDataPath: userData,
     sources,
     uvPath: uv,
     spawn,
-    indexUrl: 'https://mirror.example/simple',
+    indexUrl: 'https://mirrors.aliyun.com/pypi/simple',
     probe: probeByProgress(progress),
   })
 
   const pipArgs = calls[1].args
   assert.ok(pipArgs.includes('--index-url'))
-  assert.ok(pipArgs.includes('https://mirror.example/simple'))
+  assert.ok(pipArgs.includes('https://mirrors.aliyun.com/pypi/simple'))
+})
+
+test('ensureRuntime：未批准的依赖源直接拒绝，不退回到别的源', async t => {
+  const userData = makeUserData(t)
+  const { sources, uv } = makeResources(t)
+  const { spawn, calls, progress } = fakeSpawn(t, { onVenv: () => createVenvPython(userData) })
+
+  // 运维显式指定的源若不在批准名单里，正确行为是**明确失败**：
+  // 既不能用它（来源未审计），也不能"偷偷换一个"（那不是他选的源）。
+  await assert.rejects(
+    installer.ensureRuntime({
+      pythonMirror: '',
+      userDataPath: userData,
+      sources,
+      uvPath: uv,
+      spawn,
+      indexUrl: 'https://mirror.example/simple',
+      probe: probeByProgress(progress),
+    }),
+    /没有可用的依赖源/,
+  )
+  assert.equal(calls.length, 1, '被拒绝时不该真的去跑 pip install')
 })
 
 test('venvPython：路径落在 userData/local/runtime 下，不进程序目录', t => {
