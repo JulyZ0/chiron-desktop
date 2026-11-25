@@ -87,16 +87,69 @@ async function wipeLocalData(options = {}) {
     }
   }
 
-  // 4) 删 userData/local：会话、知识库、记忆、上传文件、PG 数据目录全在这里
+  // 4) 删 userData 下的**出厂范围**（H53）。
+  //
+  // 旧实现只删 `local/` 与设备 token：设置（服务地址/运行模式/镜像源）、安全存储里的
+  // 凭据、设备身份、已批准的项目根、2FA 材料、更新缓存与已下载安装包全都留着 ——
+  // 而界面上写的是"清空本机数据后如同首次启动"。用户按那句话做判断，代码却没做到：
+  // 重置之后仍然连向旧服务、仍然带旧设备身份，甚至会被上一份更新包顶回去。
+  //
+  // 每一项独立记录成功/失败：一处失败不该让其余项一起放弃（否则用户永远清不干净，
+  // 也不知道卡在哪）。
   const app = electron.app
   const userData = app && typeof app.getPath === 'function' ? app.getPath('userData') : ''
   if (!userData) {
     throw new Error('拿不到 userData 目录，无法清空本地数据')
   }
-  const target = pathMod.join(userData, 'local')
-  await fsMod.promises.rm(target, { recursive: true, force: true })
-  result.cleaned.push(`data:${target}`)
-  log('warn', `wiped local data: ${target}`)
+
+  const removeOne = async (label, absPath) => {
+    try {
+      await fsMod.promises.rm(absPath, { recursive: true, force: true })
+      result.cleaned.push(`${label}:${absPath}`)
+    } catch (err) {
+      // 删不掉的必须点名上报：静默跳过会把"清空成功"变成假承诺。
+      result.warnings.push(`${label} 未能删除（${absPath}）：${(err && err.message) || err}`)
+    }
+  }
+
+  // 4a) 本机数据目录（会话/知识库/记忆/上传/内嵌 PG·Redis）
+  await removeOne('data', pathMod.join(userData, 'local'))
+
+  // 4b) 设置 / 凭据 / 身份 / 2FA —— 逐个文件，而不是"删整个 userData"：
+  //     userData 里还有 Electron 自己的缓存目录，整体删除在 Windows 上经常因为
+  //     文件被占用而失败，结果是"删了一半"，比不删更难判断。
+  for (const [label, name] of [
+    ['settings', 'config.json'],
+    ['token', 'token.bin'],
+    ['secrets', 'secrets.bin'],
+    ['device-id', 'device-id'],
+    ['approved-roots', 'approved-roots.json'],
+    ['two-factor', 'two-factor.json'],
+    ['runtime-state', 'runtime-state.json'],
+  ]) {
+    await removeOne(label, pathMod.join(userData, name))
+  }
+
+  // 4c) 更新缓存与已下载安装包（含 state：否则下次启动会认为"已下载待安装"）
+  await removeOne('updates', pathMod.join(userData, 'updates'))
+
+  // 4d) 渲染进程分区：localStorage / IndexedDB 的落盘目录
+  const partitions = Array.isArray(options.partitions) && options.partitions.length
+    ? options.partitions
+    : ['persist:chiron-local', 'persist:chiron-cloud']
+  for (const name of partitions) {
+    await removeOne(
+      `partition:${name}`,
+      pathMod.join(userData, 'Partitions', String(name).replace(/^persist:/, '')),
+    )
+  }
+
+  // 4e) 日志（默认清：否则"清空"之后日志里还留着上一次的路径与会话线索）
+  if (options.keepLogs !== true) {
+    await removeOne('logs', pathMod.join(userData, 'logs'))
+  }
+
+  log('warn', `wiped user data under: ${userData}`)
 
   return result
 }
