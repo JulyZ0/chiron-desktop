@@ -7,7 +7,7 @@
 ## 1. 当前状态（一段话）
 
 S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证部分已全部收口**，
-本机可做的 W1–W3 与对齐 deepseek-harness 的第一批（G1–G3）已完成。剩下的是
+本机可做的 W1–W3 与对齐 deepseek-harness 的第一批（G1–G9）已全部完成。剩下的是
 **需要真机/外部服务**（H2）、**需要外部系统选型**（H20）、**需要产品决策**（H19/H22）
 以及**契约扩容**（H16b）。
 
@@ -22,9 +22,6 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 
 | ID | 事项 | 完成定义 | 落点 |
 |---|---|---|---|
-| **G7** | 事件丢弃可见 | `EventSink.dropped` / `delivery_dropped` 上报 `/metrics`，子 Agent 面板显示"过程事件缺失 N 条"；有断言（丢弃计数随丢弃增长且不静默） | `app/agent/event_sink.py` + `SubAgentPanel.vue` |
-| **G8** | `ToolGuard` 类型化只减权 | 把"hook 只能收紧"从注释约定变成类型：guard/PreToolUse 的返回类型里**没有 allow**，测试断言"后置 listener 无法把 deny 翻回" | `app/agent/guards.py` |
-| **G9** | 未知副作用显式化 | 崩溃/超时后"已开始但未完成"的工具调用产出 `outcome=unknown`（结构化），不是失败也不是成功；恢复时**不重试**；有状态机测试 | `app/agent/tool_execution.py`、`app/agent/resume.py` |
 
 **第二批：中等（需设计 / 多文件 / 迁移）**
 
