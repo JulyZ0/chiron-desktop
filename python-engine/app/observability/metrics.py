@@ -146,6 +146,26 @@ QUEUE_RETENTION_DEGRADED = Counter(
     ["stream"],
 )
 
+#: G13：会话级作业事件投递失败的次数（按事件名分）。
+#: 这个数持续 > 0 意味着"任务的起停在会话里看不见"：事件本身是旁路，任务不会因此失败，
+#: 所以**没有这个计数器，故障就只会表现为"前端进度不动"**（最难归因的一类现象）。
+QUEUE_JOB_EVENT_FAILED = Counter(
+    "queue_job_event_failed_total",
+    "Session-level job lifecycle events that could not be delivered "
+    "(bypass: the task itself is unaffected) —— 持续增长说明 Redis pub/sub 或 relay 这一段坏了",
+    ["event"],  # job.started / job.settled
+)
+
+#: G16：心跳超过 N 倍间隔未更新的作业数（每次扫描对每条记录记一次）。
+#: 只增不减，看的是**增长趋势**而不是绝对值：由它回答"现在有多少任务卡住了"，
+#: 而"卡住的时长"在日志与 `queue:job:heartbeat:*` 的 heartbeat_at 里。
+QUEUE_JOB_STALE = Counter(
+    "queue_job_stale_total",
+    "Queue jobs observed with a heartbeat older than N× the heartbeat interval "
+    "(counted once per sweep observation)",
+    ["task_type"],
+)
+
 # ── 子 Agent 作业级（P1-3：状态转移的观测面）──
 #
 # 为什么需要：子 Agent 的终态写入点不止一处（正常收尾 / 取消收尾 / 超时定时器 /

@@ -14,7 +14,7 @@ from typing import Any, cast
 import redis.asyncio as aioredis
 
 from app.observability.metrics import QUEUE_DEPTH, QUEUE_DLQ_TOTAL, QUEUE_PROCESSING_DURATION, QUEUE_RETRY_TOTAL
-from app.queue import idempotency
+from app.queue import heartbeat, idempotency, job_events
 from app.redis_keys import rkey
 
 logger = logging.getLogger(__name__)
@@ -172,6 +172,7 @@ class QueueWorker:
         gateway: Any = None,
         memory_service: Any = None,
         global_concurrency: int = 10,
+        job_heartbeat_interval: float | None = None,
     ) -> None:
         self._redis = redis
         self._concurrency = concurrency
@@ -186,6 +187,9 @@ class QueueWorker:
         # 本 worker 消费哪条队列（引擎 / 知识库索引）—— 见 app/queue/streams.py
         self._q = queue
         self._consumer_name = f"{CONSUMER_PREFIX}-{id(self):x}"
+        # G16：任务级心跳周期（秒）。``None`` = 用 ``QUEUE_JOB_HEARTBEAT_SECS`` 的默认值。
+        # 注入它是为了让测试用毫秒级间隔、不必真的等 30 秒，而不是为了让生产改行为。
+        self._job_heartbeat_interval = job_heartbeat_interval
         self._reclaim_task: asyncio.Task[Any] | None = None
         self._delay_task: asyncio.Task[Any] | None = None
         #: Super-agent 看门狗的定时循环（P1-3）。**默认不创建** —— 见 `start()`。
@@ -400,10 +404,29 @@ class QueueWorker:
             try:
                 await asyncio.sleep(CLAIM_LOOP_SECS)
                 await self._reclaim_pending()
+                # G16：顺手盘点"心跳停了、但还没到 claim 阈值"的任务。
+                # 修前这一档完全不可见：它们看起来和正常跑着的一样，直到 lease 超时
+                # 才以"失联"的形式被重领 —— 而重领既晚，也说不清上一次是卡住的。
+                await self._sweep_stale_heartbeats()
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
                 logger.warning("worker reclaim loop error: %s", e)
+
+    async def _sweep_stale_heartbeats(self) -> int:
+        """只读盘点卡住的任务，返回本轮发现的数量（G16）。
+
+        **不改任何队列状态**：卡住之后怎么处置（放弃、重投、叫人来看）是上层的决定。
+        指标与日志在这里落地 —— 没有它们，"卡住"只能靠人去翻 Redis。
+        """
+        try:
+            stale = await heartbeat.scan_stale_heartbeats(
+                self._redis, interval=self._job_heartbeat_interval
+            )
+        except Exception as exc:  # noqa: BLE001 - 观测失败不能把回收循环打散
+            logger.debug("worker stale heartbeat sweep failed: %s", str(exc)[:120])
+            return 0
+        return len(stale)
 
     async def _reclaim_pending(self) -> None:
         """认领本组内 idle 超过 CLAIM_MIN_IDLE_MS 的 pending 消息并重新处理。
@@ -620,8 +643,58 @@ class QueueWorker:
         claim = decision.claim
         assert claim is not None
 
+        # ── G13：把这条任务的起停变成**会话级事件** ────────────────────────────
+        # 修前：起停/完成/失败只存在于队列内部（PEL + idempotency），会话（PG）与前端
+        # （SSE）各自靠约定再拼一份"进度"，三份之间没有任何共同来源。失败进 DLQ 时
+        # 会话里连一条记录都没有，用户只看到"没有结果"。
+        # 现在由 worker 在关键节点发 `job.started` / `job.settled`（经 Redis → Go relay
+        # → 会话 SSE），前端只订阅这一处。投递是**旁路**：见下面的 `emit`。
+        job_id, session_id = job_events.resolve_job_identity(payload_raw, task_id)
+
+        async def emit(event: str, status: str, error: str = "") -> None:
+            """本任务的作业事件。任何失败**只记日志**，绝不影响任务本身。
+
+            ``job_events.emit_job_event`` 内部已经吞掉异常；这里再兜一层，是因为
+            "事件投递故障把任务搞失败"这种耦合代价最高，两层都在才敢说绝不外溢。
+
+            为什么**等待**投递而不是丢给后台 task：``started`` 必须在 ``settled`` 之前
+            到达（前端的卡片状态机按顺序走），而"每条事件起一个 task"会把这个顺序交给
+            事件循环调度。等待的代价只多一次 Redis 往返 —— 这个 worker 本来就在同一条
+            连接上做 claim/complete，投递失败也只是记日志，不改变任务的成败。
+            """
+            try:
+                await job_events.emit_job_event(
+                    self._redis,
+                    event=event,
+                    job_id=job_id,
+                    task_type=task_type,
+                    status=status,
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    error=error,
+                )
+            except Exception as exc:  # noqa: BLE001 - 旁路：只记日志
+                logger.warning(
+                    "job event emit failed (type=%s id=%s): %s",
+                    event,
+                    job_id,
+                    str(exc)[:160],
+                )
+
+        # ── G16：任务级心跳 ────────────────────────────────────────────────────
+        # 修前：claim 之后只有 lease 续租，续租失败也只记 debug —— 任务"还占着但不动了"
+        # 完全没有痕迹，上层只能等 lease 超时把它当成"失联"重领，且说不出它卡过。
+        # 这里先建好对象（未 attach 前 detach 是空操作），保证每一个提前 return 的出口
+        # 都走同一个 finally 把记录收掉。
+        job_heartbeat = heartbeat.JobHeartbeat(
+            self._redis,
+            job_id=job_id,
+            interval=self._job_heartbeat_interval,
+            consumer=self._consumer_name,
+        )
+
         owner = asyncio.current_task()
-        heartbeat = (
+        lease_heartbeat = (
             asyncio.create_task(self._heartbeat_lease(stream_id, claim, owner))
             if owner is not None
             else None
@@ -635,6 +708,13 @@ class QueueWorker:
                 )
                 if moved:
                     logger.warning("Task moved to DLQ: id=%s (retries=%d)", task_id, retry_count)
+                # 没跑就被丢弃：只有 settled，没有 started ——
+                # 从没执行过的任务不该先闪一张"运行中"的卡片（G13）。
+                await emit(
+                    job_events.EV_JOB_SETTLED,
+                    job_events.ST_DISCARDED,
+                    f"reclaim retries exhausted: {retry_count}",
+                )
                 return
 
             if deadline_raw:
@@ -654,11 +734,24 @@ class QueueWorker:
                     await self._move_to_dlq(
                         claim, stream_id, message, f"deadline exceeded: {deadline_raw}"
                     )
+                    await emit(
+                        job_events.EV_JOB_SETTLED,
+                        job_events.ST_DISCARDED,
+                        f"deadline exceeded: {deadline_raw}",
+                    )
                     return
 
             if is_foreign(task_type, self._q):
+                # 不是本队列的任务：它会在**目标队列**里发自己的 started/settled。
+                # 这里发一条只会让同一任务在会话里出现两份进度 —— 正是要消灭的东西。
                 await self._forward_foreign(stream_id, task_type, message, claim)
                 return
+
+            # 真正的执行开始：先挂心跳（处理期间持续可见），再发 started。
+            # 顺序是刻意的 —— started 一旦发出，前端就开始等"在动"的证据；
+            # 先有心跳再发事件，作者不必去想"卡片已经亮了但其实还没挂上心跳"。
+            await job_heartbeat.attach(task_type=task_type)
+            await emit(job_events.EV_JOB_STARTED, job_events.ST_RUNNING)
 
             payload = json.loads(payload_raw)
             await self._dispatch(task_type, payload, tenant_id)
@@ -673,12 +766,20 @@ class QueueWorker:
             )
             if not completed:
                 logger.warning("Stale task completion ignored: id=%s", task_id)
+                # 执行过但完成转移被 fencing 拒了（attempt 已被别人接管）：
+                # 对外如实说"这次尝试没落地"，而不是留一张永远"运行中"的卡片。
+                await emit(
+                    job_events.EV_JOB_SETTLED,
+                    job_events.ST_FAILED,
+                    "completion transition rejected (attempt fenced off)",
+                )
                 return
             elapsed = time.monotonic() - start
             QUEUE_PROCESSING_DURATION.labels(task_type=task_type).observe(elapsed)
             logger.info(
                 "Task completed: id=%s type=%s (%.2fs)", task_id, task_type, elapsed
             )
+            await emit(job_events.EV_JOB_SETTLED, job_events.ST_COMPLETED)
 
         except RetryLaterError as e:
             # "等一会儿再试"：条件（会话锁 / 并发配额 / 上游暂时不可达）会自行好转。
@@ -687,6 +788,9 @@ class QueueWorker:
             logger.warning(
                 "Task deferred: id=%s type=%s reason=%s", task_id, task_type, str(e)[:200]
             )
+            # 本次**尝试**结束（不是任务终态）：deferred 收掉这次的卡片说清"在等"，
+            # 重投后会再发一条 started。混成"还在跑"，前端就只能一直转圈。
+            await emit(job_events.EV_JOB_SETTLED, job_events.ST_DEFERRED, str(e)[:200])
             await self._defer_message(claim, stream_id, message, e)
 
         except Exception as e:
@@ -694,6 +798,7 @@ class QueueWorker:
                 logger.error("Task completion transition failed: id=%s error=%s", task_id, e)
                 raise
             logger.error("Task failed: id=%s type=%s error=%s", task_id, task_type, e)
+            await emit(job_events.EV_JOB_SETTLED, job_events.ST_FAILED, str(e))
             if retry_count >= MAX_RETRIES:
                 moved = await self._move_to_dlq(claim, stream_id, message, str(e))
                 if moved:
@@ -704,9 +809,12 @@ class QueueWorker:
                 await self._retry_message(claim, stream_id, message, task_type)
 
         finally:
-            if heartbeat is not None:
-                heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
+            if lease_heartbeat is not None:
+                lease_heartbeat.cancel()
+                await asyncio.gather(lease_heartbeat, return_exceptions=True)
+            # 无论成功/失败/丢弃/延迟重投都收掉心跳：留着它，下一轮扫描就会把
+            # 已经结束的任务算成"卡住"（G16）。
+            await job_heartbeat.detach()
 
     # ── 延迟重试与死信 ──
 
