@@ -246,11 +246,14 @@ async def _undo(args: str, ctx: CommandContext | None) -> str:
     if not session_id:
         return "没有活动会话，无法撤销。"
 
-    snapshot = await undo_stack.pop(session_id)
-    if snapshot is None:
+        # H38：pop 与 restore 必须是一个整体。
+    #
+    # 旧流程是两个独立调用：恢复失败（权限、磁盘满、路径被占）时那条快照已经从 Redis
+    # 里弹出并丢弃 —— 用户再 /undo 只会撤到更早一步，中间那次写入永久无法撤销。
+    # `pop_and_restore` 在失败时把快照放回栈顶，提示语里写明"可重试"。
+    detail, snapshot = await undo_stack.pop_and_restore(session_id)
+    if snapshot is None or detail is None:
         return "没有可撤销的文件写入（快照保留 24 小时，最多 20 步）。"
-
-    detail = undo_stack.restore(snapshot)
     return f"已撤销 {snapshot.tool}：{detail}"
 
 

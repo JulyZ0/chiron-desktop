@@ -61,6 +61,7 @@ class SubAgent:
         max_turns: int = 40,
         max_tokens: int = 0,
         temperature: float = 0.7,
+        tool_executor: Any = None,
     ):
         self.name = name
         self.description = description
@@ -72,6 +73,13 @@ class SubAgent:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self._openai_tools: list[dict[str, Any]] | None = None  # P8: 缓存工具转换结果
+        # H38：工具执行入口可注入。
+        #
+        # 旧实现固定走 `registry.execute`，于是子 Agent **绕过** ToolGuard、服务端授权、
+        # 审批与副作用账本 —— 主 Agent 里"删文件要先确认"的规则在这里不生效。
+        # 生产调度器会注入一个走 guard 链的执行器（见 `subagent_execution.py`）；
+        # 不注入时保持原语义（独立使用/单测不受影响）。
+        self._tool_executor = tool_executor
 
     async def run(
         self,
@@ -261,7 +269,11 @@ class SubAgent:
             )
 
     async def _execute_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
-        """执行一次工具调用（走注册表；含沙箱/SSRF 防护），返回真实结果或错误。"""
+        """执行一次工具调用（含沙箱/SSRF 防护），返回真实结果或错误。
+
+        H38：有注入执行器时**一律走它** —— 那条路径包含 ToolGuard / 服务端授权 /
+        副作用账本，与主 Agent 同一口径；只有独立使用（无注入）时才直连注册表。
+        """
         name = tc.get("name", "")
         raw_args = tc.get("arguments", "{}")
         try:
@@ -272,6 +284,8 @@ class SubAgent:
             args = {"input": str(raw_args)}
         if not isinstance(args, dict):
             args = {"input": args}
+        if self._tool_executor is not None:
+            return await self._tool_executor({"name": name, "arguments": args})
         result = await registry.execute(name, args)
         return {"tool": name, **result}
 
@@ -290,9 +304,13 @@ class AgentDispatcher:
         self,
         gateway: GatewayRouter | None = None,
         tool_registry: ToolRegistry | None = None,
+        runtime: Any = None,
     ):
         self._gateway = gateway
         self._tool_registry = tool_registry
+        # H38：主 Agent 的 runtime（有它才能让子 Agent 复用同一条执行链：
+        # ToolGuard → 服务端授权 → 副作用账本）。为空时子 Agent 退回直连注册表。
+        self._runtime = runtime
         self._agents: dict[str, SubAgent] = {}
         self._active: dict[str, asyncio.Task[Any]] = {}
         self._results: dict[str, SubAgentResult] = {}
@@ -309,6 +327,14 @@ class AgentDispatcher:
         max_turns: int = 5,
     ) -> SubAgent:
         """注册一个命名子代理"""
+        tool_executor = None
+        if self._runtime is not None:
+            # 注入 guard 链执行器：子 Agent 的工具调用与主 Agent 同口径。
+            # 后台跑 ⇒ allow_approval=False，"需要确认"降级为显式拒绝（见
+            # `subagent_execution.py`）。
+            from app.agent.subagent_execution import make_guarded_subagent_executor
+
+            tool_executor = make_guarded_subagent_executor(self._runtime)
         agent = SubAgent(
             name=name,
             description=description,
@@ -317,6 +343,7 @@ class AgentDispatcher:
             gateway=self._gateway,
             model=model,
             max_turns=max_turns,
+            tool_executor=tool_executor,
         )
         self._agents[name] = agent
         logger.info("Registered sub-agent: %s", name)
@@ -503,9 +530,16 @@ def create_dispatcher_with_builtins(
     gateway: GatewayRouter | None = None,
     tool_registry: ToolRegistry | None = None,
     model: str = "claude-sonnet-4-20250514",
+    runtime: Any = None,
 ) -> AgentDispatcher:
-    """创建预注册了所有内置代理的 AgentDispatcher"""
-    dispatcher = AgentDispatcher(gateway=gateway, tool_registry=tool_registry)
+    """创建带内置 agent 定义的 AgentDispatcher。
+
+    H38：`runtime` 非空时，内置子 Agent 注入**走 guard 链**的工具执行器
+    （ToolGuard → 服务端授权 → 副作用账本），与主 Agent 同口径。
+    """
+    dispatcher = AgentDispatcher(
+        gateway=gateway, tool_registry=tool_registry, runtime=runtime
+    )
     for name, config in BUILTIN_AGENTS.items():
         dispatcher.register_agent(
             name=name,

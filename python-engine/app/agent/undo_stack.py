@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import time
 from dataclasses import asdict, dataclass
@@ -38,9 +39,16 @@ class Snapshot:
 
     path: str          # 绝对路径（沙箱内，由 safe_join 产出）
     existed: bool      # 写入前是否存在；False = 新建 → undo 时应当删除它
-    content: str       # 写入前的内容（existed=False 时为空串）
+    content: str       # 写入前的内容（文本；existed=False 时为空串）
+
     tool: str          # 产生快照的工具名（write_file / edit_file）
     at: float          # 时间戳
+    # H38：**二进制安全的原始字节**（base64）。
+    #
+    # 旧实现只存 `content`（文本，读取时 `errors="replace"`）—— 对图片/压缩包/可执行
+    # 文件，快照那一刻就已经把字节替换成 U+FFFD，restore 写回去是**损坏的文件**。
+    # 这不是"恢复得不完美"，而是"撤销把文件弄坏了"，比不撤销更糟。
+    content_b64: str = ""
 
     def describe(self) -> str:
         size = len(self.content.encode("utf-8"))
@@ -88,6 +96,65 @@ async def pop(session_id: str) -> Snapshot | None:
     if raw is None:
         return None
     return _decode(raw)
+
+
+async def pop_and_restore(session_id: str) -> tuple[str | None, Snapshot | None]:
+    """弹出并恢复一步；**失败时把快照放回栈顶**，让用户能重试。
+
+    H38：旧流程是 `pop()` → `restore()` 两个独立调用 —— 恢复失败（权限、路径被占、
+    磁盘满）时那条快照已经从 Redis 里没了，用户再 `/undo` 只会撤到更早的一步：
+    中间那次写入**永久无法撤销**。现在失败即回栈，提示语里说清"还能重试"。
+    """
+    snapshot = await pop(session_id)
+    if snapshot is None:
+        return None, None
+    message = restore(snapshot)
+    if message.startswith("failed") or message.startswith("refused"):
+        requeued = await push(session_id, snapshot)
+        suffix = "（已放回撤销栈，可重试）" if requeued else "（快照已丢失，无法重试）"
+        return message + suffix, snapshot
+    return message, snapshot
+
+
+def _snapshot_bytes(snapshot: Snapshot) -> bytes:
+    """快照里保存的**原始字节**（优先 base64，老快照退回 UTF-8 文本）。"""
+    if snapshot.content_b64:
+        try:
+            return base64.b64decode(snapshot.content_b64.encode("ascii"))
+        except Exception as e:  # noqa: BLE001 - 坏快照按文本兜底，但要说清
+            logger.warning("undo snapshot base64 decode failed (%s): %s", snapshot.path, e)
+    return snapshot.content.encode("utf-8")
+
+
+def _write_no_follow(path: Path, data: bytes) -> None:
+    """写入且**不跟随符号链接**。
+
+    边界校验（resolved 在工作区内）与实际写入之间存在窗口：校验完、写之前把目标换成
+    一个指向 `/etc/passwd` 的 symlink，写入就会跑到工作区外。`O_NOFOLLOW` 让这种替换
+    直接失败（ELOOP），窗口随之消失。Windows 没有 O_NOFOLLOW，用"先删再独占创建"近似。
+    """
+    import os
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        fd = os.open(path, flags | nofollow, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        return
+
+    # Windows：不能 O_NOFOLLOW。用 lstat 判一次，再独占创建（O_EXCL 前先删目标）。
+    if path.is_symlink():
+        raise OSError(f"refusing to write through a symlink: {path}")
+    if path.exists():
+        path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
 
 
 async def peek(session_id: str, limit: int = 10) -> list[Snapshot]:
@@ -145,12 +212,14 @@ def restore(snapshot: Snapshot) -> str:
     except Exception as e:  # noqa: BLE001 - 校验不可完成时不冒险
         return f"refused: cannot verify workspace boundary ({e})"
 
+    # H38：**还原原始字节**（有 content_b64 就用它，老快照退回文本）。
+    raw = _snapshot_bytes(snapshot)
+
     try:
         if snapshot.existed:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(snapshot.content, encoding="utf-8")
-            size = len(snapshot.content.encode("utf-8"))
-            return f"restored {path}（{size} 字节）"
+            _write_no_follow(path, raw)
+            return f"restored {path}（{len(raw)} 字节）"
         if path.exists():
             path.unlink()
             return f"removed {path}（它是那次写入新建的）"
@@ -182,6 +251,7 @@ async def snapshot_before_write(session_id: str, target: Path, tool: str) -> str
             Snapshot(
                 path=str(target),
                 existed=True,
+                content_b64=base64.b64encode(raw).decode("ascii"),
                 content=raw.decode("utf-8", errors="replace"),
                 tool=tool,
                 at=time.time(),
