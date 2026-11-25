@@ -24,11 +24,24 @@ import { openLightboxFrom, openLightboxFromList } from '../common/lightboxTransi
 import type { ChatItem, ToolCallItem, ToolResultItem, TextItem, ChatAttachment } from './chat-types'
 import { formatSize } from './chat-types'
 import { resolveMediaUrl } from '../../api'
+import { sanitizeAttachmentUrl } from '../../utils/safeAttachmentUrl'
 import { useRouter } from 'vue-router'
 import { buildKbCitationLink, kbCitationLabel, kbCitationViews, normalizeKbCitations, type KbCitationView } from '../../utils/kbCitation'
 
 import { useI18n } from 'vue-i18n'
 const { t } = useI18n()
+
+// H64：附件 URL 的信任策略。
+// selfOrigin 用运行时 location.origin（云端部署就是当前域名）；对象存储 origin 由
+// 构建期环境变量注入（S3/CDN 与前端不同源是常态，但必须是**明确配置过**的那一个；
+// 没配置就只放行站内相对路径与同源，跨站一律拒绝）。
+const ATTACHMENT_URL_POLICY = {
+  selfOrigin: typeof window !== 'undefined' ? window.location?.origin : '',
+  trustedOrigins: String(import.meta.env.VITE_MEDIA_TRUSTED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean),
+}
 const props = withDefaults(defineProps<{
   item: ChatItem
   anchorKey?: number
@@ -303,7 +316,10 @@ function attName(id: string): SplitName {
 }
 
 function attachmentUrl(att: ChatAttachment): string {
-  return attachmentResolved.value[att.id] || att.url
+  // H64：渲染前统一校验来源与协议。服务端返回的 url 只是**字符串**，
+  // 之前直接进 :src/:href —— javascript:/file:/协议相对//evil.com 都能落地。
+  // 这里不可信就返回空串，模板据此不渲染（见 attachmentUnavailable）。
+  return sanitizeAttachmentUrl(attachmentResolved.value[att.id] || att.url, ATTACHMENT_URL_POLICY)
 }
 
 async function resolveAttachmentUrls() {

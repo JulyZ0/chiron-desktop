@@ -8,10 +8,20 @@
 import { ref, computed, watch } from 'vue'
 import { Modal, Input, Select, Table, Empty, Spin, message } from 'ant-design-vue'
 import { api, resolveMediaUrl } from '../../api'
+import { sanitizeAttachmentUrl } from '../../utils/safeAttachmentUrl'
 import { formatSize } from './chat-types'
 import type { ChatAttachment } from './chat-types'
 
 import { useI18n } from 'vue-i18n'
+
+// H64：与 MessageItem 同一份策略（selfOrigin + 显式配置的对象存储 origin）。
+const ATTACHMENT_URL_POLICY = {
+  selfOrigin: typeof window !== 'undefined' ? window.location?.origin : '',
+  trustedOrigins: String(import.meta.env.VITE_MEDIA_TRUSTED_ORIGINS || '')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean),
+}
 const { t } = useI18n()
 
 const props = defineProps<{ open: boolean }>()
@@ -96,6 +106,10 @@ async function handleOk() {
       } catch {
         // 静默：保留原 URL
       }
+      // H64：写进附件前再校验一次来源与协议。渲染侧（MessageItem）也会校验，
+      // 这里是**同一条策略的第二个入口** —— 附件对象还会被复制/转存/发到别处，
+      // 脏 URL 不该在数据结构里流通。
+      url = sanitizeAttachmentUrl(url, ATTACHMENT_URL_POLICY)
       const mime = r.mime_type || ''
       attachments.push({
         id: r.id,
