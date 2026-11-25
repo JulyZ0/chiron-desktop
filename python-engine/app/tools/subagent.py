@@ -35,10 +35,11 @@ from app.tools.registry import registry
 
 logger = logging.getLogger(__name__)
 
-#: 子 Agent 轮数上限。与主路径同一基准（`settings.max_turns`）：子 Agent 干的是同一类
-#: 活（读→改→测→修），10 轮连定位都跑不完。真正的时间止损由 wall 上限负责
-#: （同步委派 300s、后台委派由看门狗收口），不该用轮数当它。
-MAX_TURNS_CAP = 40
+#: 子 Agent 轮数上限 —— **唯一真源**。工具 schema、工具侧夹断、runner 侧夹断、
+#: 内网派发端点全部用这一个值；改这里就处处生效。
+#: 为什么不跟主路径的 `settings.max_turns`（默认 40）对齐：子 Agent 是"派出去干一件具体事"，
+#: 40 轮意味着它可以在无人盯的情况下烧掉一整份预算。10 轮是**有意**的收敛值。
+MAX_TURNS_CAP = 10
 MAX_DEPTH = 3  # 全局硬上限（S3）；Profile 的 max_depth 只能更严格
 
 #: 同步委派的默认 wall 上限（秒）。后台委派由注册表看门狗按 idle / max_runtime 收口，
@@ -621,7 +622,9 @@ registry.register(
             "max_turns": {
                 "type": "integer",
                 "default": 5,
-                "description": "Child loop turns cap (max 10)",
+                # G2：上限只有一个真源 —— 模型看到的数字与实际夹断值永远一致。
+                "maximum": MAX_TURNS_CAP,
+                "description": f"Child loop turns cap (max {MAX_TURNS_CAP})",
             },
             "run_in_background": {
                 "type": "boolean",

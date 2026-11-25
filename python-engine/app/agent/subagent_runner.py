@@ -40,10 +40,12 @@ from app.subagent.lifecycle import (
     PHASE_FAILED,
     PHASE_PARTIAL,
     PHASE_RESUME,
+    PHASE_RUNNING,
     SubagentLifecycle,
     emit_lifecycle,
 )
 from app.subagent.outcome import outcome_of
+from app.tools.subagent import MAX_TURNS_CAP
 
 #: R1：算作"执行"的工具名。其余工具（读文件 / 搜索 / 记忆 / 技能）不算 —— 把读也算成执行
 #: 会让收据误导。与 `_ALLOWED_EXECUTABLES` 不同：那是**命令**白名单，这是**工具**名。
@@ -791,7 +793,14 @@ class SubAgentRunner:
             content=task,
             system_prompt=system_prompt,
             llm_config=child_llm,
-            max_turns=max(1, min(max_turns or (spec.max_turns if spec else 5), 10)),
+            max_turns=max(
+            1,
+            min(
+                max_turns or (spec.max_turns if spec else 5),
+                # G2：不再写死 10 —— 与工具 schema / 内网端点共用同一个真源。
+                MAX_TURNS_CAP,
+            ),
+        ),
             subagent_depth=child_depth,
         )
         tools = self._resolve_tools(spec, mode, child_depth, max_depth)
@@ -961,6 +970,18 @@ class SubAgentRunner:
                 from app.tools.context import set_tool_context
 
                 set_tool_context(subagent_run_id=run_id)
+            # G3：`child_running` 从来没有被发过（7 个阶段里唯一缺的那个），于是任何按
+            # 阶段做看板/告警的消费方都看不到"子 Agent 真的开始跑了"——只能等终态。
+            # 落点选在**进入主循环之前**：这一步之前失败属于"没跑起来"，之后的失败才是"跑中失败"。
+            emit_lifecycle(
+                SubagentLifecycle(
+                    phase=PHASE_RUNNING,
+                    run_id=run_id,
+                    parent_run_id=self._parent_run_id,
+                    depth=self._depth + 1,
+                    profile=profile_ref,
+                )
+            )
             async for evt in runtime.run(child):
                 steps += 1
                 in_tokens += evt.input_tokens or 0
