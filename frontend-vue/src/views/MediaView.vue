@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { copyTextOrThrow } from '../utils/clipboard'
-import { ref, computed, onMounted, watch, onUnmounted, markRaw } from 'vue'
+import { ref, computed, onMounted, watch, onUnmounted, onBeforeUnmount, markRaw } from 'vue'
 import {
   Button, Input, Select, Segmented, Pagination, Table, message,
   Drawer, Modal, Popconfirm, Upload, Checkbox, Tree, Tag, Progress, Spin,
@@ -10,6 +10,14 @@ import {
   FolderAddOutlined, LeftOutlined, RightOutlined, TagOutlined, PictureOutlined,
 } from '@ant-design/icons-vue'
 import { api, resolveMediaUrl, invalidateMediaUrl, isMediaUrlExpired, API_URL } from '../api'
+import {
+  classifyMediaFailure,
+  mediaUnavailableLabel,
+  nextMediaAction,
+  recordMediaFailure,
+  type MediaFailureKind,
+  type MediaRetryState,
+} from '../utils/mediaUrlRetry'
 import { serverErrorMessage } from '../utils/apiError'
 import { createChunkUpload } from '../utils/uploader'
 import { useMediaUpload } from '../composables/useMediaUpload'
@@ -160,7 +168,16 @@ function absUrl(url: string): string {
 // ── 签名 URL 解析（安全改造：/media/ 公开路径 → 短时效签名 URL；非 /media/ 前缀原样）──
 const resolvedUrls = ref<Record<string, string>>({})
 const resolvingIds = new Set<string>()
-const failedSignedUrls = new Set<string>()
+// H70：失败账本从**永久黑名单**改成有界状态机：
+//   `gone`（404/410）→ 永久不可用（不再请求，界面给"文件已不存在"）
+//   `expired`/`unauthorized` → 重签，最多 MEDIA_RESIGN_LIMIT 次
+//   `transient` → 按 1s/2s/4s 退避重试，**永不**变成永久失败
+const mediaRetryStates = ref<Record<string, MediaRetryState>>({})
+const mediaUnavailable = ref<Record<string, MediaFailureKind>>({})
+// H70：退避重试定时器（按资源 id 去重）。声明必须在 `handleMediaFailure` 之前 ——
+// 否则 `const` 的暂时性死区会让首次失败抛 ReferenceError，而那个异常会被
+// 图片的 onerror 吞掉，表现为"点了没反应"。
+const retryTimers = new Map<string, Set<number>>()
 
 /** resolveMediaUrl 结果归一化：相对路径补 API_URL 前缀；失败回退原 file_url */
 function normalizeResolved(url: string, item: MediaItem): string {
@@ -205,40 +222,111 @@ function itemUrl(item: MediaItem): string {
   return absUrl(item.file_url)
 }
 
+/**
+ * H70：失败 → 分类 → 决定下一步。
+ *
+ * 旧实现的问题：
+ *   - `failedSignedUrls` 是**永久黑名单**，一次失败后本会话内永不重试
+ *     （切网络/休眠唤醒这种一次性失败，就足以让图片永远不显示）；
+ *   - 404 与 403 走同一分支：前者被反复重签白费请求，后者用尽次数后掉进黑洞；
+ *   - 界面上没有任何"为什么"。
+ *
+ * 现在：先按 HTTP 语义分类，再问 `nextMediaAction` 拿结论 ——
+ * `gone` 永久不可用且**不再请求**；`expired`/`unauthorized` 重签（有上限）；
+ * `transient` 退避重试（永不永久失败）。三种结局都会写进 `mediaUnavailable`，
+ * 模板据此给出可见说明，而不是留下一块空白。
+ */
+async function handleMediaFailure(item: MediaItem, failedUrl: string, status = 0, body = '') {
+  const now = Date.now()
+  const kind = classifyMediaFailure({ status, body, url: failedUrl, now })
+  const decision = nextMediaAction(mediaRetryStates.value[item.id], kind, now)
+
+  if (decision.action === 'unavailable') {
+    mediaRetryStates.value[item.id] = recordMediaFailure(mediaRetryStates.value[item.id], kind, now)
+    mediaUnavailable.value[item.id] = kind
+    resolvedUrls.value[item.id] = ''
+    return false
+  }
+
+  if (decision.action === 'wait') {
+    mediaRetryStates.value[item.id] = recordMediaFailure(mediaRetryStates.value[item.id], kind, now)
+    mediaUnavailable.value[item.id] = kind
+    // 退避到点后自动重试一次（不累积定时器：每次都覆盖同一个 id 的旧定时器）。
+    const delay = Math.max(0, decision.until - now)
+    const timers = retryTimers.get(item.id) ?? new Set<number>()
+    const handle = window.setTimeout(() => {
+      timers.delete(handle)
+      retryTimers.set(item.id, timers)
+      void retryItem(item)
+    }, delay)
+    timers.add(handle)
+    retryTimers.set(item.id, timers)
+    return false
+  }
+
+  // decision.action === 'resign'
+  mediaRetryStates.value[item.id] = recordMediaFailure(mediaRetryStates.value[item.id], kind, now)
+  invalidateMediaUrl(item.id)
+  resolvedUrls.value[item.id] = ''
+  delete mediaUnavailable.value[item.id]
+  await resolveItemUrl(item, true)
+  return !!resolvedUrls.value[item.id]
+}
+
+/** 重试一个资源：清预算外的状态后重新解析（供退避定时器与模板按钮调用）。 */
+async function retryItem(item: MediaItem) {
+  if (mediaUnavailable.value[item.id] === 'gone') return
+  delete mediaUnavailable.value[item.id]
+  invalidateMediaUrl(item.id)
+  resolvedUrls.value[item.id] = ''
+  await resolveItemUrl(item, true)
+}
+
+/** 过期的签名 URL 立即重签；其它失败按状态机分类处理。 */
 async function reSignExpiredUrl(item: MediaItem, failedUrl: string): Promise<boolean> {
-  if (!failedUrl || failedSignedUrls.has(failedUrl)) return false
-  failedSignedUrls.add(failedUrl)
-  let expired = isMediaUrlExpired(failedUrl)
-  if (!expired) {
+  // 先看 URL 自身的 exp：过期的 URL 不必再发一次探测请求。
+  const kind = classifyMediaFailure({ status: 0, url: failedUrl })
+  if (kind === 'expired') return handleMediaFailure(item, failedUrl, 403, 'link expired')
+  return false
+}
+
+/** 图片/视频加载失败：区分"过期/鉴权/真的没了/暂时不行"，不再一次性拉黑。 */
+async function onImgError(e: Event, item: MediaItem) {
+  const el = e.target as HTMLImageElement
+  const failedUrl = resolvedUrls.value[item.id] || ''
+  let status = 0
+  let body = ''
+  if (failedUrl && !isMediaUrlExpired(failedUrl)) {
     try {
       const response = await fetch(failedUrl, {
         cache: 'no-store',
         credentials: 'omit',
         headers: { Range: 'bytes=0-0' },
       })
-      const body = response.status === 403 ? await response.text() : ''
-      expired = response.status === 403 && body.includes('link expired')
+      status = response.status
+      body = status === 403 || status === 404 || status === 410 ? await response.text() : ''
     } catch {
-      return false
+      // 网络层失败：按 transient 处理（等一会儿再试），不是永久失败。
+      status = 0
     }
+  } else if (failedUrl) {
+    status = 403
+    body = 'link expired'
   }
-  if (!expired) return false
-  invalidateMediaUrl(item.id)
-  resolvedUrls.value[item.id] = ''
-  await resolveItemUrl(item, true)
-  return !!resolvedUrls.value[item.id]
-}
-
-/** 过期签名只重签一次；404、无效签名与永久加载失败不再回退公开路径。 */
-async function onImgError(e: Event, item: MediaItem) {
-  const el = e.target as HTMLImageElement
-  const failedUrl = resolvedUrls.value[item.id] || ''
-  if (await reSignExpiredUrl(item, failedUrl)) {
+  if (await handleMediaFailure(item, failedUrl, status, body)) {
     el.style.display = ''
     return
   }
   el.style.display = 'none'
 }
+
+
+onBeforeUnmount(() => {
+  for (const handles of retryTimers.values()) {
+    for (const handle of handles) window.clearTimeout(handle)
+  }
+  retryTimers.clear()
+})
 
 async function fetchItems() {
   // S 修复：请求序号守卫 — 快速翻页/搜索时丢弃过期响应，避免旧结果覆盖新列表
@@ -1632,6 +1720,23 @@ onUnmounted(() => {
                 v-else
                 class="thumb-icon"
               />
+              <!-- H70：失败要**看得见**。以前图片消失后什么都不留，
+                   用户无法区分"还在加载""文件没了""没权限"。 -->
+              <span
+                v-if="mediaUnavailable[item.id]"
+                class="thumb-error"
+                :title="mediaUnavailableLabel(mediaUnavailable[item.id])"
+              >
+                {{ mediaUnavailableLabel(mediaUnavailable[item.id]) }}
+                <button
+                  v-if="mediaUnavailable[item.id] !== 'gone'"
+                  type="button"
+                  class="thumb-retry"
+                  @click.stop="retryItem(item)"
+                >
+                  {{ $t('common.retry') }}
+                </button>
+              </span>
             </div>
             <div
               class="card-name"
@@ -1723,6 +1828,24 @@ onUnmounted(() => {
           />
         </div>
         <div class="detail-info">
+          <!-- H70：详情页同样说明"为什么看不到"。 -->
+          <div
+            v-if="detailItem && mediaUnavailable[detailItem.id]"
+            class="detail-row detail-error"
+          >
+            <span class="label">{{ $t('common.status') }}</span>
+            <span>
+              {{ mediaUnavailableLabel(mediaUnavailable[detailItem.id]) }}
+              <button
+                v-if="mediaUnavailable[detailItem.id] !== 'gone'"
+                type="button"
+                class="thumb-retry"
+                @click.stop="retryItem(detailItem)"
+              >
+                {{ $t('common.retry') }}
+              </button>
+            </span>
+          </div>
           <div class="detail-row">
             <span class="label">{{ $t('common.type') }}</span><span>{{ detailItem.type }}</span>
           </div>
@@ -2206,6 +2329,34 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* H70：加载失败的可见状态（不是一块空白）。 */
+.thumb-error {
+  position: absolute;
+  inset: auto 4px 4px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 2px 6px;
+  font-size: 11px;
+  line-height: 16px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 4px;
+  pointer-events: auto;
+}
+.thumb-retry {
+  padding: 0 4px;
+  font-size: 11px;
+  color: inherit;
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.detail-error {
+  color: var(--color-warning, #d48806);
+}
 .media-page { padding: 72px 24px 16px; display: flex; flex-direction: column; gap: 12px; height: 100%; overflow: hidden; }
 .media-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .breadcrumb { display: flex; align-items: center; gap: 4px; min-width: 0; }
