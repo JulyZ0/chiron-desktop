@@ -455,6 +455,11 @@ async def sweep_once(
                    COALESCE((checkpoint->>'generation')::int, 0) AS generation
               FROM agent_runs
              WHERE status IN ('running', 'checkpointed', 'resuming')
+               -- G20：子会话（sub:<父>:<run>）**不归巡检续跑**。
+               -- 子 Agent 现在有自己的 run 行，但它的生命周期由父 run 负责：父侧收尾后
+               -- 这行只是历史残留。若在这里被接管，就会在没有父上下文、没有父预算的
+               -- 情况下带着写权限继续动工作区 —— 那是幽灵运行，比"不续跑"危险得多。
+               AND session_id NOT LIKE 'sub:%'
                AND COALESCE(checkpoint_at, updated_at, created_at)
                    < now() - make_interval(secs => $1::int)
              ORDER BY COALESCE(checkpoint_at, updated_at, created_at) ASC

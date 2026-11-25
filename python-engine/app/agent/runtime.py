@@ -4938,6 +4938,22 @@ class AgentRuntime:
             decided_by=task.user_id or "",
         )
 
+    def awaiting_input_info(self) -> dict[str, Any] | None:
+        """当前挂起现场（只读快照）；没挂起返回 None。
+
+        为什么需要公开读口：子 Agent 的挂起协调（`app/subagent/suspension.py`）需要
+        知道"父/子现在是否停在等人工"，而它此前只能读 `self._awaiting_input` 这个
+        私有属性 —— 私有属性是随时可以改的，跨模块读它等于把一次重构变成线上故障。
+        """
+        state = getattr(self, "_awaiting_input", None)
+        if not state:
+            return None
+        # 拷贝一份：调用方拿到的是值，不是我们的内部字典（避免被就地改写）
+        try:
+            return dict(state)
+        except (TypeError, ValueError):
+            return None
+
     def _suspend_for_input(
         self, task: AgentTask, tool_call_id: str, *, tool_name: str, kind: str
     ) -> dict[str, Any] | None:

@@ -257,12 +257,17 @@ async def finish_run_row(*, tenant_id: int, session_id: str, status: str) -> boo
 
 
 def awaiting_info(runtime: Any) -> dict[str, Any] | None:
-    """这一轮是否停在"等人"上（``runtime._awaiting_input`` 的只读视图）。
+    """这一轮是否停在"等人"上（只读视图）。
 
-    为什么读私有属性：这是 runtime 在挂起时唯一留下的**进程内**信号
-    （``_suspend_for_input`` 写、回合末用它决定 ``awaiting_input``）。它没有对外的 getter，
-    而本次任务不动 ``runtime.py``。读一份拷贝而不是原对象：调用方不该改到 runtime 的状态。
+    走 `AgentRuntime.awaiting_input_info()`：这是挂起信息的**公开**读口。
+    此前只能读 `runtime._awaiting_input` 私有属性 —— 私有属性随时可能被重构掉，
+    跨模块依赖它等于把一次无害重构变成线上故障。旧对象（没有该方法的替身/测试桩）
+    仍回退到私有属性，避免把"接口新增"变成破坏性变更。
     """
+    accessor = getattr(runtime, "awaiting_input_info", None)
+    if callable(accessor):
+        info = accessor()
+        return dict(info) if isinstance(info, dict) else None
     info = getattr(runtime, "_awaiting_input", None)
     if not isinstance(info, dict):
         return None

@@ -461,6 +461,12 @@ class Settings(BaseSettings):
     # 是要显式开启的新能力（§1.3：会改变行为的机制一律默认关）。
     # 关闭时 `resume_subagent` 仍注册（与 R1/R2 同款运行时开关），但对任何调用都返回
     # **明确的"未启用"错误**，且不写 `subagent_runs.resumed_from` / `resume_at_step`。
+    #: 子 Agent 挂起等人的**等待上限（秒）**（G11/G20）。
+    #:
+    #: 挂起期间不占写槽、不计 wall 花费，所以必须有个上限：否则一个没人回答的
+    #: 子 Agent 会一直挂在 awaiting_input 上，占着该会话的活跃位。
+    #: 超时后票转 `expired`，子 Agent 以**明确失败**收尾（不是静默卡死）。
+    subagent_suspend_wait_seconds: int = 900  # 边界（60–3600）由读取处夹取，与全仓风格一致
     subagent_resume_enabled: bool = False
 
     # ── 子 Agent 的宿主证据（host receipts，见 vendor/规划.md §3.5 的 R1）──    #
