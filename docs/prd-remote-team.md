@@ -7,7 +7,7 @@
 ## 1. 当前状态（一段话）
 
 S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证部分已全部收口**，
-本机可做的 W1–W3（对外安全门禁、执行可靠性、设备与契约）已完成。剩下的是
+本机可做的 W1–W3 与对齐 deepseek-harness 的第一批（G1–G3）已完成。剩下的是
 **需要真机/外部服务**（H2）、**需要外部系统选型**（H20）、**需要产品决策**（H19/H22）
 以及**契约扩容**（H16b）。
 
@@ -22,9 +22,6 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 
 | ID | 事项 | 完成定义 | 落点 |
 |---|---|---|---|
-| **G1** | 终态事件守卫 | 每个流只能发一个终态：`input-guard` / `UserPromptSubmit` 拦截分支现在只发 `guardrail_blocked` 就 return；加"已发终态"标志后，任何后续 `done/error` 都被拦下并告警 | `python-engine/app/agent/runtime.py` |
-| **G2** | 轮数常量收口 | `MAX_TURNS_CAP=40` 与 runner 硬夹 10 漂移：统一成一个常量（实际生效值 10），并有测试断言"工具 schema 声明的上限 = 实际夹断值" | `app/tools/subagent.py`、`app/agent/subagent_runner.py` |
-| **G3** | `PHASE_RUNNING` 补发 | `lifecycle.py` 定义且测试要求 7 个阶段，但从不 emit running：在子 Agent 进入主循环处补发，测试断言阶段序列完整 | `app/agent/subagent_runner.py` |
 | **G4** | `inherit_context` 要么真传要么删除 | 工具路径构造 runner 时不传 `parent_messages` ⇒ 该开关永远无效：改为真传（Profile 开启时继承父消息），或删掉参数并在 schema 里去掉；测试断言"开启后确实带父历史" | `app/tools/subagent.py`、`subagent_runner.py` |
 | **G5** | `SessionStatsPanel` 接 `staleGuard` | 唯一没接代次票据的异步面板：连续切会话时旧响应不得覆盖新数据（有 spec） | `frontend-vue/src/components/chat/SessionStatsPanel.vue` |
 | **G6** | KB 预览大小上限 | 超过阈值直接提示"文件过大，无法预览"（并给下载入口），不再整块塞进 `<pre>`；阈值与后端 `preview_note` 口径一致 | `KBDocumentPreview.vue` + Go 预览接口 |
@@ -77,10 +74,13 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
    （G25 会让现有 Linux 部署直接不可用，需不需要先加默认关的开关？）
 4. **H19 / H22 产品承诺**：ACP 完整集成、严格只读子 Agent 是否本版本目标？
 5. **H16b 时机**：`queue` / `checkpoint` 字段还在动；等稳定再纳入，还是先纳入 `tool_approval` / `mcp`？
-6. **G20 子 Agent 挂起**：要不要让子 Agent 能"挂起等人工"？（会占配额、改超时语义，
-   现在超时即该步失败）
-7. **G22 / G23 / G24 新组件**：MCP 并入统一注册表（动 registry）、常驻 LSP、定时触发，
-   这三项本版本要不要做？
+### 3.1 已定（2026-11-25）
+
+- **G20 做**：补 `agent_runs` 行，允许子 Agent 挂起等人工（不再超时即失败）。
+- **G22 不做**：MCP 暂不并入统一注册表（动 registry 风险中高，双路径当前可用）。
+- **G23 做**：常驻 LSP。
+- **G24 不做**：定时触发原语不进本版本。
+- **G25 合并进 H2**：沙箱"缺后端即拒跑"与 Linux 内核级隔离一次做完，不单独立项。
 
 
 ## 4. 外部验收（需团队主机）
