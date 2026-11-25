@@ -24,7 +24,7 @@ import re
 import textwrap
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,6 +32,7 @@ import jsonschema
 
 from app.agent.event_sink import EV_NOTICE, EV_REASONING, EV_STATUS, EV_TEXT, ST_CANCELLED, ST_TOOL
 from app.agent.profile import DEFAULT_MAX_DEPTH, ProfileSpec
+from app.agent.runtime_types import AgentTask
 from app.subagent.budget import BudgetExceeded, TaskBudget
 from app.subagent.lifecycle import (
     PHASE_CANCELLED,
@@ -50,6 +51,10 @@ from app.tools.subagent import MAX_TURNS_CAP
 #: R1：算作"执行"的工具名。其余工具（读文件 / 搜索 / 记忆 / 技能）不算 —— 把读也算成执行
 #: 会让收据误导。与 `_ALLOWED_EXECUTABLES` 不同：那是**命令**白名单，这是**工具**名。
 _EXEC_TOOL_NAMES: frozenset[str] = frozenset({"shell_exec", "run_code", "persistent_shell"})
+
+#: `AgentTask` 从 `app.agent.runtime_types` 直接取（G20 起本模块需要它两次：装配子任务 +
+#: 给 `_run_child_segments` 标注形参）。不从 `app.agent.runtime` 模块级 import：那是 3000+
+#: 行的状态机，凡导入本模块的路径都会被拖上整条 runtime 链，且与 `runtime.py` 形成循环。
 
 
 def _noop_release() -> None:
@@ -765,9 +770,8 @@ class SubAgentRunner:
                 error=f"delegation depth exceeded (max_depth={max_depth})",
             )
 
-        # 2) 装配任务
-        from app.agent.runtime import AgentRuntime, AgentTask
-
+        # 2) 装配任务（`AgentTask` 由模块级 import 提供 —— G20 之后这个 runner 需要它两次：
+        # 一次装配子任务、一次给 `_run_child_segments` 标注形参）
         system_prompt = (spec.system_prompt if spec else "") or expert_prompt
         # 模型 / provider 的继承（P0 缺陷修复）：父 run 在工具上下文里写下"本轮实际使用的
         # 模型与 provider"（runtime 解析完 llm_config 后写入），子 Agent 默认继承它们。
@@ -927,7 +931,10 @@ class SubAgentRunner:
             owner_lease = None
 
         # 5) 运行并收集：L0 落库 + 旁路转发；reasoning 与正文分离（思考不进父上下文）
-        runtime = AgentRuntime(gateway=self._gateway, unattended=self._unattended)
+        #
+        # G20：**runtime 由 `_run_child_segments` 按段创建**（不是在这里建一个用到底）——
+        # 子 Agent 可能"挂起等人工"然后被答复续跑，每一段都要一个新的 runtime（新的
+        # run_token / 新的挂起标记），否则第二段会误读上一段残留的状态。
         texts: list[str] = []
         reasoning_parts: list[str] = []
         errors: list[str] = []
@@ -951,11 +958,22 @@ class SubAgentRunner:
         # 不额外造一条只属于超时的收尾分支。
         _wall = budget.wall if (budget is not None and budget.enabled and budget.wall) else 0
         _wall_task: asyncio.Task[Any] | None = None
+        #: G20：挂起等人期间**停表**用的剩余额度与"本段起点"。等人不是子 Agent 的花费，
+        #: 但这条豁免必须显式记录（停了多少秒进日志与事件流），不能悄悄把 wall 变无限。
+        _wall_state: dict[str, float] = {"left": float(_wall or 0), "seg_start": time.time()}
         if _wall:
             _wall_task = asyncio.create_task(_watch_wall_budget(run_id, _wall))
 
         # R3：留一个异常句柄给结算处 —— 它是"结构化结局"的唯一依据（不在结算处重新猜）
         _last_error: BaseException | None = None
+        #: G20：子 Agent 那一行 ``agent_runs`` 的**已声明**终态。挂起超时时由
+        #: `_run_child_segments` 写成 ``expired``（那比笼统的 ``failed`` 更准：用户与巡检
+        #: 据此区分"没人回答"与"跑挂了"），其余情况留空 ⇒ 收尾时用本轮的真实 status。
+        _row_state: dict[str, str] = {"status": ""}
+
+        def _set_row_status(value: str) -> None:
+            _row_state["status"] = str(value or "")
+
         # R2：写路径仲裁的槽。**默认关**时 `_acquire_write_slot` 直接返回 no-op。
         # 在 try **内部**取是有意的：取不到（嵌套无容量 / 声明非法）就落进既有的异常路径，
         # 于是"失败"这件事与其它失败走同一条收尾（落库 + 终态事件 + R3 结构化结局），
@@ -982,7 +1000,67 @@ class SubAgentRunner:
                     profile=profile_ref,
                 )
             )
-            async for evt in runtime.run(child):
+            # ── G20：挂起等人的**有界策略**（三个回调，全部由 `_run_child_segments` 调用）──
+            #
+            # 写槽：挂起时释放、续跑前重取（人在思考时不该继续占着工作区的写权）。
+            # wall 表：挂起时停、续跑时按剩余额度重启（等人不计花费，但必须记录停了多久）。
+            # 前端：挂起/恢复各发一条 notice（用户要看得见"它在等我"和"它接着跑了"）。
+            def _set_slot_release(release: Callable[[], None]) -> None:
+                nonlocal slot_release
+                slot_release = release
+
+            async def _reacquire_slot() -> Callable[[], None]:
+                return await self._acquire_write_slot(spec, run_id=run_id, child_depth=child_depth)
+
+            def _pause_wall() -> None:
+                nonlocal _wall_task
+                if _wall_task is None:
+                    return
+                _wall_task.cancel()
+                _wall_task = None
+                _wall_state["left"] = max(
+                    0.0, _wall_state["left"] - (time.time() - _wall_state["seg_start"])
+                )
+
+            def _resume_wall(waited: float) -> None:
+                nonlocal _wall_task
+                if not _wall:
+                    return
+                _wall_state["seg_start"] = time.time()
+                remaining = _wall_state["left"]
+                logger.info(
+                    "subagent %s: wall budget paused %.0fs for human input "
+                    "(remaining=%ss, 显式豁免：等人不计入子 Agent 的 wall 花费)",
+                    run_id, max(0.0, waited), int(remaining),
+                )
+                if remaining <= 0 or _wall_task is not None:
+                    return
+                _wall_task = asyncio.create_task(_watch_wall_budget(run_id, remaining))
+
+            def _notify_wait(text: str) -> None:
+                if sink is None:
+                    return
+                sink.emit_progress(
+                    run_id=run_id,
+                    channel=EV_NOTICE,
+                    content=text,
+                    parent_run_id=parent_run_id,
+                    depth=child_depth,
+                    profile=profile_name,
+                )
+
+            async for evt in self._run_child_segments(
+                child,
+                run_id=run_id,
+                child_session=child.session_id or "",
+                notify=_notify_wait,
+                release_slot=lambda: slot_release(),
+                set_slot_release=_set_slot_release,
+                reacquire_slot=_reacquire_slot,
+                pause_wall=_pause_wall,
+                resume_wall=_resume_wall,
+                set_row_status=_set_row_status,
+            ):
                 steps += 1
                 in_tokens += evt.input_tokens or 0
                 out_tokens += evt.output_tokens or 0
@@ -1312,6 +1390,45 @@ class SubAgentRunner:
             # 残留一个定时器，到点后对已结束的 run 调 cancel（幂等但会刷无意义的告警日志）。
             if _wall_task is not None:
                 _wall_task.cancel()
+            # G20：子 Agent 的 `agent_runs` 行必须收口 —— 挂起期间建的那一行不能留在
+            # `running`/`awaiting_input`（留着的后果：巡检当僵尸、前端一直转圈、唯一索引
+            # 把这会话的新 run 挡住）。走**后台任务**而不是 await：取消路径上任何 await 都会
+            # 被再次打断，那一行就永远不会收口 —— 这正是"取消后一直转圈"的机械原因。
+            if child.session_id:
+                _final_row_status = _row_state["status"] or status
+
+                async def _close_child_run_row(session_id: str, final_status: str) -> None:
+                    from app.subagent import suspension
+
+                    await suspension.finish_run_row(
+                        tenant_id=self._tenant_id,
+                        session_id=session_id,
+                        status=final_status,
+                    )
+
+                try:
+                    import sys as _sys
+
+                    from app.context.manager import _track_bg_task
+
+                    _close_task = asyncio.get_running_loop().create_task(
+                        _close_child_run_row(child.session_id, _final_row_status)
+                    )
+                    _track_bg_task(_close_task)
+                    # 正常退出/失败路径上等它写完（收尾要**确定**，不能让行靠调度时序）；
+                    # 取消路径上 `finally` 正在抛异常，任何 await 都会被立刻再打断 ——
+                    # 那里就靠后台任务写（看 `_track_bg_task`：关机会 await 它们）。
+                    if _sys.exc_info()[1] is None:
+                        try:
+                            await asyncio.shield(_close_task)
+                        except Exception as exc:  # noqa: BLE001 - 收尾失败不该改变退出路径
+                            logger.warning(
+                                "subagent %s: agent_runs row not finalised: %s", run_id, exc
+                            )
+                except RuntimeError:  # 无运行中的 loop（理论不可达）：至少留下证据
+                    logger.warning(
+                        "subagent %s: no running loop; agent_runs row not finalised", run_id
+                    )
             if ctx_snapshot is not None:
                 from app.tools.context import restore_context
 
@@ -1537,6 +1654,130 @@ class SubAgentRunner:
             structured_error=structured_error,
             # S2：审计计数（0 = 未开启继承；>0 = 子 Agent 看到了父的这么多条上下文）
             inherited_messages=inherited.inherited_messages,
+        )
+
+    # ── G20：按段执行子 Agent（挂起 → 等人工 → 续跑）──
+
+    async def _run_child_segments(
+        self,
+        child: AgentTask,
+        *,
+        run_id: str,
+        child_session: str,
+        notify: Callable[[str], None],
+        release_slot: Callable[[], None],
+        set_slot_release: Callable[[Callable[[], None]], None],
+        reacquire_slot: Callable[[], Awaitable[Callable[[], None]]],
+        pause_wall: Callable[[], None],
+        resume_wall: Callable[[float], None],
+        set_row_status: Callable[[str], None],
+    ) -> AsyncIterator[Any]:
+        """产出子 Agent 的事件；**每一步停下来等人的地方**会自动接着跑下一段。
+
+        **修前会怎样**：子会话没有 ``agent_runs`` 行 ⇒ ``_register_interaction`` 直接返回
+        空串（它只认 ``task.run_token``）⇒ 审批/提问退回"无人值守 ⇒ 即时拒绝"，
+        子 Agent 那一步**必定**失败，用户只看到"莫名失败"。
+
+        **现在**：每一段开跑前写好行与 ``run_token``（``ensure_run_row``），挂起时：
+
+        1. 释放写槽、停 wall 表（有界策略，见 ``app/subagent/suspension.py``）；
+        2. 有界等待人工答复（``wait_for_answer``，默认 900s，硬上限 1h）；
+        3. 答复到达 ⇒ 取回写槽、**开新的一段**（新 run_token）—— runtime 会用
+           ``load_awaiting``/``claim_awaiting`` 接过挂起现场，再由 ``consume_grant`` 取走
+           那张票继续执行；
+        4. 没答复 ⇒ 待办转 ``expired``、行标 ``expired``，以一条 ``error`` 事件**明确失败**
+           （不是静默卡死，也不是假 completed）。
+
+        轮数也有界（``MAX_SUSPEND_ROUNDS``）：反复要确认的模型必须收敛，否则一个子 Agent
+        可以无限期地占着这条线。
+        """
+        from app.agent.runtime import AgentEvent, AgentRuntime
+        from app.subagent import suspension
+
+        # G11：本段里"已发起、还没拿到结果"的写调用（tool_call_id → 目标路径）。
+        # 失败/被拒的那次写入要把**事前**拍下的撤销快照摘掉（见 `_observe_child_write`）。
+        pending_writes: dict[str, str] = {}
+
+        for segment in range(1, suspension.MAX_SUSPEND_ROUNDS + 2):
+            # 每一段自己的凭据：续跑要靠新 token 把挂起现场从上一段手里接过来
+            # （`claim_awaiting` 的 CAS 条件就是 token，复用旧 token 会 0 行命中）。
+            child.run_token = suspension.new_run_token()
+            await suspension.ensure_run_row(
+                tenant_id=self._tenant_id,
+                session_id=child_session,
+                run_token=child.run_token,
+                turn_id=str(getattr(child, "id", "") or ""),
+                generation=segment,
+            )
+            runtime = AgentRuntime(gateway=self._gateway, unattended=self._unattended)
+            async for evt in runtime.run(child):
+                await _observe_child_write(evt, child_session, pending_writes)
+                yield evt
+
+            info = suspension.awaiting_info(runtime)
+            if info is None:
+                return  # 这一轮真的结束了（没有停在等人上）
+
+            # ── 挂起：先把占着的东西放开，再等人 ──
+            release_slot()
+            pause_wall()
+            wait_seconds = suspension.suspend_wait_seconds()
+            notify(
+                "子 Agent 在这一步暂停，等人工答复："
+                f"{str(info.get('question') or '')[:200]}（最长等 {int(wait_seconds)}s）"
+            )
+            logger.info(
+                "subagent %s suspended for human input (session=%s kind=%s segment=%d wait<=%ss)",
+                run_id, child_session, str(info.get("kind") or ""), segment, int(wait_seconds),
+            )
+            started = time.time()
+            answered = await suspension.wait_for_answer(
+                tenant_id=self._tenant_id,
+                user_id=self._user_id,
+                session_id=child_session,
+                wait_seconds=wait_seconds,
+            )
+            resume_wall(time.time() - started)
+
+            if not answered:
+                await suspension.expire_session(
+                    tenant_id=self._tenant_id, user_id=self._user_id, session_id=child_session
+                )
+                set_row_status(suspension.STATUS_EXPIRED)
+                notify("子 Agent 等人工答复超时：这一步按 expired 收尾。")
+                yield AgentEvent(
+                    type="error",
+                    error=(
+                        "subagent suspended and expired: 没有人回答这次人工介入"
+                        f"（等了 {int(wait_seconds)}s），这一步按 expired 收尾；"
+                        "需要的话把这段重新派发一次"
+                    ),
+                )
+                return
+
+            notify("收到人工答复，子 Agent 继续（接管挂起现场，不重做已完成的步骤）。")
+            try:
+                set_slot_release(await reacquire_slot())
+            except Exception as exc:  # noqa: BLE001 - 取不到写槽 ⇒ 明确失败（不静默降级）
+                set_row_status("failed")
+                yield AgentEvent(
+                    type="error",
+                    error=f"subagent could not re-acquire the write slot after human input: {exc}",
+                )
+                return
+
+        # 每一段都挂起（模型反复要确认）⇒ 收敛：按 expired 收尾，不留悬挂的现场
+        await suspension.expire_session(
+            tenant_id=self._tenant_id, user_id=self._user_id, session_id=child_session
+        )
+        set_row_status(suspension.STATUS_EXPIRED)
+        notify("子 Agent 连续挂起超过上限，已按 expired 收尾。")
+        yield AgentEvent(
+            type="error",
+            error=(
+                f"subagent suspended more than {suspension.MAX_SUSPEND_ROUNDS} times in one "
+                "delegation（挂起轮数超过上限），已按 expired 收尾"
+            ),
         )
 
     # ── 只读口径（**单一出处**，不许各算一套）──
@@ -1840,3 +2081,109 @@ def _context_run_id() -> str:
         return str(get_tool_context("subagent_run_id", "") or "")
     except Exception:  # noqa: BLE001
         return ""
+
+
+# ── G11：子 Agent 的写调用失败/被拒 ⇒ 那条**事前**快照必须摘掉 ────────────
+
+#: 会产生 undo 快照的写类工具（与 ``app/agent/side_effect_ledger._SNAPSHOT_TOOLS``
+#: 同一组口径 + 删除；删除也会拍快照，见 ``app/tools/fs_tools.py``）。
+_SNAPSHOT_WRITE_TOOLS: frozenset[str] = frozenset(
+    {"write_file", "edit_file", "delete_file", "replace_in_files"}
+)
+
+#: 工具参数里可能承载目标路径的键（与 ``app/agent/write_claim.path_of`` 对齐）
+_PATH_ARG_KEYS: tuple[str, ...] = (
+    "path",
+    "file_path",
+    "filepath",
+    "filename",
+    "file",
+    "target",
+    "dir",
+)
+
+
+def _written_path(tool_name: str, raw_args: Any) -> str:
+    """从 ``tool_call`` 事件的参数里取这次要写的路径；不是写类工具返回空串。"""
+    if tool_name not in _SNAPSHOT_WRITE_TOOLS:
+        return ""
+    args: Any = raw_args
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return ""
+    if not isinstance(args, dict):
+        return ""
+    for key in _PATH_ARG_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _tool_result_failed(evt: Any) -> bool:
+    """这次调用算不算"没写成"：``error`` 非空，或结果是 guard 的 ``denied`` 载荷。
+
+    第二种必须单独判：被 guard 拦下的调用**根本没执行**，结果是一段
+    ``{"denied": true, "error": "requires user confirmation"}`` 的 JSON ——
+    ``evt.error`` 往往是空的（那是工具的**输出**，不是运行错误）。
+    """
+    if str(getattr(evt, "error", "") or "").strip():
+        return True
+    content = str(getattr(evt, "content", "") or "")
+    if not content:
+        return False
+    lowered = content.lower()
+    if '"denied": true' in lowered or '"denied":true' in lowered:
+        return True
+    if content.lstrip().startswith("{"):
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+        if isinstance(payload, dict) and payload.get("denied"):
+            return True
+    return False
+
+
+async def _observe_child_write(
+    evt: Any, child_session: str, pending: dict[str, str]
+) -> None:
+    """跟踪子 Agent 的写调用：结果失败/被拒 ⇒ 把那条撤销快照从**父子两个栈**摘掉。
+
+    **修前会怎样**：快照是"写入**前**"拍的（``undo_stack.snapshot_before_write``），工具随后
+    失败时文件根本没变。那条快照留在栈里 ⇒ 父会话下一次 ``/undo`` 会"恢复"成同一份内容：
+    用户按一下、什么也没变，而真正需要撤销的那一步机会已经被消耗掉了。
+
+    放在子 Agent 的边界上而不是各工具里：工具层拿不到"这次调用最终结果如何"，而这里
+    ``tool_call`` 与 ``tool_result`` 成对出现，判断失败只需要看结果事件。
+    """
+    kind = str(getattr(evt, "type", "") or "")
+    tool_call_id = str(getattr(evt, "tool_call_id", "") or "")
+    if not tool_call_id:
+        return
+    if kind == "tool_call":
+        path = _written_path(
+            str(getattr(evt, "tool_name", "") or ""), getattr(evt, "tool_arguments", "") or ""
+        )
+        if path:
+            pending[tool_call_id] = path
+        return
+    if kind != "tool_result":
+        return
+    path = pending.pop(tool_call_id, "")
+    if not path or not _tool_result_failed(evt):
+        return
+    try:
+        from app.agent import undo_stack
+
+        removed = await undo_stack.discard(child_session, path)
+    except Exception as exc:  # noqa: BLE001 - 清理失败只影响"多一条空快照"，不该影响执行
+        logger.warning("subagent undo snapshot cleanup failed (%s): %s", path, exc)
+        return
+    if removed:
+        logger.info(
+            "subagent write failed/denied: dropped %d undo snapshot(s) for %s (session=%s)",
+            removed, path, child_session,
+        )

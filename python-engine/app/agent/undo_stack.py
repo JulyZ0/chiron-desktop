@@ -32,6 +32,52 @@ TTL_SECONDS = 24 * 60 * 60
 #: 单条快照的内容上限：超过就不存 —— 但要**明确告知**这次写入不可撤销
 MAX_SNAPSHOT_BYTES = 256 * 1024
 
+#: 子 Agent 的**合成会话**前缀。子会话形如 ``sub:<父会话>:<run_id>``
+#: （见 ``app/agent/subagent_runner.py`` 构造 ``AgentTask`` 的那一行）。
+SUBAGENT_SESSION_PREFIX = "sub:"
+
+
+def lineage_sessions(session_id: str) -> list[str]:
+    """G11：解析会话的**祖先链**（由近到远）；顶层会话返回空列表。
+
+    **为什么需要它**：撤销栈与副作用账本的键都是 ``get_session_id()``，而子 Agent 跑在
+    ``sub:<父>:<run>`` 这个合成会话里 —— 于是子 Agent 写过的文件全落在
+    ``undo:sub:<父>:<run>`` 上，父会话的 ``/undo`` 永远弹不到它（用户以为撤了，其实没有）。
+    把同一条快照**镜像**到祖先键上，父会话的"整轮撤销"才成立。
+
+    解析方式是"剥前缀 + 从**最后**一个冒号切"，不是按第一个冒号切：嵌套委派
+    （``sub:sub:P:r1:r2``）里父自己的 id 也带 ``sub:``，按第一个冒号会切出 ``"sub"``
+    这个根本不存在的假会话。父会话 id 本身不含冒号时两种切法等价，含的时候只有这种是对的。
+    """
+    session_id = str(session_id or "")
+    if not session_id.startswith(SUBAGENT_SESSION_PREFIX):
+        return []
+    body = session_id[len(SUBAGENT_SESSION_PREFIX) :]
+    parent, sep, _run = body.rpartition(":")
+    if not sep or not parent:
+        # ``sub:`` / ``sub:onlyrun``：不是 lineage（没有父），别凭空造一个键
+        return []
+    return [parent, *lineage_sessions(parent)]
+
+
+def _fingerprint(snapshot: Snapshot) -> str:
+    """去重指纹：**同一条**快照在同一个栈里只能出现一次。
+
+    用 (路径, 时间戳, 工具, 写入前内容) 而不是只用路径：父子对同一文件的两次写入是
+    **两件事**，都必须能撤销；而"同一条快照被压两次"（收尾重排队、镜像 + 直接写…
+    见 ``pop_and_restore`` 失败时的回栈）必须只留一条 —— 否则撤销一次只是把内容换回同一份，
+    而它后面那一步已被悄悄吃掉，用户按两次 /undo 却只前进了一步。
+    """
+    return "\x1f".join(
+        [
+            snapshot.path,
+            f"{float(snapshot.at):.6f}",
+            snapshot.tool,
+            "1" if snapshot.existed else "0",
+            snapshot.content_b64 or snapshot.content,
+        ]
+    )
+
 
 @dataclass
 class Snapshot:
@@ -62,7 +108,25 @@ def _key(session_id: str) -> str:
 
 
 async def push(session_id: str, snapshot: Snapshot) -> bool:
-    """压入一条快照（LIFO）。返回是否成功 —— 失败意味着这次写入无法撤销。"""
+    """压入一条快照（LIFO）。返回是否成功 —— 失败意味着这次写入无法撤销。
+
+    G11：除了会话自己的键，还会把它**镜像**到祖先会话的键上（见 ``lineage_sessions``），
+    父会话的 ``/undo`` 因此能回滚子 Agent 的写入。镜像发生在**同一次** push 里（而不是
+    调用方各写一次）：挂钩点只有一处，"某个调用方忘了镜像"这种漏法就不存在。
+
+    去重按 ``_fingerprint`` —— 同一条快照不会在一个栈里排队两次（那会让用户按两次
+    ``/undo`` 只前进一步）。**顺序仍是后进先出**：镜像与直接写入一样是 ``lpush``，
+    所以"父先写、子后写"在父栈里的顺序就是 ``[子, 父]``，撤销时先回滚子。
+    """
+    ok = await _push_one(session_id, snapshot)
+    for ancestor in lineage_sessions(session_id):
+        mirrored = await _push_one(ancestor, snapshot)
+        ok = ok or mirrored
+    return ok
+
+
+async def _push_one(session_id: str, snapshot: Snapshot) -> bool:
+    """往**一个**键压入快照（带指纹去重）。"""
     try:
         from app.redis_client import get_redis
 
@@ -70,6 +134,8 @@ async def push(session_id: str, snapshot: Snapshot) -> bool:
         if redis is None:
             return False
         key = _key(session_id)
+        if await _already_present(redis, key, snapshot):
+            return True
         import json
 
         await redis.lpush(key, json.dumps(asdict(snapshot), ensure_ascii=False))
@@ -78,6 +144,78 @@ async def push(session_id: str, snapshot: Snapshot) -> bool:
         return True
     except Exception as e:  # noqa: BLE001 - 快照失败不该阻断写入本身
         logger.warning("undo snapshot push failed: %s", e)
+        return False
+
+
+async def _already_present(redis: object, key: str, snapshot: Snapshot) -> bool:
+    """栈顶起的 N 条里有没有**同一条**快照（按指纹比，不是按路径）。"""
+    try:
+        items = await redis.lrange(key, 0, MAX_SNAPSHOTS - 1)  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001 - 查不到就当没有（宁可多存一条，也不能丢快照）
+        logger.warning("undo snapshot dedupe lookup failed (%s): %s", key, e)
+        return False
+    want = _fingerprint(snapshot)
+    for raw in items or []:
+        existing = _decode(raw)
+        if existing is not None and _fingerprint(existing) == want:
+            return True
+    return False
+
+
+async def discard(session_id: str, target: str, *, at: float | None = None) -> int:
+    """丢弃某个目标**最近一条**快照（写入失败 / 被 guard 拒绝时调用），返回丢弃条数。
+
+    G11：快照是"写入**前**"拍的。工具随后失败或被拒时文件根本没变，那条快照若留着，
+    父会话下一次 ``/undo`` 会"恢复"成同一份内容 —— 用户按一下、什么也没变，
+    而真正需要撤销的那一步机会已经被消耗掉了。所以失败路径要把它**摘掉**：
+    会话自己的键与镜像到的祖先键**一起**摘（只摘一半等于没摘）。
+    """
+    removed = 0
+    for sid in [session_id, *lineage_sessions(session_id)]:
+        if await _discard_one(sid, target, at=at):
+            removed += 1
+    return removed
+
+
+async def _discard_one(session_id: str, target: str, *, at: float | None) -> bool:
+    try:
+        from app.redis_client import get_redis
+
+        redis = await get_redis()
+        if redis is None:
+            return False
+        key = _key(session_id)
+        items = await redis.lrange(key, 0, MAX_SNAPSHOTS - 1)
+        for raw in items or []:
+            snapshot = _decode(raw)
+            if snapshot is None or not _same_target(snapshot.path, target):
+                continue
+            if at is not None and abs(snapshot.at - float(at)) > 1e-6:
+                continue
+            return bool(await redis.lrem(key, 1, raw))
+        return False
+    except Exception as e:  # noqa: BLE001 - 摘不掉只是少一条清理，不该影响调用方
+        logger.warning("undo snapshot discard failed (%s): %s", target, e)
+        return False
+
+
+def _same_target(snapshot_path: str, target: str) -> bool:
+    """快照里的路径（``safe_join`` 产出的绝对路径）与调用方给的路径是不是同一个文件。
+
+    调用方（子 Agent 的 ``tool_call`` 事件）给的是**模型写的相对路径**（``src/a.py``），
+    而快照里存的是绝对路径 —— 只比字符串永远不相等，清理就会静默失效。
+    相对路径按工作区解析（不是按 cwd：进程的 cwd 与用户工作区不是一回事）。
+    """
+    if snapshot_path == target:
+        return True
+    try:
+        candidate = Path(target)
+        if not candidate.is_absolute():
+            from app.tools.sandbox import workspace_dir
+
+            candidate = Path(workspace_dir()) / candidate
+        return Path(snapshot_path).resolve() == candidate.resolve()
+    except Exception:  # noqa: BLE001 - 比不出来就当不同（宁可多留一条，也不能误删别人的快照）
         return False
 
 
@@ -194,6 +332,10 @@ def _decode(raw: object) -> Snapshot | None:
         content=str(data.get("content", "")),
         tool=str(data.get("tool", "")),
         at=float(data.get("at", 0.0)),
+        # G11：**必须**把原始字节读回来。此前这格被 `_decode` 丢掉，于是 push → pop 之后
+        # `restore` 只剩文本可用（且文本是 `errors="replace"` 出来的）—— 撤销会把
+        # 图片/压缩包写成 U+FFFD。H38 把字段加进了 Snapshot，却没接上解析这一头。
+        content_b64=str(data.get("content_b64", "") or ""),
     )
 
 
