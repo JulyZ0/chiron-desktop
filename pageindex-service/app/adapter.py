@@ -74,13 +74,21 @@ def citation_doc_id(doc_name: str) -> str:
 
 
 def citation_in_scope(doc_name: str, doc_ids: Iterable[str]) -> bool:
-    """解析不出前缀时判为通过（PageIndex 可能改写文档名，误杀比漏判更糟）。"""
+    """引用是否属于本次检索的文档集合（H44：**解析不出即拒绝**）。
+
+    旧实现在"文档名里没有 `前缀-`"时直接 `return True` —— 那是 fail-open：
+    只要 PageIndex 把文件名改写成别的形状（或返回一条来路不明的引用），越界引用
+    就会原样返回给用户，知识库边界形同虚设。
+
+    现在的口径与引擎侧一致：**无法解析 ⇒ 不认**。代价是 PageIndex 改写命名后可能
+    出现"该显示的引用被挡掉"；这比"越界内容被当成自家知识返回"要轻，而且会留
+    warning，能立刻发现。
+    """
     parsed = citation_doc_id(doc_name)
     if not parsed:
-        return True
+        logger.warning("knowledge: citation without a recognizable doc prefix: %r", doc_name)
+        return False
     return parsed in {doc_prefix(d) for d in doc_ids if d}
-
-
 def guard_citations(citations: list[dict[str, Any]], doc_ids: Iterable[str]) -> None:
     allowed = {d for d in doc_ids if d}
     strays = [
