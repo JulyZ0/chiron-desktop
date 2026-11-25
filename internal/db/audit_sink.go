@@ -40,7 +40,32 @@ type AuditSink struct {
 	window    time.Duration
 	stopCh    chan struct{}
 	doneCh    chan struct{}
+
+	// H44：失败不再"整批丢弃"。
+	//
+	// 旧实现是 `writer` 失败就 slog.Error + 丢掉整批 —— 审计是**事后追溯的唯一凭据**，
+	// 一次 PG 抖动（重启、连接池耗尽）就能让那段时间的登录/导出/删除记录**永久消失**，
+	// 而且日志里只是一行 error，没人会发现少了多少条。
+	//
+	// 现在：失败批**放回队首**等下一个窗口重试；缓冲超过上限才丢**最旧的**（并计数），
+	// 这样内存有界、丢失可见。
+	written  int64
+	dropped  int64
+	failures int64
+	// retries 是连续失败次数（成功后清零），用于退避与告警阈值。
+	retries int
 }
+
+// AuditSinkStats 是 sink 的可观测快照（供 /metrics 与诊断用）。
+type AuditSinkStats struct {
+	Buffered int64 `json:"buffered"`
+	Written  int64 `json:"written"`
+	Dropped  int64 `json:"dropped"`
+	Failures int64 `json:"failures"`
+}
+
+// 上限：缓冲最多保留 batchSize * maxBufferFactor 条，超出丢最旧。
+const maxBufferFactor = 20
 
 // NewAuditSink 创建 sink 并启动窗口定时 flush 协程。
 // batchSize<=0 → 100；window<=0 → 1s。
@@ -116,8 +141,56 @@ func (s *AuditSink) Flush(ctx context.Context) {
 		return
 	}
 	if err := s.writer(ctx, batch); err != nil {
-		slog.Error("audit sink: batch insert failed, dropping batch",
+		s.recordFailure(batch, err)
+		return
+	}
+
+	s.mu.Lock()
+	s.written += int64(len(batch))
+	s.retries = 0
+	s.mu.Unlock()
+}
+
+// recordFailure 把失败的批次放回队首并计数；缓冲超上限时丢最旧的。
+func (s *AuditSink) recordFailure(batch []AuditEntry, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.failures++
+	s.retries++
+	// 放回队首：保持时间顺序，下一窗口先重试这批，再处理新到的。
+	s.buf = append(batch, s.buf...)
+
+	limit := s.batchSize * maxBufferFactor
+	if limit < s.batchSize {
+		limit = s.batchSize
+	}
+	if over := len(s.buf) - limit; over > 0 {
+		s.buf = s.buf[over:]
+		s.dropped += int64(over)
+		slog.Error("audit sink: buffer over limit, dropped oldest entries",
+			"dropped", over, "total_dropped", s.dropped, "limit", limit)
+	}
+	// 连续失败要给运维一个"该看一眼"的信号（PG 挂了 / 表被锁 / 权限没了）。
+	if s.retries == 3 || s.retries%10 == 0 {
+		slog.Error("audit sink: batch insert failing, entries requeued",
+			"count", len(batch), "consecutive_failures", s.retries,
+			"buffered", len(s.buf), "error", err)
+	} else {
+		slog.Warn("audit sink: batch insert failed, entries requeued",
 			"count", len(batch), "error", err)
+	}
+}
+
+// Stats 返回当前统计（buffered 需要取锁，其余读计数）。
+func (s *AuditSink) Stats() AuditSinkStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return AuditSinkStats{
+		Buffered: int64(len(s.buf)),
+		Written:  s.written,
+		Dropped:  s.dropped,
+		Failures: s.failures,
 	}
 }
 
