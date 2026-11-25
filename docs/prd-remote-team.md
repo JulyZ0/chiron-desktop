@@ -27,9 +27,7 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 
 | ID | 事项 | 完成定义 | 落点 |
 |---|---|---|---|
-| **G10** | 调用链上限与折叠 | `CallChainTimeline` 一次渲染整份 trace：加"默认只展开最近 N 轮 + 按 turn 折叠 + 超限提示"，并修 `totalDurationMs` 父子重复求和（有单测） | `CallChainTimeline.vue` |
 | **G11** | 子副作用并入父账本 | 子 Agent 的写入同时记父会话键（或按 lineage 解析），整轮 `/undo` 覆盖子 Agent 写过的文件；有跨会话回滚测试 | `undo_stack.py`、`side_effect_ledger.py` |
-| **G12** | 轨迹窗格分页 + 虚拟化 | 尾部窗口 + 向前翻页 + 只渲染可见行 + 三组独立折叠 + 流式跟随（用户上滑才停）；进行中记录**不显示耗时** | `CallChainTimeline.vue`、`ChatSidePanel.vue` |
 | **G13** | job 生命周期进会话流水 | 队列任务起停/完成/失败写一条会话级事件，"队列 / 会话 / SSE 三份进度"收敛为一份；前端只订阅一处 | `app/queue/worker.py` → `internal/api/` |
 | **G14** | 工具结果 spill 统一 | 超过阈值一律落盘 + 上下文只放头尾 + locator（复用 `read_tool_result` 分段取回）；所有工具统一走同一出口 | 新增 `app/tools/spill.py`、`registry.py` |
 | **G15** | 并发安全由工具声明 | 并行从"按动作级推断"改为"工具显式声明 `is_concurrency_safe`"，未声明一律串行；漏声明只降速不放错 | `app/tools/registry.py` + 各写工具 |
@@ -69,7 +67,7 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 |---|---|---|---|---|
 | W-A | `wt-g13` / `task/g13-g16` | G13 job 进会话流水、G16 任务心跳 | `app/queue/**`、`internal/api/**`(新增)、`metrics.py`(追加) | 进行中 |
 | W-A | `wt-g14` / `task/g14-g15` | G14 结果 spill 统一、G15 并发显式声明 | `app/tools/**` | 进行中 |
-| W-A | `wt-g10` / `task/g10-g12` | G10 调用链上限/折叠、G12 轨迹分页+虚拟化 | `CallChainTimeline.vue`、`chat/traceWindow.ts` | 进行中 |
+| W-A | `wt-g10` / `task/g10-g12` | ~~G10、G12~~ ✅ 已合入 | — | 完成 |
 | W-A | `wt-g17` / `task/g17-g18` | G17 预览 offset 分页、G18 布局断点纯函数化 | `KBDocumentPreview.vue`、`composables/layout*`、`api/knowledge.py` | 进行中 |
 | W-A | `wt-g21` / `task/g21` | G21 PDF/大文件解析进 Worker | `MediaView.vue`、`workers/**` | 进行中 |
 | W-A | `wt-h16` / `task/h16b` | H16b 契约 v2 四族 | `contracts/**`、`internal/contract/**`、`app/contract/**` | 进行中 |
