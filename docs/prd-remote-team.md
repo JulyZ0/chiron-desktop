@@ -2,11 +2,11 @@
 
 - 状态：S0–S4、R1/R3/R4/R5 已实现；R6/R7 的观测与告警、R9 span/trace、R10 数据生命周期仍在推进。
 - 加固来源：H1–H86 是 2026-11-24 的全量审计结论（前端/桌面壳/后端），后经七轮推进：
-  **已完成 58 项**（逐条登记在 9.5）、**待办 24 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
+  **已完成 64 项**（逐条登记在 9.5）、**待办 18 项**（9.2）。H80/H81/H84/H85 从未立项，不计数。
 - **推进方式（唯一入口）**：只看第 9 章。9.1 决定顺序，9.2 是待办清单与可执行判据，
   9.3 是里程碑退出条件，9.4 是待确认决策，9.5 是已完成项的证据索引。
   历次「本轮做了什么」的逐条叙述已压缩，不再按轮次重复。
-- 当前波次：**W1**（H45/H48/H50/H73/H76/H11）→ W2 → W3；W4 四项等外部条件或决策。
+- 当前波次：**W1 已完成**（H45/H48/H50/H73/H76/H11）→ 下一波 **W2**；W3/W4 见 9.1。
 - 待团队主机：R2 实测切换、R6 压测、Web E2E。
 - 已知未覆盖：LiteLLM 与 Langfuse 实例级验证、R10 租户删除闭环、S5 多实例演练。
 - 关键落点：`internal/api/device_fs.go`、`internal/api/project_mirror.go`、
@@ -131,24 +131,18 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | 波次 | 范围 | 为什么排这里 | 本机能否闭环 |
 |---|---|---|---|
-| W1 | H45、H48、H50、H73（剩余半）、H76（剩余半）、H11 | 单点改动 + 纯函数/探针即可证明；其中 H45/H50/H48 是**对外**风险（更新、传输、二因素） | 能（H48 的非 Windows 分支用注入桩验证） |
+| W1 ✅ | ~~H45、H48、H50、H73、H76、H11~~ **已完成**（证据见 9.5） | 单点改动 + 纯函数/探针即可证明；H45/H50/H48 是**对外**风险（更新、传输、二因素） | 本机已闭环（H48 的非 Windows 分支用注入桩） |
 | W2 | H7、H36、H41、H17、H15、H60 | 需要在既有链路上加"身份/代次/预占"这类中间层，改动中等但都可测 | H7 的并发场景需真 Redis → 由 CI 的 redis service 闭环；其余能 |
 | W3 | H46（服务端）、H47、H38、H14、H24、H44、H51 | 体量大、跨语言，必须拆片推进（见 9.2 的"切片"列） | 能，但每片都要单独验收 |
 | W4 | H2、H20、H19、H22 | 外部条件或产品决策未定，做了也无法验收 | 不能（见 9.4） |
 
-### 9.2 待办清单（24 项）
+### 9.2 待办清单（18 项）
 
 "完成定义"一栏是**可执行判据**：满足它即可从本表删除，并把证据登记进 9.5。
 "切片"一栏给出单项可独立验收的第一步，避免"一次改到底、谁也无法证明它对"。
 
 | ID | P | 目标 | 完成定义（可执行判据） | 切片 / 前置 | 波次 |
 |---|---|---|---|---|---|
-| H45 | P0 | 更新清单与安装器真实性 | 版本/架构/文件名/大小/摘要过严格 schema；缺 `sha512` 立即拒绝；内嵌公钥验签（未配公钥 ⇒ 一律拒绝，fail-closed）；缓存包启动前复验；重定向仅允许发布域 | 已有 semver/channel/pin 基础（H57）⇒ 直接加 schema + 验签 | W1 |
-| H48 | P1 | 敏感操作与二因素 fail-closed | 不支持原生重认证的平台拒绝破坏性操作（返回 `ok:false` 并说明）；2FA 密文不可读时**阻止**解锁并给显式恢复入口；取消/关闭/成功/失败/卸载都清空 secret/QR/TOTP/recovery/password | 三处独立可测：清空数据、2FA 解锁、面板内存清理 | W1 |
-| H50 | P1 | 远程连接传输安全 | 非 loopback 强制 HTTPS；开发需显式 `allowInsecure`；配置**保存时**与**连接建立前**双重校验；禁止向 http/ws 发送 token/Cookie/私有内容 | 配置层 + API 层两处校验，各自单测 | W1 |
-| H73 | P1 | 破坏性预览绑定不可变目标 | 服务端 dry-run 下发 `plan_digest`；执行回传并**重算比对**，不一致 409；前端已就绪 | 只差服务端签发与校验（Go + Python 各一处） | W1 |
-| H76 | P0 | 技能共享层写权限 | 普通成员写共享层 400/403；成员改共享技能只生成**私有 override**（共享层字节不变）；越界/跨用户探针不落盘 | 前半（name 白名单/resolved containment）已完成，只补 tenant-admin 判据与 override | W1 |
-| H11 | P1 | Provider attempt 身份与终态 | 每个 attempt 有身份与合法终态；malformed SSE 不得跳过；流结束无 completed/tool_calls ⇒ 失败；partial 不执行后续工具；重试分类有上限且可观测 | 先做"终态判定"，再做"重试分类" | W1 |
 | H7 | P1 | 队列 claim 与 attempt fencing | 并发 claim 仅一个成功（Lua/SETNX 单点裁决）；旧 attempt 的 complete/fail/ack 不生效；重复投递副作用幂等；retry 保留 idempotency/deadline/trace/priority | 需真 Redis 复跑 ⇒ 由 CI redis service 闭环；本地用 fakeredis 覆盖逻辑 | W2 |
 | H36 | P1 | 预算与 key 绑定原子化 | 预算用 Lua/事务**预占+释放**（带 TTL）；403 区分配额/模型无权限/凭证失效；key 绑定 provider+base_url+账号域；重试预算不被 SDK 内部重试放大 | 预算预占 → 403 分类 → key 绑定，三步各自可测 | W2 |
 | H41 | P1 | 提权 helper 与子进程边界 | stdout/stderr **并发排空**且有总量上限；提权代码只从 ACL 受保护目录加载；helper 验证可执行/模块路径，拒绝用户可写 cwd | 只做可测部分：管道排空、加载路径校验、拒绝可写 cwd | W2 |
@@ -172,7 +166,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | 里程碑 | 范围 | 退出条件 |
 |---|---|---|
-| M1 对外安全门禁 | W1 | 六项完成定义全部有回归；`go build/test`、`vue-tsc`、`check:ui`、electron `node --test` 全绿 |
+| M1 对外安全门禁 ✅ | W1 | 六项完成定义全部有回归（见 9.5）；`go build/test`、`vue-tsc`、`check:ui`、electron `node --test` 全绿 |
 | M2 执行可靠性 | W2 | 并发/竞态类探针可复现"修复前失败"；H7 由 CI（真 Redis）闭环 |
 | M3 契约与设备 | W3 前段（H46/H47） | 设备桥从 fail-closed 变为可用且票据为唯一凭据；renderer 特权面收敛并有回归 |
 | M4 数据与授权收口 | W3 后段（H24/H38/H14/H44/H51） | 授权/审计/供应链三条链各自有"未授权即拒绝"的探针 |
@@ -250,6 +244,12 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H54 | 本机栈**身份挑战**：`/ready` 增补实例 ID / 协议版本 / data dir 指纹（仅本地模式，云端不设 env 就不回显）；外壳写状态时带同一身份，探测逐项比对，**任一不符即拒绝接管**；旧部署（状态里没有 instanceId）与旧网关（不回显）一律不认 ｜ 证据：Go `internal/api/instance_identity_test.go`（4 项：未注入不回显、注入则回显、协议回落、指纹稳定且不可逆）；Electron `runtime-identity-h54.test.cjs`（8 项：ID 不一致/未回显/旧状态/协议不一致各自拒绝），既有 `runtime-state.test.cjs` 12 项同步更新 |
 | H62 | 实时输出/错误/日志**出口**统一脱敏：事件 `content`/`tool_arguments`/`error` 与 runtime 的 Provider 原生错误、顶层异常都过 `redact_text`（密钥形态 + 运行时登记凭据双层，幂等）；前端新增 `utils/redact.ts`（同口径 + 剔除 `Authorization`/`Cookie`/`x-api-key` 与 URL 凭据），本地栈未就绪提示里的服务端原文也脱敏 ｜ 证据：`tests/test_redaction_h62.py`（14 项，含事件三个字段、幂等、provider 摘要保留 status）；`src/utils/__tests__/redact.spec.ts`（18 项，含 Axios 错误对象、嵌套响应体、深度折叠、上报摘要） |
 | H67 | 私密媒体不再把**裸对象 URL** 交给 renderer：`resolveMediaUrl` 默认拒绝不可信绝对地址（裸 S3/GCS 一律不算），有 asset id 就走 owner-bound 签名、没有就返回空串；签名结果过来源校验；签名缓存改为**按 user/tenant/mode/origin 作用域**隔离，作用域一变整表作废，并与 H68 的认证重置钩子联动清空 ｜ 证据：`src/utils/__tests__/mediaUrlCache.spec.ts`（12 项：换账号/租户/部署/模式各自失效、提前量过期、prune、裸 S3 不可直接渲染、blob/data 白名单） |
+| H73 | 服务端签发并校验 `plan_digest`：dry-run 下发、执行前再跑一次只读重算，不一致 409 且不删；摘要覆盖 workspace/保留期/计划内容（键序无关、planned 排序） ｜ 证据：`internal/api/checkpoint_plan.go`、`checkpoint_plan_test.go`（6 项）、`src/utils/__tests__/checkpointPlanDigestSource.spec.ts`（4 项） |
+| H76 | 共享层写入按角色分流：admin 就地更新；普通成员改租户共享技能只写**私有 override**（共享层字节不变）；全局共享层成员一律 403；缺角色头按非管理员处理 ｜ 证据：`tests/test_skill_shared_write_h76.py`（9 项） |
+| H45 | 更新清单严格 schema（版本/大小/扩展名/域名白名单/架构）+ 缺 `sha512` 立即拒绝；缓存包复验前要求摘要存在；启动安装器前过 Ed25519 验签（未配公钥即拒绝） ｜ 证据：`electron/update-manifest.cjs`、`electron/__tests__/update-manifest.test.cjs`（18 项） |
+| H50 | 服务地址传输安全双重校验（保存时 + 建连前）；非 loopback 强制 HTTPS；明文非回环**不发凭据**并给请求打匿名标记；拒 scheme 与内嵌凭据的地址 ｜ 证据：`electron/api-url-policy.cjs`、`electron/__tests__/api-url-policy.test.cjs`（11 项）、`src/utils/apiUrlPolicy.ts` |
+| H48 | 非 Windows 平台拒绝破坏性操作（不再"免验证通过"）；2FA 密文不可读时拒绝解锁并返回`second-factor-unreadable` + 显式重置路径（`desktop:reset-two-factor`，状态可读时拒绝重置） ｜ 证据：`electron/__tests__/sensitive-action-h48.test.cjs`（5 项） |
+| H11 | Responses 流式解析要求合法终态：畸形帧计数不静默跳过、无 `completed` 即失败、截断回合**不交出**已收集的工具调用（防 partial 执行副作用） ｜ 证据：`python-engine/tests/test_provider_stream_terminal_h11.py`（8 项） |
 
 ## 10. 参考
 
