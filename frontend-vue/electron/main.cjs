@@ -93,6 +93,8 @@ const openPathGuard = require('./open-path-guard.cjs')
 const { createMountDeps } = require('./mount-deps.cjs')
 const {
   parseLatestYml,
+  validateLatestManifest,
+  gateInstallerLaunch,
   compareVersions,
   pickLatestRelease,
   manifestUrlForTag,
@@ -2234,7 +2236,18 @@ async function checkUpdateViaReleaseList(current) {
   let manifest
   try {
     const text = (await httpsGetBuffer(manifestUrlForTag(UPDATE_REPO, release.tag))).toString('utf8')
-    manifest = parseLatestYml(text)
+    // H45：清单必须过严格 schema —— 缺 sha512 / 大小非正 / 域名不在白名单，
+    // 一律视为"不可用"，而不是"少校验一项照样装"。
+    const validated = validateLatestManifest(parseLatestYml(text))
+    if (!validated.ok) {
+      return {
+        ok: false,
+        reason: 'manifest-invalid',
+        message: `更新清单不合法（${validated.errors.join(', ')}）。请到发布页手动下载：https://github.com/${UPDATE_REPO}/releases`,
+        current,
+      }
+    }
+    manifest = { ...validated.manifest, notes: validated.manifest.notes || '' }
   } catch (err) {
     return {
       ok: false,
@@ -2262,7 +2275,16 @@ async function checkAppUpdate() {
     }
     return { ok: false, reason: 'network', message: err?.message || String(err), current }
   }
-  return buildUpdateCheckResult(current, parseLatestYml(text), null)
+  const validated = validateLatestManifest(parseLatestYml(text))
+  if (!validated.ok) {
+    return {
+      ok: false,
+      reason: 'manifest-invalid',
+      message: `更新清单不合法（${validated.errors.join(', ')}）。请到发布页手动下载：https://github.com/${UPDATE_REPO}/releases`,
+      current,
+    }
+  }
+  return buildUpdateCheckResult(current, validated.manifest, null)
 }
 
 /**
@@ -2361,6 +2383,34 @@ async function runUpdateJob() {
   const final = path.join(dir, job.asset)
 
   const openInstaller = async () => {
+    // H45：执行安装器前过完整门禁（摘要 + 发布者签名）。
+    //
+    // 未配置内嵌公钥时 gate 会返回 `no-public-key` —— 这是**预期**的 fail-closed：
+    // 发布签名根尚未落地（PRD 9.4 决策 4），此时"检查更新/下载"仍可用，
+    // 但**不会**执行一个无法证明来源的二进制。
+    let bytes = null
+    try {
+      bytes = await fs.promises.readFile(final)
+    } catch (err) {
+      job.state = 'error'
+      job.message = `读取安装包失败：${(err && err.message) || err}`
+      await persistUpdateJob(true)
+      return
+    }
+    const gate = gateInstallerLaunch({
+      buffer: bytes,
+      manifest: { file: { sha512: job.sha512 } },
+      installerSignature: job.signature || '',
+      publicKey: String(process.env.CHIRON_UPDATE_PUBKEY || '').trim(),
+    })
+    if (!gate.ok) {
+      job.state = 'error'
+      job.message = `安装包未通过校验（${gate.reason}），已拒绝启动`
+      logMain('error', `installer launch refused: ${gate.reason}`)
+      await persistUpdateJob(true)
+      return
+    }
+
     const failure = await shell.openPath(final)
     if (failure) {
       job.state = 'error'
@@ -2373,9 +2423,18 @@ async function runUpdateJob() {
     await persistUpdateJob(true)
   }
 
-  // 已经下载并校验过的包：直接再次拉起（升级 UAC 取消后用户重试）。
+  // 已经下载并校验过的包：复验后再次拉起（升级 UAC 取消后用户重试）。
+  //
+  // H45：旧实现的条件是 `!job.sha512 || 摘要相等` —— **没有摘要就直接放行**，
+  // 于是"缓存包无摘要"等于永久免检。现在缺摘要即拒绝（与清单侧同一口径）。
   if (fs.existsSync(final)) {
-    if (!job.sha512 || (await sha512File(final)) === job.sha512) {
+    if (!job.sha512) {
+      job.state = 'error'
+      job.message = '缓存安装包缺少摘要，已拒绝启动（请重新下载）'
+      await persistUpdateJob(true)
+      return
+    }
+    if ((await sha512File(final)) === job.sha512) {
       job.downloaded = job.total || fs.statSync(final).size
       await openInstaller()
       return
