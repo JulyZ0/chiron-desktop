@@ -6,6 +6,7 @@
 - 2026-11-24 第三轮加固：**H4/H5/H6/H9/H10/H12/H13/H18/H25/H42/H49/H52/H55/H59/H61/H69/H75/H77/H86 已完整验收并从待办表移除**，证据见 9.13。
 - 只剩两半的项：**H46**（设备桥客户端已收紧，服务端票据端点与签名校验待实现）、**H73**（前端已绑定不可变计划，服务端 `plan_digest` 校验未做）；两条都留在表里并写清了缺哪一半。
 - 2026-11-25 第四轮加固：**H43/H78/H79 已完整验收并从待办表移除**，证据见 9.14。
+- 2026-11-25 第五轮加固（按"先做容易推进的"排序）：**H21/H53/H56/H57/H64/H83 已完整验收并从待办表移除**，证据见 9.15。
 - 待团队主机：R2 实测切换、R6 压测、Web E2E。
 - 暂缓：LiteLLM、Langfuse 实接、R10 租户删除、S5；ACP 完整协议见 H19，按产品目标排期。
 - 关联：`internal/api/device_fs.go`、`project_mirror.go`、`sessionmap_projects.go`、`frontend-vue/electron/device-fs.cjs`、`docs/desktop-local/contracts.md`、`docs/team-domain-deployment.md`。
@@ -167,7 +168,6 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 |---|---|---|
 | H19 | **ACP 完整 Agent 协议** | 声明 capabilities；new_session 绑定 workspace/cwd；load_session 可回放；支持附件、tool updates、permission ask；保留现有真实 cancel。若编辑器集成非当前目标，则明确标为暂缓。 |
 | H20 | **Provider 密钥加密存储** | Redis 不保存明文 key；支持可配置的 KMS/Secret Manager 或信封加密后端；密钥轮换、version 标记、访问审计齐全；env 仅作兜底。 |
-| H21 | **关键文档 tracked 化** | 将安全契约、部署拓扑和设计决策从缺失/ignored 的 `vendor/*.md` 迁入 tracked `docs/`；文档链接检查进入 CI。 |
 | H22 | **只读子 Agent 强隔离（按需）** | 若产品承诺严格只读，使用动态 capability 与 host-observed mutation receipts；共享 workspace 的 diff 不归因到具体 child；否则明确只保证工具级只读。 |
 
 ### 9.5 里程碑与退出条件
@@ -177,7 +177,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | M-H0 对外安全门禁 | H2、H24、H45–H46、H76 | P0 自动化测试全部通过；Linux 无隔离时明确拒绝执行；跨用户资源访问、技能路径穿越、插件/Git 执行绕过、更新真实性、设备桥越权与凭据跨源复用均有回归测试。 |
 | M-H1 故障接管门禁 | H7、H11、H36、H38、H41、H47–H48、H50–H51、H65、H67、H73 | 故障注入下无双重副作用；stale worker 无写权；预算、审批、提权 helper、renderer 权限、附件/账户切换与交付链失败语义通过测试。 |
 | M-H2 契约与工程门禁 | H14–H17、H44、H53–H54、H56、H60、H62、H70–H72、H82–H83 | 状态一致性测试、schema conformance、MCP 并发测试通过；运维验收、数据生命周期、流恢复、缓存、管理权限呈现与构建可复现性证据不得假成功。 |
-| M-H3 产品化增强 | H19–H22、H57、H64 | 按确认后的产品目标逐项验收；非目标项保持显式暂缓。 |
+| M-H3 产品化增强 | H19–H20、H22 | 按确认后的产品目标逐项验收；非目标项保持显式暂缓。 |
 
 ### 9.6 待确认决策
 
@@ -214,10 +214,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H48 | P1 | **敏感操作、第二因素 fail-closed 与秘密清理** | 非 Windows 清空数据直接返回验证成功；2FA 密文不可读时按未启用放行；注册弹窗取消不清 secret/QR，恢复码弹窗用默认关闭路径也不清数组。证据：`frontend-vue/electron/main.cjs:1691`、`:2786`、`:2963`、`frontend-vue/electron/two-factor.cjs:124`、`:269`、`frontend-vue/src/components/settings/TwoFactorPanel.vue:125`、`:345`、`:362`、`:392` | 不支持原生重认证的平台不得执行破坏性操作；2FA 状态不可读时阻止解锁并提供显式恢复/重置流程；所有降级必须可观测，不得静默跳过安全因素；取消、关闭、成功、失败与卸载都清空 secret/QR/TOTP token/recovery codes/password 等敏感内存值。 |
 | H50 | P1 | **远程连接传输安全** | 配置接受任意 HTTP(S) 地址，API 客户端向其附加 Bearer token，CSP 也会放行该 origin。证据：`frontend-vue/electron/config.cjs:56`、`frontend-vue/src/api/index.ts:172`、`frontend-vue/electron/main.cjs:338` | 非 loopback 地址强制 HTTPS；开发/测试需显式不安全开关；禁止向 HTTP/WS 发送 token、Cookie 或私有内容；配置保存与连接建立双重校验。 |
 | H51 | P1 | **运行时与组件供应链完整性** | `uv pip install` 未使用 hash lock，core 依赖为版本范围并自动尝试第三方镜像；组件下载允许 HTTP，摘要来自同一来源而非签名信任根。证据：`frontend-vue/electron/runtime-install.cjs:762`、`:793`、`:1023`、`desktop-local/pyproject.toml:11`、`desktop-local/app/components/manager.py:497`、`:598`、`:973` | 完全锁定依赖与 artifact hashes；优先签名离线包/ wheels；组件 manifest 使用内嵌公钥签名；仅允许 HTTPS 与批准主机，不静默切换第三方镜像；安装后与执行前再次校验。 |
-| H53 | P2 | **清空数据的范围与残留治理** | 清空只覆盖渲染存储、token 与 `userData/local`，`secrets.bin`、更新状态/下载、配置、runtime state、device id 仍保留。证据：`frontend-vue/electron/wipe-data.cjs:60`、`:90` | 明确“清空会话数据”和“恢复出厂”两种范围；后者覆盖全部敏感残留并验证结果；前者 UI 不得宣称全部本机数据已删除。 |
 | H54 | P2 | **本机栈身份挑战** | 仅凭 loopback `/ready` 返回 PostgreSQL/Redis up 就认定现有栈属于 Chiron，无实例密钥、版本或数据目录绑定。证据：`frontend-vue/electron/runtime-state.cjs:102`、`:114`、`:120` | 使用每数据目录随机 secret 的挑战响应，并校验实例 ID/协议版本；未知服务不得附加、配置或发送凭据。 |
-| H56 | P2 | **Windows 子进程树终止** | 运行时安装与设备 Git 超时只 kill 直接子进程，Windows 后代进程可能继续运行。证据：`frontend-vue/electron/runtime-install.cjs:660`、`frontend-vue/electron/device-fs.cjs:335` | 使用 Job Object 或 `taskkill /T` 终止完整进程树；超时/取消后验证无残留，资源上限与审计一致。 |
-| H57 | P3 | **更新渠道与版本语义** | 版本比较丢弃 prerelease/build 元数据，按数字最大值选版本，无稳定/预发布策略、撤回与 pin 语义。证据：`frontend-vue/electron/update-check.cjs:52`、`:80` | 实现完整 semver 优先级、channel/withdrawal/pin 策略；降级与回滚必须来自新鲜可信清单，不得自动重装被 pin 的版本。 |
 
 ### 9.9 聊天、审批与流式恢复新增项（H58–H64）
 
@@ -225,7 +222,6 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 |---|---|---|---|---|
 | H60 | P2 | **重连、历史恢复与异步竞态守卫** | 重连仅 `/health` 后调用 `switchSession(当前 id)`，同 ID 直接返回；模型/上下文、收件箱、子 Agent、工具输出、工作台与媒体/KB 预览缺少 await 后 generation 校验。证据：`frontend-vue/src/views/ChatView.vue:1872`、`:2066`、`:2115`、`frontend-vue/src/components/chat/InteractionInbox.vue:46`、`frontend-vue/src/components/chat/SubAgentPanel.vue:619`、`frontend-vue/src/components/chat/ToolResultBlock.vue:239`、`frontend-vue/src/components/workbench/WorkbenchPanel.vue:523`、`frontend-vue/src/views/MediaView.vue:318`、`frontend-vue/src/components/KBDocumentPreview.vue:114` | 显式重开当前流、带游标补发并重拉历史；所有异步写回捕获 session/file/run 与 request generation，stale 响应和 finally 状态不得覆盖新视图；关闭/切换时 Abort 并回收 object URL。 |
 | H62 | P2 | **实时输出、错误与日志脱敏** | Provider 错误原文直接显示；子 Agent 审批参数、工具参数与结果实时发射未脱敏；Axios 错误整体进 console，可能含 Authorization 头。证据：`frontend-vue/src/views/ChatView.vue:2583`、`python-engine/app/agent/runtime.py:3196`、`python-engine/app/agent/event_sink.py:290`、`:364`、`:401`、`frontend-vue/src/composables/useSessionSwitch.ts:216` | 发射、显示、持久化与日志前统一脱敏；仅记录 status/code/request ID；明文查看需独立权限与显式揭示；测试覆盖 header、key、token、连接串。 |
-| H64 | P3 | **附件 URL 来源与协议约束** | `attachmentUrl()` 直接返回解析或持久化 URL 并进入图片/音频/文件绑定；未确认攻击者可控来源。证据：`frontend-vue/src/components/chat/MessageItem.vue:305`、`:846`、`frontend-vue/src/views/ChatView.vue:1912` | 仅允许明确 scheme/origin；记录附件来源；导出 Markdown 不携带签名 URL；新协议或跨域来源需显式策略。 |
 
 ### 9.10 API 契约、资源身份与项目操作新增项（H65–H86）
 
@@ -243,7 +239,6 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H73 | P1 | **破坏性预览绑定不可变目标** | 前端已修：预览计划携带不可变 workspace/generation/摘要，确认执行只按该计划落点，切换项目使确认失效（`frontend-vue/src/utils/checkpointGcPlan.ts`、`CheckpointTimeline.vue`、`api/checkpoints.ts` 已带 `plan_digest`）。**未做**：`internal/api/checkpoint_diff.go` 的 `checkpointGcBody` 仍不接收/校验 `plan_digest`，引擎也没有下发"服务端签发的计划摘要"，因此服务端一致校验这一条还不成立。 | 预览计划携带不可变 workspace、generation 与计划摘要；确认执行必须绑定该计划，切换项目使确认失效；**服务端**校验计划/目标一致（dry-run 下发摘要、执行回传并重算比对，不一致 409），破坏性操作不得按当前 UI 状态重新选目标。 |
 | H76 | P0 | **技能名路径穿越与共享层越权写入** | install 只检查 name 非空；`_path()` 直接拼接 `{name}.skill.json`，`save()` 创建父目录并原子替换，`../`/绝对路径可覆盖存储目录外或其他用户技能。`update_meta()` 还会就地修改共享层载体。证据：`python-engine/app/api/skills.py:172`、`:183`、`:195`、`python-engine/app/skill/store.py:406`、`:463`、`:469`、`:494`、`:545` | 所有 save/delete/meta/update 入口统一严格 name 校验（白名单、长度、拒绝分隔符/绝对路径）并验证 resolved containment；tenant 共享写入要求 tenant-admin；成员修改共享技能只生成私有 override；跨用户/越界探针不得落盘。 |
 | H82 | P1 | **缩短数据保留期需破坏性确认** | 保留期表单保存前不比较新旧值，任何天数下降都直接写入配置；后台清理在后续周期按新阈值删除 usage、分享与检查点，UI 没有展示影响范围、生效时间或不可逆确认。证据：`frontend-vue/src/views/admin/MonitorView.vue:104`、`:109`、`internal/api/admin_extras.go:563`、`internal/api/retention.go:520`、`internal/api/routes_admin.go:170` | 任一保留天数下降时展示旧/新阈值、受影响数据类型、预计生效周期并二次确认；取消不得写配置；服务端记录操作者与变更审计，测试覆盖仅缩短、混合变更与失败回滚。 |
-| H83 | P2 | **租户 Admin 可见平台 Owner 专属后台入口** | 路由与守卫允许 `admin/owner` 进入 `/admin`，侧边栏无条件展示监控、Provider 与依赖管理等页面；相应接口使用 `RequirePlatformOwner`，租户 admin 点击后得到 403。后端已阻止越权，但导航承诺与实际权限不一致。证据：`frontend-vue/src/router/index.ts:186`、`:201`、`:209`、`:309`、`frontend-vue/src/router/guard.ts:112`、`frontend-vue/src/views/admin/Layout.vue:101`、`internal/api/routes_admin.go:164`、`:184`、`internal/api/deps_admin.go:587` | 路由与菜单按服务端 capability 区分 tenant-admin 与 platform-owner；无权限入口隐藏或禁用，直接访问给出明确的未授权页面且不发起无权请求；两种角色均有导航与接口契约测试。 |
 
 ### 9.11 易推进项实施状态（2026-11-24）
 
@@ -331,6 +326,20 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H43 | `run.py` 的进程/端口判定改精确匹配：`tasklist -FO CSV` 按 PID 精确比对、`netstat`/`lsof` 按**端口整段**匹配并只看 LISTENING；新增 `restart()` 校验（PID 存活 + 端口归属一致）与 `--strict`，`main` 用 `sys.exit(0/1)` 反映结论 | `scripts/tests/test_service_identity_h43.py`（13 项）；变异复跑：端口子串/PID 子串/restart 吞退出码 三种回退**全部变红**，恢复后全绿 |
 | H78 | 画布归属以**权威存储**为准：`smLoadWorkspaceOwner` 直读 PG（不再只看 Redis）；`SaveWorkspace` 归属不符/记录不存在一律 404；`smPersist` 的 UPDATE 带 `tenant_id/user_id` 并检查影响行数、节点 DELETE 用 `USING session_map_workspaces` 收敛；`BindProjectSession` 增加 `smOwnsSession` 校验、`force` 不再能删他人归属 | `internal/api/sessionmap_owner_guard_test.go`（4 项源码约束）+ 既有 `sessionmap_edgekind_guard_test.py` 断言同步更新（取值来源从热层改为权威存储）；`go test ./internal/api` 全绿 |
 | H79 | 云端凭据与 API origin 绑定（v2 信封 `{v,origin,token,savedAt}`，规范化 `scheme://host:port`）：写侧无可信 origin 即拒绝落盘；读侧归属不符**清盘**并要求重新登录；`desktop:set-api-url` 按 `sameOrigin` 判定换代并清凭据；旧版裸 token 视为无法证明归属（清盘一次） | `frontend-vue/electron/__tests__/token-origin.test.cjs`（6 项，含跨域清盘、默认端口等价、legacy 判定）；electron 全量 `node --test` 530/531 通过（唯一失败为需真实 Electron 的既有 `csp-injection`） |
+
+### 9.15 第五轮加固验收（2026-11-25，已从待办表移除）
+
+- 挑选口径：先做**自包含、可在本机完整验证**的项（纯函数 / 源码守卫 / 内存 fs 打桩），
+  避免"改了一半没人能证明它对"的中间态。
+
+| ID | 落点 | 回归证据 |
+|---|---|---|
+| H21 | 文档可信度：`docs/` 四份关键文档（PRD / 本地契约 / 团队部署 / 贡献指南）全部 tracked；引用的设计文档**零缺失**（`doc_link_baseline.txt` 为空）；CI 已跑断链与表格结构检查，本轮把它们纳入 `scripts/check_ci_gates.py` 的自检清单（12 条门禁） | `python scripts/check_doc_links.py`（0 债务）、`check_md_tables.py`、`check_ci_gates.py`（新增 2 条并全绿） |
+| H53 | 清空数据范围与界面承诺对齐：`wipeLocalData` 从"只删 `local/` + token"扩到 `config.json` / `token.bin` / `secrets.bin` / `device-id` / `approved-roots.json` / `two-factor.json` / `runtime-state.json` / `updates/` / `Partitions/<分区>/` / `logs/`；**删不掉逐项上报**而不是静默跳过；`keepLogs` 与自定义 `partitions` 可配 | `electron/__tests__/wipe-data-scope.test.cjs`（7 项：范围齐全、递归语义、失败点名上报且其余继续、keepLogs、自定义分区、停后端失败即中止不删半份、缺 userData 明确报错） |
+| H56 | Windows 子进程树终止：新增 `electron/proc-tree.cjs`；安装与设备 Git 的取消/超时改 `taskkill /T /F /PID`（POSIX 自成进程组后 `kill(-pid)`），并保底 `SIGKILL` | `electron/__tests__/proc-tree.test.cjs`（8 项，含"taskkill 非零必须留痕"、"负 PID 而非单进程"、源码守卫禁止裸 `child.kill()`） |
+| H57 | 更新渠道与版本语义：`compareVersions` 改完整 semver 优先级（prerelease 逐标识符、build 不参与、非法输入不声称高低）；`pickLatestRelease` 加 channel / withdrawal / pin 与**不降级**规则；主进程从环境变量传入三者（不接受渲染层输入） | `electron/__tests__/update-semver.test.cjs`（10 项，含 `2.0.0-beta < 2.0.0`、`beta.2 < beta.10`、撤回规范化、pin、空列表不抛） |
+| H64 | 附件 URL 来源与协议约束：新增 `utils/safeAttachmentUrl.ts`（默认拒绝；只放行站内 `/media/`·`/v1/`、同源/受信任 origin 的 https、回环 http、`blob:`、图片 `data:`；拒绝 `javascript:`/`file:`/协议相对 `//`）；`MessageItem` 与 `MediaPickerDialog` 两个入口都过同一策略 | `src/utils/__tests__/safeAttachmentUrl.spec.ts`（14 项）；`src/components/chat` 全量 51 文件 / 495 项通过；`vue-tsc` 通过 |
+| H83 | 平台 Owner 专属后台入口三处同口径：路由 `meta.requiresPlatformOwner`（monitor/datastores/diagnostics/deps）、守卫按 `auth.isPlatformOwner` 收敛并回首页、侧边栏按 `platformOwnerOnly` 过滤（空分组一并消失），高亮也改用过滤后的菜单 | `src/views/admin/__tests__/platformOwnerNav.spec.ts`（10 项：标记存在且不过度收敛、守卫顺序与回落、模板不再直接遍历未过滤分组、过滤行为） |
 
 ## 10. 参考
 
