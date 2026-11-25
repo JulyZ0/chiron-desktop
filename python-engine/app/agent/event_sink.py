@@ -92,6 +92,26 @@ DEFAULT_BUFFER_BYTES = 8 * 1024  # 同频道未发送缓冲上限
 DEFAULT_DELIVER_QUEUE = 1024     # 常驻投递器的待发队列上限（满了计数丢弃，不阻塞 emit）
 
 
+def _redact_export(text: str) -> str:
+    """出口脱敏（H62）。
+
+    为什么在**发事件时**做而不是在渲染层做：事件会同时流向前端界面、Redis 回放、
+    以及管理端导出；只在界面藏起来，另外两条路仍然会带着明文密钥落盘。
+    """
+    if not text:
+        return text
+    try:
+        from app.subagent.redact import redact_text
+
+        redacted, _hits = redact_text(text)
+        return redacted
+    except Exception:  # noqa: BLE001
+        # 脱敏失败不得让事件发不出去（把安全问题换成可用性问题更糟）。
+        return text
+
+
+
+
 @dataclass
 class SubagentEvent:
     """一条待发给前端的子 Agent 进度事件（会被序列化进父 SSE 帧）。"""
@@ -138,7 +158,8 @@ class SubagentEvent:
         if self.status:
             payload["status"] = self.status
         if self.content:
-            payload["content"] = self.content
+            # H62：content 可能是工具输出（读文件/跑命令的回显），最可能带密钥。
+            payload["content"] = _redact_export(self.content)
         if self.truncated:
             payload["truncated"] = True
         if self.usage:
@@ -153,7 +174,8 @@ class SubagentEvent:
         if self.tool_name:
             payload["tool_name"] = self.tool_name
         if self.tool_arguments:
-            payload["tool_arguments"] = self.tool_arguments
+            # 工具参数里可能带 token（例如调用外部 API 的命令行参数）。
+            payload["tool_arguments"] = _redact_export(self.tool_arguments)
         # 提问字段：与主 Agent 的 ask 帧同名（question/options/allow_free_text），
         # 前端因此能直接复用 AskCard 组件与 /v1/agent/answer 回传通道。
         if self.type == EV_ASK:
@@ -163,7 +185,8 @@ class SubagentEvent:
         # 工具结果失败原因：只有失败时才带（前端按"有这个字段"判定标红，
         # 不必去猜 content 里那句 error JSON 是失败还是工具自己的正常输出）。
         if self.error:
-            payload["error"] = self.error
+            # 错误正文来自 Provider 原生返回（最常见泄漏点）。
+            payload["error"] = _redact_export(self.error)
         return payload
 
 

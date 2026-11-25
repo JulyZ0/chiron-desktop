@@ -18,6 +18,7 @@ import type { WorkstationType } from '../types/workstation'
 import { t } from '../i18n'
 import { currentDeviceMode, isDevAuthBypassEnabled, type ChironMode } from '../stores/device'
 import { sanitizeAttachmentUrl } from '../utils/safeAttachmentUrl'
+import { redactText, summarizeApiError } from '../utils/redact'
 import {
   MEDIA_CACHE_EXPIRY_MARGIN_MS,
   MediaUrlCache,
@@ -727,8 +728,16 @@ api.interceptors.response.use(
       const base = t('errors.local_service_not_ready')
       // 后端原文是定位问题的唯一线索，必须带出（本地后端用 FastAPI 的 detail 字段）
       const detail = serverErrorDetail(error, '')
-      const message = detail ? `${base}（${detail}）` : base
+      // H62：`detail` 是服务端/宿主的原文（可能带路径、URL 凭据、甚至 key），
+      // 它会进用户可见提示、`api:error` 事件与日志 —— 出口前统一脱敏。
+      const safeDetail = redactText(detail)
+      const message = safeDetail ? `${base}（${safeDetail}）` : base
       error.message = message
+      // 便于上报：只留 status/code/request-id 与脱敏后的正文。
+      const summary = summarizeApiError(error)
+      if (summary.requestId) {
+        ;(error as { __requestId?: string }).__requestId = summary.requestId
+      }
       const payload = error.response?.data
       if (payload && typeof payload === 'object') {
         // 注入稳定 code：describeApiError 优先按 code 取本地化文案（与 501 分支同款）

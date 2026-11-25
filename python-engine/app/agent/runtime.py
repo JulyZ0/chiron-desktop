@@ -156,6 +156,27 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _redact_error_text(text: str) -> str:
+    """错误正文出口脱敏（H62）。
+
+    Provider 的原生错误经常把整段请求上下文回显出来（含 `Authorization: Bearer …`、
+    `sk-…`、甚至 base_url 里的凭据）。这些文本会：出现在界面的错误卡片上、
+    进 `AgentEvent` 的持久化、被用户复制粘贴到工单里。
+
+    脱敏是幂等的（已脱敏标记不会再被匹配），所以在多个出口重复调用是安全的；
+    失败则原样返回 —— 脱敏不该把"能报错"变成"报不出错"。
+    """
+    if not text:
+        return text
+    try:
+        from app.subagent.redact import redact_text
+
+        redacted, _hits = redact_text(str(text))
+        return redacted
+    except Exception:  # noqa: BLE001
+        return text
+
 # ── Token 节省参数与 CompactionConfig 已迁到 `app/agent/compaction.py`（顶部已再导出） ──
 
 #: 跨副本审批决策键的 TTL（秒）：与 _await_approval 的等待上限对齐。
@@ -3412,8 +3433,11 @@ class AgentRuntime:
                     ):
                         yield AgentEvent(
                             type="error",
-                            error=chunk.message
-                            or "LLM provider unavailable or not configured",
+                            # H62：这是 Provider 原生错误正文，最可能带密钥/凭据。
+                            error=_redact_error_text(
+                                chunk.message
+                                or "LLM provider unavailable or not configured"
+                            ),
                             trace_id=trace_id,
                         )
                         break
@@ -4309,11 +4333,12 @@ class AgentRuntime:
                 await self._mark_run_status(task, "completed")
 
         except Exception as e:
-            logger.error("Agent runtime error (task=%s): %s", task.id, e)
+            logger.error("Agent runtime error (task=%s): %s", task.id, _redact_error_text(str(e)))
             await self._mark_run_status(task, "failed")
             yield AgentEvent(
                 type="error",
-                error=str(e),
+                # H62：异常文本常含路径/URL/凭据片段，出口前脱敏。
+                error=_redact_error_text(str(e)),
             )
         finally:
             # ── 兜底写终态（A4 补口 + 断线可续）──
