@@ -28,13 +28,8 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 | ID | 事项 | 完成定义 | 落点 |
 |---|---|---|---|
 | **G11** | 子副作用并入父账本 | 子 Agent 的写入同时记父会话键（或按 lineage 解析），整轮 `/undo` 覆盖子 Agent 写过的文件；有跨会话回滚测试 | `undo_stack.py`、`side_effect_ledger.py` |
-| **G14** | 工具结果 spill 统一 | 超过阈值一律落盘 + 上下文只放头尾 + locator（复用 `read_tool_result` 分段取回）；所有工具统一走同一出口 | 新增 `app/tools/spill.py`、`registry.py` |
-| **G15** | 并发安全由工具声明 | 并行从"按动作级推断"改为"工具显式声明 `is_concurrency_safe`"，未声明一律串行；漏声明只降速不放错 | `app/tools/registry.py` + 各写工具 |
-| **G17** | 预览按 offset 分页 | 文本类预览支持 `offset` 分页 + 前端增量渲染（对齐工作台已有做法），KB 预览不再整块 | Go 预览接口 + `KBDocumentPreview.vue` |
-| **G18** | 前端布局解算纯函数化 | 断点与宽度常量集中到一处纯函数（现状字面量散落 1024/768/576/1280），`useResponsive` 死代码删除；有单测 | `frontend-vue/src/composables/` |
 | **G19** | 父 → 子 steer | 父 Agent 能给运行中的子追加指令（现在 `no active agent for this session`）；有"父改子指令、子下一轮生效"的测试 | `app/agent/steer.py`、`subagent_runner.py` |
 | **G20** | 子 Agent 可挂起等人工 | 子会话补 `agent_runs` 行，审批/提问在超时前**可被回答**（现在合成会话没有 run 行 ⇒ 超时即失败）；待确认（见 3.6） | `app/agent/interactions.py` |
-| **G21** | PDF/表格渲染进 Worker | 大 PDF/Excel 不再占主线程（现状全仓无 Worker）；有"主线程不阻塞"的时延断言 | `frontend-vue/src/views/MediaView.vue` 等 |
 
 **第三批：高（新组件 / 架构前提，需决策）**
 
@@ -63,10 +58,10 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 | 波次 | worktree / 分支 | 项 | 独占文件 | 状态 |
 |---|---|---|---|---|
 | W-A | `wt-g13` / `task/g13-g16` | ~~G13、G16~~ ✅ 已合入（含 main.go relay 接线） | — | 完成 |
-| W-A | `wt-g14` / `task/g14-g15` | G14 结果 spill 统一、G15 并发显式声明 | `app/tools/**` | 进行中 |
+| W-A | `wt-g14` / `task/g14-g15` | ~~G14、G15~~ ✅ 已合入（含 runtime 接线） | — | 完成 |
 | W-A | `wt-g10` / `task/g10-g12` | ~~G10、G12~~ ✅ 已合入 | — | 完成 |
-| W-A | `wt-g17` / `task/g17-g18` | G17 预览 offset 分页、G18 布局断点纯函数化 | `KBDocumentPreview.vue`、`composables/layout*`、`api/knowledge.py` | 进行中 |
-| W-A | `wt-g21` / `task/g21` | G21 PDF/大文件解析进 Worker | `MediaView.vue`、`workers/**` | 进行中 |
+| W-A | `wt-g17` / `task/g17-g18` | ~~G17、G18~~ ✅ 已合入 | — | 完成 |
+| W-A | `wt-g21` / `task/g21` | ~~G21~~ ✅ 已合入（真实 PDF 结构解析） | — | 完成 |
 | W-A | `wt-h16` / `task/h16b` | ~~H16b 契约 v2 四族~~ ✅ 已合入（7 族 55 例） | — | 完成 |
 | W-B | `wt-g11` / `task/g11-g20` | G11 子副作用并入父账本、G20 子 Agent 可挂起 | `app/agent/undo_stack.py`、`side_effect_ledger.py`、`interactions.py` | 进行中 |
 | W-C | `wt-g23` / `task/g23-lsp` | G23 常驻 LSP（G19 待 W-B 合入后开，二者同改 agent/**） | `app/tools/lsp/**`(新) | 进行中 |
