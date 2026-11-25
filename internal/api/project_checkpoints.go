@@ -182,18 +182,18 @@ type ingestUntrackedEntry struct {
 }
 
 type ingestCheckpointBody struct {
-	SessionID    string                 `json:"session_id"`
-	TurnID       string                 `json:"turn_id"`
-	Seq          int64                  `json:"seq"`
-	Kind         string                 `json:"kind"`
-	CommitSHA    string                 `json:"commit_sha"`
-	TreeSHA      string                 `json:"tree_sha"`
-	ParentSHA    string                 `json:"parent_sha"`
-	HeadSHA      string                 `json:"head_sha"`
-	RefName      string                 `json:"ref_name"`
-	FileCount    int                    `json:"file_count"`
-	SkippedCount int                    `json:"skipped_count"`
-	ByteSize     int64                  `json:"byte_size"`
+	SessionID    string `json:"session_id"`
+	TurnID       string `json:"turn_id"`
+	Seq          int64  `json:"seq"`
+	Kind         string `json:"kind"`
+	CommitSHA    string `json:"commit_sha"`
+	TreeSHA      string `json:"tree_sha"`
+	ParentSHA    string `json:"parent_sha"`
+	HeadSHA      string `json:"head_sha"`
+	RefName      string `json:"ref_name"`
+	FileCount    int    `json:"file_count"`
+	SkippedCount int    `json:"skipped_count"`
+	ByteSize     int64  `json:"byte_size"`
 	// State 是这次快照的结果：`ok`（默认，老引擎不带）或 `failed`。
 	// 失败态必须落库并展示——列表端刻意不过滤 state，用户要能看见"这一刻没保护成功"。
 	State string `json:"state"`
@@ -242,6 +242,7 @@ func IngestProjectCheckpoint(w http.ResponseWriter, r *http.Request) {
 		BadRequest(w, "seq must be positive")
 		return
 	}
+	// （事务在下面查到项目绑定之后才开：没绑定项目时不该占着连接）
 	if len(body.Untracked) > ingestUntrackedMax {
 		BadRequest(w, fmt.Sprintf("too many untracked entries (max %d)", ingestUntrackedMax))
 		return
@@ -271,6 +272,21 @@ func IngestProjectCheckpoint(w http.ResponseWriter, r *http.Request) {
 
 	wsID := stringOf(ws["workspace_id"])
 	tenantID := intOf(ws["tenant_id"])
+
+	// H14：从这里开始主记录与清单在同一个事务里（见下方两处 Rollback）。
+	ctx := r.Context()
+	tx, err := db.GlobalDBManager.Begin(ctx)
+	if err != nil {
+		slog.Error("checkpoint ingest: begin tx failed", "error", err)
+		InternalError(w, "store failed")
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
 	userID := stringOf(ws["user_id"])
 	cpID := checkpointID(body.SessionID, body.Seq, body.Kind)
 	duplicate := false
@@ -306,6 +322,13 @@ func IngestProjectCheckpoint(w http.ResponseWriter, r *http.Request) {
 		body.State, body.ErrorCode, body.Error,
 		body.FileCount, body.SkippedCount, body.ByteSize)
 	if err != nil {
+		// H14：主记录与清单必须**原子提交**。
+		//
+		// 旧实现是两次独立语句：主记录写成功、清单写失败时，库里留下一条
+		// `state='ok'` 但没有清单的 checkpoint —— 前端显示"这份快照可用"，恢复时
+		// 才发现清单是空的（"恢复成功但文件没回来"）。现在两者在同一个事务里，
+		// 任一失败就整体回滚，宁可这次 checkpoint 不存在，也不留半条记录。
+		_ = tx.Rollback(ctx)
 		slog.Error("checkpoint ingest: insert failed", "error", err, "id", cpID)
 		InternalError(w, "store failed")
 		return
@@ -339,19 +362,28 @@ func IngestProjectCheckpoint(w http.ResponseWriter, r *http.Request) {
 				args = append(args, cpID, e.Path, e.SHA256, e.Size)
 			}
 			sb.WriteString(" ON CONFLICT DO NOTHING")
-			if _, err := db.GlobalDBManager.Exec(r.Context(), sb.String(), args...); err != nil {
+			if _, err := tx.Exec(ctx, sb.String(), args...); err != nil {
 				// 主行已经落库，清单失败不该让整个上报看起来成功 —— 但也无法回滚
 				// （已提交）。如实记录并告知调用方"部分失败"，让前端能标出这个点
 				// 的回滚可能不完整。
+				_ = tx.Rollback(ctx)
 				slog.Error("checkpoint ingest: untracked insert failed", "error", err, "id", cpID)
 				JSON(w, http.StatusInternalServerError, APIResponse{
-					Success: false, Error: "checkpoint stored but untracked manifest failed",
+					Success: false, Error: "checkpoint ingest rolled back: untracked manifest failed",
 					Code: CodeInternal,
 				})
 				return
 			}
 		}
 	}
+
+	// 提交：主记录 + 清单一起生效（defer 里的 Rollback 在 committed=true 后成为空操作）。
+	if err := tx.Commit(ctx); err != nil {
+		slog.Error("checkpoint ingest: commit failed", "error", err, "id", cpID)
+		InternalError(w, "store failed")
+		return
+	}
+	committed = true
 
 	out := map[string]interface{}{"stored": true, "id": cpID}
 	if duplicate {
