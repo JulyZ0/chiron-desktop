@@ -252,6 +252,9 @@ class ResponsesProvider(LLMProvider):
         output_tokens = 0
         cached_tokens = 0
         done = False
+        # H11：畸形帧不再"静默跳过"，而是计数 —— 它会让这一回合少掉事件
+        # （例如少一个 function_call），必须能出现在失败原因里，否则排查时无从下手。
+        malformed = 0
 
         async for line in resp.aiter_lines():
             if not line or not line.startswith("data:"):
@@ -262,6 +265,7 @@ class ResponsesProvider(LLMProvider):
             try:
                 evt = json.loads(raw)
             except json.JSONDecodeError:
+                malformed += 1
                 continue
             etype = str(evt.get("type", ""))
 
@@ -296,21 +300,39 @@ class ResponsesProvider(LLMProvider):
                 )
                 return
 
+        # H11：**合法终态**才允许提交这一回合。
+        #
+        # 旧实现的两个漏洞：
+        #   · 收集到 tool_calls 就无条件 yield —— 流被截断（没有 `completed`）时，
+        #     partial attempt 仍然会执行工具，副作用落在一次"没成功"的回合里；
+        #   · 既没工具也没 `completed` 时什么都不产出 —— 调用方拿到空流，
+        #     要么当成功、要么卡住（取决于上层写法）。
+        # 现在两者都收敛成显式失败，并把畸形帧数写进原因。
+        if done:
+            if tool_calls:
+                yield ChatResponse(
+                    tool_calls=tool_calls,
+                    finish_reason="tool_calls",
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                )
+            else:
+                yield ChatResponse(
+                    finish_reason="stop",
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                )
+            return
+
+        detail = "stream ended without a terminal event"
         if tool_calls:
-            yield ChatResponse(
-                tool_calls=tool_calls,
-                finish_reason="tool_calls",
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_tokens=cached_tokens,
-            )
-        elif done:
-            yield ChatResponse(
-                finish_reason="stop",
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                cached_tokens=cached_tokens,
-            )
+            detail += f"; dropped {len(tool_calls)} tool call(s) from an incomplete attempt"
+        if malformed:
+            detail += f"; {malformed} malformed SSE frame(s)"
+        logger.warning("responses: incomplete attempt: %s", detail)
+        yield ChatResponse(finish_reason="error", message=f"responses stream incomplete: {detail}")
 
     # ── 非流式 ───────────────────────────────────────────────────────────
 
