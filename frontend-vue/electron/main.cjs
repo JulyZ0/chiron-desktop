@@ -83,7 +83,8 @@ const {
  * 两边只要有一处把常量搬到 shared.cjs 就会同时生效。
  */
 const DEVICE_TOKEN_ARG_PREFIX = shared.DEVICE_TOKEN_ARG_PREFIX || '--chiron-device-token='
-const { readToken, writeToken, clearToken } = require('./token-store.cjs')
+const tokenOrigin = require('./token-origin.cjs')
+const { readTokenResult, writeToken, clearToken } = require('./token-store.cjs')
 const { switchMode } = require('./mode-switch.cjs')
 const { wipeLocalData, relaunchAfterWipe } = require('./wipe-data.cjs')
 const { createDeviceFSBridge } = require('./device-fs.cjs')
@@ -127,6 +128,27 @@ let currentApiUrl = ''
 
 /** 「连接设置…」菜单强制进配置页（即使已有地址），见 relaunchIntoSetup */
 let forceSetup = false
+
+/**
+ * 当前云端凭据应当绑定的 origin（PRD H79）。
+ *
+ * 只有云端模式才有"云端登录凭据"这回事：本地模式的 Bearer 是设备 token / 本地会话，
+ * 不落 safeStorage（见 api/index.ts 的分桶）。所以这里在本地模式返回空串 —— 空串
+ * 在 token-store 里是**明确的拒绝信号**（不恢复也不误删），不会把云端凭据交给本机后端。
+ *
+ * 取值来自 config.json 的规范化结果，而不是渲染层传回来的字符串：凭据归属只能由
+ * 主进程自己的配置真相决定，否则渲染层一句谎话就能把 A 的 token 记到 B 名下。
+ */
+function currentCloudTokenOrigin() {
+  try {
+    const settings = readDeviceSettings()
+    if (resolveMode(settings) !== 'cloud') return ''
+    return tokenOrigin.normalizeOrigin(resolveApiUrl(settings))
+  } catch {
+    return ''
+  }
+}
+
 
 /** 本次运行的运行模式（whenReady 时定一次；切换模式一律走重启） */
 let currentMode = 'local'
@@ -2696,7 +2718,20 @@ if (!gotLock) {
     })
     ipcMain.handle('desktop:set-api-url', async (event, url) => {
       assertTrustedSender(event)
+      // H79：服务地址变了 ⇒ 旧凭据**立刻作废**。
+      //
+      // 旧实现只写 apiUrl 并重启窗口，盘上 token 原样留着 —— 于是"A 服务登录后
+      // 把地址改成 B"，下一次启动会把 A 的 Bearer 交给 B。这里在写入前比较
+      // **规范化后的 origin**（`https://a.b` 与 `https://a.b:443` 视为同一个认证域），
+      // 变了就清盘并要求重新登录。
+      const before = currentCloudTokenOrigin()
       saveApiUrl(url)
+      const after = currentCloudTokenOrigin()
+      if (!tokenOrigin.sameOrigin(before, after)) {
+        await clearToken()
+        deviceBridge?.notifyTokenChanged()
+        logMain('info', `服务地址已切换（${before || 'unset'} → ${after || 'unset'}），已清除旧登录凭据`)
+      }
       if (currentMode === 'cloud') {
         relaunchIntoApp()
         return true
@@ -2719,9 +2754,17 @@ if (!gotLock) {
     // token：异步读取（safeStorage 的 async API），保存/清除走 invoke；全部校验 sender。
     ipcMain.handle('desktop:get-token', async event => {
       assertTrustedSender(event)
-      return readToken()
+      // H79：只交出**属于当前 API origin** 的凭据。
+      // 归属不匹配时 token-store 已把盘上凭据清掉（A 服务登录后切到 B 的典型场景）：
+      // 这里返回空串，渲染层据此走登录页，而不是拿着别人的 token 去连新服务。
+      const origin = currentCloudTokenOrigin()
+      const result = await readTokenResult(origin)
+      if (result.cleared) {
+        logMain('warn', `已清除不属于当前服务地址的登录凭据（${result.reason}）`)
+      }
+      return result.token
     })
-    ipcMain.handle('desktop:save-token', (event, token) => {
+    ipcMain.handle('desktop:save-token', async (event, token) => {
       assertTrustedSender(event)
       const next = String(token || '')
       // H52 门禁：目录没加固成功时不落 token（清空不拦 —— 那是减少泄露面的方向）。
@@ -2730,7 +2773,9 @@ if (!gotLock) {
         logMain('error', `拒绝保存登录凭据：${refusal.message}`)
         return false
       }
-      const ok = writeToken(next)
+      // H79：凭据必须绑定 origin —— 主进程自己的配置才是归属的真相来源，
+      // 不能用渲染层传回来的地址（否则一句谎话就能把 A 的 token 记到 B 名下）。
+      const ok = await writeToken(next, currentCloudTokenOrigin())
       // 登录后 token 才可用：立即让设备桥重连，远程模式下项目文件才能马上读。
       deviceBridge?.notifyTokenChanged()
       return ok
