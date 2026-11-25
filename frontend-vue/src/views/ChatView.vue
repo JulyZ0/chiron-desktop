@@ -28,6 +28,7 @@ import SessionPreviewPane from '../components/chat/SessionPreviewPane.vue'
 import { useAuthStore } from '../stores/auth'
 import { privateKey } from '../utils/privateStorage'
 import { playUiSound } from '../utils/uiSounds'
+import { planReconnect } from '../utils/streamReattach'
 import { notify } from '../utils/notify'
 import { useThemeStore } from '../stores/theme'
 import { useRoute, useRouter } from 'vue-router'
@@ -647,6 +648,44 @@ function hasSessionStream(sid: string): boolean {
 }
 
 /** 关掉**某个会话**的流（幂等；绝不碰别的会话的流） */
+/**
+ * 给会话挂上 SSE（H60：首轮与断线重连共用同一条装配逻辑）。
+ *
+ * 为什么要单独一个函数：原来的装配只写在 `sendMessage` 里，于是"断线时有回合在跑"
+ * 这种情况根本没法重新挂流 —— 重连后界面停在旧内容，用户以为模型卡住了。
+ *
+ * `sinceEventId` 会作为 `Last-Event-ID` 交给服务端：它按这个 id 从缓冲流补发缺口，
+ * 而不是把整轮重放一遍（重放会造成重复内容与重复计费）。
+ */
+function attachSessionStream(
+  sessionId: string,
+  options: { sinceEventId?: string; userItemId?: string } = {},
+): void {
+  if (!sessionId) return
+  closeSessionStream(sessionId)
+  const handle = createSSEConnection(
+    sessionId,
+    (raw, meta) => withRun(runOf(sessionId), () => onSSEMessage(raw, sessionId, meta?.id)),
+    () => {
+      runOf(sessionId).loading = false
+      loading.value = false
+      stopTurnTimer()
+      connectionLost.value = true
+      closeSessionStream(sessionId)
+      if (options.userItemId) markMessageFailed(options.userItemId, t('common.connection_lost'))
+      playUiSound('disconnected')
+    },
+    {
+      initialLastEventId:
+        options.sinceEventId || sseLastIdBySession.get(sessionId) || '',
+      autoReconnect: true,
+      heartbeatTimeoutMs: SSE_SILENT_TIMEOUT_MS,
+      onLastEventId: (id) => sseLastIdBySession.set(sessionId, id),
+    },
+  )
+  sseBySession.set(sessionId, handle)
+}
+
 function closeSessionStream(sid: string): void {
   const handle = sid ? sseBySession.get(sid) : undefined
   if (!handle) return
@@ -2047,8 +2086,18 @@ async function attemptReconnect() {
     await api.get('/health', { timeout: 5000 })
     connectionLost.value = false
     reconnectAttempts = 0
-    if (activeSessionId.value) {
-      await switchSession(activeSessionId.value)
+    // H60：重连不是"再调一次 switchSession"就完了 —— 那条路径对**同一个 id** 会直接返回，
+    // 于是断线期间的历史从未重拉；跑着的流也不会被重新挂上（服务端可能仍在生成）。
+    const plan = planReconnect({
+      sessionId: activeSessionId.value,
+      wasLoading: Boolean(currentRun.value.loading),
+      lastEventId: sseLastIdBySession.get(activeSessionId.value) || '',
+    })
+    if (plan.refreshHistory && activeSessionId.value) {
+      await switchSession(activeSessionId.value, { force: true })
+    }
+    if (plan.reattachStream && activeSessionId.value) {
+      attachSessionStream(activeSessionId.value, { sinceEventId: plan.sinceEventId })
     }
   } catch {
     if (reconnectAttempts < 5) {
@@ -2218,7 +2267,7 @@ async function onMapSwitchSession(sessionId: string) {
   await switchSession(sessionId)
 }
 
-async function switchSession(id: string) {
+async function switchSession(id: string, options: { force?: boolean } = {}) {
   // 互联互通：从统一任务模式切到普通会话时，移除 task/error（保留 kb/agent/skill 上下文）
   if (unifiedMode.value && unifiedSessionId.value) {
     const q = { ...route.query }
@@ -2228,7 +2277,9 @@ async function switchSession(id: string) {
     appliedQueryKey = JSON.stringify(q)
     unifiedSessionId.value = ''
   }
-  if (id === activeSessionId.value) return
+  // H60：`force` 供**断线重连**使用。默认的"同 ID 直接返回"是为避免无意义重复拉取，
+  // 但重连恰恰需要重拉：断线期间的消息/工具结果只在服务端，界面还停在旧内容上。
+  if (id === activeSessionId.value && !options.force) return
   // 竞态守卫 + 分页状态复位（见 composables/useSessionSwitch.ts）
   const mySeq = beginSwitch()
   // 多会话运行：切换会话**只换视图** —— 不再清空 items、也不再无条件置 loading。
