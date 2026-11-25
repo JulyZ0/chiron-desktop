@@ -237,6 +237,11 @@ async def subagent(
                 ),
                 response_schema=response_schema,
                 inherit_context=inherit_context,
+                # G4：把父历史**真的**传下去 —— 修前这里缺参数，runner 永远收到 None，
+                # `inherited_messages` 恒为 0（开关等于没接）。
+                parent_messages=(
+                    get_tool_context("parent_messages", None) if inherit_context else None
+                ),
                 # R5(b)：续跑 / 分叉的起始上下文与血缘（由 resume_subagent 传入）
                 resume_context=resume_context,
                 resumed_from=resumed_from,
@@ -311,6 +316,11 @@ async def subagent(
         response_schema=response_schema,
         # S2：fork 父会话上下文（默认关；开启时三层过滤 + 双上限，见 app/subagent/inherit.py）
         inherit_context=inherit_context,
+        # G4：把父历史**真的**传下去 —— 修前这里缺参数，runner 永远收到 None，
+        # `inherited_messages` 恒为 0（开关等于没接）。
+        parent_messages=(
+            get_tool_context("parent_messages", None) if inherit_context else None
+        ),
         # R5(b)：续跑 / 分叉 —— 起始上下文（已渲染文本）+ 血缘 + 分叉点
         # （见 app/subagent/resume.py；只由 resume_subagent 传入）
         resume_context=resume_context,

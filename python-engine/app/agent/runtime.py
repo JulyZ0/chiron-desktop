@@ -271,6 +271,35 @@ def _parse_go_duration(raw: str) -> float | None:
     return total if total > 0 else None
 
 
+#: 交给子 Agent 的父历史快照上限（条）。拼接完整历史会随会话长度线性变重，
+#: 而 fork 的语义本来就是"最近发生了什么"，不是"全部历史"。
+_PARENT_SNAPSHOT_MAX_MESSAGES = 40
+
+
+def _parent_message_snapshot(messages: Any) -> list[dict[str, Any]]:
+    """父会话消息的**有界尾部快照**（供 `subagent(inherit_context=true)` 使用）。
+
+    只保留 `role` 与文本内容，且每条截到 8000 字符 —— 更细的脱敏/预算在
+    `app/subagent/inherit.py`（那里认识 `<inherited-context>` 包装与密钥形态）。
+    这里**不**做安全判断，只做"别把整个会话搬过去"。
+    """
+    if not isinstance(messages, list):
+        return []
+    tail = messages[-_PARENT_SNAPSHOT_MAX_MESSAGES:]
+    out: list[dict[str, Any]] = []
+    for item in tail:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "")
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = item.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        out.append({"role": role, "content": content[:8000]})
+    return out
+
+
 def _gateway_turn_timeout_seconds() -> float:
     """网关**单轮**超时（`AGENT_SUBMIT_TIMEOUT`，见 `internal/api/submit_handler.go`
     的 `turnTimeout()`），秒。读不到时回落到与网关一致的 300s 兜底。
@@ -3090,6 +3119,15 @@ class AgentRuntime:
                 # 以它为父指针，于是执行图能回答"这次委派发生在第几轮、从哪个节点来"。
                 # 每轮覆写一次（`set_tool_context` 是合并语义，其余键不动）。
                 set_tool_context(span_id=turn_span_id)
+                # G4：把父会话消息的**有界尾部快照**交给工具层。
+                #
+                # 为什么放在每轮开头：`subagent(inherit_context=true)` 需要父历史，
+                # 而工具层拿不到运行时的 `messages`。快照必须**有界** —— 这里是
+                # 条数上限 + 只留角色/内容，真正的脱敏与字符预算仍由
+                # `app/subagent/inherit.py` 做（两处都能省，但只有一处能保证安全）。
+                set_tool_context(
+                    parent_messages=_parent_message_snapshot(messages)
+                )
                 _turn_started = time.time()
                 # G-L3 埋点：量一次**上一轮 LLM 调用结束 → 本轮开始**之间的空转。
                 # 审批挂起 / steer 等待 / 子 Agent 汇报在缓存眼里是同一件事（两次调用间的
