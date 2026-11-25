@@ -19,6 +19,17 @@ HTTP_REQUEST_DURATION = Histogram(
     buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
 )
 
+# ── G7：子 Agent 事件丢弃 ──
+# 两类丢弃必须分开计数：
+#   · `preview`：每秒预算/队列容量丢掉的**过程**预览（可再生）；
+#   · `delivery`：常驻投递器队列满丢掉的（后台/重跑链路，前端看不到那一段）。
+# 合成一个数字会让人以为"丢的都是无关紧要的进度"。
+SUBAGENT_EVENTS_DROPPED = Counter(
+    "subagent_events_dropped_total",
+    "Sub-agent preview events dropped before reaching the client",
+    ["kind"],  # preview / delivery
+)
+
 # ── LLM Gateway 级 ──
 LLM_REQUESTS = Counter(
     "llm_requests_total",

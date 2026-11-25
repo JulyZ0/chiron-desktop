@@ -2,6 +2,8 @@
  * chat domain strings (en-US). Keys must match zh-CN/chat.ts.
  */
 export default {
+  subagent_events_dropped: "{n} progress events were dropped (preview throttling; results and approvals are never dropped)",
+
   time: {
     justNow: 'Just now',
     minutesAgo: '{n} min ago',

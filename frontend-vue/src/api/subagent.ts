@@ -77,6 +77,18 @@ export interface SubagentEvent {
    * 正常输出（有些工具的返回体本身就带 `error` 键，但那是成功返回的一部分）。
    */
   error?: string
+  /**
+   * G7：本次 run 到终态为止**被丢弃的过程事件数**（`preview` / `delivery` 分开）。
+   *
+   * 只有终态事件（`subagent.done`）带它 —— 丢弃统计必须走必达通道，自己单发一条
+   * 统计事件也可能被丢。界面据此显示"过程事件缺失 N 条"，而不是让用户以为
+   * "模型没做"。
+   */
+  dropped?: {
+    dropped?: number
+    delivery_dropped?: number
+    pending?: number
+  }
 }
 
 export interface SubagentRunsResponse {

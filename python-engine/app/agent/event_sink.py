@@ -140,6 +140,11 @@ class SubagentEvent:
     #: 与主 Agent 的 ``tool_result`` 事件同名：前端据此把结果块标红并默认展开 ——
     #: 错误藏在折叠后面等于没报错。
     error: str = ""
+    #: G7：本次 run 到此为止**被丢弃的过程事件数**（preview / delivery 分开）。
+    #:
+    #: 为什么挂在终态上而不是单独发一条：终态是必达的（IMPORTANT_EVENTS），
+    #: 丢弃统计必须跟着必达通道走；单独发一条"统计事件"它自己也可能被丢。
+    dropped: dict[str, int] = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
 
     def to_payload(self) -> dict[str, Any]:
@@ -187,7 +192,19 @@ class SubagentEvent:
         if self.error:
             # 错误正文来自 Provider 原生返回（最常见泄漏点）。
             payload["error"] = _redact_export(self.error)
+        if self.dropped:
+            payload["dropped"] = dict(self.dropped)
         return payload
+
+
+def _count_drop(kind: str) -> None:
+    """给丢弃计数（G7）。指标模块不可用时静默跳过 —— 观测不该是单点。"""
+    try:
+        from app.observability.metrics import SUBAGENT_EVENTS_DROPPED
+
+        SUBAGENT_EVENTS_DROPPED.labels(kind=kind).inc()
+    except Exception:  # noqa: BLE001
+        return
 
 
 class EventSink:
@@ -456,9 +473,21 @@ class EventSink:
         不必再等下一轮 ``GET /v1/subagent/runs`` 轮询。
         """
         self._flush_pending(run_id, force=True)
-        self._push(SubagentEvent(type=EV_DONE, run_id=run_id, parent_run_id=parent_run_id,
-                                 depth=depth, profile=profile, status=status,
-                                 usage=usage or {}, summary=summary), terminal=True)
+        self._push(
+            SubagentEvent(
+                type=EV_DONE,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                depth=depth,
+                profile=profile,  # type: ignore[arg-type]
+                status=status,
+                usage=usage or {},
+                summary=summary,
+                # G7：终态是**必达**通道，丢弃统计只能跟着它走（自己单发一条也可能被丢）。
+                dropped=self.stats(),
+            ),
+            terminal=True,
+        )
 
     # ── 常驻投递端（生命周期与 sink 绑定，**不依赖父 SSE 生成器**）──
 
@@ -495,6 +524,7 @@ class EventSink:
             self._deliver_queue.put_nowait(event.to_payload())
         except asyncio.QueueFull:
             self.delivery_dropped += 1
+            _count_drop("delivery")
 
     # ── 消费端（由父 SSE 生成器调用）──
 
@@ -509,6 +539,18 @@ class EventSink:
         while self._queue:
             out.append(self._queue.popleft())
         return out
+
+    def stats(self) -> dict[str, int]:
+        """丢弃统计（G7）。
+
+        调用方（终态事件、`/metrics`、面板）据此说明"过程缺了多少条" ——
+        没有这个数字，"过程少了几行"就永远是玄学。
+        """
+        return {
+            "dropped": int(self.dropped),
+            "delivery_dropped": int(self.delivery_dropped),
+            "pending": len(self._queue),
+        }
 
     def pending_count(self) -> int:
         return len(self._queue)
@@ -527,11 +569,13 @@ class EventSink:
         if not important:
             if not self._consume_budget(event.run_id):
                 self.dropped += 1
+                _count_drop("preview")
                 return
         if len(self._queue) >= self._maxsize:
             self._drop_oldest_preview()
             if not important:
                 self.dropped += 1
+                _count_drop("preview")
                 return
         self._queue.append(event)
         self._fanout(event)

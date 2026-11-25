@@ -5,6 +5,8 @@
  * （`{n} 分钟前` / `{n} min ago` / `قبل {n} دقيقة`），拼接必然出错。
  */
 export default {
+  subagent_events_dropped: "过程事件缺失 {n} 条（预览限流，结论与审批不丢）",
+
   time: {
     justNow: '刚刚',
     minutesAgo: '{n} 分钟前',

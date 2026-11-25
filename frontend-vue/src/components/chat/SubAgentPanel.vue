@@ -521,6 +521,29 @@ const selectedEvents = computed<SubagentEvent[]>(() => {
  * diff —— 事件以每秒数条的速度进来时，这就是卡顿的来源。过程视图是给人"读现在
  * 在做什么"的，不需要无限历史；更早的部分由「事件流」tab 与轮询回放兜底。
  */
+/**
+ * G7：该 run 的过程事件丢弃数（终态事件携带）。
+ *
+ * 为什么要显示：预览事件有每秒预算与队列上限，丢弃是**设计内**的行为；但不说明就
+ * 变成"模型少做了几步"的错觉。审批 / 终态 / 工具调用走必达白名单，不会被丢。
+ */
+const droppedNote = computed(() => {
+  const runId = String(selectedRunId.value || '')
+  if (!runId) return ''
+  // 实时事件与回放事件是两条来源，丢弃计数只出现在**终态**上，两处都要看。
+  const events: SubagentEvent[] = [
+    ...(props.liveEvents || []),
+    ...(historyEvents.value || []),
+  ].filter((e) => String(e.run_id) === runId)
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const d = events[i]?.dropped
+    if (!d) continue
+    const total = Number(d.dropped || 0) + Number(d.delivery_dropped || 0)
+    if (total > 0) return String(total)
+  }
+  return ''
+})
+
 const OUTPUT_ROW_LIMIT = 400
 
 /**
@@ -1213,6 +1236,13 @@ onBeforeUnmount(() => {
                 class="line status"
               >
                 {{ row.event.status }}<span v-if="row.event.truncated"> {{ $t('common.preview_truncated') }}</span>
+              </div>
+              <!-- G7：过程事件被丢弃时必须说出来（否则"少了几行"看起来像"模型没做"） -->
+              <div
+                v-else-if="row.kind === 'done' && droppedNote"
+                class="line dropped"
+              >
+                {{ $t('chat.subagent_events_dropped', { n: droppedNote }) }}
               </div>
               <div
                 v-else-if="row.kind === 'done'"
