@@ -169,6 +169,8 @@ registry.register(
         },
     },
     handler=kb_list,
+    # G15：只读知识库清单 ⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -187,4 +189,6 @@ registry.register(
         "required": ["kb_id", "query"],
     },
     handler=kb_search,
+    # G15：只读知识库检索 ⇒ 可并发。
+    concurrency_safe=True,
 )

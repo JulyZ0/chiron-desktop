@@ -266,6 +266,8 @@ registry.register(
         "required": ["job_id"],
     },
     handler=job_output,
+    # G15：只读作业缓冲；job_kill 有副作用，故不声明。
+    concurrency_safe=True,
 )
 
 registry.register(

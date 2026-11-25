@@ -13,6 +13,16 @@
 来源标注：``source`` 说明工具从哪来（``builtin`` 内置 / ``mcp`` MCP 或插件注入），
 由注入点显式声明而不是从 ``owner`` 推断 —— ``app/mcp/registry.py`` 注册的是全局
 MCP 工具（无 owner），只按 owner 判断会漏标。前端据此把"看不见的 MCP"展示出来。
+
+并发安全（G15）：``execute`` 是全部入口的**唯一执行点**，因此它同时也是**唯一出口**。
+出口做两件与具体工具无关的事：
+
+1. **结果 spill 统一收口**（G14）：修前"大结果怎么处理"散在各工具实现里（有的自己截、
+   有的落盘、有的整段回吐）。现在统一过 ``spill.apply_spill`` —— 小结果原样、大结果
+   落盘换头尾 + locator、落盘失败保留原文（见 ``app/tools/spill.py``）。
+2. **并发安全由工具显式声明**（G15）：``is_concurrency_safe`` 读注册时的声明，
+   **默认 False**。修前 runtime 是按"动作分级 = read"**推断**并发的，而分级回答的是
+   "要不要人确认"，不是"能不能并发" —— 推断错一个分级就等于放错一个并发。
 """
 
 from __future__ import annotations
@@ -25,13 +35,14 @@ from typing import Any
 
 from app.observability.tool_spans import finish_tool_span, start_tool_span
 from app.tools.arg_validation import format_errors, prepare_params
-from app.tools.context import get_tenant_id_int, get_user_id
+from app.tools.context import get_session_id, get_tenant_id_int
 from app.tools.file_queue import serialized
 from app.tools.sandbox_slot import (
     SANDBOX_TOOL_NAMES,
     acquire_sandbox_slot,
     sandbox_slot_held,
 )
+from app.tools.spill import apply_spill
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +67,9 @@ class ToolDef:
     handler: Callable[..., Awaitable[Any]]
     owners: set[str] = field(default_factory=set)  # 空 = 全局工具
     source: str = SOURCE_BUILTIN
+    #: G15：**工具自己的声明** —— 同批并发执行不会互相干扰。
+    #: 默认 False：没声明就串行（与 `tool_policy` 的 fail-closed 同一取向）。
+    concurrency_safe: bool = False
 
 
 class ToolRegistry:
@@ -70,12 +84,17 @@ class ToolRegistry:
         handler: Callable[..., Awaitable[Any]],
         owner: str = "",
         source: str = SOURCE_BUILTIN,
+        concurrency_safe: bool = False,
     ) -> None:
         """注册工具。owner 非空时该工具仅对 owner（user_id）可见/可调用；
         同名重复注册幂等覆盖；已存在且带 owner 时合并归属用户集合
         （共享连接去重场景：多用户引用同一 MCP 服务器）。
 
         source 由调用方声明（内置工具用默认值，MCP/插件注入点传 SOURCE_MCP）。
+
+        ``concurrency_safe``（G15）是**工具自己**对"能不能与同批其它调用并发"的表态，
+        默认 False。重注册时按**本次**声明覆盖：声明与 handler 属于同一份定义，
+        分开保留会出现"handler 换了、并发声明还是旧的"这种更难排查的错位。
         """
         existing = self._tools.get(name)
         if existing is not None:
@@ -87,6 +106,7 @@ class ToolRegistry:
             existing.parameters = parameters
             existing.handler = handler
             existing.source = source
+            existing.concurrency_safe = concurrency_safe
             return
         owners = set()
         if owner:
@@ -98,7 +118,18 @@ class ToolRegistry:
             handler=handler,
             owners=owners,
             source=source,
+            concurrency_safe=concurrency_safe,
         )
+
+    def is_concurrency_safe(self, name: str) -> bool:
+        """该工具是否声明了"可并发执行"。
+
+        **默认 False**（未注册 / 未声明都一样）：并发是"多个调用同时动同一份状态"，
+        猜错的代价是不可复现的结果；串行猜错的代价只是慢一点。所以这里不做任何
+        "看起来是只读就放行"的推断 —— 声明归工具自己，见各工具注册处的说明。
+        """
+        tool = self._tools.get(name)
+        return bool(tool is not None and tool.concurrency_safe)
 
     def set_owners(self, name: str, owners: set[str]) -> None:
         """更新工具的归属用户集合（共享连接去重场景：多用户引用同一配置）。"""
@@ -239,11 +270,22 @@ class ToolRegistry:
                     result = await _invoke()
             else:
                 result = await _invoke()
-            if isinstance(result, dict):
-                if result.get("error"):
-                    error_text = str(result.get("error"))
-                return result
-            return {"output": result}
+            # G14：**唯一出口**统一处理"结果过大" —— 不再让每个工具各自截断/落盘。
+            # 放在 span 结束之前（`error_text` 已从原始结果里取过），且 spill 自身
+            # 失败会回退到原文，不会把 handler 的结果变成一条错误。
+            if isinstance(result, dict) and result.get("error"):
+                error_text = str(result.get("error"))
+            try:
+                return await apply_spill(
+                    result, tool_name=name, session_id=get_session_id()
+                )
+            except Exception as spill_error:  # noqa: BLE001 - 出口兜底：旁路故障不得吞掉结果
+                # spill 内部已自吞异常；这一层是最后保险 —— 真走到这里也**原样回吐**
+                # handler 的结果，而不是变成 `{"error": ...}`（那等于工具没执行成功）。
+                logger.warning(
+                    "tool result spill failed at exit (tool=%s): %s", name, spill_error
+                )
+                return result if isinstance(result, dict) else {"output": result}
         except Exception as e:
             error_text = str(e)
             return {"error": str(e)}
@@ -256,3 +298,13 @@ class ToolRegistry:
 
 # 全局注册表（进程内单例）
 registry = ToolRegistry()
+
+
+def is_concurrency_safe(name: str) -> bool:
+    """全局注册表上的并发安全查询（runtime 侧的接线入口）。
+
+    ``runtime._split_tool_batch`` 目前按"动作分级 = read"**推断**并发；接线后应改为
+    问这里。本函数只是 `registry.is_concurrency_safe` 的模块级别名 —— 保留两个形状是
+    为了让调用方（以及测试）不必先取到 registry 实例，同时保证**只有一份判定**。
+    """
+    return registry.is_concurrency_safe(name)

@@ -60,4 +60,6 @@ registry.register(
         "required": ["pattern"],
     },
     handler=glob_files,
+    # G15：只读文件系统 ⇒ 可并发。
+    concurrency_safe=True,
 )

@@ -548,6 +548,8 @@ registry.register(
         "required": ["path"],
     },
     handler=read_file,
+    # G15：只读文件内容 ⇒ 可并发（write_file/shell_exec 等有副作用，不声明）。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -614,6 +616,8 @@ registry.register(
         "required": ["query"],
     },
     handler=grep_files,
+    # G15：只读检索 ⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -629,6 +633,8 @@ registry.register(
         "required": ["pattern"],
     },
     handler=search_files,
+    # G15：只读 glob 检索 ⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -654,6 +660,8 @@ registry.register(
         "required": ["path"],
     },
     handler=outline_file,
+    # G15：只读文件大纲 ⇒ 可并发。
+    concurrency_safe=True,
 )
 
 registry.register(
@@ -694,4 +702,6 @@ registry.register(
         "required": ["path"],
     },
     handler=read_image,
+    # G15：只读图片字节 ⇒ 可并发（另见 spill.EXEMPT_TOOLS：它的数据 URL 不能被裁）。
+    concurrency_safe=True,
 )

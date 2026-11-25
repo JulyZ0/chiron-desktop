@@ -143,4 +143,6 @@ registry.register(
         "required": [],
     },
     handler=list_subagent_runs,
+    # G15：只读列表查询 ⇒ 可并发。
+    concurrency_safe=True,
 )
