@@ -172,4 +172,7 @@ export default {
   models_saved: "模型覆盖已保存",
   models_need_reindex: "修改索引模型后需要重建索引才能生效",
   models_save_failed: "模型覆盖保存失败",
+  // ── 预览分页（G17）──
+  load_more: "加载更多",
+  load_more_failed: "这一段没能加载出来，点「重试」接着读",
 }

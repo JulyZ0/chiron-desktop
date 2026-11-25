@@ -53,6 +53,15 @@ _TEXT_PREVIEW_SUFFIXES = {".txt", ".md", ".csv", ".json", ".html", ".htm", ".log
 #: 预览文本上限（字符）：够看清首页内容，又不至于把响应撑成整本书
 _PREVIEW_CHARS = 10000
 
+#: 分页预览的单页上限（字符）。调用方给的 ``limit`` 会被夹在这个值以内 ——
+#: 不夹的话"分页"只是个说法：一次 ``limit=10**9`` 又能把整本书拖进响应里。
+_PREVIEW_PAGE_LIMIT = 5000
+
+#: 分页模式下的全文硬上限（字符）。预览要支持"往后翻"，所以分页路径必须提取**超过**
+#: ``_PREVIEW_CHARS`` 的正文；但也不能无上限 —— 一本几百兆的 PDF 全量提取会把引擎的
+#: 内存交给调用方。超过此值时 ``preview_truncated`` 仍会亮起，说明"还有更多但本次不给"。
+_PREVIEW_MAX_CHARS = 200_000
+
 _ALLOWED_VISIBILITY = ("public", "private", "tenant")
 
 
@@ -1180,9 +1189,27 @@ async def query_knowledge_base(
 
 
 async def preview_document(
-    kb_id: str, doc_id: str, user_id: str, tenant_id: int = 0
+    kb_id: str,
+    doc_id: str,
+    user_id: str,
+    tenant_id: int = 0,
+    *,
+    offset: int | None = None,
+    limit: int | None = None,
 ) -> dict[str, Any]:
-    """文档预览：文本类返回头部内容；二进制返回元信息并提示下载/引用。"""
+    """文档预览：文本类返回**一页**内容；二进制返回元信息并提示下载/引用。
+
+    分页（G17）：``offset`` 是字符偏移，``limit`` 是本页字符数，两者都可选。
+
+    修前会怎样：只有"一次拿整块 content"，且引擎侧硬截在 ``_PREVIEW_CHARS`` —— 第 10000
+    个字符之后的内容用户永远读不到；响应里也没有 ``eof`` / ``next_offset``，前端连
+    "还有没有下一页"都判断不了（只能拿"长度正好 10000"当截断证据，短文档恰好 10000 字符时
+    还会误报）。
+
+    向后兼容：**两个参数都不传**时仍走旧路径 —— 只提取前 ``_PREVIEW_CHARS`` 字符，
+    ``content`` / ``preview_truncated`` 与旧版逐字节一致；``offset`` / ``next_offset`` /
+    ``eof`` / ``total_chars`` 只是附带的新增字段。
+    """
     pool = get_pool()
     kb = await pool.fetchrow(
         "SELECT id, user_id, visibility, tenant_id FROM knowledge_bases WHERE id = $1", kb_id
@@ -1205,6 +1232,12 @@ async def preview_document(
     doc["content"] = ""
     doc["preview_note"] = ""
     doc["preview_truncated"] = False
+    # 分页字段先落"没有内容"的默认值：云端文档 / 读取失败时前端据此就知道没有下一页，
+    # 不会渲染出一个点了没反应的"加载更多"。
+    doc["offset"] = 0
+    doc["next_offset"] = 0
+    doc["eof"] = True
+    doc["total_chars"] = 0
     suffix = f".{(row['file_type'] or '').lower().lstrip('.')}"
     if not row["storage_key"]:
         # 云端索引的文档只有元信息，原文不在本机对象存储里
@@ -1220,14 +1253,61 @@ async def preview_document(
         doc["preview_note"] = f"读取原文失败：{exc}"
         return {"data": doc}
 
-    text, note = await asyncio.to_thread(_preview_text, suffix, raw)
-    doc["content"] = text
+    # 分页模式要能读到第 10000 个字符之后，所以提取窗口必须放大；旧路径保持 `_PREVIEW_CHARS`
+    # 不变（否则"不传参数时行为不变"这条就破了：PDF 会从"读前一页"变成"读整本书"）。
+    paged = offset is not None or limit is not None
+    hard_cap = _PREVIEW_MAX_CHARS if paged else _PREVIEW_CHARS
+    text, note = await asyncio.to_thread(_preview_text, suffix, raw, hard_cap)
     doc["preview_note"] = note
-    doc["preview_truncated"] = len(text) >= _PREVIEW_CHARS
+    doc.update(_preview_window(text, offset, limit, hard_cap=hard_cap))
     return {"data": doc}
 
 
-def _preview_text(suffix: str, raw: bytes) -> tuple[str, str]:
+def _preview_window(
+    text: str, offset: int | None, limit: int | None, *, hard_cap: int
+) -> dict[str, Any]:
+    """把全文切成"这一页"，并给出分页游标。
+
+    约定（前端按这些约定实现"加载更多"）：
+
+    - ``offset``：本页起点，已夹进 ``[0, total_chars]``；
+    - ``next_offset``：本页末尾，也就是下一页的起点；
+    - ``eof``：没有下一页了。**空页一律算 eof** —— 包括"offset 越界"和"翻到硬上限"两种：
+      非空页判断会让前端拿着一个永远返回空串的 offset 一直点下去。
+    - ``preview_truncated``：全文本身被硬上限截掉了（还有内容，但这次不给）。
+    """
+    total = len(text)
+    if offset is None and limit is None:
+        # 旧路径：一次拿走整个窗口。口径与分页路径**共用同一套判定**，不另写一份，
+        # 否则"不传参数"与"offset=0&limit=10000"会悄悄给出不同答案。
+        start = 0
+        size = hard_cap
+    else:
+        start = 0 if offset is None else max(0, int(offset))
+        size = (
+            _PREVIEW_PAGE_LIMIT
+            if limit is None
+            else max(1, min(int(limit), _PREVIEW_PAGE_LIMIT))
+        )
+
+    start = min(start, total)
+    end = min(start + size, total)
+    content = text[start:end]
+    at_cap = total >= hard_cap
+    eof = not content or (end >= total and not at_cap)
+    return {
+        "content": content,
+        "offset": start,
+        "next_offset": end,
+        "eof": eof,
+        "total_chars": total,
+        "preview_truncated": at_cap,
+    }
+
+
+def _preview_text(
+    suffix: str, raw: bytes, max_chars: int = _PREVIEW_CHARS
+) -> tuple[str, str]:
     """把原文变成可内联的文本，返回 `(content, note)`。
 
     自托管模式**只接受 PDF**（见 `RemoteProvider.supports`），而此前的预览只认
@@ -1236,9 +1316,12 @@ def _preview_text(suffix: str, raw: bytes) -> tuple[str, str]:
 
     提取失败时返回**可读的原因**而不是空串：空内容会被界面渲染成
     "文档可能还在处理"，把"扫描件无文本层"与"服务坏了"混成同一句话。
+
+    ``max_chars`` 是提取窗口：默认 ``_PREVIEW_CHARS``（旧行为）；分页路径传更大的值，
+    否则"往后翻"翻出来的还是同一段前 10000 字符。
     """
     if suffix in _TEXT_PREVIEW_SUFFIXES:
-        return raw[:_PREVIEW_CHARS * 4].decode("utf-8", errors="replace")[:_PREVIEW_CHARS], ""
+        return raw[: max_chars * 4].decode("utf-8", errors="replace")[:max_chars], ""
 
     if suffix != ".pdf":
         return "", f"该文件类型（{suffix.lstrip('.') or '未知'}）暂不支持文本预览，可下载查看。"
@@ -1255,9 +1338,9 @@ def _preview_text(suffix: str, raw: bytes) -> tuple[str, str]:
                 if piece:
                     chunks.append(piece)
                     total += len(piece)
-                if total >= _PREVIEW_CHARS:
+                if total >= max_chars:
                     break
-            text = "\n".join(chunks)[:_PREVIEW_CHARS]
+            text = "\n".join(chunks)[:max_chars]
         finally:
             pdf.close()
     except Exception as exc:  # noqa: BLE001 — 解析失败按"提取不出"处理
@@ -1688,7 +1771,12 @@ async def preview_doc(
     request: Request,
     user_id: str = Query("", alias="user_id"),
     tenant_id: int = Query(0, alias="tenant_id"),
+    # G17：可选分页。**两个都缺省**时与旧版逐字节一致（老前端不加参数即可照旧工作）。
+    offset: int | None = Query(None, ge=0, description="字符偏移（0 起）"),
+    limit: int | None = Query(None, ge=1, description="本页字符数上限"),
 ) -> dict[str, Any]:
     if not user_id:
         raise HTTPException(status_code=401, detail="user_id required")
-    return await preview_document(kb_id, doc_id, user_id, tenant_id=tenant_id)
+    return await preview_document(
+        kb_id, doc_id, user_id, tenant_id=tenant_id, offset=offset, limit=limit
+    )

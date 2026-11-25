@@ -10,15 +10,19 @@
  * 3. **窄屏下用户仍可手动打开**：抽屉形态，同样不写宽屏偏好。
  *
  * 返回 `open` 是可直接绑定的 ref；`setOpen/toggle` 是用户动作入口（写存储）。
+ *
+ * 窄屏判据（1024 这个数字）来自 `layoutBreakpoints` 而不是写在这里：它同时是
+ * `ChatSidePanel` 的抽屉断点，两处各写一份迟早会一处 `<=` 一处 `<`（G18）。
  */
 import { computed, onBeforeUnmount, ref } from 'vue'
+import { narrowSidebarQuery } from './layoutBreakpoints'
 
 export interface PanelCollapseOptions {
   /** localStorage 键（每个面板独立：同时打开多个面板时互不干扰） */
   storageKey: string
   /** 宽屏且从未选择过时的默认值 */
   defaultOpen: () => boolean
-  /** 窄屏判定（默认 <=1024px） */
+  /** 窄屏判定（默认取 `layoutBreakpoints` 的抽屉断点） */
   narrowQuery?: string
 }
 
@@ -42,7 +46,7 @@ function writeStored(key: string, value: boolean): void {
 }
 
 export function usePanelCollapse(options: PanelCollapseOptions) {
-  const query = options.narrowQuery ?? '(max-width: 1024px)'
+  const query = options.narrowQuery ?? narrowSidebarQuery()
   const stored = readStored(options.storageKey)
 
   let media: MediaQueryList | null = null

@@ -167,4 +167,7 @@ export default {
   models_saved: "Model overrides saved",
   models_need_reindex: "Rebuilding the index is required after changing the index model",
   models_save_failed: "Failed to save model overrides",
+  // ── Preview paging (G17) ──
+  load_more: "Load more",
+  load_more_failed: "This part could not be loaded — click retry to keep reading",
 }

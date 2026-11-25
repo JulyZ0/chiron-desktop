@@ -11,6 +11,7 @@
  * 两者可以同时开，所以宽度上限各取一半的容器宽度，避免一方把另一方挤成零宽。
  */
 import { ref } from 'vue'
+import { workbenchWideQuery } from '../../composables/layoutBreakpoints'
 
 const STORAGE_KEY = 'chiron:workbench:open'
 
@@ -20,9 +21,10 @@ export const WORKBENCH_WIDTH_KEY = 'chiron:workbench-width:v1'
 /**
  * 首次进入的默认值：宽屏展开，窄屏收起。
  *
- * 断点取 1280 而不是侧面板的 1025：工作台是**在会话之外再开一栏**，还要和分屏
+ * 断点取 1280 而不是侧面板的 1024：工作台是**在会话之外再开一栏**，还要和分屏
  * 参考栏共存（两者各占一半宽度）。1024 宽的窗口上再切一栏，会话正文会被压到
- * 无法阅读 —— 那时"默认展开"反而是帮倒忙。
+ * 无法阅读 —— 那时"默认展开"反而是帮倒忙。这个数字来自 `layoutBreakpoints`
+ * （G18：断点只留一份），不再在这里写 `matchMedia('(min-width: 1280px)')`。
  */
 function readStored(): boolean {
   try {
@@ -37,7 +39,7 @@ function readStored(): boolean {
   // 一个可选的面板开关不该有这种辐射面，所以缺失时按"收起"处理。
   if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false
   try {
-    return window.matchMedia('(min-width: 1280px)').matches
+    return window.matchMedia(workbenchWideQuery()).matches
   } catch {
     return false
   }
