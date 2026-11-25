@@ -19,7 +19,7 @@ def test_fixtures_exist() -> None:
     cases = contract.load_fixtures()["cases"]
     assert cases, "夹具为空"
     families = {case["family"] for case in cases}
-    assert families == {"error", "terminal"}, f"夹具覆盖的族不完整: {families}"
+    assert families == {"error", "terminal", "run_event"}, f"夹具覆盖的族不完整: {families}"
 
 
 @pytest.mark.parametrize(

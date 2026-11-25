@@ -21,6 +21,7 @@ type Family string
 const (
 	FamilyError    Family = "error"
 	FamilyTerminal Family = "terminal"
+	FamilyRunEvent Family = "run_event"
 )
 
 // Violation 描述一处违约（带字段路径，便于定位）。
@@ -124,6 +125,58 @@ func ValidateTerminal(payload map[string]any) []Violation {
 	return out
 }
 
+var runEventTypes = map[string]bool{
+	"text": true, "thinking": true, "tool_call": true, "tool_result": true,
+	"approval": true, "todo_updated": true, "usage": true, "trace_span": true,
+	"knowledge_retrieval": true, "guardrail_blocked": true, "compaction": true,
+	"output_text": true, "cancelled": true, "done": true, "error": true,
+}
+
+// ValidateRunEvent 校验 run event 的**骨架**。
+//
+// 只钉三件事：type 必填且在枚举内、seq 若出现是非负整数、data 若出现是对象。
+// 各 type 的业务字段**故意**不收进契约 —— 它们还在演进，冻结了只会天天改版本号；
+// 消费方必须忽略不认识的 data 字段（forward-compat），这一点由夹具覆盖。
+func ValidateRunEvent(payload map[string]any) []Violation {
+	var out []Violation
+	rawType, exists := payload["type"]
+	if !exists {
+		return []Violation{{FamilyRunEvent, "type", "必填"}}
+	}
+	kind, isStr := rawType.(string)
+	if !isStr {
+		return []Violation{{FamilyRunEvent, "type", "必须是字符串"}}
+	}
+	if !runEventTypes[kind] {
+		return []Violation{{FamilyRunEvent, "type", fmt.Sprintf("未知取值 %q", kind)}}
+	}
+	if raw, exists := payload["seq"]; exists {
+		switch v := raw.(type) {
+		case float64:
+			if v < 0 || v != float64(int64(v)) {
+				out = append(out, Violation{FamilyRunEvent, "seq", "必须是非负整数"})
+			}
+		case int, int64:
+			if raw.(int64) < 0 {
+				out = append(out, Violation{FamilyRunEvent, "seq", "必须是非负整数"})
+			}
+		default:
+			out = append(out, Violation{FamilyRunEvent, "seq", "必须是整数"})
+		}
+	}
+	if raw, exists := payload["id"]; exists {
+		if _, isStr := raw.(string); !isStr {
+			out = append(out, Violation{FamilyRunEvent, "id", "必须是字符串"})
+		}
+	}
+	if raw, exists := payload["data"]; exists {
+		if _, isObj := raw.(map[string]any); !isObj {
+			out = append(out, Violation{FamilyRunEvent, "data", "必须是对象"})
+		}
+	}
+	return out
+}
+
 // Validate 按族名分派。
 func Validate(family string, payload map[string]any) ([]Violation, error) {
 	switch Family(strings.ToLower(family)) {
@@ -131,6 +184,8 @@ func Validate(family string, payload map[string]any) ([]Violation, error) {
 		return ValidateError(payload), nil
 	case FamilyTerminal:
 		return ValidateTerminal(payload), nil
+	case FamilyRunEvent:
+		return ValidateRunEvent(payload), nil
 	default:
 		return nil, fmt.Errorf("未知契约族：%q", family)
 	}

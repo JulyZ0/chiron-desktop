@@ -18,6 +18,7 @@ VERSION = 1
 
 FAMILY_ERROR = "error"
 FAMILY_TERMINAL = "terminal"
+FAMILY_RUN_EVENT = "run_event"
 
 _TERMINAL_TYPES = {"done", "error", "cancelled"}
 _MAX_MESSAGE_BYTES = 4096
@@ -99,6 +100,54 @@ def validate_terminal(payload: Mapping[str, Any]) -> list[Violation]:
     return out
 
 
+_RUN_EVENT_TYPES = {
+    "text",
+    "thinking",
+    "tool_call",
+    "tool_result",
+    "approval",
+    "todo_updated",
+    "usage",
+    "trace_span",
+    "knowledge_retrieval",
+    "guardrail_blocked",
+    "compaction",
+    "output_text",
+    "cancelled",
+    "done",
+    "error",
+}
+
+
+def validate_run_event(payload: Mapping[str, Any]) -> list[Violation]:
+    """校验 run event 的**骨架**（type/seq/id/data），不管各 type 的业务字段。
+
+    业务字段还在演进，冻结进契约只会天天升版本号；消费方必须忽略不认识的 data 字段
+    （forward-compat），夹具里有对应用例。
+    """
+    if "type" not in payload:
+        return [Violation(FAMILY_RUN_EVENT, "type", "必填")]
+    kind = payload["type"]
+    if not isinstance(kind, str):
+        return [Violation(FAMILY_RUN_EVENT, "type", "必须是字符串")]
+    if kind not in _RUN_EVENT_TYPES:
+        return [Violation(FAMILY_RUN_EVENT, "type", f"未知取值 {kind!r}")]
+
+    out: list[Violation] = []
+    if "seq" in payload:
+        seq = payload["seq"]
+        # bool 是 int 的子类，必须单独排掉
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            out.append(Violation(FAMILY_RUN_EVENT, "seq", "必须是整数"))
+        elif seq < 0:
+            out.append(Violation(FAMILY_RUN_EVENT, "seq", "必须是非负整数"))
+    if "id" in payload and not isinstance(payload["id"], str):
+        out.append(Violation(FAMILY_RUN_EVENT, "id", "必须是字符串"))
+    if "data" in payload and not isinstance(payload["data"], Mapping):
+        out.append(Violation(FAMILY_RUN_EVENT, "data", "必须是对象"))
+    return out
+
+
 def validate(family: str, payload: Mapping[str, Any]) -> list[Violation]:
     """按族名分派；未知族名抛 `ValueError`（不允许静默通过）。"""
     key = (family or "").strip().lower()
@@ -106,6 +155,8 @@ def validate(family: str, payload: Mapping[str, Any]) -> list[Violation]:
         return validate_error(payload)
     if key == FAMILY_TERMINAL:
         return validate_terminal(payload)
+    if key == FAMILY_RUN_EVENT:
+        return validate_run_event(payload)
     raise ValueError(f"未知契约族：{family!r}")
 
 

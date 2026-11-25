@@ -5,40 +5,59 @@
       "family": "error",
       "name": "minimal",
       "valid": true,
-      "payload": {"message": "工具执行失败"}
+      "payload": {
+        "message": "工具执行失败"
+      }
     },
     {
       "family": "error",
       "name": "with-code-and-retryable",
       "valid": true,
-      "payload": {"code": "rate_limited", "message": "请求过快", "retryable": true, "params": {"limit": 20}}
+      "payload": {
+        "code": "rate_limited",
+        "message": "请求过快",
+        "retryable": true,
+        "params": {
+          "limit": 20
+        }
+      }
     },
     {
       "family": "error",
       "name": "missing-message",
       "valid": false,
       "reason": "message 必填",
-      "payload": {"code": "x"}
+      "payload": {
+        "code": "x"
+      }
     },
     {
       "family": "error",
       "name": "message-too-long",
       "valid": false,
       "reason": "message 超过 4096 字节",
-      "payload": {"message": "MESSAGE_TOO_LONG"}
+      "payload": {
+        "message": "MESSAGE_TOO_LONG"
+      }
     },
     {
       "family": "error",
       "name": "wrong-type-code",
       "valid": false,
       "reason": "code 必须是字符串",
-      "payload": {"message": "x", "code": 42}
+      "payload": {
+        "message": "x",
+        "code": 42
+      }
     },
     {
       "family": "terminal",
       "name": "done",
       "valid": true,
-      "payload": {"type": "done", "finish_reason": "stop"}
+      "payload": {
+        "type": "done",
+        "finish_reason": "stop"
+      }
     },
     {
       "family": "terminal",
@@ -46,42 +65,144 @@
       "valid": true,
       "payload": {
         "type": "error",
-        "error": {"code": "provider_error", "message": "上游 502"}
+        "error": {
+          "code": "provider_error",
+          "message": "上游 502"
+        }
       }
     },
     {
       "family": "terminal",
       "name": "cancelled",
       "valid": true,
-      "payload": {"type": "cancelled"}
+      "payload": {
+        "type": "cancelled"
+      }
     },
     {
       "family": "terminal",
       "name": "unknown-type",
       "valid": false,
       "reason": "未知 type 必须判违约",
-      "payload": {"type": "maybe-done"}
+      "payload": {
+        "type": "maybe-done"
+      }
     },
     {
       "family": "terminal",
       "name": "error-without-body",
       "valid": false,
       "reason": "type=error 必须带 error 对象",
-      "payload": {"type": "error"}
+      "payload": {
+        "type": "error"
+      }
     },
     {
       "family": "terminal",
       "name": "done-with-error",
       "valid": false,
       "reason": "type=done 不得带 error",
-      "payload": {"type": "done", "error": {"message": "x"}}
+      "payload": {
+        "type": "done",
+        "error": {
+          "message": "x"
+        }
+      }
     },
     {
       "family": "terminal",
       "name": "missing-type",
       "valid": false,
       "reason": "type 必填",
-      "payload": {"finish_reason": "stop"}
+      "payload": {
+        "finish_reason": "stop"
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "text-delta",
+      "valid": true,
+      "payload": {
+        "type": "text",
+        "data": {
+          "text": "hello"
+        }
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "with-seq-and-id",
+      "valid": true,
+      "payload": {
+        "type": "tool_result",
+        "seq": 7,
+        "id": "evt_1",
+        "data": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "unknown-data-fields-ignored",
+      "valid": true,
+      "payload": {
+        "type": "usage",
+        "data": {
+          "input_tokens": 3,
+          "future_field": "x"
+        }
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "missing-type",
+      "valid": false,
+      "reason": "type 必填",
+      "payload": {
+        "data": {
+          "text": "x"
+        }
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "unknown-type",
+      "valid": false,
+      "reason": "type 必须在枚举内",
+      "payload": {
+        "type": "brand_new_event"
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "negative-seq",
+      "valid": false,
+      "reason": "seq 必须是非负整数",
+      "payload": {
+        "type": "text",
+        "seq": -1
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "seq-wrong-type",
+      "valid": false,
+      "reason": "seq 必须是整数",
+      "payload": {
+        "type": "text",
+        "seq": "7"
+      }
+    },
+    {
+      "family": "run_event",
+      "name": "data-wrong-type",
+      "valid": false,
+      "reason": "data 必须是对象",
+      "payload": {
+        "type": "text",
+        "data": "hello"
+      }
     }
   ]
 }

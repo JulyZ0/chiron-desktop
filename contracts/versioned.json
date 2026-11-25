@@ -6,11 +6,28 @@
     "error": {
       "description": "HTTP/SSE 失败载荷。网关产出、引擎也产出（工具/子 Agent 失败），前端与 SDK 消费。",
       "fields": {
-        "code": {"type": "string", "required": false, "note": "稳定错误码，客户端据此取本地化文案"},
-        "message": {"type": "string", "required": true, "max_bytes": 4096},
-        "retryable": {"type": "boolean", "required": false},
-        "params": {"type": "object", "required": false},
-        "trace_id": {"type": "string", "required": false}
+        "code": {
+          "type": "string",
+          "required": false,
+          "note": "稳定错误码，客户端据此取本地化文案"
+        },
+        "message": {
+          "type": "string",
+          "required": true,
+          "max_bytes": 4096
+        },
+        "retryable": {
+          "type": "boolean",
+          "required": false
+        },
+        "params": {
+          "type": "object",
+          "required": false
+        },
+        "trace_id": {
+          "type": "string",
+          "required": false
+        }
       },
       "rules": [
         "code 一旦发布不得改名；新增走新值",
@@ -21,20 +38,91 @@
     "terminal": {
       "description": "一次模型流/工具流的**终态**事件（收尾）。前端据此决定是否继续等。",
       "fields": {
-        "type": {"type": "string", "required": true, "enum": ["done", "error", "cancelled"]},
-        "finish_reason": {"type": "string", "required": false},
-        "error": {"type": "object", "required": false, "note": "type=error 时必填，形如 error 族"},
-        "usage": {"type": "object", "required": false}
+        "type": {
+          "type": "string",
+          "required": true,
+          "enum": [
+            "done",
+            "error",
+            "cancelled"
+          ]
+        },
+        "finish_reason": {
+          "type": "string",
+          "required": false
+        },
+        "error": {
+          "type": "object",
+          "required": false,
+          "note": "type=error 时必填，形如 error 族"
+        },
+        "usage": {
+          "type": "object",
+          "required": false
+        }
       },
       "rules": [
         "terminal 事件**只能有一个**：流里出现第二个即为违约",
         "type=error 必须带 error 对象；type=done 不得带 error",
         "未知 type 一律按违约处理（不允许静默忽略）"
       ]
+    },
+    "run_event": {
+      "description": "一次执行流里的事件骨架。前端按 type 渲染，SSE 与 SDK 都消费。",
+      "fields": {
+        "type": {
+          "type": "string",
+          "required": true,
+          "enum": [
+            "text",
+            "thinking",
+            "tool_call",
+            "tool_result",
+            "approval",
+            "todo_updated",
+            "usage",
+            "trace_span",
+            "knowledge_retrieval",
+            "guardrail_blocked",
+            "compaction",
+            "output_text",
+            "cancelled",
+            "done",
+            "error"
+          ]
+        },
+        "seq": {
+          "type": "integer",
+          "required": false,
+          "note": "单调递增；缺省时前端按到达顺序"
+        },
+        "id": {
+          "type": "string",
+          "required": false
+        },
+        "data": {
+          "type": "object",
+          "required": false
+        }
+      },
+      "rules": [
+        "type 必填且必须在上面的枚举内（新增事件类型 = 改契约文件 + 两端实现）",
+        "seq 若出现必须是非负整数；回退由消费方按 id 去重处理",
+        "data 里放该事件自己的字段；未识别的 data 字段必须被忽略（forward-compat）"
+      ]
     }
   },
   "compat": {
     "additive_only": true,
     "note": "同一 version 内只允许新增可选字段；删改字段 = 升 version，两端必须同时升级。"
+  },
+  "deferred": {
+    "families": [
+      "tool_approval",
+      "checkpoint",
+      "queue",
+      "mcp"
+    ],
+    "reason": "这四族的边界一侧在 Go、一侧在 Python 内部实现细节，本版本先把**消费方最多**的三族（error / terminal / run_event）定为契约；其余族在字段稳定后再纳入，避免把还会变的内部结构提前冻结。"
   }
 }
