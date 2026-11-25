@@ -589,6 +589,43 @@ async def _publish_pending_event(
         )
 
 
+async def expire_session(*, tenant_id: int, user_id: str, session_id: str) -> int:
+    """把**一个会话**仍未完成的介入转成 `expired`，返回处理条数（G20 的超时收尾）。
+
+    与 `expire_stale` 的区别只有一个：那里的判据是"**时间**到了"（`expires_at <= now()`），
+    这里是"**等待的人放弃等了**"—— 子 Agent 挂起的上限（``SUBAGENT_SUSPEND_WAIT_SECONDS``）
+    通常远短于票自身的 TTL(24h)，所以到点时 `expire_stale` 一条都扫不到。
+    如果什么都不做，那张票会以 `pending` 挂满 24h：列表里有一个"还能回答"的待办，
+    而它对应的子 Agent 早已按超时收尾 —— 用户答了也不会有下文（比不挂起更不诚实）。
+
+    `answered` 也一起关掉：答复已经到了、但等待方已经放弃，那张票不能再被将来某个同类调用
+    取走（`ux_pending_interactions_open` 也会一直为它留名额）。
+    """
+    if not session_id:
+        return 0
+    try:
+        pool = _pool()
+        if pool is None:
+            return 0
+        result = await pool.execute(
+            """
+            UPDATE pending_interactions
+               SET status = 'expired', updated_at = now()
+             WHERE session_id = $1
+               AND ($2 = 0 OR tenant_id = $2)
+               AND ($3 = '' OR user_id = $3)
+               AND status IN ('pending', 'answered')
+            """,
+            session_id,
+            to_tenant_int(tenant_id),
+            user_id or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pending interaction session expiry failed (session=%s): %s", session_id, exc)
+        return 0
+    return _rowcount(result)
+
+
 async def expire_stale(*, limit: int = 50) -> int:
     """把过期仍未完成的转成 `expired`，返回处理条数（reconciler 顺带扫）。
 

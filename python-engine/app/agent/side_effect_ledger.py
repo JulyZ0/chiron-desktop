@@ -94,7 +94,17 @@ def target_of(args: dict[str, Any] | None, tool: str) -> str:
 
 
 async def record(session_id: str, effect: SideEffect) -> None:
-    """记一条账。失败只记日志 —— 账本不是关键路径，不该影响工具执行。"""
+    """记一条账。失败只记日志 —— 账本不是关键路径，不该影响工具执行。
+
+    G11：与 ``undo_stack.push`` 同一个理由 —— 子 Agent 跑在 ``sub:<父>:<run>`` 里，
+    只记在子会话的键上，父会话的账本就**永远看不到**"这一轮被谁改了什么"。这里按 lineage
+    镜像到祖先键；同一条账重复上报（重试路径）靠 ``_fingerprint`` 去重。
+    """
+    for sid in [session_id, *_lineage(session_id)]:
+        await _record_one(sid, effect)
+
+
+async def _record_one(session_id: str, effect: SideEffect) -> None:
     try:
         import json
 
@@ -104,11 +114,42 @@ async def record(session_id: str, effect: SideEffect) -> None:
         if redis is None:
             return
         key = _key(session_id)
+        if await _already_present(redis, key, effect):
+            return
         await redis.lpush(key, json.dumps(asdict(effect), ensure_ascii=False))
         await redis.ltrim(key, 0, MAX_ENTRIES - 1)
         await redis.expire(key, TTL_SECONDS)
     except Exception as e:  # noqa: BLE001
         logger.warning("side effect ledger record failed: %s", e)
+
+
+def _fingerprint(effect: SideEffect) -> str:
+    """去重指纹：(类别, 工具, 目标, 时间, 结果)。**不是**按路径去重 ——
+    同一个工具的两次调用（目标相同、时间不同）是两条账。"""
+    return "\x1f".join(
+        [effect.kind, effect.tool, effect.target, f"{float(effect.at):.6f}", effect.detail]
+    )
+
+
+async def _already_present(redis: object, key: str, effect: SideEffect) -> bool:
+    try:
+        items = await redis.lrange(key, 0, MAX_ENTRIES - 1)  # type: ignore[attr-defined]
+    except Exception as e:  # noqa: BLE001 - 查不到就当没有（宁可多记一条，也不能丢账）
+        logger.warning("side effect ledger dedupe lookup failed (%s): %s", key, e)
+        return False
+    want = _fingerprint(effect)
+    for raw in items or []:
+        existing = _decode(raw)
+        if existing is not None and _fingerprint(existing) == want:
+            return True
+    return False
+
+
+def _lineage(session_id: str) -> list[str]:
+    """祖先会话（与撤销栈共用一份解析，避免两处各写一套切法）。"""
+    from app.agent.undo_stack import lineage_sessions
+
+    return lineage_sessions(session_id)
 
 
 async def recent(session_id: str, limit: int = 50) -> list[SideEffect]:
