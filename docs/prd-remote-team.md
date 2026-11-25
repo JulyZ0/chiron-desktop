@@ -7,6 +7,7 @@
 - 只剩两半的项：**H46**（设备桥客户端已收紧，服务端票据端点与签名校验待实现）、**H73**（前端已绑定不可变计划，服务端 `plan_digest` 校验未做）；两条都留在表里并写清了缺哪一半。
 - 2026-11-25 第四轮加固：**H43/H78/H79 已完整验收并从待办表移除**，证据见 9.14。
 - 2026-11-25 第五轮加固（按"先做容易推进的"排序）：**H21/H53/H56/H57/H64/H83 已完整验收并从待办表移除**，证据见 9.15。
+- 2026-11-25 第六轮加固（继续"先做容易推进的"）：**H65/H70/H71/H72/H82 已完整验收并从待办表移除**，证据见 9.16。
 - 待团队主机：R2 实测切换、R6 压测、Web E2E。
 - 暂缓：LiteLLM、Langfuse 实接、R10 租户删除、S5；ACP 完整协议见 H19，按产品目标排期。
 - 关联：`internal/api/device_fs.go`、`project_mirror.go`、`sessionmap_projects.go`、`frontend-vue/electron/device-fs.cjs`、`docs/desktop-local/contracts.md`、`docs/team-domain-deployment.md`。
@@ -174,7 +175,7 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | 里程碑 | 范围 | 退出条件 |
 |---|---|---|
-| M-H0 对外安全门禁 | H2、H24、H45–H46、H76 | P0 自动化测试全部通过；Linux 无隔离时明确拒绝执行；跨用户资源访问、技能路径穿越、插件/Git 执行绕过、更新真实性、设备桥越权与凭据跨源复用均有回归测试。 |
+| M-H0 对外安全门禁 | H2、H24、H45–H46、H67、H76 | P0 自动化测试全部通过；Linux 无隔离时明确拒绝执行；跨用户资源访问、技能路径穿越、插件/Git 执行绕过、更新真实性、设备桥越权与凭据跨源复用均有回归测试。 |
 | M-H1 故障接管门禁 | H7、H11、H36、H38、H41、H47–H48、H50–H51、H65、H67、H73 | 故障注入下无双重副作用；stale worker 无写权；预算、审批、提权 helper、renderer 权限、附件/账户切换与交付链失败语义通过测试。 |
 | M-H2 契约与工程门禁 | H14–H17、H44、H53–H54、H56、H60、H62、H70–H72、H82–H83 | 状态一致性测试、schema conformance、MCP 并发测试通过；运维验收、数据生命周期、流恢复、缓存、管理权限呈现与构建可复现性证据不得假成功。 |
 | M-H3 产品化增强 | H19–H20、H22 | 按确认后的产品目标逐项验收；非目标项保持显式暂缓。 |
@@ -231,14 +232,9 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 
 | ID | 优先级 | 需求 | 现状/证据 | 验收标准 |
 |---|---|---|---|---|
-| H65 | P1 | **聊天附件上传响应契约** | `uploadFile()` 从 `resp.data.asset` 或 `resp.data` 取字段，但 Go `OK` 返回 `{success,data}`；真实 ID/URL 丢失后伪造 `Date.now()` ID 与 `/v1/media/{id}/download`。证据：`frontend-vue/src/api/index.ts:718`、`:720`、`:722`、`frontend-vue/src/components/chat/ChatInput.vue:800`、`internal/api/media_upload.go:125`、`internal/api/response.go:63` | 严格按 `{success,data}` 解包并做 schema 校验；缺 ID/file_url 立即失败，不得生成伪 ID；上传后附件可签名、下载并随消息发送；本地/S3、≤50MB 与分片路径均有契约测试。 |
 | H67 | P1 | **私密媒体强制签名 URL 且缓存按账号隔离** | S3 `file_url` 是裸对象 URL，`resolveMediaUrl()` 对非 `/media/` 前缀直接返回，跳过 owner-bound 签名与过期；公开桶时绕过授权语义，私有桶时图片失败。签名缓存仅以 asset ID 为键。证据：`frontend-vue/src/api/index.ts:1032`、`:1044`、`:1046`、`:1064`、`internal/api/media_crud.go:729`、`internal/storage/s3.go:184`、`frontend-vue/src/views/MediaView.vue:178` | 私密存储禁止把裸 S3 URL 交给 renderer；所有资产经服务端 owner-bound 签名或受控代理；缓存键包含 tenant/user/mode/origin 并在登出清空；私有桶与公开桶配置均有回归测试。 |
-| H70 | P2 | **媒体签名过期后重新签名** | 图片签名过期时清缓存并加入 `fallbackIds`，之后直接回退原路径，不再尝试签名。证据：`frontend-vue/src/views/MediaView.vue:187`、`:207`、`:212` | 区分过期、401/403 与永久 404；过期时限频重新签名并重试，不降级到裸路径；重复失败有可见状态且不形成永久黑洞。 |
-| H71 | P2 | **请求取消键与生命周期精确化** | 跟踪键仅 `method:url`，不含 params/body/request ID，并覆盖调用方 CancelToken；同 URL 不同参数并发会互相覆盖，首个响应可能删除全部跟踪。证据：`frontend-vue/src/utils/requestOptimizer.ts:166`、`:169`、`:177`、`:183`、`frontend-vue/src/router/guard.ts:34` | 每个请求有独立 ID/AbortSignal；取消只作用于目标视图/资源代次，不误伤同端点并发操作；完成、失败与取消都只清理自身；导航取消测试覆盖不同 params。 |
-| H72 | P2 | **上传续传元数据按账号隔离并随登出清理** | `chunk-upload:*` 记录文件名、大小、时间、用途、父级和 uploadId，但未纳入 `privateStorage` 前缀，登出后仍可被下一账号读取并尝试续传。证据：`frontend-vue/src/utils/uploader.ts:57`、`:58`、`:80`、`frontend-vue/src/utils/privateStorage.ts:15`、`:36` | 续传键包含 tenant/user/mode/origin 与文件摘要；登出/切换账号清除所有旧账号续传状态；服务端每次读/写/complete 都复核 upload owner，避免元数据残留升级为跨账号上传。 |
 | H73 | P1 | **破坏性预览绑定不可变目标** | 前端已修：预览计划携带不可变 workspace/generation/摘要，确认执行只按该计划落点，切换项目使确认失效（`frontend-vue/src/utils/checkpointGcPlan.ts`、`CheckpointTimeline.vue`、`api/checkpoints.ts` 已带 `plan_digest`）。**未做**：`internal/api/checkpoint_diff.go` 的 `checkpointGcBody` 仍不接收/校验 `plan_digest`，引擎也没有下发"服务端签发的计划摘要"，因此服务端一致校验这一条还不成立。 | 预览计划携带不可变 workspace、generation 与计划摘要；确认执行必须绑定该计划，切换项目使确认失效；**服务端**校验计划/目标一致（dry-run 下发摘要、执行回传并重算比对，不一致 409），破坏性操作不得按当前 UI 状态重新选目标。 |
 | H76 | P0 | **技能名路径穿越与共享层越权写入** | install 只检查 name 非空；`_path()` 直接拼接 `{name}.skill.json`，`save()` 创建父目录并原子替换，`../`/绝对路径可覆盖存储目录外或其他用户技能。`update_meta()` 还会就地修改共享层载体。证据：`python-engine/app/api/skills.py:172`、`:183`、`:195`、`python-engine/app/skill/store.py:406`、`:463`、`:469`、`:494`、`:545` | 所有 save/delete/meta/update 入口统一严格 name 校验（白名单、长度、拒绝分隔符/绝对路径）并验证 resolved containment；tenant 共享写入要求 tenant-admin；成员修改共享技能只生成私有 override；跨用户/越界探针不得落盘。 |
-| H82 | P1 | **缩短数据保留期需破坏性确认** | 保留期表单保存前不比较新旧值，任何天数下降都直接写入配置；后台清理在后续周期按新阈值删除 usage、分享与检查点，UI 没有展示影响范围、生效时间或不可逆确认。证据：`frontend-vue/src/views/admin/MonitorView.vue:104`、`:109`、`internal/api/admin_extras.go:563`、`internal/api/retention.go:520`、`internal/api/routes_admin.go:170` | 任一保留天数下降时展示旧/新阈值、受影响数据类型、预计生效周期并二次确认；取消不得写配置；服务端记录操作者与变更审计，测试覆盖仅缩短、混合变更与失败回滚。 |
 
 ### 9.11 易推进项实施状态（2026-11-24）
 
@@ -340,6 +336,16 @@ python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公
 | H57 | 更新渠道与版本语义：`compareVersions` 改完整 semver 优先级（prerelease 逐标识符、build 不参与、非法输入不声称高低）；`pickLatestRelease` 加 channel / withdrawal / pin 与**不降级**规则；主进程从环境变量传入三者（不接受渲染层输入） | `electron/__tests__/update-semver.test.cjs`（10 项，含 `2.0.0-beta < 2.0.0`、`beta.2 < beta.10`、撤回规范化、pin、空列表不抛） |
 | H64 | 附件 URL 来源与协议约束：新增 `utils/safeAttachmentUrl.ts`（默认拒绝；只放行站内 `/media/`·`/v1/`、同源/受信任 origin 的 https、回环 http、`blob:`、图片 `data:`；拒绝 `javascript:`/`file:`/协议相对 `//`）；`MessageItem` 与 `MediaPickerDialog` 两个入口都过同一策略 | `src/utils/__tests__/safeAttachmentUrl.spec.ts`（14 项）；`src/components/chat` 全量 51 文件 / 495 项通过；`vue-tsc` 通过 |
 | H83 | 平台 Owner 专属后台入口三处同口径：路由 `meta.requiresPlatformOwner`（monitor/datastores/diagnostics/deps）、守卫按 `auth.isPlatformOwner` 收敛并回首页、侧边栏按 `platformOwnerOnly` 过滤（空分组一并消失），高亮也改用过滤后的菜单 | `src/views/admin/__tests__/platformOwnerNav.spec.ts`（10 项：标记存在且不过度收敛、守卫顺序与回落、模板不再直接遍历未过滤分组、过滤行为） |
+
+### 9.16 第六轮加固验收（2026-11-25，已从待办表移除）
+
+| ID | 落点 | 回归证据 |
+|---|---|---|
+| H65 | 上传响应契约收口：`file_url` 与分片路径的 `file_url` 都要过**来源/协议**校验（与附件渲染同一策略）；缺 ID/URL 立即失败且不伪造 ID；同时修掉一处自相矛盾 —— `ChatInput` 曾用 50MB 硬拦，而 `uploadFile()` 明确支持 >50MB 走分片，导致分片路径在聊天里永远走不到 | `src/api/__tests__/mediaUploadUrlContract.spec.ts`（8 项：`javascript:`/`file:`/协议相对/跨站 https/`data:text/html` 五类拒绝、站内路径放行、分片路径同契约、缺 asset_id 失败）；既有 `mediaUpload.spec.ts` 9 项仍绿 |
+| H70 | 媒体签名 URL 失败处理从**永久黑名单**改成分类 + 退避状态机：`gone`(404/410) 永久不可用且不再请求、`expired`/`unauthorized` 有上限重签、`transient` 指数退避（永不永久失败）；失败原因**可见**（缩略图角标 + 详情页状态 + 重试按钮），文案走 i18n key | `src/utils/__tests__/mediaUrlRetry.spec.ts`（14 项，含 exp 秒/毫秒识别、`beta` 不误判、退避上限）；`MediaView.spec.ts`、`src/views` 110 项通过 |
+| H71 | 取消粒度改按**请求签名**（method + url + 规范化 params + 非 GET 的 body）：同 url 不同参数不再互相取消；新增 `cancelWhere` 供"只取消某视图"；去重缓存对 rejected promise **立即失效**（旧实现让"重试"在 TTL 内永远拿到同一个失败） | `src/utils/__tests__/requestCancelPrecision.spec.ts`（8 项：键序无关签名、params/body 参与签名、精确取消、失败后再发一次）；既有 `requestOptimizer.spec.ts` 9 项仍绿 |
+| H72 | 上传续传元数据改成带身份信封 `{v, uploadId, owner:{user,tenant,mode,origin}, fingerprint}`：读时逐项比对，任一不符即**丢弃**（宁可重传不可串号）；旧版裸 `upload_id` 判为 `legacy` 不可用；无身份时不落盘 | `src/utils/__tests__/uploadIdentity.spec.ts`（13 项：换账号/换租户/换部署/换模式/换文件指纹各自拒绝、legacy 拒绝、空值与损坏分类） |
+| H82 | 收紧保留期改为**先预览再确认**：新增只读端点 `POST /v1/admin/retention/preview`（旧值→新值、按类型待删行数、是否需确认、生效时机）；`PUT /v1/admin/settings` 的 retention 分组严格解析（非法值报错而非静默夹取），收紧必须带 `confirm=true` 与 `reason`，成功后写审计（旧值/新值/原因/IP）；前端两步式确认，**取消不写配置**并回滚表单 | `internal/api/retention_settings_test.go`（5 项：仅收紧需确认、严格解析、确认+原因校验、差异描述、无变化不产条目）；前端 `MonitorView` 相关 12 文件 110 项通过；`check:ui`（i18n/RTL/token/可访问性）全绿 |
 
 ## 10. 参考
 
