@@ -54,6 +54,7 @@ export default {
   document: "文档",
   document_title: "文档标题",
   document_management: "文档管理",
+  preview_truncated_note: "仅显示前 {n} 个字符（文件较大，完整内容请下载原文件）。",
   document_content_preview: "文档内容预览",
   document_uploaded_successfully: "文档上传成功",
   documents: "文档数",

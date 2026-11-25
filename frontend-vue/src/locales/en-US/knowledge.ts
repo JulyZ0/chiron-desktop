@@ -54,6 +54,7 @@ export default {
   document: "Document",
   document_title: "Document title",
   document_management: "Document management",
+  preview_truncated_note: "Only the first {n} characters are shown (the file is large; download it for the full content).",
   document_content_preview: "Document content preview",
   document_uploaded_successfully: "Document uploaded successfully",
   documents: "Documents",

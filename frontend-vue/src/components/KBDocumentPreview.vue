@@ -34,6 +34,14 @@
             <span class="content-label">{{ $t('knowledge.document_content_preview') }}</span>
             <span class="content-chunks">{{ $t('knowledge.n_pages', { n: pageCount }) }}</span>
           </div>
+          <!-- G6：截断必须说出来。引擎侧只回前 1 万字符，用户若以为这是全文，
+               就会拿"预览里没有"当"文档里没有"。 -->
+          <p
+            v-if="truncated"
+            class="content-truncated"
+          >
+            {{ $t('knowledge.preview_truncated_note', { n: content.length }) }}
+          </p>
           <pre class="content-body">{{ content }}</pre>
         </div>
 
@@ -72,6 +80,7 @@ interface Document {
   name: string
   file_type: string
   file_size_bytes: number
+  preview_truncated?: boolean
   status: string
   page_count?: number
   content?: string
@@ -100,6 +109,8 @@ const loading = ref(false)
 const content = ref('')
 /** 后端给出的"为什么没有内容"（扫描件 / 云端文档 / 格式不支持），比通用文案可执行 */
 const note = ref('')
+// G6：引擎侧截断标记（见 python-engine `_PREVIEW_CHARS`）
+const truncated = ref(false)
 const error = ref('')
 const document = ref<Document | null>(null)
 const pageCount = ref(0)
@@ -112,15 +123,25 @@ const docStatusColor = computed(() => {
   return 'default'
 })
 
-watch(() => props.visible, async (val) => {
-  if (val && props.documentId) {
-    await loadPreview()
-  }
-})
-
+// G6：同时盯 `visible` 与 `documentId`，并 `immediate`。
+//
+// 修前只 watch `visible` 且无 immediate：① 父组件挂载时就是"打开"状态 ⇒ 永不加载，
+// 面板停在"暂无内容"；② 打开状态下换文档 ⇒ 不发新请求（旧响应被代次票据挡住，
+// 于是界面空白）。两个症状都表现为"预览是空的"，但原因完全不同。
 // H60：预览按 (kb, document) 取。快速连续打开两个文档时，先发的那次可能**后**回来，
 // 于是界面显示 A 的内容而标题是 B —— 用户还会据此复制引文。
 const previewGuard = createKeyedGuard(() => `${props.kbId}\u0000${props.documentId}`)
+
+watch(
+  () => [props.visible, props.documentId] as const,
+  async ([visible, documentId]) => {
+    if (visible && documentId) {
+      await loadPreview()
+    }
+  },
+  { immediate: true },
+)
+
 
 async function loadPreview() {
   if (!props.documentId) return
@@ -137,6 +158,7 @@ async function loadPreview() {
     document.value = data
     content.value = data.content || ''
     note.value = data.preview_note || ''
+    truncated.value = Boolean(data.preview_truncated)
     pageCount.value = data.page_count || 0
   } catch (e) {
     if (!previewGuard.isValid(ticket)) return
@@ -213,6 +235,12 @@ function formatSize(bytes: number): string {
   color: var(--text-tertiary);
   font-size: 12px;
 }
+.content-truncated {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary, #8a8f98);
+}
+
 .content-body {
   margin: 0;
   padding: 14px;

@@ -54,6 +54,7 @@ export default {
   document: "مستند",
   document_title: "عنوان المستند",
   document_management: "إدارة المستندات",
+  preview_truncated_note: "يُعرض أول {n} حرفًا فقط (الملف كبير؛ نزّله للمحتوى الكامل).",
   document_content_preview: "معاينة محتوى المستند",
   document_uploaded_successfully: "تم رفع المستند بنجاح",
   documents: "المستندات",
