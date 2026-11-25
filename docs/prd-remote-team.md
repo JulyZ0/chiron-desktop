@@ -22,9 +22,6 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 
 | ID | 事项 | 完成定义 | 落点 |
 |---|---|---|---|
-| **G4** | `inherit_context` 要么真传要么删除 | 工具路径构造 runner 时不传 `parent_messages` ⇒ 该开关永远无效：改为真传（Profile 开启时继承父消息），或删掉参数并在 schema 里去掉；测试断言"开启后确实带父历史" | `app/tools/subagent.py`、`subagent_runner.py` |
-| **G5** | `SessionStatsPanel` 接 `staleGuard` | 唯一没接代次票据的异步面板：连续切会话时旧响应不得覆盖新数据（有 spec） | `frontend-vue/src/components/chat/SessionStatsPanel.vue` |
-| **G6** | KB 预览大小上限 | 超过阈值直接提示"文件过大，无法预览"（并给下载入口），不再整块塞进 `<pre>`；阈值与后端 `preview_note` 口径一致 | `KBDocumentPreview.vue` + Go 预览接口 |
 | **G7** | 事件丢弃可见 | `EventSink.dropped` / `delivery_dropped` 上报 `/metrics`，子 Agent 面板显示"过程事件缺失 N 条"；有断言（丢弃计数随丢弃增长且不静默） | `app/agent/event_sink.py` + `SubAgentPanel.vue` |
 | **G8** | `ToolGuard` 类型化只减权 | 把"hook 只能收紧"从注释约定变成类型：guard/PreToolUse 的返回类型里**没有 allow**，测试断言"后置 listener 无法把 deny 翻回" | `app/agent/guards.py` |
 | **G9** | 未知副作用显式化 | 崩溃/超时后"已开始但未完成"的工具调用产出 `outcome=unknown`（结构化），不是失败也不是成功；恢复时**不重试**；有状态机测试 | `app/agent/tool_execution.py`、`app/agent/resume.py` |
