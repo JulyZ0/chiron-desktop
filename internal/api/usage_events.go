@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/athenavi/chiron/internal/db"
+	"github.com/jackc/pgx/v5"
 )
 
 // UsageEvent 是一次 LLM 调用的用量明细。
@@ -78,6 +79,35 @@ func insertUsageEvent(ctx context.Context, ev UsageEvent) {
 		ev.InputTokens, ev.OutputTokens, ev.CachedTokens, ev.CostCents)
 	if err != nil {
 		slog.Warn("usage_events: record failed",
+			"user", ev.UserID, "session", ev.SessionID, "model", ev.Model, "error", err)
+	}
+}
+
+// recordUsageEventTx 与 `RecordUsageEvent` 同口径，但写进**调用方的事务**。
+//
+// H44：turn 用量是"先删后插"的整轮替换；两步必须同事务，否则中途失败会留下
+// "旧行没了、新行只写一半"的少记状态。逐条 INSERT 走池子就无法回滚，所以这里
+// 必须能接 tx。
+func recordUsageEventTx(ctx context.Context, tx pgx.Tx, ev UsageEvent) {
+	if tx == nil {
+		RecordUsageEvent(ctx, ev)
+		return
+	}
+	if ev.Model == "" && ev.InputTokens == 0 && ev.OutputTokens == 0 && ev.CachedTokens == 0 {
+		return
+	}
+	if ev.Provider == "" {
+		ev.Provider = resolveProviderForModel(ctx, ev.Model)
+	}
+	_, err := tx.Exec(ctx,
+		`INSERT INTO usage_events
+		   (tenant_id, user_id, session_id, turn_id, model, provider,
+		    input_tokens, output_tokens, cached_tokens, cost_cents)
+		 VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, ''), $7, $8, $9, $10)`,
+		ev.TenantID, ev.UserID, ev.SessionID, ev.TurnID, ev.Model, ev.Provider,
+		ev.InputTokens, ev.OutputTokens, ev.CachedTokens, ev.CostCents)
+	if err != nil {
+		slog.Warn("usage_events: record via tx failed",
 			"user", ev.UserID, "session", ev.SessionID, "model", ev.Model, "error", err)
 	}
 }

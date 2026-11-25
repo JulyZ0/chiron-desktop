@@ -114,13 +114,32 @@ func IngestUsageEvents(w http.ResponseWriter, r *http.Request) {
 	tenantID := int16(intOf(row["tenant_id"]))
 	userID := stringOf(row["user_id"])
 
-	// 先清同一 turn 的旧行：重试与重复上报都不该让一次巡检计两遍。
-	// 删除失败不算致命（INSERT 仍会写入），但要告警 —— 那意味着幂等失效。
-	if _, err := db.GlobalDBManager.Exec(r.Context(),
+	// H44：DELETE + 全部 INSERT 必须在**同一个事务**里。
+	//
+	// 旧实现是"先删旧行，再逐条 INSERT"：中间任何一次失败（连接断、约束冲突、
+	// 上下文超时）都会留下"旧行已删、新行只写了一半"的状态 —— 用量**少记**，
+	// 而它是按 turn 结算的账，少记等于少收，且事后无从查证。
+	//
+	// 现在要么整轮换新，要么完全不动。
+	tx, err := db.GlobalDBManager.Begin(r.Context())
+	if err != nil {
+		slog.Error("usage ingest: begin tx failed", "error", err)
+		InternalError(w, "store failed")
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(r.Context())
+		}
+	}()
+	if _, err := tx.Exec(r.Context(),
 		`DELETE FROM usage_events WHERE session_id = $1 AND turn_id = $2`,
 		body.SessionID, body.TurnID); err != nil {
-		slog.Warn("usage ingest: stale rows delete failed; ingest is not idempotent",
-			"session", body.SessionID, "turn", body.TurnID, "error", err)
+		slog.Error("usage ingest: stale rows delete failed", "session", body.SessionID,
+			"turn", body.TurnID, "error", err)
+		InternalError(w, "store failed")
+		return
 	}
 
 	storeCtx, cancel := context.WithTimeout(context.Background(), ingestStoreTimeout)
@@ -132,7 +151,7 @@ func IngestUsageEvents(w http.ResponseWriter, r *http.Request) {
 		if entry.InputTokens <= 0 && entry.OutputTokens <= 0 && entry.CachedTokens <= 0 {
 			continue
 		}
-		RecordUsageEvent(storeCtx, UsageEvent{
+		recordUsageEventTx(storeCtx, tx, UsageEvent{
 			TenantID:     tenantID,
 			UserID:       userID,
 			SessionID:    body.SessionID,
@@ -147,6 +166,15 @@ func IngestUsageEvents(w http.ResponseWriter, r *http.Request) {
 		})
 		stored++
 	}
+
+	// 提交：整轮用量要么全换成新的，要么一条都不动（H44）。
+	if err := tx.Commit(r.Context()); err != nil {
+		slog.Error("usage ingest: commit failed", "session", body.SessionID,
+			"turn", body.TurnID, "error", err)
+		InternalError(w, "store failed")
+		return
+	}
+	committed = true
 
 	OK(w, map[string]interface{}{"stored": stored})
 }
