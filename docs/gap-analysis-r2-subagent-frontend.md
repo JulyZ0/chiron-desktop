@@ -116,7 +116,7 @@
 |---|---|---|
 | 三处侧栏 | ①顶栏品牌菜单 + 标题栏工作台按钮组（**字面量数组**）；②`ChatSidePanel` **五视图互斥 union**（轨迹/会话/统计/…）；③项目树 `ProjectSidebar` 嵌在会话视图内 | `components/AppLayout.vue:96-123,192-199,330-356`、`chat/ChatSidePanel.vue:26,421,503,509-515` |
 | 并存能力 | 有：工作台 / 参考栏 / 子 Agent 栏**同时挂载** | `AppLayout.vue`、`SubAgentPane.vue:44-66` |
-| 注册机制 | **无**（`registerPanel|panelRegistry|PLUGIN_SLOT` 零命中） | 同报告 |
+| 注册机制 | **无**（`registerPanel / panelRegistry / PLUGIN_SLOT` 零命中） | 同报告 |
 | 偏好持久化 | 每栏独立 localStorage 键（`chiron:chat-side-panel:v1`、workbench、todoPanel、swapLayout、splitWidth） | `views/ChatView.vue:1704-1707,212-230`、`useWorkbench.ts:15,46,79-86`、`useSplitWidth.ts:31-57` |
 | 宽度 | 4px 死区 + 指针捕获 + Escape 撤销 + 双击重置；MIN 260 / MAX 容器×0.6 | `useSplitWidth.ts:16-19,73-137` |
 | 断点 | **字面量散落**：侧栏 1024、抽屉 768/576、工作台默认展开 1280；`useResponsive.ts` 零引用 | `usePanelCollapse.ts:45,77-85`、`useWorkbench.ts:40`、报告 |
