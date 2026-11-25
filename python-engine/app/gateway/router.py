@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
+from app.gateway import budget_reserve
 from app.gateway.budget import TokenBudget
 from app.gateway.cache import SemanticCache
 from app.gateway.circuit_breaker import CircuitBreaker
@@ -590,9 +591,12 @@ class GatewayRouter:
         # `budget.check` 收到 0 会永远放行，等于把预检关掉。这里换成一个保守的代表值，
         # 保持预检的原有语义（它本来就是粗估，不是精确账）。
         estimated = max_tokens if max_tokens and max_tokens > 0 else _PREFLIGHT_TOKENS
+        reservation = None
         if self._budget and tenant_id:
-            ok = await self._budget.check(tenant_id, estimated)
-            if not ok:
+            # H36：**原子预占**。`check()` 只读一次 `used`，而扣减在这次调用结束之后 ——
+            # 中间同租户的并发请求都会通过粗检。预占把"判断 + 占位"放进同一段 Lua。
+            reservation = await budget_reserve.reserve(self._budget, tenant_id, estimated)
+            if reservation is None:
                 yield ChatResponse(
                     content="",
                     finish_reason="error",
@@ -699,16 +703,20 @@ class GatewayRouter:
             # S 修复：预算扣减放入 finally——正常/异常路径都会按实际用量扣除。
             # GeneratorExit(客户端断开)取消时 await 不安全，跳过(少量少计可接受)。
             _exc = sys.exc_info()[1]
-            if (
-                not isinstance(_exc, GeneratorExit)
-                and self._budget
-                and tenant_id
-                and (total_input + total_output) > 0
-            ):
+            if self._budget and tenant_id and reservation is not None:
                 try:
-                    await self._budget.deduct(tenant_id, total_input + total_output)
+                    if isinstance(_exc, GeneratorExit):
+                        # 调用方主动断开：这不算成功也不算失败，**退回占位**即可
+                        # （否则每次取消都会永久吃掉一份预估额度）。
+                        await budget_reserve.release(self._budget, reservation)
+                    elif finish_reason == "error" or _exc is not None:
+                        await budget_reserve.release(self._budget, reservation)
+                    else:
+                        await budget_reserve.commit(
+                            self._budget, reservation, total_input + total_output
+                        )
                 except Exception:
-                    logger.warning("budget deduct failed (non-blocking)")
+                    logger.warning("budget settle failed (non-blocking)")
             elapsed = (time.monotonic() - start) * 1000
             self._latencies[provider.name] = (
                 self._latencies[provider.name] * 0.8 + elapsed * 0.2
@@ -816,11 +824,14 @@ class GatewayRouter:
 
         # 预算预检查（非流式同口径：`max_tokens <= 0` = 不限制输出，
         # 不能直接拿去预检 —— 0 会让 `check` 永远放行）。
+        reservation = None
         if self._budget and tenant_id:
-            ok = await self._budget.check(
-                tenant_id, max_tokens if max_tokens and max_tokens > 0 else _PREFLIGHT_TOKENS
+            reservation = await budget_reserve.reserve(
+                self._budget,
+                tenant_id,
+                max_tokens if max_tokens and max_tokens > 0 else _PREFLIGHT_TOKENS,
             )
-            if not ok:
+            if reservation is None:
                 return ChatResponse(
                     content="",
                     finish_reason="error",
@@ -874,14 +885,10 @@ class GatewayRouter:
                     **cache_kwargs,
                 )
 
-            # 预算扣减
-            if (
-                self._budget
-                and tenant_id
-                and resp.input_tokens + resp.output_tokens > 0
-            ):
-                await self._budget.deduct(
-                    tenant_id, resp.input_tokens + resp.output_tokens
+            # 预算结算：占位按实际用量落账（H36）
+            if self._budget and reservation is not None:
+                await budget_reserve.commit(
+                    self._budget, reservation, resp.input_tokens + resp.output_tokens
                 )
 
             return resp

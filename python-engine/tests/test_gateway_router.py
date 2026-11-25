@@ -44,10 +44,25 @@ class FakeProvider(LLMProvider):
         pass
 
 
-def _make_budget():
+def _make_budget(*, allow: bool = True):
+    """预算桩：H36 之后 router 走 `budget_reserve`（Lua 预占），不再直接 check/deduct。
+
+    `_redis.eval` 用真 Lua 才能测的东西在 `tests/test_budget_reserve_h36.py`；
+    这里只关心"router 有没有按预占/结算的口径调用"，所以给一个最小的 eval 桩：
+    reserve 返回 `{'reserved', n}`，release/commit 返回 1。
+    """
     budget = MagicMock()
-    budget.check = AsyncMock(return_value=True)
+    budget.check = AsyncMock(return_value=allow)
     budget.deduct = AsyncMock()
+    budget._key = MagicMock(return_value="budget:t1:2026-11")
+
+    async def _eval(script, numkeys, *args):
+        if "HINCRBY', KEYS[1], 'reserved'" in script:
+            return ["reserved" if allow else "denied", 100] if allow else ["denied", 100]
+        return 1
+
+    budget._redis = MagicMock()
+    budget._redis.eval = AsyncMock(side_effect=_eval)
     return budget
 
 
@@ -69,7 +84,12 @@ class TestChatStreamBudget:
         chunks = [c async for c in router.chat_stream([], "fake-model", tenant_id="t1")]
 
         assert chunks[-1].finish_reason == "stop"
-        budget.deduct.assert_awaited_once_with("t1", 200)
+        # 成功路径：预占 → 按**实际**用量结算（不再是"直接 deduct"）
+        eval_calls = budget._redis.eval.await_args_list
+        assert len(eval_calls) == 2, f"应有一次预占 + 一次结算，实际 {len(eval_calls)}"
+        settle = eval_calls[-1]
+        assert settle.args[4] == 200, "结算必须落实际 token 数"
+        budget.deduct.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_chat_stream_no_deduct_without_tokens(self):
@@ -82,6 +102,10 @@ class TestChatStreamBudget:
 
         [c async for c in router.chat_stream([], "fake-model", tenant_id="t1")]
 
+        # 无用量：结算金额为 0，但仍要清掉占位（否则额度会被永久占用）
+        eval_calls = budget._redis.eval.await_args_list
+        assert eval_calls, "预占仍应发生"
+        assert eval_calls[-1].args[4] == 0, "无用量时结算金额为 0"
         budget.deduct.assert_not_called()
 
     @pytest.mark.asyncio
@@ -100,6 +124,10 @@ class TestChatStreamBudget:
 
         assert chunks[-1].finish_reason == "error"
         budget.deduct.assert_not_called()
+        # 失败路径必须**退回占位**：一次上游故障不该永久吃掉额度
+        eval_calls = budget._redis.eval.await_args_list
+        assert eval_calls, "预占应已发生"
+        assert eval_calls[-1].args[4] == 0, "失败时以 0 结算（等价于退回占位）"
 
 
 class _DenyLimiter:
