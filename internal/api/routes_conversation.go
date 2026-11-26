@@ -78,6 +78,8 @@ func registerConversationRoutes(
 	// 项目改动（只读 Git 视图）：与文件端点同组、同鉴权 —— 它读的是同一个项目根，
 	// 只是经 git 而不是文件系统。只执行只读子命令，见 project_git.go 开头。
 	mux.Handle("GET /v1/session-map/projects/{id}/changes", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectChanges))))
+	// 单文件 diff：改动列表点开一条时用。同样是只读 git 子命令，路径必须落在项目内。
+	mux.Handle("GET /v1/session-map/projects/{id}/diff", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectDiff))))
 	// 检查点时间线（只读）：回答"过去哪些时刻可以回滚回去"。
 	// 与 /changes 分开是因为数据源不同 —— 那条读用户仓库，这条读 Chiron 自己记的表。
 	mux.Handle("GET /v1/session-map/projects/{id}/checkpoints", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectCheckpoints))))

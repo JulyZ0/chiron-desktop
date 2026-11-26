@@ -53,6 +53,34 @@ vi.mock('../../../api/checkpoints', () => ({
   runCheckpointGc: () => Promise.reject(new Error('unused')),
 }))
 
+/**
+ * 改动页签 / 单文件 diff 的数据面。
+ *
+ * diff 请求故意用可手动 resolve 的 Promise：要能断言"请求发出去了"和"回来之后
+ * 才渲染"，而不是只测最终文本。
+ */
+const changesNet = vi.hoisted(() => ({
+  diffs: [] as Array<{ projectId: string; path: string; resolve: (v: unknown) => void }>,
+  changes: {
+    repo: true,
+    branch: 'main',
+    head: 'abc12345',
+    truncated: false,
+    changes: [
+      { path: 'src/a.ts', status: 'M', staged: false, unstaged: true, insertions: 1, deletions: 1 },
+      { path: 'new.txt', status: '?', staged: false, unstaged: true },
+    ],
+  } as Record<string, unknown>,
+}))
+
+vi.mock('../../../api/projectChanges', () => ({
+  listProjectChanges: () => Promise.resolve(changesNet.changes),
+  readProjectDiff: (projectId: string, path: string) =>
+    new Promise(resolve => {
+      changesNet.diffs.push({ projectId, path, resolve })
+    }),
+}))
+
 /** 让 resolve 之后串起来的微任务与 Vue 的下一次渲染跑完 */
 const flush = () => new Promise(r => setTimeout(r, 0))
 
@@ -202,6 +230,113 @@ describe('二进制文件的打开入口', () => {
     // `root` 是同一份载荷的一部分（主进程据此把打开动作限制在项目根内）——
     // 只断言 path 时"忘了带 root"也会绿，而那正好是越界打开的缺口。
     expect(openPath).toHaveBeenCalledWith({ path: 'C:\\proj\\简历.docx', root: 'C:\\proj' })
+  })
+})
+
+/**
+ * 改动页签 → 单文件 diff。
+ *
+ * 这条链有两个安静的失败方式：
+ *  1. 点了一条改动什么都不发生（旧行为是跳回文件树，用户以为点空了）；
+ *  2. 回来的是**上一个文件**的 diff（切条目时没有代次守卫）。
+ */
+describe('改动页签的单文件 diff', () => {
+  beforeEach(() => {
+    net.calls.length = 0
+    changesNet.diffs.length = 0
+  })
+
+  async function openChangesTab() {
+    const wrapper = mountPanel({ projectId: 'p1' })
+    await flush()
+    net.calls[0].resolve(listing('C:/p1', 'a.ts'))
+    await flush()
+    const tabs = wrapper.findAll('.wb-tab')
+    await tabs[1].trigger('click')
+    await flush()
+    return wrapper
+  }
+
+  it('点一条改动会请求 diff 并按增/删着色', async () => {
+    const wrapper = await openChangesTab()
+    const row = wrapper.findAll('.wb-change')[0]
+    expect(row.text()).toContain('src/a.ts')
+    await row.trigger('click')
+    await flush()
+
+    expect(changesNet.diffs).toHaveLength(1)
+    expect(changesNet.diffs[0]).toMatchObject({ projectId: 'p1', path: 'src/a.ts' })
+    expect(wrapper.find('.wb-diff-panel').text()).toContain('加载中')
+
+    changesNet.diffs[0].resolve({
+      repo: true,
+      path: 'src/a.ts',
+      untracked: false,
+      binary: false,
+      truncated: false,
+      diff: 'diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n',
+    })
+    await flush()
+
+    expect(wrapper.find('.wb-diff-panel').text()).toContain('+new')
+    expect(wrapper.find('.wb-diff-line.add').text()).toBe('+new')
+    expect(wrapper.find('.wb-diff-line.del').text()).toBe('-old')
+    expect(wrapper.find('.wb-diff-line.hunk').text()).toContain('@@')
+  })
+
+  it('未跟踪文件不渲染假 diff，给出打开文件的入口', async () => {
+    const wrapper = await openChangesTab()
+    await wrapper.findAll('.wb-change')[1].trigger('click')
+    await flush()
+    expect(changesNet.diffs[0].path).toBe('new.txt')
+
+    changesNet.diffs[0].resolve({
+      repo: true,
+      path: 'new.txt',
+      untracked: true,
+      binary: false,
+      truncated: false,
+      diff: '',
+    })
+    await flush()
+
+    expect(wrapper.find('.wb-preview-body').text()).toContain('尚未纳入 git')
+    expect(wrapper.find('.wb-diff').exists()).toBe(false)
+  })
+
+  it('先点 A 再点 B：A 的迟到响应不会覆盖 B', async () => {
+    const wrapper = await openChangesTab()
+    const rows = wrapper.findAll('.wb-change')
+    await rows[0].trigger('click')
+    await flush()
+    await rows[1].trigger('click')
+    await flush()
+
+    // B 先回来
+    changesNet.diffs[1].resolve({
+      repo: true, path: 'new.txt', untracked: false, binary: false, truncated: false,
+      diff: 'diff --git a/new.txt b/new.txt\n+from-B\n',
+    })
+    await flush()
+    expect(wrapper.find('.wb-diff-panel').text()).toContain('+from-B')
+
+    // A 后回来：必须被代次守卫丢弃
+    changesNet.diffs[0].resolve({
+      repo: true, path: 'src/a.ts', untracked: false, binary: false, truncated: false,
+      diff: 'diff --git a/src/a.ts b/src/a.ts\n+from-A\n',
+    })
+    await flush()
+    expect(wrapper.find('.wb-diff-panel').text()).not.toContain('+from-A')
+    expect(wrapper.find('.wb-diff-panel').text()).toContain('+from-B')
+  })
+
+  it('还原点页签不再同时渲染改动列表（v-else 串错页签）', async () => {
+    const wrapper = await openChangesTab()
+    expect(wrapper.findAll('.wb-change').length).toBeGreaterThan(0)
+    const tabs = wrapper.findAll('.wb-tab')
+    await tabs[2].trigger('click')
+    await flush()
+    expect(wrapper.findAll('.wb-change')).toHaveLength(0)
   })
 })
 

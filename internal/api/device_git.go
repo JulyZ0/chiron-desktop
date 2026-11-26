@@ -149,6 +149,60 @@ func clientProjectChanges(r *http.Request, loc projectLocator) (ProjectChanges, 
 	return result, nil
 }
 
+// clientProjectDiff 是 collectProjectDiff 的设备版本。
+//
+// 与 server 版本同一套判定（repo / untracked / binary / truncated），差异只在
+// 执行位置：git 在设备上跑，参数仍由服务端构造，路径先过 joinClientPath。
+func clientProjectDiff(r *http.Request, loc projectLocator, rel string) (ProjectDiff, error) {
+	result := ProjectDiff{Path: rel, Diff: ""}
+	rel = clientRelPath(rel)
+	if _, ok := joinClientPath(loc.RootPath, rel); !ok {
+		return result, errPathEscapes
+	}
+
+	resp, err := clientGit(r, loc, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		return result, err
+	}
+	if clientGitMissing(resp) {
+		result.GitMissing = true
+		return result, nil
+	}
+	if resp.Code != 0 || strings.TrimSpace(resp.Stdout) != "true" {
+		return result, nil
+	}
+	result.Repo = true
+
+	others, err := clientGit(r, loc, "ls-files", "--others", "--exclude-standard", "-z", "--", rel)
+	if err != nil {
+		return result, err
+	}
+	if others.Code == 0 && strings.TrimSpace(others.Stdout) != "" {
+		result.Untracked = true
+		return result, nil
+	}
+
+	diff, err := clientGit(r, loc, "diff", "--no-ext-diff", "--unified="+gitDiffContextLines, "HEAD", "--", rel)
+	if err != nil {
+		return result, err
+	}
+	if diff.Code != 0 {
+		// 空仓库：unborn HEAD，退回索引/工作区基线。
+		diff, err = clientGit(r, loc, "diff", "--no-ext-diff", "--unified="+gitDiffContextLines, "--", rel)
+		if err != nil {
+			return result, err
+		}
+	}
+	if diff.Code != 0 {
+		return result, fmt.Errorf("%w: diff exit %d", errGitFailed, diff.Code)
+	}
+	if strings.Contains(diff.Stdout, "Binary files ") {
+		result.Binary = true
+	}
+	result.Diff, result.Truncated = cappedDiff(diff.Stdout)
+	return result, nil
+}
+
 // respondClientGitError 把设备侧失败统一成 502：不是用户错误，重试/重连设备即可。
 func respondClientGitError(w http.ResponseWriter, err error) {
 	JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed,

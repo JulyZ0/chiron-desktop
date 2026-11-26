@@ -409,6 +409,12 @@ export default {
   workbench_changes_truncated: "改动过多，只显示了一部分",
   workbench_changes_head: "对照 {head}",
   workbench_agent_touched: "本次会话中 agent 改过这个文件",
+  // ── 单文件 diff（改动页签点开一条）──
+  workbench_diff_open_file: "打开文件",
+  workbench_diff_empty: "相对 HEAD 没有可见差异",
+  workbench_diff_untracked: "新文件尚未纳入 git，没有可对照的基线；可以打开文件预览内容",
+  workbench_diff_binary: "二进制文件没有文本差异可显示",
+  workbench_diff_truncated: "差异过大，只显示了一部分",
   // ── 还原点（检查点时间线 + 回滚）──
   workbench_tab_checkpoints: "还原点",
   checkpoint_empty: "还没有还原点。每次回合开始与结束时都会自动记录一个。",

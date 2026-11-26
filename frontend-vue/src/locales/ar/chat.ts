@@ -409,6 +409,12 @@ export default {
   workbench_changes_truncated: "التغييرات كثيرة، ويُعرض بعضها فقط",
   workbench_changes_head: "مقارنةً بـ {head}",
   workbench_agent_touched: "غيّر الوكيل هذا الملف في هذه الجلسة",
+  // ── فرق الملف الواحد (يُفتح من تبويب التغييرات) ──
+  workbench_diff_open_file: "فتح الملف",
+  workbench_diff_empty: "لا يوجد فرق ظاهر مقارنةً بـ HEAD",
+  workbench_diff_untracked: "هذا الملف الجديد غير متتبَّع في git بعد، لذا لا توجد مرجعية؛ افتحه لمعاينة محتواه",
+  workbench_diff_binary: "لا يوجد فرق نصي لعرضه في الملفات الثنائية",
+  workbench_diff_truncated: "الفرق كبير جدًا، ويُعرض جزء منه فقط",
   // ── نقاط الاستعادة (الجدول الزمني + الاسترجاع) ──
   workbench_tab_checkpoints: "نقاط الاستعادة",
   checkpoint_empty: "لا توجد نقاط استعادة بعد. تُسجَّل نقطة تلقائيًا في بداية كل جولة ونهايتها.",

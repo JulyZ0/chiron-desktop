@@ -71,3 +71,36 @@ export async function listProjectChanges(projectId: string): Promise<ProjectChan
     truncated: !!payload.truncated,
   }
 }
+
+/** 单个文件的统一 diff（只读）。 */
+export interface ProjectDiff {
+  repo: boolean
+  git_missing?: boolean
+  path: string
+  /**
+   * 未跟踪文件没有可对照的基线：后端不返回 diff，界面改为打开文件预览。
+   * 不要在这里合成"+ 每一行"的假 diff —— 行号与基线都会是假的。
+   */
+  untracked: boolean
+  binary: boolean
+  truncated: boolean
+  diff: string
+}
+
+/** 读取单个文件相对 HEAD 的 diff；`path` 必须是相对项目根的 POSIX 路径。 */
+export async function readProjectDiff(projectId: string, path: string): Promise<ProjectDiff> {
+  const { data } = await api.get(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/diff`,
+    { params: { path } },
+  )
+  const payload = data?.data ?? {}
+  return {
+    repo: !!payload.repo,
+    git_missing: !!payload.git_missing,
+    path: typeof payload.path === 'string' && payload.path ? payload.path : path,
+    untracked: !!payload.untracked,
+    binary: !!payload.binary,
+    truncated: !!payload.truncated,
+    diff: typeof payload.diff === 'string' ? payload.diff : '',
+  }
+}

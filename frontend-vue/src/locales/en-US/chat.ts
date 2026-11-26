@@ -406,6 +406,12 @@ export default {
   workbench_changes_truncated: "Too many changes; only some are shown",
   workbench_changes_head: "Against {head}",
   workbench_agent_touched: "The agent changed this file in this session",
+  // ── Per-file diff (opened from the Changes tab) ──
+  workbench_diff_open_file: "Open file",
+  workbench_diff_empty: "No visible difference against HEAD",
+  workbench_diff_untracked: "This new file is not tracked by git yet, so there is no baseline; open it to preview its content",
+  workbench_diff_binary: "Binary files have no textual diff to show",
+  workbench_diff_truncated: "The diff is too large; only part of it is shown",
   // ── Restore points (checkpoint timeline + rollback) ──
   workbench_tab_checkpoints: "Restore points",
   checkpoint_empty: "No restore points yet. One is recorded automatically at the start and end of every turn.",

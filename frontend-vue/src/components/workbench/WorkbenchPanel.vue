@@ -29,7 +29,7 @@ import {
 // 不另写一份：同一仓里两套高亮必然在语言映射与转义上漂移。
 import { highlightCodeBlocks } from '../chat/codeHighlighter'
 import { langOf, truncatePreview } from './previewCode'
-import { listProjectChanges, type ProjectChange, type ProjectChanges } from '../../api/projectChanges'
+import { listProjectChanges, readProjectDiff, type ProjectChange, type ProjectChanges, type ProjectDiff } from '../../api/projectChanges'
 // 还原点时间线独立成组件：回滚是写磁盘的操作，自带确认与结果展开，
 // 塞进这个已经千余行的面板只会让两边都难改。
 import CheckpointTimeline from './CheckpointTimeline.vue'
@@ -347,14 +347,81 @@ async function loadChanges() {
 /**
  * 打开一条改动。
  *
- * 删除的文件没有内容可预览 —— 明说，而不是让预览区去读一个不存在的路径再报
- * "文件不存在"（那会让人以为文件丢了）。
+ * 有 git 记录的条目直接显示 diff（删除的文件也能看：它的 diff 就是整份删除）。
+ * `agentOnly` 条目 git 里根本看不到（被忽略 / 改了又还原），没有可对照的基线，
+ * 在面板里说明原因并把用户引到文件预览 —— 不要伪造一份 diff。
  */
 async function openChange(row: ChangeRow) {
-  if (row.status === 'D') {
-    notify.info(tr('chat.workbench_change_deleted'))
-    return
+  await loadDiff(row)
+}
+
+// ── 单文件 diff ──
+const diffRow = ref<ChangeRow | null>(null)
+const diffData = ref<ProjectDiff | null>(null)
+const diffLoading = ref(false)
+const diffError = ref('')
+const diffGuard = createKeyedGuard(
+  () => `${props.projectId || ''}\u0000${diffRow.value?.path || ''}`,
+)
+
+/** 按行分类：只有增/删/hunk 头/元信息四类，够用且不依赖 diff 语法库。 */
+interface DiffLine {
+  text: string
+  cls: '' | 'add' | 'del' | 'hunk' | 'meta'
+}
+const diffLines = computed<DiffLine[]>(() => {
+  const text = diffData.value?.diff ?? ''
+  if (!text) return []
+  return text.split('\n').map((line) => {
+    if (line.startsWith('@@')) return { text: line, cls: 'hunk' }
+    if (
+      line.startsWith('diff ')
+      || line.startsWith('index ')
+      || line.startsWith('--- ')
+      || line.startsWith('+++ ')
+      || line.startsWith('\\ No newline')
+      || line.startsWith('old mode ')
+      || line.startsWith('new mode ')
+      || line.startsWith('similarity index ')
+      || line.startsWith('rename ')
+    ) {
+      return { text: line, cls: 'meta' }
+    }
+    if (line.startsWith('+')) return { text: line, cls: 'add' }
+    if (line.startsWith('-')) return { text: line, cls: 'del' }
+    return { text: line, cls: '' }
+  })
+})
+
+async function loadDiff(row: ChangeRow) {
+  diffRow.value = row
+  diffData.value = null
+  diffError.value = ''
+  if (!props.projectId || row.agentOnly) return
+  diffLoading.value = true
+  const ticket = diffGuard.ticket(`${props.projectId}\u0000${row.path}`)
+  try {
+    const fetched = await readProjectDiff(props.projectId, row.path)
+    if (!diffGuard.isValid(ticket)) return
+    diffData.value = fetched
+  } catch (e) {
+    if (diffGuard.isValid(ticket)) diffError.value = describeApiError(e)
+  } finally {
+    if (diffGuard.isValid(ticket)) diffLoading.value = false
   }
+}
+
+function closeDiff() {
+  diffRow.value = null
+  diffData.value = null
+  diffError.value = ''
+  diffLoading.value = false
+}
+
+/** 从 diff 面板跳到文件树里的同一个文件（新文件/二进制只有这条路能看内容）。 */
+async function openDiffInTree() {
+  const row = diffRow.value
+  if (!row) return
   activeTab.value = 'files'
   await revealPath(row.path)
 }
@@ -421,6 +488,7 @@ function reload() {
   // 点进去会得到"文件不在项目内"—— 比空列表更让人困惑。
   changesData.value = null
   changesError.value = ''
+  closeDiff()
   void loadDir('')
   if (activeTab.value === 'changes') void loadChanges()
 }
@@ -932,7 +1000,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
 
       <!-- 改动页签：只读。没有暂存/丢弃/提交按钮 —— 见脚本里"改动页签"那段的理由 -->
       <div
-        v-else
+        v-else-if="activeTab === 'changes'"
         class="wb-tree"
       >
         <div
@@ -996,6 +1064,84 @@ async function openWithSystem(entry: ProjectFileEntry) {
             class="wb-empty"
           >{{ tr('chat.workbench_changes_truncated') }}</div>
         </template>
+      </div>
+
+      <!-- 单文件 diff：点开改动列表的一条就在这里展开，不把用户踢到文件树再自己找。
+           这里同样**只读**：diff 是 `git diff HEAD` 的输出，没有任何暂存/回退入口。 -->
+      <div
+        v-if="diffRow && activeTab === 'changes'"
+        class="wb-preview wb-diff-panel"
+      >
+        <div class="wb-preview-head">
+          <span
+            class="wb-preview-path"
+            :title="diffRow.path"
+          >{{ diffRow.path }}</span>
+          <button
+            type="button"
+            class="wb-btn"
+            :title="tr('chat.workbench_diff_open_file')"
+            @click="openDiffInTree"
+          >{{ tr('chat.workbench_diff_open_file') }}</button>
+          <button
+            type="button"
+            class="wb-btn"
+            :title="tr('common.close')"
+            @click="closeDiff"
+          >×</button>
+        </div>
+        <div class="wb-preview-body">
+          <div
+            v-if="diffRow.agentOnly"
+            class="wb-empty"
+          >{{ tr('chat.workbench_agent_only') }}</div>
+          <div
+            v-else-if="diffLoading"
+            class="wb-empty"
+          >{{ tr('common.loading') }}</div>
+          <div
+            v-else-if="diffError"
+            class="wb-error"
+          >
+            {{ diffError }}
+            <button
+              type="button"
+              class="wb-btn"
+              @click="loadDiff(diffRow)"
+            >{{ tr('common.retry') }}</button>
+          </div>
+          <div
+            v-else-if="diffData?.untracked"
+            class="wb-empty wb-empty-action"
+          >
+            <span>{{ tr('chat.workbench_diff_untracked') }}</span>
+            <button
+              type="button"
+              class="wb-btn"
+              @click="openDiffInTree"
+            >{{ tr('chat.workbench_diff_open_file') }}</button>
+          </div>
+          <div
+            v-else-if="diffData?.binary"
+            class="wb-empty"
+          >{{ tr('chat.workbench_diff_binary') }}</div>
+          <div
+            v-else-if="diffData && !diffLines.length"
+            class="wb-empty"
+          >{{ tr('chat.workbench_diff_empty') }}</div>
+          <template v-else-if="diffData">
+            <pre class="wb-diff"><code><span
+              v-for="(line, i) in diffLines"
+              :key="i"
+              class="wb-diff-line"
+              :class="line.cls"
+            >{{ line.text || ' ' }}</span></code></pre>
+            <div
+              v-if="diffData.truncated"
+              class="wb-empty"
+            >{{ tr('chat.workbench_diff_truncated') }}</div>
+          </template>
+        </div>
       </div>
 
       <!-- 还原点页签：时间线与回滚。回滚会改写工作区，所以成功后要让"改动"
@@ -1295,6 +1441,20 @@ async function openWithSystem(entry: ProjectFileEntry) {
 .wb-agent-dot { flex: none; color: var(--accent); font-size: 10px; }
 /* 只在会话里出现、git 没记录的条目：用斜体而不是换颜色 —— 它仍然是一条改动 */
 .wb-change.agent-only .wb-name { font-style: italic; }
+
+/* ── 单文件 diff ── */
+/* 与文件预览共用 .wb-preview 外壳；上限略高一点：diff 通常比单文件短，但要多看几行上下文 */
+.wb-diff-panel { max-height: 60%; }
+.wb-diff {
+  margin: 0; font-family: var(--font-mono, monospace); font-size: var(--fs-xs);
+  line-height: 1.5; color: var(--text-secondary); direction: ltr;
+}
+/* 每行独立成块：`white-space: pre` 保留缩进，空行用模板里的单个空格撑住高度 */
+.wb-diff-line { display: block; white-space: pre; }
+.wb-diff-line.meta { color: var(--text-tertiary); }
+.wb-diff-line.hunk { color: var(--accent); }
+.wb-diff-line.add { color: var(--success); background: var(--success-bg); }
+.wb-diff-line.del { color: var(--danger); background: var(--error-bg); }
 
 /* 分栏手柄：平时不可见，悬停/拖动/聚焦时才显形（与 SessionPreviewPane 一致） */
 .wb-resize {

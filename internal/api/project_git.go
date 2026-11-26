@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -565,6 +566,141 @@ func collectProjectChanges(ctx context.Context, root string) (ProjectChanges, er
 	addNumstat(result.Changes, worktree)
 	addNumstat(result.Changes, index)
 	return result, nil
+}
+
+// ProjectDiff 是单个文件的统一 diff（只读）。
+//
+// 为什么不返回结构化 hunk：前端只需要"哪一行是增/删/hunk 头"这一层信息，而
+// 统一 diff 本身已经是稳定协议；在服务端再包一层只会让两侧各维护一套行号语义。
+type ProjectDiff struct {
+	Repo       bool   `json:"repo"`
+	GitMissing bool   `json:"git_missing,omitempty"`
+	Path       string `json:"path"`
+	// Untracked 为真时不返回 diff（git 没有可对照的基线），界面应改为
+	// 打开文件预览 —— 把整个新文件塞进一个 "+" 前缀的假 diff 里只会更难读。
+	Untracked bool `json:"untracked,omitempty"`
+	// Binary 为真表示 git 只给了"Binary files differ"而没有正文。
+	Binary    bool   `json:"binary,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
+	// Diff 是 `git diff` 的原始输出。
+	Diff string `json:"diff"`
+}
+
+const (
+	// maxProjectDiffBytes 是单个 diff 的响应上限。一个格式化过的 JSON 文件可以
+	// 产生几 MB 的 diff；界面需要的只是"改了哪里"，超出部分截断并明说。
+	maxProjectDiffBytes = 512 << 10
+	// gitDiffContextLines 保持与 git 默认一致（3 行）；写死是为了让输出不随
+	// 用户全局配置的 `diff.context` 变化 —— 同一次改动在不同机器上应当一样。
+	gitDiffContextLines = "3"
+)
+
+// cappedDiff 按字节上限截断 diff。
+//
+// 截断点回退到最后一个换行：切在一个 UTF-8 字符或行中间会让前端把半行当成
+// 一整行，而按行截断至少保证"显示的每一行都是完整的"。
+func cappedDiff(diff string) (string, bool) {
+	if len(diff) <= maxProjectDiffBytes {
+		return diff, false
+	}
+	cut := diff[:maxProjectDiffBytes]
+	if at := strings.LastIndexByte(cut, '\n'); at > 0 {
+		cut = cut[:at+1]
+	}
+	return cut, true
+}
+
+// collectProjectDiff 取单个文件的 diff（工作区 + 索引相对 HEAD 的全部改动）。
+//
+// `git diff HEAD` 同时覆盖已暂存与未暂存：分两次跑再拼起来会产生两个 `diff --git`
+// 头，界面会把同一个文件显示成两段。空仓库（还没有 HEAD）时退回 `git diff`。
+func collectProjectDiff(ctx context.Context, root, rel string) (ProjectDiff, error) {
+	result := ProjectDiff{Path: rel, Diff: ""}
+
+	abs, err := resolveProjectPath(root, rel)
+	if err != nil {
+		return result, err
+	}
+	if abs == filepath.Clean(root) {
+		return result, errPathNotRelative
+	}
+
+	overrides := repoFilterOverrides(ctx, root)
+	out, err := gitReadWith(ctx, root, overrides, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		if errors.Is(err, errGitMissing) {
+			result.GitMissing = true
+		}
+		return result, nil
+	}
+	if strings.TrimSpace(out) != "true" {
+		return result, nil
+	}
+	result.Repo = true
+
+	// 未跟踪：git 没有基线，diff 恒为空。用 ls-files --others 判定，而不是
+	// 猜状态字母 —— 状态来自 status，diff 端点不应依赖另一次调用的结果。
+	others, err := gitReadWith(ctx, root, overrides,
+		"ls-files", "--others", "--exclude-standard", "-z", "--", rel)
+	if err == nil && strings.TrimSpace(others) != "" {
+		result.Untracked = true
+		return result, nil
+	}
+
+	diff, err := gitReadWith(ctx, root, overrides,
+		"diff", "--no-ext-diff", "--unified="+gitDiffContextLines, "HEAD", "--", rel)
+	if err != nil {
+		// 空仓库（unborn HEAD）→ 以索引/工作区为基线。
+		diff, err = gitReadWith(ctx, root, overrides,
+			"diff", "--no-ext-diff", "--unified="+gitDiffContextLines, "--", rel)
+		if err != nil {
+			return result, err
+		}
+	}
+	if strings.Contains(diff, "Binary files ") {
+		result.Binary = true
+	}
+	result.Diff, result.Truncated = cappedDiff(diff)
+	return result, nil
+}
+
+// ListProjectDiff 返回单个文件的只读 diff。
+//
+// 路径必须显式给出（不做"取第一个改动"这种猜测）：前端刚列过改动，它知道用户点了哪一条。
+func (h *SessionMapHandler) ListProjectDiff(w http.ResponseWriter, r *http.Request) {
+	loc, ok := h.requireProject(w, r)
+	if !ok {
+		return
+	}
+	rel := clientRelPath(r.URL.Query().Get("path"))
+	if rel == "" || rel == "." {
+		BadRequest(w, "path is required")
+		return
+	}
+	if loc.Provider == smProviderClient {
+		result, err := clientProjectDiff(r, loc, rel)
+		if err != nil {
+			if errors.Is(err, errPathEscapes) || errors.Is(err, errPathNotRelative) {
+				BadRequest(w, "invalid path")
+				return
+			}
+			respondClientGitError(w, err)
+			return
+		}
+		OK(w, result)
+		return
+	}
+	result, err := collectProjectDiff(r.Context(), loc.RootPath, rel)
+	if err != nil {
+		if errors.Is(err, errPathNotRelative) || errors.Is(err, errPathEscapes) ||
+			errors.Is(err, errPathEscapesLink) || errors.Is(err, errPathCannotResolve) {
+			BadRequest(w, "invalid path")
+			return
+		}
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git diff")
+		return
+	}
+	OK(w, result)
 }
 
 // ListProjectChanges 返回项目内的改动文件（只读 Git 视图）。
