@@ -74,17 +74,22 @@ func StartJobEventsRelay(ctx context.Context, hub *broadcast.Hub) {
 					slog.Warn("job events relay channel closed")
 					return
 				}
-				eventType, sessionID, payload, ok := decodeJobEvent([]byte(msg.Payload))
-				if !ok {
-					slog.Warn("job event dropped (no session or no type)", "payload_bytes", len(msg.Payload))
-					continue
-				}
-				// 走 RelayEvent 而不是 Publish：事件本来就是跨实例来的（Redis pub/sub），
-				// 再 Publish 会让每个实例都把同一事件跨实例广播一次 ⇒ 客户端收到 N 份重复。
-				hub.RelayEvent(broadcast.Event{
-					Type:      eventType,
-					SessionID: sessionID,
-					Data:      payload,
+				// 单条消息的处理体包 recover：这条中继是进程级常驻 goroutine，
+				// 裸 panic 会终止**整个进程**（Go 的 goroutine panic 语义），
+				// 一条畸形 Redis 消息就能让所有副本 CrashLoop。
+				runBackgroundCycle("job-events-relay", func() {
+					eventType, sessionID, payload, ok := decodeJobEvent([]byte(msg.Payload))
+					if !ok {
+						slog.Warn("job event dropped (no session or no type)", "payload_bytes", len(msg.Payload))
+						return
+					}
+					// 走 RelayEvent 而不是 Publish：事件本来就是跨实例来的（Redis pub/sub），
+					// 再 Publish 会让每个实例都把同一事件跨实例广播一次 ⇒ 客户端收到 N 份重复。
+					hub.RelayEvent(broadcast.Event{
+						Type:      eventType,
+						SessionID: sessionID,
+						Data:      payload,
+					})
 				})
 			}
 		}

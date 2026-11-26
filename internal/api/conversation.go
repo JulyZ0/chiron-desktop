@@ -56,6 +56,12 @@ type Conversation struct {
 	// ToolCallsPartial 表示本次工具调用查询失败，返回的列表不完整。
 	// 与"确实没有工具调用"必须可区分，否则失败会伪装成空。
 	ToolCallsPartial bool `json:"tool_calls_partial,omitempty"`
+	// Running 表示服务端**此刻**仍有一个 run 在跑这个会话。
+	//
+	// 前端刷新后只有靠它才能重新挂上 SSE：否则历史拉回来 loading=false，
+	// 引擎还在跑、界面却既没有流也没有停止按钮，只能再发一条（等于并发开第二轮）。
+	// 数据源是引擎的 run 归属记录（Redis，带 TTL）—— 跨副本一致。
+	Running bool `json:"running,omitempty"`
 }
 
 // Message is a single chat message returned to the frontend.
@@ -294,6 +300,9 @@ func (h *ConversationHandler) Get(w http.ResponseWriter, r *http.Request) {
 		ToolCursor:       tcPage.Cursor,
 		ToolHasMore:      tcPage.HasMore,
 		ToolCallsPartial: toolCallsPartial,
+	}
+	if _, running := engine.RunOwner(r.Context(), sess.ID); running {
+		conv.Running = true
 	}
 	// 分支会话带上父会话展示名（单条查询；父会话已删则留空）
 	if conv.ParentSessionID != "" {

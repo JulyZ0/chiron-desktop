@@ -64,7 +64,11 @@ export interface UseComposerBridgeOptions {
   /** 把上下文写进会话运行时（单一事实源） */
   persistRuntime: (patch: Record<string, unknown>) => void
   /** 真正发送一条消息：立即重发复用**正常发送路径**，不另写一套提交 */
-  sendMessage: (text: string, attachments?: ChatAttachment[]) => Promise<boolean>
+  sendMessage: (
+    text: string,
+    attachments?: ChatAttachment[],
+    opts?: { clientMsgId?: string },
+  ) => Promise<boolean>
 }
 
 export interface ComposerBridge {
@@ -91,7 +95,12 @@ export interface ComposerBridge {
   /** 丢弃本会话全部暂存消息 */
   discardOutbox: () => void
   /** 发送失败时入队（`sendMessage` 的 catch 里调） */
-  queueFailedSend: (sessionId: string, text: string, attachments?: ChatAttachment[]) => void
+  queueFailedSend: (
+    sessionId: string,
+    text: string,
+    attachments?: ChatAttachment[],
+    clientMsgId?: string,
+  ) => void
 }
 
 export function useComposerBridge(options: UseComposerBridgeOptions): ComposerBridge {
@@ -196,7 +205,10 @@ export function useComposerBridge(options: UseComposerBridgeOptions): ComposerBr
     if (!sid) return
     const uid = options.userId()
     for (const entry of readOutbox(sid, uid)) {
-      const ok = await options.sendMessage(entry.content, entry.attachments)
+      // 复用首次提交的 clientMsgId：同一条消息重试不该被服务端当成新消息执行第二次。
+      const ok = await options.sendMessage(entry.content, entry.attachments, {
+        clientMsgId: entry.clientMsgId,
+      })
       if (ok) removeFromOutbox(sid, uid, entry.id)
       else bumpRetryCount(sid, uid, entry.id)
     }
@@ -212,8 +224,13 @@ export function useComposerBridge(options: UseComposerBridgeOptions): ComposerBr
   }
 
   /** 发送失败入队：条目直接成为最新视图（顺带省掉一次读盘） */
-  function queueFailedSend(sessionId: string, text: string, attachments?: ChatAttachment[]) {
-    outbox.value = addToOutbox(sessionId, options.userId(), { content: text, attachments })
+  function queueFailedSend(
+    sessionId: string,
+    text: string,
+    attachments?: ChatAttachment[],
+    clientMsgId?: string,
+  ) {
+    outbox.value = addToOutbox(sessionId, options.userId(), { content: text, attachments, clientMsgId })
   }
 
   return {

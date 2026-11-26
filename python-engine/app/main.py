@@ -45,6 +45,22 @@ _session_cache = SessionStore(max_sessions=200)
 # run_token 用于校验审批属于当前 run（批次 4：归属另镜像到 Redis，见 app/run_registry.py）
 _ACTIVE_RUNTIMES: dict[str, tuple[AgentRuntime, str, str]] = {}
 
+def _drop_active_runtime(session_id: str, run_token: str) -> None:
+    """只注销**自己这个 run** 的注册项。
+
+    旧实现无条件 `pop(session_id)`：同会话出现第二个 run（互斥失效/快速重跑）时，
+    先结束的那个会把后者的注册项删掉，于是审批/回答端点回 "no active agent"，
+    用户点了批准却等到超时。比对 run_token 才能保证"谁注册的谁注销"。
+    """
+    current = _ACTIVE_RUNTIMES.get(session_id)
+    if current is not None and current[2] != run_token:
+        logger.warning(
+            "skip unregistering active runtime for session %s: owned by %s, finishing %s",
+            session_id, current[2][:8], run_token[:8],
+        )
+        return
+    _ACTIVE_RUNTIMES.pop(session_id, None)
+
 # 客户端断开后仍在后台跑完的回合任务。必须持有强引用：asyncio 只保留任务的弱引用，
 # 没有这个集合，回合走到一半就可能被 GC 掉（表现为"后台跑完了但什么都没落库"）。
 _BACKGROUND_TURNS: set[asyncio.Task[Any]] = set()
@@ -1816,15 +1832,14 @@ def _setup_routes(app: FastAPI) -> None:
 
     @app.get("/readyz")
     async def readyz() -> Any:
-        """就绪探测：**只看 Redis**。
+        """就绪探测：Redis + （配置了 DSN 时）PostgreSQL。
 
-        原 docstring 写的是 "Redis + 至少一个 Provider 可用"，但实现从来没检查过
-        Provider —— 运维据此以为"provider 全挂会 503"，实际仍然回 ready。
+        Provider 不在这里查：**没配 key 是合法的待配置状态**（打包桌面态首次启动
+        必然如此），因缺 provider 回 503 会让用户连配置界面都进不去。Provider 的
+        真实可用性由 `/healthz/providers` 与熔断指标回答。
 
-        这里把说明对齐实现，而不是反过来加 Provider 检查：**没配 key 是合法的待配置
-        状态**（打包桌面态首次启动必然如此）。若因缺 provider 就回 503，壳层那段
-        "等业务就绪"会一直等到超时，用户连配置密钥的界面都进不去。Provider 的真实
-        可用性由 `/healthz/providers`（逐个探活）与 `llm_circuit_breaker_state` 指标回答。
+        PG 必须查：/healthz 恒 200 只说明"进程在"，而 PG 不可用时历史/记忆/审批/续跑
+        全部静默降级（旧实现只 warn 后继续 ready）。编排器要能据此摘流量/重启。
         """
         if _redis is None:
             return JSONResponse(
@@ -1833,11 +1848,26 @@ def _setup_routes(app: FastAPI) -> None:
             )
         try:
             await _redis.ping()
-            return {"status": "ready"}
         except Exception:
             return JSONResponse(
                 {"status": "not_ready", "reason": "redis ping failed"}, status_code=503
             )
+
+        from app.config import settings as _settings
+
+        if _settings.postgres_dsn:
+            try:
+                from app import db as _db
+
+                pool = _db.get_pool()
+                await asyncio.wait_for(pool.fetchval("SELECT 1"), timeout=2.0)
+            except Exception as exc:  # noqa: BLE001 - 就绪探测只回答布尔
+                return JSONResponse(
+                    {"status": "not_ready", "reason": f"postgres unavailable: {type(exc).__name__}"},
+                    status_code=503,
+                )
+
+        return {"status": "ready"}
 
     @app.get("/info")
     async def info() -> dict[str, Any]:
@@ -2208,6 +2238,14 @@ async def agent_submit(
         from app.run_registry import RunLease
 
         run_token = uuid.uuid4().hex
+        _previous = _ACTIVE_RUNTIMES.get(session_id)
+        if _previous and _previous[2] != run_token:
+            # 正常不该出现：claim_new 的会话级唯一索引已挡住第二个 run。
+            # 真出现了说明互斥某层失效 —— 必须留日志，否则审批会被悄悄改道。
+            logger.warning(
+                "replacing active runtime for session %s (previous token %s, new %s)",
+                session_id, _previous[2][:8], run_token[:8],
+            )
         _ACTIVE_RUNTIMES[session_id] = (runtime, task.user_id, run_token)
         # 崩溃取证：报告要能回答"崩的时候谁在跑"。session 与 run token 前 8 位够定位，
         # 不落 user_id（报告可能被用户原样贴进反馈渠道）。
@@ -2349,7 +2387,7 @@ async def agent_submit(
                         except Exception as lease_err:  # noqa: BLE001
                             logger.debug("run lease stop failed: %s", lease_err)
                     if session_id:
-                        _ACTIVE_RUNTIMES.pop(session_id, None)
+                        _drop_active_runtime(session_id, run_token)
                         crash_forensics.clear_active_run(session_id)
 
             bg = asyncio.create_task(_finish())
@@ -2362,10 +2400,17 @@ async def agent_submit(
                     raise RuntimeError("run ownership replaced before start")
                 from app.agent import checkpoint as checkpoint_mod
 
-                await checkpoint_mod.claim_new(
+                _claimed = await checkpoint_mod.claim_new(
                     tenant_id=task.tenant_id or 0, session_id=session_id,
                     run_token=run_token, generation=run_generation,
                 )
+                if not _claimed:
+                    # 会话级唯一索引是 Redis run 租约之外的第二层互斥。旧实现丢弃
+                    # 返回值，一旦租约键缺失/过期，同会话两个 run 会并行写历史、
+                    # 重复执行工具、互相覆盖审批归属。这里 fail-closed。
+                    raise RuntimeError(
+                        "another run is active for this session (or the run store is unavailable)"
+                    )
                 context_token = activate_run_fence(run_lease.fence)
             assert pump is None
             pump = asyncio.create_task(_pump_runtime())
@@ -2501,7 +2546,7 @@ async def agent_submit(
                 if run_lease is not None:
                     await run_lease.stop()
                 if session_id:
-                    _ACTIVE_RUNTIMES.pop(session_id, None)
+                    _drop_active_runtime(session_id, run_token)
                     crash_forensics.clear_active_run(session_id)
             if context_token is not None:
                 deactivate_run_fence(context_token)

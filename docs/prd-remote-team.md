@@ -15,8 +15,6 @@ Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、
 
 | ID | 事项 | 为什么阻塞 | 完成判据 | 量级 |
 |---|---|---|---|---|
-| **L05** | `no_retention` 被后台任务绕过 | 隐私位只在请求 contextvar，队列 envelope 不带；后台输出落 Redis 24h 并回注对话 | no_retention 下无 `job:result:*`、无 followup；有用例 | M |
-| **L06** | 多会话运行态不一致 | F5 不重挂运行中的会话流；`switchSession` finally 清 `loading`；SSE `onError` 跨会话写全局 loading | 长任务 F5 后 5s 内续流；切回运行中会话停止按钮仍在；A 的错误不影响 B | M |
 
 ## 3. 上线后首月加固（P1）
 
@@ -24,10 +22,9 @@ Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、
 
 | ID | 事项 | 证据/后果 | 量级 |
 |---|---|---|---|
-| L07 | 匿名端点无 per-IP 限流；分享密码可爆破 | 单客户端可烧光全站匿名配额；分享密码无失败计数 | S |
+| L07 | 分享密码可爆破（匿名 per-IP 限流已补） | 密码最短 4 位，无 per-share/IP 失败计数与短锁 | S |
 | L08 | 停机宽限 10s < 在途预算 5min；后台协程不 join | 滚动发布切断长请求；审计/画布最终 flush 可能丢 | M |
 | L11 | DB 无 acquire/查询超时；无请求超时中间件 | 池耗尽后整实例雪崩 | M |
-| L12 | 后台 Redis 中继裸 goroutine，panic 即退出 | 一条坏消息可让全副本 CrashLoop | S |
 | L13 | `REDIS_KEY_PREFIX` 在包级 var 里丢前缀 | 仅 `.env` 配置的多环境共用 Redis 会串键 | S |
 
 ### 3.2 引擎 / 队列
@@ -36,16 +33,13 @@ Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、
 |---|---|---|---|
 | L14 | 空闲自停只看 HTTP 在途，`os._exit` 硬杀队列任务 | 缩容/回收杀后台命令与子 Agent | S |
 | L15 | 停机不保证停止领取+排空；DLQ retry 用 `xadd maxlen` 可裁掉 PEL；reclaim 计入失败预算 | 任务重领进 DLQ / 丢件 / 孤儿副作用 | M |
-| L16 | `claim_new` 返回值被丢弃；`_ACTIVE_RUNTIMES` 覆盖+无条件 pop | 同会话双 run；审批找不到 runtime | S |
 | L17 | `tool_job` 输出无上限；附件下载整包进内存 | 一条大输出可打爆副本内存与 Redis | M |
-| L18 | PG 不可用仍 ready；`/readyz` 只看 Redis；`queue_depth` 死指标 | 编排不摘流量，积压告警永不触发 | S |
 | L19 | 无实例级并发上限；沙箱配额默认关闭 | 绕过网关直连/自动续跑可打满进程 | M |
 
 ### 3.3 前端
 
 | ID | 事项 | 证据/后果 | 量级 |
 |---|---|---|---|
-| L20 | 路由切换 `cancelAll()` 取消 `/submit` | 失败入 outbox + 新 clientMsgId ⇒ 同一问题执行两次 | M |
 | L22 | SSE 重连 3 次×1s，无退避；子 Agent 流无心跳 | 断网/休眠后后台会话静默死亡 | M |
 | L23 | 首屏预加载仍含 charts/diagram ~0.8MB br（fileviewer 1.8MB 已移除；二者仍随入口预载，成因待查） | 弱网首屏被图表/图形库抢带宽 | S |
 | L25 | nginx 未消费 `.br/.gz`；无 sourcemap | 镜像膨胀、线上堆栈不可读 | S |
@@ -90,12 +84,17 @@ Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、
 L01 SSE Unwrap、L02 503、L03 上传期限、L04 日志桥、L09/L10 启动自检、L21 全局错误兜底、
 L24 CSP、L23 fileviewer 预加载（1.8MB br 已移除；charts/diagram 余量留 P2）。
 
-**第 2 批 · 半天级（状态正确性）**
-L06 前端运行态 → L20 cancelAll/outbox → L16 会话互斥 → L18 健康/指标 → L12 中继 recover →
-L07 匿名限流。
+**第 2 批 · 已完成（2026-11-26）**
+L06 前端运行态（running 重挂/切回不清 loading/按会话收尾）、L20 cancelAll 与 outbox 幂等、
+L16 会话互斥与审批路由围栏、L18 PG 就绪/队列深度/健康检查、L12 中继 panic 隔离、
+L07 匿名 per-IP 限流（分享密码锁定仍待做）。
+
+**第 2 批补充 · 已完成**
+L05：no_retention 下**禁用**后台任务（结果写 Redis 24h + followup 回注都会留存；
+明确拒绝比"写一半再声称没留存"合规）。其余队列任务的隐私位待评估。
 
 **第 3 批 · 1–2 天（数据面与队列）**
-L05 privacy 跨队列 → L15 停机/DLQ/reclaim → L14 空闲自停 → L17 输出/附件上限 → L22 重连退避。
+L15 停机/DLQ/reclaim → L14 空闲自停 → L17 输出/附件上限 → L22 重连退避。
 
 **第 4 批 · 2–3 天（运行面）**
 L26 备份恢复 → L27 部署形态 → L28 升级回滚 → L30 告警 → L25 压缩/sourcemap → L29 供应链。

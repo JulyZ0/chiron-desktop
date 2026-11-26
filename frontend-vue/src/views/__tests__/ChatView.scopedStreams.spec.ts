@@ -167,8 +167,10 @@ type Vm = {
   switchSession: (id: string) => Promise<void>
 }
 
-/** 挂载 + 选定 s-1（会话列表给两个会话，切换不必再拉列表） */
-async function mountChat() {
+/** 挂载 + 选定 s-1（会话列表给两个会话，切换不必再拉列表）。
+ *  `running` 里的会话，其详情响应带 `running: true` —— 用来模拟"刷新时有 run 在跑"。 */
+async function mountChat(running: string[] = []) {
+  const runningSet = new Set(running)
   apiMocks.api.get.mockImplementation((url?: string) => {
     if (url === '/v1/conversations') {
       return Promise.resolve({
@@ -177,6 +179,19 @@ async function mountChat() {
             { id: 's-1', title: '会话 1', updated_at: '2026-10-08T00:00:00Z' },
             { id: 's-2', title: '会话 2', updated_at: '2026-10-08T00:00:00Z' },
           ],
+        },
+      }) as never
+    }
+    if (runningSet.size && url?.startsWith('/v1/conversations/') && url.includes('limit=')) {
+      const id = decodeURIComponent(url.split('/')[3].split('?')[0])
+      return Promise.resolve({
+        data: {
+          data: {
+            id,
+            messages: [],
+            tool_calls: [],
+            running: runningSet.has(id),
+          },
         },
       }) as never
     }
@@ -215,6 +230,13 @@ describe('ChatView 会话隔离（H59）', () => {
   it('★ 终态事件只关**来源流**：s-1 收尾不会掐断 s-2 仍在跑的流', async () => {
     const { wrapper, vm } = await mountChat()
     await send(wrapper)                 // s-1 起一轮
+    // /submit 必须带 __retainAcrossNavigation：路由切换的 cancelAll 不能把它 abort 掉，
+    // 否则客户端判失败入 outbox，服务端其实已受理 ⇒ 重发执行两次。
+    expect(apiMocks.api.post).toHaveBeenCalledWith(
+      '/submit',
+      expect.anything(),
+      expect.objectContaining({ __retainAcrossNavigation: true }),
+    )
     await vm.switchSession('s-2')
     await send(wrapper, '你好，B')       // s-2 起一轮
 
@@ -230,6 +252,18 @@ describe('ChatView 会话隔离（H59）', () => {
     expect(a.closed).toBe(true)   // 来源流关掉
     expect(b.closed).toBe(false)  // 别人的流一根汗毛都不动 —— 旧实现这里会关掉 b
     expect(vm.loading).toBe(true) // s-2 仍在跑
+  })
+
+  it('★ 刷新/切回时服务端 running=true 会自动重挂流（不是"已结束"）', async () => {
+    const { vm } = await mountChat(['s-1'])
+    // 初始加载会 switchSession(s-1)；running=true ⇒ 必须建流且 loading 为真
+    expect(net.turn.has('s-1')).toBe(true)
+    expect(vm.loading).toBe(true)
+
+    // 切到未运行的 s-2：s-1 的流保留（后台仍在跑），但当前视图 loading=false
+    await vm.switchSession('s-2')
+    expect(vm.loading).toBe(false)
+    expect(net.turn.get('s-1')!.closed).toBe(false)
   })
 
   it('★ approval 帧落进**发事件的那个会话**，不落进当前视图会话', async () => {

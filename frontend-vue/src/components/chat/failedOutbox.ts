@@ -25,6 +25,11 @@ export interface OutboxEntry {
   failedAt: number
   /** 已重试次数。用于"反复发不出去"时提示用户先处理网络/模型配置。 */
   retryCount: number
+  /**
+   * 首次提交时生成的幂等键。重发必须复用它 —— 否则"客户端超时但服务端已受理"
+   * 会被当成一条新消息，同一个问题执行两次（双倍 token / 双份工具副作用）。
+   */
+  clientMsgId?: string
 }
 
 const KEY_BASE = 'chiron:outbox:v1'
@@ -70,7 +75,7 @@ function writeOutbox(sessionId: string, userId: string | null | undefined, entri
 export function addToOutbox(
   sessionId: string,
   userId: string | null | undefined,
-  input: { content: string; attachments?: ChatAttachment[] },
+  input: { content: string; attachments?: ChatAttachment[]; clientMsgId?: string },
 ): OutboxEntry[] {
   const entries = readOutbox(sessionId, userId)
   entries.push({
@@ -79,6 +84,7 @@ export function addToOutbox(
     attachments: input.attachments?.length ? input.attachments : undefined,
     failedAt: Date.now(),
     retryCount: 0,
+    clientMsgId: input.clientMsgId,
   })
   return writeOutbox(sessionId, userId, entries)
 }

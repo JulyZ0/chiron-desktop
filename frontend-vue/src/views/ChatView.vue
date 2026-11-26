@@ -474,9 +474,13 @@ function attachSessionStream(
     sessionId,
     (raw, meta) => withRun(runOf(sessionId), () => onSSEMessage(raw, sessionId, meta?.id)),
     () => {
+      // 只改**来源会话**的运行态。loading / 计时器是当前视图的代理，A 的流失败
+      // 绝不能把正在看的 B 的 spinner 停掉（反之会让 A 永远显示"生成中"）。
       runOf(sessionId).loading = false
-      loading.value = false
-      stopTurnTimer()
+      if (activeSessionId.value === sessionId) {
+        loading.value = false
+        stopTurnTimer()
+      }
       connectionLost.value = true
       closeSessionStream(sessionId)
       if (options.userItemId) markMessageFailed(options.userItemId, t('common.connection_lost'))
@@ -2103,10 +2107,12 @@ async function switchSession(id: string, options: { force?: boolean } = {}) {
   if (!currentRun.value.loading) closeSessionStream(id)
   // 模式（对话模式 + 工具授权模式）不在此同步：它们是前端全局实时状态，
   // 切换会话既不改变它们，也不从会话状态读回（见 buildLlmConfig 的说明）。
+  let serverRunning = false
   try {
     const res = await api.get(`/v1/conversations/${id}?limit=${HISTORY_PAGE_SIZE}`)
     if (isStale(mySeq)) return
     const data = res.data?.data || res.data
+    serverRunning = !!data?.running
     if (data?.messages) {
       // 该会话正在生成（或流里已累积过内容）时，**不要用拉回的历史覆盖它** ——
       // 否则"切走再切回"的瞬间会把这段时间里增长的内容冲掉。
@@ -2168,14 +2174,33 @@ async function switchSession(id: string, options: { force?: boolean } = {}) {
       }
       contextChips.value = merged
     }
-  } catch { /* fallback */ } finally {
-    if (!isStale(mySeq)) {
-      loading.value = false
-      endSwitch(mySeq)
-      // 会话加载完成后自动滚到底部：**走单写者**（契约 §1.1；此处原先直接写 DOM）
-      await nextTick()
-      messageListRef.value?.scrollToBottom()
+  } catch (e) {
+    // 历史拉取失败时不要凭空判定"已结束"：保留该会话原有的运行态，
+    // 否则一次网络抖动会把后台仍跑着的会话伪装成空闲。
+    serverRunning = currentRun.value.loading
+    const code = (e as { response?: { status?: number } })?.response?.status
+    if (code === 404) {
+      notify.info(t('errors.not_found'))
+      sessions.value = sessions.value.filter(s => s.id !== id)
+    } else if (code === 403) {
+      notify.error(t('errors.forbidden'))
     }
+  }
+  if (!isStale(mySeq)) {
+    // 用服务端的 run 归属对账：刷新/切回时若还有 run 在跑，必须重新挂流；
+    // 已经结束则收掉陈旧流。**不再**无条件写 loading —— 那会把运行中的会话
+    // 伪装成已结束（用户再按回车就是并发开第二轮）。
+    if (serverRunning) {
+      currentRun.value.loading = true
+      if (!sseBySession.has(id)) attachSessionStream(id)
+    } else {
+      currentRun.value.loading = false
+      closeSessionStream(id)
+    }
+    endSwitch(mySeq)
+    // 会话加载完成后自动滚到底部：**走单写者**（契约 §1.1；此处原先直接写 DOM）
+    await nextTick()
+    messageListRef.value?.scrollToBottom()
   }
 }
 
@@ -2406,7 +2431,11 @@ async function checkProjectVcs(): Promise<void> {
 /** 发送一条消息。**返回值 = 是否已送达服务端** —— 未送达的会被暂存到本地队列
  *  （见 failedOutbox.ts），Composer 顶部横幅据此提供重发。
  *  既有调用方全部忽略返回值，所以把返回类型改成 boolean 不会影响它们。 */
-async function sendMessage(text: string, attachments?: ChatAttachment[]): Promise<boolean> {
+async function sendMessage(
+  text: string,
+  attachments?: ChatAttachment[],
+  opts?: { clientMsgId?: string },
+): Promise<boolean> {
   // 首次提问前确认项目已纳入版本控制（见 checkProjectVcs）。**不 await**：
   // 它要先查一次网关（网关慢/重启时那是秒级），把它放在这里会让"点发送"到
   // "loading 亮起"之间空等一个往返 —— 用户看到的是"发出去没反应"。
@@ -2446,32 +2475,12 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
   runOf(sessionId).turnSeq += 1
   currentTraceId.value = ''
   try {
-    // H59：只替换**本会话**的流（别的会话仍在跑的流不受影响）
-    closeSessionStream(sessionId)
-    sseBySession.set(sessionId, createSSEConnection(
-      sessionId,
-      (raw, meta) => withRun(runOf(sessionId), () => onSSEMessage(raw, sessionId, meta?.id)),
-      () => {
-        loading.value = false
-        stopTurnTimer()
-        connectionLost.value = true
-        closeSessionStream(sessionId)
-        markMessageFailed(userItemId, t('common.connection_lost'))
-        // 真断线（自动重连已用尽）才响：抖动期间的重连不该打扰
-        playUiSound('disconnected')
-      },
-      {
-        // 携带上一连接的最后事件 id：服务端按 last_event_id 从缓冲流补发断线缺口
-        initialLastEventId: sseLastIdBySession.get(sessionId) || '',
-        // 流断了交给 openEventStream 自己重连（带 Last-Event-ID，最多 3 次），用尽才回调 onError
-        autoReconnect: true,
-        // H69：静默看门狗。半开连接不会抛错也不会 EOF —— 只有"一直收不到字节"
-        // （连网关每 15s 的 `: ping` 都没到）能发现它，否则界面永远停在"思考中"。
-        heartbeatTimeoutMs: SSE_SILENT_TIMEOUT_MS,
-        onLastEventId: (id) => { sseLastIdBySession.set(sessionId, id) },
-      },
-    ))
-    const clientMsgId = crypto.randomUUID()
+    // H59/H60：与断线重连共用**同一套**装配（attachSessionStream），否则两处
+    // 各写一份 onError，必然漂移 —— 一处改来源会话、另一处改当前视图。
+    attachSessionStream(sessionId, { userItemId })
+    // 重发（outbox）复用**同一条** client_msg_id：服务端 SETNX 才能把
+    // "上次其实已受理、只是客户端超时"识别为同一条，而不是执行两次。
+    const clientMsgId = opts?.clientMsgId || crypto.randomUUID()
     const body: Record<string, unknown> = {
       content: text,
       session_id: sessionId,
@@ -2490,7 +2499,7 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
     if (resolvedAtts.length) {
       body.attachments = resolvedAtts.map(a => ({ id: a.id, name: a.name, mime_type: a.mimeType, url: a.url, is_image: a.isImage }))
     }
-    await api.post('/submit', body)
+    await api.post('/submit', body, { __retainAcrossNavigation: true } as never)
     // 新用户引导第三步：消息真的被服务端接收了才算完成（P0-3）。
     // 放在这之后而不是之前：POST 失败会走 catch，那时"发出第一轮对话"并没有发生。
     void markFirstMessageDone()
@@ -2510,7 +2519,7 @@ async function sendMessage(text: string, attachments?: ChatAttachment[]): Promis
     notify.error(t('errors.send_failed') + reason)
     // 落盘暂存：这条消息**没有**被服务端接收（POST 失败），刷新后 transcript 里不会有它。
     // 不回填输入框而是入队，是为了不打断"继续写草稿"的动作。
-    queueFailedSend(sessionId, text, attachments)
+    queueFailedSend(sessionId, text, attachments, opts?.clientMsgId)
     return false
   }
 }

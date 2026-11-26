@@ -8,6 +8,11 @@ const KEY = `chiron:outbox:v1:${SID}:${UID}`
 beforeEach(() => localStorage.clear())
 
 describe('failedOutbox（未送达消息暂存）', () => {
+  it('clientMsgId 随条目持久化（重发复用它，服务端才能幂等去重）', () => {
+    addToOutbox(SID, UID, { content: 'hi', clientMsgId: 'cm-1' })
+    expect(readOutbox(SID, UID)[0].clientMsgId).toBe('cm-1')
+  })
+
   it('没有暂存时返回空队列', () => {
     expect(readOutbox(SID, UID)).toEqual([])
   })

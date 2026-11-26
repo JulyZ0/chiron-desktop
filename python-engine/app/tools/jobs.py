@@ -105,9 +105,25 @@ async def _local_run(job_id: str, command: str) -> asyncio.Task[Any]:
 # ── 工具接口 ─────────────────────────────────────────────────────
 
 async def run_in_background(command: str) -> dict[str, Any]:
-    """Run *command* in the background; returns a job id."""
+    """Run *command* in the background; returns a job id.
+
+    **no_retention 下拒绝**：结果要写 Redis（24h）并经 followup 回注会话，这两步都会把
+    命令输出留存下来 —— 隐私位是请求作用域的 contextvar，队列 worker 在另一个任务里
+    看不到它，旧实现因此**静默绕过**了"不落库"的合规承诺。宁可明确拒绝、让用户改前台
+    执行，也不做一半（把输出写进库再声称没留存）。
+    """
     if not command.strip():
         return {"error": "command is required"}
+    from app.middleware.privacy_middleware import is_no_retention
+
+    if is_no_retention():
+        return {
+            "error": (
+                "run_in_background is unavailable in no_retention privacy mode: "
+                "its output would be retained in Redis and replayed into the session. "
+                "Run the command in the foreground instead."
+            )
+        }
     job_id = _job_id()
     shell_key = get_session_id() or "default"
 

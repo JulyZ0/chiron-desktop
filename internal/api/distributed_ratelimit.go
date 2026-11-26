@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"net"
+	"strings"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -158,7 +160,7 @@ func rateLimitDecision(result, tenantID, userID string) (bool, error) {
 
 // Allow 检查并消费一个令牌 — 单次原子 eval 完成三级检查与扣减。
 // fail-close 策略：Redis 不可用或 Eval 错误时拒绝请求（生产安全优先）。
-func (l *DistributedRateLimiter) Allow(ctx context.Context, tenantID, userID string) (bool, error) {
+func (l *DistributedRateLimiter) Allow(ctx context.Context, tenantID, userID, remoteAddr string) (bool, error) {
 	if l.rdb == nil {
 		return false, fmt.Errorf("限流 Redis 不可用，按 fail-close 拒绝请求")
 	}
@@ -166,6 +168,12 @@ func (l *DistributedRateLimiter) Allow(ctx context.Context, tenantID, userID str
 		// 未认证公开端点（install/login/register/health 等）共用 public 桶限流，
 		// 防止单一来源滥用，但不拒绝（否则 install 首次部署无法完成）
 		tenantID = "public"
+	}
+	// 匿名流量必须有 per-IP 维度：只有 public 桶时，一个客户端就能烧光全站匿名
+	// 配额，把所有人挡在登录/注册/分享页外（429）。RemoteAddr 已由 realIPHeader
+	// 在可信代理网段内改写为真实来源；不可信来源则保持直连地址。
+	if userID == "" && remoteAddr != "" {
+		userID = "ip:" + hostOnly(remoteAddr)
 	}
 
 	globalKey, tenantKey, userKey := rateLimitKeys(tenantID, userID)
@@ -201,7 +209,7 @@ func DistributedRateLimitMiddleware(limiter *DistributedRateLimiter) func(http.H
 				userID = claims.UserID
 			}
 
-			allowed, err := limiter.Allow(r.Context(), tenantID, userID)
+			allowed, err := limiter.Allow(r.Context(), tenantID, userID, r.RemoteAddr)
 			if writeRateLimitRejection(w, err, userID, r.URL.Path) {
 				return
 			}
@@ -236,4 +244,12 @@ func writeRateLimitRejection(w http.ResponseWriter, err error, userID, path stri
 	slog.Error("限流服务不可用（fail-close）", "error", err, "user", userID, "path", path)
 	ServiceUnavailable(w, "rate limiter unavailable")
 	return true
+}
+
+// hostOnly 去掉 host:port 里的端口（IPv6 的 [::1]:1234 也能处理）。
+func hostOnly(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return strings.Trim(addr, "[]")
 }

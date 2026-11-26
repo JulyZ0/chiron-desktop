@@ -51,39 +51,11 @@ func StartSubagentEventsRelay(ctx context.Context, hub *broadcast.Hub) {
 					slog.Warn("subagent events relay channel closed")
 					return
 				}
-				var payload map[string]interface{}
-				if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
-					slog.Warn("subagent event payload not json", "error", err)
-					continue
-				}
-				eventType, _ := payload["type"].(string)
-				sessionID, _ := payload["session_id"].(string)
-				if eventType == "" {
-					continue
-				}
-				if sessionID == "" {
-					// 没有会话归属就无法路由：SSE 端点是按 session 过滤的，硬塞会给
-					// **所有**会话的订阅者都推一份（串扰）。宁可丢这一条并留日志。
-					slog.Warn("subagent event without session_id, dropped", "type", eventType)
-					continue
-				}
-				// 走 RelayEvent 而不是 Publish：事件**本来就是跨实例来的**（Redis pub/sub），
-				// 再 Publish 会让每个实例都把同一事件跨实例广播一次 ⇒ 客户端收到 N 份重复。
-				// 双进程演练实测：扇出变成"同一事件两次"，重放变成 [2,2,3,3]（见 internal/broadcast/hub.go）。
-				hub.RelayEvent(broadcast.Event{
-					Type:      eventType,
-					SessionID: sessionID,
-					Data:      payload,
+				// 单条坏消息的 panic 不能升级成进程退出：中继是常驻 goroutine，
+				// Go 里未捕获的 panic 会终止整个进程（不是单个 goroutine）。
+				runBackgroundCycle("subagent-events-relay", func() {
+					processSubagentEvent(ctx, hub, msg.Payload)
 				})
-
-				// 子 Agent 失败 → 站内通知。
-				//
-				// 只在终态且非正常完成时落：这个中继是所有子 Agent 事件（status/text/
-				// reasoning/...）的公共入口，为每条写通知会把通知中心变成日志流。
-				// 去重靠 `event_id`（引擎逐条附带，多副本下 N 个网关都会看到同一条）。
-				if eventType == "subagent.done" {
-					maybeNotifySubagentFailed(ctx, payload)
-				}
 			}
 		}
 	}()
@@ -145,4 +117,36 @@ func maybeNotifySubagentFailed(ctx context.Context, payload map[string]interface
 			},
 		},
 		tenantID, userID, "subagent_failed:"+runID)
+}
+
+// processSubagentEvent 处理一条跨实例子 Agent 事件（由中继循环在 recover 包装内调用）。
+func processSubagentEvent(ctx context.Context, hub *broadcast.Hub, rawPayload string) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(rawPayload), &payload); err != nil {
+		slog.Warn("subagent event payload not json", "error", err)
+		return
+	}
+	eventType, _ := payload["type"].(string)
+	sessionID, _ := payload["session_id"].(string)
+	if eventType == "" {
+		return
+	}
+	if sessionID == "" {
+		// 没有会话归属就无法路由：SSE 端点是按 session 过滤的，硬塞会给
+		// **所有**会话的订阅者都推一份（串扰）。宁可丢这一条并留日志。
+		slog.Warn("subagent event without session_id, dropped", "type", eventType)
+		return
+	}
+	// 走 RelayEvent 而不是 Publish：事件本来就是跨实例来的（Redis pub/sub），
+	// 再 Publish 会让每个实例都把同一事件跨实例广播一次 ⇒ 客户端收到 N 份重复。
+	hub.RelayEvent(broadcast.Event{
+		Type:      eventType,
+		SessionID: sessionID,
+		Data:      payload,
+	})
+
+	// 子 Agent 失败 → 站内通知。只在终态且非正常完成时落；去重靠 event_id。
+	if eventType == "subagent.done" {
+		maybeNotifySubagentFailed(ctx, payload)
+	}
 }

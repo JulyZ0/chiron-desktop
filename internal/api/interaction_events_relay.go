@@ -65,25 +65,28 @@ func StartInteractionEventsRelay(ctx context.Context, hub *broadcast.Hub) {
 					slog.Warn("interaction events relay channel closed")
 					return
 				}
-				var payload map[string]interface{}
-				if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
-					slog.Warn("interaction event payload not json", "error", err)
-					continue
-				}
-				eventType, _ := payload["type"].(string)
-				userID, _ := payload["user_id"].(string)
-				sessionID, _ := payload["session_id"].(string)
-				event, ok := interactionEventFromPayload(payload)
-				if !ok {
-					// 没有用户归属就路由不到用户通道 —— 而用户通道正是这条事件存在的理由。
-					// 宁可丢这一条并留日志，也不把它塞给所有会话（那会变成串扰）。
-					slog.Warn("interaction event without type/user_id, dropped",
-						"type", eventType, "user_id", userID, "session_id", sessionID)
-					continue
-				}
-				// 走 RelayEvent：事件本来就是跨实例来的（Redis pub/sub），再 Publish 会让
-				// 每个实例都把同一事件跨实例广播一次 ⇒ 客户端收 N 份（双进程演练的教训）。
-				hub.RelayEvent(event)
+				// 同 job-events：单条坏消息的 panic 不能升级成进程退出。
+				runBackgroundCycle("interaction-events-relay", func() {
+					var payload map[string]interface{}
+					if err := json.Unmarshal([]byte(msg.Payload), &payload); err != nil {
+						slog.Warn("interaction event payload not json", "error", err)
+						return
+					}
+					eventType, _ := payload["type"].(string)
+					userID, _ := payload["user_id"].(string)
+					sessionID, _ := payload["session_id"].(string)
+					event, ok := interactionEventFromPayload(payload)
+					if !ok {
+						// 没有用户归属就路由不到用户通道 —— 而用户通道正是这条事件存在的理由。
+						// 宁可丢这一条并留日志，也不把它塞给所有会话（那会变成串扰）。
+						slog.Warn("interaction event without type/user_id, dropped",
+							"type", eventType, "user_id", userID, "session_id", sessionID)
+						return
+					}
+					// 走 RelayEvent：事件本来就是跨实例来的（Redis pub/sub），再 Publish 会让
+					// 每个实例都把同一事件跨实例广播一次 ⇒ 客户端收 N 份（双进程演练的教训）。
+					hub.RelayEvent(event)
+				})
 			}
 		}
 	}()

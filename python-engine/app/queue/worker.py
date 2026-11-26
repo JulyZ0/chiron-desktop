@@ -405,6 +405,9 @@ class QueueWorker:
             try:
                 await asyncio.sleep(CLAIM_LOOP_SECS)
                 await self._reclaim_pending()
+                # 队列深度指标：此前 update_queue_depth() 全仓没有调用点，
+                # prometheus_alerts 里基于 queue_depth 的积压告警永远不会触发。
+                await self.update_queue_depth()
                 # G16：顺手盘点"心跳停了、但还没到 claim 阈值"的任务。
                 # 修前这一档完全不可见：它们看起来和正常跑着的一样，直到 lease 超时
                 # 才以"失联"的形式被重领 —— 而重领既晚，也说不清上一次是卡住的。
@@ -1309,6 +1312,6 @@ class QueueWorker:
         """更新队列深度指标"""
         try:
             info = await self._redis.xinfo_stream(self._q.stream)
-            QUEUE_DEPTH.labels(stream="engine:tasks").set(info.get("length", 0))
+            QUEUE_DEPTH.labels(stream=self._q.stream).set(info.get("length", 0))
         except Exception:
             logger.warning("Failed to update queue depth metric")
