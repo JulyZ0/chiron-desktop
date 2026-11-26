@@ -125,6 +125,7 @@ export default {
   citation_doc_page: "{doc} · 第 {page} 页",
   index_progress_n_of_m: "{done}/{total} 篇已完成索引",
   index_failed_documents: "索引失败的文档",
+  index_worker_down: "索引执行器未运行（pageindex-worker 没有心跳）。请重启知识库服务后再重试。",
   retry_failed_documents: "重试失败文档",
   retry_this_document: "重试本文件",
   reindex_all: "重建全部索引",

@@ -124,6 +124,7 @@ export default {
   citation_doc_page: "{doc} · p. {page}",
   index_progress_n_of_m: "{done}/{total} documents indexed",
   index_failed_documents: "Documents that failed to index",
+  index_worker_down: "The indexing worker is not running (no pageindex-worker heartbeat). Restart the knowledge service, then retry.",
   retry_failed_documents: "Retry failed documents",
   retry_this_document: "Retry this file",
   reindex_all: "Rebuild all",

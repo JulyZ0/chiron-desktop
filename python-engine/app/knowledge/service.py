@@ -289,17 +289,21 @@ async def index_status(*, kb_id: str) -> dict[str, Any]:
         kb_error=str(kb["error_message"] or ""),
         documents=list(rows),
     )
-    # 看门狗：库在 indexing、但没有任何 pageindex-worker 心跳且这个状态已超过 2 分钟
-    # ⇒ 任务没人消费（worker 死了 / 队列没投递到）。不把这一态收口，前端会永远轮询，
-    # 用户只能看到「索引中」而没有任何原因。写成 error 才能停下轮询并给出重试入口。
-    # Cloud 模式的索引在远端执行，本地没有 worker 心跳是正常的 —— 不参与该判定。
-    if (
-        result.get("status") == STATUS_INDEXING
-        and str(kb["provider"] or "") != "cloud"
-        and kb["stale"]
-    ):
+    # 索引执行器是否活着：**无条件**带给前端（Cloud 模式除外）。
+    #
+    # 修前只在"库 indexing 且已停滞 2 分钟"时才探测，用户在那 2 分钟里只能看到
+    # 「索引中」，而真实原因（worker 根本没起）要等看门狗才浮现。把心跳作为状态字段
+    # 直接下发，页面可以在**第一次轮询**就提示"执行器未运行"，而不是让用户干等。
+    # 探测本身有 10s 缓存（见 `_kb_worker_alive`），3s 一次的状态轮询不会打爆 Redis。
+    if str(kb["provider"] or "") == "cloud":
+        # 远端索引没有本地 worker 的概念：给 `None`（未知），避免误报"未运行"。
+        result["worker_alive"] = None
+    else:
         alive = await _kb_worker_alive()
-        if alive is False:
+        result["worker_alive"] = alive
+        # 看门狗：库在 indexing、worker 没有心跳且这个状态已超过 2 分钟 ⇒ 任务没人消费
+        # （worker 死了 / 队列没投递到）。写成 error 才能停下轮询并给出重试入口。
+        if result.get("status") == STATUS_INDEXING and kb["stale"] and alive is False:
             result["status"] = STATUS_ERROR
             result["active"] = False
             result["error_message"] = (

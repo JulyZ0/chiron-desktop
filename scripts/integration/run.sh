@@ -10,8 +10,8 @@
 #   4. usage   ：断言 usage_events 有行**且 token 非零**（来自假 LLM 的 usage chunk）
 #   5. checkpoint：断言 project_checkpoints 有 state=ok 的行 → 时间线接口 → 回滚 200
 #   6. share   ：建分享 → **不带任何凭据** GET /v1/share/<token> 读到消息
-#   7. 知识库  ：pageindex ready + /v1/kb 可用；尝试真实建库/上传/索引/查询，
-#                假 LLM 建不出索引时记 SKIP（打印原因），不伪装成功
+#   7. 知识库  ：pageindex ready + worker 心跳 + /v1/kb 可用；真实建库/上传/索引/查询
+#                （索引失败、90s 未 ready、查询空引用都是 **FAIL**，不再降级为 SKIP）
 #   8. deps    ：GET /v1/admin/deps/list
 #   9. 隔离    ：GET → PUT level=job → GET 复核 effective 一致
 #
@@ -407,14 +407,14 @@ ok_assert "匿名分享可读" "token=$SHARE_ID messages=$SHARED_N"
 # 集成带不构建前端产物，所以这里只确认短链形态，不把 HTML 断言伪装成已验证。
 skip_assert "SPA 短链 /s/<token> 的 HTML 渲染" "未构建前端产物；匿名数据面已由 /v1/share 验证"
 
-# ── 6. 知识库：服务就绪 + 真实检索命中（best-effort）───────────────────
+# ── 6. 知识库：服务就绪 + 真实检索命中（索引失败即 FAIL）──────────────
 
 PI_HEALTH="$(curl -sS --max-time 5 "$PAGEINDEX_URL/healthz" 2>/dev/null || true)"
 if [ "$(jget "$PI_HEALTH" 'status')" = "ready" ] || [ "$(jget "$PI_HEALTH" 'ok')" = "True" ] \
   || [ "$(jget "$PI_HEALTH" 'ok')" = "true" ]; then
   ok_assert "pageindex 检索服务就绪" "$(jget "$PI_HEALTH" 'chat_model')"
 else
-  skip_assert "pageindex 检索服务自检" "healthz 未报告 ready：${PI_HEALTH:0:300}"
+  fail_assert "pageindex 检索服务自检" "healthz 未报告 ready：${PI_HEALTH:0:300}"
 fi
 
 http_call GET /v1/kb
@@ -422,14 +422,30 @@ require_status 200 "知识库列表 /v1/kb"
 ok_assert "知识库接口可用" ""
 
 kb_hit_probe() {
-  # 返回 0=PASS, 1=FAIL, 2=SKIP（由调用方决定如何计数）
+  # 返回 0=PASS, 1=FAIL。
+  #
+  # **不再有 SKIP 分支**：本带同时起了 pageindex-service 与 pageindex-worker，
+  # 索引失败/超时/空引用都是产品缺陷而不是"环境不具备"。修前把这些当 SKIP，
+  # 于是 schema 漂移（缺 index_engine 列）导致的**每次索引必失败**可以长期绿。
+  local health alive i
+  for ((i = 0; i < 30; i++)); do
+    health="$(curl -sS --max-time 5 "$PAGEINDEX_URL/healthz" 2>/dev/null || true)"
+    alive="$(jget "$health" 'worker_alive')"
+    if [ "$alive" = "True" ] || [ "$alive" = "true" ]; then break; fi
+    sleep 2
+  done
+  if [ "$alive" != "True" ] && [ "$alive" != "true" ]; then
+    log "    [kb] pageindex-worker 没有心跳（healthz worker_alive=${alive:-unknown}）"
+    return 1
+  fi
+
   http_call PUT /v1/kb/settings '{"provider":"selfhosted"}'
-  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 设置 provider 失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 2; }
+  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 设置 provider 失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 1; }
 
   http_call POST /v1/kb '{"name":"integration-kb","provider":"selfhosted","visibility":"private"}'
-  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 建库失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 2; }
+  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 建库失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 1; }
   local kb_id; kb_id="$(jget "$HTTP_BODY" 'data.id')"
-  [ -n "$kb_id" ] || { log "    [kb] 建库响应缺 id"; return 2; }
+  [ -n "$kb_id" ] || { log "    [kb] 建库响应缺 id"; return 1; }
 
   # 生成一页合法 PDF（pageindex 自托管只收 text-based PDF），base64 后上传。
   local pdf_b64
@@ -464,31 +480,44 @@ buf.write(
 )
 print(base64.b64encode(buf.getvalue()).decode())
 PY
-)" || { log "    [kb] PDF 生成失败"; return 2; }
-  [ -n "$pdf_b64" ] || { log "    [kb] PDF 为空"; return 2; }
+)" || { log "    [kb] PDF 生成失败"; return 1; }
+  [ -n "$pdf_b64" ] || { log "    [kb] PDF 为空"; return 1; }
 
   local upload_payload
   upload_payload="$("$PY" -c 'import json,sys; print(json.dumps({"name":"fixture.pdf","file_type":"pdf","content":sys.argv[1]}))' "$pdf_b64")"
   http_call POST "/v1/kb/$kb_id/documents" "$upload_payload"
-  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 上传失败：$HTTP_STATUS ${HTTP_BODY:0:400}"; return 2; }
+  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 上传失败：$HTTP_STATUS ${HTTP_BODY:0:400}"; return 1; }
 
   http_call POST "/v1/kb/$kb_id/build" '{}'
-  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 投递索引失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 2; }
+  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 投递索引失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 1; }
 
-  local i st
+  local i st alive
   for ((i = 0; i < 90; i++)); do
     http_call GET "/v1/kb/$kb_id/status"
     st="$(jget "$HTTP_BODY" 'data.status')"
     case "$st" in
       ready) break ;;
-      error) log "    [kb] 索引失败（假 LLM 可能建不出 PageIndex 树）：${HTTP_BODY:0:400}"; return 2 ;;
+      error) log "    [kb] 索引失败：${HTTP_BODY:0:400}"; return 1 ;;
     esac
+    # 状态端点现在**无条件**下发 worker 心跳（10s 缓存）：执行器没起时立刻失败，
+    # 不用等 2 分钟看门狗把它写成 error。
+    alive="$(jget "$HTTP_BODY" 'data.worker_alive')"
+    if [ "$alive" = "False" ] || [ "$alive" = "false" ]; then
+      log "    [kb] 索引执行器未运行（status.worker_alive=false）：${HTTP_BODY:0:300}"
+      return 1
+    fi
     sleep 1
   done
-  [ "$st" = "ready" ] || { log "    [kb] 90s 内未 ready（最后状态：${st:-unknown}）"; return 2; }
+  [ "$st" = "ready" ] || { log "    [kb] 90s 内未 ready（最后状态：${st:-unknown}）"; return 1; }
+  # ready 之后 status 必须能报出 worker_alive（新字段的接线探针）。
+  http_call GET "/v1/kb/$kb_id/status"
+  alive="$(jget "$HTTP_BODY" 'data.worker_alive')"
+  [ "$alive" = "True" ] || [ "$alive" = "true" ] || {
+    log "    [kb] ready 但 status.worker_alive=${alive:-missing}（心跳字段未接线）"; return 1;
+  }
 
   http_call POST "/v1/kb/$kb_id/query" '{"query":"ORANGE-COMPASS 这个码词是什么？"}'
-  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 查询失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 2; }
+  [ "$HTTP_STATUS" = "200" ] || { log "    [kb] 查询失败：$HTTP_STATUS ${HTTP_BODY:0:300}"; return 1; }
   local answer citations
   answer="$(jget "$HTTP_BODY" 'data.answer')"
   citations="$("$PY" -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("data",{}).get("citations",[])))' <<<"$HTTP_BODY" 2>/dev/null || echo 0)"
@@ -504,8 +533,7 @@ kb_hit_probe
 KB_RC=$?
 case "$KB_RC" in
   0) ok_assert "@知识库命中" "selfhosted + 上传 + 索引 + 查询" ;;
-  1) fail_assert "@知识库命中" "索引 ready 但查询没有 answer/citations" ;;
-  *) skip_assert "@知识库命中" "该环境未能完成自托管索引（见上方 [kb] 原因），非断言失败" ;;
+  *) fail_assert "@知识库命中" "自托管索引链路失败（见上方 [kb] 原因）" ;;
 esac
 
 # ── 7. deps list ────────────────────────────────────────────────────────

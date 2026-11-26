@@ -124,6 +124,7 @@ export default {
   citation_doc_page: "{doc} · ص. {page}",
   index_progress_n_of_m: "تمت فهرسة {done}/{total} مستندًا",
   index_failed_documents: "المستندات التي فشلت فهرستها",
+  index_worker_down: "عامل الفهرسة غير قيد التشغيل (لا توجد نبضة pageindex-worker). أعد تشغيل خدمة المعرفة ثم أعد المحاولة.",
   retry_failed_documents: "إعادة محاولة المستندات الفاشلة",
   retry_this_document: "إعادة محاولة هذا الملف",
   reindex_all: "إعادة بناء الفهرس كاملًا",
