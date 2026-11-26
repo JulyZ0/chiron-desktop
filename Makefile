@@ -72,6 +72,14 @@ check-py:
 check-web:
 	cd frontend-vue && npm run build && npm test
 
+# 依赖漏洞 / SBOM（L29）：只跑已安装的工具，缺工具记 SKIP；有漏洞退出 1。
+# CI 里可设为非阻塞或 nightly；发布前至少手动跑一次。
+dep-audit:
+	bash scripts/dep_audit.sh
+
+dep-audit-sbom:
+	bash scripts/dep_audit.sh --sbom .artifacts/sbom
+
 # ── CI 冒烟（P2-2）──
 # 与 .github/workflows/ci.yml 的三条门禁同口径：go（build+单测，排除 live/diag）·
 # engine（pytest 单测）· frontend（check:ui / vue-tsc / vitest / vite build），
