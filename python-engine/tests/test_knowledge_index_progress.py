@@ -107,6 +107,21 @@ class TestAggregate:
         assert out["status"] == STATUS_DISABLED
         assert out["active"] is False
 
+    def test_unknown_library_status_normalizes_to_error(self):
+        """历史取值（failed / building / active / draft）不能原样透传。
+
+        透传会让前端拼出 `knowledge.status_failed` 这种原始 key，并让"终态判定"
+        失效（轮询永不收敛）。归一成 error 与事实相符：这个库当前就是不可用。
+        """
+        for legacy in ("failed", "building", "active", "draft"):
+            out = aggregate(kb_id="kb-1", kb_status=legacy, documents=[])
+            assert out["status"] == STATUS_ERROR, legacy
+            assert out["active"] is False
+
+    def test_library_status_is_case_insensitive(self):
+        out = aggregate(kb_id="kb-1", kb_status="READY", documents=[])
+        assert out["status"] == STATUS_READY
+
 
 # ── 多库合并 ────────────────────────────────────────────────────────
 

@@ -734,14 +734,30 @@ const retryingDocId = ref('')
 /** 失败文档（进度接口给出，不再从库级 error_message 反解析）。 */
 const failedDocuments = computed(() => indexStatus.value?.failed_documents ?? [])
 
-/** 进度卡片是否显示：有可执行的索引信息就显示（active / 有失败 / 库级错误）。 */
+/**
+ * 索引执行器没心跳。
+ *
+ * 与库级 `error` 分开表达：执行器未运行时索引**还没开始**，提前告诉用户能省掉
+ * 2 分钟干等（看门狗要等 status=indexing 且 updated_at 超过 120s 才收口）。
+ * `error_message` 已经写了同一句时不再重复渲染。
+ */
+const workerDown = computed(() => indexStatus.value?.worker_alive === false)
+const showWorkerDown = computed(
+  // 用服务端原因里的 `pageindex-worker` 判重（它是稳定标识，不依赖中文文案）。
+  () => workerDown.value && !String(indexStatus.value?.error_message || '').includes('pageindex-worker'),
+)
+
+/** 进度卡片是否显示：有可执行的索引信息就显示（active / 有失败 / 库级错误 / 执行器未运行）。 */
 const showIndexCard = computed(() => {
   const st = indexStatus.value
   if (!st) return false
   // 库级 error 且所有文档都已是终态时，failed/pending 都是 0 —— 只看这两个数
   // 会让"索引彻底失败"的库连进度卡片都不出现，用户只看到一个「异常」标签，
   // 看不到 error_message 里的真实原因（worker 写的 column/模型/心跳原因全在里面）。
-  return st.active || st.failed > 0 || st.pending > 0 || st.status === 'error' || !!st.error_message
+  return (
+    st.active || st.failed > 0 || st.pending > 0 || st.status === 'error'
+    || !!st.error_message || st.worker_alive === false
+  )
 })
 
 // ── `?doc=` 定位（引用可点回这里） ──
@@ -1012,6 +1028,15 @@ function formatSize(bytes: number): string {
             <span v-if="(indexStatus?.indexing ?? 0) > 0">{{ $t('knowledge.status_indexing') }} {{ indexStatus?.indexing }}</span>
             <span v-if="(indexStatus?.pending ?? 0) > 0">{{ $t('common.pending') }} {{ indexStatus?.pending }}</span>
             <span v-if="(indexStatus?.failed ?? 0) > 0" class="index-failed-count">{{ $t('errors.failed') }} {{ indexStatus?.failed }}</span>
+          </div>
+          <!-- 执行器未运行：状态还没变成 error 也要先告诉用户（看门狗要等 2 分钟），
+               否则这段时间里页面只会显示「索引中」，用户只能干等。 -->
+          <div
+            v-if="showWorkerDown"
+            class="index-worker-banner"
+            data-testid="kb-worker-down"
+          >
+            {{ $t('knowledge.index_worker_down') }}
           </div>
           <!-- 库级失败原因：失败发生在库级（读不到列 / 模型未配置 / worker 无心跳）时
                没有 failed_documents 行，原因只在这里 —— 不显示等于只给用户「异常」两个字。 -->
@@ -1494,6 +1519,8 @@ function formatSize(bytes: number): string {
 .index-failed-count { color: var(--error); }
 /* 库级失败原因：与逐文档失败区分开（整库失败时没有逐条行可展示）。 */
 .index-error-banner { margin-top: 10px; padding: 8px 10px; font-size: 13px; line-height: 1.5; color: var(--error); background: var(--error-bg); border-radius: var(--radius-sm); word-break: break-word; }
+/* 执行器未运行：是"还没开始"而不是"失败了"，用 warning 色与 error 区分。 */
+.index-worker-banner { margin-top: 10px; padding: 8px 10px; font-size: 13px; line-height: 1.5; color: var(--warning); background: var(--warning-bg); border-radius: var(--radius-sm); word-break: break-word; }
 .index-failures { margin-top: 12px; padding-top: 12px; border-top: var(--hairline-width) solid var(--border-card); }
 .index-failures-title { font-size: 13px; font-weight: var(--fw-medium); color: var(--text-primary); margin-bottom: 6px; }
 .index-failures ul { margin: 0 0 10px; padding-inline-start: 18px; font-size: 13px; color: var(--text-secondary); }

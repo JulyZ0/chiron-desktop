@@ -324,6 +324,14 @@ export interface KbIndexStatus {
   pending: number
   indexing: number
   error_message: string
+  /**
+   * 索引执行器（pageindex-worker）是否活着：`true/false`，`null` = 无法判断
+   * （Cloud 模式没有本地 worker，或引擎查不到 Redis）。
+   *
+   * 服务端在**每次**状态查询里带上它（10s 缓存），页面据此在第一次轮询就提示
+   * "执行器未运行"，而不是等 2 分钟看门狗把库写成 error 才知道。
+   */
+  worker_alive?: boolean | null
   documents: KbIndexDocument[]
   failed_documents: KbIndexDocument[]
 }

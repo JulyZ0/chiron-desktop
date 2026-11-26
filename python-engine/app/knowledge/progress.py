@@ -38,6 +38,11 @@ DOC_INDEXING = "indexing"
 DOC_READY = "ready"
 DOC_ERROR = "error"
 
+#: 库级状态的约定取值（与 `app/knowledge/status.py` 同源）。
+_KB_STATUSES: frozenset[str] = frozenset(
+    {STATUS_DISABLED, STATUS_INDEXING, STATUS_READY, STATUS_ERROR}
+)
+
 #: 只用于展示的分组顺序：未开始 → 进行中 → 完成 → 失败。
 _DOC_STATUSES: tuple[str, ...] = (DOC_PENDING, DOC_INDEXING, DOC_READY, DOC_ERROR)
 
@@ -115,8 +120,13 @@ def aggregate(
     elif total and counts[DOC_READY] == total:
         status = STATUS_READY
     else:
-        # 空库 / 全部 pending：沿用库上的值（新库是 disabled）
-        status = str(kb_status or STATUS_DISABLED)
+        # 空库 / 全部 pending：沿用库上的值（新库是 disabled）。
+        #
+        # 历史取值（failed / building / active / draft）一律归一成 error：
+        # 直接透传会让前端拼出 `knowledge.status_failed` 这种原始 key，
+        # 也掩盖了"数据里存在非约定状态"这件事。error 至少与事实相符（该库不可用）。
+        raw = str(kb_status or STATUS_DISABLED).strip().lower()
+        status = raw if raw in _KB_STATUSES else STATUS_ERROR
 
     return {
         "kb_id": kb_id,

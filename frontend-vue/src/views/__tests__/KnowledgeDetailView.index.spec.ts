@@ -200,4 +200,68 @@ describe('知识库详情：索引进度与重建', () => {
     await vi.advanceTimersByTimeAsync(3_100)
     expect(statusCalls()).toBe(2)
   })
+
+  // ── A1：worker 心跳提前可见 ─────────────────────────────────────────
+  //
+  // 修前要等看门狗（indexing 且停滞 2 分钟）才把库写成 error，这 2 分钟里页面
+  // 只显示「索引中」。现在 status 无条件带 worker_alive，第一次轮询就能提示。
+
+  it('执行器未运行：索引中还来得及提示（不必等 2 分钟看门狗）', async () => {
+    installApiMock({
+      status: {
+        status: 'indexing',
+        active: true,
+        worker_alive: false,
+        error_message: '',
+        failed: 0,
+        pending: 1,
+        indexed: 0,
+        failed_documents: [],
+      },
+    })
+    wrapper = mount(KnowledgeDetailView)
+    await flushPromises()
+
+    const banner = wrapper.find('[data-testid="kb-worker-down"]')
+    expect(banner.exists()).toBe(true)
+    expect(banner.text()).toContain('索引执行器')
+    // 此时还没有库级错误原因，不该同时出现红色 error banner
+    expect(wrapper.find('[data-testid="kb-index-error"]').exists()).toBe(false)
+  })
+
+  it('库级 error 已经说明心跳问题时，不再重复渲染执行器提示', async () => {
+    installApiMock({
+      status: {
+        status: 'error',
+        active: false,
+        worker_alive: false,
+        error_message: '索引执行器未运行（pageindex-worker 没有心跳），索引任务已中断',
+        failed_documents: [],
+      },
+    })
+    wrapper = mount(KnowledgeDetailView)
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="kb-index-error"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="kb-worker-down"]').exists()).toBe(false)
+  })
+
+  it('库已 ready 但执行器掉了：进度卡片仍显示（否则用户看不到"为什么不能重建"）', async () => {
+    installApiMock({
+      status: {
+        status: 'ready',
+        active: false,
+        worker_alive: false,
+        failed: 0,
+        pending: 0,
+        failed_documents: [],
+        error_message: '',
+      },
+    })
+    wrapper = mount(KnowledgeDetailView)
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="kb-index-card"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="kb-worker-down"]').exists()).toBe(true)
+  })
 })
