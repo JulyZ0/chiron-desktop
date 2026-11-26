@@ -145,9 +145,9 @@ async function stickToBottom() {
 <!-- 行节奏 / chevron / 状态点 / 展开动画 / reduced-motion 均由全局 .chat-* 原语提供
      （src/style.css），此处只保留 Think 行独有的内容样式 -->
 <style scoped>
-.think-icon { font-size: 12px; flex-shrink: 0; }
-.think-label { font-weight: var(--fw-semibold); color: var(--text-primary); font-size: 13px; }
-.think-summary { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-tertiary); font-size: 12px; text-align: start; }
+.think-icon { font-size: var(--fs-xs); flex-shrink: 0; }
+.think-label { font-weight: var(--fw-semibold); color: var(--text-primary); font-size: var(--fs-sm); }
+.think-summary { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-tertiary); font-size: var(--fs-xs); text-align: start; }
 .reasoning-row[data-state='running'] .think-summary { color: var(--primary); }
 
 /* 网格撑开：0fr → 1fr。内层必须 min-height:0 + overflow:hidden，
@@ -165,7 +165,7 @@ async function stickToBottom() {
   padding: 10px 12px; margin-top: 2px;
   /* 自身滚动：长思考只在这一块内滚，不把整页撑长 */
   max-height: 40vh; overflow: auto;
-  font-size: 13px; line-height: 1.7; color: var(--text-secondary);
+  font-size: var(--fs-sm); line-height: 1.7; color: var(--text-secondary);
   /* 去描边：用背景色阶区分 */
   background: var(--elev-1); border: 0;
   border-radius: var(--sig-radius-button); white-space: pre-wrap;

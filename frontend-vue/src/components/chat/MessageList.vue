@@ -910,7 +910,7 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
   .skeleton-lines { max-width: 85%; }
 }
 @media (max-width: 576px) { .skeleton-list { padding: 10px 12px; } }
-.earlier-loader { display: flex; align-items: center; justify-content: center; gap: 6px; height: 36px; font-size: 12px; color: var(--text-tertiary); }
+.earlier-loader { display: flex; align-items: center; justify-content: center; gap: 6px; height: 36px; font-size: var(--fs-xs); color: var(--text-tertiary); }
 .earlier-retry { border: 0; background: none; padding: 0; font: inherit; color: var(--primary-color, inherit); cursor: pointer; }
 .earlier-retry:hover { text-decoration: underline; }
 /* 消息容器：正常文档流，不遮挡 */
@@ -993,7 +993,7 @@ const badgeText = computed(() => (unseenCount.value > 99 ? '99+' : String(unseen
 .selection-menu.below { transform: translate(-50%, 0); }
 .sel-btn {
   border: none; background: none; color: var(--text-secondary);
-  font-size: 12px; line-height: 18px; padding: 3px 8px;
+  font-size: var(--fs-xs); line-height: 18px; padding: 3px 8px;
   border-radius: var(--radius-sm); cursor: pointer; white-space: nowrap;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }

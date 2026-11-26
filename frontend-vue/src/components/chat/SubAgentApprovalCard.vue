@@ -198,17 +198,17 @@ function submitEdit() {
   flex: none; font-size: var(--fs-xs); color: var(--primary);
   background: var(--primary-bg); padding: 2px 8px; border-radius: var(--sig-radius-button);
 }
-.approval-name { font-weight: var(--fw-semibold); font-size: 13px; color: var(--text-primary); }
+.approval-name { font-weight: var(--fw-semibold); font-size: var(--fs-sm); color: var(--text-primary); }
 .approval-hint { margin-inline-start: auto; font-size: var(--fs-xs); color: var(--warning, var(--warning)); }
-.approval-desc { font-size: 12px; color: var(--text-secondary, #595959); margin-bottom: 6px; }
+.approval-desc { font-size: var(--fs-xs); color: var(--text-secondary, #595959); margin-bottom: 6px; }
 .approval-args {
-  font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
+  font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-muted);
   background: var(--surface-2, rgba(127, 127, 127, 0.06));
   padding: 6px; border-radius: var(--radius-md); overflow: auto; max-height: 140px; margin: 0 0 8px;
 }
 .approval-actions { display: flex; align-items: center; gap: 8px; }
 .approval-btn {
- border: none; border-radius: var(--radius-lg); padding: 4px 14px; font-size: 13px; cursor: pointer; 
+ border: none; border-radius: var(--radius-lg); padding: 4px 14px; font-size: var(--fs-sm); cursor: pointer; 
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .approval-btn:disabled { opacity: 0.5; cursor: default; }
@@ -220,19 +220,19 @@ function submitEdit() {
 }
 .approval-edit { margin-bottom: 8px; }
 .approval-edit-text {
-  width: 100%; box-sizing: border-box; font-family: var(--font-mono); font-size: 12px;
+  width: 100%; box-sizing: border-box; font-family: var(--font-mono); font-size: var(--fs-xs);
   color: var(--text-primary); background: var(--bg-card);
   border: var(--hairline-width) solid var(--border); border-radius: var(--radius-lg); padding: 6px 8px; resize: vertical;
 }
 .approval-edit-text:focus { outline: none; border-color: var(--primary); }
-.approval-edit-error { margin-top: 4px; font-size: 12px; color: var(--danger, var(--error)); }
+.approval-edit-error { margin-top: 4px; font-size: var(--fs-xs); color: var(--danger, var(--error)); }
 .approval-link {
-  border: none; background: none; color: var(--primary); font-size: 13px;
+  border: none; background: none; color: var(--primary); font-size: var(--fs-sm);
   cursor: pointer; padding: 4px 2px; border-radius: var(--radius-md);
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .approval-link:disabled { opacity: 0.5; cursor: default; }
 .approval-link:hover:not(:disabled) { text-decoration: underline; }
-.approval-done { font-size: 12px; color: var(--success, #16a34a); }
-.approval-error { margin-top: 6px; font-size: 12px; color: var(--danger, var(--error)); }
+.approval-done { font-size: var(--fs-xs); color: var(--success, #16a34a); }
+.approval-error { margin-top: 6px; font-size: var(--fs-xs); color: var(--danger, var(--error)); }
 </style>

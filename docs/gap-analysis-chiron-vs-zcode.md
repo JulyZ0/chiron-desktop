@@ -303,8 +303,9 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
 | P1-2 取消补齐 provider 历史 | ✅ 已具备（复核） | 挂起路径写 `not_executed`、取消路径返回 cancelled 结果；`test_interaction_suspend.py` / `test_cancel_propagation.py` 已覆盖 tool_calls 与 tool 消息配对 |
 | P1-3 guide vs queue | ✅ guide 语义已具备；queue 不加 | Chiron 的 steer 在每个模型步开头 drain（即 ZCode 的 guide）；`queue`（无活跃回合时入队等下一轮）与当前"没有活跃 run 即拒绝"的 fail-closed 准入冲突，需产品决策，不擅自放宽 |
 | P1-4 压缩回读 + 熔断 | ✅ 已合入 `eda07be` | 3 次过快压缩暂停自动压缩（手动 /compact 重置）；最近 5 个 `read_file` 结果压缩后以 `[recent-files]` 回读；6 项测试 |
-| P2 字号硬约束 | ⏸ 暂缓 | 现有 `font-size` 声明 995 处、裸 px 666 处；现在加棘轮基线会是 600+ 条噪音，建议先按文件分批迁移再上闸 |
-| P2 快捷键单一事实源 / a11y 自动化 / 工作台扩展 | ⏳ 未做 | 分别属于"统一注册表改造""引入 axe 依赖决策""产品级投入"，排在 P0-1 收尾之后 |
+| P2 字号硬约束 | ✅ 已合入（分批迁移中） | 新增 `check-font-size-ratchet.mjs` + 基线（全仓裸 px 663 → **548**）；`components/chat` 18 个文件 125 处裸 px 全部迁到 `--fs-*`（该目录归零，11px 可读性违规一并消除）；棘轮已进 `check:ui` |
+| P2 工作台扩展（Git 面板） | ✅ 已合入 | 改动页签点开单文件 diff（只读 `git diff HEAD`，512KB 截断、二进制/未跟踪分流）；服务端与设备侧双实现；顺带修正"还原点页签同时渲染改动列表"的 `v-else` 串页签 |
+| P2 快捷键单一事实源 / a11y 自动化 | ⏳ 未做 | 分别属于"统一注册表改造""引入 axe 依赖决策"；排在工作台扩展之后 |
 
 **下一步**：P0-1 已拆完。剩余按决策推进：H20 信封加密 + 可插拔 KMS；工作台 Git 面板；字号棘轮（先迁 `components/chat`）。
 

@@ -748,7 +748,7 @@ function pickSession(id: string) {
 @media (max-width: 1024px) { .side-panel { width: min(420px, 100%); } }
 @media (max-width: 768px) {
   .session-picker, .session-back { height: 36px; }
-  .toolbar-close { padding: 10px; font-size: 14px; }
+  .toolbar-close { padding: 10px; font-size: var(--fs-base); }
   .session-more-btn { width: 36px; height: 36px; }
   .anchor-row { min-height: 36px; }
   .tag-chip { min-height: 32px; }
@@ -767,13 +767,13 @@ function pickSession(id: string) {
   flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px;
   height: 28px; padding: 0 8px; border: none; border-radius: var(--sig-radius-button);
   background: transparent; color: var(--text-primary);
-  font-size: 13px; font-weight: var(--fw-semibold); cursor: pointer;
+  font-size: var(--fs-sm); font-weight: var(--fw-semibold); cursor: pointer;
   transition: background var(--dur-fast) ease;
 }
 .session-picker:hover, .session-back:hover { background: var(--bg-hover); }
 .session-picker-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: start; }
 .session-picker-arrow { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); }
-.toolbar-close { flex: none; font-size: 13px; color: var(--text-tertiary); cursor: pointer; padding: 4px; border-radius: var(--radius-sm); transition: color var(--dur-fast) ease, background var(--dur-fast) ease; }
+.toolbar-close { flex: none; font-size: var(--fs-sm); color: var(--text-tertiary); cursor: pointer; padding: 4px; border-radius: var(--radius-sm); transition: color var(--dur-fast) ease, background var(--dur-fast) ease; }
 .toolbar-close:hover { color: var(--text-primary); background: var(--bg-hover); }
 
 /* ── 当前会话上下文 chips（与消息区/侧栏 tag-chip 同设计语言）── */
@@ -784,7 +784,7 @@ function pickSession(id: string) {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 2px 8px; border-radius: var(--sig-radius-button);
   box-shadow: inset 0 0 0 var(--hairline-width) var(--border); background: var(--bg-card);
-  color: var(--text-secondary); font-size: 12px;
+  color: var(--text-secondary); font-size: var(--fs-xs);
   transition: box-shadow var(--dur-fast) ease, color var(--dur-fast) ease;
 }
 .ctx-chip:hover { box-shadow: inset 0 0 0 var(--hairline-width) var(--primary); color: var(--primary); }
@@ -808,7 +808,7 @@ function pickSession(id: string) {
 .weights-arrow { transition: transform var(--dur-fast) ease; }
 .weights-arrow.expanded { transform: rotate(180deg); }
 .weights-body { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
-.weight-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.weight-row { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xs); color: var(--text-secondary); }
 .weight-name { flex: 0 1 40%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .weight-slider { flex: 1 1 auto; min-width: 0; accent-color: var(--primary); }
 .weight-value { flex: none; font-variant-numeric: tabular-nums; color: var(--text-tertiary); }
@@ -816,7 +816,7 @@ function pickSession(id: string) {
 /* 搜索框（轨迹 / 会话通用） */
 .panel-search { flex: none; display: flex; align-items: center; gap: 4px; margin: 8px 12px 0; padding: 0 8px; height: 28px; background: var(--bg-secondary); border-radius: var(--sig-radius-button); }
 .search-icon { font-size: var(--fs-xs); color: var(--text-tertiary); }
-.search-input { flex: 1; border: none; outline: none; background: none; font-size: 12px; color: var(--text-primary); }
+.search-input { flex: 1; border: none; outline: none; background: none; font-size: var(--fs-xs); color: var(--text-primary); }
 /* 输入框自己 outline: none，焦点提示改由容器承担 —— 与 Composer 的 .input-card:focus-within 同一模式。
    此前这两处搜索框是**完全没有焦点指示**的（WCAG 2.4.7）。 */
 .panel-search:focus-within { box-shadow: 0 0 0 var(--focus-ring-width) var(--focus-ring-glow); }
@@ -853,7 +853,7 @@ function pickSession(id: string) {
 }
 .timeline-span[data-selected='false'] { opacity: 0.2; }
 .timeline-span[data-current='true'] { opacity: 1; }
-.timeline-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--text-tertiary); font-size: 12px; }
+.timeline-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: var(--text-tertiary); font-size: var(--fs-xs); }
 
 /* ── 主视图：提问锚点列表 ── */
 .anchor-list { flex: 1; overflow-y: auto; padding: 6px; scrollbar-width: thin; scrollbar-color: var(--text-disabled) transparent; }
@@ -861,9 +861,9 @@ function pickSession(id: string) {
 .anchor-row:hover { background: var(--bg-hover); }
 .anchor-row.active { background: var(--primary-bg); }
 .row-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--primary); }
-.row-text { flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row-text { flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .anchor-row.active .row-text { color: var(--primary); font-weight: var(--fw-semibold); }
-.list-empty { padding: 20px 8px; text-align: center; color: var(--text-muted); font-size: 12px; }
+.list-empty { padding: 20px 8px; text-align: center; color: var(--text-muted); font-size: var(--fs-xs); }
 
 /* ── 从视图：会话历史列表 ── */
 .sessions-head { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px 0; }
@@ -874,7 +874,7 @@ function pickSession(id: string) {
   align-items: center;
   gap: 8px;
   padding: 10px 12px 0;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
@@ -926,7 +926,7 @@ function pickSession(id: string) {
   50% { box-shadow: 0 0 0 3px var(--ring-outer); opacity: 0.65; }
 }
 .pin-icon { flex: none; font-size: var(--fs-xs); color: var(--primary); }
-.session-title { font-size: 13px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 18px; }
+.session-title { font-size: var(--fs-sm); color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 18px; }
 .session-row.active .session-title { color: var(--primary); font-weight: var(--fw-semibold); }
 .session-time { font-size: var(--fs-xs); color: var(--text-muted); line-height: 14px; }
 .session-more-btn { opacity: 0; flex-shrink: 0; width: 22px; height: 22px; color: var(--text-muted); }
@@ -935,7 +935,7 @@ function pickSession(id: string) {
 /* 同心圆圆角（desktop-agent-ui §6）：外层用主题 token，内层用 calc 跟随主题 ——
    写死像素会让换了主题（--sig-radius-code 在 0~10px 之间）的同心关系断掉。 */
 .session-menu { --session-menu-r: var(--sig-radius-code); --session-menu-pad: 4px; --session-menu-inner-r: max(0px, calc(var(--session-menu-r) - var(--session-menu-pad))); min-width: 148px; border-radius: var(--session-menu-r); padding: var(--session-menu-pad); box-shadow: var(--shadow-lg); }
-.session-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: var(--session-menu-inner-r, var(--sig-radius-button)); }
-.menu-icon { font-size: 14px; }
+.session-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); border-radius: var(--session-menu-inner-r, var(--sig-radius-button)); }
+.menu-icon { font-size: var(--fs-base); }
 
 </style>

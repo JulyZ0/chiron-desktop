@@ -119,13 +119,13 @@ function revealTarget() {
 
 .tool-row { position: relative; overflow: hidden; border-radius: var(--sig-radius-code); }
 .tool-row:hover { background: var(--bg-hover); }
-.tool-name { font-family: var(--font-mono); font-size: 13px; color: var(--text-primary); font-weight: var(--fw-regular); white-space: nowrap; }
+.tool-name { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-primary); font-weight: var(--fw-regular); white-space: nowrap; }
 /* 家族着色：让一屏工具调用能被"扫"出来，而不是一片同色行。
    只按家族调色相、不引入新的颜色体系；未知变量一律带 fallback，缺 token 时退化为原色。 */
 .tool-row-wrap[data-family='modify'] .tool-name { color: var(--warning, #d97706); }
 .tool-row-wrap[data-family='explore'] .tool-name { color: var(--primary, #2563eb); }
 .tool-row-wrap[data-family='delegate'] .tool-name { color: var(--trajectory-tool-call, var(--primary, #2563eb)); }
-.tool-summary { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-tertiary); font-size: 12px; }
+.tool-summary { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-tertiary); font-size: var(--fs-xs); }
 
 /* 「在面板中打开」：默认隐身，悬停/聚焦才出现。
    常驻会给每一行都加一个按钮，一屏几十个工具调用就成了按钮墙；隐身但又可 Tab 到，

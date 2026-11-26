@@ -91,7 +91,7 @@ const suggestions = [
 .hero { position: relative; flex: 1; display: flex; align-items: center; justify-content: center; overflow: hidden; }
 .hero-glow { position: absolute; inset: -40% -20% auto -20%; height: 70%; background: radial-gradient(ellipse 50% 50% at 50% 0%, var(--primary-bg), transparent 70%); pointer-events: none; }
 .hero-content { width: 560px; max-width: calc(100vw - 48px); text-align: center; position: relative; z-index: var(--z-content); }
-.hero-logo { width: 56px; height: 56px; margin: 0 auto 18px; border-radius: var(--sig-radius-card); background: linear-gradient(135deg, var(--primary), var(--accent)); color: var(--on-solid); font-weight: var(--fw-bold); font-size: 20px; display: flex; align-items: center; justify-content: center; box-shadow: var(--sig-shadow-hover); }
+.hero-logo { width: 56px; height: 56px; margin: 0 auto 18px; border-radius: var(--sig-radius-card); background: linear-gradient(135deg, var(--primary), var(--accent)); color: var(--on-solid); font-weight: var(--fw-bold); font-size: var(--fs-2xl); display: flex; align-items: center; justify-content: center; box-shadow: var(--sig-shadow-hover); }
 /* 问候语走 CDS 的「衬线版面标题」（.font-display）：衬线 + 38px + 轻字重 + 微负字距。
    字号由 --fs-display 派生，仍受"界面字号只有一个入口"的约束。 */
 .hero-title { font-family: var(--font-serif); font-size: var(--fs-display); font-weight: var(--fw-light); line-height: 1.2; letter-spacing: -0.015em; color: var(--text-primary); margin-bottom: 28px; }
@@ -102,10 +102,10 @@ const suggestions = [
 .suggestion-card::after { content: ''; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; background-image: radial-gradient(at bottom, var(--card-hover-glow), transparent 70%); opacity: 0; transition: opacity var(--dur-normal) var(--ease-out); }
 .suggestion-card:hover { border-color: var(--primary); transform: translateY(-2px) scale(1.005, 1.015); box-shadow: var(--sig-shadow-hover); }
 .suggestion-card:hover::after { opacity: 1; }
-.card-icon { display: block; font-size: 18px; line-height: 1; color: var(--text-secondary); margin-bottom: 8px; transition: color var(--dur-normal); }
+.card-icon { display: block; font-size: var(--fs-xl); line-height: 1; color: var(--text-secondary); margin-bottom: 8px; transition: color var(--dur-normal); }
 .suggestion-card:hover .card-icon { color: var(--primary); }
-.card-title { font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); margin-bottom: 4px; }
-.card-desc { font-size: 12px; color: var(--text-tertiary); line-height: 1.4; }
+.card-title { font-size: var(--fs-base); font-weight: var(--fw-semibold); color: var(--text-primary); margin-bottom: 4px; }
+.card-desc { font-size: var(--fs-xs); color: var(--text-tertiary); line-height: 1.4; }
 @media (max-width: 768px) { .suggestion-card { width: 100%; } .hero-content { width: 100%; } }
 /* ── 微交互 + 可访问性：键盘可操作、焦点可见、按压反馈 ── */
 .suggestion-card:active { transform: scale(0.98); border-color: var(--primary); }
@@ -113,7 +113,7 @@ const suggestions = [
 /* ── 移动端：窄屏密度压缩（展示级字号降两档，否则一行放不下） ── */
 @media (max-width: 576px) {
   .hero-content { padding: 0 16px; }
-  .hero-logo { width: 48px; height: 48px; font-size: 18px; border-radius: var(--sig-radius-button); margin-bottom: 14px; }
+  .hero-logo { width: 48px; height: 48px; font-size: var(--fs-xl); border-radius: var(--sig-radius-button); margin-bottom: 14px; }
   .hero-title { font-size: var(--fs-3xl); margin-bottom: 20px; }
   .suggestion-grid { gap: 8px; }
   .suggestion-card { padding: 12px; }

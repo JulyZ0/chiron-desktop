@@ -1447,7 +1447,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
   border: 0; border-radius: var(--input-card-r);
   background: var(--bg-input);
   box-shadow: var(--composer-shadow);
-  font-size: 16px; line-height: 24px;
+  font-size: var(--fs-lg); line-height: 24px;
   transition: box-shadow var(--dur-normal) var(--ease-out);
 }
 /* 悬停：投影加深、内环变实（三态的第一级） */
@@ -1459,7 +1459,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
   box-shadow: var(--composer-shadow-focus);
 }
 .input-field { background: transparent !important; }
-.input-field :deep(textarea) { color: var(--text-primary) !important; font-size: 16px !important; line-height: 24px !important; }
+.input-field :deep(textarea) { color: var(--text-primary) !important; font-size: var(--fs-lg) !important; line-height: 24px !important; }
 /* Composer 内的原生滚动条收敛（desktop-agent-ui components-motion §1.3）：
    只隐藏**外观**，滚轮 / 触控板手势 / 文本选中 / 键盘导航全部保留 ——
    刻意限定在输入框内，**绝不全局隐藏**系统滚动条（那会伤害其它长列表的可发现性）。 */
@@ -1522,7 +1522,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
   background: var(--border-soft, var(--border));
 }
 @container (max-width: 620px) { .input-divider { display: none; } }
-.input-hint { font-size: 12px; color: var(--text-tertiary); }
+.input-hint { font-size: var(--fs-xs); color: var(--text-tertiary); }
 /* 运行中补充指令（steer）：与"停止"并排，但**不是**危险动作 —— 它不终止回合。
    因此用主色描边而不是红/灰：视觉上要让人敢点，同时与右侧圆角方形的停止按钮区分开。 */
 .steer-btn { color: var(--primary); border-color: var(--primary); }
@@ -1533,7 +1533,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
 /* 运行态内联：生成中的活性证据（走秒），减少"以为卡死→点停止"的误操作 */
 .run-hint {
   display: inline-flex; align-items: center; gap: 6px;
-  font-size: 12px; color: var(--text-secondary);
+  font-size: var(--fs-xs); color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
 .run-dot {
@@ -1542,10 +1542,10 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
 }
 @keyframes run-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 /* 模式选择器标签 */
-.mode-label { flex: none; font-size: 12px; color: var(--text-tertiary); }
+.mode-label { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); }
 /* 模型路由下拉（与模式切换器同排；窄屏收缩防溢出） */
 .model-select { width: 170px; }
-.model-select :deep(.ant-select-selector) { font-size: 12px; }
+.model-select :deep(.ant-select-selector) { font-size: var(--fs-xs); }
 .persona-select { width: 130px; }
 /* 上下文快捷按钮：展开侧栏（抽屉模式） */
 .context-btn { color: var(--text-tertiary); display: inline-flex; align-items: center; gap: 4px; border-radius: var(--input-card-inner-r, 8px); }
@@ -1553,8 +1553,8 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
 /* 对话设置 popover（模式 / 工具授权）：垂直两行，label 右对齐，与底栏解耦 */
 .settings-pop { display: flex; flex-direction: column; gap: 10px; min-width: 230px; }
 .settings-pop__row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.settings-pop__label { font-size: 12px; color: var(--text-secondary); flex: none; }
-.context-label { font-size: 12px; }
+.settings-pop__label { font-size: var(--fs-xs); color: var(--text-secondary); flex: none; }
+.context-label { font-size: var(--fs-xs); }
 /* 发送按钮：36px 圆形，可发送时主色 + hover 微放大 */
 .send-btn.ant-btn { width: 36px; height: 36px; min-width: 36px; }
 .send-btn { transition: transform var(--dur-fast) ease, box-shadow var(--dur-fast) ease, opacity var(--dur-fast) ease; }
@@ -1608,7 +1608,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
   display: inline-flex; align-items: center; gap: 4px; max-width: 220px;
   padding: 2px 4px 2px 8px; border: var(--hairline-width) solid var(--border); border-radius: var(--radius-full);
   background: var(--bg-hover, rgba(127, 127, 127, 0.08));
-  font-size: 12px; color: var(--text-secondary);
+  font-size: var(--fs-xs); color: var(--text-secondary);
 }
 .context-chip__label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .context-chip__x {
@@ -1669,8 +1669,8 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
 .slash-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; cursor: pointer; transition: background var(--dur-fast) ease; }
 .slash-item:hover { background: var(--bg-hover); }
 .slash-item.active { background: var(--bg-hover); }
-.slash-cmd { font-weight: var(--fw-semibold); color: var(--primary); font-size: 13px; }
-.slash-desc { color: var(--text-tertiary); font-size: 12px; }
+.slash-cmd { font-weight: var(--fw-semibold); color: var(--primary); font-size: var(--fs-sm); }
+.slash-desc { color: var(--text-tertiary); font-size: var(--fs-xs); }
 
 /* 大文本粘贴折叠预览 */
 .paste-preview {
@@ -1682,7 +1682,7 @@ defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjec
   --paste-preview-inner-r: max(0px, calc(var(--paste-preview-r) - var(--paste-preview-pad)));
   border: var(--hairline-width) solid var(--border); border-radius: var(--paste-preview-r); padding: 8px 12px; background: var(--bg-secondary); margin-bottom: 4px;
 }
-.paste-preview-text { font-size: 12px; color: var(--text-secondary); line-height: 1.5; max-height: 80px; overflow: hidden; white-space: pre-wrap; word-break: break-all; }
+.paste-preview-text { font-size: var(--fs-xs); color: var(--text-secondary); line-height: 1.5; max-height: 80px; overflow: hidden; white-space: pre-wrap; word-break: break-all; }
 .paste-preview-meta { font-size: var(--fs-xs); color: var(--text-tertiary); margin: 4px 0; }
 .paste-preview-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .paste-btn {

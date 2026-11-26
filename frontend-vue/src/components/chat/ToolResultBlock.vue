@@ -549,7 +549,7 @@ function todoStatusLabel(status?: string): string {
 
 <style scoped>
 .tool-result { max-width: min(var(--chat-content-width), 92%); margin: 2px auto 8px; }
-.result-error-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; padding: 5px 10px; border-radius: var(--sig-radius-button); background: var(--error-bg); color: var(--error); font-size: 12px; }
+.result-error-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; padding: 5px 10px; border-radius: var(--sig-radius-button); background: var(--error-bg); color: var(--error); font-size: var(--fs-xs); }
 /* 子 Agent 返回 → 对照栏的入口。读起来像一个「横向关联」的动作，所以用低调的
    描边按钮而不是主色填充：它是**附加的观察路径**，不是这条结果的主要用法。 */
 .result-subagent {
@@ -566,18 +566,18 @@ function todoStatusLabel(status?: string): string {
 /* run_id 是机器的身份，等宽显示才不会把 rs_ 与后面的十六进制看成两个词 */
 .result-subagent-id {
   flex: none; max-width: 14ch; overflow: hidden; text-overflow: ellipsis;
-  font-family: var(--font-mono); font-size: 11px; color: var(--text-tertiary);
+  font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-tertiary);
 }
 .result-head {
- display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 0; border: none; background: none; color: var(--text-tertiary); cursor: pointer; font-size: 12px; 
+ display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 0; border: none; background: none; color: var(--text-tertiary); cursor: pointer; font-size: var(--fs-xs); 
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .result-head:hover { color: var(--primary); }
 .result-lines { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); }
 .result-preview { flex: none; font-size: var(--fs-xs); color: var(--warning, var(--text-tertiary)); }
 .tool-result.error .result-label { color: var(--error); }
-.result-code { margin: 0; padding: 12px; background: var(--bg-code); border-radius: var(--sig-radius-code); font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text-code); white-space: pre-wrap; word-break: break-all; }
-.result-text { padding: 10px 12px; background: var(--bg-secondary); border-radius: var(--sig-radius-button); font-size: 13px; color: var(--text-secondary); white-space: pre-wrap; word-break: break-all; }
+.result-code { margin: 0; padding: 12px; background: var(--bg-code); border-radius: var(--sig-radius-code); font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 1.6; color: var(--text-code); white-space: pre-wrap; word-break: break-all; }
+.result-text { padding: 10px 12px; background: var(--bg-secondary); border-radius: var(--sig-radius-button); font-size: var(--fs-sm); color: var(--text-secondary); white-space: pre-wrap; word-break: break-all; }
 /* 大 output 按需展开：分段加载按钮与状态提示 */
 .result-load { display: flex; align-items: center; gap: 8px; padding: 6px 2px 0; }
 .result-load-btn {
@@ -613,7 +613,7 @@ function todoStatusLabel(status?: string): string {
 .diff-line.file { color: var(--text-tertiary); background: var(--bg-secondary); }
 .diff-line.context { color: var(--text-secondary); }
 .diff-more {
- width: 100%; padding: 6px; border: none; border-top: var(--hairline-width) solid var(--border-card); background: var(--bg-secondary); color: var(--text-secondary); font-size: 12px; cursor: pointer; 
+ width: 100%; padding: 6px; border: none; border-top: var(--hairline-width) solid var(--border-card); background: var(--bg-secondary); color: var(--text-secondary); font-size: var(--fs-xs); cursor: pointer; 
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .diff-more:hover { color: var(--primary); }
@@ -622,29 +622,29 @@ function todoStatusLabel(status?: string): string {
 /* read 卡片：12px 圆角 + banner + 48px 行号 gutter + 22px 行高（deepseek ReadBlock） */
 .read-block { margin: 8px 0; background: var(--bg-code); border-radius: var(--sig-radius-code); overflow: hidden; }
 .read-banner { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 14px; background: var(--bg-secondary); }
-.read-path { font-family: var(--font-mono); font-size: 12px; line-height: 18px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.read-count { font-size: 12px; color: var(--text-tertiary); flex-shrink: 0; }
+.read-path { font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 18px; color: var(--text-primary); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.read-count { font-size: var(--fs-xs); color: var(--text-tertiary); flex-shrink: 0; }
 .read-body { max-height: 420px; overflow-y: auto; }
-.read-line { display: flex; line-height: 22px; font-family: var(--font-mono); font-size: 12px; }
+.read-line { display: flex; line-height: 22px; font-family: var(--font-mono); font-size: var(--fs-xs); }
 .line-no { flex: 0 0 48px; padding-inline-end: 12px; text-align: end; color: var(--text-tertiary); user-select: none; }
 .line-text { flex: 1; padding-inline-end: 14px; white-space: pre; overflow-x: auto; color: var(--text-primary); }
 
 /* 终端卡片（deepseek TerminalBlock 语义） */
 .terminal-block { margin: 8px 0; background: var(--terminal-bg); border-radius: var(--sig-radius-code); overflow: hidden; }
 .terminal-banner { display: flex; align-items: center; gap: 12px; padding: 9px 14px; background: var(--terminal-header-bg); }
-.terminal-label { font-family: var(--font-mono); font-size: 12px; color: var(--terminal-text); }
+.terminal-label { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--terminal-text); }
 .terminal-lines { flex: 1; font-size: var(--fs-xs); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
-.terminal-exit { font-family: var(--font-mono); font-size: 12px; color: var(--success); }
+.terminal-exit { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--success); }
 .terminal-exit.nonzero { color: var(--error); }
-.terminal-body { margin: 0; padding: 14px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--terminal-text); white-space: pre-wrap; word-break: break-all; max-height: 360px; overflow-y: auto; }
+.terminal-body { margin: 0; padding: 14px; font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 1.6; color: var(--terminal-text); white-space: pre-wrap; word-break: break-all; max-height: 360px; overflow-y: auto; }
 
 /* 计划清单（write_todos）：一眼看出还有几项没做完 */
 .todos-block { margin: 8px 0; background: var(--bg-code); border-radius: var(--sig-radius-code); overflow: hidden; }
 .todos-banner { display: flex; align-items: center; gap: 12px; padding: 9px 14px; background: var(--terminal-header-bg); }
-.todos-label { font-size: 12px; color: var(--text-tertiary); }
+.todos-label { font-size: var(--fs-xs); color: var(--text-tertiary); }
 .todos-count { flex: 1; font-size: var(--fs-xs); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 .todos-list { list-style: none; margin: 0; padding: 10px 14px; }
-.todo-item { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; line-height: 1.6; }
+.todo-item { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: var(--fs-xs); line-height: 1.6; }
 .todo-mark { font-family: var(--font-mono); color: var(--text-tertiary); }
 .todo-item[data-status='in_progress'] .todo-mark { color: var(--warning); }
 .todo-item[data-status='completed'] .todo-mark { color: var(--success); }
@@ -655,8 +655,8 @@ function todoStatusLabel(status?: string): string {
 /* 搜索卡片（deepseek SearchBlock：12px 圆角 + banner + 22px 行 + pre 不折行） */
 .search-block { margin: 8px 0; background: var(--bg-code); border-radius: var(--sig-radius-code); overflow: hidden; }
 .search-header { display: flex; align-items: center; gap: 12px; padding: 9px 14px; background: var(--bg-secondary); }
-.search-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: var(--text-secondary); }
-.search-body { padding: 8px 14px 12px 0; overflow-x: auto; font-family: var(--font-mono); font-size: 12px; }
+.search-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); color: var(--text-secondary); }
+.search-body { padding: 8px 14px 12px 0; overflow-x: auto; font-family: var(--font-mono); font-size: var(--fs-xs); }
 .search-file { padding: 6px 0 2px 14px; color: var(--primary); font-weight: var(--fw-semibold); white-space: pre; }
 .search-line { min-height: 22px; padding-inline-start: 14px; white-space: pre; color: var(--text-primary); }
 .search-line-no { display: inline-block; width: 40px; color: var(--text-tertiary); user-select: none; }

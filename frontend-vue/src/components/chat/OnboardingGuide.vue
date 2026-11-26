@@ -181,13 +181,13 @@ function onAction(target: 'model' | 'input'): void {
 
 .step-desc {
   color: var(--text-secondary, #6b7280);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
 }
 
 .step-tag {
   margin-inline-start: 8px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: 400;
 }
 

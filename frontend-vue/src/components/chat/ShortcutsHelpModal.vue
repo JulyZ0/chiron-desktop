@@ -74,7 +74,7 @@ const grouped = computed(() =>
 <style scoped>
 .help-hint {
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   margin-bottom: 16px;
 }
 .help-group { margin-bottom: 16px; }
@@ -89,11 +89,11 @@ const grouped = computed(() =>
   gap: 12px;
   padding-block: 4px;
 }
-.help-name { color: var(--text-primary); font-size: 13px; }
+.help-name { color: var(--text-primary); font-size: var(--fs-sm); }
 .help-key {
   margin-inline-start: auto;
   font-family: var(--font-mono, 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   padding: 2px 8px;
   border: var(--hairline-width) solid var(--border-card, var(--border));
   border-radius: var(--radius-sm, 4px);

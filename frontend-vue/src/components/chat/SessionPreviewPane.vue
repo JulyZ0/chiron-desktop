@@ -351,13 +351,13 @@ defineExpose({ refresh })
 .pp-select:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-ring-offset); border-radius: var(--radius-sm); }
 .pp-btn {
   flex: none; border: none; background: transparent; color: var(--text-tertiary);
-  cursor: pointer; font-size: 13px; padding: 0 4px;
+  cursor: pointer; font-size: var(--fs-sm); padding: 0 4px;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .pp-btn:hover { color: var(--text-primary); }
 /* MessageList 自带滚动与窗口化，这里只给高度与最小内边距 */
 .pp-body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; padding: 8px 4px; }
-.pp-empty { padding: 16px 12px; color: var(--text-tertiary); font-size: 12px; }
+.pp-empty { padding: 16px 12px; color: var(--text-tertiary); font-size: var(--fs-xs); }
 
 /* 分栏手柄：平时不可见（避免多一条视觉噪声），悬停/拖动/聚焦时才显形。
    z-index 用 token —— scripts/check-z-index-tokens.mjs 会拦裸数字。 */

@@ -143,13 +143,13 @@ const speedRows = computed(() => {
 <style scoped>
 .stats-panel {
   padding: 10px 12px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 .stats-empty {
   padding: 12px 4px;
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 .stats-grid {
   display: grid;

@@ -136,7 +136,7 @@ function decline() {
 .ask-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .ask-tag { font-size: var(--fs-xs); color: var(--accent); background: var(--accent-bg); padding: 2px 8px; border-radius: var(--sig-radius-card); }
 .ask-expired { font-size: var(--fs-xs); color: var(--text-tertiary); }
-.ask-question { margin: 0 0 10px; font-size: 13px; line-height: 1.6; color: var(--text-primary); }
+.ask-question { margin: 0 0 10px; font-size: var(--fs-sm); line-height: 1.6; color: var(--text-primary); }
 .ask-options { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
 .ask-option {
   /* 尺寸走 style.css §4 的 .btn-lg 阶梯；这里只留配色与发丝环 */
@@ -157,7 +157,7 @@ function decline() {
   flex: 1; min-width: 0;
   border: var(--hairline-width) solid var(--border); border-radius: var(--sig-radius-button);
   background: var(--bg-input); color: var(--text-primary);
-  font-size: 13px; line-height: 20px; padding: 5px 10px;
+  font-size: var(--fs-sm); line-height: 20px; padding: 5px 10px;
 }
 .ask-input:focus { outline: none; border-color: var(--accent); }
 .ask-input:disabled { opacity: 0.5; }

@@ -339,7 +339,7 @@ function raiseBudget(item: PendingInteraction) {
   margin-bottom: 8px;
 }
 .inbox-title {
-  font-size: 12px;
+  font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
   color: var(--accent);
   background: var(--accent-bg);
@@ -352,7 +352,7 @@ function raiseBudget(item: PendingInteraction) {
   border-radius: var(--sig-radius-button);
   background: var(--bg-surface);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 18px;
   padding: 2px 10px;
   cursor: pointer;
@@ -371,7 +371,7 @@ function raiseBudget(item: PendingInteraction) {
   border-radius: var(--sig-radius-button);
   background: var(--bg-card);
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 .inbox-answered-mark { color: var(--success, #16a34a); }
 .inbox-budget {
@@ -382,12 +382,12 @@ function raiseBudget(item: PendingInteraction) {
 }
 .inbox-budget-question {
   margin: 0 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 .inbox-budget-numbers {
   margin: 0 0 8px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
@@ -396,7 +396,7 @@ function raiseBudget(item: PendingInteraction) {
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--text-secondary);
 }
 .inbox-budget-field input {
@@ -406,14 +406,14 @@ function raiseBudget(item: PendingInteraction) {
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 .inbox-budget-submit {
   border: var(--hairline-width) solid var(--accent);
   border-radius: var(--sig-radius-button);
   background: var(--accent);
   color: var(--accent-text, #fff);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   line-height: 18px;
   padding: 3px 12px;
   cursor: pointer;
@@ -423,7 +423,7 @@ function raiseBudget(item: PendingInteraction) {
 .inbox-budget-submit:disabled { opacity: 0.5; cursor: default; }
 .inbox-error {
   margin-top: 6px;
-  font-size: 12px;
+  font-size: var(--fs-xs);
   color: var(--danger, var(--error));
 }
 </style>

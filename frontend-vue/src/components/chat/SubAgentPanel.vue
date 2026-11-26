@@ -1385,7 +1385,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.subagent-panel { display: flex; flex-direction: column; gap: 10px; padding: 8px; font-size: 13px; }
+.subagent-panel { display: flex; flex-direction: column; gap: 10px; padding: 8px; font-size: var(--fs-sm); }
 
 .cost-hint {
   display: flex; align-items: flex-start; gap: 8px;
@@ -1395,14 +1395,14 @@ onBeforeUnmount(() => {
 }
 .cost-hint-close {
   flex: none; border: none; background: none; cursor: pointer;
-  color: var(--primary-color, #1677ff); font-size: 13px;
+  color: var(--primary-color, #1677ff); font-size: var(--fs-sm);
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .cost-hint-close:hover { color: var(--text-primary); }
 
 .panel-head { display: flex; align-items: center; justify-content: space-between; }
 .panel-title { font-weight: var(--fw-semibold); }
-.panel-meta { color: var(--text-tertiary, #8c8c8c); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.panel-meta { color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); display: flex; align-items: center; gap: 6px; }
 .source-tag { margin: 0; }
 /* 失败率：平常是中性数字，≥30% 才染成警示色（否则一整片红色等于没有红） */
 .failure-rate { font-variant-numeric: tabular-nums; color: var(--text-tertiary, #8c8c8c); }
@@ -1424,7 +1424,7 @@ onBeforeUnmount(() => {
 .twisty:hover { color: var(--text-primary); }
 .twisty.placeholder { cursor: default; }
 .run-profile { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.run-usage, .run-redacted { font-size: 12px; color: var(--text-tertiary, #8c8c8c); }
+.run-usage, .run-redacted { font-size: var(--fs-xs); color: var(--text-tertiary, #8c8c8c); }
 /* 中止按钮：紧凑型，别把行撑高；hover 用错误色（停止是破坏性动作） */
 .run-stop {
   flex: none; padding: 0 6px; line-height: 18px; cursor: pointer;
@@ -1457,20 +1457,20 @@ onBeforeUnmount(() => {
 .line.approval { width: 100%; }
 /* 提问卡片复用主对话流的 AskCard —— 只要撑满宽度 */
 .line.ask { width: 100%; }
-.ask-done { margin-top: 6px; font-size: 12px; color: var(--success, #16a34a); }
+.ask-done { margin-top: 6px; font-size: var(--fs-xs); color: var(--success, #16a34a); }
 
 .output { border-top: var(--hairline-width) solid var(--border-color, rgba(127, 127, 127, 0.24)); padding-top: 10px; }
 /* 层级面包屑：一行、可横向收缩（深层嵌套时截断的是中间标签，不是整条链）。
    祖先可点 → 直接切过去比对；根节点回运行列表。 */
 .run-breadcrumb {
   display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
-  margin-bottom: 8px; font-size: 12px; color: var(--text-secondary, #595959);
+  margin-bottom: 8px; font-size: var(--fs-xs); color: var(--text-secondary, #595959);
   min-width: 0;
 }
 .run-breadcrumb .crumb {
   max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding: 1px 4px; border: none; background: none; border-radius: var(--radius-sm, 4px);
-  font-size: 12px; color: var(--text-secondary, #595959); cursor: pointer;
+  font-size: var(--fs-xs); color: var(--text-secondary, #595959); cursor: pointer;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease;
 }
 .run-breadcrumb .crumb:hover:not(:disabled) { color: var(--primary-color, #1677ff); background: var(--bg-hover, rgba(0, 0, 0, 0.03)); }
@@ -1479,7 +1479,7 @@ onBeforeUnmount(() => {
 .run-breadcrumb .crumb-root { font-weight: var(--fw-medium); }
 .run-breadcrumb .crumb-sep { color: var(--text-tertiary, #8c8c8c); flex: none; }
 .output-head { display: flex; justify-content: space-between; font-weight: var(--fw-semibold); }
-.output-meta { font-size: 12px; color: var(--text-tertiary, #8c8c8c); }
+.output-meta { font-size: var(--fs-xs); color: var(--text-tertiary, #8c8c8c); }
 
 /* 多个 run 的并列 tab 条：横向滚动而不是换行 —— 换行会把过程视图挤下去，
    而这里每一格都只是"切到谁"的入口。 */
@@ -1528,12 +1528,12 @@ onBeforeUnmount(() => {
 .line { white-space: pre-wrap; line-height: 1.5; }
 .line.reasoning { color: var(--text-tertiary, #8c8c8c); font-style: italic; }
 .line.notice { color: var(--warning, var(--warning)); }
-.line.status, .line.done { color: var(--text-secondary, #595959); font-size: 12px; }
+.line.status, .line.done { color: var(--text-secondary, #595959); font-size: var(--fs-xs); }
 .line-tag {
   display: inline-block; margin-inline-end: 4px; padding: 0 4px; border-radius: var(--radius-sm); font-size: var(--fs-xs);
   background: var(--surface-2, rgba(127, 127, 127, 0.12));
 }
-.stream-empty { color: var(--text-tertiary, #8c8c8c); font-size: 12px; }
+.stream-empty { color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); }
 
 /* ── 内部 tab（运行 · 输出 · 用量 · 事件流）── */
 .sa-tabs {
@@ -1544,7 +1544,7 @@ onBeforeUnmount(() => {
 .sa-tab {
   flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 4px;
   padding: 4px 8px; border: none; border-radius: var(--radius-md); cursor: pointer;
-  background: transparent; color: var(--text-secondary, #595959); font-size: 12px;
+  background: transparent; color: var(--text-secondary, #595959); font-size: var(--fs-xs);
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .sa-tab:hover { color: var(--text-primary, #262626); }
@@ -1557,7 +1557,7 @@ onBeforeUnmount(() => {
   background: var(--surface-2, rgba(127, 127, 127, 0.16));
   font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
 }
-.sa-empty { padding: 10px 2px; color: var(--text-tertiary, #8c8c8c); font-size: 12px; }
+.sa-empty { padding: 10px 2px; color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); }
 
 /* 用量表：数字列右对齐 + tabular-nums，便于竖排比对 */
 .usage-grid { display: flex; flex-direction: column; }
@@ -1565,7 +1565,7 @@ onBeforeUnmount(() => {
   display: grid; grid-template-columns: 1fr auto 56px 56px 48px;
   align-items: center; gap: 6px; padding: 4px 2px;
   border-bottom: var(--hairline-width) solid var(--border-color, rgba(127, 127, 127, 0.12));
-  font-size: 12px;
+  font-size: var(--fs-xs);
 }
 .usage-head { color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); }
 .usage-row .num { text-align: end; font-variant-numeric: tabular-nums; }
@@ -1588,7 +1588,7 @@ onBeforeUnmount(() => {
 .art-item {
   padding: 3px 6px; border: none; border-radius: var(--radius-sm); cursor: pointer;
   background: transparent; color: var(--text-secondary, #595959);
-  font-size: 12px; font-family: var(--font-mono); text-align: start;
+  font-size: var(--fs-xs); font-family: var(--font-mono); text-align: start;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .art-item:hover { background: var(--surface-2, rgba(127, 127, 127, 0.08)); color: var(--text-primary, #262626); }

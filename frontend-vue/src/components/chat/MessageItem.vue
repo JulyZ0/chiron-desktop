@@ -1190,7 +1190,7 @@ watch(
   display: flex; align-items: flex-start; gap: 6px;
   max-width: min(var(--chat-content-width), 92%); margin: 6px auto;
   padding: 8px 12px; border-radius: var(--sig-radius-card, 8px);
-  font-size: var(--font-size-sm, 13px); line-height: 1.5;
+  font-size: var(--fs-sm); line-height: 1.5;
   border: var(--hairline-width) solid var(--warning-border, var(--border-color));
   background: var(--warning-bg, var(--bg-secondary));
   color: var(--text-secondary, var(--text-primary));
@@ -1205,7 +1205,7 @@ watch(
 .kb-badge-row {
   display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
   max-width: min(var(--chat-content-width), 92%); margin: 2px auto 4px;
-  font-size: var(--fs-xs, 12px); line-height: 1.5;
+  font-size: var(--fs-xs); line-height: 1.5;
   color: var(--text-tertiary, var(--text-secondary));
 }
 .kb-badge {
@@ -1223,7 +1223,7 @@ watch(
   border-color: var(--danger-border, var(--warning-border, var(--border-color)));
   color: var(--danger, var(--text-secondary));
 }
-.kb-badge-icon { flex: none; font-size: 11px; }
+.kb-badge-icon { flex: none; font-size: var(--fs-xs); }
 .kb-badge-hint { color: var(--text-tertiary, var(--text-secondary)); }
 .msg-row.user { display: flex; justify-content: flex-end; }
 /* 纵向律动（CDS v1 §3.1.2）：同一回合内的行距 = 用户选的「消息间距」；
@@ -1311,7 +1311,7 @@ watch(
 /* UI/UX：日期分隔线（deepseek DateDivider） */
 .date-divider { display: flex; align-items: center; gap: 12px; max-width: min(var(--chat-content-width), 92%); margin: 18px auto; padding: 0 20px; }
 .date-divider-line { flex: 1; height: 1px; background: var(--border); opacity: 0.6; }
-.date-divider-text { font-size: 12px; color: var(--text-tertiary); white-space: nowrap; }
+.date-divider-text { font-size: var(--fs-xs); color: var(--text-tertiary); white-space: nowrap; }
 /* 流式光标：assistant 正在输出时末尾闪烁（打字感） */
 .msg-row.streaming.assistant .msg-text::after {
   content: ''; display: inline-block; width: 2px; height: 1em;
@@ -1336,10 +1336,10 @@ watch(
 /* markdown 正文（deepseek MarkdownText：16/28、标题层级、块 gap 16） */
 .msg-text :deep(p) { margin: 16px 0; }
 .msg-text :deep(p:first-child) { margin-top: 0; }
-.msg-text :deep(h1) { font-size: 24px; line-height: 34px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
-.msg-text :deep(h2) { font-size: 22px; line-height: 32px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
-.msg-text :deep(h3) { font-size: 20px; line-height: 30px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
-.msg-text :deep(h4) { font-size: 16px; line-height: 28px; font-weight: var(--fw-semibold); margin: 16px 0; }
+.msg-text :deep(h1) { font-size: var(--fs-3xl); line-height: 34px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
+.msg-text :deep(h2) { font-size: var(--fs-3xl); line-height: 32px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
+.msg-text :deep(h3) { font-size: var(--fs-2xl); line-height: 30px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
+.msg-text :deep(h4) { font-size: var(--fs-lg); line-height: 28px; font-weight: var(--fw-semibold); margin: 16px 0; }
 .msg-text :deep(strong) { font-weight: var(--fw-semibold); }
 .msg-text :deep(ul), .msg-text :deep(ol) { padding-inline-start: 24px; margin: 16px 0; }
 .msg-text :deep(li) { margin: 4px 0; }
@@ -1367,9 +1367,9 @@ watch(
 /* 代码块：12px 圆角 + banner（deepseek CodeBlock） */
 .msg-text :deep(.code-block-wrapper) { margin: 16px 0; background: var(--bg-code); border-radius: var(--sig-radius-code); overflow: hidden; }
 .msg-text :deep(.code-block-header) { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 14px; background: var(--bg-secondary); }
-.msg-text :deep(.code-lang) { font-family: var(--font-mono); font-size: 12px; line-height: 18px; color: var(--text-primary); }
+.msg-text :deep(.code-lang) { font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 18px; color: var(--text-primary); }
 .msg-text :deep(.code-lines) { flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
-.msg-text :deep(.code-copy-btn) { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 12px; padding: 0; }
+.msg-text :deep(.code-copy-btn) { display: inline-flex; align-items: center; gap: 4px; background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: var(--fs-xs); padding: 0; }
 .msg-text :deep(.code-copy-btn:hover) { color: var(--primary); }
 /* 复制成功：对勾先画出来、文案改"已复制"，2.5s 后按 saved-check-decay 淡出恢复 ——
    与消息级复制是同一套状态机（CDS v1 §5.5.4），不再只换一行文案。 */
@@ -1387,7 +1387,7 @@ watch(
   display: block; width: 100%; padding: 6px;
   border: none; border-top: var(--hairline-width) solid var(--border-subtle);
   background: var(--bg-secondary); color: var(--text-secondary);
-  font-size: 12px; cursor: pointer;
+  font-size: var(--fs-xs); cursor: pointer;
 }
 .msg-text :deep(.code-expand-btn:hover) { color: var(--primary); }
 .msg-text :deep(.code-expand-btn:focus-visible) { outline: 2px solid var(--primary); outline-offset: -2px; }
@@ -1416,7 +1416,7 @@ watch(
 .msg-text :deep(.mermaid) {
   margin: 16px 0; padding: 12px;
   background: var(--bg-code); border-radius: var(--sig-radius-code);
-  font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  font-family: var(--font-mono); font-size: var(--fs-xs); line-height: 1.6;
   white-space: pre-wrap; word-break: break-all; color: var(--text-secondary);
 }
 .msg-text :deep(.mermaid-diagram) { display: flex; justify-content: center; overflow-x: auto; background: none; padding: 8px; }
@@ -1424,17 +1424,17 @@ watch(
 .msg-text :deep(.mermaid-error) { border-inline-start: 3px solid var(--error); }
 .msg-text :deep(.mermaid-error)::before {
   content: attr(data-error); display: block; margin-bottom: 6px;
-  color: var(--error); font-family: var(--font-sans); font-size: 12px;
+  color: var(--error); font-family: var(--font-sans); font-size: var(--fs-xs);
 }
 /* 消息操作行（deepseek MessageIconActions：28px 高、hover 淡入、80ms） */
 .msg-actions { display: flex; align-items: center; gap: 10px; height: 28px; margin-top: 4px; }
 .msg-actions.user { justify-content: flex-end; }
-.msg-time { padding-inline-end: 6px; font-size: 12px; color: var(--text-tertiary); opacity: 0; transition: opacity var(--dur-fast) ease; }
+.msg-time { padding-inline-end: 6px; font-size: var(--fs-xs); color: var(--text-tertiary); opacity: 0; transition: opacity var(--dur-fast) ease; }
 [data-time-hover-root]:hover .msg-time, [data-time-hover-root]:focus-within .msg-time { opacity: 1; }
 .msg-action { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: none; border-radius: 50%; background: transparent; color: var(--text-tertiary); cursor: pointer; opacity: 0; transition: opacity var(--dur-fast) ease, background var(--dur-fast) ease, transform var(--spring-bouncy); }
 .msg-action:hover { background: var(--bg-hover); color: var(--text-primary); }
 .msg-action.active { color: var(--primary); opacity: 1; }
-.msg-action.continue-btn { width: auto; padding: 0 10px; border-radius: var(--sig-radius-button); background: var(--primary); color: var(--on-solid); font-size: 12px; gap: 4px; opacity: 1; }
+.msg-action.continue-btn { width: auto; padding: 0 10px; border-radius: var(--sig-radius-button); background: var(--primary); color: var(--on-solid); font-size: var(--fs-xs); gap: 4px; opacity: 1; }
 .msg-action.continue-btn:hover { opacity: 0.9; background: var(--primary); color: var(--on-solid); }
 /* 复制成功：对勾先"画"出来，再驻留 2.5s 衰减（CDS v1 §4.2.4 的 check-draw + saved-check-decay） */
 .msg-action.copied { color: var(--success); animation: cdsCheckDecay var(--dur-check-decay) linear; }
@@ -1489,15 +1489,15 @@ watch(
   .msg-text :deep(pre) { white-space: pre; overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .msg-text :deep(p) { margin: 10px 0; }
   .msg-text :deep(ul), .msg-text :deep(ol) { padding-inline-start: 20px; margin: 10px 0; }
-  .msg-text :deep(h1) { font-size: 20px; line-height: 28px; margin: 20px 0 10px; }
-  .msg-text :deep(h2) { font-size: 18px; line-height: 26px; margin: 18px 0 10px; }
-  .msg-text :deep(h3) { font-size: 16px; line-height: 24px; margin: 14px 0 8px; }
+  .msg-text :deep(h1) { font-size: var(--fs-2xl); line-height: 28px; margin: 20px 0 10px; }
+  .msg-text :deep(h2) { font-size: var(--fs-xl); line-height: 26px; margin: 18px 0 10px; }
+  .msg-text :deep(h3) { font-size: var(--fs-lg); line-height: 24px; margin: 14px 0 8px; }
   .msg-text :deep(blockquote) { margin: 10px 0; }
   .msg-attachment-img { max-width: min(200px, 70vw); }
   .retry-btn { min-height: 40px; } /* 失败重试触控目标 ≥40px */
 }
 @media (max-width: 576px) {
-  .msg-text { font-size: 15px; line-height: 25px; }
+  .msg-text { font-size: var(--fs-md); line-height: 25px; }
   .msg-row.user .msg-text { padding: 8px 12px; line-height: 22px; }
   .msg-error-banner { flex-wrap: wrap; }
 }
@@ -1505,9 +1505,9 @@ watch(
 /* ── P1-1 编辑重发 ── */
 .msg-edit { display: flex; flex-direction: column; gap: 8px; max-width: min(525px, 100%); margin-inline-start: auto; }
 .edit-textarea { border-radius: var(--sig-radius-card) !important; border-color: var(--primary) !important; }
-.edit-textarea :deep(textarea) { font-size: 16px !important; line-height: 24px !important; }
+.edit-textarea :deep(textarea) { font-size: var(--fs-lg) !important; line-height: 24px !important; }
 .edit-actions { display: flex; justify-content: flex-end; gap: 8px; }
-.edit-btn { padding: 4px 12px; border-radius: var(--sig-radius-button); font-size: 12px; cursor: pointer; border: var(--hairline-width) solid var(--border); background: var(--bg-card); color: var(--text-secondary); transition: transform var(--dur-fast), opacity var(--dur-fast), color var(--dur-fast), background-color var(--dur-fast); }
+.edit-btn { padding: 4px 12px; border-radius: var(--sig-radius-button); font-size: var(--fs-xs); cursor: pointer; border: var(--hairline-width) solid var(--border); background: var(--bg-card); color: var(--text-secondary); transition: transform var(--dur-fast), opacity var(--dur-fast), color var(--dur-fast), background-color var(--dur-fast); }
 .edit-btn.save { background: var(--primary); color: var(--on-solid); border-color: var(--primary); }
 .edit-btn.save:hover { opacity: 0.9; }
 .edit-btn.cancel:hover { color: var(--text-primary); background: var(--bg-hover); }
@@ -1515,7 +1515,7 @@ watch(
 /* ── P1-2 附件展示 ── */
 .msg-attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .msg-attachment-img { max-width: 200px; max-height: 200px; border-radius: var(--sig-radius-card); border: var(--hairline-width) solid var(--border); object-fit: cover; }
-.msg-attachment-file { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--sig-radius-card); box-shadow: inset 0 0 0 var(--hairline-width) var(--border); background: var(--bg-card); color: var(--text-secondary); text-decoration: none; font-size: 13px; transition: box-shadow var(--dur-fast) ease, color var(--dur-fast) ease; }
+.msg-attachment-file { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: var(--sig-radius-card); box-shadow: inset 0 0 0 var(--hairline-width) var(--border); background: var(--bg-card); color: var(--text-secondary); text-decoration: none; font-size: var(--fs-sm); transition: box-shadow var(--dur-fast) ease, color var(--dur-fast) ease; }
 .msg-attachment-file:hover { box-shadow: inset 0 0 0 var(--hairline-width) var(--primary); color: var(--primary); }
 /* 双向中间截断（CDS v1/02 §2.5.3）：head 允许被省略，tail（尾部词干 + 扩展名）
    锁成不收缩。两段之间不留空隙，看起来仍是一个连续的文件名。 */
@@ -1523,12 +1523,12 @@ watch(
 .msg-attachment-file .att-name-head { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-attachment-file .att-name-tail { flex: none; white-space: nowrap; }
 /* 类型徽标的规格已提到全局 `.file-type-badge`（消息附件行与 composer 磁贴共用同一套） */
-.msg-attachment-file .att-size { color: var(--text-tertiary); font-size: 12px; }
+.msg-attachment-file .att-size { color: var(--text-tertiary); font-size: var(--fs-xs); }
 /* 音频播放器 */
 .msg-attachment-audio { display: flex; flex-direction: column; gap: 4px; width: 100%; max-width: 300px; padding: 8px; border-radius: var(--sig-radius-card); border: var(--hairline-width) solid var(--border); background: var(--bg-card); }
 .msg-audio-player { width: 100%; height: 40px; border-radius: var(--radius-sm); }
 .msg-audio-player::-webkit-media-controls-panel { background: var(--bg-card); }
-.att-audio-name { font-size: 12px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-audio-name { font-size: var(--fs-xs); color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── 反向定位：来源工作台 chips（与 kb-hits 标签同设计语言：胶囊 + CSS 变量色）── */
 .source-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -1582,7 +1582,7 @@ watch(
 .source-chip {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 10px; border-radius: var(--sig-radius-button);
-  font-size: 12px; line-height: 18px; text-decoration: none; cursor: pointer;
+  font-size: var(--fs-xs); line-height: 18px; text-decoration: none; cursor: pointer;
   background: var(--bg-secondary); color: var(--text-secondary);
   box-shadow: inset 0 0 0 var(--hairline-width) var(--border);
   transition: box-shadow var(--dur-fast) ease, color var(--dur-fast) ease, background var(--dur-fast) ease;
@@ -1597,7 +1597,7 @@ watch(
 /* ── P1-3 错误状态 ── */
 .msg-row.msg-error .msg-text { opacity: 0.6; }
 .msg-error-banner { display: flex; align-items: center; gap: 12px; margin-top: 8px; padding: 8px 12px; border-radius: var(--sig-radius-card); background: var(--error-bg); border: var(--hairline-width) solid var(--error); }
-.msg-error-banner .error-text { font-size: 13px; color: var(--error); flex: 1; }
-.retry-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px; border-radius: var(--sig-radius-button); border: var(--hairline-width) solid var(--error); background: transparent; color: var(--error); font-size: 12px; cursor: pointer; transition: background var(--dur-fast) ease, color var(--dur-fast) ease; }
+.msg-error-banner .error-text { font-size: var(--fs-sm); color: var(--error); flex: 1; }
+.retry-btn { display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px; border-radius: var(--sig-radius-button); border: var(--hairline-width) solid var(--error); background: transparent; color: var(--error); font-size: var(--fs-xs); cursor: pointer; transition: background var(--dur-fast) ease, color var(--dur-fast) ease; }
 .retry-btn:hover { background: var(--error); color: var(--on-solid); }
 </style>
