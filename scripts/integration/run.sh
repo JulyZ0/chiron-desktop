@@ -346,6 +346,35 @@ MSG_JSON="$DB_JSON"
 MSG_COUNT="$(jget "$MSG_JSON" 'data.rows[0].id')"
 [ -n "$MSG_COUNT" ] || fail_assert "消息落库" "messages 表没有该会话的任何行"
 
+# ── 2b. 多租户：隐式建会话（消息先落库）的租户必须来自 claims（A3）──────
+#
+# 修前 `ensureSessionOwnedWithTitle` 硬编码 DefaultTenantID：邀请码/多租户用户
+# 经"首条消息创建会话"产生的会话落进默认租户 —— 本人列表看不见、项目侧按 claims
+# tenant 过滤也找不到。这里签一枚 tenant=2 的 token，用**一个新 session_id** 直接
+# submit（走隐式 upsert），再查库确认落到 2 而不是 1。
+TENANT2_ID=2
+TOKEN_TENANT2="$("$PY" "$ROOT/scripts/integration/mint_token.py" "$JWT_SECRET" "$OWNER_ID" "$OWNER_EMAIL" "$TENANT2_ID")" \
+  || fail_assert "签发 tenant=2 JWT" "mint_token.py 执行失败"
+TENANT2_SESSION="$("$PY" -c 'import uuid; print(uuid.uuid4())')"
+t2_payload="$("$PY" -c 'import json,sys; print(json.dumps({"session_id": sys.argv[1], "content": "租户归属探针", "llm_config": {}}))' "$TENANT2_SESSION")"
+SAVED_TOKEN="$TOKEN"
+TOKEN="$TOKEN_TENANT2"
+http_call POST /v1/agent/submit "$t2_payload"
+TOKEN="$SAVED_TOKEN"
+require_status 202 "tenant=2 提交（隐式建会话）"
+
+T2_TENANT=""
+for ((turns = 0; turns < 30; turns++)); do
+  db_query "SELECT tenant_id FROM sessions WHERE id='$TENANT2_SESSION'"
+  T2_TENANT="$(jget "$DB_JSON" 'data.rows[0].tenant_id')"
+  [ -n "$T2_TENANT" ] && break
+  sleep 1
+done
+[ -n "$T2_TENANT" ] || fail_assert "隐式建会话租户" "30s 内没有 sessions 行（session=$TENANT2_SESSION）"
+[ "$T2_TENANT" = "$TENANT2_ID" ] || fail_assert "隐式建会话租户" \
+  "期望 tenant_id=$TENANT2_ID，实际=$T2_TENANT —— 消息路径又写死了默认租户"
+ok_assert "隐式建会话租户来自 claims" "session=$TENANT2_SESSION tenant=$T2_TENANT"
+
 # ── 3. usage_events：非零 token ────────────────────────────────────────
 
 USAGE_SQL="SELECT COUNT(*)::int AS n, COALESCE(SUM(input_tokens),0)::int AS tin,
