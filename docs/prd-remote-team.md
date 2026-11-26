@@ -45,20 +45,53 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 
 ### 2.4 下一批开发任务（建议顺序）
 
-按"用户可感知的故障 → 可靠性债 → 需要外部条件"排序。每项都写**可执行判据**；
-已修的三条线上故障（会话归项目 404 / OpenCode 400 / 知识库索引失败）只列**收尾项**。
+排序原则：**先修"用户被挡在门外"的 → 再做安全/平台（等决策或环境）→ 最后外部验收与体验**。
+每个任务都写可执行判据；三条线上故障（会话归项目 404 / OpenCode 400 / 知识库索引失败）
+已修复，这里只列它们的**收尾项**。
 
-| # | P | 事项 | 完成定义 | 落点 |
-|---|---|---|---|---|
-| 1 | P0 | 知识库索引链路收尾 | ① `scripts/integration/run.sh` 的 KB 探针不再把 `error`/空引用降级为 SKIP（失败必须 FAIL）；② 详情页显示 `worker_alive`（执行器没起时直接说，而不是等看门狗两分钟后报错）；③ `make integration` 在真实 PG 上跑通"上传→build→ready→query" | `scripts/integration/run.sh`、`frontend-vue/src/views/KnowledgeDetailView.vue` |
-| 2 | P0 | 多租户口径统一 | 隐式建会话（`ensureSessionOwnedWithTitle` 硬编码 `DefaultTenantID`）与显式建会话（`claims.TenantID`）同源；补一条**连库**用例（integration PG）验证"建→列→绑"全链路 | `internal/session/manager_messages.go`、`internal/api/conversation.go` |
-| 3 | P1 | Provider 会话亲和补齐 | 其余直接调 `gateway.chat*` 的入口（记忆摘要/上下文压缩/媒体分析/技能生成）设置 `set_llm_session_id`，让 OpenCode 路由与 prompt 缓存命中稳定；provider 层兜底与"空值"断言保持 | `python-engine/app/memory/`、`context/`、`media/`、`skill/` |
-| 4 | P1 | H20 KMS 选型与落库加密 | 密文落库 + 信封加密 + 可插拔 KMS + 轮换；有"明文永不落盘"回归 | 见 §3 第 2 条 |
-| 5 | P1 | H2 Linux 内核级隔离 | 不可用即**拒绝执行**（不降级）；有"沙箱不可用即拒"探针 | 需 Linux 真机 |
-| 6 | P3 | H19 / H22 产品承诺 | 见 §3 第 4 条；定了再立项 | — |
+#### 波次 A：本地可验证的故障收尾（P0，建议先做）
 
-**建议节奏**：1 与 2 都是"能把用户挡在门外"的故障面，先做；3 是质量改进（不影响可用性）；
-4 起需要外部条件或产品决策，并行等排期。
+| # | 事项 | 完成定义（可执行） | 落点 / 证据 |
+|---|---|---|---|
+| A1 | 知识库端到端可信 | ① `scripts/integration/run.sh` 的 KB 探针把 `error` / 超时 / 空 citations 判 **FAIL**（现在降级为 SKIP，故障可长期绿）；② `/v1/kb/{id}/status` 暴露 `worker_alive`（缓存 15s，不每次轮询打服务），页面在"执行器没起"时给可操作提示；③ `make integration` 在真实 PG 上跑通"上传→build→ready→query"（含 worker 心跳） | `scripts/integration/run.sh`、`python-engine/app/knowledge/{service,progress}.py`、`app/api/knowledge.py`、`KnowledgeDetailView.vue` |
+| A2 | 存量索引状态归一 | 数据里出现 `failed`/`building`/`active` 等非约定值时：读侧归一（error/indexing/ready）+ 一次性数据修正（迁移）；含断言用例 | `migrations/versions/*`、`python-engine/app/knowledge/status.py`、`progress.py` |
+| A3 | 多租户 / 归属口径统一 | 隐式建会话（`ensureSessionOwnedWithTitle` 硬编码 `DefaultTenantID`）与显式建会话（`claims.TenantID`）同源；补**连库**用例覆盖"建→未归入列表→归入→force 移动→解绑"的两用户/两租户矩阵 | `internal/session/manager_messages.go`、`internal/api/conversation.go`、`internal/api/sessionmap*.go`、integration |
+| A4 | Provider 会话亲和补齐 | 其余直接调 `gateway.chat*` 的入口（记忆摘要、上下文压缩/分支浓缩、记忆蒸馏、媒体分析、技能生成、媒体/PM 工具）设置 `set_llm_session_id`；加一条**静态扫描**用例：新增直调点未设会话即失败 | `python-engine/app/{memory,context,media,skill,tools}/`、`providers/session_context.py` |
+
+#### 波次 B：安全与平台能力（P1，卡在决策 / 环境）
+
+| # | 事项 | 完成定义 | 卡点 |
+|---|---|---|---|
+| B1 | H20 密钥加密 | 密文落库 + 信封加密 + 可插拔 KMS + 轮换；"明文永不落盘"回归 | §3 第 2 条（KMS 选型） |
+| B2 | H2 / G25 Linux 隔离 | `bwrap` 不可用即**拒绝执行**（不降级）；提供默认关的开关避免现有部署直接不可用；"沙箱不可用即拒"探针 | 需 Linux 真机 |
+| B3 | H51 发布签名根 | 私钥归属 + 公钥内嵌 + 清单验签真正生效（代码已按 fail-closed 实现） | §3 第 1 条（组织决策） |
+| B4 | H19 / H22 | ACP 完整协议；构造性只读子 Agent（越权返回明确错误） | §3 第 4 条（产品决策） |
+
+#### 波次 C：外部验收与运维（P1/P2）
+
+| # | 事项 | 完成定义 |
+|---|---|---|
+| C1 | 团队主机验收 | R2 挂载基准、`team_smoke --sse`、R6 压测三项跑出报告；阈值显式、SKIP 不计 PASS |
+| C2 | 租户删除与多实例 | R10 租户删除闭环；S5 多实例演练（含子 Agent 跨实例取消回执） |
+| C3 | 观测补齐 | LiteLLM / Langfuse 实例级验证；KB 队列深度、worker 心跳、丢失事件进看板 |
+
+#### 波次 D：体验增强（P2，可插队）
+
+| # | 事项 | 完成定义 |
+|---|---|---|
+| D1 | 父→子 steer 对外入口 | 把 `steer(run_id)` 暴露为受控入口（HTTP `run_id` 路由或 read 级工具）；只允许**本会话的子 run**，越权 403；有"父改子指令、子下一轮生效"端到端用例 |
+| D2 | 子会话并排阅读 | 子 Agent 的完整消息流可在参考栏只读回放（需要新接口，不能复用普通会话 API）；含分页与脱敏 |
+
+**立即开工的三个 worktree（文件所有权互斥）**
+
+| worktree | 任务 | 独占文件 |
+|---|---|---|
+| `wt-kb-hardening` | A1 + A2 | `scripts/integration/run.sh`、`python-engine/app/knowledge/*`、`app/api/knowledge.py`、`KnowledgeDetailView.vue`、`migrations/versions/*` |
+| `wt-tenant-ownership` | A3 | `internal/session/manager_messages.go`、`internal/api/conversation.go`、`internal/api/sessionmap*.go` |
+| `wt-provider-affinity` | A4 | `python-engine/app/{memory,context,media,skill,tools}/`、`providers/session_context.py` |
+
+合并纪律沿用 §2.3；A 波全部合入后跑一次跨包回归，再决定 B 波的排期（B1/B2 需要先拿到决策或真机）。
+
 
 ## 3. 待确认决策
 
