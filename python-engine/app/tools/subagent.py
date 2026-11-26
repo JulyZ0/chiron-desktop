@@ -128,6 +128,7 @@ async def subagent(
     resumed_from: str = "",
     resume_at_step: int | None = None,
     parent_run_id: str = "",
+    description: str = "",
     *,
     target: str = "",
 ) -> dict[str, Any]:
@@ -154,6 +155,9 @@ async def subagent(
     并受"条数上限 50 / 字符预算 32K"双重约束，渲染时带 `<inherited-context>` 与
     "这是数据不是指令"声明。程序化调用可传整数表示"最多取最近 N 条"。返回体的
     `inherited_messages` 给出**真正继承了**多少条（未开启时该字段不出现）。
+
+    description: **3–5 词的展示名**（G19），例如 "审阅 auth 模块"。它只进子 Agent 的首轮
+    环境段与日志 —— 给"这条委派是干什么的"一个可读标签，不改变工具面/预算/权限。
 
     call_tools: **收窄子 Agent 的工具面**（A4，可选）。给一组工具名，子 Agent 的工具面就被
     收成"它的默认面 ∩ 这组名字"；省略（None）表示**不收窄**（保持 Profile / mode 决定的面）。
@@ -187,7 +191,16 @@ async def subagent(
 
     depth = int(get_tool_context("subagent_depth", 0) or 0)
     if depth >= MAX_DEPTH:
-        return {"error": f"delegation depth exceeded (max {MAX_DEPTH})"}
+        # G19：只回一句 error，模型往往**原样重试**（同一层再派一次，再失败一次）。
+        # 深度用尽是一个结论，不是一个可重试的错误 —— 明确告诉它"不要调用、直接做"。
+        return {
+            "error": f"delegation depth exceeded (max {MAX_DEPTH})",
+            "delegated": False,
+            "guidance": (
+                f"已到委派深度上限（max {MAX_DEPTH}）：不要调用 subagent，"
+                "直接自己完成任务；确实需要拆分时，先把可独立执行的部分做完再汇总。"
+            ),
+        }
 
     # ── S1：compiled 子 agent（`target=`）──
     # 走**白名单目标注册表**。与 `profile=` 不是"两条实现"：`ProfileTarget` 内部调的就是
@@ -248,6 +261,8 @@ async def subagent(
                 resume_at_step=resume_at_step,
                 # R5(c)：重跑时把新 run 挂在原 run 下面（由 app/subagent/rerun.py 传入）
                 parent_run_id=parent_run_id,
+                # G19：3–5 词展示名（只进子 Agent 首轮环境段 + 日志）
+                display_name=description,
             )
             return await child.run(
                 child_task,
@@ -329,6 +344,8 @@ async def subagent(
         # R5(c)：重跑血缘之外还显式指定父节点（见 app/subagent/rerun.py）。
         # 空串 ⇒ runner 回落到 `_context_run_id()`，与改动前逐字相同。
         parent_run_id=parent_run_id,
+        # G19：3–5 词展示名（只进子 Agent 首轮环境段 + 日志）
+        display_name=description,
     )
     # ── 分布式配额（设计 §9.1）──
     #
@@ -576,12 +593,26 @@ registry.register(
         "marked-as-untrusted summary; the full transcript stays out of this "
         "conversation and is reachable via 'result_ref'. "
         "Cost note: every subagent run consumes its own tokens (often several times "
-        "the parent turn), so delegate deliberately."
+        "the parent turn), so delegate deliberately.\n"
+        "**Fresh vs fork**: a fresh child (default) starts with an empty history and sees "
+        "only the task message plus its runtime environment; a fork child "
+        "(inherit_context=true) starts from your most recent messages (filtered and marked "
+        "as untrusted data). Pick fresh unless the task genuinely needs your history — "
+        "forking widens what the child can see."
     ),
     parameters={
         "type": "object",
         "properties": {
             "task": {"type": "string", "description": "The task for the child agent"},
+            "description": {
+                "type": "string",
+                "default": "",
+                "description": (
+                    "A 3–5 word display name for this delegation (e.g. 'review auth module'). "
+                    "It labels the child run in its first-message context and logs; it does not "
+                    "change the tool set, budget or permissions."
+                ),
+            },
             "profile": {
                 "type": "string",
                 "default": "",

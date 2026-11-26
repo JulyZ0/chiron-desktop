@@ -5,12 +5,24 @@
 
 只在轮次边界注入：工具执行到一半插消息会让 `tool_calls` 与 tool 结果对不上
 （与 interrupt 只在轮次边界检查是同一个理由）。跨副本靠 Redis list，本副本走本地队列。
+
+## 两条寻址方式（G19）
+
+* **按会话**（既有）：用户在界面上给正在跑的**顶层**回合补一句话，`/v1/agent/steer`
+  带 `session_id`。
+* **按子 run**（G19 新增）：父 Agent / 界面给**运行中的子 Agent** 追加指令。子 Agent 跑在
+  合成会话 `sub:<父>:<run>` 里、不在 `run_registry`（那里是顶层回合的归属），所以按会话
+  寻址时准入直接回 ``no active agent for this session``。这里让 runner 用
+  :func:`register_child_run` 把 ``run_id → (子会话, 父会话)`` 登记进来，调用方用
+  :func:`steer` 按 run 寻址，写入的仍是**子会话的既有 steer 队列** —— runtime 每轮开头
+  `drain_steer(task.session_id)` 的消费路径一个字都不用改。
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -23,6 +35,170 @@ MAX_PER_MINUTE = 6
 MAX_CHARS = 2000
 #: 队列长度上限，防止一条失控的 run 把 Redis 撑爆。
 MAX_QUEUE = 20
+
+# ── G19：按子 run 寻址 ─────────────────────────────────────────────────────
+
+#: 单个子 run **待注入**的指令条数上限。算的是 pending（子 Agent 取走即还额度），
+#: 不是历史累计 —— 否则一个长跑的子 Agent 会被永久锁死。
+#:
+#: 溢出时**明确报错**（:data:`CODE_QUEUE_FULL`）：静默丢弃会让父 Agent 以为话带到了，
+#: 而子 Agent 永远等不到那条约束。
+MAX_CHILD_STEER_PER_RUN = 8
+
+CODE_OK = "ok"
+CODE_RUN_NOT_FOUND = "run_not_found"
+CODE_RUN_FINISHED = "run_finished"
+CODE_INVALID_MESSAGE = "invalid_message"
+CODE_QUEUE_FULL = "queue_full"
+CODE_DELIVERY_FAILED = "delivery_failed"
+
+#: ``run_id → (子会话 id, 父会话 id)``。由 runner 在开跑时登记、收尾时注销。
+#: 与 `subagent_registry`（进程内任务句柄）刻意分开：那张表要在跨副本取消时广播，
+#: 这里只回答"这条追加指令该投到哪个队列"，进程内足够。
+_RUN_TARGETS: dict[str, tuple[str, str]] = {}
+#: ``子会话 id → run_id``：drain 时据此把"取走"折算回 per-run 额度。
+_RUN_BY_SESSION: dict[str, str] = {}
+#: 已经收尾的 run：再 steer 必须回 ``run_finished``，绝不静默成功。
+_FINISHED: set[str] = set()
+#: ``run_id → 待注入条数``。
+_PENDING: dict[str, int] = {}
+
+
+@dataclass(frozen=True)
+class SteerResult:
+    """一次按 run 寻址的投递结果。
+
+    失败**必须带错误码**：调用方（HTTP 层 / 另一个 Agent）要据此区分"该重试"与"不该"。
+    只给一句自然语言，重试逻辑就只能靠猜。
+    """
+
+    ok: bool
+    code: str = CODE_OK
+    reason: str = ""
+    child_session: str = ""
+
+
+def register_child_run(run_id: str, *, child_session_id: str, parent_agent_id: str) -> None:
+    """登记一条运行中的子 run（runner 开跑时调用）。幂等：重复登记覆盖同一映射。"""
+    if not run_id or not child_session_id:
+        return
+    _RUN_TARGETS[run_id] = (child_session_id, parent_agent_id or "")
+    _RUN_BY_SESSION[child_session_id] = run_id
+    _FINISHED.discard(run_id)
+    _PENDING[run_id] = 0
+
+
+def forget_child_run(run_id: str) -> None:
+    """注销一条子 run（runner 收尾时调用），并清掉它残留的待注入条目。
+
+    清队列是**安全属性**而不是清理癖好：子 Agent 收尾后残留的条目，会被下一次同会话
+    的 run 取走（跨 run 误伤）—— 那句约束是给上一件事的，注入到下一件事里就是错误指令。
+    幂等：重复调用不会重置任何正在跑的东西。
+    """
+    target = _RUN_TARGETS.pop(run_id, None)
+    _PENDING.pop(run_id, None)
+    if target is not None:
+        child_session, _parent = target
+        if _RUN_BY_SESSION.get(child_session) == run_id:
+            _RUN_BY_SESSION.pop(child_session, None)
+        # 翻转代数：与 clear 同一条路径，避免"clear 之后 Redis 才恢复"时旧副本复活。
+        clear_steer_local(child_session)
+    _FINISHED.add(run_id)
+
+
+def child_session_of(run_id: str) -> str:
+    """该 run 的合成子会话 id；未登记（或已注销）返回空串。"""
+    target = _RUN_TARGETS.get(run_id)
+    return target[0] if target is not None else ""
+
+
+def parent_of(run_id: str) -> str:
+    """派发该 run 的父会话 id；未登记返回空串。"""
+    target = _RUN_TARGETS.get(run_id)
+    return target[1] if target is not None else ""
+
+
+def pending_count(run_id: str) -> int:
+    """该 run 还有几条指令没被子 Agent 取走（有界队列的当前占用）。"""
+    return _PENDING.get(run_id, 0)
+
+
+async def steer(
+    run_id: str,
+    text: str,
+    *,
+    sender: str = "user",
+    redis: Any = None,
+) -> SteerResult:
+    """父 Agent → 运行中的子 Agent：按 **run** 追加一条指令。
+
+    只入队、**不打断**：它不 cancel run，也不把文本插到正在执行的工具调用中间
+    （那会让 `tool_calls` 与 tool 结果错位）。子 Agent 在**下一轮**开头按既有
+    `drain_steer` 取走。
+
+    消息带发送者（``来自父 Agent <id> 的追加指令：``），来源标成 ``parent:<id>``：
+    历史里必须分得清"这句是人说的、watchdog 发的，还是父 Agent 说的"。
+
+    目标未知 / 已结束 / 队列满都是**明确错误**，绝不静默成功 —— 这条通道的全部价值
+    就是让父 Agent 相信"话带到了"。
+    """
+    target = _RUN_TARGETS.get(run_id)
+    if target is None:
+        if run_id in _FINISHED:
+            return SteerResult(
+                ok=False, code=CODE_RUN_FINISHED, reason=f"child run {run_id!r} already finished"
+            )
+        return SteerResult(
+            ok=False, code=CODE_RUN_NOT_FOUND, reason=f"no child run {run_id!r} is registered"
+        )
+    child_session, _parent = target
+
+    reason = _validate(text)
+    if reason:
+        return SteerResult(ok=False, code=CODE_INVALID_MESSAGE, reason=reason, child_session=child_session)
+
+    pending = _PENDING.get(run_id, 0)
+    if pending >= MAX_CHILD_STEER_PER_RUN:
+        return SteerResult(
+            ok=False,
+            code=CODE_QUEUE_FULL,
+            reason=(
+                f"queue full ({MAX_CHILD_STEER_PER_RUN} pending for run {run_id!r}); "
+                "wait until the child drains them"
+            ),
+            child_session=child_session,
+        )
+    # 先占额度再 await：并发 steer 的检查-占用之间不能有挂起点，否则上限会被击穿。
+    _PENDING[run_id] = pending + 1
+
+    message = f"来自父 Agent {sender} 的追加指令：\n{text}"
+    client = await _resolve_redis(redis)
+    ok, delivery_reason = await _enqueue(
+        child_session, message, source=f"parent:{sender}", client=client
+    )
+    if not ok:
+        _PENDING[run_id] = pending  # 投递没成功 ⇒ 额度还回去
+        return SteerResult(
+            ok=False,
+            code=CODE_DELIVERY_FAILED,
+            reason=delivery_reason,
+            child_session=child_session,
+        )
+    return SteerResult(ok=True, code=CODE_OK, reason=delivery_reason, child_session=child_session)
+
+
+def _release_pending(session_id: str, drained: list[tuple[str, str]]) -> None:
+    """drain 出来的条数里有多少条是"父 Agent 的追加指令"，就从 per-run 额度里扣掉。
+
+    只扣 ``parent:`` 来源：同一个会话队列里可能有 watchdog / 用户的条目（那些不受
+    per-run 上限约束），拿总条数去扣会让额度提前归还。
+    """
+    run_id = _RUN_BY_SESSION.get(session_id)
+    if not run_id:
+        return
+    count = sum(1 for _text, source in drained if source.startswith("parent:"))
+    if count:
+        _PENDING[run_id] = max(0, _PENDING.get(run_id, 0) - count)
 
 #: 进程内快路径：session_id → [(置入时刻, 代数, 文本, 来源)]，同副本时零网络往返。
 #:
@@ -147,6 +323,29 @@ async def push_steer(session_id: str, text: str, *, source: str = "user",
         except Exception as exc:  # noqa: BLE001 — 计数失败不阻断投递，本地队列仍可用
             logger.warning("steer: rate counter failed: %s", exc)
 
+    # 限流按会话计数：跨副本也要一致，所以优先用 Redis 的计数窗口。
+    #
+    # 子 run 的 steer（:func:`steer`）**不走这一段**：它的上限是 per-run 的
+    # :data:`MAX_CHILD_STEER_PER_RUN`，而不是"每会话每分钟 X 条"——父 Agent 在一轮里
+    # 连续补几条约束是正常用法，按用户输入的限流口径会把它误伤成 429。
+    if client is not None:
+        try:
+            from app.redis_keys import rkey
+
+            rate_key = rkey("engine:steer:rate:") + session_id
+            count = await client.incr(rate_key)
+            if count == 1:
+                await client.expire(rate_key, 60)
+            if count > MAX_PER_MINUTE:
+                return False, f"rate limited ({MAX_PER_MINUTE}/min)"
+        except Exception as exc:  # noqa: BLE001 — 计数失败不阻断投递，本地队列仍可用
+            logger.warning("steer: rate counter failed: %s", exc)
+
+    return await _enqueue(session_id, text, source=source, client=client)
+
+
+async def _enqueue(session_id: str, text: str, *, source: str, client: Any) -> tuple[bool, str]:
+    """把一条指导写进本地队列 + Redis（不做限流；两个入口共用这一份投递逻辑）。"""
     # 本地快路径与 Redis 都要写：同副本读本地零往返，跨副本读 Redis。
     # 本地副本带**时刻 + 代数**：TTL 到期或代数翻转（run 收尾 clear）后不再被 drain 到。
     _prune_local(session_id)
@@ -183,7 +382,10 @@ async def drain_steer(session_id: str, *, redis: Any = None) -> list[tuple[str, 
     _prune_local(session_id)
     local = _LOCAL.pop(session_id, [])
     if local:
-        return [(text, source) for _, _, text, source in local]
+        drained = [(text, source) for _, _, text, source in local]
+        # G19：子 Agent 取走一轮 ⇒ 把 per-run 待注入额度还回去。
+        _release_pending(session_id, drained)
+        return drained
 
     client = await _resolve_redis(redis)
     if client is None:
@@ -207,6 +409,7 @@ async def drain_steer(session_id: str, *, redis: Any = None) -> list[tuple[str, 
             text = item.decode() if isinstance(item, bytes) else str(item)
             out.append(_decode(text))
         out.reverse()  # lpush 是头插，取出后反序才是投递顺序
+        _release_pending(session_id, out)
         return out
     except Exception as exc:  # noqa: BLE001
         logger.warning("steer: drain failed: %s", exc)

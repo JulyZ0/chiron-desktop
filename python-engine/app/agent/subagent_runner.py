@@ -606,9 +606,13 @@ class SubAgentRunner:
         #: 父回合是否无人值守（自动续跑）。子 Agent 继承它：审批/提问端点同样定位不到
         #: 子 runtime，不继承就是每个交互闸门白等 300s。
         unattended: bool = False,
+        #: G19：3–5 词展示名（`subagent` 工具的 `description`）。只进子 Agent 的首轮环境段
+        #: 与日志；不影响工具面、预算或落库（落库要有列，属于前端展示的独立改造）。
+        display_name: str = "",
     ) -> None:
         self._gateway = gateway
         self._unattended = bool(unattended)
+        self._display_name = (display_name or "").strip()
         #: 是否后台委派（决定生命周期与预算，**不再决定只读**，见 _resolve_tools）
         self._background = bool(background)
         #: 是否**显式**授权写/执行：默认 False ⇒ 子 Agent 工具面只读（见 _resolve_tools）
@@ -823,6 +827,57 @@ class SubAgentRunner:
         # （见 `app/subagent/resume.py`）。
         if self._resume_context:
             child.content = f"{self._resume_context}\n\n{child.content}"
+
+        # ── G30：首轮环境上下文（工作目录 / 沙箱 / 审批 / 身份与委派额度）──
+        #
+        # 走**首条用户消息**而不是 system_prompt：环境随会话变化，人格不该跟着变；
+        # 更重要的是父子 system prompt 必须**逐字一致**（子 Agent 是同一人格的延伸）。
+        # 顺序由 `child_context.SLOT_ORDER` 决定，调用方不靠参数顺序。
+        #
+        # 三个事实都从**既有单一来源**读，不在这里另算一套：
+        #   * 只读与否 → `_child_read_only(spec)`（工具面 / 收据 / 写槽仲裁同问它）；
+        #   * 可写路径 → `app/tools/sandbox.workspace_dir()`；
+        #   * tools_mode → runner 上工具上下文里的父级实际模式（非法值归一成 auto）。
+        from app.agent.steer import forget_child_run, register_child_run
+        from app.subagent.child_context import (
+            RETURN_GUIDANCE,
+            ChildIdentity,
+            build_child_context,
+            read_approval_state,
+            read_sandbox_state,
+        )
+        from app.tools.context import get_tool_context
+        from app.tools.sandbox import workspace_dir
+
+        _read_only = self._child_read_only(spec)
+        _context_text = build_child_context(
+            working_directory=str(workspace_dir()),
+            sandbox=read_sandbox_state(read_only=_read_only),
+            approval=read_approval_state(
+                get_tool_context("tools_mode", ""), unattended=self._unattended
+            ),
+            identity=ChildIdentity(
+                run_id=run_id,
+                parent_agent_id=self._parent_session_id,
+                current_depth=child_depth,
+                max_depth=max_depth,
+                read_only=_read_only,
+                display_name=self._display_name,
+            ),
+        )
+        # 环境段在**最前**：先读到"我在哪、能做什么"，再读任务与继承的历史。
+        child.content = f"{_context_text}\n\n{child.content}"
+        # G19：返回指引在**任务之后** —— 它讲的是"这一轮怎么收尾"，放在开头会和任务抢注意力。
+        child.content = f"{child.content}\n\n{RETURN_GUIDANCE}"
+
+        # ── G19：把这条子 run 登记进 steer 注册表 ──
+        # 父 Agent / 界面按 run_id 追加指令时，才能解析出合成子会话并写入它的既有队列
+        # （子 Agent 每轮开头 `drain_steer(task.session_id)` 取走）。收尾统一在 finally 注销。
+        register_child_run(
+            run_id,
+            child_session_id=child.session_id or "",
+            parent_agent_id=self._parent_session_id,
+        )
 
         # M15a：父 run 标识**必须在落库之前**算出来。它此前只在这里的下方算一次、只喂给
         # 事件与运行期缓存，`start_run` 没收到它 ⇒ `subagent_runs.parent_run_id` 对所有
@@ -1386,6 +1441,9 @@ class SubAgentRunner:
             # R2：先释放写槽。放在 finally 的**第一句**是为了让"任何**退出路径**都释放"
             # 成为结构上的必然（含取消、异常、正常收尾）。release 幂等。
             slot_release()
+            # G19：注销 steer 目标并清掉残留的待注入条目 —— 子 Agent 收尾后那条约束
+            # 不该被同一会话的下一次 run 取走（跨 run 误伤）。
+            forget_child_run(run_id)
             # 停止 wall 监控：正常情况下它还在 sleep。必须取消，否则每个已完成的 run 都会
             # 残留一个定时器，到点后对已结束的 run 调 cancel（幂等但会刷无意义的告警日志）。
             if _wall_task is not None:
