@@ -38,7 +38,18 @@ const quickMocks = vi.hoisted(() => ({
   executeQuickCommand: vi.fn((): Promise<unknown> => Promise.resolve({ sessionId: 'uni_1', title: 't' })),
 }))
 
-vi.mock('../../api', () => ({ api: { get: apiMocks.get } }))
+// `vi.mock` 是**整模块替换**：`stores/auth` 在 store 建立时读 `currentAuthGeneration`，
+// 不补齐这些导出就会在 `useAuthStore()` 处抛 "No export is defined"（同 MediaView.smoke
+// 的那条说明）。值取中性：本套用例不测登录态，只挂载视图。
+vi.mock('../../api', () => ({
+  api: { get: apiMocks.get },
+  currentAuthGeneration: () => 0,
+  bumpAuthGeneration: () => 0,
+  awaitAuthGeneration: async () => 0,
+  desktopDeviceToken: () => '',
+  loadDesktopToken: async () => null,
+  setAuthToken: () => {},
+}))
 
 // 快速命令的真实实现会 import 全局路由实例：在视图测试里换成替身，
 // 既避免把整张路由表拉进来，又能断言"确实复用了同一条路径"。

@@ -198,8 +198,10 @@ describe('二进制文件的打开入口', () => {
     await button!.trigger('click')
     await flush()
 
-    // 必须拼成绝对路径：openPath 只接受绝对路径，相对路径会被主进程拒掉
-    expect(openPath).toHaveBeenCalledWith({ path: 'C:\\proj\\简历.docx' })
+    // 必须拼成绝对路径：openPath 只接受绝对路径，相对路径会被主进程拒掉。
+    // `root` 是同一份载荷的一部分（主进程据此把打开动作限制在项目根内）——
+    // 只断言 path 时"忘了带 root"也会绿，而那正好是越界打开的缺口。
+    expect(openPath).toHaveBeenCalledWith({ path: 'C:\\proj\\简历.docx', root: 'C:\\proj' })
   })
 })
 

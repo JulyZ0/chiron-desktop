@@ -39,6 +39,14 @@ const apiMocks = vi.hoisted(() => ({
 vi.mock('../../api', () => ({
   api: { get: apiMocks.get, post: apiMocks.post, put: apiMocks.put, delete: apiMocks.delete },
   listAgents: apiMocks.listAgents,
+  // `vi.mock` 是整模块替换：`stores/auth` 在 store 建立时读 `currentAuthGeneration`，
+  // 不补齐这些导出就会在 `useAuthStore()` 处抛 "No export is defined"。
+  currentAuthGeneration: () => 0,
+  bumpAuthGeneration: () => 0,
+  awaitAuthGeneration: async () => 0,
+  desktopDeviceToken: () => '',
+  loadDesktopToken: async () => null,
+  setAuthToken: () => {},
 }))
 
 import PluginsView from '../PluginsView.vue'

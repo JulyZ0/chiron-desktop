@@ -43,6 +43,14 @@ const apiMocks = vi.hoisted(() => {
     runAgent: vi.fn(arr),
     getAgentSession: vi.fn(arr),
     setAgentVisibility: vi.fn(arr),
+    // `vi.mock` 是整模块替换：`stores/auth` 在 store 建立时读 `currentAuthGeneration`，
+    // 不补齐这些导出就会在 `useAuthStore()` 处抛 "No export is defined"。
+    currentAuthGeneration: () => 0,
+    bumpAuthGeneration: () => 0,
+    awaitAuthGeneration: async () => 0,
+    desktopDeviceToken: () => '',
+    loadDesktopToken: async () => null,
+    setAuthToken: () => {},
   }
 })
 
