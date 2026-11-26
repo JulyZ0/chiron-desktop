@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { createPinia } from 'pinia'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 
@@ -189,7 +190,7 @@ describe('ChatView 交互级：提交 → SSE 帧 → transcript', () => {
   })
 
   async function mountAndSend(text = '你好') {
-    const wrapper = mount(ChatView, { global: { plugins: [router], stubs: STUBS } })
+    const wrapper = mount(ChatView, { global: { plugins: [router, createPinia()], stubs: STUBS } })
     await flushPromises()
     wrapper.findComponent(ChatInput).vm.$emit('send', text, [])
     await flushPromises()
@@ -253,7 +254,7 @@ describe('ChatView 交互级：提交 → SSE 帧 → transcript', () => {
       }
       return apiMocks.emptyList() as never
     })
-    const wrapper = mount(ChatView, { global: { plugins: [router], stubs: STUBS } })
+    const wrapper = mount(ChatView, { global: { plugins: [router, createPinia()], stubs: STUBS } })
     await flushPromises()
     await flushPromises()
     const vm = wrapper.vm as unknown as {
@@ -592,7 +593,7 @@ describe('ChatView 模式选择器：code 模式的端到端接线', () => {
   })
 
   it('ChatInput 拿到 code 选项（否则用户根本选不到）', async () => {
-    const wrapper = mount(ChatView, { global: { plugins: [router], stubs: STUBS } })
+    const wrapper = mount(ChatView, { global: { plugins: [router, createPinia()], stubs: STUBS } })
     await flushPromises()
 
     const opts = wrapper.findComponent(ChatInput).props('modeOptions') as
@@ -601,7 +602,7 @@ describe('ChatView 模式选择器：code 模式的端到端接线', () => {
   })
 
   it('选中 code 后提交 ⇒ llm_config 同时带 mode=code 与 temperature=0.1', async () => {
-    const wrapper = mount(ChatView, { global: { plugins: [router], stubs: STUBS } })
+    const wrapper = mount(ChatView, { global: { plugins: [router, createPinia()], stubs: STUBS } })
     await flushPromises()
 
     wrapper.findComponent(ChatInput).vm.$emit('update:mode', 'code')

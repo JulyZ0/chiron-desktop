@@ -10,6 +10,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
+import { createPinia } from 'pinia'
 import { createRouter, createMemoryHistory } from 'vue-router'
 
 if (!window.matchMedia) {
@@ -181,7 +182,7 @@ async function mountChat() {
     }
     return apiMocks.emptyList() as never
   })
-  const wrapper = mount(ChatView, { global: { plugins: [router], stubs: STUBS } })
+  const wrapper = mount(ChatView, { global: { plugins: [router, createPinia()], stubs: STUBS } })
   await flushPromises()
   await flushPromises()
   return { wrapper, vm: wrapper.vm as unknown as Vm }

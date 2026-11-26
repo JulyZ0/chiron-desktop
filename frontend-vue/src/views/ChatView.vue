@@ -31,6 +31,8 @@ import { playUiSound } from '../utils/uiSounds'
 import { planReconnect } from '../utils/streamReattach'
 import { notify } from '../utils/notify'
 import { useThemeStore } from '../stores/theme'
+import { useChatSessionStore } from '../stores/chatSession'
+import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import type { LocationQuery } from 'vue-router'
 import ChatSidePanel from '../components/chat/ChatSidePanel.vue'
@@ -347,8 +349,18 @@ listModels()
   .catch(() => { availableModels.value = [] })
 
 // ── 会话状态 ──
-const sessions = ref<ChatSession[]>([])
-const activeSessionId = ref('')
+// 身份与项目归属的唯一事实源在 `stores/chatSession.ts`（含切换时的项目反查、晚到结果丢弃、
+// "root_path 为空不算项目"）。`storeToRefs` 解构后，下面 50+ 处 `sessions.value` /
+// `activeSessionId.value` 的读写与原来的 ref 完全一致。
+const chatSessionStore = useChatSessionStore()
+const {
+  sessions,
+  activeSessionId,
+  activeProject,
+  activeProjectError,
+  activeSession,
+} = storeToRefs(chatSessionStore)
+const refreshActiveProject = chatSessionStore.refreshActiveProject
 
 // 输入区的装配胶水（引用投递 / 附件通道 / `@` 提及 / 失败暂存队列）
 // 实现见 `composables/useComposerBridge.ts`。`chatInputRef` 仍是模板 `ref=` 绑定的那个
@@ -375,70 +387,9 @@ const {
 })
 
 
-/**
- * 当前会话所属的项目（session-map project id），`@` 引用项目文件要用。
- *
- * 为什么反查而不是从 props 拿：项目归属是**会话的属性**，而 ChatView 只知道
- * `activeSessionId`。让侧边栏把"用户点了哪个项目"传进来会被后续的自动绑定、
- * 从 URL 直达等情况撕裂成两个事实源。
- *
- * 失败时保持空串 = "没有项目文件可引用"，不弹错 —— 用户在打字，这不是他此刻
- * 要处理的事；真正需要报错的是打开预览面板的时候。
- */
-const activeProject = ref<{ id: string; name: string } | null>(null)
+// 项目归属的解析（含失败原因、晚到结果丢弃）已抽到 `stores/chatSession.ts`。
+// 这里只保留 UI 直接消费的派生 id。
 const activeProjectId = computed(() => activeProject.value?.id || '')
-/**
- * 反查项目**失败**的原因（空串 = 没失败）。
- *
- * 必须与 `activeProject === null` 分开记：两者在工作台上完全是两件事 ——
- * "这个会话没归入项目"是正常状态，而"归属查不出来"（网关 404 / 网络断 / 401）
- * 是故障。合并成一个 null 的话，故障会被显示成「当前会话未归入任何项目」，
- * 而用户刚在侧边栏把它拖进项目了 —— 一句自相矛盾的话，且没有任何线索。
- */
-const activeProjectError = ref('')
-
-/**
- * 重新解析"当前会话属于哪个项目"。
- *
- * **不能只在 `activeSessionId` 变化时跑**：用户在侧边栏把**当前正在聊的这个会话**
- * 拖进项目（或移出项目）时，会话 id 一个字都没变，watch 不会被触发 —— 工作台
- * 于是继续显示「当前会话未归入任何项目」，而此刻后端已经有归属了。刷新按钮
- * 也救不了它，因为整页重建才会重跑 watch。
- */
-async function refreshActiveProject() {
-  const sid = activeSessionId.value
-  activeProject.value = null
-  activeProjectError.value = ''
-  if (!sid) return
-  try {
-    const { sessionProject } = await import('../views/sessionmap/projectsApi')
-    const project = await sessionProject(sid)
-    // 期间切走了会话：晚到的结果属于上一个会话，写进去会让 `@` 搜错目录。
-    if (activeSessionId.value !== sid) return
-    // **`root_path` 为空不算项目**：那是旧形态的「画布」，没有绑定本地文件夹。
-    // 后端 `projectRootOf` 对这种 id 回的是 404 `not_found`（不是 409
-    // `project_root_unavailable` —— 那个才是"文件夹被删了"），于是工作台把一句
-    // "请求的资源不存在"糊在用户脸上，而真相是"这个会话本来就没有项目文件"。
-    // 判据务必与 `ListProjects` 一致：`root_path <> ''` 才是项目。
-    activeProject.value =
-      project && project.root_path
-        ? { id: project.id, name: project.name || project.root_path }
-        : null
-  } catch (e) {
-    if (activeSessionId.value !== sid) return
-    // 查询失败**不能**当成"没有项目"：那会让工作台显示「未归入任何项目」，
-    // 而用户可能刚把会话拖进项目。留原文，让面板说明是哪一步坏了。
-    activeProjectError.value = describeApiError(e)
-  }
-}
-
-/**
- * 会话切换时重新解析。
- *
- * 侧边栏改归属（绑定 / 移出 / 移动）走 `@binding-changed` 单独触发一次 —— 那条路径
- * 会话 id 不变，只有显式通知能救。
- */
-watch(activeSessionId, () => { void refreshActiveProject() })
 
 /**
  * 任务清单面板（长任务防跑偏）。
@@ -454,7 +405,6 @@ const todoBoard = computed(() => todoPanel.boardOf(activeSessionId.value))
 
 /** 失败暂存队列（按会话隔离、横幅预览、取回编辑）：见 `composables/useComposerBridge.ts`，
  *  已在上方解构。它只与输入框交互，不参与消息流投影。 */
-const activeSession = computed(() => sessions.value.find(s => s.id === activeSessionId.value) || null)
 /**
  * ── 多会话运行：运行时状态**按会话**存 ──
  *

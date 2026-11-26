@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { createPinia } from 'pinia'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
 
@@ -103,7 +104,7 @@ const router = createRouter({
 })
 
 function mountView() {
-  return mount(ChatView, { global: { plugins: [router], stubs: HEAVY_CHILDREN } })
+  return mount(ChatView, { global: { plugins: [router, createPinia()], stubs: HEAVY_CHILDREN } })
 }
 
 describe('ChatView 冒烟（3429 行、此前零测试）', () => {
