@@ -15,8 +15,8 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 
 ### 2.1 与 deepseek-harness 的差距（`G*`）
 
-来源：[gap-analysis-chiron-vs-dsh.md](gap-analysis-chiron-vs-dsh.md)、[gap-analysis-r2-subagent-frontend.md](gap-analysis-r2-subagent-frontend.md)。
-可本机验证的 G 项已全部合入；以下三项**不是待做项**，而是记录当前决定（见 §3.1）。
+历史差距分析与 DSH 循环考古已移除（结论已并入本文件与 git 历史）；可本机验证的 G 项
+均已合入。以下三项**不是待做项**，而是记录当前决定（见 §3.1）。
 
 | ID | 事项 | 决定 | 卡点 |
 |---|---|---|---|
@@ -42,6 +42,23 @@ S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证�
 合并纪律（保留给下一轮）：① 每个分支自己跑完窄回归；② 合并后我在 main 上跑跨包回归
 （Go `./internal/...`、Python 相关套件、前端 `src/components` + `check:ui`）；③ 冲突时以
 "语义正确"优先，不保留两套实现；④ 每项合入后**立即**从本文件删除对应行。
+
+### 2.4 下一批开发任务（建议顺序）
+
+按"用户可感知的故障 → 可靠性债 → 需要外部条件"排序。每项都写**可执行判据**；
+已修的三条线上故障（会话归项目 404 / OpenCode 400 / 知识库索引失败）只列**收尾项**。
+
+| # | P | 事项 | 完成定义 | 落点 |
+|---|---|---|---|---|
+| 1 | P0 | 知识库索引链路收尾 | ① `scripts/integration/run.sh` 的 KB 探针不再把 `error`/空引用降级为 SKIP（失败必须 FAIL）；② 详情页显示 `worker_alive`（执行器没起时直接说，而不是等看门狗两分钟后报错）；③ `make integration` 在真实 PG 上跑通"上传→build→ready→query" | `scripts/integration/run.sh`、`frontend-vue/src/views/KnowledgeDetailView.vue` |
+| 2 | P0 | 多租户口径统一 | 隐式建会话（`ensureSessionOwnedWithTitle` 硬编码 `DefaultTenantID`）与显式建会话（`claims.TenantID`）同源；补一条**连库**用例（integration PG）验证"建→列→绑"全链路 | `internal/session/manager_messages.go`、`internal/api/conversation.go` |
+| 3 | P1 | Provider 会话亲和补齐 | 其余直接调 `gateway.chat*` 的入口（记忆摘要/上下文压缩/媒体分析/技能生成）设置 `set_llm_session_id`，让 OpenCode 路由与 prompt 缓存命中稳定；provider 层兜底与"空值"断言保持 | `python-engine/app/memory/`、`context/`、`media/`、`skill/` |
+| 4 | P1 | H20 KMS 选型与落库加密 | 密文落库 + 信封加密 + 可插拔 KMS + 轮换；有"明文永不落盘"回归 | 见 §3 第 2 条 |
+| 5 | P1 | H2 Linux 内核级隔离 | 不可用即**拒绝执行**（不降级）；有"沙箱不可用即拒"探针 | 需 Linux 真机 |
+| 6 | P3 | H19 / H22 产品承诺 | 见 §3 第 4 条；定了再立项 | — |
+
+**建议节奏**：1 与 2 都是"能把用户挡在门外"的故障面，先做；3 是质量改进（不影响可用性）；
+4 起需要外部条件或产品决策，并行等排期。
 
 ## 3. 待确认决策
 

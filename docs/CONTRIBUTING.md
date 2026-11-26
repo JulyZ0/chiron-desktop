@@ -81,6 +81,8 @@ sandbox-service/   工具执行沙箱服务
 | 想知道 | 去哪 |
 |---|---|
 | 本地模式的完整契约（运行模式、preload 暴露面、本地身份、数据隔离、组件、推理代理、用量） | [本地模式契约](desktop-local/contracts.md) |
+| 远程执行与团队服务还差什么、下一批怎么排 | [剩余工作 PRD](prd-remote-team.md) |
+| 团队域名部署（证书、反向代理、R2、压测入口） | [团队部署](team-domain-deployment.md) |
 
 ## 数据库迁移
 
