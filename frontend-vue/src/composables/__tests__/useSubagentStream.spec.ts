@@ -14,6 +14,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../../api', () => ({
   createSSEConnection: vi.fn(() => ({ close: vi.fn() })),
+  // 子 Agent 流现在也带静默看门狗，需要这个常量（值不影响本文件的断言）。
+  SSE_SILENT_TIMEOUT_MS: 45_000,
 }))
 
 import { createSSEConnection } from '../../api'
@@ -67,7 +69,12 @@ describe('useSubagentStream', () => {
     stream.ensureSubagentStream()
 
     expect(createMock).toHaveBeenCalledTimes(1)
-    expect(createMock).toHaveBeenCalledWith('s1', expect.any(Function), expect.any(Function), { autoReconnect: true })
+    expect(createMock).toHaveBeenCalledWith(
+      's1',
+      expect.any(Function),
+      expect.any(Function),
+      expect.objectContaining({ autoReconnect: true, heartbeatTimeoutMs: 45_000 }),
+    )
     stream.disposeSubagentStream()
   })
 

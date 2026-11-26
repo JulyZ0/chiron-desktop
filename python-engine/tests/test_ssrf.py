@@ -212,3 +212,46 @@ class TestSkillInstallValidation:
     async def test_ssrf_blocked_url(self):
         out = await skill_install(url="http://169.254.169.254/latest/meta-data/")
         assert "error" in out and "blocked" in out["error"]
+
+
+class TestFetchUrlSafeLimit:
+    """L17：附件下载必须边读边截断，不能先把整包读进内存。"""
+
+    async def test_max_bytes_truncates_streaming_body(self):
+        import httpx
+
+        from app.tools.ssrf import fetch_url_safe
+
+        big = b"x" * (1024 * 1024)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"content-type": "text/plain"}, content=big)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), follow_redirects=False
+        ) as client:
+            resp = await fetch_url_safe(client, "https://1.1.1.1/big.txt", max_bytes=1024)
+
+        assert resp.status_code == 200
+        assert len(resp.content) == 1024
+
+    async def test_max_bytes_follows_redirects(self):
+        import httpx
+
+        from app.tools.ssrf import fetch_url_safe
+
+        seen: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(str(request.url))
+            if str(request.url).endswith("/start"):
+                return httpx.Response(302, headers={"location": "https://1.1.1.1/final"})
+            return httpx.Response(200, content=b"done")
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), follow_redirects=False
+        ) as client:
+            resp = await fetch_url_safe(client, "https://1.1.1.1/start", max_bytes=1024)
+
+        assert resp.content == b"done"
+        assert len(seen) == 2

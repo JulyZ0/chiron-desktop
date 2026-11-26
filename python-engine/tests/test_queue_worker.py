@@ -350,3 +350,34 @@ async def test_own_task_is_not_forwarded():
     )
     idempotency.forward.assert_not_awaited()
     redis.xadd.assert_not_awaited()
+
+
+class TestReclaimAndShutdown:
+    """L15：reclaim 计数与业务失败分离；停机窗口不丢新消息。"""
+
+    async def test_reclaim_increments_claim_count_not_retry(self):
+        worker = make_worker(AsyncMock())
+        worker._running = True
+        worker._spawn_message = AsyncMock()
+        await worker._spawn_claimed("1-0", fields(retry_count=2))
+        passed = worker._spawn_message.await_args.args[1]
+        assert passed["claim_count"] == "1"
+        assert passed["retry_count"] == "2", "reclaim 不应消耗业务重试预算"
+
+    async def test_shutdown_window_requeues_instead_of_dropping(self):
+        redis = AsyncMock()
+        worker = make_worker(redis)
+        worker._running = False
+        await worker._spawn_message("1-0", fields())
+        redis.xadd.assert_awaited_once()
+        redis.xack.assert_awaited_once()
+
+    async def test_reclaim_exhaustion_goes_to_dlq(self):
+        worker = make_worker(AsyncMock())
+        worker._running = True
+        worker._dispatch = AsyncMock()
+        exhausted = fields()
+        exhausted[b"claim_count"] = str(worker_module.MAX_RECLAIMS + 1).encode()
+        await worker._process_message("1-0", exhausted)
+        idempotency.dead_letter.assert_awaited_once()
+        worker._dispatch.assert_not_awaited()

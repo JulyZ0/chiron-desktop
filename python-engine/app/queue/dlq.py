@@ -7,7 +7,7 @@ from typing import Any
 import redis.asyncio as aioredis
 
 # 统一键前缀（与 Go 网关 RedisKey 语义一致，多环境隔离）
-from app.queue.streams import ENGINE_QUEUE, QueueSpec
+from app.queue.streams import ENGINE_QUEUE, QueueSpec, append_task
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +57,16 @@ class DeadLetterQueue:
                 message[key] = val
         message["retry_count"] = "0"
 
-        # 重新入队（MAXLEN 限界，防长期运行下流无界增长）
-        await self._redis.xadd(self._q.stream, message, maxlen=self._q.maxlen)
+        # 重新入队必须走 append_task：裸 `XADD MAXLEN` 是流级精确裁剪，积压接近上限时
+        # 会删掉**仍在 PEL 等重试**的任务（不进 DLQ、无日志）。append_task 在组内有
+        # 未 ACK 条目时放弃裁剪。
+        await append_task(
+            self._redis,
+            stream=self._q.stream,
+            group=self._q.group,
+            fields=message,
+            maxlen=self._q.maxlen,
+        )
         # 从 DLQ 删除
         await self._redis.xdel(self._q.dlq, stream_id)
         logger.info("DLQ message requeued: %s", stream_id)

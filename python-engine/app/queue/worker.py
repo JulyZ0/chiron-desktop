@@ -35,6 +35,9 @@ from app.queue.streams import (  # noqa: E402
 
 CONSUMER_PREFIX = "worker"
 MAX_RETRIES = 3
+# 重领（reclaim）上限：与业务失败分开计数。滚动发布/空闲自停会让一条**从未失败**的
+# 长任务被反复 reclaim；旧实现把它算进 retry_count，三次发布后就进 DLQ。
+MAX_RECLAIMS = 20
 
 # ── 跨实例全局并发门控(N5,防多引擎实例后台 10×N 洪峰)──
 # Redis 计数键 engine:worker:inflight;TTL 防进程崩溃泄漏;0=关闭。
@@ -199,6 +202,11 @@ class QueueWorker:
         #: 与看门狗分开是刻意的：两者节奏不同（看门狗全局 5 分钟，接管按每会话间隔到点）。
         self._takeover_task: asyncio.Task[Any] | None = None
 
+    @property
+    def in_flight_count(self) -> int:
+        """本地正在执行的任务数（供空闲自停/诊断判断"是否真的没人用"）。"""
+        return len(self._in_flight)
+
     async def start(self) -> None:
         """启动消费者"""
         self._running = True
@@ -253,6 +261,17 @@ class QueueWorker:
                 # 同样修复了 queue:flush 只写不读的死功能。
                 if await self._redis.exists(rkey("queue:flush")):
                     await self._redis.delete(rkey("queue:flush"))
+                    # PEL 是**组级共享**的：别的实例正在执行的消息也在里面。旧实现把
+                    # 它们一起 XACK + xtrim(0)，对方完成时对不上 PEL，任务被标 failed
+                    # 而副作用已经发生。有他人在跑就拒绝本轮 flush（管理员稍后重试），
+                    # 只清理本 consumer 的 pending。
+                    other_pending = await self._other_consumers_pending()
+                    if other_pending:
+                        logger.warning(
+                            "Queue flush skipped: %s task(s) in flight on other consumers",
+                            other_pending,
+                        )
+                        continue
                     while True:
                         pending = await self._redis.xpending_range(
                             self._q.stream, self._q.group, min="-", max="+", count=1000
@@ -277,20 +296,28 @@ class QueueWorker:
                 await asyncio.sleep(1)
 
     async def stop(self) -> None:
-        """P1-2: 优雅停止（带超时保护）"""
+        """P1-2: 优雅停止（带超时保护）。"""
         self._running = False
-        if self._reclaim_task is not None:
-            self._reclaim_task.cancel()
-            self._reclaim_task = None
-        if self._delay_task is not None:
-            self._delay_task.cancel()
-            self._delay_task = None
-        if self._watchdog_task is not None:
-            self._watchdog_task.cancel()
-            self._watchdog_task = None
-        if self._takeover_task is not None:
-            self._takeover_task.cancel()
-            self._takeover_task = None
+        # 先抓引用再 cancel：cancel() 只是投递请求，不等它跑完 finally（心跳 detach /
+        # 子进程 terminate），后面的 close_pool/aclose 可能先执行，留下孤儿任务。
+        background = [
+            t for t in (
+                self._reclaim_task,
+                self._delay_task,
+                self._watchdog_task,
+                self._takeover_task,
+            )
+            if t is not None
+        ]
+        for task in background:
+            task.cancel()
+        self._reclaim_task = None
+        self._delay_task = None
+        self._watchdog_task = None
+        self._takeover_task = None
+        if background:
+            await asyncio.gather(*background, return_exceptions=True)
+
         logger.info(
             "Queue worker stopping, waiting for %d in-flight tasks...",
             len(self._in_flight),
@@ -308,6 +335,8 @@ class QueueWorker:
                 )
                 for task in self._in_flight:
                     task.cancel()
+                # cancel 后必须再等一轮：被取消任务的 finally 才是心跳/子进程清理点。
+                await asyncio.gather(*self._in_flight, return_exceptions=True)
         logger.info("Queue worker stopped")
 
     async def _register_signal_handlers(self) -> None:
@@ -353,8 +382,42 @@ class QueueWorker:
             for stream_id, fields in messages:
                 await self._spawn_message(stream_id, fields)
 
+    async def _requeue_unprocessed(self, stream_id: str, fields: dict[Any, Any]) -> None:
+        """把停机窗口里已读入但未处理的消息放回队列并 ACK 原条目。
+
+        先 XADD 再 XACK：两步之间进程崩溃会留下一条重复（原 pending + 新条目），
+        但任务幂等键保证不会执行两次；反过来先 ACK 再 XADD，崩溃就是丢任务。
+        """
+        try:
+            await self._redis.xadd(self._q.stream, fields)
+            await self._redis.xack(self._q.stream, self._q.group, stream_id)
+            logger.info("requeued unprocessed task during shutdown: id=%s", stream_id)
+        except Exception as exc:  # noqa: BLE001 - 放回失败就留给 reclaim
+            logger.warning("requeue unprocessed task failed (id=%s): %s", stream_id, exc)
+
+    async def _other_consumers_pending(self) -> int:
+        """返回**其他 consumer** 的 pending 条数（用于拒绝会误伤他们的 flush）。"""
+        try:
+            summary = await self._redis.xpending(self._q.stream, self._q.group)
+        except Exception:  # noqa: BLE001 - 读不到就不做危险操作
+            return 1
+        if not isinstance(summary, dict):
+            return 1
+        total = 0
+        for c in summary.get("consumers") or []:
+            name = c.get("name") if isinstance(c, dict) else None
+            count = c.get("pending") if isinstance(c, dict) else None
+            if name and name != self._consumer_name:
+                total += int(count or 0)
+        return total
+
     async def _spawn_message(self, stream_id: str, fields: dict[Any, Any]) -> None:
         """把一条消息投入本地处理：本地信号量 + 跨实例全局门控 + 超时保护。"""
+        if not self._running:
+            # 停机窗口里 XREADGROUP 可能已把消息读进来（返回后才看到 _running=false）。
+            # 直接丢弃会让它滞留 PEL 直到 reclaim（默认 600s）；先放回队列再 ACK。
+            await self._requeue_unprocessed(stream_id, fields)
+            return
         # 等待本地信号量（每实例）
         await self._semaphore.acquire()
         # 跨实例全局门控：超限等待上限后把消息放回队尾并 ACK（避免认领窗口重复处理）
@@ -474,9 +537,9 @@ class QueueWorker:
                 )
 
     async def _spawn_claimed(self, msg_id: str, fields: dict[Any, Any]) -> None:
-        """Count a reclaim as a retry; the fenced processor owns any DLQ transition."""
+        """把一次 reclaim 记在**独立**的 claim_count 上（不是业务失败）。"""
         message = _text_fields(fields)
-        message["retry_count"] = str(_as_int(message.get("retry_count")) + 1)
+        message["claim_count"] = str(_as_int(message.get("claim_count")) + 1)
         await self._spawn_message(msg_id, message)
 
     async def _try_acquire_gate(self, stream_id: str, fields: dict[Any, Any]) -> bool:
@@ -617,6 +680,7 @@ class QueueWorker:
         task_id = message.get("task_id", "")
         payload_raw = message.get("payload", "{}")
         retry_count = _as_int(message.get("retry_count"))
+        claim_count = _as_int(message.get("claim_count"))
         tenant_id = _as_int(message.get("tenant_id"))
         # 队列 worker 在**另一个任务/进程**里运行：producer 把 trace_id 写进了
         # envelope，但 contextvars 不会跨过去。不恢复的话这条任务的所有日志
@@ -714,18 +778,18 @@ class QueueWorker:
         start = time.monotonic()
         dispatch_succeeded = False
         try:
-            if retry_count > MAX_RETRIES:
+            if claim_count > MAX_RECLAIMS:
                 moved = await self._move_to_dlq(
-                    claim, stream_id, message, f"reclaim retries exhausted: {retry_count}"
+                    claim, stream_id, message, f"reclaim attempts exhausted: {claim_count}"
                 )
                 if moved:
-                    logger.warning("Task moved to DLQ: id=%s (retries=%d)", task_id, retry_count)
+                    logger.warning("Task moved to DLQ: id=%s (claims=%d)", task_id, claim_count)
                 # 没跑就被丢弃：只有 settled，没有 started ——
                 # 从没执行过的任务不该先闪一张"运行中"的卡片（G13）。
                 await emit(
                     job_events.EV_JOB_SETTLED,
                     job_events.ST_DISCARDED,
-                    f"reclaim retries exhausted: {retry_count}",
+                    f"reclaim attempts exhausted: {claim_count}",
                 )
                 return
 

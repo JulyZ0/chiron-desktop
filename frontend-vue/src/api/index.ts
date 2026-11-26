@@ -1142,8 +1142,22 @@ export interface SSEFrameMeta {
   id: string
 }
 
-/** 重连间隔：够短让流式看起来"没断"，够长不给正在重启的网关添压。 */
-const SSE_RECONNECT_DELAY_MS = 1000
+/** 重连退避：首连失败 0.8s 起，指数增长到 15s，带 ±20% 抖动。 */
+const SSE_RECONNECT_BASE_MS = 800
+const SSE_RECONNECT_MAX_MS = 15_000
+
+/**
+ * 第 n 次重连的等待时间（n 从 1 起）。
+ *
+ * 固定 1s × 3 次的问题：合盖/隧道里十几秒就把重试耗尽，所有流在 3 秒内被 close，
+ * 而服务端仍在跑 —— 用户回来只看到"停在断线前"。退避 + 抖动既给网关重启留时间，
+ * 也避免多标签同时重连形成尖峰。
+ */
+function reconnectDelay(attempt: number): number {
+  const base = Math.min(SSE_RECONNECT_BASE_MS * 2 ** Math.max(0, attempt - 1), SSE_RECONNECT_MAX_MS)
+  const jitter = base * 0.2
+  return Math.round(base - jitter + Math.random() * jitter * 2)
+}
 
 /** 解析一帧（`\n\n` 分隔的一段文本）；字段语义按 SSE 规范，与 EventSource 对齐。 */
 function parseSSEFrame(frame: string): { data: string; event: string; id: string } {
@@ -1178,7 +1192,7 @@ export function openEventStream(
   opts: SSEConnectionOptions = {},
 ): SSEHandle {
   const {
-    initialLastEventId = '', autoReconnect = false, maxAutoReconnects = 3,
+    initialLastEventId = '', autoReconnect = false, maxAutoReconnects = 8,
     heartbeatTimeoutMs = 0, reconnectOnResume = true,
   } = opts
   const onLastEventId = opts.onLastEventId
@@ -1260,7 +1274,7 @@ export function openEventStream(
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null
         void connect()
-      }, SSE_RECONNECT_DELAY_MS)
+      }, reconnectDelay(failedReconnects))
       return
     }
     fail()

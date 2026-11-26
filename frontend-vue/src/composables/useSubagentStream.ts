@@ -43,7 +43,13 @@
  * 会话流游标）。
  */
 import { computed, watch, type ComputedRef, type WritableComputedRef } from 'vue'
-import { createSSEConnection, type SSEConnectionOptions, type SSEFrameMeta, type SSEHandle } from '../api'
+import {
+  createSSEConnection,
+  SSE_SILENT_TIMEOUT_MS,
+  type SSEConnectionOptions,
+  type SSEFrameMeta,
+  type SSEHandle,
+} from '../api'
 import type { SubagentEvent } from '../api/subagent'
 
 /** 合批窗口：见文件头 §2 */
@@ -187,7 +193,12 @@ export function useSubagentStream(options: UseSubagentStreamOptions): SubagentSt
     // H59：重连时带上本会话的游标（服务端据此补发断口之后的事件）；
     // 首次建连没有游标 ⇒ 选项对象保持原样（不带空值头，见 api/index.ts 的说明）。
     const resume = lastIdBySession.get(sid) || ''
-    const streamOpts: SSEConnectionOptions = { autoReconnect: true }
+    const streamOpts: SSEConnectionOptions = {
+      autoReconnect: true,
+      // 没有心跳看门狗时，半开连接（休眠/代理掐长连接）不会报错也不会 EOF：
+      // 子 Agent 的审批卡与进度会**永久静默**，只有切会话/刷新才恢复。
+      heartbeatTimeoutMs: SSE_SILENT_TIMEOUT_MS,
+    }
     if (resume) streamOpts.initialLastEventId = resume
     sse = createSSEConnection(
       sid,

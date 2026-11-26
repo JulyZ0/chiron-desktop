@@ -295,8 +295,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.engine_replica and settings.engine_idle_shutdown_seconds > 0:
         from app.idle_shutdown import idle_shutdown_watch
 
+        def _engine_busy() -> bool:
+            """非 HTTP 的活跃工作：后台回合 / 队列任务 / 运行中的子 Agent。"""
+            if _BACKGROUND_TURNS:
+                return True
+            if _queue_worker_instance is not None and getattr(
+                _queue_worker_instance, "in_flight_count", 0
+            ):
+                return True
+            try:
+                from app.subagent import registry as _subagent_registry
+
+                return bool(_subagent_registry.list_active())
+            except Exception:  # noqa: BLE001 - 探针坏了按"忙"处理，宁可晚缩容
+                return True
+
         _idle_task = asyncio.create_task(
-            idle_shutdown_watch(settings.engine_idle_shutdown_seconds)
+            idle_shutdown_watch(settings.engine_idle_shutdown_seconds, busy_probe=_engine_busy)
         )
 
     logger.info("=" * 60)
@@ -1662,12 +1677,16 @@ async def _resolve_attachments(content: str) -> str:
     from app.http_client import shared_client
     from app.tools.ssrf import fetch_url_safe
 
+    # 附件只用于"前 8000 字符"的上下文注入；下载 4MB 已经远超需要。
+    # 不设上限时一个超大 text/plain 链接就能把进程内存打满（含 PDF 整包进 pymupdf）。
+    attachment_max_bytes = 4 << 20
+
     # S 安全修复：禁用自动重定向，改用 ssrf.fetch_url_safe 逐跳校验
     # scheme/端口/DNS/IP（含重定向绕过）后再获取，防止附件 URL 打内网/云元数据。
     async with shared_client(timeout=settings.http_timeout_web, follow_redirects=False) as client:
         for is_image, name, url in matches:
             try:
-                resp = await fetch_url_safe(client, url)
+                resp = await fetch_url_safe(client, url, max_bytes=attachment_max_bytes)
                 if resp.status_code != 200:
                     continue
 

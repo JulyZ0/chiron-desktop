@@ -1881,6 +1881,12 @@ function onOnline() {
   // 上线后指数退避重连，恢复会话
   if (reconnectTimer) clearTimeout(reconnectTimer)
   reconnectAttempts = 0
+  // **所有**仍在跑的会话都要重挂，而不是只恢复当前视图那一条：
+  // 断网期间每条流都把重试用尽并 close，后台会话的流不会因为切走就自动回来。
+  for (const [sid, run] of runtimes) {
+    if (!run.loading || sseBySession.has(sid)) continue
+    attachSessionStream(sid, { sinceEventId: sseLastIdBySession.get(sid) || '' })
+  }
   attemptReconnect()
 }
 

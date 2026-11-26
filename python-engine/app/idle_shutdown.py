@@ -55,12 +55,32 @@ class IdleTrackingMiddleware:
             touch()
 
 
-async def idle_shutdown_watch(threshold_seconds: int, poll_seconds: int = 60) -> None:
+async def idle_shutdown_watch(
+    threshold_seconds: int,
+    poll_seconds: int = 60,
+    busy_probe: Any = None,
+) -> None:
+    """空闲自停。`busy_probe()` 返回 True 表示还有**不经过 HTTP 计数**的活跃工作。
+
+    HTTP 在途数只覆盖请求生命周期；队列 worker（tool_job 最长 1h）、后台子 Agent、
+    断连后转后台的回合都不在 `_active_requests` 里。旧实现只看 HTTP，缩容时会把
+    正在写文件/跑构建的任务硬杀（Windows Job Object 还会连带杀进程树）。
+    """
     if threshold_seconds <= 0:
         return
     logger.info("idle shutdown enabled: %ss", threshold_seconds)
     while True:
         await asyncio.sleep(poll_seconds)
+        if busy_probe is not None:
+            try:
+                if busy_probe():
+                    # 有非 HTTP 的活跃工作：把空闲计时重置，别把长任务算成"没人用"。
+                    touch()
+                    continue
+            except Exception as exc:  # noqa: BLE001 - 探针坏了不该导致误杀
+                logger.warning("idle busy probe failed, treating as busy: %s", exc)
+                touch()
+                continue
         idle = time.monotonic() - _last_activity
         if _active_requests == 0 and idle >= threshold_seconds:
             logger.info("engine replica idle for %.0fs; shutting down", idle)

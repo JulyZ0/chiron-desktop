@@ -26,6 +26,10 @@ JOB_RESULT_TTL = 24 * 3600  # 结果保留时长（秒）
 JOB_KILL_TTL = 120  # 取消标志有效期（秒）；进程被 kill 后残留标志由完成路径清理
 KILL_POLL_INTERVAL = 0.5  # watcher 轮询取消标志间隔（秒）
 JOB_TIMEOUT = 3600  # 单条后台命令上限（与原 run_in_background timeout 一致）
+# 单条后台命令的输出上限。`proc.communicate()` 会把**全部** stdout 读进内存，
+# 一条 `yes` / `npm run build` 日志刷屏就能打爆副本；这里边读边丢，超限即杀进程，
+# 并把"被截断"写进结果 —— 静默截断会让用户以为命令真的只输出了这些。
+JOB_MAX_OUTPUT_BYTES = int(os.getenv("JOB_MAX_OUTPUT_BYTES", str(8 << 20)))
 
 
 def meta_key(job_id: str) -> str:
@@ -53,6 +57,45 @@ async def _kill_proc(proc: asyncio.subprocess.Process) -> None:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except Exception:  # noqa: BLE001
             pass
+
+
+async def _communicate_capped(
+    proc: asyncio.subprocess.Process, limit: int
+) -> tuple[bytes, bool]:
+    """读取 stdout，最多保留 `limit` 字节；超限杀进程并返回 overflowed=True。
+
+    必须**边读边丢**而不是先 communicate 再截断：后者在截断前已经吃掉了全部内存。
+    stderr 已在 subprocess_exec 里并入 stdout，所以只有一条流。
+    """
+    stream = proc.stdout
+    if stream is None:
+        await proc.wait()
+        return b"", False
+    chunks: list[bytes] = []
+    total = 0
+    overflowed = False
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            break
+        remain = limit - total
+        if remain <= 0:
+            overflowed = True
+            break
+        if len(chunk) > remain:
+            chunks.append(chunk[:remain])
+            total += remain
+            overflowed = True
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if overflowed:
+        await _kill_proc(proc)
+    try:
+        await proc.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    return b"".join(chunks), overflowed
 
 
 async def _kill_watcher(redis: Any, job_id: str, proc: asyncio.subprocess.Process) -> None:
@@ -219,8 +262,16 @@ async def execute_tool_job(
     output = ""
     timed_out = False
     try:
-        out_b, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out_b, overflowed = await asyncio.wait_for(
+            _communicate_capped(proc, JOB_MAX_OUTPUT_BYTES), timeout=timeout
+        )
         output = out_b.decode("utf-8", errors="replace")
+        if overflowed:
+            # 进程已因超限被杀：不能装作正常完成（否则用户会以为构建成功）。
+            status = "failed"
+            output += (
+                f"\n[output exceeded {JOB_MAX_OUTPUT_BYTES} bytes; process killed]"
+            )
         exit_code = proc.returncode or 0
         # 被 kill 判定：退出码 <0 且存在取消标志（Redis 可用时）
         killed = False

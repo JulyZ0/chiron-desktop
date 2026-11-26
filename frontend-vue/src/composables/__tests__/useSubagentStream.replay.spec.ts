@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../../api', () => ({
   createSSEConnection: vi.fn(() => ({ close: vi.fn() })),
+  SSE_SILENT_TIMEOUT_MS: 45_000,
 }))
 
 import { createSSEConnection } from '../../api'
@@ -135,7 +136,7 @@ describe('子 Agent 通道：按会话判归属、按 run 回放（H59）', () =
     expect(createMock).toHaveBeenCalledTimes(2)
     expect(lastCall().opts?.initialLastEventId).toBe('400-11')
     // 首次建连没有游标 ⇒ 选项对象保持原样（不带空值头）
-    expect(createMock.mock.calls[0]![3]).toEqual({ autoReconnect: true })
+    expect(createMock.mock.calls[0]![3]).toMatchObject({ autoReconnect: true })
     stream.disposeSubagentStream()
   })
 

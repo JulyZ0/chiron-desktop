@@ -347,6 +347,8 @@ async def fetch_url_safe(
     client: httpx.AsyncClient,
     url: str,
     max_redirects: int = 5,
+    *,
+    max_bytes: int | None = None,
     **kwargs: Any,
 ) -> httpx.Response:
     """SSRF 安全的 HTTP GET：每次重定向跳转前重新执行 assert_safe_url，
@@ -356,12 +358,33 @@ async def fetch_url_safe(
 
     进入循环前先 `harden_async_client(client)`：**解析级检查不构成防线**（两次解析之间
     就是 rebinding 窗口），真正的收口是连接期钉住已校验 IP（PRD 9.7 / H39）。
+
+    `max_bytes` 非空时走流式读取并**只保留前 N 字节**：`client.get()` 会先把整个响应
+    读进内存，用户贴一个 2GB 的 text/plain 链接就能把引擎 RSS 打爆（SSRF 校验挡的是
+    地址，不是体积）。超限的响应返回截断 body，调用方按需标注"已截断"。
     """
     harden_async_client(client)
     max_redirects = min(max_redirects, 20)
     current = url
     for _ in range(max_redirects + 1):
         assert_safe_url(current)
+        if max_bytes is not None and max_bytes > 0:
+            async with client.stream("GET", current, follow_redirects=False, **kwargs) as resp:
+                status = resp.status_code
+                headers = resp.headers
+                if status in (301, 302, 303, 307, 308):
+                    location = headers.get("location")
+                    if not location:
+                        return httpx.Response(status, headers=headers)
+                    current = str(httpx.URL(current).join(location))
+                    continue
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    room = max_bytes - len(body)
+                    if room <= 0:
+                        break
+                    body.extend(chunk[:room])
+                return httpx.Response(status, headers=headers, content=bytes(body))
         resp = await client.get(current, follow_redirects=False, **kwargs)
         if resp.status_code in (301, 302, 303, 307, 308):
             location = resp.headers.get("location")
