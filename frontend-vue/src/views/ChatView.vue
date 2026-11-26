@@ -32,6 +32,7 @@ import { planReconnect } from '../utils/streamReattach'
 import { notify } from '../utils/notify'
 import { useThemeStore } from '../stores/theme'
 import { useChatSessionStore } from '../stores/chatSession'
+import { useChatRunState } from '../composables/useChatRunState'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import type { LocationQuery } from 'vue-router'
@@ -405,166 +406,19 @@ const todoBoard = computed(() => todoPanel.boardOf(activeSessionId.value))
 
 /** 失败暂存队列（按会话隔离、横幅预览、取回编辑）：见 `composables/useComposerBridge.ts`，
  *  已在上方解构。它只与输入框交互，不参与消息流投影。 */
-/**
- * ── 多会话运行：运行时状态**按会话**存 ──
- *
- * 背景：此前 `loading` / `items` 是**单值**，
- * 于是切会话必须打断上一个会话（清空 items + 无条件置 loading），
- * 而后台会话的 SSE 并没有被关闭 —— 它的事件会写进**当前**会话的列表（串台）。
- *
- * 手法：**存储按会话，对外仍是 `items` / `loading` 这两个名字** ——
- * 用 Vue 的**可写 computed** 代理到当前会话的切片。于是既有读写点
- * （`items.value` 50 处 + `loading.value` 19 处）**一行都不用改**：
- *   - 读 `items.value`              → 当前会话的数组（同一引用）
- *   - 写 `items.value = [...]`      → 走 setter，落到当前会话
- *   - 改内容 `items.value.push(x)`   → 直接改那个数组（引用不变，天然正确）
- *
- * `gen`（代际号）：会话运行时被**重建**（重开同一 id、重新建流）时递增。
- * 只比 `sessionId` 不够 —— 同一个 id 可能对应**前后两次生命周期**，
- * 旧回调必须靠 gen 才知道"我已经不属于这个会话了"
- * （参考 DeepSeek-Reasonix 的 `sessionGen` 与 `submissionBindingCurrent`）。
- */
-interface SessionRunState {
-  /** 该会话的消息列表：切换会话时**不再清空**，后台继续追加 */
-  items: ChatItem[]
-  /** 该会话是否正在生成（切走不影响它继续跑） */
-  loading: boolean
-  /** 代际号：该会话运行时被重建时 +1（用于丢弃旧回调） */
-  gen: number
-  /**
-   * 回合序号（H69）：每提交一轮 +1。
-   *
-   * 为什么除了 `gen` 还要它：`gen` 说的是"运行时被重建"，而 gap 重拉要防的是
-   * "拉取期间又开跑了一轮（**并且已经跑完**）"。那种情形下 `loading` 已是 false、
-   * `gen` 也没变，只有回合序号能证明"这份快照是上一轮的"。
-   */
-  turnSeq: number
-  /**
-   * 该会话的**子 Agent 实时事件**（有界缓冲）。
-   *
-   * 此前它是模块级单值 `ref`，于是会话 A 的子 Agent 进度会**串到会话 B** 的
-   * 观测面板与状态栏角标上（`items` / `loading` 早已按会话隔离，唯独漏了它）。
-   * 放进 run state 后，"事件属于哪个会话"由 `withRun` 作用域自动决定 ——
-   * `onSSEMessage` 本就在 `withRun(runOf(sessionId), …)` 内执行。
-   */
-  subagentEvents: SubagentEvent[]
-  /**
-   * 本会话的**流式累积状态**（缓冲、当前正文/思考/用量条目 id）。
-   *
-   * 为什么必须按会话：这些值此前是模块级单值，而 `runtimes` 允许多会话并行 ——
-   * 切走后后台会话继续推流时，两个会话会写同一份 `streamBuf` 与同一个
-   * `streamTextId`。表现得像"两条消息被拼成一条"，或者 A 的正文出现在 B 的会话里
-   * （`find` 找不到 id ⇒ 新建条目，但缓冲里已经混进了 A 的累积文本）。
-   */
-  streamBuf: string
-  streamTextId: string
-  streamReasonId: string
-  streamStatsId: string
-  /**
-   * 有票已答复、但唤醒被"会话正在跑"挡下了（见 `wakeFromInbox`）。
-   *
-   * 一次答复**一批**待办时必然发生：第一条答复唤醒新一轮 ⇒ `loading` 变 true，
-   * 后面几条的唤醒全被挡掉。那些票停在 `answered`，而续跑只会消费与本次调用指纹
-   * 匹配的票，于是它们**永远**不会被取走 —— 界面上就一直是
-   * 「已答复，下一次发送即从暂停处继续」。记在这里，本轮收尾后补一次唤醒。
-   */
-  pendingInboxWake?: boolean
-  /**
-   * 这一轮 run 的现场（H58）：`sessionId` + 提交时的 `client_msg_id`。
-   *
-   * 为什么必须**捕获**而不是在停止时现取：用户按下停止前往往已经切走了会话，
-   * 而取消要打到**发出这一轮**的会话上，不是此刻正在看的那个。
-   */
-  turn?: TurnRef
-  /** 停止请求的现场（H58）：`stopping` = 已下发、等确认；`failed` = 未确认、可重试 */
-  stop?: TurnStopState
-}
-
-/**
- * ⚠️ 必须是**响应式** Map：`items` / `loading` 是从这里派生的 computed，
- * 而流式输出靠 `items.value.push(...)` 追加 —— 底层若不是响应式的，push 不会触发
- * 任何重渲染，表现为"流式期间界面不动、消息结束后一次性跳出全部内容"。
- */
-const runtimes = reactive(new Map<string, SessionRunState>())
-
-function runOf(sid: string): SessionRunState {
-  let run = runtimes.get(sid)
-  if (!run) {
-    runtimes.set(sid, {
-      items: [],
-      loading: false,
-      gen: 1,
-      turnSeq: 0,
-      subagentEvents: [],
-      streamBuf: '',
-      streamTextId: '',
-      streamReasonId: '',
-      streamStatsId: '',
-    })
-    // 必须取回 `runtimes.get()` 的**代理**，而不是刚构造的原始对象 ——
-    // 原始对象不在响应式系统里，后续 push 不会触发更新。
-    run = runtimes.get(sid)!
-  }
-  return run
-}
-
-/** 当前视图所属会话的运行时（`activeSessionId` 为空时用占位键，保持既有"无会话"行为） */
-const currentRun = computed(() => runOf(activeSessionId.value || '__none__'))
-
-/** 本页面会话内"主回合仍在跑"的会话 id（`runtimes[sid].loading`）。
- *  直接读 `runtimes`，不另建状态，避免两处漂移。
- *  注意它只是侧栏心跳的**信号之一**：主回合已结束但后台子 Agent 还在跑的会话，
- *  这里会漏 —— 那个场景由下方基于 `subagentLiveEvents` 的 `runningSessionIds` 覆盖，
- *  两者在 `sidebarRunningIds` 里取并集。
- *  **已知边界**：`ChatSession` 上没有服务端的 running 字段，所以跨刷新看不见
- *  "刷新前就在后台跑的会话"；要做到需后端在会话列表里返回运行态（另开一项）。 */
-const liveRunSessionIds = computed(() => {
-  const set = new Set<string>()
-  for (const [sid, run] of runtimes) if (run.loading) set.add(sid)
-  return set
-})
-
-/**
- * 写入作用域：SSE 回调在**同步**执行期间，指向"这条事件所属的会话"。
- *
- * 为什么安全：JS 单线程 + Vue 的渲染是**异步**的 —— 同步块内设置、返回前复位，
- * 于是模板渲染**永远看不到**它（绝不可能渲染错会话）。
- * 换来的是：`onSSEMessage` 内部二十多处 `items.value…` 的写法**一行都不用改**，
- * 却会写进**正确的**会话 —— 这才是真正修掉串台的那一步。
- *
- * （前提：`onSSEMessage` 全程同步，内部没有 `await`。）
- */
-// ⚠️ 必须是 `shallowRef`（而不是普通变量）：`items` / `loading` 是 computed，
-// 而 computed **只追踪求值过程中读到的响应式数据** —— 普通变量读不到、也不会令其失效，
-// 于是 SSE 写回时 computed 会命中缓存、拿回**当前会话**的数组（作用域形同失效）。
-// 用 shallowRef 后它参与依赖追踪；又因为 withRun 在同一同步块内设置并复位，
-// 而 Vue 的渲染是**异步**的，净变化为零 —— 不会引起多余渲染。
-const writingRun = shallowRef<SessionRunState | null>(null)
-
-function withRun<T>(run: SessionRunState, fn: () => T): T {
-  const prev = writingRun.value
-  writingRun.value = run
-  try {
-    return fn()
-  } finally {
-    writingRun.value = prev
-  }
-}
-
-/** 读/写都优先走作用域：SSE 回写时指向事件所属会话，其余时刻就是当前视图的会话 */
-const loading = computed<boolean>({
-  get: () => (writingRun.value ?? currentRun.value).loading,
-  set: (v) => {
-    ;(writingRun.value ?? currentRun.value).loading = v
-  },
-})
-
-const items = computed<ChatItem[]>({
-  get: () => (writingRun.value ?? currentRun.value).items,
-  set: (v) => {
-    ;(writingRun.value ?? currentRun.value).items = v
-  },
-})
+// 多会话运行状态（runtimes / items / loading / withRun / streamState）见
+// `composables/useChatRunState.ts`。对外仍是 `items` / `loading`：既有 70+ 处读写不用改。
+const {
+  runtimes,
+  runOf,
+  currentRun,
+  liveRunSessionIds,
+  writingRun,
+  withRun,
+  loading,
+  items,
+  streamState,
+} = useChatRunState(() => activeSessionId.value)
 
 /**
  * 本次会话里 agent 写过的文件路径 —— 工作台「改动」页签的第二数据源。
@@ -2390,9 +2244,6 @@ const {
 // 多会话并行时，后台会话的事件仍会写进它自己的切片，不会污染当前视图的累积缓冲。
 // 读取一律经 `streamState()`：SSE 回调整段跑在 `withRun(...)` 的同步作用域内，
 // 因此它返回的正是"这条事件所属会话"的那一份。
-function streamState(): SessionRunState {
-  return writingRun.value ?? currentRun.value
-}
 
 function resetStreamState() {
   const st = streamState()
