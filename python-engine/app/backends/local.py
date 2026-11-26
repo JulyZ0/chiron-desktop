@@ -292,7 +292,10 @@ class LocalWorkspaceBackend:
             is_file = await asyncio.to_thread(target.is_file)
         except OSError:
             return None
-        return FileStat(path=str(target), size=info.st_size, is_file=is_file)
+        # G29：`mtime` 必须带出去 —— `grep_files` 的默认超上限策略与稳定顺序都以它为首要键。
+        return FileStat(
+            path=str(target), size=info.st_size, is_file=is_file, mtime=float(info.st_mtime)
+        )
 
     async def write(self, path: str, content: str) -> WriteResult:
         """原子覆盖写：先写同目录临时文件，再 `os.replace` 换上去。

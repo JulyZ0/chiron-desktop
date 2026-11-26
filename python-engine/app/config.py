@@ -653,6 +653,18 @@ class Settings(BaseSettings):
     # 与模型无关：窗口表查不到时按 `MAX_CONTEXT_TOKENS` 兜底。
     agent_token_window_ratio: float = 8.0
 
+    # ── grep 超上限策略（G29，`app/tools/core.py`）──
+    #
+    # 命中超过"一页装得下"的量时，**保留哪一批**是部署方的产品决策，不是实现细节：
+    #   ``head``（默认）= 按修改时间保留最新命中（改代码 / 看报错时要的就是这个）；
+    #   ``sample``      = 按顶层目录轮转抽样（通读陌生仓库时，避免第一个大目录吃光配额）。
+    # 修前没有这个选择：保留哪些完全取决于后端扫描顺序，trailer 也不说 —— 模型只能
+    # 换更窄的正则重搜。所以这里既要有默认值，也要能被覆盖；两种策略下全量命中都
+    # 写进既有 `result_store`（locator 在 trailer 里），并用 `offset` 续页取回。
+    # 运行时还可用 ``CHIRON_GREP_OVER_CAP`` 覆盖（现读环境变量，换策略不必重启）；
+    # 写了无法识别的值会**报错**而不是静默回落 —— 见 core 的 `resolve_grep_over_cap_policy`。
+    grep_over_cap: str = "head"
+
     # 为空则引擎不向 Redis 注册,网关回退静态 PYTHON_ENGINE_ADDRESS。
     engine_advertise_url: str = ""
 
