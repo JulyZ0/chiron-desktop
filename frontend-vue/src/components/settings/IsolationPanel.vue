@@ -26,11 +26,13 @@ import {
   clearIsolationLevel,
   getIsolationHelper,
   getIsolationStatus,
+  prepareContainerRuntime,
   probeIsolation,
   revokeIsolationArtifacts,
   setIsolationLevel,
   startIsolationHelper,
   stopIsolationHelper,
+  type IsolationContainerRuntime,
   type IsolationHelperStatus,
   type IsolationLevel,
   type IsolationStatus,
@@ -50,6 +52,13 @@ const status = ref<IsolationStatus | null>(null)
 const loadError = ref('')
 /** 待切换的档位（提交前先记下来，避免提交中状态抖回旧值） */
 const pendingLevel = ref<IsolationLevel | null>(null)
+/** 容器挡位的运行时快照（状态接口拼接，未支持平台也有可读原因）。 */
+const containerRuntime = computed<IsolationContainerRuntime | null>(
+  () => status.value?.container ?? null,
+)
+const preparingContainer = ref(false)
+/** 下载/安装提示（下载成功也是"还需要安装"，所以这里不是错误含义）。 */
+const containerHint = ref('')
 /**
  * 提权助手状态。
  *
@@ -75,7 +84,14 @@ const helperHint = ref('')
 const helperErrorTitle = ref('')
 
 /** 档位由弱到强，与后端 `_ORDER` 严格一致 */
-const ALL_LEVELS: IsolationLevel[] = ['none', 'job', 'low_il', 'restricted', 'appcontainer']
+const ALL_LEVELS: IsolationLevel[] = [
+  'none',
+  'job',
+  'low_il',
+  'restricted',
+  'appcontainer',
+  'container',
+]
 
 const currentEffective = computed(() => status.value?.effective ?? null)
 
@@ -221,6 +237,32 @@ async function withLocalAuth<T>(fn: () => Promise<T>): Promise<T> {
     const ready = await authStore.ensureLocalSession(true)
     if (!ready) throw err
     return await fn()
+  }
+}
+
+/**
+ * 按需下载容器运行时（Kiri）。**只下载 + 校验，不安装**：
+ * 返回里的 `install_hint` 才是需要管理员执行的命令；装好后点「复测」重新探测。
+ */
+async function prepareContainerRuntimePackage() {
+  if (preparingContainer.value) return
+  preparingContainer.value = true
+  containerHint.value = ''
+  try {
+    const next = await prepareContainerRuntime()
+    status.value = next
+    containerHint.value = next.prepare?.error || next.container?.install_hint || ''
+    if (next.prepare?.ok) {
+      message.success(t('settings.isolation_container_already_ready'))
+    } else if (next.prepare?.downloaded) {
+      message.info(t('settings.isolation_container_downloaded'))
+    } else {
+      message.error(next.prepare?.error || t('settings.isolation_container_download_failed'))
+    }
+  } catch (err) {
+    message.error(serverErrorMessage(err, t('settings.isolation_container_download_failed')))
+  } finally {
+    preparingContainer.value = false
   }
 }
 
@@ -610,6 +652,65 @@ onMounted(load)
             </p>
           </button>
         </div>
+
+        <!-- 容器挡位的运行时：不内置，缺的时候在这里按需下载（安装仍需管理员动作） -->
+        <div
+          v-if="containerRuntime"
+          class="iso-container"
+          data-testid="iso-container-runtime"
+        >
+          <div class="iso-container-head">
+            <span class="iso-container-title">{{ $t('settings.isolation_container_title') }}</span>
+            <a-tag :color="containerRuntime.installed ? 'green' : 'default'">
+              {{
+                containerRuntime.installed
+                  ? $t('settings.isolation_container_ready', { version: containerRuntime.version })
+                  : $t('settings.isolation_container_missing', { version: containerRuntime.version })
+              }}
+            </a-tag>
+          </div>
+          <p
+            v-if="containerRuntime.reason"
+            class="iso-container-reason"
+          >
+            {{ containerRuntime.reason }}
+          </p>
+          <p
+            v-else-if="containerRuntime.engine?.engine_version"
+            class="iso-container-reason"
+          >
+            {{
+              $t('settings.isolation_container_engine', {
+                version: containerRuntime.engine.engine_version,
+                platform: containerRuntime.platform,
+              })
+            }}
+          </p>
+          <div
+            v-if="!containerRuntime.installed && containerRuntime.supported"
+            class="iso-container-actions"
+          >
+            <a-button
+              size="small"
+              type="primary"
+              :loading="preparingContainer"
+              data-testid="iso-container-prepare"
+              @click="prepareContainerRuntimePackage"
+            >
+              {{ $t('settings.isolation_container_prepare') }}
+            </a-button>
+            <span
+              v-if="containerRuntime.asset"
+              class="iso-container-meta"
+            >
+              {{ containerRuntime.asset.name }} · SHA-256 {{ containerRuntime.asset.sha256.slice(0, 12) }}…
+            </span>
+          </div>
+          <pre
+            v-if="containerHint"
+            class="iso-container-hint"
+          >{{ containerHint }}</pre>
+        </div>
       </div>
 
       <!--
@@ -758,6 +859,15 @@ onMounted(load)
   color: var(--text-primary);
   margin-bottom: 10px;
 }
+/* 容器挡位运行时：状态 + 按需下载（安装命令用等宽块，方便直接复制）。 */
+.iso-container { margin-top: 16px; padding: 12px; border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-md); }
+.iso-container-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.iso-container-title { font-weight: var(--fw-medium); }
+.iso-container-reason { margin: 8px 0 0; font-size: 13px; line-height: 1.6; color: var(--text-secondary); }
+.iso-container-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.iso-container-meta { font-size: 12px; color: var(--text-tertiary); word-break: break-all; }
+.iso-container-hint { margin: 10px 0 0; padding: 8px 10px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; background: var(--bg-subtle); border-radius: var(--radius-sm); color: var(--text-secondary); }
+
 .iso-levels { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 
 /* 用原生 button 而不是 a-radio：每个档位要带两行说明，radio 的排版撑不开 */

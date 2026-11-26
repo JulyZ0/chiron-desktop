@@ -284,6 +284,17 @@ export default {
   isolation_level_appcontainer: "App container",
   isolation_level_appcontainer_desc:
     "Strongest tier: its own container identity, with file and network access granted per-capability. Requires administrator rights to provision the container profile; unavailable in some environments.",
+  isolation_level_container: "Container (Kiri)",
+  isolation_level_container_desc:
+    "Every command runs in a disposable container: own namespaces and cgroup, read-only root filesystem, no network, only the workspace mounted, default seccomp. The runtime (Kiri) is not bundled — download it below on demand. When it is missing, execution is refused rather than falling back.",
+  isolation_container_title: "Container runtime (Kiri)",
+  isolation_container_ready: "Ready · Kiri {version}",
+  isolation_container_missing: "Not installed · Kiri {version}",
+  isolation_container_engine: "Engine {version} · {platform}",
+  isolation_container_prepare: "Download runtime",
+  isolation_container_downloaded: "Downloaded and verified. Installing/enabling it needs the administrator command below.",
+  isolation_container_already_ready: "The runtime is ready.",
+  isolation_container_download_failed: "Failed to download the runtime.",
 
   isolation_reset: "Reset to configured value",
   isolation_reset_hint: "Only undoes the temporary switch made during this run. Nothing is written to the config file, so a restart restores it anyway.",

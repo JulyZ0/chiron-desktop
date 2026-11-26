@@ -1103,6 +1103,29 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
             if block_reason:
                 return {"error": f"command blocked: python code rejected — {block_reason}"}
 
+    # ── 容器挡位（H2）：命令已过逃逸/白名单/AST 检查，交给一次性容器执行 ──
+    #
+    # 判据用 `decision.requested` 而不是 `effective`：运行时切到 container 之后
+    # 若引擎/依赖丢失（effective 会退成 NONE），这里必须**拒跑**，不能顺着
+    # 往下走到本地执行 —— 那就是"以为有隔离，实际没有"。
+    from app.isolation import Level, resolve_level
+
+    _decision = resolve_level()
+    if _decision.requested is Level.CONTAINER:
+        if _decision.effective is not Level.CONTAINER:
+            return {
+                "error": "sandbox unavailable: container isolation requested but not available",
+                "reason": "; ".join(_decision.reasons) or "container runtime unavailable",
+            }
+        from app.isolation.container import exec_in_container
+
+        return await exec_in_container(
+            list(args),
+            workspace=str(workspace_dir()),
+            workdir=str(workspace_dir()),
+            timeout=timeout,
+        )
+
     # 对 git 命令额外限制：禁止 clone/fetch/pull/push 等网络操作，仅允许本地操作
     git_restricted = {"clone", "fetch", "pull", "push", "remote", "submodule", "archive", "ls-remote"}
     is_git = _normalize_exe(prog) == "git"
