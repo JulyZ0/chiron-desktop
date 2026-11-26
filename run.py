@@ -97,6 +97,25 @@ SERVICES = {
         # 可选组件：起不来只提示，不让 `run.py start` 整体失败
         "optional": True,
     },
+    "pageindex-worker": {
+        # 知识库索引执行器：消费 Redis Stream `engine:tasks:kb`，把原文交给 PageIndex
+        # 建索引并回写文档/库状态。
+        #
+        # **必须有这一项**：`pageindex-service` 只是检索 API（uvicorn），不消费队列；
+        # 只起它时 `GET /healthz` 的 worker_alive=false，build 前的真实探测会直接
+        # 503「索引执行器未运行」，或者任务在队列里堆到看门狗把库改成 error ——
+        # 表现就是「知识库能建、能传，一建索引就异常」。Electron 本地栈与
+        # docker-compose 都单独起了这个进程，只有 run.py 漏了。
+        #
+        # 没有监听端口：只按 PID 存活校验（no_port）。
+        "name": "PageIndex 索引执行器",
+        "port": 0,
+        "cmd": [""],  # 占位：真实命令在启动时用独立 venv 的解释器解析
+        "cwd": str(BASE_DIR / "pageindex-service"),
+        "env": {},
+        "optional": True,
+        "no_port": True,
+    },
     "python-engine": {
         "name": "Python AI 引擎",
         "port": 8000,
@@ -268,7 +287,7 @@ def _service_available(key: str, svc: dict) -> bool:
     `pageindex-service` 的 `SERVICES["cmd"]` 只是占位（真实解析依赖独立 venv），
     所以它不能走 `shutil.which(cmd[0])` —— 那会把"已装好 venv"判成"未安装"。
     """
-    if key == "pageindex-service":
+    if key in ("pageindex-service", "pageindex-worker"):
         return bool(pageindex_python())
     return shutil.which(svc["cmd"][0]) is not None
 
@@ -652,8 +671,9 @@ class ServiceManager:
         # 导致 python-engine 的 pydantic 校验拒绝启动）
         env.update({k: v for k, v in DEFAULT_ENV.items() if v})
 
-        if service_key == "pageindex-service":
-            # 检索服务本身用不到引擎那套变量，但需要内部令牌/模型/目录（见 _resolve_pageindex_env）
+        if service_key in ("pageindex-service", "pageindex-worker"):
+            # 两者用同一套环境（内部令牌/模型/目录/Redis/PG 都从 .env 档位来）：
+            # 检索 API 与索引 worker 读的是同一份配置，分开注入必然漂移。
             for key, value in _resolve_pageindex_env().items():
                 env.setdefault(key, value)
             port = _RUNTIME_PORTS.get("pageindex-service")
@@ -728,6 +748,12 @@ class ServiceManager:
         """
         svc = SERVICES[key]
         name = svc["name"]
+        if svc.get("no_port"):
+            # 无监听端口的常驻进程（索引 worker）：只能按 PID 存活校验。
+            pid = read_pid(key)
+            if not pid or not is_process_running(pid):
+                return False, f"{name}: 进程未运行（PID {pid or '-'}）"
+            return True, f"{name}: PID {pid} 存活（无端口）"
         if port is None:
             port = read_port(key) or svc["port"]
         pid = read_pid(key)
@@ -831,18 +857,27 @@ class ServiceManager:
                 print(f"  {name}: {gray('已跳过（缺少独立 venv：先跑 python run.py setup）')}")
                 return True
             cmd = pageindex_cmd()
+        elif key == "pageindex-worker":
+            if not pageindex_python():
+                print(f"  {name}: {gray('已跳过（缺少独立 venv：先跑 python run.py setup）')}")
+                return True
+            # 与检索 API 同一个解释器、同一个 cwd：worker 也 import pageindex SDK。
+            cmd = [pageindex_python(), "-u", "-m", "app.index_worker"]
         else:
             cmd = svc["cmd"]
 
         # 首选端口被占时换一个空闲端口。检索服务必须换（本机上 8100 常被别人占着），
         # 而引擎要拿这个**实际**端口拼 URL —— 所以端口要记进 _RUNTIME_PORTS。
+        # `no_port` 的常驻进程（索引 worker）不监听端口：跳过整套端口逻辑。
+        no_port = bool(svc.get("no_port"))
         port = svc["port"]
-        if svc.get("dynamic_port") and is_port_open(port):
-            preferred = port
-            port = find_free_port()
-            print(f"  {name}: {yellow(f'端口 {preferred} 已被占用，改用 {port}')}")
-        _RUNTIME_PORTS[key] = port
-        write_port(key, port)
+        if not no_port:
+            if svc.get("dynamic_port") and is_port_open(port):
+                preferred = port
+                port = find_free_port()
+                print(f"  {name}: {yellow(f'端口 {preferred} 已被占用，改用 {port}')}")
+            _RUNTIME_PORTS[key] = port
+            write_port(key, port)
 
         # uvicorn 的监听端口只能从命令行给（`PAGEINDEX_PORT` 只影响服务内部配置），
         # 少了这一句它会退回 uvicorn 默认的 8000 —— 正好与引擎撞车。
@@ -867,7 +902,7 @@ class ServiceManager:
             return True
 
         # 检查端口占用（换过号的端口是刚借到的，仍然有极小的竞态，所以照查）
-        if is_port_open(port):
+        if not no_port and is_port_open(port):
             print(f"  {name}: {yellow(f'端口 {port} 已被占用')}")
             return bool(svc.get("optional"))
 
@@ -909,6 +944,20 @@ class ServiceManager:
             )
 
         write_pid(key, proc.pid)
+
+        if no_port:
+            # 没有端口可等：给一个启动窗口，再只按"进程还活着"判定。
+            # worker 缺 Redis/PG 时会在导入或配置阶段立刻退出，这几秒足够把它抓出来；
+            # 等端口就绪的 20s 超时对无端口进程永远不成立。
+            for _ in range(4):
+                if proc.poll() is not None:
+                    print(f"  {name}: {red('启动失败（进程已退出）')} (退出码 {proc.returncode})")
+                    self._print_log_tail(key)
+                    remove_pid(key)
+                    return False
+                time.sleep(1)
+            print(f"  {name}: {green('已启动')} (PID {proc.pid}，无监听端口)")
+            return True
 
         # 等待端口就绪；子进程已退出（如依赖缺失/配置错误导致崩溃）时立即报错，避免空等
         for _ in range(20):
@@ -1074,27 +1123,36 @@ class ServiceManager:
 
         for key, svc in SERVICES.items():
             name = svc["name"]
+            no_port = bool(svc.get("no_port"))
             port = read_port(key) or svc["port"]
             pid = read_pid(key)
 
             # 可选服务未安装：既不是"运行中"也不是"已停止"，报"未安装"才准确
             # —— 否则用户会以为它该跑却没跑起来，去翻一个根本不存在的日志。
             if svc.get("optional") and not _service_available(key, svc):
-                hint = "可选（先跑 setup）" if key == "pageindex-service" else "可选"
-                print(f"{name:<20} {gray('未安装'):<12} {'-':<10} {port:<8} {gray(hint)}")
+                hint = "可选（先跑 setup）" if key in ("pageindex-service", "pageindex-worker") else "可选"
+                port_text = "-" if no_port else str(port)
+                print(f"{name:<20} {gray('未安装'):<12} {'-':<10} {port_text:<8} {gray(hint)}")
                 continue
 
             if pid and is_process_running(pid):
-                port_ok = is_port_open(port)
+                port_ok = (not no_port) and is_port_open(port)
                 status_text = green("运行中")
                 pid_text = str(pid)
-                port_text = green("监听中") if port_ok else yellow("未就绪")
+                if no_port:
+                    port_text = gray("-")
+                else:
+                    port_text = green("监听中") if port_ok else yellow("未就绪")
             else:
                 status_text = red("已停止")
                 pid_text = "-"
-                port_text = gray("未监听") if not is_port_open(port) else yellow("被占用")
+                if no_port:
+                    port_text = gray("-")
+                else:
+                    port_text = gray("未监听") if not is_port_open(port) else yellow("被占用")
 
-            print(f"{name:<20} {status_text:<12} {pid_text:<10} {port:<8} {port_text}")
+            port_display = "-" if no_port else port
+            print(f"{name:<20} {status_text:<12} {pid_text:<10} {port_display:<8} {port_text}")
 
         print()
 

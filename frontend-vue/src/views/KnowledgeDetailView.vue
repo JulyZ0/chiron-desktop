@@ -54,16 +54,23 @@ function kbErrorText(err: unknown, fallback: string): string {
   return fallback
 }
 
-// 库状态：disabled/indexing/ready/error（0023 迁移的取值集合）
+// 库状态：disabled/indexing/ready/error（worker 实际写入的四个，见
+// `python-engine/app/knowledge/status.py`）。**未知值按 error 处理**：
+// 直接拼 `knowledge.status_${status}` 会把 `knowledge.status_failed` 这种原始 key
+// 渲染给用户（locale 只有四个），既看不懂、又掩盖了"数据里出现了非约定状态"这件事。
+const KNOWN_KB_STATUSES = new Set(['disabled', 'indexing', 'ready', 'error'])
+
 function kbStatusColor(status?: string): string {
   if (status === 'ready') return 'green'
   if (status === 'indexing') return 'processing'
   if (status === 'error') return 'red'
+  if (status && !KNOWN_KB_STATUSES.has(status)) return 'red'
   return 'default'
 }
 
 function kbStatusLabel(status?: string): string {
-  return t(`knowledge.status_${status || 'disabled'}`)
+  const safe = status && KNOWN_KB_STATUSES.has(status) ? status : status ? 'error' : 'disabled'
+  return t(`knowledge.status_${safe}`)
 }
 
 /**
@@ -727,11 +734,14 @@ const retryingDocId = ref('')
 /** 失败文档（进度接口给出，不再从库级 error_message 反解析）。 */
 const failedDocuments = computed(() => indexStatus.value?.failed_documents ?? [])
 
-/** 进度卡片是否显示：有可执行的索引信息就显示（active 或 有失败）。 */
+/** 进度卡片是否显示：有可执行的索引信息就显示（active / 有失败 / 库级错误）。 */
 const showIndexCard = computed(() => {
   const st = indexStatus.value
   if (!st) return false
-  return st.active || st.failed > 0 || st.pending > 0
+  // 库级 error 且所有文档都已是终态时，failed/pending 都是 0 —— 只看这两个数
+  // 会让"索引彻底失败"的库连进度卡片都不出现，用户只看到一个「异常」标签，
+  // 看不到 error_message 里的真实原因（worker 写的 column/模型/心跳原因全在里面）。
+  return st.active || st.failed > 0 || st.pending > 0 || st.status === 'error' || !!st.error_message
 })
 
 // ── `?doc=` 定位（引用可点回这里） ──
@@ -1002,6 +1012,15 @@ function formatSize(bytes: number): string {
             <span v-if="(indexStatus?.indexing ?? 0) > 0">{{ $t('knowledge.status_indexing') }} {{ indexStatus?.indexing }}</span>
             <span v-if="(indexStatus?.pending ?? 0) > 0">{{ $t('common.pending') }} {{ indexStatus?.pending }}</span>
             <span v-if="(indexStatus?.failed ?? 0) > 0" class="index-failed-count">{{ $t('errors.failed') }} {{ indexStatus?.failed }}</span>
+          </div>
+          <!-- 库级失败原因：失败发生在库级（读不到列 / 模型未配置 / worker 无心跳）时
+               没有 failed_documents 行，原因只在这里 —— 不显示等于只给用户「异常」两个字。 -->
+          <div
+            v-if="indexStatus?.error_message"
+            class="index-error-banner"
+            data-testid="kb-index-error"
+          >
+            <strong>{{ $t('knowledge.status_error') }}</strong>：{{ indexStatus.error_message }}
           </div>
           <!-- 失败原因逐条列出：只给"异常"两个字，用户没法判断是重试还是换文件 -->
           <div
@@ -1473,6 +1492,8 @@ function formatSize(bytes: number): string {
 /* ── 索引进度卡片 ── */
 .index-summary { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 8px; font-size: 13px; color: var(--text-secondary); }
 .index-failed-count { color: var(--error); }
+/* 库级失败原因：与逐文档失败区分开（整库失败时没有逐条行可展示）。 */
+.index-error-banner { margin-top: 10px; padding: 8px 10px; font-size: 13px; line-height: 1.5; color: var(--error); background: var(--error-bg); border-radius: var(--radius-sm); word-break: break-word; }
 .index-failures { margin-top: 12px; padding-top: 12px; border-top: var(--hairline-width) solid var(--border-card); }
 .index-failures-title { font-size: 13px; font-weight: var(--fw-medium); color: var(--text-primary); margin-bottom: 6px; }
 .index-failures ul { margin: 0 0 10px; padding-inline-start: 18px; font-size: 13px; color: var(--text-secondary); }
