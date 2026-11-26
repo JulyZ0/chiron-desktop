@@ -290,6 +290,24 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
 11. **a11y 自动化**：引入 axe（组件测试或 E2E 之一），先覆盖聊天区、工具卡、审批弹窗、设置页。
 12. **工作台扩展（产品级）**：内嵌终端 → Git 面板 → 浏览器预览，按用户价值排序，不一次性追 ZCode 的 23 tab。
 
+### 4.1 落地状态（2026-11-26）
+
+| 项 | 状态 | 证据 / 说明 |
+|---|---|---|
+| P0-2 流式浮现 | ✅ 已合入 `2ee68f5` | 只给本批新增字符建 span（prefix 纯文本），取消 2000 字总量上限；动画改纯 opacity；5+1 项测试 |
+| P0-1 状态抽离（三刀） | ✅ 已合入 `05c9011`/`4b8cca3`/`931b1d0` | 身份与项目归属 → `chatSession` store；多会话运行时 → `useChatRunState`；增量文本投影 → `useChatStreamText`。ChatView 4403 → **4143 行**，新增 15 项脱离视图的单测 |
+| P0-1 收尾（onSSEMessage 分发） | ⏳ 未做 | 它依赖审批/路由/工作台十余个局部状态；剩余约 250 行，需要先定义事件投影上下文。**这是下一步唯一的大块** |
+| P0-3 工具卡注册表/惰性详情/统一摘要 | ✅ 基本已具备 | 摘要单一来源 `utils/toolFamily.ts`；`ToolCallCard` 用 `v-if` 惰性详情；`ToolResultBlock` 已按类型分流。剩余只是"按工具名注册 renderer"的扩展性优化 |
+| P0-4 testid + 桌面 E2E | ⏸ 按决定不做 | 仓库无 Playwright/WDIO；上 E2E 需要先定工具链 |
+| P1-1 工具调度元数据 | ✅ 已合入 `eda07be` | `ToolDef.destructive` + `is_parallel_safe`；破坏性动作一票否决并发；2 项测试 |
+| P1-2 取消补齐 provider 历史 | ✅ 已具备（复核） | 挂起路径写 `not_executed`、取消路径返回 cancelled 结果；`test_interaction_suspend.py` / `test_cancel_propagation.py` 已覆盖 tool_calls 与 tool 消息配对 |
+| P1-3 guide vs queue | ✅ guide 语义已具备；queue 不加 | Chiron 的 steer 在每个模型步开头 drain（即 ZCode 的 guide）；`queue`（无活跃回合时入队等下一轮）与当前"没有活跃 run 即拒绝"的 fail-closed 准入冲突，需产品决策，不擅自放宽 |
+| P1-4 压缩回读 + 熔断 | ✅ 已合入 `eda07be` | 3 次过快压缩暂停自动压缩（手动 /compact 重置）；最近 5 个 `read_file` 结果压缩后以 `[recent-files]` 回读；6 项测试 |
+| P2 字号硬约束 | ⏸ 暂缓 | 现有 `font-size` 声明 995 处、裸 px 666 处；现在加棘轮基线会是 600+ 条噪音，建议先按文件分批迁移再上闸 |
+| P2 快捷键单一事实源 / a11y 自动化 / 工作台扩展 | ⏳ 未做 | 分别属于"统一注册表改造""引入 axe 依赖决策""产品级投入"，排在 P0-1 收尾之后 |
+
+**下一步**：P0-1 收尾（事件投影上下文 + 分发抽离）是唯一剩下的结构性大块；P2 三项需要先做工具链/产品决策。
+
 ## 5. 不建议照搬
 
 1. **多进程/多端 V4 协议栈**：ZCode 为桌面/Web/手机远控/远程 Source Server 服务；Chiron 的团队形态是"中心服务 +
