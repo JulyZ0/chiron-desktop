@@ -296,7 +296,7 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
 |---|---|---|
 | P0-2 流式浮现 | ✅ 已合入 `2ee68f5` | 只给本批新增字符建 span（prefix 纯文本），取消 2000 字总量上限；动画改纯 opacity；5+1 项测试 |
 | P0-1 状态抽离（三刀） | ✅ 已合入 `05c9011`/`4b8cca3`/`931b1d0` | 身份与项目归属 → `chatSession` store；多会话运行时 → `useChatRunState`；增量文本投影 → `useChatStreamText`。ChatView 4403 → **4143 行**，新增 15 项脱离视图的单测 |
-| P0-1 收尾（onSSEMessage 分发） | ⏳ 未做 | 它依赖审批/路由/工作台十余个局部状态；剩余约 250 行，需要先定义事件投影上下文。**这是下一步唯一的大块** |
+| P0-1 收尾（onSSEMessage 分发） | ◐ 部分完成 `66d1336` | 工具调用/结果、清单、完成判定、用量、steer 六类纯投影已抽到 `sseProjection.ts`（6 项测试）；审批/子 Agent/路由/工作台仍依赖局部状态，留在视图。ChatView **4106 行** |
 | P0-3 工具卡注册表/惰性详情/统一摘要 | ✅ 基本已具备 | 摘要单一来源 `utils/toolFamily.ts`；`ToolCallCard` 用 `v-if` 惰性详情；`ToolResultBlock` 已按类型分流。剩余只是"按工具名注册 renderer"的扩展性优化 |
 | P0-4 testid + 桌面 E2E | ⏸ 按决定不做 | 仓库无 Playwright/WDIO；上 E2E 需要先定工具链 |
 | P1-1 工具调度元数据 | ✅ 已合入 `eda07be` | `ToolDef.destructive` + `is_parallel_safe`；破坏性动作一票否决并发；2 项测试 |
