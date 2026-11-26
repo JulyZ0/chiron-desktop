@@ -145,7 +145,9 @@ class SkillBackend:
             info = target.stat()
         except OSError:
             return None
-        return FileStat(path=str(target), size=info.st_size, is_file=True)
+        return FileStat(
+            path=str(target), size=info.st_size, is_file=True, mtime=float(info.st_mtime)
+        )
 
     async def ls(self, path: str = ".") -> LsResult:
         rel = _norm(path)

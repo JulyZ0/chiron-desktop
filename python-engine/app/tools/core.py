@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -46,6 +47,26 @@ GREP_MAX_LINE_CHARS = 240
 
 #: grep 单次返回的总字节预算。命中的是**线索**，不是正文。
 GREP_MAX_BYTES = 48 * 1024
+
+#: grep 一次调用最多**扫描并收集**多少条命中（G29）。
+#:
+#: 为什么把它和 `max_results` 拆开：修前两者是同一个数，于是"一次交付多少条"顺手
+#: 决定了"一次扫描多少条" —— 想翻页看到第 201 条命中时，唯一的办法是把
+#: `max_results` 调大，等于让每一页都重新按上限重扫、重算。收集上限独立之后，
+#: `max_results` 只回答"这一页给几条"，`offset` 才有意义。
+#:
+#: 撞上这条上限时**必须说出来**（`scan_truncated` + trailer）：它是资源边界，
+#: 不是"搜索结果就这么多"。
+GREP_COLLECT_MAX_HITS = 2000
+
+#: 超上限策略的环境变量名（部署方显式选择，见 :func:`resolve_grep_over_cap_policy`）。
+GREP_OVER_CAP_ENV = "CHIRON_GREP_OVER_CAP"
+
+#: 合法策略：``head`` = 按修改时间保留最新命中；``sample`` = 按顶层目录均匀抽样。
+GREP_OVER_CAP_POLICIES: tuple[str, ...] = ("head", "sample")
+
+#: 缺省策略。选 ``head`` 是因为最常见的超上限场景是"改代码/看报错"——那要的是**最新**的。
+GREP_OVER_CAP_DEFAULT = "head"
 
 #: `outline` 按扩展名取"结构行"的正则。
 #:
@@ -293,56 +314,274 @@ async def execute_command(command: str, timeout: int = 30) -> dict[str, Any]:
     return await run_in_sandbox(command, timeout=timeout)
 
 
+def resolve_grep_over_cap_policy() -> tuple[str, str]:
+    """取 grep 的超上限策略，返回 ``(策略, 错误说明)``。
+
+    解析顺序：``CHIRON_GREP_OVER_CAP`` 环境变量（**每次调用现读**，换策略不必重启引擎）
+    → Settings 的 ``grep_over_cap`` 字段（``GREP_OVER_CAP`` 环境变量，启动时读一次）
+    → ``head``。
+
+    非法值返回 ``("", 说明)`` 而**不回落**：回落会让部署方以为自己换了抽样策略，
+    实际仍在按修改时间取头部，而这种偏差不会出现在任何日志里 —— G29 要消灭的正是
+    "超上限时悄悄替你决定"。
+    """
+    raw = (os.environ.get(GREP_OVER_CAP_ENV) or "").strip().lower()
+    if not raw:
+        try:
+            from app.config import settings
+
+            raw = str(getattr(settings, "grep_over_cap", "") or "").strip().lower()
+        except Exception:  # noqa: BLE001 - 配置模块不可用不是拒绝搜索的理由
+            raw = ""
+    if not raw:
+        return GREP_OVER_CAP_DEFAULT, ""
+    if raw not in GREP_OVER_CAP_POLICIES:
+        return "", (
+            f"invalid grep over-cap policy '{raw}' (from {GREP_OVER_CAP_ENV} / grep_over_cap); "
+            f"choose one of: {', '.join(GREP_OVER_CAP_POLICIES)}"
+        )
+    return raw, ""
+
+
+def _grep_failure(message: str) -> dict[str, Any]:
+    """统一的失败形状。
+
+    为什么失败结果也要带分页字段：翻页调用方（`while not eof: offset = next_offset`）
+    遇到缺键的字典会变成 `KeyError` 或"这一页到底结束了没有"无从判断 —— 一条本来
+    很清楚的 `error` 会被解读成工具坏了。
+    """
+    return {
+        "error": message,
+        "count": 0,
+        "matches": [],
+        "offset": 0,
+        "next_offset": 0,
+        "eof": True,
+        "total": 0,
+    }
+
+
+def _top_level_group(path: str, root: str) -> str:
+    """命中路径的**顶层目录**（相对 `root`）；直接躺在根目录下的文件归到空串。"""
+    norm = path.replace("\\", "/")
+    base = (root or ".").replace("\\", "/").rstrip("/")
+    if base and base != "." and norm.startswith(base + "/"):
+        norm = norm[len(base) + 1 :]
+    parts = [piece for piece in norm.split("/") if piece]
+    return parts[0] if len(parts) > 1 else ""
+
+
+def _canonical_hits(
+    pool: list[tuple[str, int, str]], mtimes: dict[str, float]
+) -> list[tuple[str, int, str]]:
+    """稳定顺序：**修改时间降序 → 路径升序 → 行号升序**。
+
+    为什么把 mtime 放在首位：默认超上限策略是"保留最新命中"，若展示顺序按路径、
+    而保留逻辑按时间，页内与翻页就是两套顺序，`offset` 拼接必然错位。顺序只有一份。
+    后端没有 mtime（全为 ``0.0``）时这一键恒等，自然退化为路径序。
+    """
+    return sorted(pool, key=lambda hit: (-mtimes.get(hit[0], 0.0), hit[0], hit[1]))
+
+
+def _sample_hits(
+    hits: list[tuple[str, int, str]], root: str
+) -> list[tuple[str, int, str]]:
+    """`sample` 策略的顺序：按顶层目录**轮转**，每轮每个目录取一条。
+
+    为什么不是"均匀丢弃"：交付顺序在这里就是**优先级** —— 第一页给出"每个目录的
+    代表"，后面各轮继续补齐。这样既不丢命中（全集仍可续页取回），又不会让第一个
+    大目录吃光整个配额（`head` 在刚 clone 的仓库上就退化成这个毛病：所有文件 mtime
+    几乎相同）。
+
+    输入已按稳定顺序排好 ⇒ 同目录内相对次序不变 ⇒ 输出确定，分页拼得回去。
+    """
+    buckets: dict[str, list[tuple[str, int, str]]] = {}
+    for hit in hits:
+        buckets.setdefault(_top_level_group(hit[0], root), []).append(hit)
+    order = sorted(buckets)
+    out: list[tuple[str, int, str]] = []
+    round_index = 0
+    while True:
+        added = False
+        for key in order:
+            bucket = buckets[key]
+            if round_index < len(bucket):
+                out.append(bucket[round_index])
+                added = True
+        if not added:
+            return out
+        round_index += 1
+
+
+def _order_hits(
+    pool: list[tuple[str, int, str]],
+    *,
+    root: str,
+    policy: str,
+    mtimes: dict[str, float],
+) -> list[tuple[str, int, str]]:
+    """按策略给出**交付顺序**（分页与 `offset` 都在这个顺序上进行）。"""
+    ordered = _canonical_hits(pool, mtimes)
+    if policy == "sample":
+        return _sample_hits(ordered, root)
+    return ordered
+
+
+def _slice_page(
+    hits: list[tuple[str, int, str]], *, start: int, max_results: int
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """切一页：``[start, start+max_results)``，再按字节预算截尾。
+
+    返回 ``(页内命中, next_offset, 是否被字节预算截断)``。`next_offset` 按**实际
+    返回条数**推进 —— 按请求的 `max_results` 推进会静默跳过被预算砍掉的页尾，
+    这正是 `read_file` 分页踩过的同一个坑。
+    """
+    page: list[dict[str, Any]] = []
+    used = 0
+    budget_hit = False
+    index = start
+    end = min(len(hits), start + max_results)
+    while index < end:
+        path_, line_no, line = hits[index]
+        text = _clip_line(line, GREP_MAX_LINE_CHARS)
+        cost = len(text.encode("utf-8")) + 1
+        if page and used + cost > GREP_MAX_BYTES:
+            budget_hit = True
+            break
+        page.append({"path": path_, "line": line_no, "text": text})
+        used += cost
+        index += 1
+    return page, index, budget_hit
+
+
+async def _stat_mtimes(backend: Any, paths: list[str], known: dict[str, float]) -> None:
+    """补全每个命中文件的修改时间（已由 glob 路径填过的跳过）。"""
+    for path_ in paths:
+        if path_ in known:
+            continue
+        info = None
+        try:
+            info = await backend.stat(path_)
+        except Exception as exc:  # noqa: BLE001 - 元信息拿不到不该让整次搜索失败
+            logger.debug("Cannot stat %s for grep order: %s", path_, exc)
+        known[path_] = float(getattr(info, "mtime", 0.0) or 0.0) if info is not None else 0.0
+
+
+async def _store_full_hits(hits: list[tuple[str, int, str]], *, session_id: str) -> str:
+    """把**全量**命中（稳定顺序）写进既有 `result_store`，返回 locator；失败返回 ``""``。
+
+    为什么不另造存储：`read_tool_result` 已经是"大结果取回"的唯一通道，再开一条
+    就必然漂移（与 `app/tools/spill.py` 的同一条理由）。行格式与 `matches` 逐字一致
+    （path/line/text），模型不必学第二种形状。
+    """
+    body = "\n".join(
+        json.dumps(
+            {"path": path_, "line": line_no, "text": _clip_line(line, GREP_MAX_LINE_CHARS)},
+            ensure_ascii=False,
+        )
+        for path_, line_no, line in hits
+    )
+    try:
+        from app.agent import result_store
+        from app.tools.spill import new_result_ref
+
+        ref = new_result_ref()
+        if await result_store.store(session_id, ref, body):
+            return ref
+        logger.warning("grep over-cap spill skipped (result store unavailable)")
+    except Exception as exc:  # noqa: BLE001 - 落盘是旁路，存不下也要让调用方拿到这一页
+        logger.warning("grep over-cap spill failed: %s", exc)
+    return ""
+
+
 async def grep_files(
-    query: str, root: str = ".", glob: str = "", max_results: int = 200
+    query: str,
+    root: str = ".",
+    glob: str = "",
+    max_results: int = 200,
+    offset: int = 0,
 ) -> dict[str, Any]:
-    """按正则搜索文件内容（批 B：匹配与读取都经后端）。
+    """按正则搜索文件内容（批 B：匹配与读取都经后端；G29：显式超上限契约 + 分页）。
 
-    R1：匹配下沉到**后端的流式 grep**，不再逐文件 `read(limit=0)` 读全文。
+    R1（既有）：匹配下沉到**后端的流式 grep**，不再逐文件 `read(limit=0)` 读全文。
 
-    此前这里是"glob 拿文件列表 → 对每个文件读完整内容 → 逐行匹配"，于是大仓库
-    一次搜索的内存开销按**仓库总字节**走，而产出只是一小把行号。后端本来就有
-    `grep`（逐行读，驻留内存只有当前行），却一直没被调用 —— 工具层自己抄了一份
-    全文读取的实现。
+    G29 ① 超上限契约 —— 修前"保留哪些命中"根本没有契约：
 
-    两条路径都保持原有语义（`max_results` 截断点、命中行裁剪、字节预算）：
+    * 修前：后端按路径序流式扫描，凑满 `max_results` 停；工具层再按同一顺序截字节
+      预算。trailer 只写 "result limit reached (N hits)"，**不说保留的是哪一批**。
+      于是模型既不知道被丢掉的命中里有没有自己要找的，也没有通道把它们取回来，
+      只能换一个更窄的正则重搜（把一个"翻页"问题变成"反复重试"问题）。
+    * 现在：交付顺序由**显式策略**决定（部署方必须选；非法值报错，见
+      :func:`resolve_grep_over_cap_policy`）：
 
-    - 无 `glob` 限定：一次 `backend.grep(root)`，后端只遍历一遍。
-    - 有 `glob` 限定：先按名筛出候选，再对每个候选走同一套流式匹配 ——
-      仍然是流式，只是分多次调用，不退回全文读取。
+      - ``head``（默认）：按**修改时间**降序 —— 先给最新命中，trailer 明写
+        "按修改时间保留前 N 条"；
+      - ``sample``：按**顶层目录**轮转抽样 —— 先给每个目录的代表，避免第一个大
+        目录吃光配额（通读陌生仓库时这才是想要的批次）。
+
+      两种策略都**不丢信息**：全集按同一顺序可用 `offset` 续页取回，同一份全量
+      还写进既有 `result_store`（locator 在 trailer 里），两条通道互为兜底。
+
+    G29 ② 分页 —— 修前没有任何续页参数：
+
+    * 稳定顺序**唯一**：修改时间降序 → 路径升序 → 行号升序（后端给不出 mtime 时
+      退化为路径序，并如实写明）。页只是这个顺序上的窗口 ⇒ 两页拼接逐条等于全集。
+    * `offset` 是**命中序号**（0 基），不是行号也不是文件序号；越界归一到末尾，
+      负值按 0 处理。`next_offset` 按实际返回条数推进（字节预算会砍掉页尾）。
+
+    参数语义与修前对齐：`max_results` = **每页**最多多少条（默认 200），所以不传
+    `offset` 的既有调用方拿到的仍是第一页。
+
+    两条收集路径（有/无 `glob`）产出同一种三元组，后面的排序、分页、裁剪只写一遍。
     """
     from app.backends.context import get_backend
+    from app.tools.context import get_session_id
 
     try:
         # 只做一次语法校验：真正的匹配在后端内进行（逐行流式）。
         # 无效正则若留到后端才暴露，会变成"每个候选文件各报一次错"。
         re.compile(query)
     except re.error as exc:
-        return {"error": f"invalid pattern: {exc}", "count": 0, "matches": []}
+        return _grep_failure(f"invalid pattern: {exc}")
+
+    policy, policy_error = resolve_grep_over_cap_policy()
+    if policy_error:
+        return _grep_failure(policy_error)
+
+    try:
+        start = max(0, int(offset))
+    except (TypeError, ValueError):
+        return _grep_failure(f"offset must be an integer, got {offset!r}")
+
+    # 页大小至少 1：`max_results=0` 的调用方（历史遗留）不该拿到一页空白。
+    page_size = max(1, int(max_results))
 
     backend = get_backend()
     # 命中三元组 (path, line_number, line) —— 与 GrepMatch 字段一一对应，
-    # 两条路径产出同一种形状，后面的裁剪逻辑因此只需写一遍。
+    # 两条路径产出同一种形状，后面的排序/分页/裁剪因此只需写一遍。
     pool: list[tuple[str, int, str]] = []
-    backend_cut = False
+    mtimes: dict[str, float] = {}
+    scan_truncated = False
 
     if not glob:
-        found = await backend.grep(query, path=root or ".", max_results=max_results)
+        found = await backend.grep(query, path=root or ".", max_results=GREP_COLLECT_MAX_HITS)
         if found.error:
-            return {"error": found.error, "count": 0, "matches": []}
+            return _grep_failure(found.error)
         pool = [(m.path, m.line_number, m.line) for m in found.matches]
-        backend_cut = found.truncated
+        scan_truncated = found.truncated
     else:
         globbed = await backend.glob(f"**/{glob}", path=root or ".")
         if globbed.error:
-            return {"error": globbed.error, "count": 0, "matches": []}
+            return _grep_failure(globbed.error)
         for candidate in globbed.paths:
             info = await backend.stat(candidate)
             if info is None or not info.is_file:
                 continue
-            remaining = max_results - len(pool)
+            # glob 路径本来就要 stat 一次：顺手记下 mtime，排序时不必再问一遍。
+            mtimes[candidate] = float(getattr(info, "mtime", 0.0) or 0.0)
+            remaining = GREP_COLLECT_MAX_HITS - len(pool)
             if remaining <= 0:
-                backend_cut = True
+                scan_truncated = True
                 break
             one = await backend.grep(query, path=candidate, max_results=remaining)
             if one.error:
@@ -350,47 +589,85 @@ async def grep_files(
                 continue
             pool.extend((m.path, m.line_number, m.line) for m in one.matches)
             if one.truncated:
-                backend_cut = True
+                scan_truncated = True
 
-    # **命中行按预算裁剪**（`GREP_MAX_LINE_CHARS` / `GREP_MAX_BYTES`）。定位类工具的产出
-    # 是"线索"，不是"正文"：一次命中 200 行、每行都是压缩过的长行时，不裁剪的 grep
-    # 结果本身就够把上下文撑爆 —— 而模型真正要的只是"哪个文件第几行匹配到了"。
-    # 需要细节时用 `read_file` 带着 offset 去读那个位置。
-    matches: list[dict[str, Any]] = []
-    used = 0
-    budget_hit = False
-    for path_, line_no, line in pool:
-        text = _clip_line(line, GREP_MAX_LINE_CHARS)
-        cost = len(text.encode("utf-8")) + 1
-        if matches and used + cost > GREP_MAX_BYTES:
-            budget_hit = True
-            break
-        matches.append({"path": path_, "line": line_no, "text": text})
-        used += cost
-        if len(matches) >= max_results:
-            return {"count": len(matches), "matches": matches}
+    await _stat_mtimes(backend, [path_ for path_, _line, _text in pool], mtimes)
+    mtime_available = any(value > 0.0 for value in mtimes.values())
 
+    ordered = _order_hits(pool, root=root or ".", policy=policy, mtimes=mtimes)
+    total = len(ordered)
+    start = min(start, total)  # 越界 offset 归一到末尾，不回绕（见 docstring）
+
+    page, next_offset, budget_hit = _slice_page(
+        ordered, start=start, max_results=page_size
+    )
+    eof = next_offset >= total
+    over_cap = total > page_size
+
+    result: dict[str, Any] = {
+        "count": len(page),
+        "matches": page,
+        "offset": start,
+        "next_offset": next_offset,
+        "eof": eof,
+        "total": total,
+    }
+    if scan_truncated:
+        result["scan_truncated"] = True
+
+    clauses: list[str] = []
+    if over_cap:
+        ref = await _store_full_hits(ordered, session_id=get_session_id())
+        result["over_cap"] = {
+            "policy": policy,
+            "total": total,
+            "page": len(page),
+            # `mtime_available=False` ⇒ 顺序实际是路径序。契约不能承诺后端给不出的
+            # 东西，否则模型会把路径序当时间序推理（"改最近的三个文件"）。
+            "mtime_available": mtime_available,
+            "result_ref": ref,
+            "stored": bool(ref),
+        }
+        if start == 0:
+            if policy == "sample":
+                kept = f"按顶层目录均匀抽样保留前 {len(page)} 条"
+            elif mtime_available:
+                kept = f"按修改时间保留前 {len(page)} 条"
+            else:
+                kept = f"按路径序保留前 {len(page)} 条（后端未提供修改时间）"
+            clauses.append(f"命中 {total} 条超过单次上限 {page_size} 条：{kept}")
+        else:
+            clauses.append(
+                f"命中 {total} 条超过单次上限 {page_size} 条：按同一顺序续页"
+                f"（offset={start}，本页 {len(page)} 条）"
+            )
+        if ref:
+            clauses.append(
+                f'全量 {total} 条已落盘 result_ref="{ref}"；需要完整清单时用 '
+                f'read_tool_result(result_ref="{ref}", offset=0, limit=8000) 取回'
+            )
+        else:
+            clauses.append(
+                f"全量 {total} 条未能落盘（结果存储不可用）；按同一顺序用 offset= 续页取回"
+            )
+
+    if scan_truncated:
+        clauses.append(
+            f"扫描在 {GREP_COLLECT_MAX_HITS} 条命中处停止（扫描上限），可能还有更多命中；"
+            "缩小 root/glob 再搜"
+        )
     if budget_hit:
-        return {
-            "count": len(matches),
-            "matches": matches,
-            "truncated": True,
-            "note": (
-                f"byte budget reached ({GREP_MAX_BYTES} bytes); "
-                "narrow the pattern or pass a smaller `root`/`glob` for the rest"
-            ),
-        }
-    if backend_cut:
-        return {
-            "count": len(matches),
-            "matches": matches,
-            "truncated": True,
-            "note": (
-                f"result limit reached ({max_results} hits); "
-                "narrow the pattern or pass a smaller `root`/`glob` for the rest"
-            ),
-        }
-    return {"count": len(matches), "matches": matches}
+        clauses.append(
+            f"byte budget reached ({GREP_MAX_BYTES} bytes); pass offset={next_offset} to continue"
+        )
+    elif not eof:
+        clauses.append(f"more hits on the next page; pass offset={next_offset} to continue")
+
+    if over_cap or scan_truncated or budget_hit or not eof:
+        result["truncated"] = True
+    if clauses:
+        result["note"] = "; ".join(clauses)
+    return result
 
 
 async def search_files(
@@ -602,8 +879,15 @@ registry.register(
         "already know where something lives** — locating first and then reading a window costs "
         "a fraction of the tokens of opening files to find out. Returns `path`/`line`/`text` per "
         "match with match lines clipped to a byte budget; treat it as an index, then call "
-        "`read_file` with `offset` to read the surrounding code. Narrow with `glob`/`root` "
-        "instead of raising `max_results` when the hit list is too long."
+        "`read_file` with `offset` to read the surrounding code.\n"
+        "**Paging**: hits come in one stable order (newest file first, then path, then line). "
+        "Each page reports `offset`, `next_offset`, `eof` and `total`; when `eof` is false, call "
+        "again with `offset=next_offset` — the pages concatenate to the full hit list, so you "
+        "never have to invent a narrower regex just to see the rest.\n"
+        "**Over the cap**: the order is an explicit deployment policy (default keeps the most "
+        "recently modified hits; a repo-wide sampling policy is also available). When hits "
+        "exceed what one page can carry, the trailer says which policy was applied and gives a "
+        "`result_ref` locator for the complete list (`read_tool_result`)."
     ),
     parameters={
         "type": "object",
@@ -611,7 +895,15 @@ registry.register(
             "query": {"type": "string", "description": "Regular expression to match against each line"},
             "root": {"type": "string", "default": ".", "description": "Directory to search under (relative to the workspace)"},
             "glob": {"type": "string", "default": "", "description": "Only scan files matching this glob (e.g. '*.py')"},
-            "max_results": {"type": "integer", "default": 200, "description": "Stop after this many matches"},
+            "max_results": {"type": "integer", "default": 200, "description": "Max matches returned per page (default 200)"},
+            "offset": {
+                "type": "integer",
+                "default": 0,
+                "description": (
+                    "Hit index to start from (0-based, in the documented stable order). "
+                    "Pass the `next_offset` of the previous page to continue."
+                ),
+            },
         },
         "required": ["query"],
     },

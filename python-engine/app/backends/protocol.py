@@ -49,11 +49,17 @@ class ReadBytesResult:
 
 @dataclass(frozen=True)
 class FileStat:
-    """文件元信息（`glob` 结果只给路径，大小需要单独问）。"""
+    """文件元信息（`glob` 结果只给路径，大小需要单独问）。
+
+    ``mtime``（G29）：修改时间，Unix 秒。`grep_files` 的默认超上限策略是"保留最新命中"，
+    顺序契约也以它为首要键 —— 后端不提供时留 ``0.0``，调用方据此**退化为路径序**
+    并如实说明（见 `app/tools/core.py`），而不是把 0 当成"1970 年最新"。
+    """
 
     path: str
     size: int = 0
     is_file: bool = True
+    mtime: float = 0.0
 
 
 @dataclass(frozen=True)
