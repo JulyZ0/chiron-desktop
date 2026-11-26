@@ -306,7 +306,8 @@ async def exec_in_container(
     失败/超时返回 `{"error": ...}`（`error="timeout"` 与本地路径同口径）。
     **引擎不可用时直接拒跑**，绝不回退。
     """
-    live = kiri.probe(force=True)
+    # 探测是同步 socket 调用：放到线程里，别堵住引擎事件循环（流式对话正在跑）。
+    live = await asyncio.to_thread(kiri.probe, force=True)
     if live is None:
         return {"error": kiri.failure_message()}
     sock = str(live.get("socket") or kiri.socket_path())
