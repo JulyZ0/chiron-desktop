@@ -870,14 +870,7 @@ class SubAgentRunner:
         # G19：返回指引在**任务之后** —— 它讲的是"这一轮怎么收尾"，放在开头会和任务抢注意力。
         child.content = f"{child.content}\n\n{RETURN_GUIDANCE}"
 
-        # ── G19：把这条子 run 登记进 steer 注册表 ──
-        # 父 Agent / 界面按 run_id 追加指令时，才能解析出合成子会话并写入它的既有队列
-        # （子 Agent 每轮开头 `drain_steer(task.session_id)` 取走）。收尾统一在 finally 注销。
-        register_child_run(
-            run_id,
-            child_session_id=child.session_id or "",
-            parent_agent_id=self._parent_session_id,
-        )
+        # （G19 的 steer 登记在下面的 `try` 内、执行之前完成；注销在 finally。）
 
         # M15a：父 run 标识**必须在落库之前**算出来。它此前只在这里的下方算一次、只喂给
         # 事件与运行期缓存，`start_run` 没收到它 ⇒ `subagent_runs.parent_run_id` 对所有
@@ -1037,6 +1030,15 @@ class SubAgentRunner:
         try:
             slot_release = await self._acquire_write_slot(
                 spec, run_id=run_id, child_depth=child_depth
+            )
+            # ── G19：把这条子 run 登记进 steer 注册表 ──
+            # 父 Agent / 界面按 run_id 追加指令时，才能解析出合成子会话并写入它的既有队列
+            # （子 Agent 每轮开头 `drain_steer(task.session_id)` 取走）。放在 try 内是为了让
+            # finally 的注销覆盖**所有**退出路径（含取消），不留下悬空目标。
+            register_child_run(
+                run_id,
+                child_session_id=child.session_id or "",
+                parent_agent_id=self._parent_session_id,
             )
             if ctx_snapshot is not None:
                 # 让孙 Agent 能报告 parent_run_id（runtime 内部的 set_tool_context 是合并语义）

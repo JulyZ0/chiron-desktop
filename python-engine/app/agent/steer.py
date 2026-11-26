@@ -59,7 +59,12 @@ _RUN_TARGETS: dict[str, tuple[str, str]] = {}
 #: ``子会话 id → run_id``：drain 时据此把"取走"折算回 per-run 额度。
 _RUN_BY_SESSION: dict[str, str] = {}
 #: 已经收尾的 run：再 steer 必须回 ``run_finished``，绝不静默成功。
-_FINISHED: set[str] = set()
+#:
+#: 用**有界 FIFO**（插入序 dict）而不是无界 set：每个子 run 收尾都会留一个 id，
+#: 长驻引擎上这就是一条只增不减的泄漏。"已结束"只需要回答**最近**的 run（界面看到
+#: 的卡片、刚收尾的委派）；更早的 id 早已不会被 steer，丢掉不影响语义。
+_FINISHED: dict[str, None] = {}
+_FINISHED_MAX = 4096
 #: ``run_id → 待注入条数``。
 _PENDING: dict[str, int] = {}
 
@@ -78,13 +83,21 @@ class SteerResult:
     child_session: str = ""
 
 
+def _mark_finished(run_id: str) -> None:
+    """把 run 记进"已结束"（有界 FIFO）。重复记同一 id 会刷新它的位置。"""
+    _FINISHED.pop(run_id, None)
+    _FINISHED[run_id] = None
+    while len(_FINISHED) > _FINISHED_MAX:
+        _FINISHED.pop(next(iter(_FINISHED)))
+
+
 def register_child_run(run_id: str, *, child_session_id: str, parent_agent_id: str) -> None:
     """登记一条运行中的子 run（runner 开跑时调用）。幂等：重复登记覆盖同一映射。"""
     if not run_id or not child_session_id:
         return
     _RUN_TARGETS[run_id] = (child_session_id, parent_agent_id or "")
     _RUN_BY_SESSION[child_session_id] = run_id
-    _FINISHED.discard(run_id)
+    _FINISHED.pop(run_id, None)
     _PENDING[run_id] = 0
 
 
@@ -103,7 +116,7 @@ def forget_child_run(run_id: str) -> None:
             _RUN_BY_SESSION.pop(child_session, None)
         # 翻转代数：与 clear 同一条路径，避免"clear 之后 Redis 才恢复"时旧副本复活。
         clear_steer_local(child_session)
-    _FINISHED.add(run_id)
+    _mark_finished(run_id)
 
 
 def child_session_of(run_id: str) -> str:
