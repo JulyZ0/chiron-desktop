@@ -163,5 +163,6 @@ LiteLLM 与 Langfuse 的实例级验证、R10 租户删除闭环、S5 多实例�
 
 ## 6. 参考
 
+- ZCode v4.0.0 对照分析（核心循环 / 前端 UI·UX）：[gap-analysis-chiron-vs-zcode.md](gap-analysis-chiron-vs-zcode.md)
 - OpenAI Codex Sandbox：<https://tonybai.com/2026/11/19/inside-openai-codex-sandbox/>
 - Hosted Agents 边界 / OpenHands V1：<https://xwang.dev/blog/2026/openhands-sdk-claude-managed-agents/>
