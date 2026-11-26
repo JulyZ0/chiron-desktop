@@ -73,7 +73,7 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
 
 - ZCode：每个流 delta 都作为 `ModelStreaming` `SessionEvent` 落库（`model.ts:229-245`、
   `model-streaming-event-queue.ts:40-73`，128 水位背压），live 只发布"已落库事件"，live/replay/snapshot 的
-  `eventSeq` 同源（`events.ts:82-125`）。工具调用只认 final tool-call（`docs/model-tool-call-stream-commit-boundary.md`）。
+  `eventSeq` 同源（`events.ts:82-125`）。工具调用只认 final tool-call（`ZCode 仓内 `model-tool-call-stream-commit-boundary.md``）。
 - Chiron：SSE 逐帧下发，`Last-Event-ID` 补发（`internal/api/events.go`），但事件不构成"可重建投影的唯一日志"；
   消息与旁路事件（thinking/tool/usage）分开存，恢复靠消息 + checkpoint。
 
@@ -200,7 +200,7 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
 
 ### 3.3 流式渲染（ZCode 最大亮点）
 
-- ZCode 的三代教训写在 `docs/streaming-markdown-reveal.md:1-30`：逐字 `visibleText` 会让高度逐帧增长、撞虚拟滚动测高。
+- ZCode 的三代教训写在 `ZCode 仓内 `streaming-markdown-reveal.md`:1-30`：逐字 `visibleText` 会让高度逐帧增长、撞虚拟滚动测高。
 - 现方案：**DOM 文本第一帧就是全文**，只给每个词/字写 `data-zcode-reveal` + `--zcode-reveal-delay`，用 CSS
   `transition + @starting-style` 淡入；`Intl.Segmenter` 词粒度、CJK 再拆字；只对"纯追加且单帧 ≤600 字符"生效，
   否则整条不动画（`:36-170`、`:250-268`）。
@@ -250,7 +250,7 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
 
 - ZCode：**退役 App 业务单测**，保留 Agent CLI/CUA/E2E/工程测试；816 个桌面 E2E（WDIO + Electron）；
   组件测试用"真 React + 真浏览器 + 确定性 fixture"（`node:test` + Playwright）断言 DOM 几何；
-  **testid 单一来源 + 禁止截图判定**（`docs/conversation-session-ui-testid-contract.md`）；无视觉快照、无 axe。
+  **testid 单一来源 + 禁止截图判定**（`ZCode 仓内 `conversation-session-ui-testid-contract.md``）；无视觉快照、无 axe。
 - Chiron：213 个 `*.spec.ts` 组件/交互测试（vitest + jsdom），无体系化 Electron E2E；a11y 为静态契约。
 - **评价**：Chiron 的单测密度是资产，不应照搬"退役单测"；但应补 **桌面 E2E + testid 契约**，否则四栏/分屏/
   流式这类"几何与滚动"问题只能靠手测。
@@ -264,7 +264,7 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
    - 落点：`frontend-vue/src/stores/`、`components/chat/use*`。
 2. **流式"文本完整、只动透明度"**：渲染后处理给词/字打 `data-reveal` + 延迟，CSS 淡入；只对纯追加生效。
    - 判据：流式期间行高稳定（ResizeObserver 不触发连续重算）；复制/搜索拿到全文；`prefers-reduced-motion` 生效。
-   - 落点：`MessageItem.vue` / 新的 markdown 渲染 composable；参考 ZCode `docs/streaming-markdown-reveal.md`。
+   - 落点：`MessageItem.vue` / 新的 markdown 渲染 composable；参考 ZCode `ZCode 仓内 `streaming-markdown-reveal.md``。
 3. **工具卡注册表 + 惰性详情 + 统一摘要**：按工具名分流 renderer；闭合不建详情 DOM；摘要语法集中一处。
    - 判据：新增工具只加一个 renderer 文件；收起时 DOM 不含详情；同一工具在聊天/工作台/子 Agent 面板渲染一致。
    - 落点：`components/chat/ToolCallCard.vue`、`ToolResultBlock.vue`。
@@ -344,10 +344,10 @@ ZCode（仓库外 `../zcode`，commit `a4b44451`）：
 - 子 Agent：`core/src/runtime/methods/subagent.ts`、`core/src/subagent/runner.ts`、`send-message.ts`
 - 压缩：`core/src/compact/{microcompact,policy,prompt}.ts`、`runtime/helpers/compact-post-reminders.ts`
 - 隔离：`packages/dynamic-workflow-runtime/src/{harness,child-source}.ts`、`adapters/src/mcp/windows-job-object.ts`
-- 前端流式：`packages/ui/src/components/ai-elements/message.tsx`、`docs/streaming-markdown-reveal.md`
+- 前端流式：`packages/ui/src/components/ai-elements/message.tsx`、`ZCode 仓内 `streaming-markdown-reveal.md``
 - 布局/工具卡：`packages/ui/src/app-shell/WorkspaceShellLayout.tsx`、`packages/ui/src/ToolCallBlocks/*`
 - 设计系统：`DESIGN.md`、`packages/ui/src/styles.css`
-- 测试契约：`docs/conversation-session-ui-testid-contract.md`、`packages/desktop/test/e2e/*`
+- 测试契约：`ZCode 仓内 `conversation-session-ui-testid-contract.md``、`packages/desktop/test/e2e/*`
 
 Chiron：
 

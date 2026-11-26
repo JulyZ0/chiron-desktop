@@ -1,0 +1,105 @@
+# Chiron 最小告警集（Prometheus 规则）。
+#
+# 指标来源：
+#   网关   GET /metrics                     → chiron_*（见 internal/api/system_handler.go）
+#   引擎   GET /metrics（引擎端口）          → queue_* / llm_*（见 app/observability/metrics.py）
+#
+# 这是"上线最小集"，不是完整可观测性：先保证**没人用/全挂/积压/投递异常**四类能被叫醒。
+# 接入方式：prometheus.yml 里 `rule_files: [deploy/prometheus-alerts.yml]`。
+groups:
+  - name: chiron-availability
+    rules:
+      - alert: ChironGatewayDown
+        expr: up{job="chiron-gateway"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "网关实例不可达"
+          description: "{{ $labels.instance }} 已 2 分钟抓取失败；先看进程/端口，再看 /ready。"
+
+      - alert: ChironEngineDown
+        expr: up{job="python-engine"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Python 引擎实例不可达"
+          description: "长任务与工具执行会全部失败；检查容器状态与引擎 /readyz。"
+
+  - name: chiron-sse
+    rules:
+      - alert: ChironSSEPublishBacklog
+        expr: chiron_sse_publish_queued > 1000
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "SSE 发布队列积压"
+          description: "实时事件开始落后；通常是订阅端慢或单实例连接过多。看 chiron_sse_publish_fallback。"
+
+      - alert: ChironSSEPublishFallingBack
+        expr: rate(chiron_sse_publish_fallback_total[5m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "SSE 发布退化为同步路径"
+          description: "队列已满，事件发布会阻塞请求协程；持续出现会拉高接口延迟。"
+
+  - name: chiron-queue
+    rules:
+      - alert: ChironQueueBacklog
+        expr: sum(queue_depth) > 1000
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "引擎任务队列积压"
+          description: "worker 吞吐不足或卡死；先看 queue_processing_duration_seconds 与 worker 日志。"
+
+      - alert: ChironDLQGrowing
+        expr: increase(queue_dlq_total[30m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "有任务进入死信队列"
+          description: "任务重试耗尽；按 task_type 查错误，再决定重投或修数据。"
+
+      - alert: ChironQueueRetentionDegraded
+        expr: increase(queue_retention_degraded_total[30m]) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: "队列因 PEL 未 ACK 放弃裁剪"
+          description: "有任务长期未 ACK（或 worker 卡住）；队列会超出 maxlen，需扩容/排查。"
+
+  - name: chiron-llm
+    rules:
+      - alert: ChironLLMCircuitOpen
+        expr: max by (provider) (llm_circuit_state) >= 2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Provider {{ $labels.provider }} 熔断"
+          description: "上游连续失败；检查 key 余额/限流/网络，必要时在后台重置熔断。"
+
+      - alert: ChironRateLimitDegraded
+        expr: increase(rate_limit_degraded_total[10m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "分布式限流降级"
+          description: "Redis 不可用时限流按 fail-close/降级运行；与 Redis 告警一起看。"
+
+  - name: chiron-resources
+    rules:
+      - alert: ChironGatewayMemoryHigh
+        expr: chiron_go_memory_sys_bytes > 4 * 1024 * 1024 * 1024
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "网关进程内存 > 4GiB"
+          description: "看 goroutine/连接数、SSE 队列与 checkpoint 缓存；先确认不是泄漏。"
+
+      - alert: ChironNoActiveRequestsButTrafficExpected
+        # 只在"应该有流量"的时段使用；默认不启用，避免夜间误报。
+        expr: sum(rate(chiron_requests_total[10m])) == 0 and hour() >= 8 and hour() <= 20
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "工作时段网关无请求"
+          description: "可能是反代/健康检查/SDK 配置问题，而不是「没人用」；先看 /ready 与反代日志。"

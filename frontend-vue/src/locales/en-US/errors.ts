@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 后端稳定错误码 → 文案（en-US）。
  * 键与 internal/api/error_codes.go 的 Code* 常量一一对应，勿改键名。
  */

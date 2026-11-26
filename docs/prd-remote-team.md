@@ -38,17 +38,15 @@ Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、
 | ID | 事项 | 证据/后果 | 量级 |
 |---|---|---|---|
 | L23 | 首屏预加载仍含 charts/diagram ~0.8MB br（fileviewer 1.8MB 已移除；二者仍随入口预载，成因待查） | 弱网首屏被图表/图形库抢带宽 | S |
-| L25 | nginx 未消费 `.br/.gz`；无 sourcemap | 镜像膨胀、线上堆栈不可读 | S |
 
 ### 3.4 运维 / 供应链
 
 | ID | 事项 | 完成判据 | 量级 |
 |---|---|---|---|
-| L26 | 备份/恢复与 APP_SECRET/KMS 托管 | `pg_dump` + 目录快照；空环境恢复一次并跑 team_smoke | M |
+| L26 | 备份/恢复演练 | 脚本与 runbook 已备（`scripts/backup.sh`/`restore.sh`、`docs/ops-runbook.md`）；**空环境恢复并跑 team_smoke 一次**待做 | M |
 | L27 | 生产部署形态与入口 | 二选一：桌面托管（NSSM/日志轮转/重启）或容器化（prod compose + 迁移 job + 资源上限）；修掉失效的 `make docker-build/dev-up` | L |
-| L28 | 升级/回滚规程 | 备份→迁移→启动→冒烟→回滚，演练一次 | M |
+| L28 | 升级/回滚演练 | 规程已写入 `docs/ops-runbook.md`；按规程完整演练一次（含迁移失败回滚） | M |
 | L29 | 依赖与供应链 | pip-audit/npm audit/镜像扫描进 CI；SBOM；H51 签名清单 | M |
-| L30 | 观测与告警最小集 | 5xx、队列积压、SSE 投递失败、DB/Redis 断、磁盘增长 5 条规则 + 看板 | M |
 | L31 | 长会话内存/渲染 | `runtimes`/`seenIds` 淘汰；流式不重投影；`read_file` 折叠 | M |
 
 ## 4. 需环境 / 需决策
@@ -95,8 +93,10 @@ L15 停机排空/拒绝新 spawn、DLQ 走 `append_task`、reclaim 与业务失�
 截断（4MB）；L22 SSE 指数退避 + 抖動（8 次）、子 Agent 心跳看门狗、上线后重挂**所有**
 运行中的会话。
 
-**第 4 批 · 2–3 天（运行面）**
-L26 备份恢复 → L27 部署形态 → L28 升级回滚 → L30 告警 → L25 压缩/sourcemap → L29 供应链。
+**第 4 批 · 进行中**
+已完成：L25 `gzip_static`、L30 最小告警集（`deploy/prometheus-alerts.yml`）、
+L26/L28 的脚本与 runbook（`docs/ops-runbook.md`）。
+待做：L27 部署形态与生产编排（需先定 A/B）、L26/L28 的空环境演练、L29 依赖审计/SBOM。
 
 **第 5 批 · 按环境/决策**
 C1/C1b/C2/C3 → H2/H51/H19/H22 → L31 长会话性能 → E4 a11y → E1 父→子 steer → E2 字号第二波 → E5 Git 面板增强。

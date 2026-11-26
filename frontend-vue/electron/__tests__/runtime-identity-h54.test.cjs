@@ -45,7 +45,7 @@ test('实例 ID 一致才接管', async () => {
   assert.equal(result.port, 18900)
 })
 
-test('实例 ID 不同 ⇒ 拒绝接管（这是本条的核���）', async () => {
+test('实例 ID 不同 ⇒ 拒绝接管（这是本条的核心）', async () => {
   const stub = readyFetch({ postgres: 'up', redis: 'up', instance_id: 'someone-else', protocol: rs.INSTANCE_PROTOCOL })
   const result = await rs.probeExistingStack(baseState, { fetch: stub.fetch })
   assert.equal(result.alive, false)
