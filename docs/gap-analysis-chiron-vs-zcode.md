@@ -305,9 +305,12 @@ Source Server"服务的；Chiron 的"网关 + 引擎 + 前端"更紧凑，团队
 | P1-4 压缩回读 + 熔断 | ✅ 已合入 `eda07be` | 3 次过快压缩暂停自动压缩（手动 /compact 重置）；最近 5 个 `read_file` 结果压缩后以 `[recent-files]` 回读；6 项测试 |
 | P2 字号硬约束 | ✅ 已合入（分批迁移中） | 新增 `check-font-size-ratchet.mjs` + 基线（全仓裸 px 663 → **548**）；`components/chat` 18 个文件 125 处裸 px 全部迁到 `--fs-*`（该目录归零，11px 可读性违规一并消除）；棘轮已进 `check:ui` |
 | P2 工作台扩展（Git 面板） | ✅ 已合入 | 改动页签点开单文件 diff（只读 `git diff HEAD`，512KB 截断、二进制/未跟踪分流）；服务端与设备侧双实现；顺带修正"还原点页签同时渲染改动列表"的 `v-else` 串页签 |
-| P2 快捷键单一事实源 / a11y 自动化 | ⏳ 未做 | 分别属于"统一注册表改造""引入 axe 依赖决策"；排在工作台扩展之后 |
+| P2 快捷键单一事实源 | ✅ 已具备（复核） | `config/shortcutCatalog.ts` 是唯一声明源，`AppLayout`（真实绑定）、`CommandPalette`、设置页、速查表四处共用；改键与显示不会再漂移 |
+| P2 a11y 自动化 | ◐ 静态已具备，运行时待定 | `check-a11y.mjs` 静态契约 0 违规；真实 DOM 检查需先定是否引入 axe（devDependency/CI 时长），对应 E4 |
 
-**下一步**：P0-1 已拆完。剩余按决策推进：H20 信封加密 + 可插拔 KMS；工作台 Git 面板；字号棘轮（先迁 `components/chat`）。
+**下一步**：P0-1 / H20 / 工作台 Git diff / 字号棘轮均已合入。后续见 `docs/prd-remote-team.md`
+§2.4「下一批怎么排」：E1 父→子 steer 入口 → E2 字号第二波 → E3 轮换演练 → E4 a11y 运行时 → E5 Git 面板增强；
+需要环境的 C1/C1b 与需要决策的 B2–B4 单列。
 
 ## 5. 不建议照搬
 
