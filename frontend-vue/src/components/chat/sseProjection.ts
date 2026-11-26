@@ -105,6 +105,86 @@ export function projectUsage(
   )
 }
 
+/**
+ * 知识库检索事件（P1-6）：只落一个**徽标**，不进正文/思考。
+ *
+ * 用户要回答的是三个不同的问题（检索了几个库 / 命中几条 / 哪个库报错），
+ * 一句话的 notice 装不下；做成气泡又会被误读成 Assistant 说话。
+ * 历史不回放：这是实时过程事件，刷新后仅剩正文（与 `todo_updated` 同款处置）。
+ */
+export function projectKnowledgeRetrieval(
+  items: ChatItem[],
+  d: Obj,
+  evt: Obj,
+  now: () => number = Date.now,
+): void {
+  let kbEvent: Record<string, unknown> = {}
+  try {
+    const parsed = JSON.parse(String(d.content ?? evt.content ?? '{}'))
+    kbEvent = parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    kbEvent = {}
+  }
+  const kbIds = Array.isArray(kbEvent.kb_ids) ? kbEvent.kb_ids.map(v => String(v)) : []
+  const errors = Array.isArray(kbEvent.errors)
+    ? (kbEvent.errors as Array<Record<string, unknown>>).map(e => ({
+      kbId: String(e?.kb_id ?? ''),
+      category: String(e?.category ?? 'unknown'),
+      message: String(e?.message ?? ''),
+    }))
+    : []
+  items.push({
+    kind: 'knowledge',
+    kbIds,
+    queried: Number(kbEvent.queried ?? kbIds.length) || 0,
+    hits: Number(kbEvent.hits ?? 0) || 0,
+    citations: Number(kbEvent.citations ?? 0) || 0,
+    zeroHit: kbEvent.zero_hit === true,
+    errors,
+    id: `kb:${now()}`,
+  })
+}
+
+export interface CompactionInfo {
+  beforeTokens: number
+  afterTokens: number
+  savedTokens: number
+}
+
+/**
+ * 自动压缩事件：把"上下文悄悄变短"变成状态栏可见的读数 + 一条 info 行。
+ *
+ * 与**历史投影**产出同一种 notice（`chat-history.ts` 把 `tool_name='compaction'` 映射过来）
+ * ⇒ 实时与刷新后观感一致；文案复用状态栏那个键与单位（k），两处读数不会互相矛盾。
+ */
+export function projectCompaction(
+  items: ChatItem[],
+  d: Obj,
+  evt: Obj,
+  onInfo: (info: CompactionInfo) => void,
+  label: (before: string, after: string) => string,
+  now: () => number = Date.now,
+): void {
+  let info: { saved_tokens?: unknown; before_tokens?: unknown; after_tokens?: unknown } = {}
+  try {
+    const parsed = JSON.parse(String(d.content ?? evt.content ?? '{}'))
+    info = parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    info = {}
+  }
+  if (!info.saved_tokens) return
+  const beforeTokens = Number(info.before_tokens) || 0
+  const afterTokens = Number(info.after_tokens) || 0
+  onInfo({ beforeTokens, afterTokens, savedTokens: Number(info.saved_tokens) || 0 })
+  const kTok = (n: number) => (n ? `${(n / 1000).toFixed(1)}k` : '0')
+  items.push({
+    kind: 'notice',
+    tone: 'info',
+    content: label(kTok(beforeTokens), kTok(afterTokens)),
+    id: `compaction-${String(d.id ?? now())}`,
+  })
+}
+
 /** steer 被消费：只落一行小字（正文已作为 user 消息进历史，贴两遍就是重复）。 */
 export function projectSteerNotice(
   items: ChatItem[],
@@ -120,4 +200,30 @@ export function projectSteerNotice(
     time: new Date(now()).toLocaleTimeString(),
     id: `steer:${now()}`,
   })
+}
+
+
+/**
+ * 完成判定的实时文案：只在**未完成**时返回（completed/none 不插行；解析不出也不插）。
+ * 与历史留痕 `goal_incomplete` 同一套措辞，避免"实时看到的"与"刷新后看到的"不一致。
+ */
+export function completionNotice(
+  raw: string,
+  t: (key: string, params?: Record<string, unknown>) => string,
+): string {
+  try {
+    const report = JSON.parse((raw || '').trim() || '{}') as { outcome?: unknown; reasons?: unknown }
+    const outcome = typeof report.outcome === 'string' ? report.outcome : ''
+    if (!outcome || outcome === 'completed' || outcome === 'none') return ''
+    const reasons = Array.isArray(report.reasons)
+      ? report.reasons.filter((r): r is string => typeof r === 'string' && r.trim() !== '')
+      : []
+    const head = reasons.slice(0, 3).join('；')
+    const more = reasons.length > 3
+      ? `（${t('chat.turn_incomplete_more', { n: reasons.length - 3 })}）`
+      : ''
+    return t('chat.turn_incomplete_reasons', { reasons: head + more || outcome })
+  } catch {
+    return ''
+  }
 }

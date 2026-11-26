@@ -34,14 +34,8 @@ import { useThemeStore } from '../stores/theme'
 import { useChatSessionStore } from '../stores/chatSession'
 import { useChatRunState } from '../composables/useChatRunState'
 import { useChatStreamText } from '../composables/useChatStreamText'
-import {
-  projectCompletion,
-  projectSteerNotice,
-  projectTodoEvent,
-  projectToolCall,
-  projectToolResult,
-  projectUsage,
-} from '../components/chat/sseProjection'
+import { createSseDispatcher } from '../composables/useChatSse'
+import type { CompactionInfo } from '../components/chat/sseProjection'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import type { LocationQuery } from 'vue-router'
@@ -282,7 +276,7 @@ const lastTurnStats = computed<TurnStatsItem | null>(() => {
 
 // 最近一次自动压缩（问题 4：压缩早已实现，但此前前端完全不可感知 —— 用户只会
 // 觉得"上下文好像丢了/回答变短了"）。引擎现在会发 compaction 事件，这里接住并展示。
-const lastCompaction = ref<{ beforeTokens?: number; afterTokens?: number; savedTokens?: number } | null>(null)
+const lastCompaction = ref<CompactionInfo | null>(null)
 
 /**
  * 观测浮层开关。统计与组件健康仍是浮层（看完即关）；
@@ -2265,262 +2259,50 @@ const {
   flushStreamingFlags,
 } = useChatStreamText({ items, streamState })
 
-/**
- * 完成判定事件的**实时**文案（P1）：载荷是 host 证据判定的报告 `{outcome, findings, reasons}`。
- *
- * **只在未完成时返回文案** —— `completed` / `none` 不插行（正常对话不该多一行噪声）；
- * 解析不出也不插行（宁可没有，也不给用户看半截信息）。与历史留痕（`goal_incomplete`）
- * 同一套措辞，避免"实时看到的"和"刷新后看到的"说得不一样。
- */
-function goalCompletionNotice(raw: string): string {
-  try {
-    const report = JSON.parse((raw || '').trim() || '{}') as { outcome?: unknown; reasons?: unknown }
-    const outcome = typeof report.outcome === 'string' ? report.outcome : ''
-    if (!outcome || outcome === 'completed' || outcome === 'none') return ''
-    const reasons = Array.isArray(report.reasons)
-      ? report.reasons.filter((r): r is string => typeof r === 'string' && r.trim() !== '')
-      : []
-    const head = reasons.slice(0, 3).join('；')
-    const more = reasons.length > 3 ? `（${t('chat.turn_incomplete_more', { n: reasons.length - 3 })}）` : ''
-    return t('chat.turn_incomplete_reasons', { reasons: head + more || outcome })
-  } catch {
-    return ''
-  }
-}
-
-/** `stream_gap` 后的补拉（含"本轮在跑就先记账"）：见 `composables/useSessionSwitch.ts`，
- *  已在上方解构。断线补不齐时事实源是消息列表，重拉即恢复。 */
-function onSSEMessage(raw: unknown, sid: string, frameId = '') {
-  // SSE 载荷来自服务端 JSON（createSSEConnection 的 onMessage 契约即 unknown）：
-  // 在边界一次性窄化成 Record，后续各事件分支只做字段级取值，不把 unknown 透出去。
-  const evt = (raw ?? {}) as Record<string, unknown>
-  const type = evt.type
-  const d = (evt.data ?? {}) as Record<string, unknown>
-  if (type === 'text') {
-    const text = String(d.content ?? evt.content ?? '')
-    if (!text) return
-    onTextChunk(text)
-  } else if (type === 'thinking') {
-    // A1：native reasoning 的独立通道（见 onThinkingChunk）。模型**自产**的
-    // `[thinking]…[/thinking]` 标记仍会出现在 text 里，由 onTextChunk 的 splitThinking 处理。
-    onThinkingChunk(String(d.content ?? evt.content ?? ''))
-  } else if (type === 'tool_call') {
-    projectToolCall(items.value, d)
-  } else if (type === 'tool_result') {
-    projectToolResult(items.value, d)
-  } else if (type === 'todo_updated') {
-    // 任务清单更新（引擎在 todo_write 执行后单独发，见 runtime.py）。
-    //
-    // **从事件投影、不解析 tool_result 正文**：tool_result 的 content 在大输出时会被
-    // 截断（`output_truncated`），去里面正则抠 JSON 会在那一刻静默失效 —— 面板停在
-    // 上一版看起来像"卡住了"，而事件通道始终是完整结构化数据。
-    //
-    // 归属用显式传入的 `sid`，**不是** `activeSessionId`：SSE 在用户切走之后仍会继续
-    // 送达（多会话并行），用当前视图的会话会把 A 的清单写到 B 的面板上。
-    projectTodoEvent(sid, d, evt, (targetSid, todos, revision) => {
-      todoPanel.applyEvent(targetSid, todos as never, revision as never)
-    })
-  } else if (type === 'completion') {
-    // P1：host 证据判定的**实时**结论。只在"未完成"时插一条通知行 —— 否则"这一轮没做完"
-    // 与"正常结束"在界面上完全一样（用户只看到回复停了下来）。
-    projectCompletion(items.value, String(d.content ?? evt.content ?? ''), goalCompletionNotice)
-  } else if (type === 'usage' || type === 'turn_stats') {
-    // 本轮用量：引擎在**每次 LLM 调用**结束后发一条 `usage`（增量），
-    // 终态 `done` 给的是整轮累计 —— 两条通道各自成立（Go 侧 `usageTotals` 同口径，见
-    // internal/api/usage_accounting.go：那里据此避免重复计费）。
-    // 因此这里必须**累加进同一条** `turn_stats`：一次提交跨多步，逐条 push 会堆出 N 行。
-    // 会话级累计（tokens/费用/**缓存命中率**/吞吐）由 GET /v1/sessions/{id}/metrics 提供。
-    projectUsage(items.value, streamState(), d, evt, mergeTurnStats, genItemId)
-  } else if (type === 'steer') {
-    // 引擎在轮次边界消费了一条运行中指导（runtime.py 的 steer 分支）。
-    // 只落一行小字：指令正文已作为 user 消息进了会话历史，这里再贴一遍就是重复。
-    projectSteerNotice(items.value, d.content ?? evt.content, t('common.steer_applied'))
-  } else if (type === 'knowledge_retrieval') {
-    // 知识库检索事件（P1-6）：引擎在注入上下文的同时发一条结构化结果。
-    //
-    // 只落一个**徽标**（不是思考/正文）：用户要的是"这次到底检索了没有、命中几条、
-    // 哪个库出错了"。把它做成 notice 会挤占正文区域，做成气泡又会被当成 Assistant
-    // 说的话。`zero_hit` 与 `errors` 是两件事，模板按优先级分别显示提示。
-    //
-    // 历史不回放：这是**实时过程事件**，刷新后仅剩正文（与 todo_updated 同款处置）。
-    let kbEvent: Record<string, unknown> = {}
-    try { kbEvent = JSON.parse(String(d.content ?? evt.content ?? '{}')) } catch { kbEvent = {} }
-    if (kbEvent && typeof kbEvent === 'object') {
-      const kbIds = Array.isArray(kbEvent.kb_ids) ? kbEvent.kb_ids.map(v => String(v)) : []
-      const errors = Array.isArray(kbEvent.errors)
-        ? (kbEvent.errors as Array<Record<string, unknown>>).map(e => ({
-          kbId: String(e?.kb_id ?? ''),
-          category: String(e?.category ?? 'unknown'),
-          message: String(e?.message ?? ''),
-        }))
-        : []
-      items.value.push({
-        kind: 'knowledge',
-        kbIds,
-        queried: Number(kbEvent.queried ?? kbIds.length) || 0,
-        hits: Number(kbEvent.hits ?? 0) || 0,
-        citations: Number(kbEvent.citations ?? 0) || 0,
-        zeroHit: kbEvent.zero_hit === true,
-        errors,
-        id: `kb:${Date.now()}`,
-      })
-    }
-  } else if (type === 'compaction') {
-    // 引擎的自动压缩事件（runtime.py 的 _compact_with_notice）：把"上下文悄悄变短"
-    // 变成用户可见的状态栏提示（问题 4）。
-    let info: { saved_tokens?: unknown; before_tokens?: unknown; after_tokens?: unknown } = {}
-    try { info = JSON.parse(String(d.content ?? evt.content ?? '{}')) } catch { info = {} }
-    if (info?.saved_tokens) {
-      lastCompaction.value = {
-        beforeTokens: Number(info.before_tokens) || 0,
-        afterTokens: Number(info.after_tokens) || 0,
-        savedTokens: Number(info.saved_tokens) || 0,
-      }
-      // 与**历史投影**产出同一种条目（`chat-history.ts` 把 `tool_name='compaction'` 映射成 notice）
-      // ⇒ 实时与刷新后观感一致；文案复用状态栏那个键与单位（k），两处读数不会互相矛盾。
-      const kTok = (n: number) => (n ? `${(n / 1000).toFixed(1)}k` : '0')
-      items.value.push({
-        kind: 'notice',
-        tone: 'info',
-        content: t('common.compressed_before_after', {
-          before: kTok(Number(info.before_tokens) || 0),
-          after: kTok(Number(info.after_tokens) || 0),
-        }),
-        id: `compaction-${String(d.id ?? Date.now())}`,
-      })
-    }
-  } else if (type === 'done') {
-    // `done` 是**引擎一段**的终态，不是整条任务的终态。
-    //
-    // Goal FSM 判定本段未完成（撞预算墙 / 清单没做完 / 被单轮 deadline 截断）后，
-    // 网关会自动续跑下一段 —— 所以这里**不能**收尾：一旦 `loading` 收起、这条流
-    // 关掉，续跑段的 text / tool_call 就全送进一条无人订阅的流，用户看到的是
-    // "长任务跑到一半就停"，而刷新后结果又在（都已落库）。
-    // 链级收尾信号是 `turn_done`（见 HandleSubmit 的 defer）。
-    flushStreamingFlags()
-    currentTraceId.value = String(d.trace_id || '')
-    const doneMeta = normalizeMeta(d.metadata)
-    // 读的是**本会话**的流式条目 id（`streamState()`），不是模块级单值：
-    // 多会话并行时，模块级 id 指向的是"最后推送的那个会话"的正文条目。
-    const doneStreamId = streamState().streamTextId
-    if (doneMeta && Object.keys(doneMeta).length && doneStreamId) {
-      const streamItem = items.value.find(x => x.id === doneStreamId)
-      if (streamItem?.kind === 'text' && streamItem.role === 'assistant') {
-        streamItem.metadata = { ...(streamItem.metadata || {}), ...doneMeta }
-      }
-    }
-    const it = Number(d.input_tokens ?? 0) || 0
-    const ot = Number(d.output_tokens ?? 0) || 0
-    if (it || ot) {
-      items.value.push({
-        kind: 'turn_stats', inputTokens: it, outputTokens: ot,
-        durationSec: turnElapsed.value,
-      })
-    }
-    // 任务预算快照：引擎五轴（steps/turns/tokens/wall/cost）一直在强制生效，此前完全不外露，
-    // 用户只能等到 `budget_exceeded` 才知道原来有上限。
-    budgetSnapshot.value = (d.budget && typeof d.budget === 'object')
-      ? (d.budget as Record<string, { used?: number; limit?: number }>)
-      : null
-    contextSnapshot.value = (d.context && typeof d.context === 'object')
-      ? (d.context as { used?: number; limit?: number; compact_ratio?: number; breakdown?: Record<string, number>; largest?: Array<{ class?: string; role?: string; tokens?: number }>; estimated?: boolean })
-      : null
-    cacheSnapshot.value = (d.cache && typeof d.cache === 'object')
-      ? (d.cache as { prefix_changed?: string[]; first_turn?: boolean })
-      : null
-    // 成本常显：每段结束拉一次会话级 metrics（此前只在需展开的 SessionStatsPanel 里能看到）
-    void refreshSessionCost()
-  } else if (type === 'turn_done') {
-    // **链级**收尾：整条 Goal FSM 续跑链结束（或引擎不可达 / 用户停止）。
-    // 只有这里才收掉 loading 与 SSE —— 见 `done` 分支的说明。
-    flushStreamingFlags()
-    loading.value = false
-    stopTurnTimer()
-    // H59：只关**这条流自己**。全局单句柄时代，A 收尾会关掉 B 仍在跑的流（B 从此静默）。
-    closeSessionStream(sid)
-    // 轮次可能以 `awaiting_input` 收尾（SSE 已关，实时卡片不会再出现）：刷新收件箱把
-    // 落在 pending_interactions 里的待办补上，否则用户只看到"回合结束"却不知还欠一次答复。
-    void interactionInboxRef.value?.refresh()
-    // 本轮收尾 ⇒ 之前被"正在跑"挡下的那次唤醒现在可以补发了（见 wakeFromInbox）
-    flushPendingInboxWake()
-    // 断线期间补不齐的那一段：本轮已定稿，重拉历史补齐（见 scheduleGapResync）
-    flushGapResync(sid)
-  } else if (type === 'approval') {
-    const callId = String(d.id ?? d.tool_call_id ?? Date.now())
-    interactionScope.addApproval({
-      id: callId,
-      toolName: String(d.name ?? 'tool'),
-      arguments: String(d.arguments ?? ''),
-      // 倒计时：与后端 _await_approval 的 300s 超时对齐（超时按拒绝处理）
-      expiresAt: Date.now() + APPROVAL_TIMEOUT_MS,
-      // H59：归属**在到达时冻结** —— 是"发这条事件的那条流"的会话，不是此刻正在看的会话。
-      // 用户切走之后事件仍会到达（多会话并行），用 activeSessionId 会把 A 的票记到 B 头上。
-      sessionId: sid,
-      runGen: runOf(sid).gen,
-    })
-    ensureApprovalTimer()
-  } else if (type === 'ask') {
-    // 后端 ask_user 工具在等答案：卡片按 tool_call_id 回填
-    interactionScope.addQuestion({
-      id: String(d.id ?? d.tool_call_id ?? Date.now()),
-      question: String(d.question ?? d.content ?? t('common.needs_your_confirmation')),
-      options: Array.isArray(d.options) ? d.options.map((option: unknown) => String(option)) : [],
-      allowFreeText: d.allow_free_text !== false,
-      expiresAt: Date.now() + ASK_TIMEOUT_MS,
-      sessionId: sid,
-      runGen: runOf(sid).gen,
-    })
-    ensureAskTimer()
-  } else if (type === 'stream_gap') {
-    // 服务端明确告知"断线期间的推送补不齐"（缓冲被 MaxLen 裁掉 / 流已过 TTL）。
-    // 不弹窗：这是可自愈的降级，不是错误。但**必须重拉**，否则界面就停在断线前那一刻。
-    scheduleGapResync(sid)
-  } else if (type === 'guardrail_blocked') {
-    flushStreamingFlags()
-    loading.value = false
-    stopTurnTimer()
-    closeSessionStream(sid) // 同上：只关来源流
-    // 被安全策略拦下不是"临时故障"：自动补唤醒只会再撞一次同一道护栏
-    clearPendingInboxWake()
-    const reason = typeof d.content === 'string' && d.content
-      ? d.content
-      : t('admin.request_blocked_by_security_policy')
-    // 与**历史投影**产出同一种条目（`chat-history.ts` 把 `tool_name='guardrail'` 映射成 notice）
-    // ⇒ "刚被拦下"与"刷新后"观感一致（2026-10-09）。toast 仍保留：即时可见；transcript 那行负责可追溯。
-    items.value.push({
-      kind: 'notice',
-      tone: 'warning',
-      content: reason,
-      id: `guard-${String(d.id ?? Date.now())}`,
-    })
-    notify.warning(reason)
-  } else if (type === 'error') {
-    flushStreamingFlags()
-    loading.value = false
-    stopTurnTimer()
-    closeSessionStream(sid) // 同上：只关来源流
-    // 这一轮以错误收尾：自动补唤醒大概率撞同一个错（401/余额不足/限流），
-    // 把一次失败变成反复失败。票留在 answered，等用户手动发下一条时被消费。
-    clearPendingInboxWake()
-    const raw = typeof d.content === 'string' && d.content
-      ? d.content
-      : (typeof d.error === 'string' && d.error ? d.error : '')
-    // provider 认证失败：弹引导把用户**带路**到配置页（首次完整引导；之后降级为
-    // 一句带按钮的提示 —— 都由同一个 `Tour` 承担）。弹不出来才退化成 toast。
-    // 其余错误照旧：加一句可行动的提示，但**保留原文**（原文才是定位线索）。
-    if (raw && isProviderAuthError(raw)) {
-      offerSetupTour('provider-auth', actionableStreamError(raw), 'error')
-    } else {
-      notify.error(raw ? actionableStreamError(raw) : t('errors.request_failed_2'))
-    }
-  } else if (typeof type === 'string' && type.startsWith('subagent.')) {
-    // 子 Agent 进度（docs/subagent-design.md §4.2）：只进侧边栏观测面板。
-    // 刻意不落主对话流 —— 子 Agent 的思考/正文是"数据"，不是会话内容。
-    const event = (Object.keys(d).length ? { ...d, type } : { ...evt }) as unknown as SubagentEvent
-    // 带上帧 id：同一条事件会经两条连接（本轮流 + 会话级子 Agent 流）各到一份，按 run 去重
-    pushSubagentEvent(event, frameId)
-  }
-}
+// SSE 事件分发见 `composables/useChatSse.ts`（P0-1 收尾）：依赖以显式端口注入，
+// 事件分支不再散落在视图里；这里只负责把视图的 action / ref 接上。
+const onSSEMessage = createSseDispatcher({
+  items,
+  streamState,
+  genItemId,
+  runOf,
+  onTextChunk,
+  onThinkingChunk,
+  flushStreamingFlags,
+  applyTodos: (sid, todos, revision) => {
+    todoPanel.applyEvent(sid, todos as never, revision as never)
+  },
+  mergeStats: mergeTurnStats,
+  loading,
+  stopTurnTimer,
+  closeSessionStream,
+  refreshInbox: () => { void interactionInboxRef.value?.refresh() },
+  flushPendingInboxWake,
+  clearPendingInboxWake,
+  scheduleGapResync,
+  flushGapResync,
+  refreshSessionCost: () => { void refreshSessionCost() },
+  interactionScope: {
+    addApproval: ticket => interactionScope.addApproval(ticket as never),
+    addQuestion: ticket => interactionScope.addQuestion(ticket as never),
+  },
+  ensureApprovalTimer,
+  ensureAskTimer,
+  approvalTimeoutMs: APPROVAL_TIMEOUT_MS,
+  askTimeoutMs: ASK_TIMEOUT_MS,
+  currentTraceId,
+  turnElapsed,
+  lastCompaction,
+  budgetSnapshot,
+  contextSnapshot,
+  cacheSnapshot,
+  pushSubagentEvent,
+  notify,
+  offerSetupTour,
+  actionableStreamError,
+  isProviderAuthError,
+  t,
+})
 
 /**
  * 首次向某个项目提问前，确认它已纳入版本控制。
