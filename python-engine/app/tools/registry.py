@@ -70,6 +70,9 @@ class ToolDef:
     #: G15：**工具自己的声明** —— 同批并发执行不会互相干扰。
     #: 默认 False：没声明就串行（与 `tool_policy` 的 fail-closed 同一取向）。
     concurrency_safe: bool = False
+    #: ZCode 对齐：不可逆/破坏性动作。即使误标了 concurrency_safe，调度器也**永不并发**
+    #: （删除、覆盖、对外提交这类动作的顺序必须可预测；一处误标不该靠 review 兜底）。
+    destructive: bool = False
 
 
 class ToolRegistry:
@@ -85,6 +88,7 @@ class ToolRegistry:
         owner: str = "",
         source: str = SOURCE_BUILTIN,
         concurrency_safe: bool = False,
+        destructive: bool = False,
     ) -> None:
         """注册工具。owner 非空时该工具仅对 owner（user_id）可见/可调用；
         同名重复注册幂等覆盖；已存在且带 owner 时合并归属用户集合
@@ -107,6 +111,7 @@ class ToolRegistry:
             existing.handler = handler
             existing.source = source
             existing.concurrency_safe = concurrency_safe
+            existing.destructive = destructive
             return
         owners = set()
         if owner:
@@ -119,7 +124,16 @@ class ToolRegistry:
             owners=owners,
             source=source,
             concurrency_safe=concurrency_safe,
+            destructive=destructive,
         )
+
+    def is_parallel_safe(self, name: str) -> bool:
+        """能否与同批其它调用**并发**：声明可并发且不是破坏性动作。
+
+        破坏性动作即使被误标 `concurrency_safe` 也串行 —— 顺序可预测优先于吞吐。
+        """
+        tool = self._tools.get(name)
+        return bool(tool is not None and tool.concurrency_safe and not tool.destructive)
 
     def is_concurrency_safe(self, name: str) -> bool:
         """该工具是否声明了"可并发执行"。
@@ -298,6 +312,11 @@ class ToolRegistry:
 
 # 全局注册表（进程内单例）
 registry = ToolRegistry()
+
+
+def is_parallel_safe(name: str) -> bool:
+    """模块级别名：调度器问"能不能与同批并发"时用这个（含 destructive 一票否决）。"""
+    return registry.is_parallel_safe(name)
 
 
 def is_concurrency_safe(name: str) -> bool:

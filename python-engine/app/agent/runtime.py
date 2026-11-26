@@ -824,7 +824,8 @@ def _split_tool_batch(
 
     **并发条件（全部满足才并发）**：
 
-    1. 动作级别是 `read`（`tool_policy.tool_level`）—— 写/删/外部类有副作用，顺序敏感；
+    1. 工具自己声明 `concurrency_safe=true`，且**不是破坏性动作**（`destructive=true`
+       一票否决 —— 删除/覆盖/对外提交的顺序必须可预测，误标也不能并发）；
     2. 不是 `ask_user`（有交互语义，必须逐个等答案）；
     3. 不与同批内**其它**调用共享路径 —— 同路径并发读写在语义上无法保证顺序
        （借鉴 deepagents 的 `_parallel_file_mutation_error`：它为同一问题在文件工具里
@@ -842,13 +843,13 @@ def _split_tool_batch(
     # 之前是按动作级 `tool_level(...) == READ` 推断的：那张表是给"要不要审批"用的，
     # 拿它兼职决定并发有两个方向的错 —— 漏声明只读工具（白白串行），
     # 或错标一个会碰外部状态的工具（并发执行不该并发的调用）。
-    from app.tools.registry import is_concurrency_safe
+    from app.tools.registry import is_parallel_safe
 
     candidates: list[dict[str, Any]] = []
     serial: list[dict[str, Any]] = []
     for call in tool_calls:
         name = str(call.get("name", ""))
-        if name == ASK_USER_TOOL or name == COMPACT_TOOL or not is_concurrency_safe(name):
+        if name == ASK_USER_TOOL or name == COMPACT_TOOL or not is_parallel_safe(name):
             serial.append(call)
             continue
         candidates.append(call)
@@ -1076,6 +1077,22 @@ def parse_approval_payload(
     return ApprovalDecision(decision=DECISION_EDIT, arguments=edited, reason=text_reason)
 
 
+#: P1-4：压缩后回读段的稳定标记。重压时按它替换上一份，避免同一段文字越堆越多。
+_RECENT_FILES_MARKER = "[recent-files]"
+
+
+def _strip_recent_files(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """去掉上一轮注入的回读段（只认标记开头的 system 消息）。"""
+    return [
+        m
+        for m in messages
+        if not (
+            str(m.get("role", "")) == "system"
+            and str(m.get("content", "")).startswith(_RECENT_FILES_MARKER)
+        )
+    ]
+
+
 class AgentRuntime:
     """
     Agent 运行时 — 完整的推理循环
@@ -1191,6 +1208,13 @@ class AgentRuntime:
         #: 轮次边界统一测量，成因由这里传入 —— 测完即清空，不跨轮累积。
         self._idle_reason: str | None = None
         self._tool_steps = 0
+        #: P1-4：压缩"过快重复"熔断 + 最近读文件回读。
+        #: 连续两次压缩之间新增工具步 < 3 ⇒ 视为"刚压完又被填满"；第 3 次即暂停自动压缩，
+        #: 手动 /compact 仍可用并重置。`_recent_reads` 只保留最近 5 个文件（path → 截断正文）。
+        self._compaction_rapid = 0
+        self._compaction_last_step = -1
+        self._compaction_disabled_reason = ""
+        self._recent_reads: dict[str, str] = {}
         # ── M7 人工介入闭环（`app/agent/interactions.py`）──
         # 三个簿记都以 `tool_call_id` 为键，实例级 ⇒ 天然只活到这一轮结束。
         # runtime 是**每会话**复用的（见上面 `_last_prefix_fp` 的说明），所以每次 `run()`
@@ -1272,6 +1296,11 @@ class AgentRuntime:
         `window` 是模型窗口表给出的预算（C4）；优先级 = **显式配置 > 窗口表 > 历史常量**，
         因为显式配置是租户/模式的明确口径，而常量只是"查不到时的兜底"。
         """
+        if self._compaction_disabled_reason and not force:
+            # 刚压完又被填满：继续压缩只会反复烧摘要调用。暂停自动压缩，
+            # 让下一次请求的溢出路径给出明确错误（或用户手动 /compact 重置）。
+            logger.debug("auto compaction paused: %s", self._compaction_disabled_reason)
+            return messages, None
         comp_cfg = self._resolve_compaction(mode_cfg, llm_config)
         provider = str((llm_config or {}).get("provider", "") or "")
         # 窗口预算先扣掉输出额度与估算余量（`_input_budget`）：窗口是输入输出共用的，
@@ -1354,11 +1383,18 @@ class AgentRuntime:
         tokens_before = _estimate_tokens(messages, comp_cfg.model) + tools_tokens
         count_before = len(messages)
         compacted = _compact_messages(messages, comp_cfg, dropped=dropped, folds=folds)
+        # 压缩后**回读最近读过的文件**：摘要会丢掉文件正文，而长任务往往还要接着改它。
+        # 先注入再算 tokens_after，报告里的数字才是用户真正看到的上下文。
+        _recent = self._recent_files_message()
+        if _recent is not None:
+            compacted = _strip_recent_files(compacted)
+            compacted.append(_recent)
         # 压缩只动消息、不动工具表，两边加同一个常量不改变差值；但报出去的绝对值
         # 必须与判定同口径，否则"占用了多少"会被少报一截。
         tokens_after = _estimate_tokens(compacted, comp_cfg.model) + tools_tokens
         if tokens_after >= tokens_before:
             return compacted, None
+        self._note_compaction(force=force)
         report = {
             "before_tokens": tokens_before,
             "after_tokens": tokens_after,
@@ -1366,12 +1402,74 @@ class AgentRuntime:
             "messages_before": count_before,
             "messages_after": len(compacted),
             "strategy": getattr(comp_cfg, "strategy", "") or "auto",
+            "rapid_refill_count": self._compaction_rapid,
         }
+        if self._compaction_disabled_reason:
+            report["warning"] = self._compaction_disabled_reason
         return compacted, AgentEvent(
             type="compaction",
             content=json.dumps(report, ensure_ascii=False),
             span_name="compaction",
         )
+
+    def _note_compaction(self, *, force: bool) -> None:
+        """记录一次**真实发生**的压缩，判断是否"过快重复"。
+
+        手动 `/compact` 是用户的显式决定：重置计数并解除暂停（否则用户手动整理一次
+        仍会被上一条熔断挡住，界面上看就是"/compact 没反应"）。
+        """
+        step = int(getattr(self, "_tool_steps", 0))
+        if force:
+            self._compaction_rapid = 0
+            self._compaction_last_step = step
+            self._compaction_disabled_reason = ""
+            return
+        if self._compaction_last_step >= 0 and step - self._compaction_last_step < 3:
+            self._compaction_rapid += 1
+        else:
+            self._compaction_rapid = 1
+        self._compaction_last_step = step
+        if self._compaction_rapid >= 3 and not self._compaction_disabled_reason:
+            self._compaction_disabled_reason = (
+                f"上下文在 {self._compaction_rapid} 次压缩内反复填满（每次间隔 < 3 个工具步）；"
+                "已暂停自动压缩，请手动 /compact 或缩小任务范围"
+            )
+            logger.warning("compaction paused: %s", self._compaction_disabled_reason)
+
+    def _remember_read(self, call: dict[str, Any], result: Any) -> None:
+        """记录 read_file 的结果（有界），供压缩后回读。
+
+        只看 `read_file`：其它工具的结果语义差异太大（grep 是线索、read_tool_result 是
+        引用），回读它们会把摘要省下的空间又填回去。失败/未执行的调用不记 —— 回读一段
+        错误信息没有意义。
+        """
+        if str(call.get("name", "")) != "read_file":
+            return
+        if not isinstance(result, dict) or result.get("error") or result.get("not_executed"):
+            return
+        try:
+            path = str(json.loads(call.get("arguments") or "{}").get("path") or "").strip()
+        except (TypeError, ValueError):
+            return
+        text = result.get("content") or result.get("text") or result.get("output") or ""
+        if not path or not isinstance(text, str) or not text.strip():
+            return
+        self._recent_reads.pop(path, None)
+        self._recent_reads[path] = text[:1500]
+        while len(self._recent_reads) > 5:
+            self._recent_reads.pop(next(iter(self._recent_reads)), None)
+
+    def _recent_files_message(self) -> dict[str, Any] | None:
+        """压缩后回读的 system 段（无记录时返回 None，不注入空段）。"""
+        if not self._recent_reads:
+            return None
+        parts = [
+            _RECENT_FILES_MARKER
+            + " 压缩后恢复最近读过的文件（内容可能截断；需要精确内容请重新 read_file）："
+        ]
+        for path, text in self._recent_reads.items():
+            parts.append(f"--- {path} ---\n{text}")
+        return {"role": "system", "content": "\n\n".join(parts)}
 
     def _force_compact(
         self,
@@ -2484,6 +2582,11 @@ class AgentRuntime:
         budget = _budget_from_env(max_segments=DEFAULT_MAX_SEGMENTS)
         self._budget = budget
         self._tool_steps = 0
+        # P1-4：每轮重置压缩熔断与回读集合（runtime 每会话复用，不能跨轮累积）。
+        self._compaction_rapid = 0
+        self._compaction_last_step = -1
+        self._compaction_disabled_reason = ""
+        self._recent_reads = {}
         # 后台「Agent 运行配置」在**每轮开头**刷一次（而不是只在构造时读一次）：
         # 配置是热更的（`runtime_config.listen_for_changes` 写回 `settings`），而 runtime
         # 实例是**每会话复用**的 —— 只在 `__init__` 读，后台改了要等新会话才生效。
@@ -3829,6 +3932,11 @@ class AgentRuntime:
                             # M7：这一步在等人 ⇒ 本轮到此为止。后面还没跑的调用不会拿到
                             # 空 `{}`（那在模型眼里是一次没有解释的失败），见下面的补齐。
                             break
+
+                    # P1-4：记录本批 read_file 的结果，压缩后回读（有界，后写覆盖先写）。
+                    for _call in tool_calls:
+                        if _call["id"] in batch_results:
+                            self._remember_read(_call, batch_results[_call["id"]])
 
                     #: 因为挂起而**没有执行**的调用（不进 checkpoint 的 done_tools：
                     #: 它们没做完，续跑的那一轮还要做）
