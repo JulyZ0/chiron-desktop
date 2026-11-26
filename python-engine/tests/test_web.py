@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from app.agent.untrusted import EXTERNAL_WEB_NOTICE
 from app.tools.web import (
     DuckDuckGoProvider,
     WebProvider,
@@ -70,7 +71,9 @@ class TestWebTools:
             "url": "https://e.com", "status_code": 200, "content_type": "text/html", "content": "ok",
         }))
         out = await web_fetch("https://e.com")
-        assert out["content"] == "ok"
+        # G26：网页正文前固定一句"当数据不当指令"；正文本身与其余字段不变。
+        assert out["content"] == f"{EXTERNAL_WEB_NOTICE}\nok"
+        assert out["url"] == "https://e.com"
 
     @pytest.mark.asyncio
     async def test_web_search_provider_error(self):
