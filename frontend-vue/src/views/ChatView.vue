@@ -33,6 +33,7 @@ import { notify } from '../utils/notify'
 import { useThemeStore } from '../stores/theme'
 import { useChatSessionStore } from '../stores/chatSession'
 import { useChatRunState } from '../composables/useChatRunState'
+import { useChatStreamText } from '../composables/useChatStreamText'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import type { LocationQuery } from 'vue-router'
@@ -2245,78 +2246,16 @@ const {
 // 读取一律经 `streamState()`：SSE 回调整段跑在 `withRun(...)` 的同步作用域内，
 // 因此它返回的正是"这条事件所属会话"的那一份。
 
-function resetStreamState() {
-  const st = streamState()
-  st.streamBuf = ''
-  st.streamTextId = ''
-  st.streamReasonId = ''
-  st.streamStatsId = ''
-}
-
-function appendUserText(text: string, attachments?: ChatAttachment[]) {
-  items.value.push({ kind: 'text', role: 'user', content: text, id: genItemId(), attachments })
-}
-
-// 性能/正确性：稳定 id（虚拟列表 key + 流式定位，loadEarlier 头部插入不错位）
-let itemIdSeq = 0
-function genItemId() {
-  return `msg_${Date.now().toString(36)}_${itemIdSeq++}`
-}
-
-function onThinkingChunk(text: string) {
-  // A1（方案 04）：native reasoning 现在走**独立的 `thinking` 事件**，不再被引擎包装成
-  // `[thinking]…[/thinking]` 混进 `text`。
-  //
-  // 所以它有**自己的累积与条目**，并且**绝不进 `streamBuf`** —— 否则下面的
-  // `splitThinking(streamBuf, …)` 会把它当正文，刚分开的两条通道又被合回去了。
-  if (!text) return
-  const st = streamState()
-  const existing = items.value.find(it => it.id === st.streamReasonId)
-  if (existing?.kind === 'reasoning') {
-    existing.content += text // 事件是**增量**（text 那条是"从累积文本重算"，两者不同）
-  } else {
-    const id = genItemId()
-    st.streamReasonId = id
-    items.value.push({ kind: 'reasoning', content: text, streaming: true, id })
-  }
-}
-
-function onTextChunk(text: string) {
-  const st = streamState()
-  st.streamBuf += text
-  // 引擎按 ~80 字分段下发 "[thinking]片段[/thinking]"，用 loose 状态机解析：
-  // 多段思考全部归 reasoning，正文不再残留 [/thinking][thinking] 标签。
-  const { reasoning, body } = splitThinking(st.streamBuf, { loose: true })
-  if (reasoning) {
-    const existing = items.value.find(it => it.id === st.streamReasonId)
-    if (existing?.kind === 'reasoning') {
-      existing.content = reasoning
-    } else {
-      const id = genItemId()
-      st.streamReasonId = id
-      items.value.push({ kind: 'reasoning', content: reasoning, streaming: true, id })
-    }
-  }
-  if (body) {
-    const existing = items.value.find(it => it.id === st.streamTextId)
-    if (existing?.kind === 'text' && existing.role === 'assistant') {
-      existing.content = body
-    } else {
-      const id = genItemId()
-      st.streamTextId = id
-      items.value.push({ kind: 'text', role: 'assistant', content: body, streaming: true, id })
-    }
-  }
-}
-
-function flushStreamingFlags() {
-  for (const it of items.value) {
-    if (it.kind === 'text' && it.streaming) it.streaming = false
-    if (it.kind === 'reasoning' && it.streaming) it.streaming = false
-    if (it.kind === 'tool_call' && it.status === 'running') it.status = 'done'
-  }
-  resetStreamState()
-}
+// 流式正文/思考的累积与落条（[thinking] 拆分、独立 reasoning、收口）见
+// `composables/useChatStreamText.ts`；这里只负责按事件类型调用。
+const {
+  genItemId,
+  resetStreamState,
+  appendUserText,
+  onThinkingChunk,
+  onTextChunk,
+  flushStreamingFlags,
+} = useChatStreamText({ items, streamState })
 
 /**
  * 完成判定事件的**实时**文案（P1）：载荷是 host 证据判定的报告 `{outcome, findings, reasons}`。
