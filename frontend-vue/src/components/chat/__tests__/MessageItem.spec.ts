@@ -84,6 +84,40 @@ describe('流式期的渲染让位（§4.3）', () => {
     expect(wrapper.html()).toContain('<p>abcde</p>')
     sanitize.mockRestore()
   })
+
+  it('★ 水墨浮现只给本批新增字符建 span：前缀不重播、正文仍完整', async () => {
+    const streaming: TextItem = {
+      kind: 'text',
+      role: 'assistant',
+      content: 'ab',
+      id: 's-ink',
+      streaming: true,
+    }
+    const wrapper = mount(MessageItem, { props: { item: streaming as ChatItem } })
+    await settleAsync()
+
+    // 首批：两个字都是新增
+    expect(wrapper.find('.msg-text').text()).toBe('ab')
+    expect(wrapper.findAll('.ink')).toHaveLength(2)
+
+    // 纯追加：只有新增的 cd 建 span，ab 变成纯文本前缀（不重复动画）
+    await wrapper.setProps({ item: { ...streaming, content: 'abcd' } as ChatItem })
+    await settleAsync(2)
+    expect(wrapper.find('.msg-text').text()).toBe('abcd')
+    expect(wrapper.findAll('.ink')).toHaveLength(2)
+    expect(wrapper.find('.msg-text').text().startsWith('ab')).toBe(true)
+
+    // 正文被替换/缩短（重试、编辑）：前缀归零，新正文重新浮现 —— 不能留下旧前缀
+    await wrapper.setProps({ item: { ...streaming, content: 'xy' } as ChatItem })
+    await settleAsync(2)
+    expect(wrapper.find('.msg-text').text()).toBe('xy')
+    expect(wrapper.findAll('.ink')).toHaveLength(2)
+
+    // 回合结束：回落到 markdown（此时不再有 ink span）
+    await wrapper.setProps({ item: { ...streaming, content: 'xy' , streaming: false } as ChatItem })
+    await settleAsync()
+    expect(wrapper.findAll('.ink')).toHaveLength(0)
+  })
 })
 
 /** 生成 n 行代码块，用于验证长代码折叠阈值 */

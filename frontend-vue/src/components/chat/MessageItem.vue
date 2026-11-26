@@ -13,7 +13,7 @@ import { notify } from '../../utils/notify'
 import { fileTypeBadge, splitFileName, type SplitName } from '../../utils/fileName'
 import { CopyOutlined, CheckOutlined, EditOutlined, ReloadOutlined, LikeOutlined, DislikeOutlined, LikeFilled, DislikeFilled, CommentOutlined, BarChartOutlined } from '@ant-design/icons-vue'
 import ReasoningBlock from './ReasoningBlock.vue'
-import { inkCharsFor, inkIndexFor } from './ink'
+import { inkIndexFor, nextBaseChars, revealSlice } from './ink'
 import ToolCallCard from './ToolCallCard.vue'
 import ToolResultBlock from './ToolResultBlock.vue'
 import { renderMermaidBlocks } from './mermaidRenderer'
@@ -82,28 +82,23 @@ const props = withDefaults(defineProps<{
 const msgTextRef = ref<HTMLElement | null>(null)
 
 /**
- * 水墨逐字：流式期把正文拆成单字，让每个新字符"从模糊到对焦"。
+ * 水墨浮现：流式期只把**本批新增**字符拆成 span，已提交正文保持纯文本。
  *
  * 两条硬约束：
- *  1. **≤ 2000 字才拆** —— 逐字 DOM 数量与字符数线性相关，长回答会拖慢滚动；
- *     超过就退回整条插值（长回答本就在快速滚动，逐字反而不易读）。
- *  2. **只为本批新增字符计时** —— `--i = min(i - batchStart, 12)`：
- *     否则第 500 个字要等 14 秒才出现；上限 12 档让"一次返回一大段"也在 ~340ms 内铺开。
+ *  1. **前缀不建 span** —— DOM 规模只与本次增量有关，与消息总长无关；已显示的文字
+ *     不会因为 `--i` 变化而重播动画（修前是整条逐字拆，2000 字封顶）。
+ *  2. **只为本批新增字符计时** —— `--i = min(batchIndex, 12)`：一次返回一大段时，
+ *     最后一个字最多等 12 档（~340ms），不会"等十几秒才出现"。
+ *  3. 单批超过 `INK_MAX_TAIL_CHARS` 时退回整段纯文本（极端大 delta 不建几万节点）。
  */
-const inkChars = computed(() => {
-  if (!('streaming' in props.item) || !props.item.streaming) return null
-  return inkCharsFor(('content' in props.item ? props.item.content : '') || '')
+const contentText = computed(() => ('content' in props.item ? props.item.content : '') || '')
+const inkBaseChars = ref(0)
+watch(contentText, (now, before) => {
+  inkBaseChars.value = nextBaseChars(before, now)
 })
-const inkBatchStart = ref(0)
-watch(
-  () => ('content' in props.item ? props.item.content : '') || '',
-  (now, before) => {
-    const prev = (before || '').length
-    inkBatchStart.value = (now || '').length > prev ? prev : 0
-  },
-)
+const reveal = computed(() => revealSlice(contentText.value, inkBaseChars.value))
 function inkIndex(i: number): number {
-  return inkIndexFor(i, inkBatchStart.value)
+  return inkIndexFor(i)
 }
 
 /**
@@ -815,11 +810,12 @@ watch(
           v-if="item.streaming"
           class="msg-text streaming-text"
         >
-          <!-- 水墨逐字：≤2000 字才拆；超过退回整条插值（见 script 里的注释） -->
-          <template v-if="inkChars">
+          <!-- 水墨浮现：前缀是纯文本（不重播），只给本批新增字符建 span -->
+          <template v-if="reveal.tail.length">
+            <span v-if="reveal.prefix">{{ reveal.prefix }}</span>
             <span
-              v-for="(ch, i) in inkChars"
-              :key="i"
+              v-for="(ch, i) in reveal.tail"
+              :key="`${inkBaseChars}-${i}`"
               class="ink"
               :style="{ '--i': inkIndex(i) }"
             >{{ ch }}</span>
@@ -1277,13 +1273,16 @@ watch(
   -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 3rem), transparent);
 }
 /* 水墨晕染：极快高斯模糊 → 对焦；相邻字错开（步长走 token，见 style.css :root） */
+/* 水墨浮现：**只动透明度**。
+   修前用 filter: blur + translateY，几百个字符同时模糊对 GPU 不友好；而且位移/模糊
+   会让"文字已就位但看不清"，与"视线跟随"相悖。纯 opacity 最便宜也最接近"浮现"。 */
 .ink {
   animation: inkIn var(--dur-ink) var(--ease-out) both;
   animation-delay: calc(var(--i, 0) * var(--dur-ink-stagger));
 }
 @keyframes inkIn {
-  from { filter: blur(6px); opacity: 0.35; transform: translateY(1px); }
-  to { filter: blur(0); opacity: 1; transform: none; }
+  from { opacity: 0.35; }
+  to { opacity: 1; }
 }
 /* 行内图标下移 1/8 字高（与正文基线咬合） */
 .msg-text :is(svg, img) { vertical-align: -0.125em; }
