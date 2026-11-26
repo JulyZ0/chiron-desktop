@@ -366,6 +366,8 @@ export default {
   subagent_card_budget: "↑{input} · ↓{output} · {steps} خطوات",
   subagent_card_children_n: "{n} مهام فرعية",
   subagent_card_depth: "العمق {n}",
+  subagent_breadcrumb_root: "الجلسة الرئيسية",
+  subagent_breadcrumb_aria: "تسلسل الجلسات",
   subagent_card_retry_hint: "أعِد التشغيل من المهمة المخزنة؛ وإذا رفض الخادم، تعود المهمة إلى حقل الإدخال",
   subagent_card_retry_default: "فشلت المهمة الفرعية لـ {name}. يُرجى إعادة تشغيلها.",
   subagent_card_empty_summary: "(لا يوجد ملخّص بعد — افتحه لعرض تدفّق الأحداث)",

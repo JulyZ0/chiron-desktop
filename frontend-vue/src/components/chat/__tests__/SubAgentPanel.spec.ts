@@ -369,3 +369,86 @@ describe('SubAgentPanel 的失败重试（P0-2）', () => {
     expect(wrapper.find('.failure-rate').text()).toContain('50')
   })
 })
+
+/**
+ * 子 Agent 运行区的「查看」与层级面包屑。
+ *
+ * 修前：卡片上的「查看」只设置 `selectedRunId`，不切 tab —— 用户还在「运行」页，
+ * 界面上除了一行高亮没有任何变化（"点击无效"）。现在点它切到「输出」区，
+ * 并在顶部给出"主会话 → 祖先 run → 当前 run"的层级链；祖先可点、根节点回列表。
+ */
+describe('SubAgentPanel 的「查看」与层级面包屑', () => {
+  const HIERARCHY = [
+    { run_id: 'rs_parent', depth: 1, status: 'completed', profile: 'reviewer' },
+    { run_id: 'rs_child', parent_run_id: 'rs_parent', depth: 2, status: 'completed' },
+  ]
+
+  function mountWithRuns(runs: unknown[]) {
+    subagentApi.listSubagentRuns.mockResolvedValue({ runs, source: 'db' })
+    subagentApi.getSubagentRunEvents.mockResolvedValue({
+      events: [{ type: 'subagent.text', run_id: 'rs_child', depth: 2, content: '中途输出' }],
+      source: 'db',
+    })
+    return mount(SubAgentPanel, { props: { sessionId: 's1', liveEvents: [] as never } })
+  }
+
+  it('点「查看」切到输出区，并显示完整层级链', async () => {
+    const wrapper = mountWithRuns(HIERARCHY)
+    await flushPromises()
+
+    // 两张卡片各有一个「查看」；点子 run 那一个。
+    const openButtons = wrapper.findAll('.run-open')
+    expect(openButtons.length).toBe(2)
+    await openButtons[1].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.output').isVisible()).toBe(true)
+    const crumbs = wrapper.findAll('.run-breadcrumb .crumb').map(el => el.text())
+    expect(crumbs[0]).toBe('主会话')
+    expect(crumbs[1]).toContain('reviewer')
+    expect(crumbs[crumbs.length - 1]).toContain('子 Agent')
+    expect(wrapper.find('.crumb-current').text()).toBe(crumbs[crumbs.length - 1])
+    expect(subagentApi.getSubagentRunEvents).toHaveBeenCalledWith('rs_child')
+  })
+
+  it('点祖先面包屑切到父 run', async () => {
+    const wrapper = mountWithRuns(HIERARCHY)
+    await flushPromises()
+    await wrapper.findAll('.run-open')[1].trigger('click')
+    await flushPromises()
+    subagentApi.getSubagentRunEvents.mockClear()
+
+    // crumb[0] 是「主会话」根，crumb[1] 是父 run。
+    await wrapper.findAll('.run-breadcrumb .crumb')[1].trigger('click')
+    await flushPromises()
+
+    expect(subagentApi.getSubagentRunEvents).toHaveBeenCalledWith('rs_parent')
+    expect(wrapper.find('.crumb-current').text()).toContain('reviewer')
+  })
+
+  it('点根面包屑回到运行列表', async () => {
+    const wrapper = mountWithRuns(HIERARCHY)
+    await flushPromises()
+    await wrapper.findAll('.run-open')[1].trigger('click')
+    await flushPromises()
+
+    await wrapper.find('.run-breadcrumb .crumb-root').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.output').isVisible()).toBe(false)
+    expect(wrapper.find('.timeline').isVisible()).toBe(true)
+  })
+
+  it('父级已轮转：保留层级但不可点开（不抹掉关系）', async () => {
+    const wrapper = mountWithRuns([
+      { run_id: 'rs_orphan_child', parent_run_id: 'rs_gone', depth: 2, status: 'completed' },
+    ])
+    await flushPromises()
+    const crumbs = wrapper.findAll('.run-breadcrumb .crumb')
+    expect(crumbs.map(el => el.text())[0]).toBe('主会话')
+    // 中间那个是缺失的父级：显示但 disabled。
+    const missing = crumbs[1]
+    expect(missing.attributes('disabled')).toBeDefined()
+    expect(missing.text()).toContain('rs_gone'.slice(-6))
+  })
+})

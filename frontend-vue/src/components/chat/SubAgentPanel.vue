@@ -706,6 +706,79 @@ async function selectRun(runId: string) {
   }
 }
 
+/**
+ * 点「查看」：切到输出 tab **并**选中该 run。
+ *
+ * 修前只做 `selectedRunId = runId`：选中的是输出了，但用户还在「运行」tab 上，
+ * 界面上除了一行高亮没有任何变化 —— 这就是"查看按钮点了没反应"的机械原因。
+ * 外部定位（对话流里的工具卡）早就会切 tab，只有卡片上的入口漏了。
+ */
+function openRunDetails(runId: string): void {
+  saTab.value = 'output'
+  void selectRun(runId)
+}
+
+/** 面包屑的一个节点：`known=false` 表示父级已轮转出列表（只显示层级，不可点开）。 */
+interface RunCrumb {
+  runId: string
+  label: string
+  known: boolean
+}
+
+function runDisplayLabel(run: SubagentRunView): string {
+  const profile = String(run.profile || '').trim()
+  const short = run.run_id.length > 8 ? run.run_id.slice(-6) : run.run_id
+  return profile ? `${profile} · ${short}` : `${t('agent.sub_agent')} ${short}`
+}
+
+/**
+ * 选中 run 的层级链（主会话 → 最深祖先 → 当前 run）。
+ *
+ * 为什么需要：子 Agent 可以嵌套（`parent_run_id` 已经有完整血缘），但「输出」区
+ * 只显示一个 run —— 用户看到一段过程时无法回答"它在替谁干活、上面还有几层"。
+ * 面包屑把这条链一字排开，并且**可点祖先**直接切过去比对；根节点回运行列表。
+ *
+ * 父级不在列表里（后台 run 结束较久、已被轮转）时仍保留一个不可点的占位：
+ * 层级关系本身就是信息，不能因为拿不到父级的正文就把这段关系抹掉。
+ */
+const runBreadcrumbs = computed<RunCrumb[]>(() => {
+  const current = selectedRun.value
+  if (!current) return []
+  const byId = new Map<string, SubagentRunView>()
+  for (const run of [...displayRuns.value, ...liveRuns.value]) byId.set(run.run_id, run)
+  const ancestors: RunCrumb[] = []
+  const seen = new Set<string>([current.run_id])
+  let parentId = current.parent_run_id || ''
+  while (parentId && !seen.has(parentId) && ancestors.length < 20) {
+    seen.add(parentId)
+    const parent = byId.get(parentId)
+    if (!parent) {
+      const short = parentId.length > 8 ? parentId.slice(-6) : parentId
+      ancestors.unshift({
+        runId: parentId,
+        label: `${t('agent.sub_agent')} ${short}`,
+        known: false,
+      })
+      break
+    }
+    ancestors.unshift({ runId: parent.run_id, label: runDisplayLabel(parent), known: true })
+    parentId = parent.parent_run_id || ''
+  }
+  return [...ancestors, { runId: current.run_id, label: runDisplayLabel(current), known: true }]
+})
+
+/** 点祖先面包屑：切到那个 run（同一套"选中 + 切 tab"）。 */
+function goRunCrumb(crumb: RunCrumb): void {
+  if (!crumb.known || crumb.runId === selectedRunId.value) return
+  openRunDetails(crumb.runId)
+}
+
+/** 面包屑根「主会话」：回到运行列表并清空选择。 */
+function backToRunList(): void {
+  selectedRunId.value = ''
+  saTab.value = 'runs'
+}
+
 /** 已经为某个 run 补过"终态尾巴"的标记（避免终态后继续空轮询） */
 const tailLoaded = new Set<string>()
 
@@ -910,22 +983,22 @@ onBeforeUnmount(() => {
       :aria-label="$t('agent.sub_agent_view')"
     >
       <button
-        v-for="t in SA_TABS"
-        :key="t.id"
+        v-for="tab in SA_TABS"
+        :key="tab.id"
         type="button"
         role="tab"
         class="sa-tab"
-        :class="{ active: saTab === t.id }"
-        :aria-selected="saTab === t.id"
-        @click="saTab = t.id"
+        :class="{ active: saTab === tab.id }"
+        :aria-selected="saTab === tab.id"
+        @click="saTab = tab.id"
       >
-        {{ $t(t.labelKey) }}
+        {{ $t(tab.labelKey) }}
         <span
-          v-if="t.id === 'runs' && runs.length"
+          v-if="tab.id === 'runs' && runs.length"
           class="sa-tab-count"
         >{{ runs.length }}</span>
         <span
-          v-if="t.id === 'events' && liveEvents.length"
+          v-if="tab.id === 'events' && liveEvents.length"
           class="sa-tab-count"
         >{{ liveEvents.length }}</span>
       </button>
@@ -972,7 +1045,7 @@ onBeforeUnmount(() => {
           :cancelling="cancelling.has(run.run_id)"
           :rerunning="rerunning.has(run.run_id)"
           :now="nowTick"
-          @select="selectRun(run.run_id)"
+          @select="openRunDetails(run.run_id)"
           @toggle="toggleCollapse(run.run_id)"
           @stop="stopRun(run.run_id)"
           @pending="focusApprovals(run.run_id)"
@@ -1097,6 +1170,46 @@ onBeforeUnmount(() => {
       v-show="saTab === 'output'"
       class="output"
     >
+      <!-- 层级面包屑：子 Agent 可以嵌套，「输出」区又只显示一个 run —— 这条链回答
+           "它在替谁干活、上面还有几层"，祖先可点、根节点回运行列表。 -->
+      <nav
+        v-if="runBreadcrumbs.length"
+        class="run-breadcrumb"
+        data-testid="run-breadcrumb"
+        :aria-label="$t('agent.subagent_breadcrumb_aria')"
+      >
+        <button
+          type="button"
+          class="crumb crumb-root"
+          @click="backToRunList()"
+        >
+          {{ $t('agent.subagent_breadcrumb_root') }}
+        </button>
+        <template
+          v-for="(crumb, index) in runBreadcrumbs"
+          :key="crumb.runId"
+        >
+          <span
+            class="crumb-sep"
+            aria-hidden="true"
+          >›</span>
+          <span
+            v-if="index === runBreadcrumbs.length - 1"
+            class="crumb crumb-current"
+            aria-current="page"
+          >{{ crumb.label }}</span>
+          <button
+            v-else
+            type="button"
+            class="crumb"
+            :disabled="!crumb.known"
+            :title="crumb.label"
+            @click="goRunCrumb(crumb)"
+          >
+            {{ crumb.label }}
+          </button>
+        </template>
+      </nav>
       <!-- 多个子 Agent **并列成 tab**：一个会话里常有多个 run（并行委派、嵌套子代理），
            一次只看一个就逼用户回「运行」页来回点。tab 条让"切到那一个"只需一次点击，
            与"同一类东西并排摆放"的直觉一致。
@@ -1347,6 +1460,24 @@ onBeforeUnmount(() => {
 .ask-done { margin-top: 6px; font-size: 12px; color: var(--success, #16a34a); }
 
 .output { border-top: var(--hairline-width) solid var(--border-color, rgba(127, 127, 127, 0.24)); padding-top: 10px; }
+/* 层级面包屑：一行、可横向收缩（深层嵌套时截断的是中间标签，不是整条链）。
+   祖先可点 → 直接切过去比对；根节点回运行列表。 */
+.run-breadcrumb {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
+  margin-bottom: 8px; font-size: 12px; color: var(--text-secondary, #595959);
+  min-width: 0;
+}
+.run-breadcrumb .crumb {
+  max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 1px 4px; border: none; background: none; border-radius: var(--radius-sm, 4px);
+  font-size: 12px; color: var(--text-secondary, #595959); cursor: pointer;
+  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease;
+}
+.run-breadcrumb .crumb:hover:not(:disabled) { color: var(--primary-color, #1677ff); background: var(--bg-hover, rgba(0, 0, 0, 0.03)); }
+.run-breadcrumb .crumb:disabled { cursor: default; opacity: 0.7; }
+.run-breadcrumb .crumb-current { color: var(--text-primary); font-weight: var(--fw-medium); cursor: default; }
+.run-breadcrumb .crumb-root { font-weight: var(--fw-medium); }
+.run-breadcrumb .crumb-sep { color: var(--text-tertiary, #8c8c8c); flex: none; }
 .output-head { display: flex; justify-content: space-between; font-weight: var(--fw-semibold); }
 .output-meta { font-size: 12px; color: var(--text-tertiary, #8c8c8c); }
 

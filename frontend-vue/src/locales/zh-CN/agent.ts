@@ -366,6 +366,9 @@ export default {
   subagent_card_budget: "↑{input} · ↓{output} · {steps} 步",
   subagent_card_children_n: "{n} 个子任务",
   subagent_card_depth: "第 {n} 层",
+  // 输出区的层级面包屑：根是主会话，祖先可点
+  subagent_breadcrumb_root: "主会话",
+  subagent_breadcrumb_aria: "会话层级",
   subagent_card_retry_hint: "按原任务直接重跑；后端拒绝时把任务放回输入框由你决定",
   subagent_card_retry_default: "{name} 的子任务失败了，请重新执行。",
   subagent_card_empty_summary: "（还没有摘要，点开看事件流）",

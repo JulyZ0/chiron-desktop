@@ -366,6 +366,9 @@ export default {
   subagent_card_budget: "↑{input} · ↓{output} · {steps} steps",
   subagent_card_children_n: "{n} subtasks",
   subagent_card_depth: "Depth {n}",
+  // Breadcrumb above the output pane: root is the main session, ancestors are clickable.
+  subagent_breadcrumb_root: "Main session",
+  subagent_breadcrumb_aria: "Session hierarchy",
   subagent_card_retry_hint: "Re-run from the stored task; if the backend refuses, the task goes back to the composer",
   subagent_card_retry_default: "{name}'s subtask failed. Please run it again.",
   subagent_card_empty_summary: "(no summary yet — open it to see the event stream)",
