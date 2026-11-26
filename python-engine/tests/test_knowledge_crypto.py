@@ -59,6 +59,44 @@ def test_fingerprint_is_stable_and_short() -> None:
     assert crypto.key_fingerprint(PLAIN) != PLAIN
 
 
+# ── H20：信封加密（v2） ──
+
+#: 由 Go `internal/kms` 生成（keyID=vector，KEK=base64(00..1f)，明文 sk-vector-plaintext）。
+#: 两条语言各自的固定向量互解，是"轮换后的密文引擎读得开"的唯一无真机证明。
+V2_KEK_B64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+V2_CIPHER = (
+    "v2:vector:EE3SaVsJ7Miw+oC36zjvAcVHWOB2MOStqPpWkt66CErmrk0P8bj4buMnLxPxvEb2"
+    "qWKZYkmz0IHKxqCB:2A/1PLYYgENM3wuxFFwwCOSWxLP0mf/9zHHTP12QGiMVMGnnqNT6a6"
+    "sJwKhQu+Y="
+)
+V2_PLAIN = "sk-vector-plaintext"
+
+
+def test_envelope_go_vector(monkeypatch) -> None:
+    monkeypatch.setenv("KMS_KEK_KEYS", '{"vector":"' + V2_KEK_B64 + '"}')
+    monkeypatch.delenv("KMS_KEK_KEYS_FILE", raising=False)
+    assert crypto.decrypt_secret(V2_CIPHER, "") == V2_PLAIN
+
+
+def test_envelope_unknown_key_id_fails_closed(monkeypatch) -> None:
+    monkeypatch.delenv("KMS_KEK_KEYS", raising=False)
+    monkeypatch.delenv("KMS_KEK_KEYS_FILE", raising=False)
+    # 没有任何 KEK 时不得把密文当明文返回。
+    with pytest.raises(crypto.SecretCryptoError):
+        crypto.decrypt_secret(V2_CIPHER, "")
+
+
+def test_envelope_app_secret_fallback(monkeypatch) -> None:
+    """不配 KMS_KEK_KEYS 时，KEK 由 APP_SECRET 派生（老部署零改动）。"""
+    monkeypatch.delenv("KMS_KEK_KEYS", raising=False)
+    monkeypatch.delenv("KMS_KEK_KEYS_FILE", raising=False)
+    cipher = crypto.encrypt_secret(PLAIN, SECRET)
+    assert cipher.startswith("v1:")  # 写入仍是 v1；读取 v2 的兜底只用于网关写入的值
+    # 用 Go 侧派生规则构造的 v2 密文：Python 必须用同一把 fallback KEK 解开。
+    # 这里只验证 KEK 集合里有 app-secret-v1（向量见 internal/kms 的跨语言测试）。
+    assert crypto.APP_SECRET_KEY_ID in crypto._kek_material(SECRET)
+
+
 # ── blob ──
 
 

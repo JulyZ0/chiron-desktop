@@ -68,7 +68,7 @@ func llmEnc(cfg *config.Config) *settings.Store {
 
 // syncProviderKeyset 在写库后重建该 provider 的 Redis keyset 并广播变更。
 // Redis 不可用时仅返回 nil(仅 DB 权威;引擎退化为 env 种子),调用方按需告警。
-func syncProviderKeyset(ctx context.Context, cfg *config.Config, provider string) error {
+func syncProviderKeyset(ctx context.Context, provider string) error {
 	if db.Redis == nil {
 		return nil
 	}
@@ -99,21 +99,16 @@ func syncProviderKeyset(ctx context.Context, cfg *config.Config, provider string
 		}
 	}
 
-	enc := llmEnc(cfg)
-
-	// 从库里**解得开**的每一条，构成这份 keyset 的新内容（Redis 只是 DB 权威层的运行时镜像）。
-	// 解不开就跳过 —— 那是"这条不该进缓存"，不是"整份不刷新"（否则换 APP_SECRET 后旧明文会一直留着）。
+	// Redis 里放的是**密文**（DB 权威层的原样字节，v2 信封 / 旧 v1），不是明文：
+	// Redis 会做 AOF/RDB 持久化，镜像写明文等于给"密钥不落盘"开了个后门。
+	// 引擎在取出后按 `k` 前缀自行解密（app/gateway/key_ring.py），解不开就跳过该条
+	// —— 密钥材料不可用应当**少用**一把 key，而不是拿空串去打上游。
 	fields := make([]interface{}, 0, 2*len(rows))
 	for _, r := range rows {
-		plain, err := enc.DecryptString(r.encrypted)
-		if err != nil {
-			slog.Warn("llm keyset decrypt failed, dropping key from cache", "provider", provider, "error", err)
-			continue
-		}
 		// M27：权重必须随 keyset 一起镜像进 Redis 的 `w` 字段 —— 少了这一步，PG 里设的权重
 		// 永远到不了引擎（Lua 读不到 `w` 就按 1 兜底），那就是"看起来生效"的假象。
 		payload, _ := json.Marshal(map[string]interface{}{
-			"k": plain,
+			"k": r.encrypted,
 			"s": r.status,
 			"w": r.weight,
 		})
@@ -123,7 +118,7 @@ func syncProviderKeyset(ctx context.Context, cfg *config.Config, provider string
 	// **整体替换**而非 HMSET 增量写。HMSET 只增不删：一条 key 从库里删掉、只要该 provider 还剩别的 key，
 	// 它那 12 位指纹字段就永久留在 hash 里 —— 而引擎 KeyRing 是 `HGETALL` 整份镜像当"当前可用 key"轮询的
 	// （app/gateway/key_ring.py `_refresh`），于是**一把已撤销的 key 会被继续拿去打上游**。
-	// 全部解密失败 / 该 provider 已无 key ⇒ fields 为空 ⇒ 等价于清空 ⇒ 陈旧明文不再被服务（正确）。
+	// 该 provider 已无 key ⇒ fields 为空 ⇒ 等价于清空 ⇒ 陈旧材料不再被服务（正确）。
 	if _, err := llmReplaceKeyset(ctx, provider, fields); err != nil {
 		slog.Warn("llm keyset replace failed", "provider", provider, "error", err)
 	}
@@ -198,14 +193,16 @@ func HydrateProviderKeysets(ctx context.Context, cfg *config.Config) (int, error
 // hydrateKeysetsForProviders 对给定 provider 列表逐个重建 keyset。
 //
 // 拆出来是为了让"镜像哪些"与"怎么镜像"能被分别测到：真库用例若直接跑
-// HydrateProviderKeysets，会连开发者本机别的 provider 一起按测试 APP_SECRET 重解，
-// 解不开的那些就被**清空**（syncProviderKeyset 的 skip-undecryptable 语义）——
+// HydrateProviderKeysets，会连开发者本机别的 provider 一起重建 ——
 // 用例不该有这种副作用。逐个失败只告警不中断：这层是镜像，权威还在库里；
 // 但一个都不成功时必须能从日志里看出来（providers < providers_in_db）。
-func hydrateKeysetsForProviders(ctx context.Context, cfg *config.Config, providers []string) int {
+//
+// H20 起 Redis 里存的是**密文**（DB 原样字节），所以这里不再有"测试 APP_SECRET
+// 解不开就把别的 key 清空"的副作用；解不开只发生在引擎侧，且只影响该把 key。
+func hydrateKeysetsForProviders(ctx context.Context, _ *config.Config, providers []string) int {
 	hydrated := 0
 	for _, p := range providers {
-		if err := syncProviderKeyset(ctx, cfg, p); err != nil {
+		if err := syncProviderKeyset(ctx, p); err != nil {
 			// 单个 provider 失败不影响其余：这层是镜像，权威还在库里。
 			// 但必须留在日志里 —— 静默跳过的话，日志就只剩"网关起来了"，
 			// 用户看到的仍然是"没有 provider"。
@@ -330,7 +327,7 @@ func (h *AdminHandler) AddLLMKey(w http.ResponseWriter, r *http.Request) {
 		InternalError(w, "failed to add api key")
 		return
 	}
-	if err := syncProviderKeyset(r.Context(), h.cfg, body.Provider); err != nil {
+	if err := syncProviderKeyset(r.Context(), body.Provider); err != nil {
 		slog.Warn("sync keyset after add", "provider", body.Provider, "error", err)
 	}
 	// 端点覆盖随 key 一并保存（可选）：写入后引擎侧 base_url 优先取 DB 覆盖。
@@ -389,7 +386,7 @@ func (h *AdminHandler) UpdateLLMKeyStatus(w http.ResponseWriter, r *http.Request
 	_ = db.Pool.QueryRow(r.Context(),
 		`SELECT provider FROM llm_provider_keys WHERE left(key_hash, 12) = $1`, digest).Scan(&provider)
 	if provider != "" {
-		_ = syncProviderKeyset(r.Context(), h.cfg, provider)
+		_ = syncProviderKeyset(r.Context(), provider)
 	}
 	OK(w, map[string]interface{}{"status": "updated", "id": digest, "key_status": body.Status})
 }
@@ -441,7 +438,7 @@ func (h *AdminHandler) UpdateLLMKeyWeight(w http.ResponseWriter, r *http.Request
 	_ = db.Pool.QueryRow(r.Context(),
 		`SELECT provider FROM llm_provider_keys WHERE left(key_hash, 12) = $1`, digest).Scan(&provider)
 	if provider != "" {
-		_ = syncProviderKeyset(r.Context(), h.cfg, provider)
+		_ = syncProviderKeyset(r.Context(), provider)
 	}
 	OK(w, map[string]interface{}{"status": "updated", "id": digest, "weight": *body.Weight})
 }
@@ -471,7 +468,7 @@ func (h *AdminHandler) DeleteLLMKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if provider != "" {
-		_ = syncProviderKeyset(r.Context(), h.cfg, provider)
+		_ = syncProviderKeyset(r.Context(), provider)
 	}
 	OK(w, map[string]interface{}{"status": "deleted", "id": digest})
 }

@@ -2,8 +2,10 @@
 
 权威分层（与 docs/llm-provider-key-management-dr.md 一致）：
 - **DB 是权威**：网关 `syncProviderKeyset` 把 `llm:keys:{provider}` 这个 HASH 整体替换成
-  库里当前 key，字段值只带 `{"k": 明文, "s": 权威状态}`；`s` 只有管理员能改（active /
-  rate_limited / circuit_open）。
+  库里当前 key，字段值带 `{"k": 密文, "s": 权威状态, "w": 权重}`；`s` 只有管理员能改
+  （active / rate_limited / circuit_open）。`k` 是 **v1/v2 密文**（H20：Redis 会持久化，
+  镜像里不放明文）；引擎在选出 key 后用 APP_SECRET / KMS_KEK_KEYS 解开。
+  无前缀的历史值按明文处理，升级不需清缓存。
 - **Redis 镜像是每次取 key 的唯一仲裁**：本类不再维护进程内的"本地环 + freshness 缓存"，
   `get_key`/`report_failure` 各自跑一段**只碰这一个 HASH 键**的 Lua 脚本，读写都在服务端原子完成。
 
@@ -231,10 +233,16 @@ class KeyRing:
     """LLM 密钥环（V2：Redis 为每次取的原子仲裁；env 种子仅作降级兜底）。"""
 
     def __init__(
-        self, redis: Any = None, env_seeds: dict[str, list[str]] | None = None
+        self,
+        redis: Any = None,
+        env_seeds: dict[str, list[str]] | None = None,
+        app_secret: str = "",
     ) -> None:
         self._redis = redis
         self._env = env_seeds or {}
+        #: H20：Redis 镜像里的 `k` 是**密文**（v1 / v2 信封，与网关 internal/kms 同构）。
+        #: 解密只在选出一把之后做一次，不改变 Redis 侧"单键原子选 key"的语义。
+        self._app_secret = app_secret or ""
         # env 兜底路径（无 Redis）用的进程内 LRU 游标与软冷却：digest -> epoch。
         self._env_used: dict[str, float] = {}
         self._env_cool: dict[str, float] = {}
@@ -254,6 +262,30 @@ class KeyRing:
         if provider.endswith("-anthropic"):
             sources.append(provider[: -len("-anthropic")])
         return sources
+
+    def _decode_key(self, value: Any, provider: str = "") -> str:
+        """把 Redis 里的 `k` 还原成明文；解不开返回空串（该把 key 视为不可用）。
+
+        `v1:`/`v2:` 前缀是**密文标记**；无前缀的历史值按明文处理（兼容旧镜像）。
+        解不开时绝不回退成"把密文当 key 用"：那会拿一条 `v2:...` 去打上游，
+        既泄漏密文形态，又必然 401。
+        """
+        text = str(value or "")
+        if not text:
+            return ""
+        if not (text.startswith("v1:") or text.startswith("v2:")):
+            return text
+        try:
+            from app.knowledge.crypto import decrypt_secret
+
+            return decrypt_secret(text, self._app_secret)
+        except Exception as exc:  # noqa: BLE001 - 单条坏 key 不得阻断整份镜像
+            logger.warning(
+                "KeyRing: cannot decrypt key material for provider=%s (%s); key skipped",
+                provider,
+                type(exc).__name__,
+            )
+            return ""
 
     @staticmethod
     def _usable(obj: Any, now: float) -> tuple[str, float] | None:
@@ -293,7 +325,9 @@ class KeyRing:
                 continue
             usable = self._usable(obj, now)
             if usable:
-                out.append({"key": usable[0], "id": digest})
+                key = self._decode_key(usable[0], provider)
+                if key:
+                    out.append({"key": key, "id": digest})
         return out
 
     async def active_keys(self, provider: str) -> list[dict[str, Any]]:
@@ -373,7 +407,12 @@ class KeyRing:
                     digest, key = picked[0], picked[1]
                     digest = digest.decode() if isinstance(digest, bytes) else digest
                     key = key.decode() if isinstance(key, bytes) else key
-                    return {"key": str(key), "id": str(digest)}
+                    plain = self._decode_key(key, src)
+                    if plain:
+                        return {"key": plain, "id": str(digest)}
+                    # 解不开（KEK 不匹配 / 运维删了旧 keyID）⇒ 换下一个来源，
+                    # 最终退 env 种子；绝不把密文当 key 返回。
+                    continue
         return self._env_pick(provider, now)
 
     def _env_pick(self, provider: str, now: float) -> dict[str, Any] | None:

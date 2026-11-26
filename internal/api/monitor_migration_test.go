@@ -88,13 +88,18 @@ func TestMonitorMigrationChainSingleHead(t *testing.T) {
 	if len(heads) != 1 {
 		t.Fatalf("迁移链有 %d 个 head（应为 1）: %v", len(heads), heads)
 	}
-	// 单链：… → 0008_team_accounts → 0009_personas → 0010_user_invites → 0011_project_locator
-	//       → 0012_session_fold_lineage → 0013_tenant_identity。
+	// 单链：… → 0013_tenant_identity → 0014_kb_index_engine → 0015_kb_status_normalize。
 	//
 	// 这里断言的是**链尾**（head）与关键环节的父子关系。新增迁移时只改这一处 head 断言，
 	// 不要退化成"有且仅有一个 head"就收工 —— 那样链在某处被接错时仍然会绿。
-	if heads[0] != "0013_tenant_identity" {
-		t.Fatalf("链头应为 0013_tenant_identity，实际 %q", heads[0])
+	if heads[0] != "0015_kb_status_normalize" {
+		t.Fatalf("链头应为 0015_kb_status_normalize，实际 %q", heads[0])
+	}
+	if migs["0015_kb_status_normalize"].down != "0014_kb_index_engine" {
+		t.Fatalf("0015 必须接在 0014_kb_index_engine 之后，实际 %q", migs["0015_kb_status_normalize"].down)
+	}
+	if migs["0014_kb_index_engine"].down != "0013_tenant_identity" {
+		t.Fatalf("0014 必须接在 0013_tenant_identity 之后，实际 %q", migs["0014_kb_index_engine"].down)
 	}
 	if migs["0013_tenant_identity"].down != "0012_session_fold_lineage" {
 		t.Fatalf("0013 必须接在 0012_session_fold_lineage 之后，实际 %q", migs["0013_tenant_identity"].down)

@@ -649,6 +649,8 @@ async def _start_gateway() -> Any:
             for preset in _catalog
             if (seed := provider_api_key(preset))
         },
+        # H20：keyset 里的 `k` 是密文，解 envelope 需要与网关共享的 KEK 材料。
+        app_secret=settings.app_secret,
     )
     # DR 集中派(管理端 /v1/admin/api-keys 添加的 key 经网关写入 Redis keyset
     # llm:keys:{provider}):provider 注册条件 = env 种子非空 或 keyset 已存在该 provider 的 key

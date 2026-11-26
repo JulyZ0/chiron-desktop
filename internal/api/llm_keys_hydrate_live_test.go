@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,10 +23,9 @@ import (
 // 以及"运行中的引擎真的被告知要重读"。
 //
 // 为什么用例只喂 hydrateKeysetsForProviders 而不直接跑 HydrateProviderKeysets：后者会
-// 对**全表**每个 provider 重解重镜像，测试用的 APP_SECRET 解不开开发者本机已有的密文，
-// 按"解不开就不进缓存"的语义会把它们清空 —— 用例不该有这种副作用。
-// 全表那一步（DISTINCT + 缺表跳过）由 TestLiveDistinctLLMKeyProviders 与
-// llm_keys_hydrate_test.go 的闸门用例分别覆盖。
+// 对**全表**每个 provider 重建镜像，会把开发者本机已有的 keyset 一并改写 ——
+// 用例不该有这种副作用。全表那一步（DISTINCT + 缺表跳过）由
+// TestLiveDistinctLLMKeyProviders 与 llm_keys_hydrate_test.go 的闸门用例分别覆盖。
 
 const hydrateTestSecret = "m52-live-test-app-secret"
 
@@ -139,9 +139,26 @@ func TestLiveHydrateKeysetsMirrorsAuthorityAndNotifies(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 			t.Fatalf("字段 %s 不是预期 JSON: %q (%v)", field, raw, err)
 		}
-		if payload.K != tc.wantKey || payload.S != tc.wantStatus || payload.W != tc.wantWeight {
-			t.Fatalf("字段 %s 内容不对: 期望 {k:%s s:%s w:%d}，实际 %+v",
-				field, tc.wantKey, tc.wantStatus, tc.wantWeight, payload)
+		if payload.S != tc.wantStatus || payload.W != tc.wantWeight {
+			t.Fatalf("字段 %s 内容不对: 期望 {s:%s w:%d}，实际 %+v",
+				field, tc.wantStatus, tc.wantWeight, payload)
+		}
+		// H20「明文永不落盘」回归：Redis 里必须是密文，且能用部署密钥还原成原 key。
+		if payload.K == tc.wantKey {
+			t.Fatalf("字段 %s 的 k 是明文：Redis 持久化后密钥就泄漏了", field)
+		}
+		if !strings.HasPrefix(payload.K, "v2:") {
+			t.Fatalf("字段 %s 的 k 不是 v2 信封: %q", field, payload.K)
+		}
+		plain, err := settings.New(db.Pool, hydrateTestSecret).DecryptString(payload.K)
+		if err != nil {
+			t.Fatalf("字段 %s 的密文解不开: %v", field, err)
+		}
+		if plain != tc.wantKey {
+			t.Fatalf("字段 %s 解出 %q，期望 %q", field, plain, tc.wantKey)
+		}
+		if strings.Contains(raw, tc.wantKey) {
+			t.Fatalf("字段 %s 的 payload 里出现明文: %q", field, raw)
 		}
 	}
 

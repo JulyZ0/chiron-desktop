@@ -133,6 +133,51 @@ async def test_get_key_redis_empty_falls_back_to_env():
     assert await ring.get_key("openai") == {"key": "sk-env", "id": _key_id("openai", "sk-env")}
 
 
+# ── H20：Redis 镜像里的 k 是密文 ──
+
+
+async def test_get_key_decrypts_sealed_material(monkeypatch):
+    monkeypatch.delenv("KMS_KEK_KEYS", raising=False)
+    monkeypatch.delenv("KMS_KEK_KEYS_FILE", raising=False)
+    from app.knowledge import crypto
+
+    cipher = crypto.encrypt_secret("sk-sealed", "deploy-secret")
+    ring = KeyRing(redis=_FakeRedis(eval_results=[["dig", cipher]]), app_secret="deploy-secret")
+    assert await ring.get_key("openai") == {"key": "sk-sealed", "id": "dig"}
+
+
+async def test_get_key_skips_undecryptable_material(monkeypatch):
+    monkeypatch.delenv("KMS_KEK_KEYS", raising=False)
+    monkeypatch.delenv("KMS_KEK_KEYS_FILE", raising=False)
+    from app.knowledge import crypto
+
+    cipher = crypto.encrypt_secret("sk-sealed", "deploy-secret")
+    ring = KeyRing(
+        redis=_FakeRedis(eval_results=[["dig", cipher]]),
+        env_seeds={"openai": ["sk-env"]},
+        app_secret="wrong-secret",
+    )
+    # 解不开必须换下一来源（env 兜底），绝不把 `v1:...` 当 key 返回。
+    assert await ring.get_key("openai") == {"key": "sk-env", "id": _key_id("openai", "sk-env")}
+
+
+async def test_active_keys_skips_undecryptable_material(monkeypatch):
+    monkeypatch.delenv("KMS_KEK_KEYS", raising=False)
+    monkeypatch.delenv("KMS_KEK_KEYS_FILE", raising=False)
+    from app.knowledge import crypto
+
+    sealed = crypto.encrypt_secret("sk-sealed", "right")
+    data = {
+        "llm:keys:openai": {
+            "a": json.dumps({"k": sealed, "s": "active"}),
+            "b": json.dumps({"k": "sk-plain-legacy", "s": "active"}),
+        }
+    }
+    ring = KeyRing(redis=_FakeRedis(hash_data=data), app_secret="right")
+    keys = await ring.active_keys("openai")
+    assert sorted(k["key"] for k in keys) == ["sk-plain-legacy", "sk-sealed"]
+
+
 async def test_get_key_redis_down_falls_back_to_env():
     ring = KeyRing(redis=_FakeRedis(eval_raises=True), env_seeds={"openai": ["sk-env"]})
     assert await ring.get_key("openai") == {"key": "sk-env", "id": _key_id("openai", "sk-env")}

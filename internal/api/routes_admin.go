@@ -194,6 +194,12 @@ func registerAdminRoutes(
 	mux.Handle("PUT /v1/admin/api-keys/{id}/weight", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.UpdateLLMKeyWeight)))))
 	mux.Handle("DELETE /v1/admin/api-keys/{id}", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.DeleteLLMKey)))))
 
+	// H20：密钥信封加密的状态与轮换。
+	// 读用 platformReadMW（回的是全平台密钥的加密口径与规模）；轮换用 platformWriteMW ——
+	// 它会把全部密文重包到当前 KEK，属于平台级写操作。
+	mux.Handle("GET /v1/admin/kms/status", authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.KMSStatus)))))
+	mux.Handle("POST /v1/admin/kms/rotate", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.RotateKMS)))))
+
 	// LLM provider catalog routes（服务提供商目录与端点覆盖）
 	mux.Handle("GET /v1/admin/llm-providers", authMW(rlMW(platformReadMW(http.HandlerFunc(adminHandler.ListLLMProviders)))))
 	mux.Handle("PUT /v1/admin/llm-providers/{id}", authMW(rlMW(platformWriteMW(http.HandlerFunc(adminHandler.SetLLMProviderConfig)))))
