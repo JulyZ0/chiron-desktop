@@ -43,3 +43,29 @@ func TestCreateSessionTenantComesFromCaller(t *testing.T) {
 		t.Fatalf("sessions INSERT 必须使用调用方的 tenantID：\n%s", args)
 	}
 }
+
+// A3：**隐式**建会话（消息先落库、会话后建）同样不能再写死默认租户。
+//
+// 显式 CreateSession 早已要求调用方传 tenantID（上一条），但 SaveUserMessage /
+// SaveMessages / CreateTurn / SaveMessage 这条"按 session_id 写入"的路径仍硬编码
+// DefaultTenantID —— 多租户/邀请码用户经它产生的会话落进默认租户：本人列表看不见，
+// 项目侧按 claims tenant 过滤也找不到。没有 DB 时这里只钉结构事实：
+// 整个文件不得再出现常量租户，两处 INSERT 都必须读 tenantIDFromContext(ctx)。
+func TestImplicitSessionInsertsUseCallerTenant(t *testing.T) {
+	src, err := os.ReadFile("manager_messages.go")
+	if err != nil {
+		t.Fatalf("读取 manager_messages.go 失败: %v", err)
+	}
+	text := string(src)
+
+	if strings.Contains(text, "DefaultTenantID") {
+		t.Fatal("manager_messages.go 又出现了 DefaultTenantID：隐式建会话必须用 tenantIDFromContext(ctx)")
+	}
+	inserts := strings.Count(text, "INSERT INTO sessions (id, tenant_id, user_id, title, created_at, updated_at)")
+	if inserts < 2 {
+		t.Fatalf("预期至少两处隐式建会话 INSERT，找到 %d 处 —— 守卫的匹配串可能已失效", inserts)
+	}
+	if got := strings.Count(text, "tenantIDFromContext(ctx)"); got < inserts {
+		t.Fatalf("每处 sessions INSERT 都要读 claims 租户：INSERT=%d, tenantIDFromContext=%d", inserts, got)
+	}
+}

@@ -9,7 +9,7 @@
 而本地免口令引导要求回环来源（容器 NAT 后不是）。自签是本测试唯一稳定的入口。
 
 用法：
-    python scripts/integration/mint_token.py <jwt_secret> [user_id] [email]
+    python scripts/integration/mint_token.py <jwt_secret> [user_id] [email] [tenant_id]
 """
 
 from __future__ import annotations
@@ -77,7 +77,9 @@ def main(argv: list[str]) -> int:
     secret = argv[1]
     user_id = argv[2] if len(argv) > 2 else DEFAULT_USER_ID
     email = argv[3] if len(argv) > 3 else DEFAULT_EMAIL
-    print(mint(secret, user_id, email))
+    # 第 4 个参数：租户。集成带用它签第二租户的 token，验证"隐式建会话落对桶"（A3）。
+    tenant_id = int(argv[4]) if len(argv) > 4 else DEFAULT_TENANT_ID
+    print(mint(secret, user_id, email, tenant_id=tenant_id))
     return 0
 
 

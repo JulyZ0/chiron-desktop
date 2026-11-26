@@ -29,7 +29,7 @@ func (m *Manager) SaveMessage(ctx context.Context, sessionID, role, content stri
 		`INSERT INTO sessions (id, tenant_id, user_id, title, created_at, updated_at)
 		 VALUES ($1, $2, NULL::uuid, '', NOW(), NOW())
 		 ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
-		sessionID, DefaultTenantID)
+		sessionID, tenantIDFromContext(ctx))
 	if err != nil {
 		return fmt.Errorf("ensure session: %w", err)
 	}
@@ -113,7 +113,7 @@ func (m *Manager) ensureSessionOwnedWithTitle(ctx context.Context, sessionID, us
 		     END
 		  WHERE sessions.user_id = EXCLUDED.user_id
 		 RETURNING id`,
-		sessionID, DefaultTenantID, userID, title).Scan(&ensured)
+		sessionID, tenantIDFromContext(ctx), userID, title).Scan(&ensured)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: %s", ErrSessionForbidden, sessionID)
 	}
