@@ -330,10 +330,11 @@ func TestWebSocketHandshakeFailsClosedWithoutRevocationStore(t *testing.T) {
 
 	env := newWSAuthTestEnv(t)
 	env.issueToken(t, false)
-	if got := env.httpStatus(t); got != http.StatusUnauthorized {
-		t.Fatalf("HTTP 撤销存储不可用状态=%d，want 401", got)
+	// 存储不可用 → 503（可重试），不是 401：否则 Redis 抖动会让前端清掉登录态。
+	if got := env.httpStatus(t); got != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP 撤销存储不可用状态=%d，want 503", got)
 	}
-	assertWSHandshakeRejected(t, env, http.StatusUnauthorized)
+	assertWSHandshakeRejected(t, env, http.StatusServiceUnavailable)
 }
 
 func TestWebSocketHandshakeFailsClosedOnRedisError(t *testing.T) {
@@ -347,7 +348,7 @@ func TestWebSocketHandshakeFailsClosedOnRedisError(t *testing.T) {
 
 	env := newWSAuthTestEnv(t)
 	env.issueToken(t, false)
-	assertWSHandshakeRejected(t, env, http.StatusUnauthorized)
+	assertWSHandshakeRejected(t, env, http.StatusServiceUnavailable)
 }
 
 // 纪元精度是秒，而"改密成功 → 响应里签发新 token"就发生在同一秒内。

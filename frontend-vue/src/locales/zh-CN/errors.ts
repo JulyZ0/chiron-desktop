@@ -287,6 +287,8 @@ export default {
   no_relevant_content_found: "未找到相关内容",
   no_similar_memory_found: "未找到相似记忆",
   unknown_error: "未知错误",
+  unhandled_error: "出了点问题，请重试；若持续出现请刷新页面",
+  chunk_load_failed: "页面已更新，请刷新后继续",
   the_document_may_be_processing_or_its_format_is_not_previewable_yet: "文档可能正在处理中，或内容格式暂不支持预览",
   unable_to_start_speech_transcription_please_check_microphone_permission: "无法启动语音转写，请检查麦克风权限",
   the_switches_below_all_depend_on_enable_email_service_above_the_send_channel_tab_please_turn_on_the_master_switch_and_save_first_otherwise_the_save_will_be_rejected: "下面的开关都依赖「启用邮件服务」（在“发信通道”页签上方）。请先打开总开关并保存，否则保存会被拒绝。",

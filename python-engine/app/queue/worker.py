@@ -13,6 +13,7 @@ from typing import Any, cast
 
 import redis.asyncio as aioredis
 
+from app.observability.logging import tenant_id_var, trace_id_var
 from app.observability.metrics import QUEUE_DEPTH, QUEUE_DLQ_TOTAL, QUEUE_PROCESSING_DURATION, QUEUE_RETRY_TOTAL
 from app.queue import heartbeat, idempotency, job_events
 from app.redis_keys import rkey
@@ -614,6 +615,14 @@ class QueueWorker:
         payload_raw = message.get("payload", "{}")
         retry_count = _as_int(message.get("retry_count"))
         tenant_id = _as_int(message.get("tenant_id"))
+        # 队列 worker 在**另一个任务/进程**里运行：producer 把 trace_id 写进了
+        # envelope，但 contextvars 不会跨过去。不恢复的话这条任务的所有日志
+        # 都缺 trace_id，网关侧一跳转就断链。本函数在自己的 task 里跑，
+        # 直接用 set 即可（task 结束随之丢弃），不需要 reset。
+        if _trace := message.get("trace_id"):
+            trace_id_var.set(str(_trace))
+        if tenant_id:
+            tenant_id_var.set(int(tenant_id))
         idem_key = idempotency.key_for(task_type, task_id, message.get("idempotency_key", ""))
         deadline_raw = message.get("deadline", "")
 

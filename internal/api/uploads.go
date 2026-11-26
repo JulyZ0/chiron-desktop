@@ -229,6 +229,9 @@ func (h *UploadHandler) PutChunk(w http.ResponseWriter, r *http.Request) {
 		Unauthorized(w, ErrAuthRequired)
 		return
 	}
+	// 分片也可能是 64MB：按整段上传放宽读期限，避免每一片都被 10s 的
+	// 全局 ReadTimeout 切断。
+	extendUploadReadDeadline(w)
 	uploadID := r.PathValue("id")
 	idxStr := r.PathValue("index")
 	idx, err := strconv.Atoi(idxStr)

@@ -41,6 +41,11 @@ func (r *sessionRevocation) Error() string {
 // 判定顺序与既有 HTTP 语义一致：纪元 → 黑名单 → 强制改密。
 // 纪元比较复用 tokenRevokedByEpoch（`epoch > token.iat` 才算撤销），因此
 // 撤销同一秒内新签发的 token 不会被误杀 —— 改密响应里新发的 token 就落在这一秒。
+//
+// **"查不了" ≠ "已撤销"**：存储不可用返回 503（可重试），只有明确 revoked 才是 401。
+// 旧实现两者都回 401，而前端对 401 的处理是清 token + 跳登录 —— Redis 主从切换
+// 几秒就会把全团队踢下线并清掉凭据。安全语义不变（仍然 fail-close，拒绝请求），
+// 变的只是让客户端知道"这是暂时故障，别销毁登录态"。
 func evaluateSessionRevocation(ctx context.Context, claims *auth.Claims, path string) *sessionRevocation {
 	if claims == nil {
 		return &sessionRevocation{status: http.StatusUnauthorized, message: "missing authorization"}
@@ -52,11 +57,7 @@ func evaluateSessionRevocation(ctx context.Context, claims *auth.Claims, path st
 	}
 	revoked, err := tokenRevokedByEpoch(ctx, claims.UserID, issuedAt, hasIssuedAt)
 	if err != nil {
-		return &sessionRevocation{
-			status:  http.StatusUnauthorized,
-			message: "authentication service unavailable",
-			cause:   err,
-		}
+		return authStoreUnavailable(err)
 	}
 	if revoked {
 		return &sessionRevocation{status: http.StatusUnauthorized, message: "token has been revoked"}
@@ -64,11 +65,7 @@ func evaluateSessionRevocation(ctx context.Context, claims *auth.Claims, path st
 	if claims.ID != "" {
 		blacklisted, err := checkJWTBlacklisted(ctx, claims.ID)
 		if err != nil {
-			return &sessionRevocation{
-				status:  http.StatusUnauthorized,
-				message: "authentication service unavailable",
-				cause:   err,
-			}
+			return authStoreUnavailable(err)
 		}
 		if blacklisted {
 			return &sessionRevocation{status: http.StatusUnauthorized, message: "token has been revoked"}
@@ -82,4 +79,17 @@ func evaluateSessionRevocation(ctx context.Context, claims *auth.Claims, path st
 		}
 	}
 	return nil
+}
+
+// authStoreUnavailable 是"撤销存储查不了"的统一拒绝形态：503 + 稳定错误码。
+//
+// 调用方（authMW）看到 code 非空会用 JSONWithCode 写出对应状态码；前端据此
+// 走"稍后重试"而不是"登录已失效"。cause 只进日志，不进响应体。
+func authStoreUnavailable(cause error) *sessionRevocation {
+	return &sessionRevocation{
+		status:  http.StatusServiceUnavailable,
+		code:    CodeServiceUnavailable,
+		message: "authentication service unavailable",
+		cause:   cause,
+	}
 }

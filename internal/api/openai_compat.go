@@ -302,7 +302,9 @@ func proxyOpenAIStream(
 	rc := http.NewResponseController(w)
 	// SSE 长连接豁免服务器 WriteTimeout（默认会切断流）；豁免是逐帧完成的，
 	// 见下方每一帧前的 SetWriteDeadline。
-	_ = rc.SetWriteDeadline(time.Time{})
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		slog.Warn("openai stream: cannot exempt write timeout (long streams will be cut)", "error", err)
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")

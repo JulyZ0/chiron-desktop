@@ -281,6 +281,8 @@ export default {
   no_relevant_content_found: "لم يُعثر على محتوى ذي صلة",
   no_similar_memory_found: "لم يُعثر على ذاكرة مشابهة",
   unknown_error: "خطأ غير معروف",
+  unhandled_error: "حدث خطأ ما. أعد المحاولة، وحدّث الصفحة إذا تكرر ذلك.",
+  chunk_load_failed: "تم تحديث التطبيق. يرجى تحديث الصفحة للمتابعة.",
   the_document_may_be_processing_or_its_format_is_not_previewable_yet: "قد يكون المستند قيد المعالجة، أو أن صيغته غير قابلة للعرض مبدئيًا",
   unable_to_start_speech_transcription_please_check_microphone_permission: "تعذّر بدء تحويل الكلام إلى نص، يرجى التحقق من إذن الميكروفون",
   the_switches_below_all_depend_on_enable_email_service_above_the_send_channel_tab_please_turn_on_the_master_switch_and_save_first_otherwise_the_save_will_be_rejected: "كل المفاتيح أدناه تعتمد على «تفعيل خدمة البريد» (أعلى تبويب «قناة الإرسال»). يرجى تشغيل المفتاح الرئيسي والحفظ أولًا، وإلا سيُرفض الحفظ.",

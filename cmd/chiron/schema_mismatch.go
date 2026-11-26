@@ -32,6 +32,9 @@ type schemaMismatch struct {
 	Reason string `json:"reason,omitempty"`
 	// Missing 在 Reason=missing_tables 时列出缺失的表名。
 	Missing []string `json:"missing_tables,omitempty"`
+	// Error 是"根本查不了"的原因（迁移目录缺失、查库失败）；
+	// 与 Expected/Actual 不同，它不代表版本不一致，而是校验本身不可用。
+	Error string `json:"error,omitempty"`
 }
 
 // Reason 取值。前端只按 `status` 判定，这两个值只用于日志与页面副标题。
@@ -63,6 +66,7 @@ func (m schemaMismatch) body() schemaMismatchBody {
 		Reason:   m.Reason,
 		Missing:  m.Missing,
 		Fix:      schemaMismatchFix,
+		Error:    m.Error,
 	}
 }
 

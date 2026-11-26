@@ -104,16 +104,19 @@ func main() {
 		}
 		pgConnected = true
 		defer db.ClosePostgres()
-		// 幂等 seed 默认租户（不依赖迁移状态；缺失时注册会违反外键 23503）
-		if err := db.EnsureDefaultTenant(ctx, db.Pool); err != nil {
-			slog.Warn("ensure default tenant failed", "error", err)
-		}
 		// schema 版本校验（只读）：迁移由发布流程/DBA 执行，应用不再自行迁移
 		drift = verifySchemaVersion(ctx, cfg)
 	}
 
 	if !pgConnected {
 		fatalExit("FATAL: no PostgreSQL connection was established — refusing to start (check POSTGRES_DSN)")
+	}
+
+	// 默认租户种子必须在**两条路径之外**执行：配了读副本（DatabaseRouter）时
+	// 旧实现跳过了这一步，tenants(id=1) 不存在，注册/建会话在首次部署就撞外键 23503。
+	// 种子幂等且不依赖迁移状态，放在这里对单池与读写分离完全一致。
+	if err := db.EnsureDefaultTenant(ctx, db.Pool); err != nil {
+		slog.Warn("ensure default tenant failed", "error", err)
 	}
 
 	// schema 漂移：业务路由一条都不能挂（PG/Redis/引擎的初始化都假定 schema 正确），
@@ -544,14 +547,20 @@ func logResourceLayout() {
 func verifySchemaVersion(ctx context.Context, cfg *config.Config) *schemaMismatch {
 	expected, actual, match, err := db.CheckSchemaVersion(ctx)
 	if err != nil {
-		// 迁移目录解析失败时不阻断启动（DB 也许还没就绪，且这是"看不见"而非"不一致"），
-		// 但日志里必须带上解析到的**绝对**目录：否则这条 warn 只会告诉运维"检查不可用"，
-		// 而他连该去哪个目录放 migrations 都不知道。
-		slog.Warn("schema version check unavailable",
+		// **检查不了 ≠ 检查通过**。旧实现只 Warn 后 return nil，等于"缺 migrations /
+		// MIGRATIONS_DIR 指错 / 查库抖动"时整体跳过版本校验，服务带着不匹配 schema
+		// 起来，直到运行期 `relation does not exist` 才暴露 —— 正是本函数要防的场景。
+		// 现在默认拒绝启动（仍可用 ALLOW_SCHEMA_DRIFT=true 显式越过），并保留绝对目录，
+		// 否则运维不知道迁移该放哪里。
+		slog.Error("schema version check unavailable",
 			"error", err,
 			"migrations_dir", db.MigrationsDir(),
 			"resources_root", config.ResourcesRoot())
-		return nil
+		if cfg.AllowSchemaDrift {
+			slog.Warn("ALLOW_SCHEMA_DRIFT=true — continuing although schema cannot be verified")
+			return nil
+		}
+		return &schemaMismatch{Reason: schemaMismatchRevision, Error: err.Error()}
 	}
 	if match {
 		slog.Info("schema version verified", "migration", expected)

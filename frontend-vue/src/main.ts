@@ -14,6 +14,7 @@ import { useAuthStore } from './stores/auth'
 import { i18n, applyDocumentLocale } from './i18n'
 import { installLocaleSync } from './utils/localeSync'
 import { syncDevAuthBypassFromUrl } from './stores/device'
+import { notify } from './utils/notify'
 
 // 开发环境登录绕过：URL 参数（`?devAuthBypass=1`）必须先落到 localStorage，
 // 否则首帧的模式/登录态判定读到的还是旧值。生产构建里这个函数是空操作。
@@ -24,6 +25,33 @@ syncDevAuthBypassFromUrl()
 applyDocumentLocale()
 
 const app = createApp(App)
+
+// ── 全局错误兜底 ──
+//
+// ErrorBoundary 只覆盖**子树内的渲染/生命周期**错误；事件处理器里的 throw、
+// `void someAsync()` 的 rejection、路由懒加载 chunk 404 都不经过它。缺了这三条，
+// 线上的表现是"点了没反应"或导航后白屏，且没有任何上报入口。
+let chunkErrorNotified = false
+router.onError((err) => {
+  const text = String((err as { message?: string })?.message ?? err)
+  if (/dynamically imported module|Importing a module script failed|Loading chunk/i.test(text)) {
+    // 发布新版本后旧页面引用的 chunk 已不在：提示刷新，而不是让 router-view 空白。
+    if (!chunkErrorNotified) {
+      chunkErrorNotified = true
+      notify.error(i18n.global.t('errors.chunk_load_failed'))
+    }
+    return
+  }
+  console.error('[router]', err)
+})
+app.config.errorHandler = (err, _instance, info) => {
+  console.error(`[vue:${info}]`, err)
+  notify.error(i18n.global.t('errors.unhandled_error'))
+}
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('[unhandledrejection]', event.reason)
+  notify.error(i18n.global.t('errors.unhandled_error'))
+})
 
 // 标记应用启动
 performance.mark('app-init-start')

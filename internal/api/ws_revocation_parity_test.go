@@ -102,8 +102,9 @@ func TestSessionRevocationParityBetweenHTTPAndWebSocket(t *testing.T) {
 				db.Redis = nil
 				return func() { db.Redis = previous }
 			},
-			httpWant: http.StatusUnauthorized,
-			wsWant:   http.StatusUnauthorized,
+			// 存储不可用 ≠ 凭据被撤销：必须回 503（可重试），前端才不会清登录态。
+			httpWant: http.StatusServiceUnavailable,
+			wsWant:   http.StatusServiceUnavailable,
 		},
 		{
 			name: "撤销存储读失败",
@@ -117,8 +118,8 @@ func TestSessionRevocationParityBetweenHTTPAndWebSocket(t *testing.T) {
 					rdb.mu.Unlock()
 				}
 			},
-			httpWant: http.StatusUnauthorized,
-			wsWant:   http.StatusUnauthorized,
+			httpWant: http.StatusServiceUnavailable,
+			wsWant:   http.StatusServiceUnavailable,
 		},
 	}
 

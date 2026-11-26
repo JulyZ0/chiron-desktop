@@ -22,7 +22,14 @@ export default defineConfig(({ mode }) => ({
   base: mode === 'desktop' ? './' : '/',
   plugins: [
     vue(),
-    fileViewerRenderers({ copyAssets: true }),
+    fileViewerRenderers({
+      copyAssets: true,
+      // 默认 inject=true 会把 `virtual:file-viewer-renderers` 作为 **entry 的静态模块**
+      // 注入 index.html —— 于是 pdfjs/docx/diagram 这些大块全部进首屏 modulepreload
+      // （实测 vendor-fileviewer 1.8MB br、vendor-diagram 636KB br）。
+      // MediaView 本身就是懒加载路由，并且显式传 `preset: allPreset`，不需要入口注册。
+      inject: false,
+    }),
     AutoImport({
       imports: ['vue', 'vue-router'],
       dts: 'src/auto-imports.d.ts',

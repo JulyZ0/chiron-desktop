@@ -284,6 +284,8 @@ export default {
   no_relevant_content_found: "No relevant content found",
   no_similar_memory_found: "No similar memory found",
   unknown_error: "Unknown error",
+  unhandled_error: "Something went wrong. Please retry; refresh the page if it keeps happening.",
+  chunk_load_failed: "The app has been updated. Please refresh to continue.",
   the_document_may_be_processing_or_its_format_is_not_previewable_yet: "The document may be processing, or its format is not previewable yet",
   unable_to_start_speech_transcription_please_check_microphone_permission: "Unable to start speech transcription, please check microphone permission",
   the_switches_below_all_depend_on_enable_email_service_above_the_send_channel_tab_please_turn_on_the_master_switch_and_save_first_otherwise_the_save_will_be_rejected: "The switches below all depend on \"Enable email service\" (above the \"Send channel\" tab). Please turn on the master switch and save first, otherwise the save will be rejected.",

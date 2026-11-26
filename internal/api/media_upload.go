@@ -25,6 +25,7 @@ func (h *MediaHandler) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tenantID := claims.TenantID
+	extendUploadReadDeadline(w)
 
 	// 单请求流式上传：上限 50MB。更大的文件应走 /v1/uploads 分片上传
 	// （前端 api/index.ts uploadFile 会按大小自动分流）。

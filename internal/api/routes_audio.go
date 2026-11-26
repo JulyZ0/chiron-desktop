@@ -70,6 +70,9 @@ func AudioTranscribeHandler(pythonClient *engine.PythonClient) http.HandlerFunc 
 			ServiceUnavailable(w, "python engine not available")
 			return
 		}
+		// 26MB 录音在慢网/反代下会超过全局 ReadTimeout(10s)：它量的是
+		// "从 accept 起读取整个请求体"，与处理时长无关。
+		extendUploadReadDeadline(w)
 		if r.ContentLength > audioMaxBodyBytes {
 			JSON(w, http.StatusRequestEntityTooLarge, APIResponse{Success: false, Error: "audio too large"})
 			return

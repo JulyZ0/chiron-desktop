@@ -1,202 +1,118 @@
-# PRD：Chiron 远程执行与团队服务模式 —— 剩余工作
+# PRD：Chiron 团队服务模式 —— 上线阻塞与后续工作
 
-> 本文件只保留**未完成**的项。已完成项（H1–H86 中已验收的 78 项）与逐条过程描述已移除：
-> 它们的结论在 `git log` 的提交信息里（每条都带 ID 与"修前会怎样"），证据在对应测试文件里。
-> 契约版本见 `contracts/versioned.json`，外部验收入口见 `scripts/team_acceptance.py`。
+> 只保留**未完成**项与已定决策。已完成项的结论在 `git log`（提交信息带 ID 与"修前会怎样"），
+> 证据在对应测试文件。契约版本见 `contracts/versioned.json`，外部验收入口见
+> `scripts/team_acceptance.py`。
 
-## 1. 当前状态（一段话）
+## 1. 当前状态
 
-S0–S4 与 R1/R3/R4/R5 已实现；加固审计 H1–H86 的**可本机验证部分已全部收口**，
-本机可做的 W1–W3 与对齐 deepseek-harness 的第一批（G1–G9）已全部完成，第二轮差距
-**G10–G30 已全部收口**（G22/G24 明确不做、G25 并入 H2）。2026-11-26 的 A 波
-（知识库索引链路、存量状态归一、多租户归属、Provider 路由亲和）与 B1（H20 密钥信封加密）
-也已合入；剩下的 `H*` 需要**真机**（H2）或**产品/组织决策**（H19/H22/H51）。
+S0–S4、R1/R3/R4/R5、H1–H86 可本机验证部分、G1–G30、A 波（KB 链路/状态归一/租户归属/
+Provider 亲和）、H20 信封加密均已合入。2026-11-26 完成一轮**生产就绪审计**（Go 网关 /
+Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、合规、运行面"，不是功能缺口。
+当前没有在飞的 worktree。
 
-## 2. 剩余项
+## 2. 上线阻塞（P0）
 
-### 2.1 与 deepseek-harness 的差距（`G*`）
-
-历史差距分析与 DSH 循环考古已移除（结论已并入本文件与 git 历史）；可本机验证的 G 项
-均已合入。以下三项**不是待做项**，而是记录当前决定（见 §3.1）。
-
-| ID | 事项 | 决定 | 卡点 |
-|---|---|---|---|
-| **G22** | MCP 并入统一注册表 | 不做：动 registry 风险中高，`use_capability` 双路径当前可用 | — |
-| **G24** | 定时触发原语 | 不做：不进本版本 | — |
-| **G25** | 沙箱缺后端即拒跑 | 并入 H2：与 Linux 内核级隔离一次做完，不单独立项 | 见 §3 第 3 条；会让现有 Linux 部署不可用，需开关 |
-
-### 2.2 原有未完成项（`H*`）
-
-| ID | P | 事项 | 完成定义 | 卡点 |
+| ID | 事项 | 为什么阻塞 | 完成判据 | 量级 |
 |---|---|---|---|---|
-| **H2** | P0 | Linux 内核级执行隔离 | 不可用即**拒绝执行**（不降级）；有"沙箱不可用即拒"探针 | 需 Linux 真机 |
-| **H19** | P3 | ACP 完整 Agent 协议 | 编辑器侧拿到工具调用/审批/终态 | 需产品决策（3.4） |
-| **H22** | P3 | 只读子 Agent 强隔离 | **构造性**禁止写（非提示词），越权返回明确错误 | 需产品决策（3.4） |
+| **L05** | `no_retention` 被后台任务绕过 | 隐私位只在请求 contextvar，队列 envelope 不带；后台输出落 Redis 24h 并回注对话 | no_retention 下无 `job:result:*`、无 followup；有用例 | M |
+| **L06** | 多会话运行态不一致 | F5 不重挂运行中的会话流；`switchSession` finally 清 `loading`；SSE `onError` 跨会话写全局 loading | 长任务 F5 后 5s 内续流；切回运行中会话停止按钮仍在；A 的错误不影响 B | M |
 
+## 3. 上线后首月加固（P1）
 
-### 2.3 并行推进计划（worktree + 多 agent）
+### 3.1 网关
 
-本轮分组推进的 12 个 worktree 已**全部合入**（逐项明细与"修前会怎样"见对应 merge / feat
-提交信息，证据在各自测试文件）；当前**没有在飞的分支**。未列出的 `H*` 依赖外部条件（见 §3）。
-
-合并纪律（保留给下一轮）：① 每个分支自己跑完窄回归；② 合并后我在 main 上跑跨包回归
-（Go `./internal/...`、Python 相关套件、前端 `src/components` + `check:ui`）；③ 冲突时以
-"语义正确"优先，不保留两套实现；④ 每项合入后**立即**从本文件删除对应行。
-
-### 2.4 下一批开发任务（建议顺序）
-
-排序原则：**先修"用户被挡在门外"的 → 再做安全/平台（等决策或环境）→ 最后外部验收与体验**。
-每个任务都写可执行判据；三条线上故障（会话归项目 404 / OpenCode 400 / 知识库索引失败）
-已修复，这里只列它们的**收尾项**。
-
-#### 波次 A：本地可验证的故障收尾（✅ 已合入 2026-11-26）
-
-| # | 事项 | 落地内容 | 证据 |
+| ID | 事项 | 证据/后果 | 量级 |
 |---|---|---|---|
-| A1 | 知识库端到端可信 | integration 的 KB 探针失败即 FAIL（不再 SKIP）；建索引前等 worker 心跳、轮询中 `worker_alive=false` 立即失败；`/status` 无条件下发 `worker_alive`（10s 缓存，Cloud 为 null）；页面在执行器未运行时提前给 warning 提示（与库级 error 判重） | `scripts/integration/run.sh`、`knowledge/service.py`、`KnowledgeDetailView.vue`、`test_knowledge_worker_alive.py`、`KnowledgeDetailView.index.spec.ts` |
-| A2 | 存量索引状态归一 | 读侧未知库状态 → error、大小写归一；迁移 0015 把库级未知值→error、文档级→pending（幂等） | `progress.py`、`0015_kb_status_normalize.py`、`test_knowledge_index_progress.py` |
-| A3 | 多租户 / 归属口径统一 | 隐式建会话改用 `tenantIDFromContext(ctx)`（claims 优先，0/无 claims 回退默认）；源码守卫 + ctx 优先级单测；集成带新增 tenant=2 隐式建会话探针 | `internal/session/tenant_context.go`、`manager_messages.go`、`run.sh`、`mint_token.py` |
-| A4 | Provider 会话亲和 | `llm_session_scope()`：显式会话优先，否则按 scope+输入哈希+trace 固定路由；覆盖记忆摘要/蒸馏、上下文压缩、媒体分析、技能生成、provider 探活、agents 派发；**静态清单**要求每个直调点在 scoped/self-managed/inherit 中表态 | `providers/session_context.py`、`test_llm_session_affinity.py` |
+| L07 | 匿名端点无 per-IP 限流；分享密码可爆破 | 单客户端可烧光全站匿名配额；分享密码无失败计数 | S |
+| L08 | 停机宽限 10s < 在途预算 5min；后台协程不 join | 滚动发布切断长请求；审计/画布最终 flush 可能丢 | M |
+| L11 | DB 无 acquire/查询超时；无请求超时中间件 | 池耗尽后整实例雪崩 | M |
+| L12 | 后台 Redis 中继裸 goroutine，panic 即退出 | 一条坏消息可让全副本 CrashLoop | S |
+| L13 | `REDIS_KEY_PREFIX` 在包级 var 里丢前缀 | 仅 `.env` 配置的多环境共用 Redis 会串键 | S |
 
-> **唯一未在本机验证**：`make integration` 需要 docker 守护进程（本机未启动）。
-> 已做 `bash -n` + 逐段静态检查，需在 CI 或有 docker 的主机跑一次 A1/A3 的探针。
+### 3.2 引擎 / 队列
 
-#### 波次 B：安全与平台能力（P1，卡在决策 / 环境）
-
-| # | 事项 | 完成定义 | 卡点 |
+| ID | 事项 | 证据/后果 | 量级 |
 |---|---|---|---|
-| B1 | H20 密钥加密 | ✅ 已合入：v2 信封（每条一个 DEK）+ 可插拔 KMS（`KMS_PROVIDER` / `Register`）+ 轮换端点；DB 与 Redis 镜像都不含明文，有回归 | — |
-| B2 | H2 / G25 Linux 隔离 | `bwrap` 不可用即**拒绝执行**（不降级）；提供默认关的开关避免现有部署直接不可用；"沙箱不可用即拒"探针 | 需 Linux 真机 |
-| B3 | H51 发布签名根 | 私钥归属 + 公钥内嵌 + 清单验签真正生效（代码已按 fail-closed 实现） | §3 第 1 条（组织决策） |
-| B4 | H19 / H22 | ACP 完整协议；构造性只读子 Agent（越权返回明确错误） | §3 第 4 条（产品决策） |
+| L14 | 空闲自停只看 HTTP 在途，`os._exit` 硬杀队列任务 | 缩容/回收杀后台命令与子 Agent | S |
+| L15 | 停机不保证停止领取+排空；DLQ retry 用 `xadd maxlen` 可裁掉 PEL；reclaim 计入失败预算 | 任务重领进 DLQ / 丢件 / 孤儿副作用 | M |
+| L16 | `claim_new` 返回值被丢弃；`_ACTIVE_RUNTIMES` 覆盖+无条件 pop | 同会话双 run；审批找不到 runtime | S |
+| L17 | `tool_job` 输出无上限；附件下载整包进内存 | 一条大输出可打爆副本内存与 Redis | M |
+| L18 | PG 不可用仍 ready；`/readyz` 只看 Redis；`queue_depth` 死指标 | 编排不摘流量，积压告警永不触发 | S |
+| L19 | 无实例级并发上限；沙箱配额默认关闭 | 绕过网关直连/自动续跑可打满进程 | M |
 
-#### 波次 C：外部验收与运维（P1/P2）
+### 3.3 前端
 
-| # | 事项 | 完成定义 |
-|---|---|---|
-| C1 | 团队主机验收 | R2 挂载基准、`team_smoke --sse`、R6 压测三项跑出报告；阈值显式、SKIP 不计 PASS |
-| C2 | 租户删除与多实例 | R10 租户删除闭环；S5 多实例演练（含子 Agent 跨实例取消回执） |
-| C3 | 观测补齐 | LiteLLM / Langfuse 实例级验证；KB 队列深度、worker 心跳、丢失事件进看板 |
-
-#### 波次 D：体验增强（P2，可插队）
-
-| # | 事项 | 完成定义 |
-|---|---|---|
-| D1 | 父→子 steer 对外入口 | 把 `steer(run_id)` 暴露为受控入口（HTTP `run_id` 路由或 read 级工具）；只允许**本会话的子 run**，越权 403；有"父改子指令、子下一轮生效"端到端用例 |
-| D2 | 子会话并排阅读 | 子 Agent 的完整消息流可在参考栏只读回放（需要新接口，不能复用普通会话 API）；含分页与脱敏 |
-
-**下一批怎么排（2026-11-26 复盘）**
-
-已完成：A 波、B1（H20）、P0-1 事件分发拆完、工作台 Git diff、字号棘轮 + chat 迁移。
-当前**没有在飞的 worktree**。排序原则不变：**无外部依赖的先做 → 需要环境的集中跑 →
-需要决策的等拍板**。
-
-#### 立即可开工（推荐按此顺序）
-
-| # | 事项 | 为什么现在做 | 完成判据 |
+| ID | 事项 | 证据/后果 | 量级 |
 |---|---|---|---|
-| E1 | 父→子 steer 对外入口（D1） | 引擎侧 `steer(run_id)` 与 G19 测试已具备，**只缺对外通道**；不做的话界面无法给运行中的子 Agent 补话 | 新路由只允许**本会话的子 run**（越权 403 / 跨会话 404）；子 Agent 下一轮消费；SSE 有 `steer` 回显；子 Agent 卡片可输入；网关 + Vue 各有用例 |
-| E2 | 字号迁移第二波 | 棘轮已上闸，基线 548 处；纯机械、可小批提交 | `components/`（非 chat）按目录迁到 `--fs-*`，基线降到 < 300；`check:ui` 绿 |
-| E3 | H20 轮换演练脚本 | 信封加密已合入，但"换 KEK → 重包 → 撤旧 KEK"没有一条可执行验证 | 脚本用两把 `KMS_KEK_KEYS` 起服务：写值 → 切 active → dry-run → rotate → 只留新 KEK 后旧值仍可读；失败即非零退出 |
-| E4 | a11y 运行时检查（需定依赖） | 现在只有静态契约（0 违规），没有真实 DOM 检查 | 二选一：`vitest-axe`（轻）或 Playwright+axe（重）；先覆盖 chat 关键 5 个组件，违规数基线只降不升 |
-| E5 | 工作台 Git 面板增强 | diff 已能看，但还缺"我在哪个分支、领先/落后多少" | `/changes` 增 `ahead/behind`（只读 `rev-list --left-right --count`）并在头部展示；无上游时明说而不是显示 0 |
+| L20 | 路由切换 `cancelAll()` 取消 `/submit` | 失败入 outbox + 新 clientMsgId ⇒ 同一问题执行两次 | M |
+| L22 | SSE 重连 3 次×1s，无退避；子 Agent 流无心跳 | 断网/休眠后后台会话静默死亡 | M |
+| L23 | 首屏预加载仍含 charts/diagram ~0.8MB br（fileviewer 1.8MB 已移除；二者仍随入口预载，成因待查） | 弱网首屏被图表/图形库抢带宽 | S |
+| L25 | nginx 未消费 `.br/.gz`；无 sourcemap | 镜像膨胀、线上堆栈不可读 | S |
 
-#### 需要环境（集中一次跑完）
+### 3.4 运维 / 供应链
 
-| # | 事项 | 环境 |
+| ID | 事项 | 完成判据 | 量级 |
+|---|---|---|---|
+| L26 | 备份/恢复与 APP_SECRET/KMS 托管 | `pg_dump` + 目录快照；空环境恢复一次并跑 team_smoke | M |
+| L27 | 生产部署形态与入口 | 二选一：桌面托管（NSSM/日志轮转/重启）或容器化（prod compose + 迁移 job + 资源上限）；修掉失效的 `make docker-build/dev-up` | L |
+| L28 | 升级/回滚规程 | 备份→迁移→启动→冒烟→回滚，演练一次 | M |
+| L29 | 依赖与供应链 | pip-audit/npm audit/镜像扫描进 CI；SBOM；H51 签名清单 | M |
+| L30 | 观测与告警最小集 | 5xx、队列积压、SSE 投递失败、DB/Redis 断、磁盘增长 5 条规则 + 看板 | M |
+| L31 | 长会话内存/渲染 | `runtimes`/`seenIds` 淘汰；流式不重投影；`read_file` 折叠 | M |
+
+## 4. 需环境 / 需决策
+
+| 项 | 内容 | 卡点 |
 |---|---|---|
-| C1 | A1/A3 真实集成探针 + R2 挂载 / R6 压测 | docker 主机 |
-| C1b | Kiri `container` 挡位端到端（无网络、只写工作区、pids/memory、超时、daemon 停即拒） | Linux + Kiri |
+| C1 | A1/A3 真实集成 + R2 挂载 + R6 压测 | docker 主机 |
+| C1b | Kiri `container` 挡位端到端 | Linux + Kiri |
 | C2/C3 | 租户删除、多实例演练、观测看板 | 团队主机 |
+| H2/G25 | Linux 内核级隔离；`bwrap` 不可用即拒跑 + 默认关开关 | Linux 真机 + 产品决策 |
+| H51 | 发布签名根归属 | 组织决策 |
+| H19/H22 | ACP 完整协议；构造性只读子 Agent | 产品决策 |
+| E4 | a11y 运行时检查是否引入 axe | 依赖决策 |
 
-#### 需要拍板（§3）
+## 5. 已定决策（不再讨论）
 
-- **B2**：H2/G25 是否接受「bwrap 不可用即拒绝执行」+ 默认关开关；
-- **B3**：H51 发布签名私钥归属；
-- **B4**：H19 ACP 范围、H22 构造性只读子 Agent 是否本版本目标；
-- **E4**：是否允许新增 axe 相关 devDependency（体积/CI 时长）。
+- **H20**：进程内信封加密 + 可插拔 KMS。`v2:<keyID>:<DEK>:<data>`；KEK 来自 `KMS_KEK_KEYS`
+  或 `APP_SECRET` 派生；`/v1/admin/kms/{status,rotate}`；Redis keyset 也只存密文。
+- **Kiri 挡位**：`container` 用 Kiri（Docker Engine API），**不内置** Kiri/Docker，按需下载
+  + 内嵌 SHA-256 校验；不可用即拒跑；规格不可放宽；Linux 宿主内核，不是 VM；Windows
+  命名管道本版不支持。
+- **G22** MCP 不并入统一注册表；**G24** 不做定时触发；**G25** 并入 H2。
+- **插件化**：不做 Cordis 式"一切皆可替换"；只做能力 seam + 声明式 bundle（候选 E6）。
+- **P1-3 steer**：顶层会话维持现状（run 级入口见 E1）。
 
-合并纪律沿用 §2.3。
+## 6. 落地路线（由易到难）
 
+**第 1 批 · 已完成（2026-11-26）**
+L01 SSE Unwrap、L02 503、L03 上传期限、L04 日志桥、L09/L10 启动自检、L21 全局错误兜底、
+L24 CSP、L23 fileviewer 预加载（1.8MB br 已移除；charts/diagram 余量留 P2）。
 
-### 2.5 执行隔离：`container` 挡位（Kiri，2026-11-26 定）
+**第 2 批 · 半天级（状态正确性）**
+L06 前端运行态 → L20 cancelAll/outbox → L16 会话互斥 → L18 健康/指标 → L12 中继 recover →
+L07 匿名限流。
 
-**决定**：新增 `container` 隔离挡位，运行时用 Kiri（Docker Engine API）。Kiri 与 docker
-**都不内置**，缺依赖时按需下载。
+**第 3 批 · 1–2 天（数据面与队列）**
+L05 privacy 跨队列 → L15 停机/DLQ/reclaim → L14 空闲自停 → L17 输出/附件上限 → L22 重连退避。
 
-- **语义**：每条命令放进一次性容器 —— 独立 namespaces/cgroup、只读根文件系统、
-  `--network none`、`CAP_DROP=ALL`、`no-new-privileges`、pids/memory 上限、只挂工作区、
-  默认 seccomp。规格**不可放宽**（没有 privileged / cap-add / host network 开关）。
-- **依赖获取**：`POST /v1/system/isolation/container/prepare` 按平台下载**固定版本**
-  `0.2.2` 的官方包到缓存目录，并用**内嵌 SHA-256** 校验（不信任远端校验和）；
-  **不自动提权安装** —— 响应里的 `install_hint` 是给人/流水线执行的命令
-  （Linux：`dpkg -i`/`rpm -U` + `kiri host-access`；macOS：dmg 手动）。
-- **fail-closed**：挡位请求了但运行时不可用 ⇒ `effective=none + below_floor=true`，
-  启动门禁拒绝启动、执行侧拒跑（`sandbox unavailable: container isolation requested
-  but not available`），**不回退**到无命名空间的本地执行。
-- **部署前提**：引擎（或 sandbox 服务）需要能访问 Engine socket
-  （`SANDBOX_CONTAINER_SOCKET` / `KIRI_SOCKET`，Linux 默认 `/run/kiri/docker.sock`）；
-  镜像需预先拉取，用 `SANDBOX_CONTAINER_IMAGE` 指定（默认 `python:3.12-slim`，
-  团队部署应按项目工具链自建）；`SANDBOX_CONTAINER_USER`/`_MEMORY_MB`/`_PIDS` 可调。
-- **边界（别夸大）**：Linux 上 Kiri 容器仍跑在**宿主内核**（与 Docker 同一隔离档），
-  不是 VM；若目标是"不可信多租户代码"，需要 gVisor/Kata/Firecracker 这一档。
-  该挡位目前**只支持 Unix socket**：Windows 的 Kiri 走命名管道，本版没有驱动，
-  界面会明确标为不可用。桌面端 Windows 继续用 appcontainer/restricted。
-- **验证**：单测覆盖检测/哈希校验/容器规格/失败拒跑/超时杀容器；
-  **真实 Kiri 上的端到端（无网络、只写工作区、pids/memory、超时、daemon 停掉即拒）
-  仍需在 Linux 主机跑一次**（本机未装运行时）。
+**第 4 批 · 2–3 天（运行面）**
+L26 备份恢复 → L27 部署形态 → L28 升级回滚 → L30 告警 → L25 压缩/sourcemap → L29 供应链。
 
-## 3. 待确认决策
+**第 5 批 · 按环境/决策**
+C1/C1b/C2/C3 → H2/H51/H19/H22 → L31 长会话性能 → E4 a11y → E1 父→子 steer → E2 字号第二波 → E5 Git 面板增强。
 
-1. **H51 签名根**：发布签名私钥谁持有、公钥如何内嵌进安装包？（决定组件/更新清单验签
-   是否真正生效 —— 代码已按"公钥内嵌 + 缺失即拒绝"实现，缺的是这把钥匙的归属）
-2. ~~**H20 KMS 选型**~~ 已定：**进程内信封加密 + 可插拔 KMS**（不引云 SDK）。见 §3.1。
-3. **H2 / G25 隔离承诺**：是否接受「bwrap 不可用即拒绝执行」作为首个可发货版本？
-   （G25 会让现有 Linux 部署直接不可用，需不需要先加默认关的开关？）
-4. **H19 / H22 产品承诺**：ACP 完整集成、严格只读子 Agent 是否本版本目标？
+合并纪律：每项自己跑窄回归；合入后在 main 跑跨包回归；每项合入后从本文件删除对应行。
 
-### 3.1 已定（2026-11-25）
-- **已验证无需追平**（记录以免重复讨论）：① SSRF——我们已有全球 unicast 白名单 + scheme/端口白名单 + 连接级 IP 钉住 + **重定向逐跳校验**，而 DSH 的 `web-fetch-http` 明确不限制目标地址；② 代码定位——我们已有 `outline`（结构行索引）工具，DSH 没有，故不引入符号索引/LSP 前置依赖。
-- **G20 做**（已合入）：补 `agent_runs` 行，允许子 Agent 挂起等人工（不再超时即失败）。
-- **G23 做**（已合入）：常驻 LSP。
+## 7. 外部验收入口
 
-### 3.2 已定（2026-11-26）
-- **H20 做**（已合入）：采用**进程内信封加密 + 可插拔 KMS**，不引入云 KMS SDK。
-  - 密文格式 `v2:<keyID>:<包裹后的DEK>:<数据密文>`；v1 继续可读，轮换时一次性升级。
-  - KEK 来源：`KMS_KEK_KEYS`（JSON，`{"v1":"<base64 32B>"}`）或 `_FILE`；未配置时由
-    `APP_SECRET` 派生（keyID `app-secret-v1`），老部署零改动。
-  - 轮换：`GET /v1/admin/kms/status` 看规模，`POST /v1/admin/kms/rotate {dry_run}` 预演/执行；
-    只重包 DEK，不重写数据密文。
-  - Redis keyset 同样只存密文：引擎侧用同一套 KEK 材料（`KMS_KEK_KEYS` 需同时下发给网关
-    与引擎；零配置时共享 `APP_SECRET`）在取 key 后解密。解不开即跳过该把 key（fail closed）。
-  - 证据：`internal/kms`（往返/篡改/轮换/跨语言向量）、`internal/settings`（v1→v2、并发）、
-    `llm_keys_hydrate_live_test.go`（Redis 无明文回归）、Python `test_knowledge_crypto.py` /
-    `test_key_ring.py`（Go 向量互解、密文 key 解密与跳过）。
+`python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公司> --r2-root R:\project --sse --strict-web`
+（退出码 0=无 FAIL 且至少一项 PASS，1=有 FAIL，77=全部 SKIP；**SKIP 绝不当 PASS**）。
+R2 挂载、团队 Web E2E、R6 压测的判据见 `scripts/` 下对应脚本输出。
 
+## 8. 参考
 
-## 4. 外部验收（需团队主机）
-
-本机只能静态检查。统一入口 `scripts/team_acceptance.py`（退出码 0=无 FAIL 且至少一项
-PASS、1=有 FAIL、77=全部 SKIP；**SKIP 绝不当 PASS**）。
-
-```bat
-set CHIRON_OWNER_PASSWORD=<owner 密码>
-python scripts/team_acceptance.py --base-url https://<域名> --email owner@<公司> ^
-    --r2-root R:\\project --sse --strict-web --json-out .artifacts/team-acceptance.json
-```
-
-| 项 | 脚本 | 通过判据 |
-|---|---|---|
-| R2 实测挂载 | `r2_mount_bench.py` | read_p95≤50ms、write_p95≤150ms、`rev-parse` 为 true、rename/delete 有效、10 分钟稳定 |
-| 团队 Web E2E | `team_smoke.py`（`--sse`） | 登录/改密/邀请/强制下线/匿名分享/分享页 HTML/首 token 逐项 PASS |
-| R6 压测 | `--r6-report` | P=2/4 首 token P95、引擎 RSS、空闲回收、`/metrics` 齐全（阈值显式给） |
-
-## 5. 已知未覆盖
-
-LiteLLM 与 Langfuse 的实例级验证、R10 租户删除闭环、S5 多实例演练。
-
-## 6. 参考
-
-- ZCode v4.0.0 对照分析（核心循环 / 前端 UI·UX）：[gap-analysis-chiron-vs-zcode.md](gap-analysis-chiron-vs-zcode.md)
-- OpenAI Codex Sandbox：<https://tonybai.com/2026/11/19/inside-openai-codex-sandbox/>
-- Hosted Agents 边界 / OpenHands V1：<https://xwang.dev/blog/2026/openhands-sdk-claude-managed-agents/>
+- ZCode 对照分析：[gap-analysis-chiron-vs-zcode.md](gap-analysis-chiron-vs-zcode.md)
+- 桌面本地模式契约：[desktop-local/contracts.md](desktop-local/contracts.md)
+- 团队域名部署：[team-domain-deployment.md](team-domain-deployment.md)

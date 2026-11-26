@@ -217,6 +217,35 @@ func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
 }
 
+// Unwrap 让 http.NewResponseController 穿过本包装层。
+//
+// **没有它，SSE 的写期限豁免就是空操作**：events.go / openai_compat.go 用
+// `http.NewResponseController(w).SetWriteDeadline(...)` 豁免全局 WriteTimeout，
+// 而 handler 拿到的 `w` 正是本类型；ResponseController 只能通过 `Unwrap()` 逐层
+// 下探，缺这个方法时直接返回 ErrNotSupported（调用点原先用 `_ =` 吞掉），
+// 60s 的绝对写期限照常生效 —— 长回答/事件流在第 60 秒被切断。
+// 上传端点也依赖同一条链放宽 `SetReadDeadline`（默认 ReadTimeout=10s）。
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
+// uploadReadDeadline 是上传请求的读期限。
+//
+// ReadTimeout（默认 10s）是**从 accept 起算的绝对期限**，对 50MB 单文件、
+// 64MB 分片、26MB 音频都不够；移动网络/跨区反代下必然中途失败。这里按
+// "整段上传给 30 分钟"放宽，仍然有上限（死连接不会永久占住 goroutine）。
+const uploadReadDeadline = 30 * time.Minute
+
+// extendUploadReadDeadline 放宽本请求的读期限。必须在读取 body 之前调用。
+//
+// 依赖 responseWriter.Unwrap：没有它 SetReadDeadline 会返回 ErrNotSupported。
+// 测试里用的是 httptest.ResponseRecorder（不支持期限），返回错误属预期，记 debug。
+func extendUploadReadDeadline(w http.ResponseWriter) {
+	if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadReadDeadline)); err != nil {
+		slog.Debug("extend upload read deadline unsupported", "error", err)
+	}
+}
+
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

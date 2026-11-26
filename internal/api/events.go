@@ -44,7 +44,9 @@ func handleSSE(w http.ResponseWriter, r *http.Request, hub *broadcast.Hub, subID
 	// P1 修复：SSE 长连接豁免服务器 WriteTimeout（默认 60s 会切断流）。
 	// 豁免是**逐帧**完成的：writeFrame 每次写前重设 sseWriteTimeout ——
 	// 既不让全局 WriteTimeout 切断活跃的流，也不让死连接无限阻塞。
-	_ = rc.SetWriteDeadline(time.Time{})
+	if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+		slog.Warn("sse: cannot exempt write timeout (long streams will be cut)", "error", err)
+	}
 
 	// writeFrame 写一帧并 flush；返回 false 表示连接已不可用，读循环须立即收尾。
 	//
