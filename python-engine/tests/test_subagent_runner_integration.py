@@ -213,17 +213,18 @@ async def test_concurrent_writers_serialize_through_the_runner(monkeypatch):
 
     first = asyncio.create_task(_runner().run("任务一", max_turns=1))
     await asyncio.wait_for(started.wait(), timeout=5.0)
-    assert spawned == ["任务一"]
+    # G30 之后任务消息前有环境段、后有返回指引，断言改为"任务文本在内"而不是逐字相等。
+    assert len(spawned) == 1 and "任务一" in spawned[0]
     assert sched.active_counts() == (1, 1)
 
     second = asyncio.create_task(_runner().run("任务二", max_turns=1))
     # 正面证据：第二个**已经进入排队**（不是"还没轮到调度"）
     await _wait_until(lambda: sched.pending_waiter_count() == 1)
-    assert spawned == ["任务一"]                # 还在等槽：**没有**同时开跑
+    assert len(spawned) == 1 and "任务二" not in spawned[0]  # 还在等槽：**没有**同时开跑
 
     go.set()
     results = await asyncio.wait_for(asyncio.gather(first, second), timeout=5.0)
     assert [r.status for r in results] == ["completed", "completed"]
-    assert spawned == ["任务一", "任务二"]
+    assert len(spawned) == 2 and "任务一" in spawned[0] and "任务二" in spawned[1]
     assert sched.active_counts() == (0, 0)
     scheduler_mod.reset_schedulers()
