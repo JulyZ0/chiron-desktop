@@ -120,9 +120,13 @@ async def _llm_generate(*, name: str, description: str, model: str, max_tokens: 
         },
     ]
     try:
-        response = await gateway.chat(
-            messages=prompt, model=model or settings.default_model, max_tokens=max_tokens
-        )
+        # 技能生成是请求级旁路：按「描述」固定路由（同一条描述重试命同一路由）。
+        from app.providers.session_context import llm_session_scope, stable_key
+
+        with llm_session_scope("skill-generate", key=stable_key(f"{name}\n{description}")):
+            response = await gateway.chat(
+                messages=prompt, model=model or settings.default_model, max_tokens=max_tokens
+            )
     except Exception as exc:  # noqa: BLE001 — 生成失败以结构化结果返回
         logger.info("skill generate: LLM call failed: %s", str(exc)[:160])
         return ""

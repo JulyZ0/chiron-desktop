@@ -324,10 +324,17 @@ class ContextManager:
         ]
         # Try the gateway's non-streaming chat interface
         from app.config import settings
+        from app.providers.session_context import llm_session_scope, stable_key
 
-        resp = await gateway.chat(
-            messages=summary_prompt, model=settings.default_model, max_tokens=1024
+        # 压缩既可能发生在 runtime 回合里（继承会话），也可能在后台维护任务里
+        # （没有上下文）：没有显式会话时按"被压缩的这段历史"固定路由。
+        _seed = "\n".join(
+            str(m.get("content") or "") for m in messages if isinstance(m.get("content"), str)
         )
+        with llm_session_scope("context-summarise", key=stable_key(_seed)):
+            resp = await gateway.chat(
+                messages=summary_prompt, model=settings.default_model, max_tokens=1024
+            )
         return (
             getattr(resp, "content", "") or "(summary generation produced no content)"
         )

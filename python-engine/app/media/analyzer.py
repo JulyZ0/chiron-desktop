@@ -57,7 +57,11 @@ async def analyze_image(
 
         # 从环境变量获取模型名，默认使用 gpt-4o（主线模型）
         model_name = os.getenv("VISION_MODEL", "gpt-4o")
-        response = await gateway.chat(messages, model=model_name)
+        # 多模态分析常在工具/后台里发生：按图片 URL 固定路由（同一附件重复分析命同一路由）。
+        from app.providers.session_context import llm_session_scope, stable_key
+
+        with llm_session_scope("media-analyze", key=stable_key(image_url)):
+            response = await gateway.chat(messages, model=model_name)
         return {
             "success": True,
             "analysis": (
