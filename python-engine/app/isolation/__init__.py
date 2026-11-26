@@ -14,6 +14,7 @@
 | `job` | 内存/CPU 打爆、进程数失控、退出后子孙进程残留 | 无 |
 | `low_il` | 以上 + **写**用户目录/注册表等中完整性对象 | 无（实测零提权可用） |
 | `appcontainer` | 以上 + 文件系统按包 SID 白名单、可断网 | 需 `icacls` 授权路径 |
+| `container` | 以上所有 + 独立 namespaces/cgroup/caps/seccomp，只挂工作区、无网络 | 需 Kiri（按需下载，不内置） |
 
 实测依据（本机，非管理员账户）：
 - Job Object：256MB 上限成功拦下 600MB 分配；
@@ -56,13 +57,24 @@ class Level(enum.StrEnum):
     LOW_IL = "low_il"
     RESTRICTED = "restricted"
     APPCONTAINER = "appcontainer"
+    #: 一次性容器（Kiri 的 Docker Engine API）：独立 namespaces/cgroup、
+    #: 只读根文件系统、CAP_DROP=ALL、seccomp 默认档、无网络。
+    #: 跨平台可用的"最强"档位；依赖缺失即拒跑（见 `kiri.py`）。
+    CONTAINER = "container"
 
     @property
     def rank(self) -> int:
         return _ORDER.index(self)
 
 
-_ORDER = [Level.NONE, Level.JOB, Level.LOW_IL, Level.RESTRICTED, Level.APPCONTAINER]
+_ORDER = [
+    Level.NONE,
+    Level.JOB,
+    Level.LOW_IL,
+    Level.RESTRICTED,
+    Level.APPCONTAINER,
+    Level.CONTAINER,
+]
 
 #: 默认档位：`restricted`（受限令牌 + 合成 SID + 一条可撤销 ACE）。
 #:
@@ -294,6 +306,27 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
     #: —— 那等于确认一次、永久有效。
     user_selected = False
 
+    # ⓪ `container` 挡位：跨平台，但只认 Engine API over Unix socket。
+    #
+    # 依赖缺失 ⇒ **effective=NONE + below_floor=True**：启动门禁会拒绝启动、
+    # 执行侧也会拒跑（`require_or_raise` 不看 allow_downgrade）。这正是 H2 的
+    # "沙箱不可用即拒绝"，不是静默降级到无命名空间的本地执行。
+    if want is Level.CONTAINER:
+        from app.isolation import kiri
+
+        if win.IS_WINDOWS:
+            return IsolationDecision(
+                want,
+                Level.NONE,
+                ["Windows 的 Kiri 通过命名管道提供 Docker API，本版未实现该驱动"],
+                below_floor=True,
+            )
+        if kiri.available():
+            return IsolationDecision(want, Level.CONTAINER, [])
+        return IsolationDecision(
+            want, Level.NONE, [kiri.unavailable_reason()], below_floor=True
+        )
+
     if not win.IS_WINDOWS:
         # Linux 侧保持既有 local 实现（POSIX 走 setrlimit），不受硬底线约束。
         return IsolationDecision(want, Level.NONE, ["非 Windows 平台；POSIX 走 setrlimit"])
@@ -463,6 +496,12 @@ def reset_probes() -> None:
     _low_il_ok = None
     _restricted_ok = None
     _appcontainer_ok = None
+    try:
+        from app.isolation import kiri
+
+        kiri.reset_probe()
+    except Exception as exc:  # noqa: BLE001 — 运行时探测复位失败不影响其它档位
+        logger.warning("kiri probe reset failed: %s", exc)
     try:
         from app.isolation import win_launch
 
@@ -907,9 +946,14 @@ def _level_executable(level: Level) -> bool:
     子进程读回输出），但结果都有缓存（`_restricted_ok` / `_appcontainer_ok`），
     所以只有第一次查询稍慢，后续是常数时间。
     """
+    if level is Level.CONTAINER:
+        from app.isolation import kiri
+
+        return (not win.IS_WINDOWS) and kiri.available()
     if not win.IS_WINDOWS:
-        # 非 Windows：POSIX 走 setrlimit，档位概念不适用（见 resolve_level 的注释）
-        return True
+        # 非 Windows：只有 `none`（setrlimit 基线）与 `container` 是本机真能执行的；
+        # Windows 原生机（job/low_il/restricted/appcontainer）在这里没有实现。
+        return level is Level.NONE
     if level.rank < Level.JOB.rank:
         # none：没有可"执行"的机制，它本身就是"不隔离"
         return True
@@ -936,6 +980,12 @@ def _level_unavailable_reason(level: Level) -> str:
     反过来，某个低档位若真的**不可执行**（如 Job Object 创建失败），仍要给机器
     原因，否则用户会以为只是策略限制。
     """
+    if level is Level.CONTAINER:
+        from app.isolation import kiri
+
+        if win.IS_WINDOWS:
+            return "Windows 的 Kiri 通过命名管道提供 Docker API，本版未实现该驱动"
+        return kiri.unavailable_reason()
     if not win.IS_WINDOWS:
         return ""
     try:
@@ -948,6 +998,25 @@ def _level_unavailable_reason(level: Level) -> str:
         return "Job Object 不可用"
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _container_status() -> dict[str, Any]:
+    """容器挡位的运行时快照（不在支持的平台上也要返回可读原因）。"""
+    try:
+        from app.isolation import kiri
+
+        return kiri.status()
+    except Exception as exc:  # noqa: BLE001 — 状态查询失败不该让整页失败
+        return {
+            "version": "",
+            "supported": False,
+            "installed": False,
+            "socket": "",
+            "engine": None,
+            "reason": f"运行时状态不可读：{exc}",
+            "asset": None,
+            "install_hint": "",
+        }
 
 
 def status() -> dict[str, Any]:
@@ -1003,6 +1072,9 @@ def status() -> dict[str, Any]:
             if lv.value not in selectable_values
         },
         "capabilities": caps,
+        #: 容器挡位的运行时快照（是否装了 Kiri、socket、可下载资产、安装命令）。
+        #: 前端据此显示"未安装/可下载/已就绪"，而不是只给一个灰掉的档位。
+        "container": _container_status(),
         "appcontainer_name": win.appcontainer_name("default"),
         "appcontainer_workspace": appcontainer_workspace(),
     }

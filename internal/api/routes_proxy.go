@@ -390,6 +390,9 @@ func registerProxyRoutes(
 	// 强制复测：清引擎侧冒烟缓存后重算 `selectable`。它**不改档位**，
 	// 只解决"助手启用成功但档位仍灰着"的缓存滞留，所以读权限即可。
 	mux.Handle("POST /v1/system/isolation/probe", authMW(rlMW(RequirePermission(auth.PermAdminRead)(isoP(pathFn("/v1/system/isolation/probe"))))))
+	// 容器挡位的运行时**按需获取**：下载固定版本的 Kiri 包并校验 SHA-256（不安装）。
+	// 属于运维/安全管理动作（会触达外网、在磁盘落安装包），用写权限。
+	mux.Handle("POST /v1/system/isolation/container/prepare", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation/container/prepare"))))))
 
 	// 提权助手（`restricted` 档的执行前置）：查询 / 启用（**会弹一次 UAC**）/ 停用。
 	//

@@ -1712,11 +1712,44 @@ export async function setKBVisibility(id: string, visibility: 'private' | 'tenan
  * 必须与后端 `app/isolation/__init__.py` 的 `Level` 枚举**逐项对齐**：
  * 少了哪一档，那一档在界面上就不存在（`restricted` 此前就是这样丢的）。
  */
-export type IsolationLevel = 'none' | 'job' | 'low_il' | 'restricted' | 'appcontainer'
+export type IsolationLevel =
+  | 'none'
+  | 'job'
+  | 'low_il'
+  | 'restricted'
+  | 'appcontainer'
+  | 'container'
 
 /** 单个档位的能力探测结果 */
 export interface IsolationCapabilities {
   [key: string]: unknown
+}
+
+export interface IsolationContainerAsset {
+  name: string
+  sha256: string
+  url: string
+  /** 已下载且校验通过的安装包路径（空 = 尚未下载） */
+  cached: string
+}
+
+export interface IsolationContainerRuntime {
+  /** 固定版本（beta）：升级需要显式改代码并重新核对哈希 */
+  version: string
+  /** `${os}/${arch}`，用于界面显示 */
+  platform: string
+  /** 当前平台是否存在可下载/可用的运行时 */
+  supported: boolean
+  /** 引擎 socket（空 = 未检测到） */
+  socket: string
+  installed: boolean
+  /** `/_ping` + `/version` 的结果；null = 不可达 */
+  engine: { api_version?: string; engine_version?: string; os?: string; arch?: string } | null
+  /** 不可用的**可操作**原因（未安装 / 未启动 / 平台不支持） */
+  reason: string
+  asset: IsolationContainerAsset | null
+  /** 安装/启用命令（Linux 需要 root；下载不会自动提权） */
+  install_hint: string
 }
 
 export interface IsolationStatus {
@@ -1764,6 +1797,13 @@ export interface IsolationStatus {
    */
   unavailable_reasons?: Record<string, string>
   capabilities: IsolationCapabilities
+  /**
+   * 容器挡位的运行时快照（Kiri / Docker Engine API）。
+   *
+   * 依赖**不内置**：`installed=false` 时界面显示原因与「下载运行时」入口；
+   * 下载只落缓存并校验 SHA-256，安装/启用需要管理员动作（`install_hint`）。
+   */
+  container?: IsolationContainerRuntime
   appcontainer_name: string
   appcontainer_workspace: string
   /** 运行时覆盖值；null = 按配置文件走 */
@@ -1819,6 +1859,21 @@ export async function setIsolationLevel(
 export async function probeIsolation(): Promise<IsolationStatus> {
   const resp = await api.post('/v1/system/isolation/probe')
   return toIsolationStatus(resp.data)
+}
+
+/**
+ * 容器挡位的运行时**按需下载**（不安装、不提权）。
+ *
+ * 下载固定版本的 Kiri 包到缓存目录并用内嵌 SHA-256 校验；成功与否都在返回的
+ * `prepare` 里说明，`container.install_hint` 给出安装/启用命令。
+ */
+export async function prepareContainerRuntime(): Promise<
+  IsolationStatus & { prepare: { ok: boolean; downloaded: string; error: string } }
+> {
+  const resp = await api.post('/v1/system/isolation/container/prepare')
+  return toIsolationStatus(resp.data) as IsolationStatus & {
+    prepare: { ok: boolean; downloaded: string; error: string }
+  }
 }
 
 /** 撤销运行时覆盖，回到配置文件的值。幂等。 */

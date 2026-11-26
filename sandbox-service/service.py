@@ -5,7 +5,13 @@
 **是**：故障隔离（执行把引擎拖垮）、资源隔离（执行独立扩缩/限流）、审计单点。
 **不是**：安全等级的跃升 —— 基线（命令白名单 / RLIMIT / 逃逸拦截 / 审计）**直接复用引擎那一份**
 （`app/tools/sandbox.py` 的 `run_in_sandbox`），不重写一份"看起来一样"的名单（两份名单必然漂移，
-而且漂移方向通常是**放宽**）。仍然**没有**命名空间 / seccomp。
+而且漂移方向通常是**放宽**）。
+
+默认执行仍然**没有**命名空间 / seccomp；唯一例外是启用 `container` 隔离挡位
+（`SANDBOX_ISOLATION_LEVEL=container`）：`run_in_sandbox` 会把命令交给一次性容器
+（Kiri / Docker Engine API，见 `app/isolation/container.py`），此时本服务所在容器
+需要挂载引擎 socket（`SANDBOX_CONTAINER_SOCKET`、默认 `/run/kiri/docker.sock`）。
+引擎/依赖不可用时**拒跑**，不回退到无命名空间的路径。
 
 ## 契约
 

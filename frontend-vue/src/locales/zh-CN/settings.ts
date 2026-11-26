@@ -284,6 +284,17 @@ export default {
   isolation_level_appcontainer: "应用容器",
   isolation_level_appcontainer_desc:
     "最强档位：独立容器身份，文件与网络按授权放行。需要管理员权限预置容器配置，部分环境不可用。",
+  isolation_level_container: "容器（Kiri）",
+  isolation_level_container_desc:
+    "每条命令在一次性容器里执行：独立命名空间与 cgroup、只读根文件系统、无网络、只挂工作区、默认 seccomp。运行时（Kiri）不内置，可在下方按需下载；依赖缺失时直接拒绝执行，不回退。",
+  isolation_container_title: "容器运行时（Kiri）",
+  isolation_container_ready: "已就绪 · Kiri {version}",
+  isolation_container_missing: "未安装 · Kiri {version}",
+  isolation_container_engine: "引擎 {version} · {platform}",
+  isolation_container_prepare: "下载运行时",
+  isolation_container_downloaded: "已下载并校验，安装/启用需要管理员执行下方命令。",
+  isolation_container_already_ready: "运行时已就绪。",
+  isolation_container_download_failed: "下载运行时失败。",
 
   isolation_reset: "恢复为配置值",
   isolation_reset_hint: "只撤销本次运行内的临时切换，不写配置文件，重启后自然恢复。",

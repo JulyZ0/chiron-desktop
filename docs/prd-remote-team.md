@@ -98,6 +98,33 @@ A 波已全部合入并跑过跨包回归（Go `./internal/...`、Python 相关�
 合并纪律沿用 §2.3。
 
 
+### 2.5 执行隔离：`container` 挡位（Kiri，2026-11-26 定）
+
+**决定**：新增 `container` 隔离挡位，运行时用 Kiri（Docker Engine API）。Kiri 与 docker
+**都不内置**，缺依赖时按需下载。
+
+- **语义**：每条命令放进一次性容器 —— 独立 namespaces/cgroup、只读根文件系统、
+  `--network none`、`CAP_DROP=ALL`、`no-new-privileges`、pids/memory 上限、只挂工作区、
+  默认 seccomp。规格**不可放宽**（没有 privileged / cap-add / host network 开关）。
+- **依赖获取**：`POST /v1/system/isolation/container/prepare` 按平台下载**固定版本**
+  `0.2.2` 的官方包到缓存目录，并用**内嵌 SHA-256** 校验（不信任远端校验和）；
+  **不自动提权安装** —— 响应里的 `install_hint` 是给人/流水线执行的命令
+  （Linux：`dpkg -i`/`rpm -U` + `kiri host-access`；macOS：dmg 手动）。
+- **fail-closed**：挡位请求了但运行时不可用 ⇒ `effective=none + below_floor=true`，
+  启动门禁拒绝启动、执行侧拒跑（`sandbox unavailable: container isolation requested
+  but not available`），**不回退**到无命名空间的本地执行。
+- **部署前提**：引擎（或 sandbox 服务）需要能访问 Engine socket
+  （`SANDBOX_CONTAINER_SOCKET` / `KIRI_SOCKET`，Linux 默认 `/run/kiri/docker.sock`）；
+  镜像需预先拉取，用 `SANDBOX_CONTAINER_IMAGE` 指定（默认 `python:3.12-slim`，
+  团队部署应按项目工具链自建）；`SANDBOX_CONTAINER_USER`/`_MEMORY_MB`/`_PIDS` 可调。
+- **边界（别夸大）**：Linux 上 Kiri 容器仍跑在**宿主内核**（与 Docker 同一隔离档），
+  不是 VM；若目标是"不可信多租户代码"，需要 gVisor/Kata/Firecracker 这一档。
+  该挡位目前**只支持 Unix socket**：Windows 的 Kiri 走命名管道，本版没有驱动，
+  界面会明确标为不可用。桌面端 Windows 继续用 appcontainer/restricted。
+- **验证**：单测覆盖检测/哈希校验/容器规格/失败拒跑/超时杀容器；
+  **真实 Kiri 上的端到端（无网络、只写工作区、pids/memory、超时、daemon 停掉即拒）
+  仍需在 Linux 主机跑一次**（本机未装运行时）。
+
 ## 3. 待确认决策
 
 1. **H51 签名根**：发布签名私钥谁持有、公钥如何内嵌进安装包？（决定组件/更新清单验签

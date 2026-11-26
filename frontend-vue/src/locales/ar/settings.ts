@@ -286,6 +286,17 @@ export default {
   isolation_level_appcontainer: "حاوية تطبيق",
   isolation_level_appcontainer_desc:
     "أقوى مستوى: هوية حاوية مستقلة، والوصول إلى الملفات والشبكة يُمنح حسب الصلاحية. يتطلب صلاحيات مسؤول لتهيئة ملف الحاوية، وغير متاح في بعض البيئات.",
+  isolation_level_container: "حاوية (Kiri)",
+  isolation_level_container_desc:
+    "يُنفَّذ كل أمر في حاوية مؤقتة: مساحات أسماء وcgroup مستقلة، ونظام ملفات جذري للقراءة فقط، وبلا شبكة، وتُركَّب مساحة العمل فقط، وseccomp افتراضي. وقت التشغيل (Kiri) غير مضمَّن ويمكن تنزيله عند الطلب أدناه؛ وعند غيابه يُرفض التنفيذ بدل التراجع.",
+  isolation_container_title: "وقت تشغيل الحاوية (Kiri)",
+  isolation_container_ready: "جاهز · Kiri {version}",
+  isolation_container_missing: "غير مثبَّت · Kiri {version}",
+  isolation_container_engine: "المحرّك {version} · {platform}",
+  isolation_container_prepare: "تنزيل وقت التشغيل",
+  isolation_container_downloaded: "تم التنزيل والتحقق. التثبيت/التمكين يحتاج أمر المسؤول أدناه.",
+  isolation_container_already_ready: "وقت التشغيل جاهز.",
+  isolation_container_download_failed: "فشل تنزيل وقت التشغيل.",
 
   isolation_reset: "إعادة إلى القيمة المضبوطة",
   isolation_reset_hint: "يلغي فقط التبديل المؤقت في هذه الجلسة ولا يكتب في ملف الإعدادات؛ إعادة التشغيل تعيد القيمة تلقائيًا.",

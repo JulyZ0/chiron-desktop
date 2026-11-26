@@ -22,6 +22,7 @@ const apiMock = vi.hoisted(() => ({
   getIsolationStatus: vi.fn(),
   getIsolationHelper: vi.fn(),
   setIsolationLevel: vi.fn(),
+  prepareContainerRuntime: vi.fn(),
   clearIsolationLevel: vi.fn(),
   revokeIsolationArtifacts: vi.fn(),
   startIsolationHelper: vi.fn(),
@@ -99,7 +100,7 @@ function mountPanel() {
           props: ['message', 'description'],
           template: '<div class="alert-stub">{{ message }} {{ description }}</div>',
         },
-        'a-tag': true,
+        'a-tag': { name: 'ATag', template: '<span class="tag-stub"><slot /></span>' },
         'a-spin': true,
         'a-popconfirm': true,
         'a-button': { name: 'AButton', template: '<button type="button"><slot /></button>' },
@@ -196,5 +197,85 @@ describe('IsolationPanel 启用助手失败的展示', () => {
     expect(messageMock.error, '取消授权是用户的正常选择，不该报错').not.toHaveBeenCalled()
     expect(messageMock.info).toHaveBeenCalled()
     expect(wrapper.text()).not.toContain('启用助手失败')
+  })
+})
+
+
+/**
+ * 容器挡位（Kiri）：依赖**不内置**，面板要说清"缺什么、能不能下载、怎么装"。
+ */
+describe('IsolationPanel 的容器挡位运行时', () => {
+  function containerStatus(overrides: Record<string, unknown> = {}): Record<string, any> {
+    return statusPayload({
+      container: {
+        version: '0.2.2',
+        platform: 'linux/amd64',
+        supported: true,
+        socket: '',
+        installed: false,
+        engine: null,
+        reason: '未检测到 Kiri。可在设置页下载运行时包',
+        asset: {
+          name: 'kiri-lite_0.2.2_amd64.deb',
+          sha256: '24798125ee50bb24db86594a9ee1469b1032d9b2ffd7da616b06e40763c723b9',
+          url: 'https://example.invalid/pkg.deb',
+          cached: '',
+        },
+        install_hint: 'sudo dpkg -i <pkg> && sudo kiri host-access $USER',
+      },
+      ...overrides,
+    })
+  }
+
+  it('未安装时显示运行时版本、原因与下载入口', async () => {
+    apiMock.getIsolationStatus.mockResolvedValue(containerStatus())
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    const box = wrapper.find('[data-testid="iso-container-runtime"]')
+    expect(box.exists()).toBe(true)
+    expect(box.text()).toContain('Kiri 0.2.2')
+    expect(box.text()).toContain('未检测到 Kiri')
+    expect(wrapper.find('[data-testid="iso-container-prepare"]').exists()).toBe(true)
+  })
+
+  it('已就绪时不再显示下载入口', async () => {
+    apiMock.getIsolationStatus.mockResolvedValue(
+      containerStatus({
+        container: {
+          ...containerStatus().container,
+          installed: true,
+          socket: '/run/kiri/docker.sock',
+          engine: { engine_version: '0.2.2', api_version: '1.47' },
+          reason: '',
+        },
+      }),
+    )
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="iso-container-runtime"]').text()).toContain('已就绪')
+    expect(wrapper.find('[data-testid="iso-container-prepare"]').exists()).toBe(false)
+  })
+
+  it('点下载：调用 prepare，并把安装命令留在面板上（不自动提权）', async () => {
+    apiMock.getIsolationStatus.mockResolvedValue(containerStatus())
+    apiMock.prepareContainerRuntime.mockResolvedValue({
+      ...containerStatus(),
+      prepare: {
+        ok: false,
+        downloaded: '/home/u/.chiron/runtimes/kiri/0.2.2/kiri-lite.deb',
+        error: '已下载并校验安装包，安装/启用需要管理员动作：sudo dpkg -i <pkg>',
+      },
+    })
+    const wrapper = mountPanel()
+    await flushPromises()
+
+    await wrapper.find('[data-testid="iso-container-prepare"]').trigger('click')
+    await flushPromises()
+
+    expect(apiMock.prepareContainerRuntime).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).toContain('sudo dpkg -i')
+    expect(messageMock.info).toHaveBeenCalled()
   })
 })

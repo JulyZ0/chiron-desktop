@@ -167,6 +167,33 @@ async def reprobe_isolation(request: Request) -> dict[str, Any]:
     return payload
 
 
+@router.post("/isolation/container/prepare")
+async def prepare_container_runtime(request: Request) -> dict[str, Any]:
+    """容器挡位的运行时按需获取：下载固定版本的 Kiri 包并校验 SHA-256。
+
+    **不安装、不提权**：Linux 的 `.deb`/`.rpm` 与 macOS 的 `.dmg` 都交给人（或部署
+    流水线）执行；响应里的 `container.install_hint` 就是那条命令。这样"按需下载"
+    不会变成"引擎替你静默装一个 root 服务"。
+
+    下载失败/哈希不符时 `prepare.error` 给出原因，缓存里不会留下未校验的文件。
+    """
+    _verify_gateway_key(request)
+    from app.isolation import kiri
+
+    result = await asyncio.to_thread(kiri.prepare)
+    # 用户可能刚装好运行时：清掉探测缓存，让返回的状态立刻反映"已就绪"。
+    kiri.reset_probe()
+    payload = await asyncio.to_thread(_status_payload)
+    override = iso.runtime_override()
+    payload["runtime_override"] = override.value if override is not None else None
+    payload["prepare"] = {
+        "ok": result.ok,
+        "downloaded": result.downloaded,
+        "error": result.error,
+    }
+    return payload
+
+
 @router.put("/isolation")
 async def set_isolation(body: LevelChange, request: Request) -> dict[str, Any]:
     """切换运行时隔离档位。
