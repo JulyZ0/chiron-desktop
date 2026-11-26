@@ -103,16 +103,21 @@ async def summarise_messages(
     if not transcript.strip():
         return ""
     try:
-        response = await gateway.chat(
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": transcript},
-            ],
-            model=model,
-            tenant_id=tenant_id,
-            max_tokens=max_tokens,
-            temperature=0.1,
-        )
+        # 后台记忆巩固不一定在某个 run 的 task 里：给"同一段对话"固定路由标识，
+        # 重试命中同一路由（provider 兜底只保证非空，不保证亲和）。
+        from app.providers.session_context import llm_session_scope, stable_key
+
+        with llm_session_scope("memory-summary", key=stable_key(transcript)):
+            response = await gateway.chat(
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": transcript},
+                ],
+                model=model,
+                tenant_id=tenant_id,
+                max_tokens=max_tokens,
+                temperature=0.1,
+            )
     except Exception as exc:  # noqa: BLE001 — 摘要失败退回抽取式，不影响写入
         logger.info("summariser: LLM call failed: %s", str(exc)[:160])
         return ""

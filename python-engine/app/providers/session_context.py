@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 
 #: 当前请求所属的会话标识（空串 = 未知；provider 层会用 trace / 进程常量兜底，
@@ -69,6 +71,52 @@ def opencode_session_id() -> str:
     except Exception:  # noqa: BLE001 - trace 不可用不该影响请求
         pass
     return _PROCESS_SESSION
+
+
+def stable_key(value: str) -> str:
+    """把任意文本压成 16 位稳定键（给 :func:`llm_session_scope` 的 `key` 用）。
+
+    用途：同一份"输入"（一段对话、一张图片的 URL、一次技能描述）多次调用应落同一路由，
+    而不同输入不应共用（否则 prompt 缓存与路由亲和都失去意义）。
+    """
+    import hashlib
+
+    return hashlib.sha1((value or "").encode("utf-8")).hexdigest()[:16]
+
+
+@contextmanager
+def llm_session_scope(scope: str, *, key: str = "") -> Iterator[None]:
+    """给**不在 runtime 回合里**的旁路调用固定一次路由标识。
+
+    覆盖的路径：记忆摘要/蒸馏、上下文压缩、媒体分析、技能生成、provider 探活、
+    旧多 Agent 循环 —— 它们直接调 `gateway.chat*`，既没有工具上下文，也不一定在
+    某个 run 的 task 里。修前这些调用只能落到 provider 兜底的「请求 trace / 进程常量」：
+    可用（不会 400），但同一段输入的重试可能换路由，也缺少"同一件事走同一路由"的语义。
+
+    语义：
+    * **不覆盖已有会话**（runtime / 工具上下文已经设了的，直接沿用）—— 否则会把
+      一片旁路调用的 id 写到主对话上，主对话的亲和反而被拆散；
+    * 没有显式会话时，标识 = ``scope:key:trace|进程常量``（≤128 字符）。`key` 用
+      :func:`stable_key` 从输入派生，保证"同输入同路由、异输入异路由"；
+    * 退出时精确复位（token），不污染同一 task 里后续的调用。
+    """
+    if get_llm_session_id().strip():
+        yield
+        return
+
+    trace = ""
+    try:
+        from app.observability.trace_context import current_trace_id
+
+        trace = current_trace_id().strip()
+    except Exception:  # noqa: BLE001 - trace 不可用不该影响请求
+        pass
+    seed = f"{scope}:{key}" if key else scope
+    token = set_llm_session_id(f"{seed}:{trace or _PROCESS_SESSION}"[:128])
+    try:
+        yield
+    finally:
+        reset_llm_session_id(token)
 
 
 #: 当前请求的思考档位（**归一化前的原始值**）。

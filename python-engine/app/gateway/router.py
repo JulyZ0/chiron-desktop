@@ -1046,12 +1046,17 @@ class GatewayRouter:
                 continue
             try:
                 # 尝试廉价模型调用 probe
-                resp = await provider.chat(
-                    [ChatMessage(role="user", content="ping")],
-                    model=probe_model,
-                    max_tokens=1,
-                    temperature=0,
-                )
+                # 探活是服务级后台调用（没有会话）：按 provider 名固定路由标识，
+                # 免得 OpenCode 一类要求会话头的 provider 每次探活落到不同路由。
+                from app.providers.session_context import llm_session_scope
+
+                with llm_session_scope("provider-probe", key=name):
+                    resp = await provider.chat(
+                        [ChatMessage(role="user", content="ping")],
+                        model=probe_model,
+                        max_tokens=1,
+                        temperature=0,
+                    )
                 if resp.finish_reason != "error":
                     breaker.record_success()
                     result[name] = {"status": "ok", "circuit": breaker.state.value}

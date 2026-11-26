@@ -83,11 +83,25 @@ async def dispatch_agent(body: AgentDispatchRequest) -> dict[str, Any]:
             max_tokens=body.max_tokens,
             temperature=body.temperature or 0.7,
         )
-        result = await agent.run(
-            task=body.task,
-            context={"session_id": body.session_id} if body.session_id else None,
-            tenant_id=body.tenant_id,
+        # 这条派发是请求级的旁路（不在某个 run 的 task 里）：显式设置会话标识，
+        # 让 multi_agent 的 chat_stream 与主链路一样有稳定的 provider 路由。
+        from app.providers.session_context import (
+            reset_llm_session_id,
+            set_llm_session_id,
+            stable_key,
         )
+
+        _session_token = set_llm_session_id(
+            str(body.session_id or f"agent-dispatch:{body.tenant_id}:{stable_key(body.task)}")
+        )
+        try:
+            result = await agent.run(
+                task=body.task,
+                context={"session_id": body.session_id} if body.session_id else None,
+                tenant_id=body.tenant_id,
+            )
+        finally:
+            reset_llm_session_id(_session_token)
         return {
             "success": result.success,
             "output": result.output,

@@ -133,14 +133,17 @@ async def distill_candidates(
     if gateway is None or not (transcript or "").strip():
         return [], 0, 0
     try:
-        response = await gateway.chat(
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": transcript[:6000]},
-            ],
-            model=model,
-            max_tokens=max_tokens,
-        )
+        from app.providers.session_context import llm_session_scope, stable_key
+
+        with llm_session_scope("memory-distill", key=stable_key(transcript)):
+            response = await gateway.chat(
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": transcript[:6000]},
+                ],
+                model=model,
+                max_tokens=max_tokens,
+            )
     except Exception as exc:  # noqa: BLE001 — 提炼失败不影响回合
         logger.info("distill: LLM call failed: %s", str(exc)[:160])
         return [], 0, 0
