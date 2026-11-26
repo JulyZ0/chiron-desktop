@@ -197,6 +197,20 @@ func smTenant(claims *auth.Claims) string {
 	return claims.UserID
 }
 
+// smTenantID 返回用于 **SQL 数值列（smallint）** 的租户 ID。
+//
+// 与 :func:`smTenant` 刻意分开：后者是 Redis 键 / 设备通道用的**字符串**标识
+// （tenant 0 时退化成 userID），把它直接塞进 `tenant_id = $N` 会让 PostgreSQL
+// 按列类型把参数推断成 smallint，而 tenant 0 的 UUID 值必然解析失败；更糟的是
+// 同一个参数若还出现在 `= ”` 里，会在 prepare 阶段直接报类型推断冲突（42P08）。
+// 所以 SQL 一律走这个函数：0 回退默认租户（与隐式建会话的口径一致）。
+func smTenantID(claims *auth.Claims) int16 {
+	if claims == nil || claims.TenantID == 0 {
+		return db.DefaultTenantID
+	}
+	return claims.TenantID
+}
+
 // ── 热层读写 ──
 
 // smCacheGet 读热层快照；"不存在"与"Redis 出错"都按未命中处理（读路径可接受）。

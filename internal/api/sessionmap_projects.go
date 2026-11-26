@@ -925,8 +925,16 @@ func (h *SessionMapHandler) BindProjectSession(w http.ResponseWriter, r *http.Re
 	// 旧实现只校验目标 workspace：于是 A 可以把自己项目的 `force=true` 用在本会话
 	// 别人的 session 上，DELETE 会按 session_id 删掉 B 的归属（"移动"语义变成了
 	// 跨用户抢绑定），同时把 B 的会话标题/状态暴露进 A 的项目列表。
-	// 未知与越权统一 404（不泄露 session 是否存在）。
-	if !smOwnsSession(r.Context(), sessionID, claims) {
+	// 未知与越权统一 404（不泄露 session 是否存在）；**查询失败**则 500 ——
+	// 把库错误当 404 会让用户以为"会话被删了"，见 smOwnsSession 的注释。
+	owned, err := smOwnsSession(r.Context(), sessionID, claims)
+	if err != nil {
+		slog.Error("bind project session: session ownership lookup failed",
+			"session", sessionID, "error", err)
+		InternalError(w, "session lookup failed")
+		return
+	}
+	if !owned {
 		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "session not found"})
 		return
 	}
@@ -1085,7 +1093,7 @@ func (h *SessionMapHandler) ListUnassignedSessions(w http.ResponseWriter, r *htt
 			           WHERE n.session_id = s.id AND n.edge_kind = 'project')
 			  ORDER BY COALESCE(s.pinned,false) DESC, s.updated_at DESC
 			  LIMIT 200`,
-			smTenant(claims), claims.UserID)
+			smTenantID(claims), claims.UserID)
 		if err != nil {
 			slog.Error("list unassigned sessions failed", "error", err)
 		}
@@ -1109,15 +1117,29 @@ func (h *SessionMapHandler) ListUnassignedSessions(w http.ResponseWriter, r *htt
 //
 // 与 `smOwnsWorkspace` 同一套判据（tenant + user），同样"查不到即否" ——
 // 与 HTTP 层的 404 语义一致，避免"能区分存在与无权"的探针。
-func smOwnsSession(ctx context.Context, sessionID string, claims *auth.Claims) bool {
+//
+// **返回 error 而不是把失败也当"不是你的"**：修前这里把查询错误和"没有这一行"
+// 合并成 false，于是 SQL 一报错，用户看到的就是 404「资源不存在」——
+// 把"库坏了"伪装成"东西没了"，既误导用户也让排障无从下手。调用方对 error 回 500。
+//
+// **租户用 int16**：修前 WHERE 里既有「$3 与空串比较」又有 `tenant_id = $3`，
+// 同一个参数被分别推断成 text 与 smallint，PostgreSQL 在 prepare 阶段直接报
+// `inconsistent types deduced for parameter (42P08)`；pgx 默认走扩展协议
+// （服务端推断类型），于是这次查询**每次必失败**、每次都被吞成 404。仓库里已有同款
+// 事故记录（`internal/session/manager_messages.go` 的 $7）。现在参数只与 int2 列比较。
+// 0 回退默认租户，与隐式建会话（`ensureSessionOwnedWithTitle`）的口径一致。
+func smOwnsSession(ctx context.Context, sessionID string, claims *auth.Claims) (bool, error) {
 	if db.GlobalDBManager == nil || sessionID == "" || claims == nil {
-		return false
+		return false, nil
 	}
 	row, err := db.GlobalDBManager.FetchOne(ctx,
 		`SELECT 1 AS ok FROM sessions
-		  WHERE id = $1 AND user_id = $2 AND ($3 = '' OR tenant_id = $3)`,
-		sessionID, claims.UserID, smTenant(claims))
-	return err == nil && row != nil
+		  WHERE id = $1 AND user_id = $2 AND tenant_id = $3`,
+		sessionID, claims.UserID, smTenantID(claims))
+	if err != nil {
+		return false, err
+	}
+	return row != nil, nil
 }
 
 func smOwnsWorkspace(r *http.Request, wsID string, claims *auth.Claims) bool {
@@ -1126,6 +1148,6 @@ func smOwnsWorkspace(r *http.Request, wsID string, claims *auth.Claims) bool {
 	}
 	row, err := db.GlobalDBManager.FetchOne(r.Context(),
 		`SELECT 1 AS ok FROM session_map_workspaces
-		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`, wsID, smTenant(claims), claims.UserID)
+		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`, wsID, smTenantID(claims), claims.UserID)
 	return err == nil && row != nil
 }

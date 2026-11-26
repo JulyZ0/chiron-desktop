@@ -90,6 +90,57 @@ func TestSessionMapBindRequiresSessionOwner(t *testing.T) {
 	}
 }
 
+// TestSessionMapSessionOwnerQueryIsTypeSafe 钉住「归入项目 404」的机械原因。
+//
+// 修前 `smOwnsSession` 的 WHERE 是
+//
+//	WHERE id=$1 AND user_id=$2 AND ($3 = '' OR tenant_id = $3)
+//
+// 同一个参数 $3 在 `= ”` 处被推断成 text、在 `tenant_id = $3` 处被推断成 smallint，
+// PostgreSQL 在 prepare 阶段直接报 `inconsistent types deduced for parameter $3`
+// （42P08）。pgx 默认走扩展协议（服务端推断类型），于是这次查询**每次必失败**；
+// 失败又被 `err == nil && row != nil` 吞掉，最终统一返回 404「会话不存在」——
+// 表现就是「归入项目」必定失败，且没有任何日志。仓库里已有同款事故
+// （`internal/session/manager_messages.go` 的 $7 参数）。
+//
+// 这个用例是源码级守卫：不连库，但能拦住"再引入多态参数"和"把查询失败当不存在"。
+func TestSessionMapSessionOwnerQueryIsTypeSafe(t *testing.T) {
+	src := readSessionMapSources(t)
+
+	start := strings.Index(src, "func smOwnsSession(")
+	if start < 0 {
+		t.Fatal("找不到 smOwnsSession")
+	}
+	body := src[start:]
+	if end := strings.Index(body, "\nfunc "); end > 0 {
+		body = body[:end]
+	}
+
+	if strings.Contains(body, "$3 = ''") {
+		t.Fatal("smOwnsSession 又出现了 `$3 = ''`：同一参数被 text/smallint 双推断会触发 42P08，查询必失败")
+	}
+	if !strings.Contains(body, "tenant_id = $3") {
+		t.Fatal("smOwnsSession 必须按 tenant_id = $3 过滤（参数走 int16，不与其他类型并列推断）")
+	}
+	if !strings.Contains(body, ") (bool, error)") {
+		t.Fatal("smOwnsSession 必须把查询错误返回给调用方，不能把 err 吞成「不是你的」")
+	}
+	if !strings.Contains(body, "smTenantID(claims)") {
+		t.Fatal("smOwnsSession 的租户参数必须走 smTenantID（int16），不能把 smTenant 的字符串塞进 smallint 列")
+	}
+	helperAt := strings.Index(src, "func smTenantID(")
+	if helperAt < 0 {
+		t.Fatal("缺少 smTenantID：SQL 侧的租户参数必须与字符串标识（smTenant）分开")
+	}
+	helper := src[helperAt:]
+	if end := strings.Index(helper, "\nfunc "); end > 0 {
+		helper = helper[:end]
+	}
+	if !strings.Contains(helper, "db.DefaultTenantID") {
+		t.Fatal("tenant_id=0 时必须回退默认租户，否则隐式创建的会话永远绑不上")
+	}
+}
+
 func TestSessionMapOwnerLookupFailsClosed(t *testing.T) {
 	// 数据库不可用 ⇒ 必须显式报错。返回 (_, false, nil) 会让调用方当成"画布不存在"
 	// 而走进"新建"分支 —— 那正是"授权层不可用反而放行"的经典退化。
