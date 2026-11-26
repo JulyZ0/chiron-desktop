@@ -111,7 +111,9 @@ class PromptEngine:
 
         # Gather all sections
         tools_section = self._format_tools(tools)
-        project_context_section = self._load_claude_md(root)
+        # G28：项目指令链必须经 `_instruction_chain()` 加工（链头声明 + 字节预算），
+        # 不能直接拼文件正文 —— 详见 `app/context/claude_md.py` 的 `compose_instruction_chain`。
+        project_context_section = self._instruction_chain(root)
         memory_section = await self._get_memory_context(
             task.user_id,
             task.content,
@@ -163,6 +165,10 @@ class PromptEngine:
         候选名与优先级复用 `app.context.claude_md` 的同一份定义（G-P2）——
         两处各写一份清单必然漂移，结果是"层级加载认 AGENTS.md，root 加载不认"。
 
+        返回的是**原始正文**（不做 G28 加工）：`tests/test_project_instruction_files.py`
+        需要逐字比对"root 加载认不认 AGENTS.md"，把声明混进来会让那条断言验的是别的东西。
+        要注入请用 `_instruction_chain()`。
+
         Returns the file contents as a string, or an empty string if no
         candidate exists.
         """
@@ -176,6 +182,31 @@ class PromptEngine:
         except (OSError, UnicodeDecodeError) as exc:
             logger.warning("Failed to read %s: %s", path, exc)
             return ""
+
+    def _instruction_chain(self, root: str) -> str:
+        """把 root 的项目指令装配成**可注入的指令链**（G28）。
+
+        ## 为什么声明放在链头
+
+        提示词按顺序读：先读到的内容给后面内容定解读框架。声明回答的是"这后面是什么、
+        有多大权威"，放链尾等于让模型先把命令执行完才被告知"这只是项目约定"。
+        它排在 `## Project Context (CLAUDE.md)` 标题**之内**的第一行、文件标签之前 ——
+        标题只是"这里开始是项目上下文"的路牌，声明是这一段内容的身份，两者不重复。
+
+        ## 两个分支共用这里
+
+        `assemble()` 有两条分支：任务自带 `system_prompt`（子 Agent 的子任务总是这种形态：
+        system_prompt 来自 Profile / expert prompt）与默认模板。两条分支都只从这个方法
+        取项目上下文，所以声明对父 Agent 与子 Agent **只有一处定义**，不会各说一套。
+
+        ## 预算
+
+        预算是 `MAX_INSTRUCTION_CHAIN_BYTES`（65536 字节/链），声明**计入**其中；
+        加声明不会放宽上限，超长时由 `compose_instruction_chain` 显式截断。
+        """
+        from app.context.claude_md import compose_instruction_chain
+
+        return compose_instruction_chain(self._load_claude_md(root))
 
     def _get_git_context(self, root: str) -> str:
         """Return a short summary of the current git state in *root*.
