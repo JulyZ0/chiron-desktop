@@ -217,6 +217,27 @@ async def chat_completions(body: ChatCompletionRequest, request: Request) -> Any
     )
 
 
+def _session_id_for(messages: list[dict[str, Any]], model: str) -> str:
+    """OpenAI 兼容端点的稳定会话标识（给 provider 的 ``x-opencode-session`` 用）。
+
+    取**首条 user 消息 + 模型名**的哈希而不是每次请求新生成的 ``completion_id``：
+    同一个 OpenAI 客户端连续多轮会把完整历史再来一遍，哈希稳定 ⇒ 上游路由与 prompt
+    缓存能命中；`completion_id` 每轮都变，等于每轮换一条路由。
+
+    空消息历史返回空串 —— 此时交给 provider 层兜底（trace / 进程常量），不会 400。
+    """
+    import hashlib
+
+    first_user = next(
+        (str(m.get("content") or "") for m in messages if m.get("role") == "user"),
+        "",
+    )
+    if not first_user:
+        return ""
+    digest = hashlib.sha1(f"{model}\n{first_user[:2000]}".encode()).hexdigest()[:16]
+    return f"compat-{digest}"
+
+
 async def _complete(
     gateway: Any,
     body: ChatCompletionRequest,
@@ -226,6 +247,9 @@ async def _complete(
     created: int,
 ) -> Any:
     """非流式：一次性拿到完整回答，包成 ``chat.completion``。"""
+    from app.providers.session_context import reset_llm_session_id, set_llm_session_id
+
+    _token = set_llm_session_id(_session_id_for(messages, body.model))
     try:
         resp = await gateway.chat(
             messages,
@@ -240,6 +264,8 @@ async def _complete(
             "openai compat: upstream failure: %s: %s", type(exc).__name__, exc
         )
         raise _upstream_error() from None
+    finally:
+        reset_llm_session_id(_token)
 
     if resp.finish_reason == "error":
         # gateway 把 provider 的失败包成 error 响应（不抛异常），这里补上状态码。
@@ -331,6 +357,15 @@ def _stream(
         finish = "stop"
         model = body.model
 
+        # 与 `_complete` 同一条：provider 需要稳定的会话标识（OpenCode 缺失即 400）。
+        # 生成器在**自己的**上下文里跑（StreamingResponse 换 task），所以必须在这里设/复位。
+        from app.providers.session_context import (
+            reset_llm_session_id,
+            set_llm_session_id,
+        )
+
+        _token = set_llm_session_id(_session_id_for(messages, body.model))
+
         try:
             async for chunk in gateway.chat_stream(
                 messages,
@@ -390,7 +425,8 @@ def _stream(
         finally:
             # 客户端断开（GeneratorExit / CancelledError）时这里**不能** await，
             # 但记账由 Go 网关按已收到的用量完成，引擎侧无额外副作用。
-            pass
+            # 会话上下文必须复位（同步操作，不涉及 await）。
+            reset_llm_session_id(_token)
 
         yield _frame({}, finish=finish, model=model)
         yield _frame(

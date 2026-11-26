@@ -62,11 +62,47 @@ def test_other_providers_get_no_session_header():
     assert "extra_headers" not in kwargs
 
 
-def test_no_session_id_means_no_header():
-    """会话未知时不注入（行为与旧版本一致，由对方自行决定是否拒绝）。"""
+def test_no_session_id_still_injects_fallback():
+    """会话未知时**仍然注入**（兜底非空）。
+
+    修前这里是"不注入"，理由写的是"与旧版本一致"——但空值不是中性行为：OpenCode
+    直接 400 MissingSessionID。真实故障就是这样复现的：`desktop_infer` /
+    `openai_compat` 这些入口没有设置会话 ContextVar，同一个 provider 在主干能用、
+    在这些入口必然失败。现在兜底在 provider 层，漏设只损失路由亲和性。
+    """
     set_llm_session_id("")
     kwargs = _provider("opencode-go")._build_kwargs([], "glm-5", 100, 0.0, None)
-    assert "extra_headers" not in kwargs
+    headers = kwargs.get("extra_headers") or {}
+    assert headers.get("x-opencode-session"), "空会话也必须给出非空的兜底值"
+
+
+def test_fallback_prefers_trace_then_process_constant(monkeypatch):
+    """兜底顺序：显式会话 > 请求 trace > 进程常量；三档都非空。"""
+    from app.observability import trace_context
+    from app.providers import session_context
+
+    set_llm_session_id("")
+    token = trace_context.set_request_trace_id("trace-xyz")
+    try:
+        assert session_context.opencode_session_id() == "trace-xyz"
+    finally:
+        trace_context.reset_request_trace_id(token)
+
+    # 没有 trace 时落到进程常量：同进程稳定、非空。
+    empty_trace = trace_context.set_request_trace_id("")
+    try:
+        first = session_context.opencode_session_id()
+        assert first and first == session_context.opencode_session_id()
+    finally:
+        trace_context.reset_request_trace_id(empty_trace)
+
+
+def test_fallback_is_stable_for_same_conversation():
+    """同一会话（显式 ID 相同）必然同头 —— prompt 缓存与路由亲和的前提。"""
+    set_llm_session_id("sess-same")
+    a = _provider("opencode")._build_kwargs([], "m", 10, 0.0, None)["extra_headers"]
+    b = _provider("opencode")._build_kwargs([], "m", 10, 0.0, None)["extra_headers"]
+    assert a == b == {"x-opencode-session": "sess-same"}
 
 
 @pytest.fixture(autouse=True)

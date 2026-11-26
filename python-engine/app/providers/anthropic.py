@@ -215,13 +215,12 @@ class AnthropicProvider(LLMProvider):
         }
         self._apply_max_tokens(kwargs, max_tokens)
         # OpenCode 的 Anthropic 协议端点同样强制要求 x-opencode-session
-        # （缺失即 400 MissingSessionID，见 docs/service-providers.md）；用当前会话 ID 注入。
+        # （缺失即 400 MissingSessionID）；用**永不为空**的稳定 ID 注入
+        # （显式会话 > trace > 进程常量，见 `session_context.opencode_session_id`）。
         if self.name.startswith("opencode"):
-            from app.providers.session_context import get_llm_session_id  # 延迟导入：避免循环
+            from app.providers.session_context import opencode_session_id  # 延迟导入：避免循环
 
-            session_id = get_llm_session_id()
-            if session_id:
-                kwargs["extra_headers"] = {"x-opencode-session": session_id}
+            kwargs["extra_headers"] = {"x-opencode-session": opencode_session_id()}
         if system_prompt:
             kwargs["system"] = system_prompt
         if tools:
@@ -336,13 +335,12 @@ class AnthropicProvider(LLMProvider):
         }
         self._apply_max_tokens(kwargs, max_tokens)
         # OpenCode 的 Anthropic 协议端点同样强制要求 x-opencode-session
-        # （缺失即 400 MissingSessionID，见 docs/service-providers.md）；用当前会话 ID 注入。
+        # （缺失即 400 MissingSessionID）；用**永不为空**的稳定 ID 注入
+        # （显式会话 > trace > 进程常量，见 `session_context.opencode_session_id`）。
         if self.name.startswith("opencode"):
-            from app.providers.session_context import get_llm_session_id  # 延迟导入：避免循环
+            from app.providers.session_context import opencode_session_id  # 延迟导入：避免循环
 
-            session_id = get_llm_session_id()
-            if session_id:
-                kwargs["extra_headers"] = {"x-opencode-session": session_id}
+            kwargs["extra_headers"] = {"x-opencode-session": opencode_session_id()}
         if system_prompt:
             kwargs["system"] = system_prompt
         if tools:

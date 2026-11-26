@@ -273,6 +273,15 @@ async def _run_inference(
         )
         raise HTTPException(status_code=502, detail="upstream inference failed") from None
 
+    # OpenCode 等 provider 要求请求带稳定会话头（缺失即 400）。本端点此前从未设置过
+    # 会话上下文 —— `request_id` 正好是天然的会话标识（它同时是幂等键，重试同一请求
+    # 会落同一路由）。为空时交给 provider 层兜底（trace / 进程常量），仍不会 400。
+    token = None
+    if body.request_id:
+        from app.providers.session_context import set_llm_session_id
+
+        token = set_llm_session_id(body.request_id)
+
     try:
         resp = await gateway.chat(
             messages,
@@ -290,6 +299,11 @@ async def _run_inference(
             exc,
         )
         raise HTTPException(status_code=502, detail="upstream inference failed") from None
+    finally:
+        if token is not None:
+            from app.providers.session_context import reset_llm_session_id
+
+            reset_llm_session_id(token)
 
     if resp.finish_reason == "error":
         # gateway 把 provider 的失败包成 error 响应（不抛异常），这里补上状态码。

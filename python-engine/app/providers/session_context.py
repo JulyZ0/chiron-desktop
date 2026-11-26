@@ -14,10 +14,16 @@
 
 from __future__ import annotations
 
+import uuid
 from contextvars import ContextVar, Token
 
-#: 当前请求所属的会话标识（空串 = 未知，此时不注入该头，行为与不带头的旧版本一致）
+#: 当前请求所属的会话标识（空串 = 未知；provider 层会用 trace / 进程常量兜底，
+#: 见 :func:`opencode_session_id` —— 宁可多一个稳定值，也不要让 OpenCode 400）。
 _llm_session_id: ContextVar[str] = ContextVar("chiron_llm_session_id", default="")
+
+#: 进程级兜底（进程启动时生成一次）：既没有会话也没有 trace 时用它。
+#: 它不提供"同对话同路由"的亲和性，但能保证**请求可被路由** —— 而空值会直接 400。
+_PROCESS_SESSION = f"chiron-{uuid.uuid4().hex[:12]}"
 
 
 def set_llm_session_id(value: str) -> Token[str]:
@@ -37,6 +43,32 @@ def reset_llm_session_id(token: Token[str]) -> None:
 
 def get_llm_session_id() -> str:
     return _llm_session_id.get() or ""
+
+
+def opencode_session_id() -> str:
+    """OpenCode 请求头 ``x-opencode-session`` 要用的**永不为空**的稳定标识。
+
+    优先级：显式设置的会话 ID → 请求 trace id → 进程级常量。
+
+    **为什么要有兜底**：这个头一旦缺失，OpenCode 直接 400（`MissingSessionID`），
+    而"设置会话 ID"依赖调用链上的入口自觉 —— 历史上 `desktop_infer` / `openai_compat`
+    这类新入口就漏了，导致同一个 provider 在主干能用、在这些入口必然失败。把兜底放在
+    provider 层之后，"漏设"的最坏结果退化为"路由亲和性差一点"，不再是 400。
+
+    兜底值同样满足 OpenCode 的要求：非空、稳定、无空格/PII。
+    """
+    explicit = get_llm_session_id().strip()
+    if explicit:
+        return explicit
+    try:
+        from app.observability.trace_context import current_trace_id
+
+        trace = current_trace_id().strip()
+        if trace:
+            return trace
+    except Exception:  # noqa: BLE001 - trace 不可用不该影响请求
+        pass
+    return _PROCESS_SESSION
 
 
 #: 当前请求的思考档位（**归一化前的原始值**）。

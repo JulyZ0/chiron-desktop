@@ -359,15 +359,13 @@ class OpenAIProvider(LLMProvider):
             kwargs["response_format"] = response_format
         # OpenCode（Zen / Go）要求请求带 `x-opencode-session`，否则直接
         # 400 MissingSessionID: "Request is missing x-opencode-session and cannot be
-        # routed efficiently"。该头只影响对方的路由与 prompt 缓存，所以用**同一会话的
-        # 稳定 ID**：同对话请求走同一路由，prompt 缓存命中更好。
-        # 见 docs/service-providers.md 的 OpenCode 一节。
+        # routed efficiently"。该头只影响对方的路由与 prompt 缓存，所以用**稳定 ID**：
+        # 显式会话 ID > 请求 trace > 进程常量（见 `session_context.opencode_session_id`）。
+        # **永不为空**：空值不是"等价于旧行为"，而是必然 400 —— 兜底就是为此存在。
         if self.name.startswith("opencode"):
-            from app.providers.session_context import get_llm_session_id  # 延迟导入：避免循环
+            from app.providers.session_context import opencode_session_id  # 延迟导入：避免循环
 
-            session_id = get_llm_session_id()
-            if session_id:
-                kwargs["extra_headers"] = {"x-opencode-session": session_id}
+            kwargs["extra_headers"] = {"x-opencode-session": opencode_session_id()}
 
         # 思考档位：**归一化之后**才发送。
         # 各 provider 对档位的词表不一致（`disabled/false/no/none/nothink/off` 都说"关"，
