@@ -83,11 +83,12 @@ _ASSETS: dict[tuple[str, str, str], tuple[str, str]] = {
     ),
 }
 
-#: socket 候选（按优先级）。`KIRI_SOCKET` / `SANDBOX_CONTAINER_SOCKET` 可覆盖。
+#: socket 候选（按优先级）。**只认 Kiri**：这是"用 Kiri 做容器挡位"的语义，
+#: 不能因为机器上恰好跑着 Docker 就悄悄换成 Docker（那不是用户选的东西）。
+#: 要显式使用 Docker/Podman 等兼容引擎，设 `SANDBOX_CONTAINER_SOCKET`。
 _SOCKET_CANDIDATES = (
     "/run/kiri/docker.sock",
     "~/.kiri/run/docker.sock",
-    "/var/run/docker.sock",
 )
 
 _SOCKET_ENV = "SANDBOX_CONTAINER_SOCKET"
