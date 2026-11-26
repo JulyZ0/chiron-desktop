@@ -34,6 +34,14 @@ import { useThemeStore } from '../stores/theme'
 import { useChatSessionStore } from '../stores/chatSession'
 import { useChatRunState } from '../composables/useChatRunState'
 import { useChatStreamText } from '../composables/useChatStreamText'
+import {
+  projectCompletion,
+  projectSteerNotice,
+  projectTodoEvent,
+  projectToolCall,
+  projectToolResult,
+  projectUsage,
+} from '../components/chat/sseProjection'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import type { LocationQuery } from 'vue-router'
@@ -2297,22 +2305,9 @@ function onSSEMessage(raw: unknown, sid: string, frameId = '') {
     // `[thinking]…[/thinking]` 标记仍会出现在 text 里，由 onTextChunk 的 splitThinking 处理。
     onThinkingChunk(String(d.content ?? evt.content ?? ''))
   } else if (type === 'tool_call') {
-    items.value.push({
-      kind: 'tool_call', id: String(d.id ?? Date.now()), name: String(d.name ?? 'tool'),
-      arguments: String(d.arguments ?? ''), status: 'running',
-    })
+    projectToolCall(items.value, d)
   } else if (type === 'tool_result') {
-    const callId = String(d.tool_call_id ?? d.id ?? '')
-    const call = items.value.find(it => it.kind === 'tool_call' && it.id === callId)
-    if (call && call.kind === 'tool_call') call.status = 'done'
-    const content = d.content ?? d.result ?? ''
-    if (content) {
-      items.value.push({
-        kind: 'tool_result', toolCallId: callId, id: `${callId}:res`,
-        content: typeof content === 'string' ? content : JSON.stringify(content),
-        isError: !!d.error,
-      })
-    }
+    projectToolResult(items.value, d)
   } else if (type === 'todo_updated') {
     // 任务清单更新（引擎在 todo_write 执行后单独发，见 runtime.py）。
     //
@@ -2322,56 +2317,24 @@ function onSSEMessage(raw: unknown, sid: string, frameId = '') {
     //
     // 归属用显式传入的 `sid`，**不是** `activeSessionId`：SSE 在用户切走之后仍会继续
     // 送达（多会话并行），用当前视图的会话会把 A 的清单写到 B 的面板上。
-    let todos: unknown = []
-    try {
-      todos = JSON.parse(String(d.content ?? evt.content ?? '[]'))
-    } catch { todos = [] }
-    if (Array.isArray(todos)) {
-      todoPanel.applyEvent(sid, todos, d.revision ?? evt.revision)
-    }
+    projectTodoEvent(sid, d, evt, (targetSid, todos, revision) => {
+      todoPanel.applyEvent(targetSid, todos as never, revision as never)
+    })
   } else if (type === 'completion') {
     // P1：host 证据判定的**实时**结论。只在"未完成"时插一条通知行 —— 否则"这一轮没做完"
     // 与"正常结束"在界面上完全一样（用户只看到回复停了下来）。
-    const notice = goalCompletionNotice(String(d.content ?? evt.content ?? ''))
-    if (notice) {
-      items.value.push({
-        kind: 'notice',
-        tone: 'warning',
-        content: notice,
-        time: new Date().toLocaleTimeString(),
-        id: `completion:${Date.now()}`,
-      })
-    }
+    projectCompletion(items.value, String(d.content ?? evt.content ?? ''), goalCompletionNotice)
   } else if (type === 'usage' || type === 'turn_stats') {
     // 本轮用量：引擎在**每次 LLM 调用**结束后发一条 `usage`（增量），
     // 终态 `done` 给的是整轮累计 —— 两条通道各自成立（Go 侧 `usageTotals` 同口径，见
     // internal/api/usage_accounting.go：那里据此避免重复计费）。
     // 因此这里必须**累加进同一条** `turn_stats`：一次提交跨多步，逐条 push 会堆出 N 行。
     // 会话级累计（tokens/费用/**缓存命中率**/吞吐）由 GET /v1/sessions/{id}/metrics 提供。
-    const inputTokens = Number(d.input_tokens ?? evt.input_tokens ?? 0) || 0
-    const outputTokens = Number(d.output_tokens ?? evt.output_tokens ?? 0) || 0
-    const durationMs = Number(d.duration_ms ?? evt.duration_ms ?? 0) || 0
-    if (inputTokens || outputTokens) {
-      const st = streamState()
-      st.streamStatsId = mergeTurnStats(
-        items.value,
-        st.streamStatsId,
-        { inputTokens, outputTokens, durationMs },
-        genItemId,
-      )
-    }
+    projectUsage(items.value, streamState(), d, evt, mergeTurnStats, genItemId)
   } else if (type === 'steer') {
     // 引擎在轮次边界消费了一条运行中指导（runtime.py 的 steer 分支）。
     // 只落一行小字：指令正文已作为 user 消息进了会话历史，这里再贴一遍就是重复。
-    if (String(d.content ?? evt.content ?? '')) {
-      items.value.push({
-        kind: 'notice',
-        tone: 'info',
-        content: t('common.steer_applied'),
-        time: new Date().toLocaleTimeString(),
-        id: `steer:${Date.now()}`,
-      })
-    }
+    projectSteerNotice(items.value, d.content ?? evt.content, t('common.steer_applied'))
   } else if (type === 'knowledge_retrieval') {
     // 知识库检索事件（P1-6）：引擎在注入上下文的同时发一条结构化结果。
     //
