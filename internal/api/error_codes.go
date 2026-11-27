@@ -101,6 +101,9 @@ const (
 	// CodeGitClientUnsupported 表示设备项目暂不支持 git 写操作（409）。
 	// 与"没有权限"分开：这不是授权问题，是能力尚未接入设备桥。
 	CodeGitClientUnsupported = "git_client_unsupported"
+	// CodeGitDirty 表示工作区有改动，无法切换分支（409）。
+	// 用户可以提交或丢弃后再试，所以是可自行解决的冲突。
+	CodeGitDirty = "git_dirty"
 )
 
 // knownMessageCodes 已知文案 → 错误码（键为小写原文）。

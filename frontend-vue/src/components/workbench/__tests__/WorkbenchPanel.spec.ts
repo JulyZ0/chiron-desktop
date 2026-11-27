@@ -64,7 +64,7 @@ vi.mock('../../../api/checkpoints', () => ({
 const changesNet = vi.hoisted(() => ({
   diffs: [] as Array<{ projectId: string; path: string; resolve: (v: unknown) => void }>,
   /** N5 P1：stage/unstage 调用记录与返回的下一份 status */
-  indexCalls: [] as Array<{ action: 'stage' | 'unstage' | 'commit'; projectId: string; body: unknown }>,
+  indexCalls: [] as Array<{ action: 'stage' | 'unstage' | 'commit' | 'discard' | 'branch'; projectId: string; body: unknown }>,
   nextChanges: null as Record<string, unknown> | null,
   changes: {
     repo: true,
@@ -93,6 +93,18 @@ vi.mock('../../../api/projectChanges', () => ({
     return Promise.resolve({
       sha: 'abc1234',
       changes: changesNet.nextChanges ?? changesNet.changes,
+    })
+  },
+  discardProjectPaths: (projectId: string, paths: string[]) => {
+    changesNet.indexCalls.push({ action: 'discard', projectId, body: paths })
+    return Promise.resolve(changesNet.nextChanges ?? changesNet.changes)
+  },
+  listProjectBranches: () => Promise.resolve({ branches: ['main', 'dev'], current: 'main' }),
+  projectBranchAction: (projectId: string, body: { action: string; name: string }) => {
+    changesNet.indexCalls.push({ action: 'branch', projectId, body })
+    return Promise.resolve({
+      branches: body.action === 'create' ? ['main', 'dev', body.name] : ['main', 'dev'],
+      current: body.action === 'switch' ? body.name : 'main',
     })
   },
   readProjectDiff: (projectId: string, path: string) =>
@@ -577,6 +589,25 @@ describe('工作台的提交历史（F5）', () => {
     await commits[0].trigger('click')
     await flushPromises()
     expect(wrapper.find('.wb-diff-panel').text()).toContain('+from-commit')
+  })
+
+  it('切换分支调用后端并刷新列表（N5 P3）', async () => {
+    changesNet.indexCalls.length = 0
+    const wrapper = mountPanel({ projectId: 'p1' })
+    await flushPromises()
+    await wrapper.findAll('.wb-tab')[3].trigger('click')
+    await flushPromises()
+
+    const select = wrapper.find('.wb-branch-bar select')
+    expect(select.exists()).toBe(true)
+    await select.setValue('dev')
+    await flushPromises()
+
+    expect(changesNet.indexCalls).toContainEqual({
+      action: 'branch',
+      projectId: 'p1',
+      body: { action: 'switch', name: 'dev' },
+    })
   })
 })
 

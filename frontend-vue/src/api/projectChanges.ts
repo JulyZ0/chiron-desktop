@@ -121,6 +121,57 @@ export async function commitProjectGit(
   }
 }
 
+/**
+ * 丢弃未暂存的已跟踪改动（N5 P3）。
+ *
+ * 后端会先 `stash push --keep-index` 留一份可找回的副本，再回退工作区；
+ * 未跟踪文件不在范围内（没有基线可回退）。
+ */
+export async function discardProjectPaths(
+  projectId: string,
+  paths: string[],
+): Promise<ProjectChanges> {
+  const { data } = await api.post(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/git/discard`,
+    { paths },
+  )
+  return normalizeChanges(data?.data)
+}
+
+export interface GitBranches {
+  branches: string[]
+  /** 空串 = detached HEAD */
+  current: string
+}
+
+function normalizeBranches(payload: unknown): GitBranches {
+  const p = (payload ?? {}) as Partial<GitBranches>
+  const list = Array.isArray(p.branches)
+    ? p.branches.filter((b): b is string => typeof b === 'string' && b !== '')
+    : []
+  return { branches: list, current: typeof p.current === 'string' ? p.current : '' }
+}
+
+/** 本地分支列表（N5 P3）。 */
+export async function listProjectBranches(projectId: string): Promise<GitBranches> {
+  const { data } = await api.get(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/git/branches`,
+  )
+  return normalizeBranches(data?.data)
+}
+
+/** 创建或切换分支（N5 P3）。切换要求工作区干净，否则后端返回 git_dirty。 */
+export async function projectBranchAction(
+  projectId: string,
+  body: { action: 'create' | 'switch'; name: string; from?: string },
+): Promise<GitBranches> {
+  const { data } = await api.post(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/git/branch`,
+    body,
+  )
+  return normalizeBranches(data?.data)
+}
+
 /** 单个文件的统一 diff（只读）。 */
 export interface ProjectDiff {
   repo: boolean

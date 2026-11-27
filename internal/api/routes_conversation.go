@@ -86,6 +86,11 @@ func registerConversationRoutes(
 	mux.Handle("POST /v1/session-map/projects/{id}/git/unstage", authMW(rlMW(http.HandlerFunc(smHandler.UnstageProjectGit))))
 	// commit（N5 P2）：只提交已暂存内容，不做隐式 add；message 必填。
 	mux.Handle("POST /v1/session-map/projects/{id}/git/commit", authMW(rlMW(http.HandlerFunc(smHandler.CommitProjectGit))))
+	// discard（N5 P3）：先 stash 再回退工作区，只处理未暂存的已跟踪文件。
+	mux.Handle("POST /v1/session-map/projects/{id}/git/discard", authMW(rlMW(http.HandlerFunc(smHandler.DiscardProjectGit))))
+	// 分支（N5 P3）：只列本地分支、创建与切换；不做 merge/rebase/push。
+	mux.Handle("GET /v1/session-map/projects/{id}/git/branches", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectGitBranches))))
+	mux.Handle("POST /v1/session-map/projects/{id}/git/branch", authMW(rlMW(http.HandlerFunc(smHandler.BranchProjectGit))))
 	// 单文件 diff：改动列表点开一条时用。同样是只读 git 子命令，路径必须落在项目内。
 	mux.Handle("GET /v1/session-map/projects/{id}/diff", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectDiff))))
 	// F5：最近提交与单条提交 diff（只读）。

@@ -34,6 +34,9 @@ import { langOf, truncatePreview } from './previewCode'
 import {
   listProjectChanges,
   commitProjectGit,
+  discardProjectPaths,
+  listProjectBranches,
+  projectBranchAction,
   readCommitDiff,
   readProjectDiff,
   readProjectLog,
@@ -51,6 +54,7 @@ import CheckpointTimeline from './CheckpointTimeline.vue'
 import { pathKey, projectRelative } from './paths'
 import { describeApiError } from '../../utils/apiError'
 import { notify } from '../../utils/notify'
+import { Modal } from 'ant-design-vue'
 import { desktopHost } from '../../stores/device'
 import { useAuthStore } from '../../stores/auth'
 import { revealRequest, WORKBENCH_WIDTH_KEY } from './useWorkbench'
@@ -497,6 +501,97 @@ async function commitStagedChanges(): Promise<void> {
   }
 }
 
+// ── N5 P3：discard / 分支 ────────────────────────────────────────────────
+const discardBusy = ref(false)
+
+/** 只有"未暂存的已跟踪改动"能丢弃：未跟踪文件没有基线，删掉不可恢复。 */
+function canDiscardRow(row: ChangeRow | null): boolean {
+  return !!row && !row.agentOnly && row.unstaged && row.status !== '?'
+}
+
+async function discardCurrentDiff(): Promise<void> {
+  const row = diffRow.value
+  if (!props.projectId || !row || discardBusy.value || !canDiscardRow(row)) return
+  Modal.confirm({
+    title: tr('chat.workbench_discard_title'),
+    content: tr('chat.workbench_discard_body', { path: row.path }),
+    okText: tr('chat.workbench_discard_action'),
+    okType: 'danger',
+    cancelText: tr('common.cancel'),
+    onOk: async () => {
+      discardBusy.value = true
+      try {
+        const next = await discardProjectPaths(props.projectId as string, [row.path])
+        applyChanges(next)
+        notify.success(tr('chat.workbench_discard_done'))
+        // 工作区已回退：diff 可能变空，重拉一次让用户看到真实结果。
+        if (diffRow.value) await loadDiff(diffRow.value)
+      } catch (e) {
+        notify.error(describeApiError(e))
+      } finally {
+        discardBusy.value = false
+      }
+    },
+  })
+}
+
+const branchList = ref<string[]>([])
+const branchCurrent = ref('')
+const branchesLoading = ref(false)
+const branchBusy = ref(false)
+const newBranchName = ref('')
+
+async function loadBranches(): Promise<void> {
+  if (!props.projectId || branchesLoading.value) return
+  branchesLoading.value = true
+  try {
+    const result = await listProjectBranches(props.projectId)
+    branchList.value = result.branches
+    branchCurrent.value = result.current
+  } catch (e) {
+    // 分支栏是历史页的增强信息：失败时保留已有列表，错误由 select 的 title 提示。
+    notify.error(describeApiError(e))
+  } finally {
+    branchesLoading.value = false
+  }
+}
+
+async function switchBranch(event: Event): Promise<void> {
+  const select = event.target as HTMLSelectElement
+  const name = select.value
+  if (!props.projectId || !name || name === branchCurrent.value || branchBusy.value) return
+  branchBusy.value = true
+  try {
+    const result = await projectBranchAction(props.projectId, { action: 'switch', name })
+    branchList.value = result.branches
+    branchCurrent.value = result.current
+    notify.success(tr('chat.workbench_branch_switched', { name: result.current || name }))
+    await loadHistory()
+    await loadChanges()
+  } catch (e) {
+    notify.error(describeApiError(e))
+    select.value = branchCurrent.value
+  } finally {
+    branchBusy.value = false
+  }
+}
+
+async function createBranch(): Promise<void> {
+  const name = newBranchName.value.trim()
+  if (!props.projectId || !name || branchBusy.value) return
+  branchBusy.value = true
+  try {
+    const result = await projectBranchAction(props.projectId, { action: 'create', name })
+    branchList.value = result.branches
+    newBranchName.value = ''
+    notify.success(tr('chat.workbench_branch_created', { name }))
+  } catch (e) {
+    notify.error(describeApiError(e))
+  } finally {
+    branchBusy.value = false
+  }
+}
+
 /**
  * 打开一条改动。
  *
@@ -870,6 +965,7 @@ function selectTab(tab: 'files' | 'changes' | 'checkpoints' | 'history') {
   activeTab.value = tab
   if (tab === 'changes' && !changesData.value && !changesLoading.value) void loadChanges()
   if (tab === 'history' && !historyData.value && !historyLoading.value) void loadHistory()
+  if (tab === 'history') void loadBranches()
 }
 
 /**
@@ -1649,6 +1745,14 @@ async function openWithSystem(entry: ProjectFileEntry) {
             :title="verificationBadge.title"
           >{{ verificationBadge.text }}</span>
           <button
+            v-if="canDiscardRow(diffRow)"
+            type="button"
+            class="wb-btn"
+            :disabled="discardBusy"
+            :title="tr('chat.workbench_discard_body', { path: diffRow.path })"
+            @click="discardCurrentDiff"
+          >{{ tr('chat.workbench_discard_action') }}</button>
+          <button
             type="button"
             class="wb-btn"
             :title="tr('chat.workbench_diff_open_file')"
@@ -1768,6 +1872,34 @@ async function openWithSystem(entry: ProjectFileEntry) {
         v-if="activeTab === 'history'"
         class="wb-tree"
       >
+        <!-- N5 P3：分支栏。只切本地分支；切换要求工作区干净（后端 git_dirty）。 -->
+        <div class="wb-branch-bar">
+          <span class="wb-branch-current">{{ tr('chat.workbench_branch_current', { name: branchCurrent || historyData?.branch || '—' }) }}</span>
+          <select
+            :value="branchCurrent || historyData?.branch || ''"
+            :disabled="branchesLoading || branchBusy || !branchList.length"
+            :aria-label="tr('chat.workbench_branch_switch')"
+            @change="switchBranch"
+          >
+            <option
+              v-for="name in branchList"
+              :key="name"
+              :value="name"
+            >{{ name }}</option>
+          </select>
+          <input
+            v-model="newBranchName"
+            class="wb-branch-new"
+            :placeholder="tr('chat.workbench_branch_new_placeholder')"
+            @keydown.enter.prevent="createBranch"
+          >
+          <button
+            type="button"
+            class="wb-btn"
+            :disabled="!newBranchName.trim() || branchBusy"
+            @click="createBranch"
+          >{{ tr('chat.workbench_branch_create') }}</button>
+        </div>
         <div
           v-if="historyError"
           class="wb-error"
@@ -2264,6 +2396,21 @@ async function openWithSystem(entry: ProjectFileEntry) {
 .wb-commit-warn { font-size: 12px; color: var(--warning); }
 .wb-commit-actions .wb-btn-primary { margin-left: auto; }
 .wb-commit-actions .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* N5 P3：分支栏 */
+.wb-branch-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 0; font-size: 12px; }
+.wb-branch-current { color: var(--text-secondary); }
+.wb-branch-bar select,
+.wb-branch-new {
+  padding: 3px 6px;
+  border: var(--hairline-width) solid var(--border-default);
+  border-radius: 6px;
+  background: var(--bg-page);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+}
+.wb-branch-new { width: 140px; }
+.wb-branch-bar .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* 分栏手柄：平时不可见，悬停/拖动/聚焦时才显形（与 SessionPreviewPane 一致） */
 .wb-resize {

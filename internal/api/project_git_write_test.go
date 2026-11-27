@@ -344,3 +344,77 @@ func TestCommitRequiresMessageAndStagedContent(t *testing.T) {
 		t.Fatal("commit with nothing staged should fail")
 	}
 }
+
+// ── N5 P3：discard / 分支 ──────────────────────────────────────────────
+
+func TestDiscardUnstagedPathsKeepsRecoverableStash(t *testing.T) {
+	root := gitTestRepo(t)
+	ctx := context.Background()
+	writeFile(t, root, "a.txt", "base")
+	if err := stageGitPaths(ctx, root, []string{"a.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := commitStagedPaths(ctx, root, "base"); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, root, "a.txt", "changed")
+	if err := discardUnstagedPaths(ctx, root, []string{"a.txt"}); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(root, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "base" {
+		t.Fatalf("working tree should be restored, got %q", content)
+	}
+	// 先 stash 再回退：丢掉的改动必须能在 stash 里找回来
+	stash, err := gitRead(ctx, root, "stash", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stash, "chiron-discard:") {
+		t.Fatalf("discard should leave a stash entry, got %q", stash)
+	}
+}
+
+func TestBranchCreateListAndSwitch(t *testing.T) {
+	root := gitTestRepo(t)
+	ctx := context.Background()
+	writeFile(t, root, "a.txt", "base")
+	if err := stageGitPaths(ctx, root, []string{"a.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := commitStagedPaths(ctx, root, "base"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := gitWrite(ctx, root, "branch", "feature/x"); err != nil {
+		t.Fatalf("create branch: %v", err)
+	}
+	branches, err := listGitBranches(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, name := range branches.Branches {
+		if name == "feature/x" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("feature/x missing from %v", branches.Branches)
+	}
+
+	if _, err := gitWrite(ctx, root, "switch", "feature/x"); err != nil {
+		t.Fatalf("switch: %v", err)
+	}
+	branches, err = listGitBranches(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branches.Current != "feature/x" {
+		t.Fatalf("current = %q, want feature/x", branches.Current)
+	}
+}

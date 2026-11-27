@@ -374,3 +374,214 @@ func commitStagedPaths(ctx context.Context, root, message string) (string, error
 	}
 	return strings.TrimSpace(sha), nil
 }
+
+// ── P3：discard / 分支 ──────────────────────────────────────────────────
+
+type gitDiscardRequest struct {
+	Paths []string `json:"paths"`
+}
+
+// DiscardProjectGit POST /v1/session-map/projects/{id}/git/discard
+//
+// 只丢弃**未暂存的已跟踪改动**：先 `stash push --keep-index` 留一份可找回的副本，
+// 再把工作区回退到 index。未跟踪文件不在范围内 —— 它们没有基线可回退，删掉就是
+// 真的删掉，不能靠 stash 恢复。
+func (h *SessionMapHandler) DiscardProjectGit(w http.ResponseWriter, r *http.Request) {
+	loc, release, ok := h.beginProjectGitWrite(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var body gitDiscardRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
+		BadRequest(w, "invalid request body")
+		return
+	}
+	if len(body.Paths) == 0 {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil, "paths is required")
+		return
+	}
+
+	before, err := collectProjectChanges(r.Context(), loc.RootPath)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git changes")
+		return
+	}
+	// 只允许"有未暂存改动的已跟踪文件"。
+	discardable := ProjectChanges{}
+	for _, change := range before.Changes {
+		if change.Unstaged && change.Status != "?" {
+			discardable.Changes = append(discardable.Changes, change)
+		}
+	}
+	paths, err := allowedGitPaths(body.Paths, discardable)
+	if err != nil {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil,
+			"only unstaged tracked files can be discarded")
+		return
+	}
+
+	if err := discardUnstagedPaths(r.Context(), loc.RootPath, paths); err != nil {
+		switch {
+		case errors.Is(err, errGitMissing):
+			JSONWithCode(w, http.StatusConflict, CodeServiceUnavailable, nil, "git is not installed")
+		default:
+			logAndRespond(w, err, http.StatusInternalServerError, "git discard failed")
+		}
+		return
+	}
+
+	after, err := collectProjectChanges(r.Context(), loc.RootPath)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git changes")
+		return
+	}
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		db.AuditLog(r.Context(), claims.UserID, smTenantID(claims), "project.git.discard",
+			"session_map_workspaces:"+loc.ID,
+			fmt.Sprintf("files=%d", len(paths)), r.RemoteAddr,
+			map[string]interface{}{"project_id": loc.ID, "file_count": len(paths)})
+	}
+	OK(w, after)
+}
+
+// discardUnstagedPaths 把未暂存改动存入 stash（可恢复），并回退工作区到 index。
+func discardUnstagedPaths(ctx context.Context, root string, paths []string) error {
+	args := []string{
+		"stash", "push", "--keep-index",
+		"-m", fmt.Sprintf("chiron-discard:%d", time.Now().Unix()),
+	}
+	args = append(args, gitPathsArgs(paths)...)
+	_, err := gitWrite(ctx, root, args...)
+	return err
+}
+
+// GitBranches 是分支列表响应。
+type GitBranches struct {
+	Branches []string `json:"branches"`
+	Current  string   `json:"current"`
+}
+
+// ListProjectGitBranches GET /v1/session-map/projects/{id}/git/branches
+func (h *SessionMapHandler) ListProjectGitBranches(w http.ResponseWriter, r *http.Request) {
+	loc, ok := h.requireProject(w, r)
+	if !ok {
+		return
+	}
+	if loc.Provider == smProviderClient {
+		JSONWithCode(w, http.StatusConflict, CodeGitClientUnsupported, nil,
+			"git branches are not supported for device projects")
+		return
+	}
+	if !projectVCS(r.Context(), loc.RootPath).Repo {
+		JSONWithCode(w, http.StatusConflict, CodeGitNotRepo, nil, "project is not a git work tree")
+		return
+	}
+	branches, err := listGitBranches(r.Context(), loc.RootPath)
+	if err != nil {
+		if errors.Is(err, errGitMissing) {
+			JSONWithCode(w, http.StatusConflict, CodeServiceUnavailable, nil, "git is not installed")
+			return
+		}
+		logAndRespond(w, err, http.StatusInternalServerError, "could not list branches")
+		return
+	}
+	OK(w, branches)
+}
+
+func listGitBranches(ctx context.Context, root string) (GitBranches, error) {
+	out, err := gitRead(ctx, root, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+	if err != nil {
+		return GitBranches{}, err
+	}
+	branches := make([]string, 0, 8)
+	for _, line := range strings.Split(out, "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			branches = append(branches, name)
+		}
+	}
+	// detached HEAD 时 symbolic-ref 退出非 0：那是正常状态（current 为空）。
+	current, _ := gitRead(ctx, root, "symbolic-ref", "--short", "-q", "HEAD")
+	return GitBranches{Branches: branches, Current: strings.TrimSpace(current)}, nil
+}
+
+type gitBranchRequest struct {
+	// Action: create | switch
+	Action string `json:"action"`
+	Name   string `json:"name"`
+	From   string `json:"from"`
+}
+
+// BranchProjectGit POST /v1/session-map/projects/{id}/git/branch
+func (h *SessionMapHandler) BranchProjectGit(w http.ResponseWriter, r *http.Request) {
+	loc, release, ok := h.beginProjectGitWrite(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var body gitBranchRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&body); err != nil {
+		BadRequest(w, "invalid request body")
+		return
+	}
+	action := strings.TrimSpace(body.Action)
+	name := strings.TrimSpace(body.Name)
+	if name == "" || (action != "create" && action != "switch") {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil,
+			"action (create|switch) and name are required")
+		return
+	}
+	// 交给 git 自己判定引用名合法性：`..`、空格、`~^:?*[` 等规则由它维护，
+	// 在 Go 里抄一份迟早漂移。
+	if _, err := gitRead(r.Context(), loc.RootPath, "check-ref-format", "--branch", name); err != nil {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil, "invalid branch name")
+		return
+	}
+
+	if action == "switch" {
+		changes, err := collectProjectChanges(r.Context(), loc.RootPath)
+		if err != nil {
+			logAndRespond(w, err, http.StatusInternalServerError, "could not read git changes")
+			return
+		}
+		if len(changes.Changes) > 0 {
+			JSONWithCode(w, http.StatusConflict, CodeGitDirty, nil,
+				"working tree is not clean; commit or discard changes before switching branches")
+			return
+		}
+	}
+
+	var err error
+	if action == "switch" {
+		_, err = gitWrite(r.Context(), loc.RootPath, "switch", name)
+	} else {
+		args := []string{"branch", name}
+		if from := strings.TrimSpace(body.From); from != "" {
+			args = append(args, from)
+		}
+		_, err = gitWrite(r.Context(), loc.RootPath, args...)
+	}
+	if err != nil {
+		if errors.Is(err, errGitMissing) {
+			JSONWithCode(w, http.StatusConflict, CodeServiceUnavailable, nil, "git is not installed")
+			return
+		}
+		logAndRespond(w, err, http.StatusInternalServerError, "git branch operation failed")
+		return
+	}
+
+	branches, err := listGitBranches(r.Context(), loc.RootPath)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not list branches")
+		return
+	}
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		db.AuditLog(r.Context(), claims.UserID, smTenantID(claims), "project.git.branch",
+			"session_map_workspaces:"+loc.ID,
+			action+"="+name, r.RemoteAddr,
+			map[string]interface{}{"project_id": loc.ID, "action": action, "branch": name})
+	}
+	OK(w, branches)
+}
