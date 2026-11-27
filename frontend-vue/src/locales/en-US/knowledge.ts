@@ -136,6 +136,7 @@ export default {
   no_failed_documents: "No failed documents to retry",
   index_already_running: "This knowledge base is already indexing; please wait",
   located_referenced_document: "Located the cited document",
+  located_referenced_document_page: "Located the referenced document (page {page})",
   clear_located_document: "Clear",
   max_knowledge_bases_n: "A conversation can include at most {n} knowledge bases",
   kb_weights: "Knowledge base weights",

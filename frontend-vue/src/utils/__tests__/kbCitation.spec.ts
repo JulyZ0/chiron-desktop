@@ -20,6 +20,12 @@ describe('buildKbCitationLink', () => {
     )
   })
 
+  it('带页码时把 page 一起带进查询串', () => {
+    expect(buildKbCitationLink({ kb_id: 'kb-1', doc_id: 'doc-9', page: 7 })).toBe(
+      '/knowledge/kb-1?doc=doc-9&page=7',
+    )
+  })
+
   it('只有 kb → 无 ?doc（仍可回到该库）', () => {
     expect(buildKbCitationLink({ kb_id: 'kb-1' })).toBe('/knowledge/kb-1')
   })

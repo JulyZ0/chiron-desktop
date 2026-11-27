@@ -136,6 +136,7 @@ export default {
   no_failed_documents: "لا توجد مستندات فاشلة لإعادة المحاولة",
   index_already_running: "هذه القاعدة قيد الفهرسة بالفعل؛ يُرجى الانتظار",
   located_referenced_document: "تم الانتقال إلى المستند المُستشهد به",
+  located_referenced_document_page: "تم تحديد المستند المشار إليه (الصفحة {page})",
   clear_located_document: "إلغاء التحديد",
   max_knowledge_bases_n: "يمكن تضمين {n} قواعد معرفة كحد أقصى في المحادثة الواحدة",
   kb_weights: "أوزان قواعد المعرفة",

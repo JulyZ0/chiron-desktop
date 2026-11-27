@@ -137,6 +137,7 @@ export default {
   no_failed_documents: "没有失败的文档需要重试",
   index_already_running: "该知识库正在索引，请稍候",
   located_referenced_document: "已定位到引用的文档",
+  located_referenced_document_page: "已定位到被引用的文档（第 {page} 页）",
   clear_located_document: "取消定位",
   // ── 对话多库选择 ──
   max_knowledge_bases_n: "一次对话最多选择 {n} 个知识库",

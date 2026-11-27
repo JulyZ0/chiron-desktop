@@ -78,7 +78,14 @@ export function buildKbCitationLink(citation: Partial<KbCitation> | null | undef
   if (!kbId) return ''
   const base = `/knowledge/${encodeURIComponent(kbId)}`
   const docId = asString(citation?.doc_id)
-  return docId ? `${base}?doc=${encodeURIComponent(docId)}` : base
+  if (!docId) return base
+  const params = new URLSearchParams({ doc: docId })
+  // 页码不是文档身份的一部分，但它是"回到原文位置"的唯一坐标；带上它，
+  // 详情页可以提示"第 N 页"（没有阅读器时至少不会丢掉这个信息）。
+  const page = asPage(citation?.page)
+  if (page) params.set('page', String(page))
+  return `${base}?${params.toString()}`
+
 }
 
 /**

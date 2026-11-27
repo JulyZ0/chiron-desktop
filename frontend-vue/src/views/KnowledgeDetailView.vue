@@ -787,6 +787,11 @@ const showIndexCard = computed(() => {
 // `route.query` 在测试的轻量路由桩里可能不存在（只 mock 了 params），
 // 这里按"没有定位参数"处理，而不是把组件挂载直接打崩。
 const targetDocId = ref<string>(typeof route?.query?.doc === 'string' ? route.query.doc : '')
+const targetPage = ref<number>(0)
+{
+  const rawPage = Number(route?.query?.page)
+  if (Number.isFinite(rawPage) && rawPage > 0) targetPage.value = Math.floor(rawPage)
+}
 const docTableRef = ref<HTMLElement | null>(null)
 
 async function focusTargetDocument() {
@@ -806,8 +811,10 @@ function docRowClassName(record: KnowledgeDocument): string {
 /** 行内高亮的锚点目标（引用落点）：也供“清除定位”使用。 */
 function clearTargetDocument() {
   targetDocId.value = ''
+  targetPage.value = 0
   const q = { ...route.query }
   delete q.doc
+  delete q.page
   void router.replace({ path: route.path, query: q })
 }
 
@@ -1298,7 +1305,11 @@ function formatSize(bytes: number): string {
               v-if="targetDocId"
               class="doc-target-hint"
             >
-              <span>{{ $t('knowledge.located_referenced_document') }}</span>
+              <span>
+                {{ targetPage
+                  ? $t('knowledge.located_referenced_document_page', { page: targetPage })
+                  : $t('knowledge.located_referenced_document') }}
+              </span>
               <Button
                 type="link"
                 size="small"
