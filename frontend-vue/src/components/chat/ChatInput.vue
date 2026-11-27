@@ -975,7 +975,11 @@ function restoreDraft(text: string, attachments?: ChatAttachment[]) {
   nextTick(() => textareaRef.value?.focus?.())
 }
 
-defineExpose({ insertText, setCommandDraft, setDraft, restoreDraft, attachProjectFile: attachFileReference })
+function focus(): void {
+  nextTick(() => textareaRef.value?.focus?.())
+}
+
+defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attachProjectFile: attachFileReference })
 </script>
 
 <template>

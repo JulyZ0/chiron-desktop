@@ -29,6 +29,7 @@ const {
   session,
   dialog,
   Tray,
+  globalShortcut,
   nativeImage,
   clipboard,
   powerMonitor,
@@ -260,6 +261,28 @@ let tray = null
  * 图标缺失时**不建托盘也不报错退出**：托盘是增强功能，缺它只是退化成
  * "最小化仍留在任务栏"，不该让整个应用起不来。
  */
+/**
+ * 全局快捷键：Ctrl/Cmd+Alt+Space —— 把窗口拉到前台并让输入框获得焦点。
+ *
+ * 只做"回来提问"，不做独立迷你窗口：迷你窗口要另开 BrowserWindow、维护第二套
+ * 会话选择与提交链路，收益与风险不成比例。窗口已在前台时同样发信号（用于从别的
+ * 页面/面板回到输入框）。注册失败（组合被占用）只告警，不影响应用启动。
+ */
+function registerQuickAskShortcut() {
+  if (process.platform !== 'win32' && process.platform !== 'darwin') return
+  try {
+    const ok = globalShortcut.register('CommandOrControl+Alt+Space', () => {
+      showMainWindow()
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send(shared.QUICK_ASK_CHANNEL)
+      }
+    })
+    if (!ok) logMain('warn', 'quick-ask shortcut registration failed (already in use)')
+  } catch (err) {
+    logMain('warn', `quick-ask shortcut failed: ${err && err.message}`)
+  }
+}
+
 function createTray() {
   if (tray || process.platform !== 'win32') return
   const iconPath = path.join(__dirname, 'resources', 'icon-32.png')
@@ -1942,6 +1965,7 @@ function createWindow() {
   // setup / error 不做 —— 它们收起来就没有恢复入口。
   if (target === 'app') {
     createTray()
+    registerQuickAskShortcut()
     // 最小化即"收进托盘"：只摘掉任务栏按钮，**不做 hide()**。
     //
     // hide() 会让窗口进入「已最小化 + 已隐藏」的复合态：Windows 认为它仍是最小化的，
@@ -3735,6 +3759,8 @@ if (!gotLock) {
   // "只停一次"的标记由 stopLocalBackend 自己维护：它一进门就清空 localBackend 的归属，
   // 这里若再置一次，等于在壳里留第二个状态真值来源。
   app.on('before-quit', event => {
+    // 全局快捷键必须在进程退出前注销；否则热重载/重启后组合键会显示被占用。
+    globalShortcut.unregisterAll()
     // 真正的退出从这里开始（托盘菜单、系统关机、菜单栏退出都会走到）。
     // 必须先立标志：紧接着派发的 close 若还看到 isQuitting=false，
     // 就会把它当成"用户关窗"拦下来 —— 系统关机也会被卡住。

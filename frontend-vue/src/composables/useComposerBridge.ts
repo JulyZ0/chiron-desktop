@@ -45,6 +45,8 @@ import type { ChatAttachment } from '../components/chat/chat-types'
  * 整个 `InstanceType` 绑进来（那是组件内部形状，不属于本模块的契约）。
  */
 export interface ComposerHandle {
+  /** 聚焦输入框（全局快捷键/面板跳转用） */
+  focus: () => void
   insertText: (text: string) => void
   setDraft: (text: string) => void
   setCommandDraft: (cmd: string) => void

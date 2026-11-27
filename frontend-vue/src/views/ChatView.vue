@@ -30,6 +30,7 @@ import { privateKey } from '../utils/privateStorage'
 import { playUiSound } from '../utils/uiSounds'
 import { planReconnect } from '../utils/streamReattach'
 import { notify } from '../utils/notify'
+import { consumeQuickAsk, onQuickAsk } from '../utils/quickAsk'
 import { useThemeStore } from '../stores/theme'
 import { useChatSessionStore } from '../stores/chatSession'
 import { useChatRunState } from '../composables/useChatRunState'
@@ -463,6 +464,7 @@ const sseLastIdBySession = new Map<string, string>()
 // H68: auth switch must clear the SSE resume cursor; the map lives here,
 // so the reset is registered as a hook and released on unmount.
 let unregisterAuthScopedReset: (() => void) | undefined
+let unsubQuickAsk: (() => void) | undefined
 
 /** 该会话是否有一条本页的会话流（子 Agent 通道据此决定同一帧交给谁） */
 function hasSessionStream(sid: string): boolean {
@@ -1781,6 +1783,10 @@ useKeyboardShortcuts({
 // ── 会话 CRUD（保留原逻辑） ──
 onMounted(async () => {
   unregisterAuthScopedReset?.()
+  // F10：从全局快捷键/其它页面跳来时，挂载后聚焦输入框；已在聊天页时由 onQuickAsk 处理。
+  const focusComposer = () => { void nextTick(() => chatInputRef.value?.focus?.()) }
+  if (consumeQuickAsk()) focusComposer()
+  unsubQuickAsk = onQuickAsk(focusComposer)
   unregisterAuthScopedReset = registerAuthScopedReset(() => {
     // 认证切换：续传游标与全部会话流一起作废（旧身份的事件流不该在新身份下继续被消费）
     sseLastIdBySession.clear()
@@ -1809,6 +1815,8 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  unsubQuickAsk?.()
+  unsubQuickAsk = undefined
   unregisterAuthScopedReset?.()
   unregisterAuthScopedReset = undefined
   stopTurnTimer()

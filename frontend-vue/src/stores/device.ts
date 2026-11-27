@@ -93,6 +93,8 @@ export interface ChironDesktopHost {
    * 没有这条通道时返回一个空的取消函数。
    */
   onAutoLock?: (callback: (payload: { reason?: string }) => void) => () => void
+  /** 全局快捷键触发的「快速提问」信号；返回取消订阅函数 */
+  onQuickAsk?: (callback: () => void) => () => void
   /**
    * 订阅**引擎崩溃取证**（崩溃自愈放弃时由主进程推送）。
    *

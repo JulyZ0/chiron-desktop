@@ -122,6 +122,8 @@ const AUTO_LOCK_CHANNEL = 'desktop:auto-lock'
  * 的唯一通知。
  */
 const ENGINE_CRASH_CHANNEL = 'desktop:engine-crash'
+/** 全局快捷键触发：主进程把窗口拉起来并发这个信号，渲染层聚焦输入框。 */
+const QUICK_ASK_CHANNEL = 'desktop:quick-ask'
 
 /**
  * 主进程建窗时把「这个窗口有没有系统标题栏」告诉 preload。
@@ -327,6 +329,7 @@ module.exports = {
   RUNTIME_MIRROR_CHANNEL,
   AUTO_LOCK_CHANNEL,
   ENGINE_CRASH_CHANNEL,
+  QUICK_ASK_CHANNEL,
   TITLEBAR_ARG_PREFIX,
   WINDOW_CHANNELS,
   PIP_INDEX_MIRRORS,

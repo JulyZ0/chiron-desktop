@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, watchEffect } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, onMounted, onUnmounted, watchEffect } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ConfigProvider, theme } from 'ant-design-vue'
 import AppLayout from './components/AppLayout.vue'
@@ -13,8 +13,11 @@ import LockScreen from './components/shell/LockScreen.vue'
 import { useThemeStore } from './stores/theme'
 import { useTypographyStore } from './stores/typography'
 import { languageMeta } from './i18n/languages'
+import { desktopHost } from './stores/device'
+import { requestQuickAsk } from './utils/quickAsk'
 
 const route = useRoute()
+const router = useRouter()
 const { locale } = useI18n()
 // ant-design-vue 组件库语言（分页器/日期选择器/空态等）必须与界面语言同步，
 // 否则会出现"界面英文、组件中文"的混搭。
@@ -45,6 +48,19 @@ watchEffect(() => {
   root.setAttribute('data-theme', themeStore.cssThemeId)
   if (themeStore.isDark) root.classList.add('dark')
   else root.classList.remove('dark')
+})
+
+// F10：全局快捷键「快速提问」。IPC 到达时先切到聊天页并置位，ChatView 挂载后聚焦输入框。
+let unsubQuickAsk: (() => void) | undefined
+onMounted(() => {
+  unsubQuickAsk = desktopHost()?.onQuickAsk?.(() => {
+    requestQuickAsk()
+    if (route.path !== '/chat') void router.push('/chat')
+  })
+})
+onUnmounted(() => {
+  unsubQuickAsk?.()
+  unsubQuickAsk = undefined
 })
 </script>
 

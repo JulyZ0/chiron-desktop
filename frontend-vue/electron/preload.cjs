@@ -124,6 +124,16 @@ contextBridge.exposeInMainWorld('chironDesktop', {
    * 返回取消订阅函数。老外壳没有这条通道时返回一个空的取消函数 —— 界面照常
    * 可用，只是没有被动锁定；这比让调用点存不存在都要判断一层更简单。
    */
+  /**
+   * 全局快捷键「快速提问」：主进程已把窗口拉到前台，这里只通知页面聚焦输入框。
+   * 返回取消订阅函数；老外壳没有该通道时返回空函数。
+   */
+  onQuickAsk: callback => {
+    if (typeof callback !== 'function') return () => {}
+    const handler = () => callback()
+    ipcRenderer.on(shared.QUICK_ASK_CHANNEL, handler)
+    return () => ipcRenderer.removeListener(shared.QUICK_ASK_CHANNEL, handler)
+  },
   onAutoLock: callback => {
     if (typeof callback !== 'function') return () => {}
     const handler = (_event, payload) => callback(payload || {})
