@@ -154,7 +154,15 @@ func (c *cappedBuffer) String() string {
 // 做成变量是为了单测能替换成假实现 —— 但**不要**为了方便而让它接受调用方给的
 // 任意参数：调用方只传代码里写死的子命令。
 var gitRun = func(ctx context.Context, dir string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
+	return gitRunTimeout(ctx, dir, gitTimeout, args...)
+}
+
+// gitRunTimeout 与 gitRun 相同，但允许调用方指定更长的上限。
+//
+// 写操作（N5）需要独立超时：`commit` 在冷缓存/大仓库上会明显超过只读的 5s，
+// 而把只读超时统一放宽又会让"仓库不可达"时的等待变长。两者分开，互不牵连。
+func gitRunTimeout(ctx context.Context, dir string, timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -175,7 +183,7 @@ var gitRun = func(ctx context.Context, dir string, args ...string) (string, erro
 			return "", errGitMissing
 		}
 		if ctx.Err() != nil {
-			return out.String(), fmt.Errorf("%w: timed out after %s", errGitFailed, gitTimeout)
+			return out.String(), fmt.Errorf("%w: timed out after %s", errGitFailed, timeout)
 		}
 		// stderr 可能含绝对路径，只留在错误里给日志，不透给页面（见 handler）。
 		return out.String(), fmt.Errorf("%w: %s", errGitFailed, strings.TrimSpace(errOut.String()))
@@ -580,8 +588,8 @@ type ProjectDiff struct {
 	// 打开文件预览 —— 把整个新文件塞进一个 "+" 前缀的假 diff 里只会更难读。
 	Untracked bool `json:"untracked,omitempty"`
 	// Binary 为真表示 git 只给了"Binary files differ"而没有正文。
-	Binary    bool   `json:"binary,omitempty"`
-	Truncated bool   `json:"truncated,omitempty"`
+	Binary    bool `json:"binary,omitempty"`
+	Truncated bool `json:"truncated,omitempty"`
 	// Diff 是 `git diff` 的原始输出。
 	Diff string `json:"diff"`
 }
@@ -751,9 +759,9 @@ type ProjectCommit struct {
 
 // ProjectLog 是「提交」页的数据。
 type ProjectLog struct {
-	Repo       bool            `json:"repo"`
-	GitMissing bool            `json:"git_missing,omitempty"`
-	Branch     string          `json:"branch,omitempty"`
+	Repo       bool   `json:"repo"`
+	GitMissing bool   `json:"git_missing,omitempty"`
+	Branch     string `json:"branch,omitempty"`
 	// Upstream 为空表示当前分支没有上游（本地仓库或未 push 过）；这时 Ahead/Behind 无意义。
 	Upstream string          `json:"upstream,omitempty"`
 	Ahead    int             `json:"ahead"`
