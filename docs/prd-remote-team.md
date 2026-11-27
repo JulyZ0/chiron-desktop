@@ -44,7 +44,6 @@ Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、
 | ID | 事项 | 完成判据 | 量级 |
 |---|---|---|---|
 | L26 | 备份/恢复演练 | 脚本与 runbook 已备（`scripts/backup.sh`/`restore.sh`、`docs/ops-runbook.md`）；**空环境恢复并跑 team_smoke 一次**待做 | M |
-| L27 | 生产部署形态与入口 | 二选一：桌面托管（NSSM/日志轮转/重启）或容器化（prod compose + 迁移 job + 资源上限）；修掉失效的 `make docker-build/dev-up` | L |
 | L28 | 升级/回滚演练 | 规程已写入 `docs/ops-runbook.md`；按规程完整演练一次（含迁移失败回滚） | M |
 | L29 | 依赖与供应链 | 脚本已备（`scripts/dep_audit.sh`、`make dep-audit[-sbom]`）；CI 接入/镜像扫描/SBOM 归档待做；H51 签名清单待决策 | M |
 | L31 | 长会话内存/渲染 | `runtimes`/`seenIds` 淘汰；流式不重投影；`read_file` 折叠 | M |
@@ -70,6 +69,8 @@ Python 引擎 / 前端三面），发现的问题集中在"长连接、停机、
   命名管道本版不支持。
 - **G22** MCP 不并入统一注册表；**G24** 不做定时触发；**G25** 并入 H2。
 - **插件化**：不做 Cordis 式"一切皆可替换"；只做能力 seam + 声明式 bundle（候选 E6）。
+- **部署形态（2026-11-27）**：本版本只支持 **Windows 桌面端**（Electron + 本机反代），
+  用任务计划程序做登录自启 + 崩溃重启；容器/WSL 编排保留为未来选项，不进本版本承诺。
 - **P1-3 steer**：顶层会话维持现状（run 级入口见 E1）。
 
 ## 6. 落地路线（由易到难）
@@ -94,9 +95,10 @@ L15 停机排空/拒绝新 spawn、DLQ 走 `append_task`、reclaim 与业务失�
 运行中的会话。
 
 **第 4 批 · 进行中**
-已完成：L25 `gzip_static`、L30 最小告警集（`deploy/prometheus-alerts.yml`）、
-L26/L28 的脚本与 runbook（`docs/ops-runbook.md`）。
-待做：L27 部署形态与生产编排（需先定 A/B）、L26/L28 的空环境演练、L29 的 CI/镜像扫描接入。
+已完成：L25 `gzip_static`、L30 最小告警集、L26/L28 的脚本与 runbook、**L27 Windows 桌面托管**
+（`deploy/windows/` 自启/重启/备份脚本；`run.py` 日志追加+轮转；部署文档 §10；失效的
+compose/docker make 入口改成明确报错）。
+待做：L26/L28 的空环境演练（需环境）、L29 的 CI/镜像扫描接入（需评估）。
 
 **第 5 批 · 按环境/决策**
 C1/C1b/C2/C3 → H2/H51/H19/H22 → L31 长会话性能 → E4 a11y → E1 父→子 steer → E2 字号第二波 → E5 Git 面板增强。

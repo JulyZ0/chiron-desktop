@@ -238,3 +238,56 @@ Windows 上**，文件工具写的是 Windows 路径。两者不能直接共用�
 **确认拓扑后再落容器执行**；在确认前，已落地的隔离是：
 数据侧（项目目录按用户根隔离）、执行侧（shell 走独立 sandbox-service + 资源限制，
 `run_code` 仍走引擎进程的 Windows 隔离档位）。
+
+---
+
+## 10. Windows 桌面托管（当前唯一支持形态）
+
+2026-11-27 决定：**本版本只支持 Windows 桌面端部署**（Electron 壳 + 本机反代）。
+§9 的 WSL2/容器拓扑保留为未来选项，未纳入本版本承诺。
+
+### 10.1 进程守护
+
+Electron 需要交互式会话，不能用 Windows 服务（Session 0 无 GUI）。用任务计划程序：
+
+```powershell
+# 管理员 PowerShell
+.\deploy\windows\install-autostart.ps1 `
+  -AppPath "$env:LOCALAPPDATA\Programs\Chiron\Chiron.exe"
+```
+
+- 登录时启动、最高权限、失败每分钟重启（不限次数）；
+- 服务器需为该账户配置**自动登录**（否则重启后没人登录，任务不会启动）；
+- 卸载：`.\deploy\windows\uninstall-autostart.ps1`。
+
+### 10.2 日志
+
+- 应用/网关/引擎：`logs/*.stdout.log` / `*.stderr.log`，**追加 + 10MB × 5 轮转**
+  （`run.py` 已改为不截断历史）；
+- 嵌入式 PG/Redis：数据目录 `local/logs/`；
+- 审计事实在数据库 `audit_logs`，不要依赖日志文件做合规检索。
+
+### 10.3 备份
+
+```powershell
+.\deploy\windows\backup.ps1 -BackupDir D:\ChironBackups
+```
+
+必须先退出 Chiron（运行中复制 PGDATA 会损坏）。备份包含数据目录但不含
+`APP_SECRET` / `KMS_KEK_KEYS` —— 它们单独托管，丢失后密文配置不可解。
+恢复：停应用 → 解压覆盖 → 启动 → `python scripts/team_smoke.py --sse` 验收。
+
+### 10.4 升级与回滚
+
+1. 备份；
+2. 退出 Chiron；
+3. 覆盖安装新版本（数据目录不变）；
+4. 启动 → 登录 → 发一条消息确认模型可用；
+5. 失败：卸载新版本 → 安装旧版本 → 必要时用备份恢复数据目录。
+
+### 10.5 单机边界
+
+- 无副本冗余：主机宕机 = 服务中断；备份与**定期恢复演练**是唯一保障。
+- 自动更新只校验同一发布仓库的 SHA-512，未接入发布签名（H51）。
+- 更多运维动作（健康检查、告警、故障速查、KMS 轮换）见
+  [ops-runbook.md](ops-runbook.md)。

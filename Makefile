@@ -37,15 +37,15 @@ dev:
 # 前置：cp .env.example .env 并填写必填项；首次需先对目标库跑迁移：
 #   python -m alembic -c alembic.ini upgrade head
 dev-up:
-	@test -f .env || (echo "缺少 .env：先 cp .env.example .env 并填写必填项" && exit 1)
-	docker compose up -d
-	@echo "前端入口: http://localhost:3000  （多副本：make dev-up-scale）"
+	@echo "仓库没有 docker-compose.yml（只有 docker-compose.integration.yml，用于集成测试）。"
+	@echo "本版本只支持 Windows 桌面部署，见 docs/team-domain-deployment.md §10。"
+	@echo "本地开发请用: python run.py start"
+	@exit 2
 
 # 多副本形态：验证跨实例语义时用（会话锁 / SSE 重放 / run 归属）
 dev-up-scale:
-	@test -f .env || (echo "缺少 .env：先 cp .env.example .env 并填写必填项" && exit 1)
-	docker compose up -d --scale gateway=2 --scale python-engine=2
-	@echo "前端入口: http://localhost:3000  （2 网关 + 2 引擎）"
+	@echo "无生产/多副本 compose（本版本只支持 Windows 单机桌面部署）。"
+	@exit 2
 
 dev-down:
 	docker compose down
@@ -123,8 +123,9 @@ check-all: check check-py check-web
 	@echo "check-all: OK"
 
 docker-build:
-	docker build -t $(APP):latest -t $(APP):$(VERSION) -f Dockerfile .
-	@echo "docker image: $(APP):latest, $(APP):$(VERSION)"
+	@echo "未提供生产 Dockerfile：本版本只支持 Windows 桌面部署。"
+	@echo "集成测试镜像见 docker-compose.integration.yml（scripts/integration）。"
+	@exit 2
 
 docker-run:
 	docker compose up -d

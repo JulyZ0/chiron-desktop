@@ -537,6 +537,30 @@ def get_log_file(service: str, stream: str = "stdout") -> Path:
     return LOG_DIR / f"{service}.{stream}.log"
 
 
+# 日志轮转：单文件 10MB × 5 份。生产主机上进程可能连续跑几周，`open(..., "w")`
+# 既会在重启时**截断上一次崩溃现场**，又会让长跑进程把磁盘写满。
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUPS = 5
+
+
+def open_log_append(path: Path):
+    """追加打开日志；超过上限先轮转（`.1` … `.5`），绝不截断历史。"""
+    try:
+        if path.exists() and path.stat().st_size >= LOG_MAX_BYTES:
+            oldest = path.with_suffix(path.suffix + f".{LOG_BACKUPS}")
+            if oldest.exists():
+                oldest.unlink()
+            for i in range(LOG_BACKUPS - 1, 0, -1):
+                src = path.with_suffix(path.suffix + f".{i}")
+                if src.exists():
+                    src.replace(path.with_suffix(path.suffix + f".{i + 1}"))
+            path.replace(path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        # 轮转失败不能阻断启动：宁可直接追加，也不要让服务起不来。
+        pass
+    return open(path, "a", encoding="utf-8", buffering=1)
+
+
 def color(text: str, code: str) -> str:
     """ANSI 颜色输出"""
     if is_windows():
@@ -925,8 +949,8 @@ class ServiceManager:
 
         if is_windows():
             # Windows: 直接使用 Popen 后台启动，重定向输出到日志文件
-            out = open(stdout_log, "w")
-            err = open(stderr_log, "w")
+            out = open_log_append(stdout_log)
+            err = open_log_append(stderr_log)
             proc = subprocess.Popen(
                 cmd, cwd=cwd, env=env,
                 stdout=out, stderr=err,
@@ -935,8 +959,8 @@ class ServiceManager:
             )
         else:
             # Linux/macOS: 使用 nohup
-            out = open(stdout_log, "w")
-            err = open(stderr_log, "w")
+            out = open_log_append(stdout_log)
+            err = open_log_append(stderr_log)
             proc = subprocess.Popen(
                 cmd, cwd=cwd, env=env,
                 stdout=out, stderr=err,
