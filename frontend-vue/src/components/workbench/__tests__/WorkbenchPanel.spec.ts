@@ -305,6 +305,42 @@ describe('改动页签的单文件 diff', () => {
     expect(wrapper.find('.wb-diff-line.hunk').text()).toContain('@@')
   })
 
+  it('选中 diff 行后可把审阅意见发给父组件（N2）', async () => {
+    const wrapper = await openChangesTab()
+    await wrapper.findAll('.wb-change')[0].trigger('click')
+    await flush()
+    changesNet.diffs[0].resolve({
+      repo: true,
+      path: 'src/a.ts',
+      untracked: false,
+      binary: false,
+      truncated: false,
+      diff: 'diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n',
+    })
+    await flush()
+
+    // hunk 头不可选：它不是代码行
+    await wrapper.find('.wb-diff-line.hunk').trigger('click')
+    expect(wrapper.find('.wb-review').exists()).toBe(false)
+
+    await wrapper.find('.wb-diff-line.del').trigger('click')
+    await wrapper.find('.wb-diff-line.add').trigger('click')
+    expect(wrapper.find('.wb-review').exists()).toBe(true)
+    expect(wrapper.findAll('.wb-diff-line.selected')).toHaveLength(2)
+
+    await wrapper.findAll('.wb-review .wb-btn')[0].trigger('click')
+    await wrapper.find('.wb-review-box textarea').setValue('把 new 改成 new2')
+    await wrapper.find('.wb-review-box .wb-btn-primary').trigger('click')
+
+    const emitted = wrapper.emitted('fix-request')
+    expect(emitted).toHaveLength(1)
+    expect(emitted?.[0]?.[0]).toMatchObject({ path: 'src/a.ts', comment: '把 new 改成 new2' })
+    // 按 diff 顺序取行，而不是按点击顺序
+    expect((emitted?.[0]?.[0] as { lines: string[] }).lines).toEqual(['-old', '+new'])
+    // 提交后选择态清空，避免同一批意见被重复发送
+    expect(wrapper.find('.wb-review').exists()).toBe(false)
+  })
+
   it('未跟踪文件不渲染假 diff，给出打开文件的入口', async () => {
     const wrapper = await openChangesTab()
     await wrapper.findAll('.wb-change')[1].trigger('click')

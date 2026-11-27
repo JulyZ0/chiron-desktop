@@ -98,6 +98,11 @@ const emit = defineEmits<{
   /** 把文件交给对话（父组件转成附件）；`path` 是相对项目根的 POSIX 路径 */
   (e: 'reference', payload: { path: string; name: string }): void
   /**
+   * 审阅意见（N2）：把选中的 diff 行 + 用户意见交给父组件，由它拼成一条会话消息
+   * 并发给 Agent。面板**不直接发消息** —— 它拿不到 sendMessage 与当前会话。
+   */
+  (e: 'fix-request', payload: { path: string; comment: string; lines: string[] }): void
+  /**
    * 重新反查会话归属。
    *
    * 归属查询失败时面板只能显示错误，**重试必须由父组件执行** —— 项目归属是
@@ -436,10 +441,56 @@ function toDiffLines(text: string): DiffLine[] {
 
 const diffLines = computed<DiffLine[]>(() => toDiffLines(diffData.value?.diff ?? ''))
 
+/**
+ * 审阅意见（N2）：用户在 diff 上选中的行。
+ *
+ * 用行下标而不是行内容：同一段文本在 diff 里可能出现多次，内容去重会把两处选择
+ * 合并成一处。提交时再按次序取出文本，顺序与 diff 一致。
+ */
+const selectedDiffLines = ref<Set<number>>(new Set())
+const diffCommentOpen = ref(false)
+const diffCommentText = ref('')
+
+/** 元信息/hunk 头不可选：它们不是"代码行"，拿它们去让 Agent 修没有意义。 */
+function diffLineSelectable(line: DiffLine | undefined): boolean {
+  return !!line && line.cls !== 'meta' && line.cls !== 'hunk'
+}
+
+function toggleDiffLine(index: number): void {
+  if (!diffLineSelectable(diffLines.value[index])) return
+  const next = new Set(selectedDiffLines.value)
+  if (next.has(index)) next.delete(index)
+  else next.add(index)
+  selectedDiffLines.value = next
+}
+
+function clearDiffSelection(): void {
+  selectedDiffLines.value = new Set()
+  diffCommentOpen.value = false
+  diffCommentText.value = ''
+}
+
+const selectedDiffCount = computed(() => selectedDiffLines.value.size)
+
+function submitDiffComment(): void {
+  const row = diffRow.value
+  const comment = diffCommentText.value.trim()
+  if (!row || !comment || !selectedDiffCount.value) return
+  // 上限与输入框同量级：一次审阅意见不该把整份 diff 塞进提示词。
+  const lines = [...selectedDiffLines.value]
+    .sort((a, b) => a - b)
+    .slice(0, 40)
+    .map(i => diffLines.value[i]?.text ?? '')
+  emit('fix-request', { path: row.path, comment, lines })
+  clearDiffSelection()
+}
+
 async function loadDiff(row: ChangeRow) {
   diffRow.value = row
   diffData.value = null
   diffError.value = ''
+  // 换文件/重拉后行号会变：旧选择必须作废，否则会把意见挂到无关的行上。
+  clearDiffSelection()
   if (!props.projectId || row.agentOnly) return
   diffLoading.value = true
   const ticket = diffGuard.ticket(`${props.projectId}\u0000${row.path}`)
@@ -560,6 +611,20 @@ function closeDiff() {
   diffData.value = null
   diffError.value = ''
   diffLoading.value = false
+  clearDiffSelection()
+}
+
+/**
+ * 修复回合结束后重拉当前 diff（N2）。
+ *
+ * 只刷新"改动列表 + 当前文件"，不调用 `reload()` —— 那会清空文件树、关掉 diff
+ * 面板，用户刚发的意见会随着视图一起消失。Agent 还没写完时调用也没关系：
+ * 拉到的仍是当前 git 视图。
+ */
+async function refreshDiff() {
+  if (!diffRow.value || diffRow.value.agentOnly) return
+  if (activeTab.value === 'changes') void loadChanges()
+  await loadDiff(diffRow.value)
 }
 
 /** 从 diff 面板跳到文件树里的同一个文件（新文件/二进制只有这条路能看内容）。 */
@@ -671,7 +736,7 @@ watch(
   { immediate: true },
 )
 
-defineExpose({ reload })
+defineExpose({ reload, refreshDiff })
 
 // ── 预览 ──
 /**
@@ -1370,11 +1435,59 @@ async function openWithSystem(entry: ProjectFileEntry) {
             class="wb-empty"
           >{{ tr('chat.workbench_diff_empty') }}</div>
           <template v-else-if="diffData">
+            <!-- N2：审阅意见条。选中任意代码行后出现；意见只会进入会话消息，
+                 不会直接改盘 —— 修改仍由 Agent 的工具链完成。 -->
+            <div
+              v-if="selectedDiffCount"
+              class="wb-review"
+            >
+              <div class="wb-review-head">
+                <span>{{ tr('chat.workbench_review_selected', { n: selectedDiffCount }) }}</span>
+                <button
+                  v-if="!diffCommentOpen"
+                  type="button"
+                  class="wb-btn"
+                  @click="diffCommentOpen = true"
+                >{{ tr('chat.workbench_review_add') }}</button>
+                <button
+                  v-else
+                  type="button"
+                  class="wb-btn"
+                  @click="clearDiffSelection"
+                >{{ tr('common.cancel') }}</button>
+              </div>
+              <div
+                v-if="diffCommentOpen"
+                class="wb-review-box"
+              >
+                <textarea
+                  v-model="diffCommentText"
+                  rows="2"
+                  :placeholder="tr('chat.workbench_review_placeholder')"
+                  @keydown.ctrl.enter.prevent="submitDiffComment"
+                  @keydown.meta.enter.prevent="submitDiffComment"
+                />
+                <button
+                  type="button"
+                  class="wb-btn wb-btn-primary"
+                  :disabled="!diffCommentText.trim()"
+                  @click="submitDiffComment"
+                >{{ tr('chat.workbench_review_send') }}</button>
+              </div>
+            </div>
             <pre class="wb-diff"><code><span
               v-for="(line, i) in diffLines"
               :key="i"
               class="wb-diff-line"
-              :class="line.cls"
+              :class="[
+                line.cls,
+                {
+                  selectable: diffLineSelectable(line),
+                  selected: selectedDiffLines.has(i),
+                },
+              ]"
+              :title="diffLineSelectable(line) ? tr('chat.workbench_review_pick') : ''"
+              @click="toggleDiffLine(i)"
             >{{ line.text || ' ' }}</span></code></pre>
             <div
               v-if="diffData.truncated"
@@ -1805,6 +1918,35 @@ async function openWithSystem(entry: ProjectFileEntry) {
 .wb-diff-line.hunk { color: var(--accent); }
 .wb-diff-line.add { color: var(--success); background: var(--success-bg); }
 .wb-diff-line.del { color: var(--danger); background: var(--error-bg); }
+/* N2：可审阅的行。选择态用 inset 描边 + 半透明底色，避免盖掉 add/del 的语义色。 */
+.wb-diff-line.selectable { cursor: pointer; }
+.wb-diff-line.selected {
+  box-shadow: inset 2px 0 0 var(--primary);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+}
+.wb-review {
+  margin: 6px 0 8px;
+  padding: 8px;
+  border: var(--hairline-width) solid var(--border-default);
+  border-radius: var(--sig-radius-button);
+  background: var(--panel-bg);
+}
+.wb-review-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.wb-review-box { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.wb-review-box textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 44px;
+  padding: 6px 8px;
+  border: var(--hairline-width) solid var(--border-default);
+  border-radius: 6px;
+  background: var(--bg-page);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+}
+.wb-review-box .wb-btn { align-self: flex-end; }
+.wb-review-box .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* 分栏手柄：平时不可见，悬停/拖动/聚焦时才显形（与 SessionPreviewPane 一致） */
 .wb-resize {

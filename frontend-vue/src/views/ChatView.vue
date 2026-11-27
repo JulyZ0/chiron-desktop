@@ -550,6 +550,26 @@ watch(workbenchOpen, open => {
   if (activeProjectId.value) setProjectWorkbench(activeProjectId.value, open)
 })
 
+// ── N2：审阅 → 修复 ────────────────────────────────────────────────────────
+// 工作台只负责"选行 + 写意见"，拼会话消息与发送在这里（它才拿得到 sendMessage）。
+const workbenchRef = ref<InstanceType<typeof WorkbenchPanel> | null>(null)
+/** 发过修复请求后等本回合结束，再把当前 diff 重拉一次。 */
+let pendingDiffRefresh = false
+
+function onWorkbenchFixRequest(payload: { path: string; comment: string; lines: string[] }) {
+  const comment = String(payload.comment || '').trim()
+  if (!comment) return
+  // 围栏里出现 ``` 会把提示词的代码块提前闭合；替换掉比"拼一个更长的围栏"简单可靠。
+  const diffText = payload.lines.join('\n').replaceAll('```', '`` `')
+  const prompt = t('chat.workbench_review_prompt', {
+    path: payload.path,
+    comment,
+    diff: diffText,
+  })
+  pendingDiffRefresh = true
+  void sendMessage(prompt)
+}
+
 /**
  * 任务清单面板（长任务防跑偏）。
  *
@@ -577,6 +597,16 @@ const {
   items,
   streamState,
 } = useChatRunState(() => activeSessionId.value)
+
+// N2：修复回合结束（loading true→false）时刷新 diff。失败/取消也算结束：
+// 用户至少能看到"改了什么/没改什么"，而不是一个过期的 diff。
+// 放在 `loading` 解构之后 —— 组合式函数的返回值不是提升的绑定。
+watch(loading, (now, before) => {
+  if (before && !now && pendingDiffRefresh) {
+    pendingDiffRefresh = false
+    void workbenchRef.value?.refreshDiff?.()
+  }
+})
 
 /**
  * 本次会话里 agent 写过的文件路径 —— 工作台「改动」页签的第二数据源。
@@ -2992,6 +3022,7 @@ function continueGeneration() {
       <WorkbenchPanel
         v-if="workbenchOpen"
         id="workbench-panel"
+        ref="workbenchRef"
         :project-id="activeProjectId"
         :project-name="activeProject?.name || ''"
         :project-error="activeProjectError"
@@ -3000,6 +3031,7 @@ function continueGeneration() {
         :handle-side="layoutSwapped ? 'left' : 'right'"
         @close="toggleWorkbench()"
         @reference="onWorkbenchReference"
+        @fix-request="onWorkbenchFixRequest"
         @retry-project="refreshActiveProject"
       />
     </Transition>
