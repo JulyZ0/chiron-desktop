@@ -14,7 +14,7 @@
 为什么第 2 档必须存在、且排在 fakeredis 之前：``fakeredis`` 对契约 §5.3 的七条命令
 实测 6/7 通过，但 **EVAL 一条都不支持**（``unknown command 'eval'``）。而引擎的
 KeyRing 仲裁（D19）、限流、预算预留、队列闸门共 15 处依赖 Redis 单键 EVAL 的
-**原子性**，``vendor/规划.md:132`` 也记过「桩 Redis 不解释 Lua ⇒ 这类算术只能在真
+**原子性**，「桩 Redis 不解释 Lua ⇒ 这类算术只能在真
 Redis 上验」。桩能证明"命令存在"，证明不了"语义正确"，所以本地模式优先用真二进制，
 并把 Lua 自检结果（:attr:`RedisServer.lua_supported`）如实上报。
 

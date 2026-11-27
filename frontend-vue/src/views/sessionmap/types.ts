@@ -164,7 +164,7 @@ export interface BranchResult {
 
 // ── 项目（Workspace 即项目）──
 //
-// 语义见 `docs/project-management-design.md`：一个 workspace 要么是**项目**
+// 语义见 `internal/api/sessionmap_projects.go`：一个 workspace 要么是**项目**
 // （`root_path` 非空，绑定本地文件夹），要么是**画布**（`root_path` 为空，旧形态）。
 // 会话归属不是独立表，而是 `session_map_nodes` 里 `edge_kind='project'` 的行。
 

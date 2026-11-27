@@ -1,6 +1,6 @@
 """S5-(e)：远程执行后端的分流与失败语义。
 
-对应 `vendor/设计-独立sandbox服务.md` §7 的验收口径。四条硬要求：
+验收口径：四条硬要求：
 
 1. **`local`（默认）行为逐字不变** —— 引入这个机制不该让任何既有部署多发一个请求；
 2. **白名单外的租户走本地** —— 不是"没配就全走服务"；
@@ -218,7 +218,7 @@ async def test_malformed_response_fails_without_falling_back():
 
 
 def test_this_backend_carries_no_second_copy_of_the_baseline():
-    """设计稿 §4 的核心取舍：宁可共享一份实现，也不要第二份"看起来一样"的白名单。
+    """核心取舍：宁可共享一份实现，也不要第二份"看起来一样"的白名单。
 
     因此本模块**不得**自带白名单 / RLIMIT —— 它只负责转发；基线仍由服务侧 import
     `app/tools/sandbox.py` 的同一份实现。

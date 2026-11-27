@@ -22,7 +22,7 @@
 
 计费：**引擎不记账**。用量随响应体回到 Go 网关，由网关写 ``usage_events``（与
 ``/v1/chat/submit`` 同一张表、同一套 ``cost_cents`` 定价）。两处各记一份就会重复
-计费，这也是 ``desktop_infer`` 的既有口径（contracts.md §9.3）。
+计费，这也是 ``desktop_infer`` 的既有口径（contracts.md §9）。
 
 身份：复用 ``AuthMiddleware`` 的网关代理路径（``X-Internal-Token`` +
 ``?tenant_id=&user_id=``），这里只读中间件已经设好的 ``request.state.tenant_id``。

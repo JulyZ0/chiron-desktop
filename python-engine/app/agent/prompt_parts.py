@@ -65,7 +65,7 @@ def build_system_sections(
     """
     inline: dict[str, str] = {}
     if task.system_prompt:
-        # B1（方案 04 §3）：按**模型家族**追加 harness suffix。注册表默认为空 ⇒ 恒等变换。
+        # B1：按**模型家族**追加 harness suffix。注册表默认为空 ⇒ 恒等变换。
         # 这里显式取出 suffix 而不是调 `apply_harness_suffix` 拼成一个字符串，是为了让它
         # 成为**独立可比的段**：换模型导致 suffix 变化时，diff 只说 `harness_suffix` 变了。
         profile = match_harness_profile(

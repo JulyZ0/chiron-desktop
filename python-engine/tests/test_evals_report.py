@@ -2,11 +2,11 @@
 
 报告是**会上传的制品**（CI artifact / 贴进 issue），而失败明细里有两类自由文本：
 ① 断言 `detail`（带固件文本）② 异常 `error`（可能带 URL / 密钥）。
-`vendor/规划.md` §5.1 把"报告脱敏"写成安全边界的一条 ⇒ 这里把它钉住。
+"报告脱敏"是安全边界的一条 ⇒ 这里把它钉住。
 
 两条纪律：
 * **复用引擎那份规则集**（`app/subagent/redact.py`），**不新造第二份清单**（两份必然漂移）；
-* 评测套件本身**不 import 引擎**（runner 走 HTTP 真实路径，见 `vendor/规划.md` §6），
+* 评测套件本身**不 import 引擎**（runner 走 HTTP 真实路径），
   所以脱敏是**惰性 import**，引擎不在场时跳过并留痕（fail-soft，但必须可见）。
 """
 from __future__ import annotations

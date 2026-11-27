@@ -655,7 +655,7 @@ export const useDeviceStore = defineStore('device', () => {
    * 只把"要不要同时删除本地数据"这一个选择透传给主进程 —— 清理哪些内容（cookie /
    * localStorage / IndexedDB / CacheStorage / Service Worker / HTTP 缓存 / token）
    * 由主进程按契约执行，渲染进程**不**自行删除用户数据（误删 `userData/local/**`
-   * 是不可逆的，见 contracts.md §8）。
+   * 是不可逆的，见 contracts.md §5）。
    *
    * 抛错语义：外壳不支持、主进程拒绝时直接抛给调用方（界面据此提示），
    * 不静默吞掉 —— 否则用户以为切了，重启后又回到原模式。

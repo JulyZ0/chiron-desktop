@@ -357,7 +357,7 @@ async def execute_tool(
 
     分层顺序是刻意的：本方法在 `_guarded_execute_tool`（工具策略 / 服务端授权 /
     审批）**之后**才被调用，因此 `PreToolUse` hook 只能进一步**收紧** —— 它没有
-    "放行"语义，也就不会成为绕过 `tool_policy` 分级的新通道（方案 03 §3.2）。
+    "放行"语义，也就不会成为绕过 `tool_policy` 分级的新通道。
 
     - `PreToolUse`：**可阻断**（`deny` = 拒绝；`ask` = 要求用户确认，2026-10-09）；
     - `PostToolUse` / `PostToolUseFailure` / `SubagentStart` / `SubagentStop`：

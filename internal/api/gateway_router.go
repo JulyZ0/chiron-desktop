@@ -325,7 +325,7 @@ func NewGatewayRouter(
 	// 新用户引导（P0-3）：三步进度读写。
 	onboardingHandler := NewOnboardingHandler()
 
-	// 用户级 API Key 自助（P1-3 / roadmap §11.3）：api_keys 表早已在鉴权链路里，
+	// 用户级 API Key 自助（P1-3）：api_keys 表早已在鉴权链路里，
 	// 但此前没有任何写路径 —— 用户只能手工插表才能拿到 key。
 	apiKeyHandler := NewAPIKeyHandler()
 
@@ -379,7 +379,7 @@ func NewGatewayRouter(
 	// 放这里而不是 registerAgentRoutes：那个函数的作用域里没有 sessionMgr。
 	mux.Handle("POST /v1/conversations/{id}/fork", authMW(rlMW(ForkConversationHandler(sessionMgr))))
 	// 会话分支（裁剪 + 压缩）：前端用它创建"带核心上下文的分支"（见 session_branch.go
-	// 与 docs/session-map-branch-design.md）。与 /fork 共用 BranchSession，只差 mode。
+	// 与 internal/session/manager_branch.go）。与 /fork 共用 BranchSession，只差 mode。
 	mux.Handle("POST /v1/conversations/{id}/branch", authMW(rlMW(BranchConversationHandler(sessionMgr, pythonClient))))
 	// 重试压缩：压缩是异步的，失败/网关重启会把 branch_state 停在 failed/pending，
 	// 没有这个入口那两个状态就是死胡同（见 session_branch.go::BranchRetryHandler）。
@@ -428,7 +428,7 @@ func NewGatewayRouter(
 	superagentHandler := NewSuperagentHandler(pythonClient)
 	superagentHandler.RegisterRoutes(mux, authMW, rlMW)
 
-	// 会话运行时状态与遥测（P1 单一事实源；见 docs/session-runtime-spec.md）
+	// 会话运行时状态与遥测（P1 单一事实源；见 internal/api/session_runtime.go）
 	sessionRuntimeHandler := NewSessionRuntimeHandler(db.Redis, sessionMgr)
 	mux.Handle("GET /v1/sessions/{session_id}/runtime", authMW(rlMW(http.HandlerFunc(sessionRuntimeHandler.GetRuntime))))
 	mux.Handle("PUT /v1/sessions/{session_id}/runtime", authMW(rlMW(http.HandlerFunc(sessionRuntimeHandler.PutRuntime))))

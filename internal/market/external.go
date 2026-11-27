@@ -26,7 +26,7 @@ type DocumentFetcher interface {
 	FetchDocument(ctx context.Context, url string, maxBytes int) ([]byte, error)
 }
 
-// 外部源的硬性约束（与设计文档 §9/§10 对齐，集中在此处便于审阅）。
+// 外部源的硬性约束（集中在此处便于审阅）。
 const (
 	// MaxDocumentBytes 单份文档（目录或 manifest）上限 1 MiB。
 	MaxDocumentBytes = 1 << 20

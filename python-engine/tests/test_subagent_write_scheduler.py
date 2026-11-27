@@ -1,7 +1,6 @@
 """R2 回归测试：子 Agent 写路径仲裁（`app/subagent/scheduler.py`）。
 
-对位 vendor/规划.md §3.5 的 R2 与 `vendor/DeepSeek-Reasonix/internal/agent/scheduler.go`
-（含 `scheduler_test.go` / `write_claims_test.go` 的口径）。**三条并发行为是核心验收**：
+对位 R2 的写路径仲裁设计。**三条并发行为是核心验收**：
 
 1. 同路径 ⇒ **串行**（后来的排队等前者释放）；
 2. 不同路径 ⇒ **并行**（互不阻塞）；
@@ -106,7 +105,7 @@ async def test_nested_writer_fails_fast_instead_of_queueing(tmp_path):
 
 
 def test_arbitration_is_off_by_default():
-    """§1.3：新增机制的默认值必须是"什么都不做"。"""
+    """新增机制的默认值必须是"什么都不做"。"""
     assert settings.subagent_write_arbitration is False
     scheduler_mod.reset_schedulers()
     assert get_scheduler("sess-1", workspace_root="x") is None

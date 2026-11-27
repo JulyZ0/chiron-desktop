@@ -445,7 +445,7 @@ async def test_filestore_backend_write_read_round_trip():
 
 @pytest.mark.asyncio
 async def test_filestore_backend_missing_file_is_an_error_not_empty():
-    """方案 02 §3.4 的完成标准：必须区分"没有这个文件"与"文件是空的"。"""
+    """完成标准：必须区分"没有这个文件"与"文件是空的"。"""
     backend, _ = _filestore_with_fake_gateway()
 
     read = await backend.read("nope.md", limit=0)

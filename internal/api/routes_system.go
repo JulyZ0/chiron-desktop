@@ -65,7 +65,7 @@ func registerSubagentRoutes(
 	h *SubagentHandler,
 ) {
 	// 子 Agent 运行观测（层级树 / 详情 / 过程）：Redis 优先、DB 回落，租户隔离。
-	// 见 docs/subagent-design.md §4.4；前端据此画递归树与侧边栏实时输出。
+	// 前端据此画递归树与侧边栏实时输出。
 	mux.Handle("GET /v1/subagent/runs", authMW(rlMW(http.HandlerFunc(h.ListRuns))))
 	mux.Handle("GET /v1/subagent/runs/{run_id}", authMW(rlMW(http.HandlerFunc(h.GetRun))))
 	mux.Handle("GET /v1/subagent/runs/{run_id}/events", authMW(rlMW(http.HandlerFunc(h.GetRunEvents))))

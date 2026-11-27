@@ -2,7 +2,7 @@ package api
 
 // ── 会话运行时状态与遥测（P1 单一事实源）──
 //
-// 设计见 docs/session-runtime-spec.md。核心诉求：让「模式 / 模型 / provider / 工具授权 /
+// 设计目标：核心诉求：让「模式 / 模型 / provider / 工具授权 /
 // 上下文激活项」只存在一处，并让**两条提交链路**（SSE `/submit` 与统一 `/v1/chat/submit`）
 // 读同一份解析结果 —— 此前两条链路各带一份，缺一份就静默失效（模式与模型切换无效的根因）。
 //
@@ -10,7 +10,7 @@ package api
 //   Redis `session:runtime:{tenant}:{sid}`（Hash，热，TTL 24h）
 //   `unified_sessions.runtime` jsonb（权威持久；Redis 缺失时由它回填）
 //
-// 解析优先级（唯一实现，见 spec §3）：
+// 解析优先级（唯一实现）：
 //   mode        : 请求显式 > 用户默认 > 全局默认 > normal
 //   tools_mode  : 请求显式 > 用户默认 > 全局默认 > auto
 //   model       : 请求显式 > runtime > 用户默认 > 全局默认 > deepseek-chat
@@ -304,7 +304,7 @@ type agentConfig struct {
 	provider  resolvedValue
 }
 
-// resolveAgentConfig 是**唯一**的解析实现（spec §3）。两条提交链路都必须调用它。
+// resolveAgentConfig 是**唯一**的解析实现。两条提交链路都必须调用它。
 //
 // explicit 是"本次请求的显式意图"（如 SSE 链路里前端传来的 llm_config.mode/model）。
 // 优先级：explicit > runtime(会话) > 用户/全局默认 > 系统兜底。
@@ -336,7 +336,7 @@ func (h *SessionRuntimeHandler) resolveAgentConfig(userID string, state *runtime
 	return cfg
 }
 
-// ResolveSessionAgentConfig 是解析链的**包级入口**，供各提交链路复用（spec §3）。
+// ResolveSessionAgentConfig 是解析链的**包级入口**，供各提交链路复用。
 // explicit 传该请求自带的意图（可为 nil）；返回最终生效值与来源。
 //
 // 两条链路（SSE `/submit` 与统一 `/v1/chat/submit`）都走这一份实现，

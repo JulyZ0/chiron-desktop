@@ -13,7 +13,7 @@
 4. **计费口径** —— 云端片段推理**只记 usage、不扣 credits**：唯一的副作用是
    ``desktop:infer:usage:{tenant}:{date}`` 这个 Hash，不写 ``credit_transactions`` /
    ``billing_records``、不 import db/billing；本地模式（``desktop-local``）不计费；
-   ``dtk_`` 结算未启用。口径见 ``docs/desktop-local/contracts.md`` §9.3。
+   ``dtk_`` 结算未启用。口径见 ``docs/desktop-local/contracts.md`` §9。
 
 全部用 mock gateway + ASGITransport 发真实 HTTP 请求（与 ``test_tools_service_api.py``
 同型）：本文件不碰网络、不花钱、不需要真实 provider key。
@@ -518,7 +518,7 @@ async def test_usage_is_recorded_per_tenant_and_day(
     assert len(keys) == 1, f"usage 没有写到 desktop:infer:usage:1:{{date}}（现有键：{list(fake_redis.hashes)}）"
     bucket = fake_redis.hashes[keys[0]]
     # 字段集合**严格相等**：多一个 `credits` 字段就说明有人把计费搬进了引擎 —— 那会和
-    # 网关的 billing（internal/billing 的 credit_transactions）双写、重复扣费（§9.3）。
+    # 网关的 billing（internal/billing 的 credit_transactions）双写、重复扣费（§9）。
     assert bucket == {
         "requests": "1",
         "input_tokens": "11",
@@ -549,7 +549,7 @@ async def test_inference_still_works_without_redis() -> None:
     assert resp.json()["content"] == "压好的两行"
 
 
-# ── 计费口径：只记 usage，不扣 credits，不碰任何账本（contracts.md §9.3） ──
+# ── 计费口径：只记 usage，不扣 credits，不碰任何账本（contracts.md §9） ──
 
 
 def _desktop_infer_tail(key: str) -> str:
@@ -563,7 +563,7 @@ async def test_only_usage_and_idempotency_keys_are_written(
 ) -> None:
     """成功请求的**全部**副作用只有两类键：幂等键 + 用量键。
 
-    口径（§9.3）：云端片段推理只记 usage、不扣 credits；本地模式什么都不写。所以这里
+    口径（§9）：云端片段推理只记 usage、不扣 credits；本地模式什么都不写。所以这里
     整体钉住"写了哪些键" —— 将来有人顺手加 ``desktop:infer:credits:*``、往 credits
     账本推一条，或者把计费搬进引擎，用例立刻变红。
     """
@@ -604,7 +604,7 @@ def test_module_has_no_billing_imports() -> None:
 
     credits 的计价口径（provider 定价 × 计费 token）在 Go billing 模块里。引擎一旦
     import 了 db/billing，就说明扣费逻辑被搬到了引擎侧 —— 那会和网关的
-    ``credit_transactions`` / ``billing_records`` 双写、重复扣费（§9.3）。
+    ``credit_transactions`` / ``billing_records`` 双写、重复扣费（§9）。
     """
     source_path = getattr(desktop_infer_module, "__file__", None)
     assert source_path, "拿不到 app/api/desktop_infer.py 的路径"

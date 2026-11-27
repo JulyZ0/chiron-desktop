@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// ── 晴辰云邮 HTTP 通道（docs/mail.md 契约）────────────────
+// ── 晴辰云邮 HTTP 通道（internal/auth/mail.go 契约）────────────────
 
 func TestSendQingchenSuccess(t *testing.T) {
 	var gotPath, gotAuth string
@@ -90,7 +90,7 @@ func TestSendQingchenTemplateAndChannel(t *testing.T) {
 	}
 }
 
-// 附件走本地文件路径时必须自动读盘并转 Base64（docs/mail.md 编写要求 5）。
+// 附件走本地文件路径时必须自动读盘并转 Base64。
 func TestSendQingchenAttachmentFromFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "invoice.pdf")
@@ -167,7 +167,7 @@ func TestSendQingchenRejectsOversizeAttachment(t *testing.T) {
 	}
 }
 
-// 429 触发指数退避重试；重试成功后整体视为成功（docs/mail.md 编写要求 4）。
+// 429 触发指数退避重试；重试成功后整体视为成功。
 func TestSendQingchenRateLimitRetriesThenSucceeds(t *testing.T) {
 	restore := shortBackoff(t)
 	defer restore()

@@ -439,7 +439,7 @@ ASK_DECLINED = "\x00__declined__\x00"
 
 #: 子 agent 委派工具名 —— 必须与 app/tools/subagent.py 的工具定义一致。
 #: runtime 靠它把该工具的调用识别为"子 agent 执行"，从而分发
-#: `SubagentStart`/`SubagentStop` 生命周期 hook（方案 03 §3.1）。
+#: `SubagentStart`/`SubagentStop` 生命周期 hook。
 #: 定义已随工具执行编排搬到 `app/agent/tool_execution.py`（P2-11），这里以同名再导出，
 #: 既有 `runtime.SUBAGENT_TOOL` 的引用字面不变。
 
@@ -967,7 +967,7 @@ def _loop_guard_result(
 
 #: 动作级别的危险度序（越大越危险）。用于 `edit` 后的**升级判定** ——
 #: 编辑把动作升级（如 shell 的 `ls` → `rm -rf`，WRITE → DELETE）时必须拒绝直接执行，
-#: 否则 `edit` 就成了绕过 `tool_policy` 分级的新通道（方案 01 §3.5）。
+#: 否则 `edit` 就成了绕过 `tool_policy` 分级的新通道。
 _LEVEL_RANK: dict[str, int] = {"read": 0, "write": 1, "delete": 2, "external": 3}
 
 
@@ -2181,7 +2181,7 @@ class AgentRuntime:
             return None
 
     def _record_resume_metric(self, resume: Any) -> None:
-        """记"续跑次数"与"省下的回合数"（方案 §3.1 要求的两个指标之一）。"""
+        """记"续跑次数"与"省下的回合数"（两个指标之一）。"""
         try:
             from app.observability import metrics
 
@@ -3536,7 +3536,7 @@ class AgentRuntime:
                                 reasoning_content[_thinking_last_flushed:]
                             )
                             if safe_thinking:
-                                # A1（方案 04 批次 1）：思考走**独立事件**，不再包装成
+                                # A1：思考走**独立事件**，不再包装成
                                 # `[thinking]…[/thinking]` 混进 `text`。
                                 #
                                 # 为什么必须分开：`[thinking]` 这个形态有**两个来源**——
@@ -3811,7 +3811,7 @@ class AgentRuntime:
                     # ── C3：分批执行（读级并发 / 其余串行），收尾统一按**原始顺序** ──
                     #
                     # 为什么"按调用粒度分组"而不是"批内含写就整批串行"：deep agent 的典型批是
-                    # "1 写 + N 读"，整批降级会因一个写惩罚 9 个读（评审 01 §1.6）。
+                    # "1 写 + N 读"，整批降级会因一个写惩罚 9 个读。
                     parallel_calls, serial_calls = _split_tool_batch(tool_calls)
 
                     # 同一条消息内只允许一次 `todo_write` —— 并发写清单只会互相覆盖
@@ -4646,7 +4646,7 @@ class AgentRuntime:
             #   * 因此**不能**把条件反过来 —— 一轮对话结束 ≠ 会话结束（用户会继续聊），
             #     正常路径也调用会变成"每轮都 rollup + 每轮丢 L1"，成本与语义都不对；
             #   * 真正缺的是"会话结束"的触发点：删除会话与空闲超时都没有通知引擎
-            #     （全仓 `on_session_end` 只有这一处调用点，见评审 03）。
+            #     （全仓 `on_session_end` 只有这一处调用点）。
             # 本批处置：保留"异常路径收尾"（被中断的会话同样需要摘要，有实际价值），
             # 只修正注释让代码与文档一致；"会话结束触发点"作为设计项单独立项。
             if self._memory is not None and memory_started and task.session_id:
@@ -5389,7 +5389,7 @@ class AgentRuntime:
         # ── C5：`edit` = "编辑后批准" ──
         # 用户改的是"将要执行的那一次调用"，因此此后一律以**编辑后的参数**为准
         # （Broker 重新授权 / 执行 / 二次校验 / 票据）。编辑后的参数**必须**重跑分级 ——
-        # 否则 `edit` 就成了绕过 `tool_policy` 分级的新通道（方案 01 §3.5）。
+        # 否则 `edit` 就成了绕过 `tool_policy` 分级的新通道。
         edited_args: dict[str, Any] | None = None
         level_before = ""
         level_after = ""
@@ -5417,7 +5417,7 @@ class AgentRuntime:
                 #
                 # 方案要求"转为再次确认"；此处落成 **fail-closed 拒绝 + 明确的重发起提示**：
                 # 不实现"重新发起审批"的重入循环，避免用户"编辑 → 再审批 → 再编辑"的活锁。
-                # 安全性（升级后的动作绝不直接执行）与方案一致；取舍记录见评审 03 §13.2。
+                # 安全性（升级后的动作绝不直接执行）。
                 logger.warning(
                     "approval edit ESCALATED (tool=%s id=%s): %s → %s — refusing to execute",
                     tool_name, tc_id, level_before, level_after,
@@ -5659,7 +5659,7 @@ class AgentRuntime:
     ) -> None:
         """回合末落盘 run 现场（C1 批 2：**只写不读**）。
 
-        三条约定（评审 01 §1.2–1.5）：
+        三条约定：
 
         * 快照只留**尾部窗口 + 既有压缩摘要** —— 整段没必要（会话消息本就有 PG 表与 Redis 缓存），
           但下限保证最近若干条完整保留，避免 `assistant(tool_calls)` 与其 `tool` 结果被切开；
@@ -5787,7 +5787,7 @@ class AgentRuntime:
         `original_arguments`（C5 · `edit`）：非 None 表示本次批准的是**编辑后**的参数。
         核对票据仍以**模型原始请求**为据 —— 那是"这张票属于这次调用"的凭据；核对通过后把
         票据**重写**为编辑后参数的摘要与资源范围，使"票据 = 被批准且将被执行的那个调用"
-        这一语义在 edit 之后依然成立（方案 01 §3.5 的不变量"批准的就是执行的"）。
+        这一语义在 edit 之后依然成立（不变量"批准的就是执行的"）。
         """
         from app.agent.tool_policy import args_hash
 

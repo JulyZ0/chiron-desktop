@@ -51,7 +51,7 @@ SUCCESS_KINDS: frozenset[str] = frozenset(
 #: 允许的 tier（`smoke` 用于 PR 门禁，`full` 用于 nightly）
 TIERS: frozenset[str] = frozenset({"smoke", "full"})
 
-#: 允许的分类（覆盖 Chiron 的真实能力面，见方案 02 §6.1）
+#: 允许的分类（覆盖 Chiron 的真实能力面）
 CATEGORIES: frozenset[str] = frozenset(
     {
         "file_edit",

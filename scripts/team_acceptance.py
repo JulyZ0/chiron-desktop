@@ -371,7 +371,7 @@ def stage_r6(opts, log=print) -> dict:
             make_check(
                 "r6.load_test",
                 "SKIP",
-                "未提供 --r6-report：R6 需在团队主机上以 P=2/4 跑真实回合（见 docs/prd-remote-team.md §4）",
+                "未提供 --r6-report：R6 需在团队主机上以 P=2/4 跑真实回合（见 docs/prd-remote-team.md §5.3）",
             )
         ]
         return make_stage("r6", "SKIP", "未提供压测结果", gates, data={"checklist": checklist})

@@ -39,7 +39,7 @@ import (
 const localOwnerEmail = "owner@chiron.local"
 
 // localOwnerName 是引导账号的显示名，用户随时可在「设置 → 账户」里改。
-// 与 desktop-local core 的 LOCAL_USER.name 保持一致（契约 §4），切换后端时界面不跳字。
+// 与 desktop-local core 的 LOCAL_USER.name 保持一致，切换后端时界面不跳字。
 const localOwnerName = "Local"
 
 // isLoopbackPeer 判断请求是否来自本机。

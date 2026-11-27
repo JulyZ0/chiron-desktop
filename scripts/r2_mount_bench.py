@@ -6,7 +6,7 @@
 
     python scripts/r2_mount_bench.py --root R:\\project
 
-判定阈值（PRD §8.1）：单文件读 P95 <= 50ms、写 P95 <= 150ms，且 git 可用
+判定阈值（PRD §8）：单文件读 P95 <= 50ms、写 P95 <= 150ms，且 git 可用
 （`git -C <root> rev-parse --is-inside-work-tree`）。rename/delete 的实际生效与
 10 分钟稳定性仍需人工/上层联调确认，本脚本只覆盖 I/O 数字、rename/delete 时延
 与 git 基本可用性。

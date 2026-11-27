@@ -796,7 +796,7 @@ async def execute_python(code: str, timeout: int = 30) -> dict[str, Any]:
 #
 # 这里曾有一份 `web_fetch` 实现（httpx + assert_safe_url），但它**从未注册**，
 # 而 `app/tools/web.py` 里有一份更完整的同名实现（HTML→Markdown、字符上限、错误语义）。
-# 两份实现并存 = 必然漂移（规划 §5.3 的"两份白名单必然漂移"是同一类错）。
+# 两份实现并存 = 必然漂移（"两份白名单必然漂移"是同一类错）。
 # 只保留 web.py 的那一份；本模块不再有出网能力。
 
 

@@ -325,7 +325,7 @@ class TaskRouter:
         1. 尝试调用 LLM (如果 gateway 可用)
         2. 降级到关键词提取 (LLM 不可用时)
 
-        model / provider_hint / tenant_id 来自**会话运行时状态**（P1-d，docs/session-runtime-spec.md）。
+        model / provider_hint / tenant_id 来自**会话运行时状态**（P1-d，internal/api/session_runtime.go）。
         此前这条链路把模型写死为 gpt-4o-mini，导致用户在界面上切换模型/提供商
         对统一链路（/v1/chat/submit）完全无效。
         """

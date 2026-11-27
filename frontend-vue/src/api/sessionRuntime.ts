@@ -2,7 +2,7 @@
  * 会话运行时状态与遥测 API（网关 internal/api/session_runtime.go）。
  *
  * **单一事实源**：模式 / 模型 / provider / 工具授权 / 上下文激活项，
- * 见 docs/session-runtime-spec.md。存储分层为 Redis 热（TTL 24h）
+ * 见 internal/api/session_runtime.go。存储分层为 Redis 热（TTL 24h）
  * + `unified_sessions.runtime` 持久 —— 刷新、重开会话都不丢。
  *
  * 背景：这些选择此前散落在「会话 llm_config」「组件 ref」「URL query」三处，

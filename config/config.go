@@ -140,7 +140,7 @@ type Config struct {
 	RateLimitGlobal    int // global requests per minute
 	// 注：三级令牌桶（global/tenant/user）均为"每分钟总量配额"，由 Redis 原子计数
 	// 承载，与网关副本数无关 —— 历史上曾按副本数线性放大的 RATE_LIMIT_INSTANCES
-	// 已移除（扩缩容无需调参，见 docs/deployment-multi-instance.md 第 5 节）。
+	// 已移除（扩缩容无需调参）。
 
 	// TrustedProxyCIDRs trusted reverse-proxy CIDRs (comma separated).
 	// X-Forwarded-For / X-Real-IP are only honored when the direct peer

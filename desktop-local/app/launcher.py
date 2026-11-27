@@ -1,6 +1,6 @@
 """本地数据栈引导器：只负责把 PG / Redis 拉起来并把连接信息交给 Go 网关。
 
-**为什么要有这个进程**（架构决策，见 docs/desktop-local/launcher.md）：
+**为什么要有这个进程**（架构决策，见 desktop-local/app/launcher.py）：
 
 本地模式的目标是"与云端几乎无差"，而云端全部业务路由都在 Go 网关里（``cmd/chiron``）。
 过去 desktop-local 自己实现了一份 14 组端点的"骨架后端"，与 Go 网关是两套并存的

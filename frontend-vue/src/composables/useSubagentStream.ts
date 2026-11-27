@@ -132,7 +132,7 @@ export function useSubagentStream(options: UseSubagentStreamOptions): SubagentSt
 
   /**
    * 实时事件缓冲（有界）：SSE 里的 `subagent.*` 分流到这里，只供侧边栏观测面板消费，
-   * 绝不混入主对话流（docs/subagent-design.md §4.2）。
+   * 绝不混入主对话流（旁路见 python-engine/app/agent/event_sink.py）。
    *
    * 对外是可写 computed —— 既有读写（push / length / 模板传参）一行都不用改。
    */

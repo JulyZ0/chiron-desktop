@@ -500,11 +500,11 @@ jobs:
         run: python scripts/check_source_encoding.py
       # Go 侧（权威判定）与 Python 侧（保守镜像）的判定表**必须同构**。两者语言
       # 不同、无法共享代码，此前只有一行注释约定 —— 并且已经漂移过
-      # （read_tool_result / list_subagent_runs / rerun_subagent）。见路线图 L3-9。
+      # （read_tool_result / list_subagent_runs / rerun_subagent）。
       # 2026-10-09 起**同时覆盖另外四族**：对话模式（Go `validAgentModes` ↔ 引擎
-      # `AgentMode` 枚举 ↔ `_BASE_MODES` 覆盖，见 docs/session-runtime-spec.md §3）·
+      # `AgentMode` 枚举 ↔ `_BASE_MODES` 覆盖，见 internal/api/session_runtime.go）·
       # 模型服务提供商目录（Go `llmProviderCatalog` ↔ 引擎 `providers/catalog.py`，
-      # 见 docs/service-providers.md §1）· 故障注入的作用面/类型（Go `chaosSupported*`
+      # 见 python-engine/app/providers/catalog.py）· 故障注入的作用面/类型（Go `chaosSupported*`
       # ↔ 引擎 `chaos/injector.py`，见 internal/api/ent_chaos_handler.go 文件头）·
       # **共享 Redis 键前缀**（`subagent:run:` / `subagent:cancel:ack:` / `engine:instance:`；
       # 两侧各自都有测试钉住自己那份字面量 ⇒ 只改一侧时容易两边都绿而漂移上线）·
@@ -535,6 +535,11 @@ jobs:
       # （scripts/doc_link_baseline.txt，**只应缩小**），新增断链直接失败 —— 已用变异验证。
       - name: Doc links (referenced docs must exist)
         run: python scripts/check_doc_links.py
+      # 代码注释里的文档引用：`docs/*.md` 必须存在、同行写出的 `§N` 必须在该文档标题里、
+      # 已删除的规划稿（方案/评审/roadmap/spec/vendor 规划）不得再被引用。与上一步互补：
+      # 上一步只扫 Markdown 里的链接，这一步只扫代码注释与 Python docstring。
+      - name: Comment doc refs (code comments must land)
+        run: python scripts/check_comment_refs.py
       # Markdown 表格结构：同一表格块内每行的列数必须一致。手写的表格**多一个 / 少一个 `|`
       # 不会让 Markdown 报错** —— 只是静默错位（看着"差不多"）。实测在
       # 某个长表格的 §3 抓到两处：一行多了一个分隔符、另一行少了行尾 `|`，
@@ -543,8 +548,8 @@ jobs:
       - name: Markdown tables (consistent column counts)
         run: python scripts/check_md_tables.py
       # 错误码键集：Go `Code*` 必须与三语言 `errors.ts` 的契约键一致，且三语言键集完全相同。
-      # docs/error-codes.md 把这条写成**硬要求**，却自陈"目前靠人工核对" —— 缺一个键不会有
-      # 任何报错，只有该语言的用户会看到未本地化的原文。存量基线为空（当前一致）。
+      # internal/api/error_codes.go 把这条写成**硬要求**，却自陈"目前靠人工核对" —— 缺一个键
+      # 不会有任何报错，只有该语言的用户会看到未本地化的原文。存量基线为空（当前一致）。
       - name: Error code keys (Go Code* vs 3 locales)
         run: python scripts/check_error_code_keys.py
       # compose 必填环境变量必须有文档：`docker-compose.yml` 里用 `${VAR:?…}` 声明的变量

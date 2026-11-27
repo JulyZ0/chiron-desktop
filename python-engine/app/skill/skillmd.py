@@ -16,8 +16,7 @@ Chiron 既有技能载体是**扁平**的 `{name}.skill.json`（`exec`/`paramete
 - **不引第三方依赖**：frontmatter 是 YAML 子集，而仓库依赖清单里没有 pyyaml，这里手写最小
   解析器（标量 / 引号 / 列表 / 一层嵌套映射），足够覆盖 deepagents 的字段形状。
 
-执行语义：目录型技能是「文档」，没有 `exec` 段；执行时把**正文**包成一次 prompt（与
-方案 02 D7 的「显式调用」同源），故 `load_skill_dir` 产出的 `SkillDef.exec_type="prompt"`。
+执行语义：目录型技能是「文档」，没有 `exec` 段；执行时把**正文**包成一次 prompt（与「显式调用」同源），故 `load_skill_dir` 产出的 `SkillDef.exec_type="prompt"`。
 """
 
 from __future__ import annotations
@@ -296,7 +295,7 @@ def builtin_skills_root() -> Path | None:
     缺失时返回 `None`（**不抛异常** —— 内置源缺失不该让技能列表报错），但会**告警一次**：
     静默返回 None 曾经掩盖了一个真实缺陷 —— 引擎镜像只 `COPY app/`（构建上下文是
     `python-engine/`），`market/skills/` 进不了镜像，于是容器部署**一直没有内置技能**
-    且日志里什么都看不到（vendor/规划.md §1.3「失败要显式」）。
+    且日志里什么都看不到（「失败要显式」）。
     """
     override = os.getenv(BUILTIN_SKILLS_ENV, "").strip()
     if override:

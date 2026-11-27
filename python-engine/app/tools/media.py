@@ -266,7 +266,7 @@ def _read_workspace_asset(rel: str) -> tuple[bytes, str | None]:
     * 路径必须过 `sandbox.safe_join` —— clamp 到**该用户自己的工作区**，`../` 与绝对路径
       一律拒绝。没有这一步，这个参数就是一条新的任意文件读通道；
     * **先 `stat()` 再读**：上限必须在**消费之前**生效（读完再判大小 = 把一个不受控的文件
-      整份读进内存。§4 的同族教训："有上限"不等于"在消费前拦住"）；
+      整份读进内存。同族教训："有上限"不等于"在消费前拦住"）；
     * 不存在 / 是目录 ⇒ **明确说清怎么办**（先生成到工作区），不静默回退到别处。
     """
     from app.tools.sandbox import safe_join
@@ -489,7 +489,7 @@ async def media_create(
         }
 
     # 回退：引擎本地 store。**必须说出来** —— 否则"创建成功"是假的：用户按提示去媒体库
-    # 什么也找不到，而模型一无所知（§1.3「失败要显式」）。
+    # 什么也找不到，而模型一无所知（「失败要显式」）。
     asset = get_store().write(
         name=display_name,
         content=data,

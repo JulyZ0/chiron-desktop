@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// ── 稳定错误码契约（docs/error-codes.md）──────────────────────────────
+// ── 稳定错误码契约（internal/api/error_codes.go）──────────────────────────────
 //
 // code 由 error 文案推断：knownMessageCodes 精确匹配（小写整串）→ messageCodeRules
 // 关键字按序包含匹配 → request_failed 兜底；空文案不写 code 字段。
@@ -23,7 +23,7 @@ func TestCodeForMessage_EmptyMessageOmitsCode(t *testing.T) {
 }
 
 func TestCodeForMessage_KnownMessagesExactMatch(t *testing.T) {
-	// 与 docs/error-codes.md 的「错误码表」逐条对应。
+	// 与 internal/api/error_codes.go 的「错误码表」逐条对应。
 	cases := []struct {
 		msg  string
 		want string

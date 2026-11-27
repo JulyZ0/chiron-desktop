@@ -1,6 +1,6 @@
 package api
 
-// ── 子 Agent 运行观测 API（docs/subagent-design.md §4.4）──
+// ── 子 Agent 运行观测 API ──
 //
 // 三个只读端点，供前端画"递归层级树 + 侧边栏看运行中子 Agent 输出"：
 //
@@ -8,7 +8,7 @@ package api
 //	GET /v1/subagent/runs/{run_id}                     单 run 详情（状态/摘要/用量）
 //	GET /v1/subagent/runs/{run_id}/events?limit=       输出过程（Redis Stream → DB steps 回落）
 //
-// 数据源分层（§3.3）：Redis = 运行期（TTL 1h，引擎写入，key 带 tenant 维度）；
+// 数据源分层：Redis = 运行期（TTL 1h，引擎写入，key 带 tenant 维度）；
 // PostgreSQL = 权威。每个查询都"先 Redis 后 DB"，Redis 不可用或键过期时自动回落。
 //
 // 安全：全部要求鉴权；租户取自 claims（TenantID 回退 UserID）；DB 查询强制 tenant_id 过滤，

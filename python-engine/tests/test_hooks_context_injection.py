@@ -1,4 +1,4 @@
-"""批 G+ 批次 4：hook 的**上下文注入**回归（`docs/hook-protocol-design.md` §4.5）。
+"""批 G+ 批次 4：hook 的**上下文注入**回归（`app/hooks/inject.py`）。
 
 这一批是协议里**唯一**改变"什么能影响模型输入"的机制，所以用例围绕四件事钉：
 
@@ -107,7 +107,7 @@ async def test_structured_field_is_collected(monkeypatch: pytest.MonkeyPatch) ->
 
 
 async def test_stdout_of_a_command_hook_is_not_injected(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`python`/`command` 形态**打印的正文**不是注入通道，只有结构化字段才是（§6 明令）。"""
+    """`python`/`command` 形态**打印的正文**不是注入通道，只有结构化字段才是（约定）。"""
     _enable(monkeypatch)
     hooks.register(events.PRE_TOOL_USE, "noise", "def main(input):\n    print('SHOULD NOT INJECT')\n")
     task = _task()

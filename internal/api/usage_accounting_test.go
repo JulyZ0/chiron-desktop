@@ -71,7 +71,7 @@ func TestSettledFallsBackToUsageIncrementsWhenDoneHasNoTokens(t *testing.T) {
 	})
 }
 
-// M15d（方案 2B）：子 Agent 的 token 只进引擎侧的任务线账，**不进租户额度池**。
+// M15d：子 Agent 的 token 只进引擎侧的任务线账，**不进租户额度池**。
 //
 // 引擎今天把子 Agent 的用量放在 `subagent.done` 的**嵌套** `usage` 字段里，父帧的扁平
 // `input_tokens/output_tokens` 是 0 —— 所以"不并入"过去只是一个巧合。这一条把它变成契约：

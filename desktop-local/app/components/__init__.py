@@ -7,7 +7,7 @@
 
 组件源由 ``CHIRON_COMPONENT_BASE_URL`` 指定（本地目录或 HTTP 基址），**不内置下载地址**；
 未配置时安装返回 409 ``component_source_unconfigured``。详见
-``docs/desktop-local/components.md``。
+``desktop-local/app/components/``。
 """
 
 from __future__ import annotations

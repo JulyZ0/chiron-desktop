@@ -10,7 +10,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// runCmd 是 headless 非交互入口（方案 03 §2「批 F」）：
+// runCmd 是 headless 非交互入口（批 F）：
 // 复用网关既有的 /submit + /events(SSE)，把一次 agent 回合跑完并把结果交给 CI/脚本。
 var runCmd = &cobra.Command{
 	Use:   "run",

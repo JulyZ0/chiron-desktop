@@ -179,7 +179,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期：启动初始化 + 关闭清理"""
     global _redis, _gateway, _queue_worker
     # 关闭段要用的句柄：**显式初始化**（此前它们只在条件分支里赋值，关闭段靠 `'x' in locals()`
-    # 探测——那种写法会让"把启动段抽成函数"的纯移动重构静默跳过清理，见拆分评估 §2.3）
+    # 探测——那种写法会让"把启动段抽成函数"的纯移动重构静默跳过清理）
     _metrics_task: Any = None
     _retention_task: Any = None
     #: M28：按模型的价格同步（默认关，见 app/pricing/sync.py 的 sync_enabled）。
@@ -276,7 +276,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # （读不到键 = 判定所有人都死了）。没 Redis 时 start() 返回 False，清扫随之禁用。
     _liveness = await _start_instance_liveness()
 
-    # 批 G：用户自定义 hook 误开必须可见（方案 03 §3.2）
+    # 批 G：用户自定义 hook 误开必须可见
     # 批 G+（钩子协议批次 1）：部署级声明文件（`hooks_config_path` 为空 ⇒ 零行为变化）。
     # 只接受部署级声明；解析失败只记 error + 审计并**不注册任何 hook**，绝不拖垮启动。
     _apply_hook_config()
@@ -284,7 +284,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── C1 批 3：僵尸 run 巡检（启动一次 + 周期 60s + 每实例抖动）──
     # 它只修正"旧主已死"的 run 状态（`running` → `checkpointed`；快照超冷窗口 → `abandoned`），
     # **不触发续跑** —— 自动续跑需要重建 AgentTask，而配置只存在于提交请求里
-    # （见评审 03 §17.2）。巡检起不来不该拖垮引擎启动，故 try 包住。
+    # 。巡检起不来不该拖垮引擎启动，故 try 包住。
     # 续跑的执行体是模块级的 `_auto_resume_runner`（无人值守回合，见其注释）。
     _reconciler_task = await _start_run_reconciler()
 
@@ -324,7 +324,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ── 关闭 ──
     if _idle_task is not None:
         _idle_task.cancel()
-    # 句柄显式传递（不用 `'x' in locals()` 探测）：见 内部文档 §2.3
+    # 句柄显式传递（不用 `'x' in locals()` 探测）
     await _shutdown_lifespan(
         reconciler_task=_reconciler_task,
         metrics_task=_metrics_task,
@@ -449,7 +449,7 @@ async def _start_file_backend() -> None:
     # ── 1.6 文件后端选择（批 B 片 4）──
     # 默认 `local`：agent 文件工具直接读写 per-user workspace（行为与历史完全一致）。
     # `filestore`：改为经网关 `/v1/internal/storage/*` 读写部署级 FileStore（共享卷 / S3），
-    # 多副本下不再"写 A 副本、读 B 副本"失忆。**显式开关**，不猜部署形态（评审 02 §1）。
+    # 多副本下不再"写 A 副本、读 B 副本"失忆。**显式开关**，不猜部署形态。
     from app.backends.context import set_default_backend
     from app.backends.filestore import build_filestore_backend_from_settings
 
@@ -619,7 +619,7 @@ async def _start_memory_service() -> None:
         set_memory_service(mem_svc)
         bind_prompt_memory(mem_svc)
 
-        # N1（评审 03 §1.2）：把"空闲会话结束"接到记忆的会话级收尾上。
+        # N1：把"空闲会话结束"接到记忆的会话级收尾上。
         #
         # 此前 `start_periodic_cleanup` **从未被调用** —— 空闲会话既不清理也不通知，于是
         # `on_session_end`（会话级 L3 rollup 入队 + 丢 L1）只在"异常/中断退出"那条路径上
@@ -949,7 +949,7 @@ def _start_deployment_extensions() -> None:
     **默认关**：`deploy_extensions_enabled=false` 时 `load_*_from_settings` 直接返回
     `None`，连后端都不触碰 —— 零行为变化。开启时从**部署目录**读 `extensions.json`：
     工具登记进注册表，后端虚拟路由装配进默认后端（**重启生效**，不做热切换）。
-    任何失败都 fail-soft：记日志、绝不拖垮引擎启动（方案 03 §4 验收③）。
+    任何失败都 fail-soft：记日志、绝不拖垮引擎启动。
 
     只经 `set_default_backend` 产生进程级副作用，**不返回句柄**：扩展登记的工具与路由都落在
     全局注册表 / 默认后端里，后续的关闭段无需再持有 `deploy_extensions`。
@@ -1347,7 +1347,7 @@ async def _start_instance_liveness() -> Any:
 def _apply_hook_config() -> None:
     """应用部署级 hook 配置（从 `lifespan` 抽出）。
 
-    批 G：用户自定义 hook 误开必须可见（方案 03 §3.2）。
+    批 G：用户自定义 hook 误开必须可见。
     批 G+：部署级声明文件（`hooks_config_path` 为空 ⇒ 零行为变化）；只接受
     部署级声明，解析失败只记 error + 审计并**不注册任何 hook**，绝不拖垮启动。
     """
@@ -1362,7 +1362,7 @@ async def _start_run_reconciler() -> Any:
 
     C1 批 3：启动一次 + 周期 60s + 每实例抖动。它只修正"旧主已死"的 run 状态
     （`running` → `checkpointed`；快照超冷窗口 → `abandoned`），**不触发续跑** ——
-    自动续跑需要重建 AgentTask，而配置只存在于提交请求里（见评审 03 §17.2）。
+    自动续跑需要重建 AgentTask，而配置只存在于提交请求里。
     巡检起不来不该拖垮引擎启动，故 try 包住。续跑的执行体是模块级的
     `_auto_resume_runner`（无人值守回合，见其注释）。
     """
@@ -1404,7 +1404,7 @@ def _apply_sandbox_service_branch(base: Any, *, service_healthy: bool | None = N
       （静默回退会让"隔离已生效"这个判断失真，见 config.py 同段说明）。
 
     抽成函数是为了**可测**：这段"配置 → 运行期生效"的接线此前内联在 `lifespan` 里，
-    没有任何用例 —— 而"配置里写了却没人用"正是这个仓库反复踩的坑（见 vendor/规划.md §4）。
+    没有任何用例 —— 而"配置里写了却没人用"正是这个仓库反复踩的坑。
     """
     if (settings.sandbox_backend or "local").strip().lower() != "service" or not settings.sandbox_service_url:
         return base
@@ -1473,7 +1473,7 @@ async def _shutdown_lifespan(
 
     ⚠ 这里刻意**不用** `'x' in locals()` 探测"启动时到底建没建"：那种写法一旦把启动段抽成
     函数就会**静默跳过**清理（任务不取消、实例不注销，还不报错）。判据与实测见
-    内部文档 §2.3。
+    启动段的句柄必须显式传递。
     """
     global _plugin_pool  # 关闭后置空，避免关闭完成后仍被读成"可用"
 
@@ -2290,7 +2290,7 @@ async def agent_submit(
         total_out = 0
         started = time.monotonic()
 
-        # ── 子 Agent 事件旁路（docs/subagent-design.md §4.3）──
+        # ── 子 Agent 事件旁路（app/agent/event_sink.py）──
         # 子 Agent 在工具调用内部运行，其进度需"穿透"到这条父 SSE 流：经 contextvar
         # 暴露 EventSink，再把 runtime 事件与旁路事件合并输出。旁路有界+限流，绝不阻塞子 Agent。
         from app.agent.event_sink import EventSink

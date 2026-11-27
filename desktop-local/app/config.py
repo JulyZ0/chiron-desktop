@@ -89,7 +89,7 @@ class Settings(BaseSettings):
     # 为什么非要有内置二进制这一档：fakeredis 对契约 §5.3 的七条命令实测 6/7 通过，
     # 但 **EVAL 完全不支持**（``unknown command 'eval'``，4/4 失败）。而引擎的 KeyRing
     # 仲裁（D19）、限流、预算预留、队列闸门共 15 处依赖 Redis 单键 EVAL 的原子性，
-    # vendor/规划.md:132 也记过「桩 Redis 不解释 Lua」。桩只能证明"命令存在"，
+    # 「桩 Redis 不解释 Lua」这条教训。桩只能证明"命令存在"，
     # 证明不了"语义正确"，所以本地模式要有一个**真** Redis。
     redis_bin_dir: str = ""  # 指向 redis-server 所在目录；空 = 探测内置目录与 PATH
     redis_port: int = 0  # 0 = 每次启动选空闲端口（不写死 6379，免得撞用户自己的实例）

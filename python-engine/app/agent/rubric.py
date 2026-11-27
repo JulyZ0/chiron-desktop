@@ -1,6 +1,6 @@
-"""S6b：rubric grader —— 主循环收尾前的**可选**自评回合（方案 01 §4.6(b)）。
+"""S6b：rubric grader —— 主循环收尾前的**可选**自评回合。
 
-四条约束（前三条来自方案，均有测试钉住）：
+四条约束（前三条均有测试钉住）：
 
 1. **默认关**：`llm_config["rubric"]` 缺省即不做 —— 每轮多两次 LLM 调用不能是默认行为；
 2. **只看脱敏 transcript**：复用 `app/subagent/redact.py` 的规则集（**不新造清单**，
@@ -27,7 +27,7 @@ from app.agent.bounded_llm import call_bounded
 
 logger = logging.getLogger(__name__)
 
-#: 默认评审轮数上限（方案：开启时默认最多迭代 2 次）。
+#: 默认评审轮数上限（开启时默认最多迭代 2 次）。
 DEFAULT_MAX_ITERATIONS = 2
 #: 硬上限：即便调用方配了更大的值也不越过它（成本护栏）。
 MAX_ITERATIONS_CAP = 5

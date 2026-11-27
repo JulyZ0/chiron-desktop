@@ -1,13 +1,13 @@
 """批 G+ 批次 2b：`command` 形态（**运维声明的本地命令** hook）回归。
 
-对应 `docs/hook-protocol-design.md` §7 的验收项③（只能收紧）/④（退出码约定）/⑤（fail-open + 留痕）
-/⑦（执行入口清单），外加 §4.3 选项 **(b)** 独有的三条：
+对应 `app/hooks/runner.py` 的验收项③（只能收紧）/④（退出码约定）/⑤（fail-open + 留痕）
+/⑦（执行入口清单），外加 `command` 形态独有的三条：
 
 1. **默认关**：`hooks_allow_commands=false` 时条目**被拒**（不是"配了但不生效"）；
 2. **独立 allowlist**：可执行文件必须落在 `hooks_command_allowlist` 内，且这张表**不是**
    面向模型的那张（`git` 在沙箱白名单里、却不在 hook allowlist 里 ⇒ 拒绝）；
 3. **允许绝对路径**：这是"让既有的 Claude Code / Codex 脚本能直接用"的前提 ——
-   也是 `run_in_sandbox` 直接复用不成立的那一条（§4.3 实测表）。
+   也是 `run_in_sandbox` 直接复用不成立的那一条（实测表）。
 
 用例真的**起子进程**（用 `sys.executable` 跑临时脚本），因为"能不能跑、退出码怎么解释"
 是这批的对外行为本身，不能靠桩函数证明。
@@ -286,7 +286,7 @@ async def test_exit_zero_allows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 async def test_stdout_json_decision_is_honoured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """两种输入都接受：结构化 JSON 与退出码 2（§4.4）。"""
+    """两种输入都接受：结构化 JSON 与退出码 2。"""
     script = _script(
         tmp_path,
         "import json\nprint(json.dumps({'decision': 'deny', 'reason': 'nope from stdout'}))\n",

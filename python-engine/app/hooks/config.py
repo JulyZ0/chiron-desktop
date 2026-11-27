@@ -1,12 +1,12 @@
 """批 G+（钩子协议批次 1）：**部署级声明面** `hooks.json`。
 
-设计见 `docs/hook-protocol-design.md` §4.2。三条纪律：
+三条纪律：
 
 1. **默认零行为变化**：`settings.hooks_config_path` 为空 ⇒ 不读文件、不注册、不执行；
 2. **失败显式**：文件不可读 / 非法 JSON / 结构不对 / 超限 ⇒ error 日志 + 审计，且
    **不注册任何 hook**（引擎照常启动）—— 不静默降级；
 3. **只接受部署级声明**：文件里的条目一律 `OWNER_DEPLOYMENT`；显式写 `owner: user`
-   的条目被**拒绝**（多租户下"租户可写的文件"等于把可执行面交给租户，与 §6 冲突）。
+   的条目被**拒绝**（多租户下"租户可写的文件"等于把可执行面交给租户，与"不扩大可执行面"冲突）。
 
 格式（Claude Code 兼容子集）::
 
@@ -21,7 +21,7 @@
 `type` 接受三种形态：`python`（沙箱子进程）· **`command`（批次 2b：运维声明的本地命令）**·
 **`webhook`（批次 3：出站 POST 到运维声明的 URL）**。后两者各自有一道闸（独立开关**默认关** +
 目标 allowlist **默认空 = fail-closed**），不满足的条目在 `manager.register` 处被拒并留审计 ——
-**配了却不生效是最难查的一类问题**，所以宁可当场拒（见 `docs/hook-protocol-design.md` §4.3）：
+**配了却不生效是最难查的一类问题**，所以宁可当场拒（见 `app/hooks/runner.py`）：
 
 * `command`：`hooks_allow_commands` + `hooks_command_allowlist`（可执行文件，裸名或绝对路径）；
 * `webhook`：`hooks_allow_webhooks` + `hooks_webhook_allowlist`（host 名；scheme/端口/IP 段由

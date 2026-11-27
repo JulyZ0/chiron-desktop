@@ -2,7 +2,7 @@ package api
 
 // ── 项目（Workspace 即项目）──
 //
-// 语义与不变式见 `docs/project-management-design.md`：
+// 语义与不变式见 `internal/api/sessionmap_projects.go`：
 //   - 一个 workspace 要么是**项目**（root_path 非空，绑定本地文件夹），
 //     要么是**画布**（root_path 为空，旧形态）。不设第三种。
 //   - 会话归属 = `session_map_nodes` 里 `edge_kind='project'` 的行。

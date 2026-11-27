@@ -1,6 +1,6 @@
 """子 Agent 执行器 —— 一次委派的完整生命周期（P0 核心）。
 
-职责（对应 docs/subagent-design.md 的 P0 与三级消息模型）：
+职责（对应 app/subagent/ 的 P0 与三级消息模型）：
 
 1. 解析 Profile（``agents`` 表 ``kind='subagent'``，见 :mod:`app.agent.profile`）；
 2. 装配**独立** AgentRuntime：独立 session id / 消息历史、工具收窄（白名单 / 黑名单 /
@@ -351,7 +351,7 @@ async def _record_delegation_span(
     两层守卫：
     1. `trace_id` 为空 ⇒ 直接返回。没有父 trace 就不写（凭空造一个 trace 只会产出孤儿节点，
        在父图里看不见）；这同时让"未接入 trace 的调用方"（例如跨实例 `internal_subagent`）
-       保持**零开销、零行为变化** —— vendor/规划.md §1.3 的"新机制默认什么都不做"。
+       保持**零开销、零行为变化** —— "新机制默认什么都不做"。
     2. 一切异常降级为一条 warning 日志。`record_span` 内部本来就 fail-soft（Redis 不可用 /
        `no_retention` 时跳过），这里再包一层是因为**委派不能因为观测面出问题而失败** ——
        未来 trace 模块若改了失败语义（例如配置错误直接抛），今天的调用方也不该被拖下水。
@@ -575,7 +575,7 @@ class SubAgentRunner:
         cache: Any = None,
         background: bool = False,
         allow_write: bool = False,
-        #: A4（方案 04）：per-call 的**工具收窄**（`CapabilityGrant` 的最小形态）。
+        #: A4：per-call 的**工具收窄**（`CapabilityGrant` 的最小形态）。
         #:
         #: 与 `ProfileSpec.allowed_tools` 的关系是「**天花板 ∩ 收窄**」：Profile 说"这个 worker
         #: 最多能给哪些"，本参数说"**这一次**只要哪些"，两者取**交集**，且**只能收窄、永不放宽**
@@ -584,7 +584,7 @@ class SubAgentRunner:
         #: `None` = 不按调用收窄；**空序列** = 这一次不允许任何工具（两者语义不同，故用 `is not None`
         #: 而不是真值判断）。
         call_tools: Sequence[str] | None = None,
-        #: R2（vendor/规划.md §3.5）：本次委派**声明**要写的路径（见 app/subagent/scheduler.py）。
+        #: R2：本次委派**声明**要写的路径（见 app/subagent/scheduler.py）。
         #:
         #: `None` = 不覆盖，用 Profile 的 `write_paths`；两边都没有 ⇒ 可写委派由仲裁器按
         #: **整工作区**独占（保守方向）。非空 = 本次委派的声明。
@@ -640,7 +640,7 @@ class SubAgentRunner:
         #: S4：调用方声明的响应 schema（JSON Schema）。非空时会在收尾阶段抽取结构化结果。
         self._response_schema = response_schema if isinstance(response_schema, dict) else None
         #: S2：是否继承父会话上下文（`False` 默认关 / `True` 全部 / `int` 最近 N 条）。
-        #: 默认关是**安全默认** —— 继承会扩大子 Agent 的可见面（评审 01 §1.9）。
+        #: 默认关是**安全默认** —— 继承会扩大子 Agent 的可见面。
         self._inherit_context: bool | int = inherit_context
         #: S2：父会话消息（由调用方提供；`None` 表示没有可继承的上下文）
         self._parent_messages = parent_messages
@@ -682,7 +682,7 @@ class SubAgentRunner:
         span_id, dispatch_span_id = _delegation_span_ids(parent_trace_id, run_id)
         _span_started = time.time()
 
-        # A5（方案 04 §3）：生命周期遥测的**起点**。`rerun_of` 非空 ⇒ 这次是"恢复/重跑"而不是
+        # A5：生命周期遥测的**起点**。`rerun_of` 非空 ⇒ 这次是"恢复/重跑"而不是
         # 新派发 —— 两者在诊断上必须能分开（参照 Reasonix 的 `child_resume`）。
         # 遥测是**旁路**：没有注册 sink 时零开销，sink 出错也不会影响这次委派。
         emit_lifecycle(
@@ -718,7 +718,7 @@ class SubAgentRunner:
             },
         )
 
-        # ── R1（vendor/规划.md §3.5）：宿主证据。执行**前后**各拍一次工作区快照，用于核验子
+        # ── R1：宿主证据。执行**前后**各拍一次工作区快照，用于核验子
         # Agent 的产出，而不是只信它的自述。有界快照；可用 SUBAGENT_HOST_RECEIPTS=false 关掉。
         from app.config import settings
 
@@ -1163,7 +1163,7 @@ class SubAgentRunner:
                                                parent_run_id=parent_run_id, depth=child_depth,
                                                profile=profile_name)
                 elif evt.type == "thinking" and evt.content:
-                    # A1（方案 04）：native reasoning 走独立事件 —— 直接的 reasoning，
+                    # A1：native reasoning 走独立事件 —— 直接的 reasoning，
                     # 不再需要从 text 里拆。上面 `text` 分支的 `_split_thinking` **保留**：
                     # 模型自产的 `[thinking]…[/thinking]` 标记仍在正文里。
                     reasoning_parts.append(evt.content)
@@ -1937,7 +1937,7 @@ class SubAgentRunner:
             core = MINIMAL_TOOL_NAMES if mode == "minimal" else CORE_TOOL_NAMES
             names = base & set(core)
         names -= disallowed
-        # A4（方案 04）：per-call **收窄** —— 取交集，**只减不增**。
+        # A4：per-call **收窄** —— 取交集，**只减不增**。
         #
         # 天花板仍然优先：调用方即使列了 Profile 白名单之外的名字，也会被上面 `base & allowed`
         # 挡掉，所以"越权放宽"在这个位置上不可能发生。`frozenset()`（空）是合法的强收窄

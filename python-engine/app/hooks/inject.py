@@ -1,8 +1,8 @@
-"""批 G+ 批次 4：hook 的**上下文注入**（`docs/hook-protocol-design.md` §4.5）。
+"""批 G+ 批次 4：hook 的**上下文注入**。
 
 这是本协议里**唯一**改变"什么能影响模型输入"的一环，因此它的形态是被约束死的：
 
-1. **只走结构化字段**，不是 stdout —— §6 明令"不把 hooks 的 stdout 拼进 system prompt"；
+1. **只走结构化字段**，不是 stdout —— 约定明令"不把 hooks 的 stdout 拼进 system prompt"；
    `command` 形态打印的正文、`webhook` 响应的正文都**不会**被当成上下文（它们的正文只用于
    人读的 `reason`）。可注入的只有输出 JSON 里的 `additional_context` 字段。
 2. **独立开关默认关**（`settings.hooks_allow_context_injection`）⇒ 关闭时零行为变化。

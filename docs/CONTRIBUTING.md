@@ -57,8 +57,8 @@ make check                                # 提交前快检：Go build/vet + 文
 make check-all                            # 全量：再加 Python(pytest/ruff/mypy) 与前端(build/test)
 ```
 
-> **`go` 命令请保留 `-mod=mod`**：仓库的 `vendor/` 下放的是参考源码（不含 `vendor/modules.txt`），
-> 而 Go 只要看到 `vendor/` 就按 vendor 模式做一致性检查并报 `inconsistent vendoring`。
+> **`go` 命令请保留 `-mod=mod`**：本地若放了 `vendor/` 参考源码（不含 `vendor/modules.txt`），
+> Go 只要看到 `vendor/` 就按 vendor 模式做一致性检查并报 `inconsistent vendoring`。
 > `run.py`、`Makefile`、`Dockerfile` 已在编译入口显式排除该目录。
 
 ## 目录结构
@@ -75,6 +75,18 @@ shared/            跨端契约事实源（如 workstations.json，由三端契�
 pageindex-service/ 文档索引服务（知识库页面级检索）
 sandbox-service/   工具执行沙箱服务
 ```
+
+## 代码注释
+
+注释解释**为什么**，不复述代码做了什么。提交前自查四条：
+
+1. 只写代码本身看不出的信息：取舍、约束、踩过的坑、失败模式；
+2. 不复述类型签名与控制流；同一个理由只写一处，别在调用方再抄一遍；
+3. **引用必须能落地**：不引已删除的文档或章节号；要指向实现就写当前模块路径；
+4. 不保留注释掉的代码、无主 TODO/FIXME、分隔装饰线。
+
+`make docs-check` 中的 `scripts/check_comment_refs.py` 校验注释里的文档引用与章节号；
+`scripts/check_comment_hygiene.py` 校验本次改动新增行的注释卫生。
 
 ## 文档
 

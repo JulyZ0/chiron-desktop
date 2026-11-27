@@ -1,6 +1,6 @@
 """跨实例演练：**两个真实网关进程** + Redis，验证 SSE 扇出与断线重连补发。
 
-为什么需要它：`docs/deployment-multi-instance.md` 的「多副本语义的对外保证」表里，**"两个 OS 进程"
+为什么需要它：多副本语义的对外保证里，**"两个 OS 进程"
 这一格此前没有自动化** —— 已有的是进程内双 hub（`internal/api/sse_cross_instance_live_test.go`）
 与沙箱服务的跨进程（`tests/test_sandbox_service_multiprocess.py`），都不是"两个网关进程"。
 

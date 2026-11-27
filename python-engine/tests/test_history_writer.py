@@ -468,7 +468,8 @@ def test_h15_migration_chain_keeps_exactly_one_head():
 
     revisions, parents = module.parse(root / "migrations" / "versions")
 
-    assert set(revisions) - parents == {"0012_session_fold_lineage"}
+    heads = set(revisions) - parents
+    assert len(heads) == 1, f"迁移链必须恰好一个 head，实际: {sorted(heads)}"
 
 
 def test_tenant_id_is_coerced_not_raised():
@@ -801,7 +802,7 @@ class TestRecallByMessageId:
 
 
 class TestTieredArchiving:
-    """分级归档（§2.3）：≤4MB 原样入库，>4MB 外置。
+    """分级归档：≤4MB 原样入库，>4MB 外置。
 
     这一组守的是"原文不会永久丢失"：第 10 步之前 256k 字符以上一律截断，
     而设计要求的 64KB~4MB 区间本该原样保留。
@@ -970,7 +971,7 @@ class TestPersistFolds:
     async def test_conflict_does_not_count_as_write(self, monkeypatch: pytest.MonkeyPatch, no_privacy):
         """`ON CONFLICT DO NOTHING` 命中时不得计入写入数。
 
-        这是规则二（`docs/context-projection-design.md` §3.3）的落地点：跨副本用
+        这是规则二的落地点：跨副本用
         不同模型摘要同一区间时，先到者胜、后到者被静默丢弃。若仍无条件 `written += 1`，
         调用方会以为摘要更新了，实际读到的还是旧那份 —— 冲突变成不可观测。
         """

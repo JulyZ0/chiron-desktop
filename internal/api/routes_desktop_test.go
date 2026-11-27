@@ -82,7 +82,7 @@ func TestDesktopInferHandlerRequiresTenant(t *testing.T) {
 	}
 }
 
-// ── 计费口径：代理路径不触发任何扣费（contracts.md §9.3） ────────────────────
+// ── 计费口径：代理路径不触发任何扣费（contracts.md §9） ────────────────────
 
 // TestDesktopInferProxyForwardsVerbatim 跑一遍**真实代理路径**（httptest 当引擎），
 // 盯住计费口径的前置条件：
@@ -138,7 +138,7 @@ func TestDesktopInferProxyForwardsVerbatim(t *testing.T) {
 // 为什么扫描源码而不是运行时断言：`DesktopInferHandler` 只接受 `*engine.PythonClient`，
 // 结构上就没有计费入口 —— "没有调用"这件事在运行时不可观测（能观测的只有"没写库"，
 // 而单测环境本来就没有库）。所以直接盯源码：出现计费调用或计费表名即失败。
-// 注释会被剔除，所以 desktop_infer.go 的文件头可以放心解释计费口径（§9.3）。
+// 注释会被剔除，所以 desktop_infer.go 的文件头可以放心解释计费口径（§9）。
 func TestDesktopInferHandlerHasNoBillingCalls(t *testing.T) {
 	raw, err := os.ReadFile("desktop_infer.go")
 	if err != nil {
@@ -153,7 +153,7 @@ func TestDesktopInferHandlerHasNoBillingCalls(t *testing.T) {
 		"billing_records",     // 企业成本中心明细表
 	} {
 		if strings.Contains(code, banned) {
-			t.Errorf("desktop_infer.go 出现了 %q：片段推理只记 usage、不扣 credits（contracts.md §9.3）；"+
+			t.Errorf("desktop_infer.go 出现了 %q：片段推理只记 usage、不扣 credits（contracts.md §9）；"+
 				"要接线请先改口径与用例", banned)
 		}
 	}

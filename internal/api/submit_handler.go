@@ -322,7 +322,7 @@ func (h *SubmitHandler) SubmitSteer(w http.ResponseWriter, r *http.Request) {
 
 // steerStatus 把引擎的拒绝原因映射成状态码，让调用方能区分"重试有用"与"没用"。
 //
-// 按 `docs/error-codes.md` 的口径：4xx 是调用方的问题（不该重试），429 是限流（可退避），
+// 按 `internal/api/error_codes.go` 的口径：4xx 是调用方的问题（不该重试），429 是限流（可退避），
 // 409 是状态冲突（run 已结束/换了 run，重试通常无用但换 token 可能有用）。
 func steerStatus(reason string) int {
 	switch {
@@ -642,7 +642,7 @@ func (h *SubmitHandler) submitOnce(ctx context.Context, userID, sessionID, conte
 	if len(attachments) > 0 {
 		pythonReq["attachments"] = attachments
 	}
-	// P1-c：用**会话运行时状态**解析最终生效的模式/模型/provider（唯一解析链，spec §3）。
+	// P1-c：用**会话运行时状态**解析最终生效的模式/模型/provider（唯一解析链）。
 	// 前端 llm_config 视为"本次请求的显式意图"，优先级高于会话 runtime 与默认值；
 	// 若前端未传（P1-e 后的目标形态），则由 runtime / 用户默认 / 全局默认依次生效。
 	explicit := map[string]string{}

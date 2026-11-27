@@ -50,7 +50,7 @@ func registerConversationRoutes(
 	mux.Handle("DELETE /v1/session-map/workspaces/{id}", authMW(rlMW(http.HandlerFunc(smHandler.DeleteWorkspace))))
 	mux.Handle("POST /v1/session-map/workspaces/{id}/fork-node", authMW(rlMW(http.HandlerFunc(smHandler.ForkNode))))
 	// 项目（Workspace 即项目）：会话地图改造后的主要入口，语义见
-	// docs/project-management-design.md。项目 = root_path 非空的 workspace。
+	// internal/api/sessionmap_projects.go。项目 = root_path 非空的 workspace。
 	mux.Handle("GET /v1/session-map/projects", authMW(rlMW(http.HandlerFunc(smHandler.ListProjects))))
 	mux.Handle("POST /v1/session-map/projects", authMW(rlMW(http.HandlerFunc(smHandler.CreateProject))))
 	mux.Handle("PATCH /v1/session-map/projects/{id}", authMW(rlMW(http.HandlerFunc(smHandler.PatchProject))))

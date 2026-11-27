@@ -78,7 +78,7 @@ func TestBuildPayload_FillsEveryStepInOrder(t *testing.T) {
 func TestBuildPayload_EligibleOnlyWhenUserHasRows(t *testing.T) {
 	h := &OnboardingHandler{}
 
-	// 没有行 = 存量用户：不弹引导（roadmap：不打断已有用户）
+	// 没有行 = 存量用户：不弹引导（不打断已有用户）
 	if got := h.buildPayload("u1", map[string]OnboardingStepState{}); got["eligible"] != false {
 		t.Fatalf("没有行的用户 eligible 应为 false，得到 %v", got["eligible"])
 	}

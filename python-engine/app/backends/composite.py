@@ -1,4 +1,4 @@
-"""按前缀路由的复合后端（批 B 片 3，见方案 02 §3.3）。
+"""按前缀路由的复合后端（批 B 片 3）。
 
 用途：把"虚拟路径空间"映射到不同后端 —— 例如
 
@@ -10,7 +10,7 @@ CompositeBackend(
 ```
 
 之后 `/artifacts/large_tool_results/xyz` 的读写会落到 artifacts 后端，而 `a.txt` 仍走默认后端。
-方案 01 的 C1（checkpoint 快照）与 C2（媒体/大结果卸载）就是要挂到 `/artifacts/` 上。
+C1（checkpoint 快照）与 C2（媒体/大结果卸载）就是要挂到 `/artifacts/` 上。
 
 **路由规则**：按**最长前缀**匹配（`/artifacts/sub/` 优先于 `/artifacts/`），剥离前缀后交给
 挂载的后端；挂载点与传入路径都做归一化（`artifacts` / `/artifacts` / `/artifacts/` 等价）。

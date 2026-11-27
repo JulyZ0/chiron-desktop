@@ -10,7 +10,7 @@ package api
 //
 // 为什么不是"整仓长期同步"：镜像只在有 client 项目回合时建立/使用，且带文件数与
 // 字节上限（设备侧 walk 执行）；超限直接报错让用户改用附件，而不是给 agent 半个仓库。
-// 这是 S2 的过渡实现；S3 之后再按 PRD §4 换成逐操作 ProjectFS RPC。
+// 这是 S2 的过渡实现；S3 之后再换成逐操作 ProjectFS RPC。
 
 import (
 	"context"

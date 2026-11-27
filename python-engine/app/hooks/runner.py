@@ -1,4 +1,4 @@
-"""批 G：单个 hook 的沙箱执行（方案 03 §3.2 —— 复用 `plugin_runner.py` 的既有模式）。
+"""批 G：单个 hook 的沙箱执行（复用 `plugin_runner.py` 的既有模式）。
 
 **不新造沙箱**：与 `app/api/plugins.py:run_plugin_in_sandbox` 同一套隔离 ——
 独立 subprocess（`sys.executable plugin_runner.py`）+ 子进程内 `setrlimit`
@@ -10,14 +10,14 @@ payload 走 stdin、结果走 stdout，宿主 env 由 `sandboxed_env()` 清空�
 失败都以 `{"success": false, "error": ...}` JSON 输出。本模块把这一切**收束成
 永不抛异常**的 `HookOutcome`，让调用方（主流程）天然 fire-and-forget。
 
-批 G+ 批次 2b（`docs/hook-protocol-design.md` §4.3 选项 **(b)**）新增 **`command` 形态**：
+批 G+ 批次 2b 新增 **`command` 形态**：
 运维在**部署级声明文件**里给出的本地命令。它与 `python` 形态的差别只有三处，其余原语
 （清环境 / RLIMIT / 截断 / 审计）**完全复用**：
 
 1. 不走 `plugin_runner.py`，直接 `create_subprocess_exec(argv…)`（**不经过 shell**）；
 2. 准入用**部署自备的 allowlist**（`hooks_command_allowlist`，**允许绝对路径**）——
    而不是那张**面向模型**的白名单：前者约束"模型挑的命令"，后者是"运维声明的命令"，
-   两者信任级不同（§4.3 实测表）；
+   两者信任级不同；
 3. 判定语义按 DSH 约定：**退出码 2 = 阻断**（stderr 尾部作为原因），其余非 0 是
    **非阻断失败**（动作照走 + 留审计）。
 
@@ -262,7 +262,7 @@ def command_policy_error(command: str) -> str | None:
     三条闸口（任一不过即拒，**fail-closed**）：
 
     1. `hooks_allow_commands` —— 本形态的**独立开关**，默认关（它新增一个**运维级**
-       可执行面，见 `docs/hook-protocol-design.md` §4.3 选项 (b)）；
+       可执行面）；
     2. allowlist **为空 ⇒ 一条也不批准**（与插件命令白名单"未配置即全部拒绝"同款默认）；
     3. 可执行文件的身份必须落在 allowlist 内。
 
@@ -408,7 +408,7 @@ async def run_command_hook(
             truncated=truncated,
         )
 
-    # 退出码 0：stdout 是**可选**的结构化判定通道（两种输入都接受，§4.4）。
+    # 退出码 0：stdout 是**可选**的结构化判定通道（两种输入都接受）。
     output: Any = None
     text = stdout_text.strip()
     if text:
@@ -464,7 +464,7 @@ def webhook_payload(context: dict[str, Any]) -> dict[str, Any]:
 
     刻意**不**送 `tool_arguments` / `tool_result`（可能是租户内容）与
     `tenant_id` / `user_id` / `session_id`（租户标识）：把载荷或身份送到**运维配置的外部
-    URL** 是一次**数据出境**决定，`docs/hook-protocol-design.md` §4.3 的拍板结论是
+    URL** 是一次**数据出境**决定，拍板结论是
     **默认只送内容无关字段**。要送它们需要**再拍一次板**并单独加开关 —— 本批不做。
     """
     from app.audit_log import utc_timestamp

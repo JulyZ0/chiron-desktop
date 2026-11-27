@@ -39,7 +39,7 @@ type BranchPlan struct {
 
 // planBranch 校验参数并给出裁剪计划。
 //
-// 语义（docs/session-map-branch-design.md 2.3）：
+// 语义：
 //
 //	源会话  m1 ... m(N-K) | m(N-K+1) ... mN | m(N+1) ...
 //	        └─ 压缩区 ──┘ └─ 原文保留 ──┘ └─ 被裁掉（丢弃）─┘
@@ -115,10 +115,10 @@ type BranchResult struct {
 
 // BranchSession 从 srcSessionID 裁出一段上下文，落到一个**带血缘标记**的新会话。
 //
-// 参照实现 `vendor/dsh-synapse` 按 `session.header.parentSession` 画边、用 `seedLength`
+// 参照实现 dsh-synapse 按 `session.header.parentSession` 画边、用 `seedLength`
 // 记分叉点；我们此前只有"复制前 N 条"的 fork，没有父子关系与裁剪语义。
 //
-// 两种模式（见 docs/session-map-branch-design.md 2.2）：
+// 两种模式：
 //   - truncate：复制前 N 条原文（等价旧行为，无压缩、无 pending 状态）；
 //   - condense：只复制**尾部 K 条原文**，其余保留区交给引擎压成"核心上下文摘要"
 //     （摘要由引擎异步写入，因此这里先把 branch_state 置为 pending）。

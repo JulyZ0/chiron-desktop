@@ -6,7 +6,7 @@
 #   - `desktop-local/`（引导器 + `bin/` 下的 PG/Redis 二进制）；
 #   - `python-engine/`（聊天/知识库/记忆/图谱的实现方）；
 #   - `python-runtime/` + `uv/`（裸 CPython 与建 venv 的工具）。
-# 首启不下载任何东西，只在本机建 venv 装依赖，详见 docs/desktop-local/packaging.md。
+# 首启不下载任何东西，只在本机建 venv 装依赖。
 # 版本号采用 V0.1.261025.01 的语义：0.1 起步 → 261025 日期 → 01 当日序号。
 #
 # 发行策略：**只发布 Windows x64 安装包** + latest.yml 更新清单。
@@ -30,7 +30,7 @@ directories:
 #
 # 代价：`electron-updater` 也被排除，且**未签名构建本来就不能自动更新**。
 # main.cjs 的 setupAutoUpdater 已有 try/catch，require 失败只记一条 warn 并跳过，
-# 不影响启动。签名接入后再按 `docs/desktop-local/packaging.md` 的白名单加回。
+# 不影响启动。签名接入后再按发布白名单加回。
 files:
   - electron/**/*
   - dist/**/*

@@ -48,7 +48,7 @@ const (
 	// 归属与画布卡片同表（`session_map_nodes`），靠这一列区分。判据**只能是它**，
 	// 不能用 `hidden` —— `hidden` 是用户可切换的显示字段，「显示全部」就会把
 	// 归属记录当成 0,0 的幽灵卡片画出来。
-	// 见 docs/project-management-design.md 的「判据只能是 edge_kind」。
+	// 见 internal/api/sessionmap_projects.go 的「判据只能是 edge_kind」。
 	smEdgeKindProject = "project"
 )
 
@@ -664,7 +664,7 @@ func (h *SessionMapHandler) ListWorkspaces(w http.ResponseWriter, r *http.Reques
 	}
 	out := []map[string]interface{}{}
 	if db.GlobalDBManager != nil {
-		// 只列**画布**（root_path 为空）。项目与画布同表（见 docs/project-management-design.md），
+		// 只列**画布**（root_path 为空）。项目与画布同表（见 internal/api/sessionmap_projects.go），
 		// 而这条端点的唯一消费者是画布选择器 —— 若把项目也列进去，用户在"画布"下拉里
 		// 会看到一堆文件夹名，选中后得到一张永远空白的画布。
 		// 项目有自己的列表端点（`GET /v1/session-map/projects`）。
@@ -769,7 +769,7 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// 配额只统计**画布节点**。`session_map_nodes` 现在同表存两类记录：画布卡片与
-	// 项目归属（`edge_kind='project'`，见 docs/project-management-design.md）。
+	// 项目归属（`edge_kind='project'`，见 internal/api/sessionmap_projects.go）。
 	// 若把归属一起数进来，用户在项目里归几百个会话就会挤爆画布额度 ——
 	// 那时画布明明"空着"却存不进去，且报错说的是"节点太多"，无从排查。
 	canvasNodes := 0

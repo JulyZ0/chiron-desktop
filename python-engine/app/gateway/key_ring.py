@@ -1,6 +1,6 @@
 """KeyRing —— 引擎侧 LLM 密钥环（集中派 DR 的引擎运行时组件，V2：Redis Lua 原子取 key）。
 
-权威分层（与 docs/llm-provider-key-management-dr.md 一致）：
+权威分层（与 internal/api/llm_keys.go 一致）：
 - **DB 是权威**：网关 `syncProviderKeyset` 把 `llm:keys:{provider}` 这个 HASH 整体替换成
   库里当前 key，字段值带 `{"k": 密文, "s": 权威状态, "w": 权重}`；`s` 只有管理员能改
   （active / rate_limited / circuit_open）。`k` 是 **v1/v2 密文**（H20：Redis 会持久化，

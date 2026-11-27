@@ -1,4 +1,4 @@
-// Package cli 实现 `chiron-cli run` 的 headless（非交互）执行核心 —— 方案 03 §2「批 F」。
+// Package cli 实现 `chiron-cli run` 的 headless（非交互）执行核心 —— 批 F。
 //
 // 定位：**纯客户端封装**，把一次 agent 回合跑完并把结果交给 CI/脚本消费。
 // 它只复用网关既有的两条链路，不新造任何协议、也不新增服务端端点：
@@ -29,7 +29,7 @@ import (
 	"time"
 )
 
-// 退出码 —— 与引擎 AgentEvent 的既有语义对齐（方案 03 §2）。
+// 退出码 —— 与引擎 AgentEvent 的既有语义对齐。
 //
 // 关键约定来自引擎 SSE 事件：
 //   - `error` 事件的 content 以 `budget_exceeded:<轴>` 开头 = 预算越界（失败收尾）；

@@ -3,7 +3,7 @@
 父 agent 调用 ``subagent(task, profile="reviewer")``，在**独立 session** 上运行一个完整的
 AgentRuntime 循环（独立消息历史、工具集、轮次与深度预算）。
 
-分层（docs/subagent-design.md §3.4）：
+分层：
 * **L0 完整过程** → ``subagent_run_steps``（脱敏后落库，供审计/回放，**永不进父上下文**）
 * **L1 有效消息** → ``subagent_runs.summary``（LLM 整理；父会话后续 turn 只注入这一条）
 * **L2 当轮回传** → 限长 + ``<subagent-result>`` 不可信包装（仅当轮）

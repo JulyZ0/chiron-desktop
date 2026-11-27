@@ -650,7 +650,7 @@ function scrollToBottom() {
 
 // 对外只暴露"意图"，**不暴露元素**：父组件（会话加载完成后回底）必须走单写者，
 // 否则直接写 `.message-list` 的 scrollTop 会绕过输入租约与 writer provenance
-// （契约见 docs/transcript-contract.md §1.1）。
+// （契约见本文件顶部的 transcriptViewport 单写者说明）。
 defineExpose({ scrollToBottom })
 
 // 跳转（轨迹面板 / 提问导航条 / 会话内检索）：滚动到目标行 + 高亮闪烁

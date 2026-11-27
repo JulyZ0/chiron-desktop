@@ -54,6 +54,7 @@ dev-down:
 # `check` 是快检（几十秒）；`check-all` 跑全量（pytest 约 2000 例 + 前端构建，数分钟）。
 docs-check:
 	python scripts/check_doc_links.py
+	python scripts/check_comment_refs.py
 	python scripts/check_doc_line_refs.py
 	python scripts/check_md_tables.py
 	python scripts/check_source_encoding.py

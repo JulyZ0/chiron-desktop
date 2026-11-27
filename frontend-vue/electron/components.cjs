@@ -19,7 +19,7 @@
  *   - 启动参数只走环境变量 + 少量 CLI（见 buildCoreEnv / resolveCoreLaunch）：
  *     `CHIRON_*` 是 contracts.md §3.1 的契约名，`CHIRON_LOCAL_*` 是当前
  *     desktop-local/app/config.py（pydantic-settings 的 env_prefix）真正读的名字，
- *     两套一起下发，见 docs/desktop-local/handshake.md。
+ *     两套一起下发，见 docs/desktop-local/contracts.md。
  */
 const fs = require('node:fs')
 const net = require('node:net')

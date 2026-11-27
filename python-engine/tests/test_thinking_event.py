@@ -1,4 +1,4 @@
-"""A1（方案 04 批次 1）：思考走**独立事件**。
+"""A1：思考走**独立事件**。
 
 `[thinking]` 这个形态有**两个来源**：① 模型自产（`app/main.py` 的思考模式 prompt 教的）；
 ② 引擎包装 native reasoning（原 `runtime.py` 把 `chunk.reasoning_content` 包进 `text`）。

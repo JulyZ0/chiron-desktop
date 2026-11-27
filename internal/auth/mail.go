@@ -6,7 +6,7 @@ package auth
 //
 //	smtp     通用 SMTP（host / port / 用户名 / 密码 / TLS 模式 / 发件地址）
 //	         覆盖市面绝大多数邮件服务商与自建邮件网关。
-//	qingchen 晴辰云邮 HTTP API（契约见 docs/mail.md）
+//	qingchen 晴辰云邮 HTTP API（契约见 internal/auth/mail.go）
 //
 // 设计要点：
 //   - 通道以 MailSender 抽象，按 cfg.Provider 分派；新增厂商只需加一个分支。
@@ -14,7 +14,7 @@ package auth
 //     任何厂商默认域名，后台改配置即切换发信服务，无需重新构建。
 //   - SMTP 不引入任何第三方 SDK：标准库 net/smtp + crypto/tls，
 //     支持 none（明文/内网中继）、starttls（587）、ssl（465）三种安全模式。
-//   - HTTP 通道严格按 docs/mail.md：202 = 入队成功；429 指数退避重试（上限 60s）；
+//   - HTTP 通道严格按 internal/auth/mail.go：202 = 入队成功；429 指数退避重试（上限 60s）；
 //     附件大小上限 10MB；本地文件路径自动读盘转 Base64。
 
 import (
@@ -42,7 +42,7 @@ import (
 // 邮件通道类型。
 const (
 	MailProviderSMTP     = "smtp"     // 通用 SMTP
-	MailProviderQingchen = "qingchen" // 晴辰云邮（HTTP API，docs/mail.md）
+	MailProviderQingchen = "qingchen" // 晴辰云邮（HTTP API，internal/auth/mail.go）
 )
 
 // SMTP 安全模式。
@@ -52,11 +52,11 @@ const (
 	MailSecuritySSL      = "ssl"      // 直连 TLS（通常 465）
 )
 
-// MaxMailAttachmentBytes 单附件上限。与 docs/mail.md 的服务端限制保持一致，
+// MaxMailAttachmentBytes 单附件上限。与 internal/auth/mail.go 的服务端限制保持一致，
 // 在本地先拦一次，避免把 10MB+ 的请求白发给服务商。
 const MaxMailAttachmentBytes = 10 << 20
 
-// 晴辰云邮通道的退避重试参数（docs/mail.md 第九节：指数退避，最大间隔 60 秒）。
+// 晴辰云邮通道的退避重试参数（指数退避，最大间隔 60 秒）。
 const (
 	mailHTTPMaxRetries  = 3
 	mailHTTPBaseBackoff = 1 * time.Second
@@ -95,7 +95,7 @@ func IsKnownMailSecurity(m string) bool {
 //
 // 内容来源二选一：
 //   - Content：直接给出字节（调用方自取）
-//   - FilePath：本地文件路径，发送前自动读盘并转 Base64（docs/mail.md 要求 5）
+//   - FilePath：本地文件路径，发送前自动读盘并转 Base64
 //
 // 注意：FilePath 只能来自服务端自身的配置/代码，**绝不可**由请求参数拼出，
 // 否则等于开放任意文件读取。
@@ -164,7 +164,7 @@ type HTTPMailSender struct {
 	client *http.Client
 }
 
-// NewHTTPMailSender 构造发送器（HTTP 通道默认 30s 超时，见 docs/mail.md 第八节）。
+// NewHTTPMailSender 构造发送器（HTTP 通道默认 30s 超时）。
 func NewHTTPMailSender() *HTTPMailSender {
 	return &HTTPMailSender{
 		client: &http.Client{Timeout: mailHTTPDefaultTTL},
@@ -362,7 +362,7 @@ func (a *loginAuth) Next(fromServer []byte, more bool) ([]byte, error) {
 	return []byte(a.password), nil
 }
 
-// ── 晴辰云邮（HTTP API，docs/mail.md）────────────────────
+// ── 晴辰云邮（HTTP API，internal/auth/mail.go）────────────────────
 
 // qingchenSendRequest 是 POST {base_url}/send 的请求体。
 type qingchenSendRequest struct {
@@ -431,7 +431,7 @@ func (s *HTTPMailSender) sendQingchen(ctx context.Context, cfg *MailConfig, msg 
 		}
 		switch {
 		case status == http.StatusAccepted:
-			// 202 = 已入队（异步发送），符合 docs/mail.md 契约
+			// 202 = 已入队（异步发送），符合 internal/auth/mail.go 契约
 			return nil
 		case status == http.StatusTooManyRequests:
 			if attempt >= mailHTTPMaxRetries {
@@ -587,7 +587,7 @@ func NormalizeMailAddress(addr string) string {
 	return addr[:at] + "@" + strings.ToLower(addr[at+1:])
 }
 
-// AttachmentFromFile 读取本地文件构造附件（docs/mail.md 要求 5：自动转 Base64）。
+// AttachmentFromFile 读取本地文件构造附件（自动转 Base64）。
 // 路径只能来自服务端自身的可信上下文，不得由外部请求参数拼出。
 func AttachmentFromFile(path string) (MailAttachment, error) {
 	info, err := os.Stat(path)

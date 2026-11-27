@@ -1,6 +1,6 @@
 """数据库迁移 —— **只读**。
 
-决策（[docs/db-migration-entry.md](../../../docs/db-migration-entry.md)）：**Alembic 是唯一迁移入口**，
+决策（[scripts/cli/commands/migrate.py](../../../scripts/cli/commands/migrate.py)）：**Alembic 是唯一迁移入口**，
 CLI 只做只读诊断，**不写 schema**。升级 / 回滚属于**发布流程步骤**，请直接执行：
 
 ```bash

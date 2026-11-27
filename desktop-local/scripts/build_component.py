@@ -3,7 +3,7 @@
 
 产物就是 ``app/components/manager.py`` 能直接吃的那种东西：
 
-    <out>/<name>/manifest.json          # 契约见 docs/desktop-local/components.md §3
+    <out>/<name>/manifest.json          # 契约见 desktop-local/app/components/manager.py
     <out>/<name>/bundle.zip             # 解压后 = 组件版本目录的内容
 
 ``bundle.zip`` 里的布局::

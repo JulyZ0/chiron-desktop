@@ -1,4 +1,4 @@
-"""ACP 适配层：把 Chiron 的 HTTP API 包成 ACP 的 `Agent`（方案 03 §5 · 批 I）。
+"""ACP 适配层：把 Chiron 的 HTTP API 包成 ACP 的 `Agent`（批 I）。
 
 ## 为什么用 Python + 官方 SDK，而不是设计稿原来推荐的 Go
 

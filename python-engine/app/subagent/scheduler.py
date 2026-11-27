@@ -1,4 +1,4 @@
-"""R2：子 Agent 写路径仲裁（vendor/规划.md §3.5）。
+"""R2：子 Agent 写路径仲裁。
 
 ## 为什么需要
 
@@ -21,11 +21,11 @@
 | `MarkOpaque`（无法预知 ⇒ 独占整工作区） | ✅ | ❌ **不做** |
 
 后两项要在**事前声明**之外再加一层"运行期把声明收窄到具体文件"的协议；Chiron 目前只有**事后**
-记录（`subagent_runs.write_paths`），学它得先有声明协议本身 —— 按 §3.5 的「刻意简化」先不做。
+记录（`subagent_runs.write_paths`），学它得先有声明协议本身 —— 按「刻意简化」先不做。
 已知边界（**不是疏漏**）：目录声明在本模块里一直按"目录级"对待，不细化到文件，因此两个都声明
 `docs/` 的子 Agent 会排队而不是并行写 `docs/a.md` 与 `docs/b.md`。
 
-## 默认关（§1.3 的"默认值必须是'什么都不做'"）
+## 默认关（"默认值必须是'什么都不做'"）
 
 `settings.subagent_write_arbitration` 默认 `False` ⇒ :func:`get_scheduler` 返回 `None`，
 `SubAgentRunner` 既不做 acquire 也不做 release。**零行为变化**。

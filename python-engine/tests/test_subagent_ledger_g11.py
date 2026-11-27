@@ -5,7 +5,7 @@
 ``sub:<父>:<run>`` 这个**合成会话**里（见 ``app/agent/subagent_runner.py`` 构造
 ``AgentTask`` 的那一行）。于是子 Agent 写过的文件全部落在 ``undo:sub:<父>:<run>``
 这个**没有任何人会去弹**的栈上：父会话敲 ``/undo`` 只回滚父自己的写入，子 Agent 的改动
-留在工作区 —— 而用户以为撤了（比"没有 /undo"更危险，见 ``docs/agent-safety-and-reliability.md``）。
+留在工作区 —— 而用户以为撤了（比"没有 /undo"更危险，见 ``internal/api/tool_broker.go``）。
 
 **为什么这么改**：不新造机制，只在 ``push`` / ``record`` 里按 **lineage** 把同一条快照
 **镜像**到祖先会话的键上（``sub:A:B`` → ``A``；嵌套委派 → 每一级祖先），并用

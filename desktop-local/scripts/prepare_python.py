@@ -73,7 +73,7 @@ UV_ASSETS_DIR = FRONTEND_VUE / "assets" / "uv"
 # 最新稳定版"——于是不同日期、不同镜像上的干净构建会拿到不同解释器，制品无法复现，
 # 供应链核对也无从谈起（"昨天打的包"和"今天打的包"不是同一个运行时）。
 # 升级补丁版本是本文件 + runtime-install.cjs 两处同时改，并同步
-# `docs/desktop-local/packaging.md` 的记录。
+# `deploy/windows/README.md` 的记录。
 RUNTIME_PYTHON_VERSION = "3.14.4"
 
 #: 运行时清单文件名（落在 ``assets/python-runtime/`` 根上，随 extraResources 一起装进包）。

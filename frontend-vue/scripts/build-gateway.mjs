@@ -7,7 +7,7 @@
  * 而 app-builder-lib 对匹配不到的 glob **只 warn 不报错**（`out/fileMatcher.js`：
  * `statOrNull(from)` 为 null 就 `log.warn` 后 `return`）。于是"忘了建网关"不会让打包失败，
  * 只会打出一个**没有业务入口的残包**：桌面壳退回 `desktop-local` core，而 core 只实现
- * `/v1/**` 的一小部分（见 docs/desktop-local/endpoint-coverage.md），用户看到的就是
+ * `/v1/**` 的一小部分（见 scripts/integration/run.sh），用户看到的就是
  * "本地模式什么都用不了"。这正是本脚本要把静默降级换成非零退出的原因。
  *
  * 因为 CI 与 `pnpm desktop:pack|dist` 走同一份脚本，本地出包与 CI 出包不会各说一套。
@@ -85,7 +85,7 @@ export function planGatewayBuild(input = {}) {
     output,
     goos,
     goarch,
-    // `-mod=mod` 是必需的：仓库里的 vendor/ 放的是参考源码（不含 vendor/modules.txt），
+    // `-mod=mod` 是必需的：仓库根目录若出现 vendor/（本地参考源码，不含 vendor/modules.txt），
     // Go 只要看到 vendor/ 就会按 vendor 模式做一致性检查并报 "inconsistent vendoring"
     // （与 ci.yml / Makefile / Dockerfile 同一口径）。
     args: ['build', '-mod=mod', '-ldflags', '-s -w', '-o', output, GATEWAY_PACKAGE],

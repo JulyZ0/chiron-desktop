@@ -1,4 +1,4 @@
-"""远程执行后端（方案 03 S5-(e)）：把 `execute` 转发到**独立的 sandbox 服务**。
+"""远程执行后端（S5-(e)）：把 `execute` 转发到**独立的 sandbox 服务**。
 
 ## 它做什么 / 不做什么
 
@@ -20,7 +20,7 @@
 
 ## 服务不可用时：**失败，不回退**（这是显式选择）
 
-见 `vendor/方案04.md` §4 与设计稿 §7。静默回退本地基线会让"隔离已生效"这个判断**失真** ——
+静默回退本地基线会让"隔离已生效"这个判断**失真** ——
 你以为租户走的是隔离服务，实际悄悄跑在引擎进程里，而且**不会有人知道**。
 
 要退回本地，那是**配置层面**的决定（`SANDBOX_BACKEND=local`，或把租户移出白名单），
@@ -52,7 +52,7 @@ from app.tools.context import get_session_id, get_tenant_id, get_user_id
 
 logger = logging.getLogger(__name__)
 
-#: 与既有 `/v1/internal/*` 同构（设计稿 §2）：形状不另发明一套。
+#: 与既有 `/v1/internal/*` 同构：形状不另发明一套。
 SERVICE_RUN_PATH = "/v1/internal/exec/run"
 SERVICE_HEALTH_PATH = "/v1/internal/exec/health"
 

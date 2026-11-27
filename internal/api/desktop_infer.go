@@ -12,7 +12,7 @@ package api
 //	   透传（ForwardRequest 是流式的，2M 字符的片段不会被整个读进内存，也不会被
 //	   panic 时的 body dump 带出来）。
 //
-// 计费口径（契约见 docs/desktop-local/contracts.md §9.3；三条先于实现写死）：
+// 计费口径（契约见 docs/desktop-local/contracts.md §9；三条先于实现写死）：
 //
 //	1. 本地模式不计费 —— 本地后端（desktop-local）与本地 provider 的推理不产生云端成本，
 //	   不写 credits，也不写 `desktop:infer:usage:*`（那是云端对账账本，混进本地用量会让
@@ -24,11 +24,11 @@ package api
 //	   （见 python-engine/app/api/desktop_infer.py::_record_usage）。
 //	3. `dtk_` 结算（按设备/令牌维度出账）未启用 —— 计费主体是租户/用户；设备 token 由
 //	   本地后端自己生成、从不经过网关，不能当可信的计费身份。是否按设备发放额度/归属历史
-//	   用量属商业口径，待产品确认后再接（详见 §9.3.3）。
+//	   用量属商业口径，待产品确认后再接。
 //
 // 因此本文件**不写** `credit_transactions` / `billing_records`，也不调用 `DeductTokens`
 // / `RecordTokenUsage` / `TrueUpTenantQuota`；这个"没有计费入口"的约束由
-// routes_desktop_test.go 的源码扫描用例守着。接线计费 = 先改 §9.3 + 补用例，再动代码。
+// routes_desktop_test.go 的源码扫描用例守着。接线计费 = 先改契约 + 补用例，再动代码。
 
 import (
 	"log/slog"

@@ -1,7 +1,7 @@
 """本地组件管理：安装、校验、启停（pageindex / langextract）。
 
 设计边界（与 ``frontend-vue/electron/components.cjs`` 对齐，见
-``docs/desktop-local/components.md``）：
+``desktop-local/app/components/``）：
 
 - **组件源由用户提供**，本模块不内置任何下载地址：``CHIRON_COMPONENT_BASE_URL``
   指向一个本地目录（``<源>/<name>/manifest.json``）或一个 HTTP 基址

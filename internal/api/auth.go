@@ -439,7 +439,7 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 	//
 	// 放在 commit **之后**：引导进度写不进去不能让一个已经合法的账号注册失败。
 	// 存量用户（没有这一步之前注册的）因此不会在该表里留下行 ⇒ 前端判定
-	// eligible=false，不弹引导，符合 roadmap「不打断已有用户」。
+	// eligible=false，不弹引导，避免打断已有用户。
 	StartOnboarding(ctx, userID)
 
 	SetTokenCookie(w, token, int(h.cfg.JWTExpiration.Seconds()), h.cfg.CookieSecure)

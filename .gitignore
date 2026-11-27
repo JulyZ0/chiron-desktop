@@ -38,7 +38,7 @@ out/
 *.bak
 # compose 本机覆盖文件（端口避让等，本机专用）：不入库，各环境按需自建。
 # 曾因被提交而让**所有人**的 `docker compose up` 都用本机端口（前端 8081 / redis 16379），
-# 与 README 和 docs/deployment-multi-instance.md 写的 :3000 不一致 —— 而文件自己的
+# 与 README 写的 :3000 不一致 —— 而文件自己的
 # 注释就写着"不要提交到仓库（本机专用）"。`git rm --cached` 后本机文件仍在，行为不变。
 docker-compose.override.yml
 .envrc
@@ -135,7 +135,7 @@ Thumbs.db
 # `uv lock` 在本机留下的锁文件（排查依赖时顺手生成的）。
 # 依赖声明只有一份 —— core 是 `pyproject.toml`、引擎是 `requirements.txt`，装 venv 时
 # 由 uv 现解析。把 lock 冻进仓库等于重新引入"构建机当时装了什么"，而那是上一轮
-# httpx 事故的根因（见 docs/desktop-local/packaging.md §3），所以刻意不入库。
+# httpx 事故的根因，所以刻意不入库。
 /desktop-local/uv.lock
 # 随安装包发布的 uv 二进制（`desktop-local/scripts/prepare_uv.py` 就位，每个平台约 20MB）。
 # 产物，不入库；`electron-builder.yml` 把它映射成 `resources/uv/`。

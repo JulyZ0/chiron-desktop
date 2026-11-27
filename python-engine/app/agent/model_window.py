@@ -4,14 +4,14 @@
 "约 GPT-4 的 1/10"），而 `llm_models.context_window` 列**早已存在**（baseline 迁移）。
 本模块把它读进进程内缓存，作为压缩阈值的来源。
 
-**为什么不引 tiktoken**（评审 01 §1.7 的三条理由）：
+**为什么不引 tiktoken**：
 
 1. 它只覆盖 OpenAI 系词表，而 Chiron 声明 20+ provider —— anthropic/glm/qwen 等会系统性偏差；
 2. 新增重依赖要付维护成本（`requirements.txt` 有过"声明缺口导致 CI 红"的教训）；
 3. provider 已在响应里回传真实 `usage`，**用它校准比换词表更准**。
 
 缓存策略：进程内 TTL（默认 5 分钟）。窗口配置属"低频变更、高频读取"，每次请求查库不值当；
-TTL 内变更最多滞后 5 分钟 —— 这是刻意的取舍（与评审 01 §1.7 的"系数不落 PG"同一取向）。
+TTL 内变更最多滞后 5 分钟 —— 这是刻意的取舍（"系数不落 PG"的同一取向）。
 """
 
 from __future__ import annotations

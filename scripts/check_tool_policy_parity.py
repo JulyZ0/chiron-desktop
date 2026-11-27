@@ -9,13 +9,13 @@
 "改动其一必须同步另一个"，但这条不变量**此前没有任何机械化断言**，并且**已经漂移**
 （``list_subagent_runs`` / ``read_tool_result`` / ``rerun_subagent`` 三处）。
 
-**第二族（2026-10-09 补）**：对话模式。``docs/session-runtime-spec.md`` §3 声称
+**第二族（2026-10-09 补）**：对话模式。``internal/api/session_runtime.go`` 声称
 Go 的 ``validAgentModes``（``internal/api/session_runtime.go``）与引擎
 ``app/agent/modes.py`` 的 ``AgentMode`` **对齐** —— 同一种"跨语言各写一份"的结构，
 此前同样**没有断言**（漂移的表现会很隐蔽：前端能选一个引擎不认的模式，
 或引擎支持的模式在服务端被 400 掉）。
 
-**第三族（2026-10-09 补）**：**模型服务提供商目录**。``docs/service-providers.md`` §1/§10 写着
+**第三族（2026-10-09 补）**：**模型服务提供商目录**。``app/providers/catalog.py`` 写着
 "新增提供商 = 在 `llmProviderCatalog` 追加一项 **+ 同步 Python 兜底目录**，否则网关认得、引擎不认"
 —— 又是"跨语言各写一份"，此前同样没有断言（漂移的表现是"目录里有、调用时没有"）。
 
@@ -208,7 +208,7 @@ def parse_go_modes(text: str) -> set[str]:
 def parse_py_modes(text: str) -> tuple[set[str], set[str]]:
     """返回 `(AgentMode 枚举取值, _BASE_MODES 实际覆盖的取值)`。
 
-    两个都解析，是因为 `docs/session-runtime-spec.md` §3 说的是"与 `_BASE_MODES` 对齐"：
+    两个都解析，是因为 `internal/api/session_runtime.go` 的注释说的是"与 `_BASE_MODES` 对齐"：
     只比枚举的话，"**加了枚举成员却忘了写 base 配置**"这种漂移仍然漏网 —— 那种情况下
     模式只有在被真正选中时才会以 `KeyError` 暴露（`_BASE_MODES[AgentMode(mode)]`）。
     """
@@ -332,7 +332,7 @@ def main() -> int:
             f"只在 Python {sorted(py_command - go_command) or '—'}"
         )
 
-    # 第二族：对话模式（docs/session-runtime-spec.md §3 声称两侧对齐）
+    # 第二族：对话模式（internal/api/session_runtime.go 声称两侧对齐）
     go_modes = (
         parse_go_modes(GO_MODES_FILE.read_text(encoding="utf-8"))
         if GO_MODES_FILE.exists()
@@ -359,7 +359,7 @@ def main() -> int:
             f"{sorted(py_modes - py_modes_covered) or '—'}（选中该模式会 KeyError）"
         )
 
-    # 第三族：模型服务提供商目录（docs/service-providers.md §1/§10 要求两侧同步）
+    # 第三族：模型服务提供商目录（app/providers/catalog.py 要求两侧同步）
     go_catalog = (
         parse_go_catalog(GO_CATALOG_FILE.read_text(encoding="utf-8"))
         if GO_CATALOG_FILE.exists()

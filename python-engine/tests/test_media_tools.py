@@ -345,7 +345,7 @@ async def test_size_guard_runs_before_reading(library, store, workspace, monkeyp
     """体积上限必须在**消费之前**生效：超限时连 `read_bytes` 都不该被调用。
 
     只断言"报错"不够 —— 读完再判大小同样会报错，但那时整个文件已经进了内存。
-    （§4 的同族教训：「有上限」不等于「在消费前拦住」。）
+    （同族教训：「有上限」不等于「在消费前拦住」。）
     """
     monkeypatch.setattr(media_mod, "MAX_ASSET_BYTES", 16)
     (workspace / "big.bin").write_bytes(b"x" * 64)

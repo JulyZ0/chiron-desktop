@@ -19,7 +19,7 @@
     pytest tests/test_hardcode_audit.py -q -s
     python -m tests.test_hardcode_audit          # 在 desktop-local/ 下跑
 
-人工结论（哪些该提取、提取到哪里）见 ``docs/desktop-local/configuration.md``。
+人工结论（哪些该提取、提取到哪里）另行评审。
 """
 
 from __future__ import annotations

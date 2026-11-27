@@ -3,7 +3,7 @@
 
 ## 它查什么
 
-把 `docs/**/*.md` 与 `vendor/规划.md` 里的 `路径:行号` 断言抽出来，只报**硬错误**：
+把 `docs/**/*.md` 里的 `路径:行号` 断言抽出来，只报**硬错误**：
 **引用的行号超出了该文件的实际长度**（例如 `gateway_router.go:660` 而该文件只有 499 行）。
 
 这一条**零假阳性**：行号大于总行数时，那段代码**不可能在那里**。
@@ -66,9 +66,6 @@ def main() -> int:
 
     candidates: dict[tuple[str, int, int | None], list[str]] = {}
     docs = list((ROOT / "docs").glob("*.md"))
-    plan = ROOT / "vendor" / "规划.md"
-    if plan.exists():
-        docs.append(plan)
 
     for f in docs:
         for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):

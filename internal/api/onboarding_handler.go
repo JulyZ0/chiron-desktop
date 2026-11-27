@@ -215,7 +215,7 @@ func (h *OnboardingHandler) buildPayload(userID string, states map[string]Onboar
 	}
 
 	return map[string]interface{}{
-		// 没有行 = 不是新注册流程里的用户 ⇒ 前端不弹引导（roadmap：不打断已有用户）
+		// 没有行 = 不是新注册流程里的用户 ⇒ 前端不弹引导（不打断已有用户）
 		"eligible": len(states) > 0,
 		"finished": finished,
 		"steps":    steps,

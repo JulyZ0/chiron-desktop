@@ -1,6 +1,6 @@
 """子 Agent Profile（定义层）—— 复用 ``agents`` 表，``kind='subagent'``。
 
-设计见 ``docs/subagent-design.md`` §3.1。承载列的选择（重要）：
+设计见 ``python-engine/app/subagent/``。承载列的选择（重要）：
 
 * ``system_prompt`` / ``max_turns`` / ``timeout_seconds`` / ``skills`` / ``plugins`` /
   ``workflows`` / ``kb_id`` / ``visibility`` —— 直接复用既有列；
@@ -29,7 +29,7 @@ from app.tools.context import to_tenant_int
 
 logger = logging.getLogger(__name__)
 
-# ── 默认值（与设计文档 §3.4/§7 一致）──
+# ── 默认值（与运行层一致）──
 DEFAULT_MAX_TURNS = 5
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_MAX_DEPTH = 1            # 默认禁止子 Agent 再委派（对标 Claude Code 默认不给 Agent 工具）

@@ -108,7 +108,7 @@ func registerProxyRoutes(
 		methods []string // allowed HTTP methods; empty = GET+POST+PUT+DELETE
 		logTag  string
 		// mutateBody 在把请求体转发给引擎前改写它（P1-c：统一链路注入会话运行时解析结果，
-		// 见 docs/session-runtime-spec.md §5）。返回 false 表示已自行写出响应、代理应中止。
+		// 见 internal/api/session_runtime.go 的 loadRuntime）。返回 false 表示已自行写出响应、代理应中止。
 		mutateBody func(w http.ResponseWriter, r *http.Request, body map[string]interface{}) bool
 		// guardBody 在 mutateBody **之后**执行准入校验（P2-2b：模型可用范围）。
 		//

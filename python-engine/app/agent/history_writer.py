@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 #: 单条消息 content 的**兜底**截断上限。只在归档不可用时使用。
 #:
 #: 第 10 步之前这里是唯一的上限，256k 以上的正文一律截断。加了归档之后语义变了：
-#: 设计（`docs/context-archive-implementation.md` §2.3）要求 64KB~4MB 的正文
+#: 设计上要求 64KB~4MB 的正文
 #: **原样**留在 `content`（PG TOAST 会自动压缩），只有 > 4MB 才外置。
 #: 若仍按 256k 截断，那 256k~4MB 区间的原文既没入 `content` 也没进对象存储，
 #: 等于永久丢失 —— 所以正常路径不再用它，只在归档失败时兜底。
@@ -203,7 +203,7 @@ async def persist_messages(
     `system` 消息不入库 —— 它是每轮重建的（技能目录 / 记忆 / harness suffix 都会变），
     存下来会让"历史"里混进一堆互相矛盾的 system 段。
 
-    **分级归档**（`docs/context-archive-implementation.md` §2.3）：
+    **分级归档**：
     ≤ 4MB 的正文原样入库（64KB 以上的交给 PG TOAST 压缩）；
     > 4MB 的全文写对象存储、`content` 只留前 64k 字符 + 标记、`blob_ref` 指向归档。
     归档失败时退回 `_truncate` 兜底 —— 宁可丢原文，也不能丢整条历史。
@@ -356,8 +356,7 @@ async def persist_folds(session_id: str, tenant_id: Any, folds: list[dict[str, A
 
     返回值按 asyncpg 的 `INSERT 0 n` 状态串解析：`ON CONFLICT DO NOTHING` 命中时
     `n == 0`，此时记一条 `fold conflict` warning。无条件计数会把冲突谎报成写入，
-    让「后到者的摘要被丢弃」这件事彻底不可观察（见 `docs/context-projection-design.md` §3.3
-    规则二）。
+    让「后到者的摘要被丢弃」这件事彻底不可观察（规则二）。
     """
     if not folds or not session_id:
         return 0
@@ -427,7 +426,7 @@ async def persist_folds(session_id: str, tenant_id: Any, folds: list[dict[str, A
                     if _rowcount(status) > 0:
                         written += 1
                     else:
-                        # 规则二（`docs/context-projection-design.md` §3.3）：
+                        # 规则二：
                         # 同区间已被写过。跨副本用不同模型摘要同一区间时，先到者胜、
                         # 后到者被静默丢弃 —— 不记一笔，事后就无从判断读过的是哪一份。
                         conflicts += 1

@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # `filestore`：经网关 `/v1/internal/storage/*` 读写部署级 FileStore（local 共享卷 / S3），
     #   多副本下"写 A 副本、读 B 副本"不再失忆。网关地址复用既有的 `gateway_internal_url`
     #   （见下方"Go 网关内部配置下发端点"），不另设一份以免两处漂移。
-    # 用**显式开关**而不是"猜部署形态"：后者不可靠且不可审计（与评审 02 §1 的同一结论）。
+    # 用**显式开关**而不是"猜部署形态"：后者不可靠且不可审计。
     backend_kind: str = "local"
 
     # ── MCP 插件池（按节点开关）──
@@ -184,10 +184,10 @@ class Settings(BaseSettings):
     default_temperature: float = 0.1
 
     # ── 生命周期 hooks（批 G）──
-    #: 机制总开关。**默认关** —— 开启前零行为变化（方案 03 §3.2）。
+    #: 机制总开关。**默认关** —— 开启前零行为变化。
     hooks_enabled: bool = False
     #: 是否允许**用户自定义** hook（部署级 hook 不受此开关限制）。
-    #: SaaS 部署误开必须可见：启用时启动告警 + 审计（方案 03 §3.2）。
+    #: SaaS 部署误开必须可见：启用时启动告警 + 审计。
     hooks_allow_user_defined: bool = False
     #: 单个 hook 的硬超时（秒）。超时按"失败"处理但**不阻断主流程**（fire-and-forget）。
     hooks_timeout_seconds: int = 5
@@ -197,17 +197,17 @@ class Settings(BaseSettings):
     hooks_event_budget_seconds: int = 10
     #: 部署级声明文件（`hooks.json`）路径。**默认空 = 不读文件、不注册、不执行 = 零行为变化**。
     #: 只接受**部署级**声明（文件里的条目一律视为部署级）；格式与纪律见
-    #: `docs/hook-protocol-design.md` §4.2。改动需重启生效（不做热加载）。
+    #: `python-engine/app/hooks/config.py`。改动需重启生效（不做热加载）。
     hooks_config_path: str = ""
     #: `command` 形态（运维声明的本地命令）的**独立开关**。**默认关** —— 它新增一个
-    #: **运维级**可执行面，是「不扩大可执行面」的一处显式例外（`docs/hook-protocol-design.md` §4.3 (b)）。
+    #: **运维级**可执行面，是「不扩大可执行面」的一处显式例外（`app/hooks/runner.py` 的 `command_policy_error`）。
     hooks_allow_commands: bool = False
     #: `command` 形态允许使用的可执行文件 allowlist（逗号分隔；**裸名**或**绝对路径**）。
     #: **默认空 = 一条也不批准（fail-closed）**。它**不复制**面向模型的那张白名单 ——
     #: 两者信任级不同（前者约束"模型挑的命令"，后者是"**运维**声明的命令"）。
     hooks_command_allowlist: str = ""
     #: `webhook` 形态（出站 POST 到运维声明的 URL）的**独立开关**。**默认关** ——
-    #: 它是一次**数据出境**面（`docs/hook-protocol-design.md` §4.3 批次 3）。
+    #: 它是一次**数据出境**面（`app/hooks/runner.py` 的 `webhook_payload`）。
     hooks_allow_webhooks: bool = False
     #: `webhook` 形态允许的目标 host 白名单（逗号分隔，**只比 host 名**、不分大小写；
     #: scheme / 端口 / IP 段由 `app/tools/ssrf.py` 的既有守卫管）。
@@ -223,7 +223,7 @@ class Settings(BaseSettings):
     #: 开启后从**部署目录**读 `extensions.json`（只读、不进用户上传通道），重启生效。
     deploy_extensions_enabled: bool = False
     #: 部署目录（清单文件名固定为其中的 `extensions.json`）；清单引用的模块
-    #: 必须落在该目录内，越界一律拒绝（方案 03 §4）。
+    #: 必须落在该目录内，越界一律拒绝。
     deploy_extensions_dir: str = ""
 
     # ── run 恢复（C1 批 3）──
@@ -387,7 +387,7 @@ class Settings(BaseSettings):
     # Service，集群内任何 Pod 都能直连 8000，靠"端口不外露"是部署假设而不是保证。
     metrics_token: str = ""
 
-    # ── 独立 sandbox 服务（S5-(e)，见 vendor/设计-独立sandbox服务.md）──
+    # ── 独立 sandbox 服务（S5-(e)）──
     #
     # `service`（**默认**）：执行转发给独立服务（`app/backends/remote_exec.py`），把 agent
     # 生成的命令 / Python 代码从引擎进程挪到**受限容器**里跑（只读根、无 capability、
@@ -395,7 +395,7 @@ class Settings(BaseSettings):
     # `local`：执行走引擎进程内的基线（`app/tools/sandbox.py`）—— 仅适用于单机开发。
     #
     # **服务不可用时失败而不是回退本地** —— 静默回退会让"隔离已生效"这个判断失真
-    # （方案 04 §4）。启动时会探测服务健康：不可达且 `degraded_mode=false`（生产默认）
+    # 。启动时会探测服务健康：不可达且 `degraded_mode=false`（生产默认）
     # ⇒ **拒绝启动**；`degraded_mode=true`（单机开发）⇒ 告警并回退本地。
     sandbox_backend: str = "service"
 
@@ -455,10 +455,10 @@ class Settings(BaseSettings):
     #: 交给 provider。用例：`tests/test_fs_guard.py::TestStrictMode`。
     fs_require_observation: bool = False
 
-    # ── 子 Agent 的「继续 / 分叉」（R5(b)，见 vendor/规划.md §3.5）──
+    # ── 子 Agent 的「继续 / 分叉」（R5(b)）──
     #
     # 默认**关**：它让模型能"带着某个子 Agent 已记录的步骤继续跑（或从某一步分叉）"，
-    # 是要显式开启的新能力（§1.3：会改变行为的机制一律默认关）。
+    # 是要显式开启的新能力（会改变行为的机制一律默认关）。
     # 关闭时 `resume_subagent` 仍注册（与 R1/R2 同款运行时开关），但对任何调用都返回
     # **明确的"未启用"错误**，且不写 `subagent_runs.resumed_from` / `resume_at_step`。
     #: 子 Agent 挂起等人的**等待上限（秒）**（G11/G20）。
@@ -469,16 +469,16 @@ class Settings(BaseSettings):
     subagent_suspend_wait_seconds: int = 900  # 边界（60–3600）由读取处夹取，与全仓风格一致
     subagent_resume_enabled: bool = False
 
-    # ── 子 Agent 的宿主证据（host receipts，见 vendor/规划.md §3.5 的 R1）──    #
+    # ── 子 Agent 的宿主证据（host receipts，R1）──    #
     # 默认开：委派的价值就在**可信度** —— 父模型看到的 `summary` 是子 Agent 的自述，而收据是
     # **宿主观测**（工作区差分 + 执行计数），追加在摘要之后。
     # 关掉它会退回"只信自述"的旧行为（成本：执行前后各拍一次**有界**工作区快照）。
     subagent_host_receipts: bool = True
 
-    # ── 子 Agent 写路径仲裁（R2，见 vendor/规划.md §3.5）──
+    # ── 子 Agent 写路径仲裁（R2）──
     #
     # 默认**关**：开启它会让"可写的子 Agent"按写路径排队（同路径串行、不同路径并行），
-    # 这是行为变化，所以默认必须是"什么都不做"（§1.3）。
+    # 这是行为变化，所以默认必须是"什么都不做"。
     # 关闭时 `get_scheduler()` 返回 None，SubAgentRunner 不做 acquire/release。
     #
     # 为什么需要它：`background=True` 的子 Agent 与父 turn **真并发**且共享同一工作区，
@@ -489,12 +489,12 @@ class Settings(BaseSettings):
     #: 会话内**可写**委派的上限（0 = 内置默认 3）。
     subagent_max_writers: int = 0
 
-    # ── Super-agent 看门狗（语义级进展判断，roadmap P1-3）──
+    # ── Super-agent 看门狗（语义级进展判断）──
     #
     # 与 `loop_guard`/`recovery` 的区别：它们看"这次调用是否与上次相同"、处理的是**失败**；
     # 看门狗看的是"整轮是否还在向用户的目标靠近"——每一步都换工具、都成功，也可能原地绕圈。
     #
-    # **三层默认全关**，与 §1.3「会改变行为的机制一律默认关」一致：
+    # **三层默认全关**，与「会改变行为的机制一律默认关」一致：
     #   enabled=false     → 连采集都不跑，零影响（也不产生 DB 查询）
     #   act=false         → 采集与判断都跑，结论**只进审计与日志**，不注入提示、不终止
     # act 需要 enabled 才生效：两者是"观察"与"动作"两道独立的闸。
@@ -530,7 +530,7 @@ class Settings(BaseSettings):
     #
     # ⚠️ 这是**故意制造故障**的开关：只应在预发/演练环境开启。开启后任何持有
     # chaos:manage 权限的调用方都能让引擎按要求失败或变慢（网关侧的同名中间件另有
-    # CHAOS_ENABLED 开关）。详见 docs/deployment-multi-instance.md 的混沌工程一节。
+    # CHAOS_ENABLED 开关）。
     chaos_enabled: bool = False
 
     # ── 本地语音转写（`POST /v1/audio/transcribe`，见 app/api/audio.py）──

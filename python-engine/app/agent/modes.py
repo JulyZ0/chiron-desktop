@@ -60,7 +60,7 @@ CORE_TOOL_NAMES = frozenset(
         "use_capability",  # P7：外部能力（MCP / 插件）的单一代理入口
         "best_of_n",  # 差距D：多条路并排比较后选优（重构/修 bug/设计取舍）
         # 模型自主整理上下文。注册了却不可见 = 这条能力等于不存在（`media_create` 踩过
-        # 同一个坑：见 vendor/规划.md §4）。它只在模型主动调用时才占上下文，平时零成本。
+        # 同一个坑）。它只在模型主动调用时才占上下文，平时零成本。
         "compact_conversation",
         # 任务清单：长线任务唯一的"可观测计划"载体。
         #

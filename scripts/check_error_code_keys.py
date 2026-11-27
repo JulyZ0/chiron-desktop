@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """错误码键集守卫：Go `Code*` ↔ 三语言 `errors.ts`。
 
-**为什么需要它**：`docs/error-codes.md` 把"三语言 `errors.ts` 的键必须与后端 `Code*`
+**为什么需要它**：`internal/api/error_codes.go` 把"三语言 `errors.ts` 的键必须与后端 `Code*`
 一一对应、且三语言键集完全相同"写成**硬要求**（缺键时客户端只能回退 `error` 原文，
 用户看到英文/中文原文而不是本地化文案），**但该文档自己承认这一步"目前靠人工核对"**：
 
@@ -32,7 +32,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 GO_FILE = ROOT / "internal" / "api" / "error_codes.go"
 LANGS = ("zh-CN", "en-US", "ar")
 
-#: 由**客户端网络层**产生、后端不产生的键（`docs/error-codes.md` 的"前端专用"一行）。
+#: 由**客户端网络层**产生、后端不产生的键（`internal/api/error_codes.go` 的"前端专用"一行）。
 FRONTEND_ONLY = ("timeout", "network_error", "payload_too_large", "http_status")
 
 #: `errors.ts` 里顶层键的形态：两空格缩进 + `key:`（不匹配嵌套对象里的键）。
@@ -89,11 +89,11 @@ def main() -> int:
                 )
 
     if problems:
-        print("FAIL: 错误码键集漂移（docs/error-codes.md 的硬要求）：", file=sys.stderr)
+        print("FAIL: 错误码键集漂移（internal/api/error_codes.go 的硬要求）：", file=sys.stderr)
         for p in problems:
             print("  - " + p, file=sys.stderr)
         print(
-            "\n补法见 docs/error-codes.md「新增 / 修改错误码的清单」：先写 zh-CN，再补 en-US / ar。",
+            "\n补法见 internal/api/error_codes.go「新增 / 修改错误码的清单」：先写 zh-CN，再补 en-US / ar。",
             file=sys.stderr,
         )
         return 1

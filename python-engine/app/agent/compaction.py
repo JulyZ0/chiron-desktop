@@ -248,7 +248,7 @@ def _estimate_tokens(messages: list[dict[str, Any]], model: str = "") -> int:
 
     有 `model` 时走**校准系数**（C4，`app/agent/model_window.py`）：provider 每轮回传真实
     `input_tokens`，用它反推该模型的分词密度并指数平滑 —— 比换词表（tiktoken）更准，
-    且不必新增依赖（评审 01 §1.7 的三条理由）。
+    且不必新增依赖。
 
     无 `model` 时保持历史近似（4 chars ≈ 1 token），供不关心模型差异的调用点使用。
     """

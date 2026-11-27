@@ -1240,7 +1240,7 @@ const unifiedSessionId = ref('')     // 统一任务会话 id（query.task）
 const unifiedSubmitMode = ref('auto') // 会话创建时的 mode（shared_context.mode 优先）
 // P1-e：**统一任务模式（TaskRouter 自动编排）已并入常规对话链路**。
 // 常规链路（SSE /submit → AgentTask）才是模式/模型/工具集/上下文全部生效的那条；
-// 保留两条会让"切换模式/模型"看起来只对其中一条起作用（见 docs/session-runtime-spec.md）。
+// 保留两条会让"切换模式/模型"看起来只对其中一条起作用（见 internal/api/session_runtime.go）。
 // 恒为 false 即停用分流，unifiedSessionId 等相关代码保留以便回退。
 const unifiedMode = computed(() => false)
 // 纯展示 flag：任务提交成功时，徽标短暂过渡到"完成"态后复位
@@ -1425,7 +1425,7 @@ async function resolveAttachmentUrls(attachments?: ChatAttachment[]): Promise<Ch
 /**
  * 消息列表组件句柄。**只用来提交"意图"**（回底），不碰 DOM —— 直接写 `.message-list` 的
  * `scrollTop` 会绕过 `transcriptViewport` 的输入租约与 writer provenance
- * （契约见 docs/transcript-contract.md §1.1："别处直接写 scrollTop 一律视为缺陷"）。
+ * （契约见 MessageList.vue 的 transcriptViewport 单写者约定："别处直接写 scrollTop 一律视为缺陷"）。
  */
 const messageListRef = ref<InstanceType<typeof MessageList> | null>(null)
 
@@ -1579,7 +1579,7 @@ const panelView = ref<'trajectory' | 'sessions' | 'agents' | 'stats'>('trajector
 /**
  * 会话地图：**独立的整屏大窗格**（不是侧栏里的一个小视图 —— 侧栏太窄，
  * 放不下"空间化排布"这件事本身）。位置稳定性是它的立身之本，
- * 见 docs/session-map-branch-design.md。
+ * 见 internal/session/manager_branch.go。
  */
 
 /**
