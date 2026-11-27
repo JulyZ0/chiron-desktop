@@ -62,6 +62,10 @@ export default {
     model: '需要可用模型',
     approval: '需要在插件页逐条授权',
     command: '会在本机执行 MCP 命令',
+    fs: '会访问文件：{paths}',
+    net: '会联网：{hosts}',
+    shell: '会执行本机命令',
+    undeclared: '未声明权限（按最严处理）',
     none: '无需额外权限',
   },
 

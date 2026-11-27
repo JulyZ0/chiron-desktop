@@ -37,6 +37,12 @@ export interface MarketRequires {
   model?: boolean
   /** 装完仍需在插件页授权才能真正执行。 */
   approval?: boolean
+  /** 需要访问的文件范围（相对项目根的通配符）；空 = 未声明。 */
+  fs?: string[]
+  /** 需要联网的主机；空 = 未声明。 */
+  net?: string[]
+  /** 需要启动子进程/执行命令。 */
+  shell?: boolean
 }
 
 export interface MarketItem {

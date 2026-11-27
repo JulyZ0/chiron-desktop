@@ -70,6 +70,12 @@ type Requires struct {
 	Model bool `json:"model,omitempty"`
 	// Approval 表示装完仍需用户在插件页授权才能真正执行（mcp 类）。
 	Approval bool `json:"approval,omitempty"`
+	// FS 声明需要访问的文件范围（相对项目根的通配符；空 = 未声明）。
+	FS []string `json:"fs,omitempty"`
+	// Net 声明需要联网的主机（域名/IP；空 = 未声明）。
+	Net []string `json:"net,omitempty"`
+	// Shell 声明是否需要启动子进程/执行命令。
+	Shell bool `json:"shell,omitempty"`
 }
 
 // Item 是市场里的一条资源。

@@ -308,3 +308,23 @@ func TestLoadSortsDeterministically(t *testing.T) {
 		}
 	}
 }
+
+func TestRequiresDeclaresFsNetShell(t *testing.T) {
+	const raw = `{
+	  "kind":"mcp","id":"x","name":"X",
+	  "requires":{"env":["TOKEN"],"fs":["src/**"],"net":["api.example.com"],"shell":true}
+	}`
+	var def itemDef
+	if err := json.Unmarshal([]byte(raw), &def); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(def.Requires.FS) != 1 || def.Requires.FS[0] != "src/**" {
+		t.Fatalf("fs 解析错: %+v", def.Requires)
+	}
+	if len(def.Requires.Net) != 1 || def.Requires.Net[0] != "api.example.com" {
+		t.Fatalf("net 解析错: %+v", def.Requires)
+	}
+	if !def.Requires.Shell {
+		t.Fatal("shell 未解析")
+	}
+}

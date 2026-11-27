@@ -54,6 +54,10 @@ export default {
     model: 'Requires a usable model',
     approval: 'Needs per-plugin approval on the plugins page',
     command: 'Runs an MCP command locally',
+    fs: 'Accesses files: {paths}',
+    net: 'Network access: {hosts}',
+    shell: 'Runs local commands',
+    undeclared: 'Permissions undeclared (treated as strictest)',
     none: 'No extra permission required',
   },
 

@@ -295,7 +295,16 @@ function permissionSummary(it: MarketItem): string {
   if (it.requires?.model) parts.push(tr('market.permission.model'))
   if (it.requires?.approval) parts.push(tr('market.permission.approval'))
   if (it.kind === 'mcp') parts.push(tr('market.permission.command'))
-  if (!parts.length) return tr('market.permission.none')
+  const fs = it.requires?.fs ?? []
+  if (fs.length) parts.push(tr('market.permission.fs', { paths: fs.join(', ') }))
+  const net = it.requires?.net ?? []
+  if (net.length) parts.push(tr('market.permission.net', { hosts: net.join(', ') }))
+  if (it.requires?.shell) parts.push(tr('market.permission.shell'))
+  if (!parts.length) {
+    return it.kind === 'mcp'
+      ? tr('market.permission.undeclared')
+      : tr('market.permission.none')
+  }
   return parts.join(' · ')
 }
 
