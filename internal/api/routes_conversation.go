@@ -84,6 +84,8 @@ func registerConversationRoutes(
 	// 安全基座（禁 hook/filter/签名、路径白名单、项目写锁）见 project_git_write.go。
 	mux.Handle("POST /v1/session-map/projects/{id}/git/stage", authMW(rlMW(http.HandlerFunc(smHandler.StageProjectGit))))
 	mux.Handle("POST /v1/session-map/projects/{id}/git/unstage", authMW(rlMW(http.HandlerFunc(smHandler.UnstageProjectGit))))
+	// commit（N5 P2）：只提交已暂存内容，不做隐式 add；message 必填。
+	mux.Handle("POST /v1/session-map/projects/{id}/git/commit", authMW(rlMW(http.HandlerFunc(smHandler.CommitProjectGit))))
 	// 单文件 diff：改动列表点开一条时用。同样是只读 git 子命令，路径必须落在项目内。
 	mux.Handle("GET /v1/session-map/projects/{id}/diff", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectDiff))))
 	// F5：最近提交与单条提交 diff（只读）。

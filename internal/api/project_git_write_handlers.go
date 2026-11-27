@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -112,22 +113,56 @@ func (h *SessionMapHandler) UnstageProjectGit(w http.ResponseWriter, r *http.Req
 	h.projectGitIndexAction(w, r, false)
 }
 
-// projectGitIndexAction 是 stage / unstage 的共用实现。`stage=false` 表示反向操作。
-func (h *SessionMapHandler) projectGitIndexAction(w http.ResponseWriter, r *http.Request, stage bool) {
+// beginProjectGitWrite 跑完所有写操作共用的前置检查，返回项目与释放函数。
+//
+// 顺序与文件头一致：归属 → client → git 仓库 → 活跃 run → 项目锁。
+// 失败时已经写好响应，调用方只需 return。
+func (h *SessionMapHandler) beginProjectGitWrite(w http.ResponseWriter, r *http.Request) (projectLocator, func(), bool) {
 	loc, ok := h.requireProject(w, r)
 	if !ok {
-		return
+		return projectLocator{}, nil, false
 	}
 	if loc.Provider == smProviderClient {
 		JSONWithCode(w, http.StatusConflict, CodeGitClientUnsupported, nil,
 			"git write operations are not supported for device projects")
-		return
+		return projectLocator{}, nil, false
 	}
 	if !projectVCS(r.Context(), loc.RootPath).Repo {
 		JSONWithCode(w, http.StatusConflict, CodeGitNotRepo, nil,
 			"project is not a git work tree")
+		return projectLocator{}, nil, false
+	}
+	active, err := projectHasActiveRuns(r.Context(), loc.ID)
+	if err != nil {
+		logAndRespond(w, err, http.StatusServiceUnavailable, ErrDBUnavailable)
+		return projectLocator{}, nil, false
+	}
+	if active {
+		// 等这一轮跑完就能写：明确告诉客户端"可重试"。
+		JSONWithRetryable(w, http.StatusConflict, CodeGitBusy, nil,
+			"an agent run is still active for this project", true)
+		return projectLocator{}, nil, false
+	}
+	release, err := acquireProjectGitLock(r.Context(), loc.ID)
+	if err != nil {
+		if errors.Is(err, errGitWriteBusy) {
+			JSONWithRetryable(w, http.StatusConflict, CodeGitBusy, nil,
+				"another git write is in progress for this project", true)
+			return projectLocator{}, nil, false
+		}
+		logAndRespond(w, err, http.StatusServiceUnavailable, ErrDBUnavailable)
+		return projectLocator{}, nil, false
+	}
+	return loc, release, true
+}
+
+// projectGitIndexAction 是 stage / unstage 的共用实现。`stage=false` 表示反向操作。
+func (h *SessionMapHandler) projectGitIndexAction(w http.ResponseWriter, r *http.Request, stage bool) {
+	loc, release, ok := h.beginProjectGitWrite(w, r)
+	if !ok {
 		return
 	}
+	defer release()
 
 	var body gitPathsRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
@@ -139,30 +174,6 @@ func (h *SessionMapHandler) projectGitIndexAction(w http.ResponseWriter, r *http
 			"paths or all is required")
 		return
 	}
-
-	active, err := projectHasActiveRuns(r.Context(), loc.ID)
-	if err != nil {
-		logAndRespond(w, err, http.StatusServiceUnavailable, ErrDBUnavailable)
-		return
-	}
-	if active {
-		// 等这一轮跑完就能写：明确告诉客户端"可重试"。
-		JSONWithRetryable(w, http.StatusConflict, CodeGitBusy, nil,
-			"an agent run is still active for this project", true)
-		return
-	}
-
-	release, err := acquireProjectGitLock(r.Context(), loc.ID)
-	if err != nil {
-		if errors.Is(err, errGitWriteBusy) {
-			JSONWithRetryable(w, http.StatusConflict, CodeGitBusy, nil,
-				"another git write is in progress for this project", true)
-			return
-		}
-		logAndRespond(w, err, http.StatusServiceUnavailable, ErrDBUnavailable)
-		return
-	}
-	defer release()
 
 	before, err := collectProjectChanges(r.Context(), loc.RootPath)
 	if err != nil {
@@ -263,4 +274,103 @@ func unstageGitPaths(ctx context.Context, root string, paths []string) error {
 	args := append([]string{"reset", "-q"}, gitPathsArgs(paths)...)
 	_, err := gitWrite(ctx, root, args...)
 	return err
+}
+
+// ── P2：commit ──────────────────────────────────────────────────────────
+
+type gitCommitRequest struct {
+	Message string `json:"message"`
+}
+
+// GitCommitResult 是提交成功的响应：前端要 sha 来提示"提交到哪一个"，
+// 并直接用 `changes` 刷新列表（避免再发一次 GET 引起闪烁）。
+type GitCommitResult struct {
+	CommitSHA string         `json:"commit_sha"`
+	Changes   ProjectChanges `json:"changes"`
+}
+
+// CommitProjectGit POST /v1/session-map/projects/{id}/git/commit
+func (h *SessionMapHandler) CommitProjectGit(w http.ResponseWriter, r *http.Request) {
+	loc, release, ok := h.beginProjectGitWrite(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var body gitCommitRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&body); err != nil {
+		BadRequest(w, "invalid request body")
+		return
+	}
+	message := strings.TrimSpace(body.Message)
+	if message == "" {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil,
+			"commit message is required")
+		return
+	}
+	if len(message) > 5000 {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil,
+			"commit message is too long")
+		return
+	}
+
+	before, err := collectProjectChanges(r.Context(), loc.RootPath)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git changes")
+		return
+	}
+	staged := 0
+	for _, change := range before.Changes {
+		if change.Staged {
+			staged++
+		}
+	}
+	if staged == 0 {
+		// **只提交已暂存**：不做隐式 `add -A`。用户没勾的东西不该被写进历史。
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil,
+			"nothing is staged; stage files before committing")
+		return
+	}
+
+	sha, err := commitStagedPaths(r.Context(), loc.RootPath, message)
+	if err != nil {
+		switch {
+		case errors.Is(err, errGitMissing):
+			JSONWithCode(w, http.StatusConflict, CodeServiceUnavailable, nil, "git is not installed")
+		case errors.Is(err, errGitFailed):
+			logAndRespond(w, err, http.StatusInternalServerError, "git commit failed")
+		default:
+			logAndRespond(w, err, http.StatusInternalServerError, "git commit failed")
+		}
+		return
+	}
+
+	after, err := collectProjectChanges(r.Context(), loc.RootPath)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git changes")
+		return
+	}
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		db.AuditLog(r.Context(), claims.UserID, smTenantID(claims), "project.git.commit",
+			"session_map_workspaces:"+loc.ID,
+			fmt.Sprintf("sha=%s files=%d", sha, staged), r.RemoteAddr,
+			map[string]interface{}{"project_id": loc.ID, "file_count": staged, "commit_sha": sha})
+	}
+	OK(w, GitCommitResult{CommitSHA: sha, Changes: after})
+}
+
+// commitStagedPaths 提交索引里已有的内容。**不带 `-a`**：工作区里未暂存的改动
+// 不参与这次提交；也不支持 amend/签名（历史改写与凭据交互不在 N5 范围）。
+func commitStagedPaths(ctx context.Context, root, message string) (string, error) {
+	if strings.TrimSpace(message) == "" {
+		return "", errors.New("commit message is required")
+	}
+	if _, err := gitWrite(ctx, root, "commit", "-m", message); err != nil {
+		return "", err
+	}
+	sha, err := gitRead(ctx, root, "rev-parse", "--short", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(sha), nil
 }

@@ -297,3 +297,50 @@ func TestAcquireProjectGitLockIsExclusive(t *testing.T) {
 	}
 	release2()
 }
+
+// ── N5 P2：commit ──────────────────────────────────────────────────────
+
+func TestCommitStagedPathsOnlyCommitsIndex(t *testing.T) {
+	root := gitTestRepo(t)
+	ctx := context.Background()
+	writeFile(t, root, "staged.txt", "s")
+	writeFile(t, root, "other.txt", "o")
+	if err := stageGitPaths(ctx, root, []string{"staged.txt"}); err != nil {
+		t.Fatal(err)
+	}
+
+	sha, err := commitStagedPaths(ctx, root, "feat: staged only")
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if sha == "" {
+		t.Fatal("commit sha should not be empty")
+	}
+	changes, err := collectProjectChanges(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes.Changes {
+		if change.Path == "staged.txt" && (change.Staged || change.Unstaged) {
+			t.Fatalf("staged.txt should be committed and clean, got %+v", change)
+		}
+		if change.Path == "other.txt" && change.Staged {
+			t.Fatal("other.txt was not staged and must not be committed")
+		}
+	}
+	if _, err := gitWrite(ctx, root, "log", "--oneline", "-1"); err != nil {
+		t.Fatalf("log: %v", err)
+	}
+}
+
+func TestCommitRequiresMessageAndStagedContent(t *testing.T) {
+	root := gitTestRepo(t)
+	ctx := context.Background()
+	if _, err := commitStagedPaths(ctx, root, "   "); err == nil {
+		t.Fatal("empty message should fail")
+	}
+	writeFile(t, root, "a.txt", "x")
+	if _, err := commitStagedPaths(ctx, root, "nothing staged"); err == nil {
+		t.Fatal("commit with nothing staged should fail")
+	}
+}

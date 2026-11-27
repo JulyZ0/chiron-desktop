@@ -100,6 +100,27 @@ export async function unstageProjectPaths(
   return normalizeChanges(data?.data)
 }
 
+export interface GitCommitResult {
+  /** 短 sha（7 位）。空串 = 后端没回（按失败处理前已抛错） */
+  sha: string
+  changes: ProjectChanges
+}
+
+/** 提交已暂存内容（N5 P2）。不传路径：只提交 index，不做隐式 add。 */
+export async function commitProjectGit(
+  projectId: string,
+  message: string,
+): Promise<GitCommitResult> {
+  const { data } = await api.post(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/git/commit`,
+    { message },
+  )
+  return {
+    sha: typeof data?.data?.commit_sha === 'string' ? data.data.commit_sha : '',
+    changes: normalizeChanges(data?.data?.changes),
+  }
+}
+
 /** 单个文件的统一 diff（只读）。 */
 export interface ProjectDiff {
   repo: boolean

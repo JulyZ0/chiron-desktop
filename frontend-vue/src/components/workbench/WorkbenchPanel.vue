@@ -33,6 +33,7 @@ import { highlightCodeBlocks } from '../chat/codeHighlighter'
 import { langOf, truncatePreview } from './previewCode'
 import {
   listProjectChanges,
+  commitProjectGit,
   readCommitDiff,
   readProjectDiff,
   readProjectLog,
@@ -463,6 +464,38 @@ async function stageAllChanges(stage: boolean): Promise<void> {
 /** 已暂存数量：头部按钮据此决定是否可用（没有可暂存的就不显示按钮）。 */
 const stagedCount = computed(() => changeRows.value.filter(r => !r.agentOnly && r.staged).length)
 const stageableCount = computed(() => changeRows.value.filter(r => !r.agentOnly).length)
+
+// ── N5 P2：commit ────────────────────────────────────────────────────────
+const commitMessage = ref('')
+const commitBusy = ref(false)
+
+/**
+ * 提交已暂存内容。
+ *
+ * 只提交 index：没勾选的文件不会进历史。失败时消息保留在输入框里 —— 用户不该
+ * 因为一次 409（还有回合在跑）就重打一遍提交说明。
+ */
+async function commitStagedChanges(): Promise<void> {
+  const message = commitMessage.value.trim()
+  if (!props.projectId || commitBusy.value || !stagedCount.value) return
+  if (!message) {
+    notify.info(tr('chat.workbench_commit_message_required'))
+    return
+  }
+  commitBusy.value = true
+  try {
+    const result = await commitProjectGit(props.projectId, message)
+    applyChanges(result.changes)
+    commitMessage.value = ''
+    notify.success(tr('chat.workbench_commit_done', { sha: result.sha || '—' }))
+    // 当前打开的文件若已被提交，diff 会变成空：重拉一次让用户看到真实结果。
+    if (diffRow.value) await loadDiff(diffRow.value)
+  } catch (e) {
+    notify.error(describeApiError(e))
+  } finally {
+    commitBusy.value = false
+  }
+}
 
 /**
  * 打开一条改动。
@@ -1487,6 +1520,32 @@ async function openWithSystem(entry: ProjectFileEntry) {
               class="wb-index-busy"
             >{{ tr('common.loading') }}</span>
           </div>
+          <!-- N5 P2：提交只收已暂存内容；验证失败/未验证时给出提示但不阻止。 -->
+          <div
+            v-if="changesData?.repo && stagedCount"
+            class="wb-commit"
+          >
+            <textarea
+              v-model="commitMessage"
+              rows="2"
+              :placeholder="tr('chat.workbench_commit_placeholder')"
+              @keydown.ctrl.enter.prevent="commitStagedChanges"
+              @keydown.meta.enter.prevent="commitStagedChanges"
+            />
+            <div class="wb-commit-actions">
+              <span class="wb-commit-hint">{{ tr('chat.workbench_commit_staged', { n: stagedCount }) }}</span>
+              <span
+                v-if="verificationBadge && verificationBadge.tone === 'warn'"
+                class="wb-commit-warn"
+              >{{ verificationBadge.text }}</span>
+              <button
+                type="button"
+                class="wb-btn wb-btn-primary"
+                :disabled="!commitMessage.trim() || commitBusy"
+                @click="commitStagedChanges"
+              >{{ tr('chat.workbench_commit_action') }}</button>
+            </div>
+          </div>
           <!-- F4：本回合改动（会话级实时数据，不依赖 git 是否记录） -->
           <div
             v-if="turnRows.length"
@@ -2187,6 +2246,24 @@ async function openWithSystem(entry: ProjectFileEntry) {
 .wb-stage { display: inline-flex; align-items: center; }
 .wb-stage input { cursor: pointer; }
 .wb-stage input:disabled { cursor: progress; }
+.wb-commit { display: flex; flex-direction: column; gap: 6px; padding: 8px; margin: 4px 0 8px; border: var(--hairline-width) solid var(--border-default); border-radius: var(--sig-radius-button); background: var(--panel-bg); }
+.wb-commit textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 44px;
+  padding: 6px 8px;
+  border: var(--hairline-width) solid var(--border-default);
+  border-radius: 6px;
+  background: var(--bg-page);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+}
+.wb-commit-actions { display: flex; align-items: center; gap: 8px; }
+.wb-commit-hint { font-size: 12px; color: var(--text-secondary); }
+.wb-commit-warn { font-size: 12px; color: var(--warning); }
+.wb-commit-actions .wb-btn-primary { margin-left: auto; }
+.wb-commit-actions .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* 分栏手柄：平时不可见，悬停/拖动/聚焦时才显形（与 SessionPreviewPane 一致） */
 .wb-resize {

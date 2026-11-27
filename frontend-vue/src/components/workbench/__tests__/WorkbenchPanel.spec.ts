@@ -64,7 +64,7 @@ vi.mock('../../../api/checkpoints', () => ({
 const changesNet = vi.hoisted(() => ({
   diffs: [] as Array<{ projectId: string; path: string; resolve: (v: unknown) => void }>,
   /** N5 P1：stage/unstage 调用记录与返回的下一份 status */
-  indexCalls: [] as Array<{ action: 'stage' | 'unstage'; projectId: string; body: unknown }>,
+  indexCalls: [] as Array<{ action: 'stage' | 'unstage' | 'commit'; projectId: string; body: unknown }>,
   nextChanges: null as Record<string, unknown> | null,
   changes: {
     repo: true,
@@ -87,6 +87,13 @@ vi.mock('../../../api/projectChanges', () => ({
   unstageProjectPaths: (projectId: string, body: unknown) => {
     changesNet.indexCalls.push({ action: 'unstage', projectId, body })
     return Promise.resolve(changesNet.nextChanges ?? changesNet.changes)
+  },
+  commitProjectGit: (projectId: string, message: string) => {
+    changesNet.indexCalls.push({ action: 'commit', projectId, body: message })
+    return Promise.resolve({
+      sha: 'abc1234',
+      changes: changesNet.nextChanges ?? changesNet.changes,
+    })
   },
   readProjectDiff: (projectId: string, path: string) =>
     new Promise(resolve => {
@@ -417,6 +424,31 @@ describe('改动页签的单文件 diff', () => {
     expect(
       (wrapper.findAll('.wb-change')[0].find('input[type="checkbox"]').element as HTMLInputElement).checked,
     ).toBe(true)
+  })
+
+  it('暂存后可提交，成功清空输入（N5 P2）', async () => {
+    changesNet.nextChanges = {
+      ...(changesNet.changes as Record<string, unknown>),
+      changes: [
+        { path: 'src/a.ts', status: 'M', staged: true, unstaged: false, insertions: 1, deletions: 1 },
+      ],
+    }
+    const wrapper = await openChangesTab()
+    await wrapper.findAll('.wb-change')[0].find('input[type="checkbox"]').trigger('change')
+    await flush()
+
+    expect(wrapper.find('.wb-commit').exists()).toBe(true)
+    const textarea = wrapper.find('.wb-commit textarea')
+    await textarea.setValue('feat: test')
+    await wrapper.find('.wb-commit .wb-btn-primary').trigger('click')
+    await flush()
+
+    expect(changesNet.indexCalls).toContainEqual({
+      action: 'commit',
+      projectId: 'p1',
+      body: 'feat: test',
+    })
+    expect((wrapper.find('.wb-commit textarea').element as HTMLTextAreaElement).value).toBe('')
   })
 
   it('未跟踪文件不渲染假 diff，给出打开文件的入口', async () => {
