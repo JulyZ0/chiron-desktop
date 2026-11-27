@@ -418,6 +418,11 @@ export default {
   // ── 还原点（检查点时间线 + 回滚）──
   workbench_tab_checkpoints: "还原点",
   workbench_tab_history: "提交",
+  workbench_search_content_placeholder: "在项目文件中搜索内容（回车）",
+  workbench_search_content_action: "搜索",
+  workbench_search_content_empty: "没有匹配的内容",
+  workbench_search_content_unsupported: "当前项目文件在设备上，暂不支持内容搜索",
+  workbench_search_content_truncated: "结果过多，只显示前一部分",
   workbench_history_empty: "还没有提交",
   workbench_no_upstream: "当前分支没有上游",
   checkpoint_empty: "还没有还原点。每次回合开始与结束时都会自动记录一个。",

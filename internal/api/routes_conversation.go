@@ -74,6 +74,8 @@ func registerConversationRoutes(
 	// "我大概记得叫什么"，而不是"列出这里有什么" —— 两者的排序与预算都不同。
 	mux.Handle("GET /v1/session-map/projects/{id}/files/search", authMW(rlMW(http.HandlerFunc(smHandler.SearchProjectFiles))))
 	mux.Handle("GET /v1/session-map/projects/{id}/file", authMW(rlMW(http.HandlerFunc(smHandler.ReadProjectFile))))
+	// F6：按内容搜索（只读，有文件/字节/命中上限）。
+	mux.Handle("GET /v1/session-map/projects/{id}/files/search-content", authMW(rlMW(http.HandlerFunc(smHandler.SearchProjectContent))))
 	mux.Handle("GET /v1/session-map/projects/{id}/file/raw", authMW(rlMW(http.HandlerFunc(smHandler.RawProjectFile))))
 	// 项目改动（只读 Git 视图）：与文件端点同组、同鉴权 —— 它读的是同一个项目根，
 	// 只是经 git 而不是文件系统。只执行只读子命令，见 project_git.go 开头。

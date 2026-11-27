@@ -18,6 +18,8 @@ import { copyTextOrThrow } from '../../utils/clipboard'
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
+  searchProjectContent,
+  type ProjectContentHit,
   isImagePath,
   isPdfPath,
   listProjectFiles,
@@ -464,6 +466,57 @@ async function openCommit(commit: ProjectCommit) {
   } finally {
     commitDiffLoading.value = false
   }
+}
+
+// ── F6：按内容搜索 ──
+const contentQuery = ref('')
+const contentHits = ref<ProjectContentHit[]>([])
+const contentSearching = ref(false)
+const contentError = ref('')
+const contentUnsupported = ref(false)
+const contentTruncated = ref(false)
+const contentGuard = createKeyedGuard(() => String(props.projectId || ''))
+
+async function runContentSearch() {
+  const q = contentQuery.value.trim()
+  contentError.value = ''
+  contentHits.value = []
+  contentUnsupported.value = false
+  contentTruncated.value = false
+  if (!props.projectId || !q) return
+  const ticket = contentGuard.ticket(String(props.projectId || ''))
+  contentSearching.value = true
+  try {
+    const res = await searchProjectContent(props.projectId, q, 50)
+    if (!contentGuard.isValid(ticket)) return
+    contentHits.value = res.files
+    contentUnsupported.value = res.unsupported
+    contentTruncated.value = res.truncated
+  } catch (e) {
+    if (contentGuard.isValid(ticket)) contentError.value = describeApiError(e)
+  } finally {
+    if (contentGuard.isValid(ticket)) contentSearching.value = false
+  }
+}
+
+async function openContentHit(hit: ProjectContentHit) {
+  await revealPath(hit.path)
+  await nextTick()
+  // 行号定位：codeHighlighter 把每行包成 `.code-line`；只标首屏里能找到的那一行。
+  const lines = previewHost.value?.querySelectorAll('.code-line')
+  const el = lines?.[hit.line - 1] as HTMLElement | undefined
+  if (!el) return
+  el.classList.add('line-focus')
+  el.scrollIntoView({ block: 'center' })
+  setTimeout(() => el.classList.remove('line-focus'), 1600)
+}
+
+function clearContentSearch() {
+  contentQuery.value = ''
+  contentHits.value = []
+  contentError.value = ''
+  contentUnsupported.value = false
+  contentTruncated.value = false
 }
 
 function closeCommitDiff() {
@@ -1026,6 +1079,60 @@ async function openWithSystem(entry: ProjectFileEntry) {
         v-if="activeTab === 'files'"
         class="wb-tree"
       >
+        <!-- F6：按内容搜索（只读）。结果与文件树并存：搜索是"找"，树是"翻"。 -->
+        <div class="wb-search">
+          <input
+            v-model="contentQuery"
+            class="wb-search-input"
+            type="search"
+            :placeholder="tr('chat.workbench_search_content_placeholder')"
+            @keydown.enter.prevent="runContentSearch"
+          >
+          <button
+            type="button"
+            class="wb-btn"
+            :disabled="contentSearching || !contentQuery.trim()"
+            @click="runContentSearch"
+          >{{ contentSearching ? tr('common.loading') : tr('chat.workbench_search_content_action') }}</button>
+          <button
+            v-if="contentQuery"
+            type="button"
+            class="wb-btn"
+            :title="tr('common.close')"
+            @click="clearContentSearch"
+          >×</button>
+        </div>
+        <div
+          v-if="contentError"
+          class="wb-error"
+        >{{ contentError }}</div>
+        <div
+          v-else-if="contentUnsupported"
+          class="wb-empty"
+        >{{ tr('chat.workbench_search_content_unsupported') }}</div>
+        <div
+          v-else-if="contentQuery && !contentSearching && !contentHits.length"
+          class="wb-empty"
+        >{{ tr('chat.workbench_search_content_empty') }}</div>
+        <template v-else-if="contentHits.length">
+          <div
+            v-for="hit in contentHits"
+            :key="`${hit.path}:${hit.line}`"
+            class="wb-row wb-hit"
+            role="treeitem"
+            tabindex="0"
+            :title="hit.path"
+            @click="openContentHit(hit)"
+            @keydown.enter.prevent="openContentHit(hit)"
+          >
+            <span class="wb-hit-path">{{ hit.path }}:{{ hit.line }}</span>
+            <span class="wb-hit-text">{{ hit.text }}</span>
+          </div>
+          <div
+            v-if="contentTruncated"
+            class="wb-empty"
+          >{{ tr('chat.workbench_search_content_truncated') }}</div>
+        </template>
         <div
           v-if="treeError"
           class="wb-error"
@@ -1671,4 +1778,26 @@ async function openWithSystem(entry: ProjectFileEntry) {
   flex: none; margin-inline-start: auto;
   font-size: var(--fs-xs); color: var(--text-tertiary);
 }
+/* F6：内容搜索 */
+.wb-search {
+  display: flex; align-items: center; gap: 4px; padding: 4px 8px;
+  border-bottom: var(--hairline-width) solid var(--border-subtle);
+}
+.wb-search-input {
+  flex: 1; min-width: 0; font-size: var(--fs-xs);
+  padding: 3px 8px; border-radius: var(--radius-sm);
+  border: var(--hairline-width) solid var(--border-subtle);
+  background: var(--bg-card); color: var(--text-primary);
+}
+.wb-search-input:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: 1px; }
+.wb-hit { flex-direction: column; align-items: stretch; gap: 0; }
+.wb-hit-path {
+  font-family: var(--font-mono, monospace); font-size: var(--fs-xs);
+  color: var(--text-tertiary); direction: ltr;
+}
+.wb-hit-text {
+  font-size: var(--fs-xs); color: var(--text-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wb-code :deep(.code-line.line-focus) { background: var(--warning-bg, var(--primary-bg)); }
 </style>

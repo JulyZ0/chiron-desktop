@@ -199,3 +199,41 @@ export function isImagePath(path: string): boolean {
 export function isPdfPath(path: string): boolean {
   return fileExt(path) === 'pdf'
 }
+
+/** F6：按内容搜索的命中行。 */
+export interface ProjectContentHit {
+  path: string
+  /** 1-based */
+  line: number
+  text: string
+}
+
+/**
+ * 按内容搜索（只读）。客户端项目暂不支持：`unsupported=true`，界面据此说明原因。
+ */
+export async function searchProjectContent(
+  projectId: string,
+  query: string,
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<{ files: ProjectContentHit[]; truncated: boolean; unsupported: boolean }> {
+  const params = new URLSearchParams({ q: query, limit: String(limit) })
+  const { data } = await api.get(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/files/search-content?${params.toString()}`,
+    signal ? { signal } : undefined,
+  )
+  const payload = data?.data ?? {}
+  const list: unknown[] = Array.isArray(payload.files) ? payload.files : []
+  return {
+    files: list.map((raw) => {
+      const h = (raw ?? {}) as Partial<ProjectContentHit>
+      return {
+        path: typeof h.path === 'string' ? h.path : '',
+        line: typeof h.line === 'number' ? h.line : 0,
+        text: typeof h.text === 'string' ? h.text : '',
+      }
+    }).filter(h => h.path !== ''),
+    truncated: !!payload.truncated,
+    unsupported: !!payload.unsupported,
+  }
+}

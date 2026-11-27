@@ -418,6 +418,11 @@ export default {
   // ── نقاط الاستعادة (الجدول الزمني + الاسترجاع) ──
   workbench_tab_checkpoints: "نقاط الاستعادة",
   workbench_tab_history: "الالتزامات",
+  workbench_search_content_placeholder: "ابحث في محتوى الملفات (اضغط Enter)",
+  workbench_search_content_action: "بحث",
+  workbench_search_content_empty: "لا يوجد محتوى مطابق",
+  workbench_search_content_unsupported: "البحث في المحتوى غير متاح بعد للمشاريع المستضافة على الجهاز",
+  workbench_search_content_truncated: "النتائج كثيرة، ويُعرض بعضها فقط",
   workbench_history_empty: "لا توجد التزامات بعد",
   workbench_no_upstream: "لا يوجد فرع أعلى مُهيأ",
   checkpoint_empty: "لا توجد نقاط استعادة بعد. تُسجَّل نقطة تلقائيًا في بداية كل جولة ونهايتها.",

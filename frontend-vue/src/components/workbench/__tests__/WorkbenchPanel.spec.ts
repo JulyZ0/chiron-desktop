@@ -29,6 +29,7 @@ const net = vi.hoisted(() => ({
   calls: [] as Array<{ projectId: string; path: string; resolve: (v: unknown) => void }>,
   /** `readProjectFile` 的返回值：二进制预览那个分支要能构造出 `binary: true` */
   readResult: { path: '', binary: false, size: 0, content: '' },
+  searchResult: { files: [], truncated: false, unsupported: false },
 }))
 
 vi.mock('../../../api/projectFiles', () => ({
@@ -40,6 +41,7 @@ vi.mock('../../../api/projectFiles', () => ({
   projectFileObjectURL: () => Promise.reject(new Error('unused')),
   isImagePath: () => false,
   isPdfPath: () => false,
+  searchProjectContent: () => Promise.resolve(net.searchResult),
 }))
 
 /**
@@ -429,5 +431,45 @@ describe('工作台的提交历史（F5）', () => {
     await commits[0].trigger('click')
     await flushPromises()
     expect(wrapper.find('.wb-diff-panel').text()).toContain('+from-commit')
+  })
+})
+
+
+describe('工作台的内容搜索（F6）', () => {
+  it('回车搜索并显示命中行', async () => {
+    net.searchResult = {
+      files: [{ path: 'src/a.ts', line: 3, text: 'const needle = 1' }],
+      truncated: false,
+      unsupported: false,
+    }
+    const wrapper = mountPanel({ projectId: 'p1' })
+    await flush()
+    net.calls[0]?.resolve(listing('C:/p1', 'a.ts'))
+    await flush()
+
+    const input = wrapper.find('.wb-search-input')
+    await input.setValue('needle')
+    await input.trigger('keydown.enter')
+    await flush()
+
+    const hits = wrapper.findAll('.wb-hit')
+    expect(hits).toHaveLength(1)
+    expect(hits[0].text()).toContain('src/a.ts:3')
+    expect(hits[0].text()).toContain('const needle = 1')
+  })
+
+  it('设备侧项目：明确说不支持，而不是空结果', async () => {
+    net.searchResult = { files: [], truncated: false, unsupported: true }
+    const wrapper = mountPanel({ projectId: 'p1' })
+    await flush()
+    net.calls[0]?.resolve(listing('C:/p1', 'a.ts'))
+    await flush()
+
+    const input = wrapper.find('.wb-search-input')
+    await input.setValue('needle')
+    await input.trigger('keydown.enter')
+    await flush()
+
+    expect(wrapper.text()).toContain('暂不支持内容搜索')
   })
 })

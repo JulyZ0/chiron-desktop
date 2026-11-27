@@ -415,6 +415,11 @@ export default {
   // ── Restore points (checkpoint timeline + rollback) ──
   workbench_tab_checkpoints: "Restore points",
   workbench_tab_history: "Commits",
+  workbench_search_content_placeholder: "Search file contents (press Enter)",
+  workbench_search_content_action: "Search",
+  workbench_search_content_empty: "No matching content",
+  workbench_search_content_unsupported: "Content search is not available for device-hosted projects yet",
+  workbench_search_content_truncated: "Too many results; only some are shown",
   workbench_history_empty: "No commits yet",
   workbench_no_upstream: "No upstream configured",
   checkpoint_empty: "No restore points yet. One is recorded automatically at the start and end of every turn.",

@@ -1212,3 +1212,34 @@ func clientRawProjectFile(w http.ResponseWriter, r *http.Request, loc projectLoc
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = w.Write(data)
 }
+
+// SearchProjectContent 在项目内按内容搜索（只读，F6）。
+func (h *SessionMapHandler) SearchProjectContent(w http.ResponseWriter, r *http.Request) {
+	loc, ok := h.requireProject(w, r)
+	if !ok {
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		BadRequest(w, "q is required")
+		return
+	}
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			limit = n
+		}
+	}
+	if loc.Provider == smProviderClient {
+		// 客户端项目：文件在用户设备上，逐文件 RPC 不现实。明确返回"不支持"，
+		// 前端据此隐藏入口/说明原因，而不是让用户等一个超时。
+		OK(w, map[string]any{"unsupported": true, "files": []ProjectContentHit{}, "truncated": false})
+		return
+	}
+	hits, truncated, err := searchProjectContent(r.Context(), loc.RootPath, q, limit)
+	if err != nil {
+		respondFileError(w, err, "")
+		return
+	}
+	OK(w, map[string]any{"files": hits, "truncated": truncated, "root": loc.RootPath})
+}
