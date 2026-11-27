@@ -385,7 +385,14 @@ export function projectTranscript(input: ProjectionInput): ProjectionResult {
   const rows: ProjectedRow[] = []
 
   for (const turn of turns) {
-    const cacheable = Boolean(input.cache) && turn.to < items.length && !turn.resident
+    // L31：**常驻尾部也参与缓存**。此前 `!turn.resident` 把最后两轮排除在外，于是流式
+    // 期间每个 token 都会把"上一轮"（内容早已定稿、只是还在尾部常驻）连同活跃轮一起
+    // 重投影；长回合里那是整表级的开销。活跃轮（`turn.to === items.length`）仍然不缓存，
+    // 它本来就是唯一在变的部分。
+    //
+    // 缓存的唯一副作用是行上烘焙了写入时的 `resident` 标记：新回合到来后同一轮会退出
+    // 尾部常驻，必须在命中时按当前 `turn.resident` 校正（见下面的分支）。
+    const cacheable = Boolean(input.cache) && turn.to < items.length
     const version = cacheable ? turnVersion(items, turn.from, turn.to) : ''
     const cached = cacheable ? input.cache!.get(turn.key) : undefined
     if (
@@ -394,7 +401,16 @@ export function projectTranscript(input: ProjectionInput): ProjectionResult {
       cached.to === turn.to &&
       cached.version === version
     ) {
-      rows.push(...cached.rows)
+      // 常驻标记随位置变化：缓存行不可原地改（它们同时被上一帧的渲染树引用），
+      // 只在标记真的不一致时复制这一轮的行，并把校正结果写回缓存 —— 否则下一帧又会
+      // 生成一批新对象，等于每帧让这一轮重渲染。校正后恢复纯引用复用。
+      if (cached.rows.some(row => row.resident !== turn.resident)) {
+        const corrected = cached.rows.map(row => ({ ...row, resident: turn.resident }))
+        cached.rows = corrected
+        rows.push(...corrected)
+      } else {
+        rows.push(...cached.rows)
+      }
       for (const [key, open] of cached.folds) folds.set(key, open)
       continue
     }

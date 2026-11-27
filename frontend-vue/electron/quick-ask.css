@@ -1,0 +1,137 @@
+/*
+ * 迷你输入框（F10）。刻意不引主题变量：它可能在没有主界面渲染层的情况下
+ * 独立显示（窗口最小化在托盘里），读不到 <html data-theme>。
+ * 只用 prefers-color-scheme，与 Electron 的 nativeTheme 同源。
+ */
+:root {
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  font-size: 14px;
+  background: #fbfbfa;
+  color: #1f2328;
+  -webkit-user-select: none;
+  user-select: none;
+  overflow: hidden;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #161a1f;
+    color: #e6edf3;
+  }
+  .qa-label {
+    color: #8b949e;
+  }
+  #qa-input {
+    background: #0d1117;
+    border-color: #30363d;
+    color: #e6edf3;
+  }
+  #qa-input::placeholder {
+    color: #6e7681;
+  }
+  .qa-send {
+    background: #1f6feb;
+    color: #fff;
+  }
+  .qa-hint {
+    color: #8b949e;
+  }
+  kbd {
+    background: #21262d;
+    border-color: #30363d;
+  }
+}
+
+.qa {
+  height: 100%;
+  padding: 14px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.qa-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #57606a;
+}
+
+#qa-input {
+  flex: 1;
+  min-height: 46px;
+  max-height: 96px;
+  resize: none;
+  padding: 10px 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  line-height: 1.45;
+  outline: none;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+#qa-input:focus {
+  border-color: #0969da;
+  box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.15);
+}
+
+#qa-input::placeholder {
+  color: #8b949e;
+}
+
+.qa-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.qa-hint {
+  font-size: 12px;
+  color: #57606a;
+}
+
+kbd {
+  padding: 1px 5px;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  background: #f6f8fa;
+  font-family: inherit;
+  font-size: 11px;
+}
+
+.qa-send {
+  padding: 5px 14px;
+  border: 0;
+  border-radius: 6px;
+  background: #0969da;
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.qa-send:hover {
+  filter: brightness(1.06);
+}
+
+.qa-send:active {
+  filter: brightness(0.94);
+}

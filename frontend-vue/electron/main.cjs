@@ -34,6 +34,8 @@ const {
   clipboard,
   powerMonitor,
   net,
+  screen,
+  nativeTheme,
 } = require('electron')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
@@ -86,7 +88,7 @@ const {
  */
 const DEVICE_TOKEN_ARG_PREFIX = shared.DEVICE_TOKEN_ARG_PREFIX || '--chiron-device-token='
 const tokenOrigin = require('./token-origin.cjs')
-const { readTokenResult, writeToken, clearToken } = require('./token-store.cjs')
+const { readToken, readTokenResult, writeToken, clearToken } = require('./token-store.cjs')
 const { switchMode } = require('./mode-switch.cjs')
 const { wipeLocalData, relaunchAfterWipe } = require('./wipe-data.cjs')
 const { createDeviceFSBridge } = require('./device-fs.cjs')
@@ -257,23 +259,115 @@ function holdingWindowQuota(fn) {
  */
 let tray = null
 
+/** 迷你输入框尺寸（F10）。quick-ask.css 的版心按这里的高度排版，改一处要同时看另一边。 */
+const QUICK_ASK_WINDOW_SIZE = { width: 560, height: 172 }
+/** 主进程 → 迷你窗口：每次显示时清空并聚焦输入框。 */
+const QUICK_ASK_RESET_CHANNEL = 'desktop:quick-ask-reset'
+
+let quickAskWindow = null
+/** 首次加载期间按了快捷键：加载完成后补一次显示（不重复排队）。 */
+let quickAskRevealPending = false
+
 /**
- * 创建托盘图标（只创建一次；createWindow 会被 relaunch* 多次调用）。
+ * 迷你输入框（F10 后半）。
  *
- * 图标缺失时**不建托盘也不报错退出**：托盘是增强功能，缺它只是退化成
- * "最小化仍留在任务栏"，不该让整个应用起不来。
+ * 为什么用**独立窗口**而不是"把主窗口拉起来再聚焦输入框"：用户按下快捷键时往往
+ * 主窗口还在托盘/最小化，把整窗拉起来再收起，比直接出一个只装 textarea 的小窗
+ * 重得多；而提交之后才需要看完整会话。
+ *
+ * 安全面与主界面隔离：窄 preload（只有 submit/cancel）、sandbox 开、
+ * 禁止导航与新窗口、复用当前模式的 partition（继承同一套 CSP）。
  */
+function createQuickAskWindow() {
+  if (quickAskWindow && !quickAskWindow.isDestroyed()) return quickAskWindow
+  const partition = partitionFor(currentMode || resolveMode(readDeviceSettings()))
+  quickAskWindow = new BrowserWindow({
+    width: QUICK_ASK_WINDOW_SIZE.width,
+    height: QUICK_ASK_WINDOW_SIZE.height,
+    show: false,
+    frame: false,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#161a1f' : '#fbfbfa',
+    webPreferences: {
+      preload: path.join(__dirname, 'quick-ask-preload.cjs'),
+      partition,
+      contextIsolation: true,
+      nodeIntegration: false,
+      // preload 只用 contextBridge / ipcRenderer（Electron 内置），不需要 Node。
+      sandbox: true,
+    },
+  })
+  // H47：登记为可信窗口，但能力表里只给 submit/cancel 两条通道。
+  registerTrustedWebContents(quickAskWindow.webContents, 'quickAsk')
+  quickAskWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  quickAskWindow.webContents.on('will-navigate', event => event.preventDefault())
+  // 失焦即收起：它是个浮层，留在屏幕上会挡住用户接下来要看的主窗口。
+  quickAskWindow.on('blur', () => {
+    if (quickAskWindow && !quickAskWindow.isDestroyed() && !quickAskWindow.webContents.isDevToolsOpened()) {
+      quickAskWindow.hide()
+    }
+  })
+  quickAskWindow.on('closed', () => {
+    quickAskWindow = null
+    quickAskRevealPending = false
+  })
+  quickAskWindow
+    .loadFile(path.join(__dirname, 'quick-ask.html'))
+    .catch(err => logMain('warn', `quick-ask window load failed: ${err && err.message}`))
+  return quickAskWindow
+}
+
+/** 显示迷你输入框；返回 false 表示建不出来（调用方负责退回旧行为）。 */
+function showQuickAskWindow() {
+  const win = createQuickAskWindow()
+  if (!win || win.isDestroyed()) return false
+  const reveal = () => {
+    if (!win || win.isDestroyed()) return
+    try {
+      // 出现在**鼠标所在显示器**的偏上位置（多显示器下不能固定主屏居中）。
+      const cursor = screen.getCursorScreenPoint()
+      const area = screen.getDisplayNearestPoint(cursor).workArea
+      win.setPosition(
+        Math.round(area.x + (area.width - QUICK_ASK_WINDOW_SIZE.width) / 2),
+        Math.round(area.y + Math.max(72, (area.height - QUICK_ASK_WINDOW_SIZE.height) * 0.2)),
+      )
+    } catch {
+      /* 显示器热插拔竞态：位置失败不影响显示 */
+    }
+    win.show()
+    win.focus()
+    win.webContents.send(QUICK_ASK_RESET_CHANNEL)
+  }
+  // 首次创建时页面还在加载：等它落地再显示，否则会闪一下空白小窗。
+  if (win.webContents.isLoading()) {
+    quickAskRevealPending = true
+    win.webContents.once('did-finish-load', () => {
+      if (!quickAskRevealPending) return
+      quickAskRevealPending = false
+      reveal()
+    })
+  } else {
+    reveal()
+  }
+  return true
+}
+
 /**
- * 全局快捷键：Ctrl/Cmd+Alt+Space —— 把窗口拉到前台并让输入框获得焦点。
+ * 全局快捷键：Ctrl/Cmd+Alt+Space —— 打开迷你输入框（F10 后半）。
  *
- * 只做"回来提问"，不做独立迷你窗口：迷你窗口要另开 BrowserWindow、维护第二套
- * 会话选择与提交链路，收益与风险不成比例。窗口已在前台时同样发信号（用于从别的
- * 页面/面板回到输入框）。注册失败（组合被占用）只告警，不影响应用启动。
+ * 迷你窗口建不出来时退回旧行为：把主窗口拉到前台并聚焦输入框。快捷键是唯一入口，
+ * 降级路径不能丢。注册失败（组合被占用）只告警，不影响应用启动。
  */
 function registerQuickAskShortcut() {
   if (process.platform !== 'win32' && process.platform !== 'darwin') return
   try {
     const ok = globalShortcut.register('CommandOrControl+Alt+Space', () => {
+      if (showQuickAskWindow()) return
       showMainWindow()
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send(shared.QUICK_ASK_CHANNEL)
@@ -285,6 +379,12 @@ function registerQuickAskShortcut() {
   }
 }
 
+/**
+ * 创建托盘图标（只创建一次；createWindow 会被 relaunch* 多次调用）。
+ *
+ * 图标缺失时**不建托盘也不报错退出**：托盘是增强功能，缺它只是退化成
+ * "最小化仍留在任务栏"，不该让整个应用起不来。
+ */
 function createTray() {
   if (tray || process.platform !== 'win32') return
   const iconPath = path.join(__dirname, 'resources', 'icon-32.png')
@@ -300,6 +400,13 @@ function createTray() {
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: '显示主窗口', click: () => showMainWindow() },
+      {
+        label: '快速提问',
+        accelerator: 'CommandOrControl+Alt+Space',
+        click: () => {
+          if (!showQuickAskWindow()) showMainWindow()
+        },
+      },
       { type: 'separator' },
       {
         label: '退出 Chiron',
@@ -2995,6 +3102,36 @@ if (!gotLock) {
         logMain('warn', `clipboard write failed: ${err?.message || err}`)
         return { ok: false, reason: 'write-failed', message: err?.message || String(err) }
       }
+    })
+    // ── 迷你输入框（F10 后半）────────────────────────────────────────────
+    //
+    // 来源校验比普通通道多一条：必须是**那个迷你窗口**。能力表只说明"quickAsk
+    // 这类窗口能调这两条通道"，不能说明"这条事件真的来自它" —— 后者用 webContents 引用比。
+    const isQuickAskSender = event => {
+      assertTrustedSender(event)
+      return Boolean(
+        quickAskWindow &&
+          !quickAskWindow.isDestroyed() &&
+          event.sender === quickAskWindow.webContents,
+      )
+    }
+
+    ipcMain.handle('desktop:quick-ask-submit', (event, payload) => {
+      if (!isQuickAskSender(event)) return { ok: false, reason: 'unexpected-sender' }
+      // 上限与主界面输入框同量级：迷你框只用来说一句话，超长文本按粘贴误差处理。
+      const text = String(payload?.text ?? '').trim().slice(0, 8000)
+      if (!text) return { ok: false, reason: 'empty' }
+      if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, reason: 'no-window' }
+      quickAskWindow.hide()
+      // 提交后必须把主界面带到前台：回答在那边流式输出，藏在托盘里等于没反应。
+      showMainWindow()
+      mainWindow.webContents.send(shared.QUICK_ASK_TEXT_CHANNEL, { text })
+      return { ok: true }
+    })
+
+    ipcMain.on('desktop:quick-ask-cancel', event => {
+      if (!isQuickAskSender(event)) return
+      quickAskWindow.hide()
     })
 
     /**

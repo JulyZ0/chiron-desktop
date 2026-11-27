@@ -122,6 +122,10 @@ const WINDOW_CAPABILITIES = {
   ]),
   // error 页比 setup 更窄：只要版本信息与重启（它没有输入框）。
   error: new Set(['desktop:get-app-info', 'desktop:restart']),
+  // 迷你输入框（F10）：只够提交一段文本 / 关掉自己。
+  // 刻意不给 `get-token` / `save-token` 等任何一条 —— 它只放一个 textarea，
+  // 没有理由持有凭据或打开路径。
+  quickAsk: new Set(['desktop:quick-ask-submit', 'desktop:quick-ask-cancel']),
 }
 
 /**

@@ -296,9 +296,9 @@ func main() {
 	// 子 Agent 事件中继：引擎把事件 pub 到 Redis，这里转投 SSE hub ——
 	// 前端 /events 才可能**实时**看到后台子 Agent 的进度（否则只剩选中 run 时的轮询）。
 	api.StartSubagentEventsRelay(lifecycleCtx, eventHub)
- // G13：队列任务的生命周期事件中继（引擎 worker 把 job.started / job.settled
- // 发到 Redis，这里转投 SSE hub）—— 否则前端只能靠轮询猜任务进度。
- api.StartJobEventsRelay(lifecycleCtx, eventHub)
+	// G13：队列任务的生命周期事件中继（引擎 worker 把 job.started / job.settled
+	// 发到 Redis，这里转投 SSE hub）—— 否则前端只能靠轮询猜任务进度。
+	api.StartJobEventsRelay(lifecycleCtx, eventHub)
 	// M21：待办提醒的用户级中继 —— 引擎落票时广播"多了一张票"，这里转投 SSE hub
 	// （带 UserID ⇒ 同时进该会话流与该用户的用户通道）。
 	api.StartInteractionEventsRelay(lifecycleCtx, eventHub)
@@ -351,6 +351,22 @@ func main() {
 	<-done
 	slog.Info("shutting down...")
 
+	// ── 停机宽限**分级**（L08）─────────────────────────────────────────────
+	//
+	// 三类工作的收尾代价完全不同，共用一个预算时最贵的那类会把别的挤掉：
+	//   1. 接入层（普通请求 / SSE）：SSE 先 BeginDrain 主动收尾，剩下的请求通常很快；
+	//   2. detached agent runs：一轮可能跑几十秒，等不完就交给 checkpoint + 租约恢复；
+	//   3. 审计 / 画布最终 flush：纯本地写，必须**等到写完**，否则最后一批操作会丢。
+	// 每一段都有独立上界，总停机时间 ≈ 三段之和，不会因为某一段挂住而无限等。
+	const (
+		shutdownHTTPGrace  = 10 * time.Second
+		shutdownRunsGrace  = 10 * time.Second
+		shutdownFlushGrace = 5 * time.Second
+		// flush 内部再分账：审计是逐条 XAdd，画布是批量写 PG；给画布留大头。
+		shutdownAuditGrace  = 2 * time.Second
+		shutdownCanvasGrace = shutdownFlushGrace - shutdownAuditGrace
+	)
+
 	// 先通知 SSE 长连接收尾，再 Shutdown。
 	// srv.Shutdown 会**等待所有活跃连接结束**，而 SSE 连接只有客户端断开才结束 ——
 	// 先 drain 才能让它们主动收尾；否则每个打开着页面的用户都会把 10s 宽限吃满，
@@ -364,7 +380,7 @@ func main() {
 	// lifecycleCtx 由 signal.NotifyContext 创建，收到 SIGTERM 时它已经被 cancel，
 	// 以它为父会让 shutdownCtx 立即到期、srv.Shutdown 随即返回 —— 10s 宽限形同
 	// 虚设，in-flight 请求（含正在流式输出的 SSE）会被直接切断。
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownHTTPGrace)
 	defer shutdownCancel()
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -374,13 +390,28 @@ func main() {
 	// ── H12：已回 202 的回合在 detached goroutine 里跑，Shutdown 看不到它们 ──
 	//
 	// 顺序刻意放在 `srv.Shutdown` 之后：先停接入（不再有新 run 进来），再等在跑的。
-	// 宽限还是同一个 10s 预算（shutdownCtx 已被 Shutdown 消耗一部分，这里另起一份，
-	// 但总时长有上界，不会把"停机"变成"挂住"）。
-	// 没等完时由 DrainInFlightRuns 打出**明确的恢复口径**（checkpoint + run 租约 TTL），
-	// 而不是静默丢一轮。
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 宽限独立于 HTTP 段（shutdownCtx 已被 Shutdown 消耗一部分），但仍有上界，
+	// 不会把"停机"变成"挂住"。没等完时由 DrainInFlightRuns 打出**明确的恢复口径**
+	// （checkpoint + run 租约 TTL），而不是静默丢一轮。
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), shutdownRunsGrace)
 	defer drainCancel()
 	api.DrainInFlightRuns(drainCtx)
+
+	// ── L08：审计与画布的最终 flush ──
+	//
+	// 放在 runs 之后：这两项是纯本地写，不该被"还在跑的回合"无限推迟，但必须在
+	// 进程退出前**同步**完成。审计 worker 在 lifecycleCtx 取消时已停止接新任务，
+	// 这里只负责把通道里剩下的条目写完；画布则把 dirty 集合刷进 PG。
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), shutdownFlushGrace)
+	defer flushCancel()
+
+	auditCtx, auditCancel := context.WithTimeout(flushCtx, shutdownAuditGrace)
+	api.DrainAuditLogs(auditCtx)
+	auditCancel()
+
+	canvasCtx, canvasCancel := context.WithTimeout(flushCtx, shutdownCanvasGrace)
+	api.FlushSessionMap(canvasCtx)
+	canvasCancel()
 
 	slog.Info("server stopped")
 }

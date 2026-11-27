@@ -146,7 +146,11 @@ class RemoteProvider:
         return {
             "mode": self._mode,
             "kb_id": ctx.kb_id,
-            "tenant_id": ctx.tenant_id,
+            # pageindex-service 的 `ContextBody.tenant_id` 是 **str**（pydantic 严格模式），
+            # 而 ProviderContext.tenant_id 是 int。直接传 int 会让整个请求在请求体校验阶段
+            # 422（`string_type` / `['body','tenant_id']`），表现为"查知识库时 service_error"。
+            # 0 是"没有租户"的语义，与对端默认值 "" 对齐。
+            "tenant_id": "" if not ctx.tenant_id else str(ctx.tenant_id),
             "user_id": ctx.user_id,
             "doc_ids": list(ctx.doc_ids),
             "index_ref": ctx.index_ref or self._folder_id,

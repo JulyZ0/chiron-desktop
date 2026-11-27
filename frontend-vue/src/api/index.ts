@@ -2066,7 +2066,9 @@ export async function getSuperagentStatus(): Promise<SuperagentStatus> {
  */
 export async function reportPresence(): Promise<{ ok: boolean; ttl_seconds: number }> {
   try {
-    const resp = await api.post('/v1/superagent/presence', {})
+    // `__silent`：心跳是后台行为，401 只说明"当前没有会话"（匿名访客、会话过期），
+    // 不该由全局拦截器登出并跳登录页 —— 分享落地页最容易被这一条打飞。
+    const resp = await api.post('/v1/superagent/presence', {}, { __silent: true })
     return unwrap<{ ok: boolean; ttl_seconds: number }>(resp.data)
   } catch {
     return { ok: false, ttl_seconds: 0 }

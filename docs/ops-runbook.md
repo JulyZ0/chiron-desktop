@@ -56,7 +56,11 @@ POSTGRES_DSN='postgresql://…' CHIRON_DATA_DIR=/data \
 
 1. 记录当前版本（`git rev-parse --short HEAD` / 镜像 tag）与 `alembic_version`；
 2. 备份（上一节）；
-3. 停新写入：反代摘流量或停网关；等 `DrainInFlightRuns` 日志结束（最长 10s 宽限）；
+3. 停新写入：反代摘流量或停网关；按日志确认三段收尾都结束（L08）：
+   HTTP 停接（≤10s）→ `in-flight agent runs drained`（≤10s，未等完会给出
+   checkpoint/租约恢复口径）→ `audit log drain complete` 与 `sessionmap final flush complete`
+   （各 2s / 3s）。总停机上界约 25s；任一段超时都会留下 `did NOT drain` / `incomplete`
+   级别的 warn，照原样记录即可（不要用强杀"跳过"它）；
 4. 跑迁移：`alembic upgrade head`（应用**不会**自动迁移；版本不匹配会拒绝启动并只开诊断端口）；
 5. 启动新版本 → `GET /ready` 200 → 跑 `team_smoke --sse`；
 6. 失败回滚：停新版本 → 恢复上一版镜像/安装包 → 用备份恢复 DB 与卷（迁移不可逆时这是唯一路径）。

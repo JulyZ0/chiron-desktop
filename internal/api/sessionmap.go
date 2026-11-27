@@ -298,6 +298,36 @@ func smFlushOnce(ctx context.Context) int {
 	return handled
 }
 
+// FlushSessionMap 停机收尾：把 dirty 集合里的画布**同步**落库（L08）。
+//
+// `StartSessionMapFlusher` 在 ctx.Done 时也做一次最终 pass，但那是个 detached
+// goroutine —— main 不等它，进程可以在写库完成前退出。停机流程必须显式调用这里，
+// 否则"用户最后拖的那一下"就卡在退出路上。
+//
+// 返回落库成功的画布数；超出 ctx 预算时记录已完成数（dirty 集合本身是持久化的，
+// 没写完的条目由下一个实例继续处理，不会丢）。
+func FlushSessionMap(ctx context.Context) int {
+	total := 0
+	const maxPerShutdown = 200 // 脏集合异常大时不把停机拖死；ctx 仍是硬上界
+	for total < maxPerShutdown {
+		select {
+		case <-ctx.Done():
+			slog.Warn("sessionmap final flush incomplete", "workspaces", total)
+			return total
+		default:
+		}
+		n := smFlushOnce(ctx)
+		if n == 0 {
+			break
+		}
+		total += n
+	}
+	if total > 0 {
+		slog.Info("sessionmap final flush complete", "workspaces", total)
+	}
+	return total
+}
+
 // StartSessionMapFlusher 后台把热层快照落库。main 启动时调用一次。
 func StartSessionMapFlusher(ctx context.Context) {
 	if db.Redis == nil {

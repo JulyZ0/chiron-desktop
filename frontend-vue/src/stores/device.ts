@@ -95,6 +95,8 @@ export interface ChironDesktopHost {
   onAutoLock?: (callback: (payload: { reason?: string }) => void) => () => void
   /** 全局快捷键触发的「快速提问」信号；返回取消订阅函数 */
   onQuickAsk?: (callback: () => void) => () => void
+  /** 迷你输入框提交的文本（F10 后半）；返回取消订阅函数 */
+  onQuickAskText?: (callback: (text: string) => void) => () => void
   /**
    * 订阅**引擎崩溃取证**（崩溃自愈放弃时由主进程推送）。
    *

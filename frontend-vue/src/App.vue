@@ -14,7 +14,7 @@ import { useThemeStore } from './stores/theme'
 import { useTypographyStore } from './stores/typography'
 import { languageMeta } from './i18n/languages'
 import { desktopHost } from './stores/device'
-import { requestQuickAsk } from './utils/quickAsk'
+import { requestQuickAsk, submitQuickAskText } from './utils/quickAsk'
 
 const route = useRoute()
 const router = useRouter()
@@ -31,7 +31,16 @@ useTypographyStore()
 // 因此 `meta.public` 与 Login/Register 一样走裸 `router-view`。
 const showLayout = computed(
   // 登录页与强制改密页不套主布局：它们需要在没有可用会话时也能独立渲染。
-  () => !['Login', 'Register', 'ChangePassword'].includes(route.name as string) && route.meta.public !== true,
+  //
+  // `matched.length === 0`：首帧路由还没解析完（`app.mount` 早于首次导航落定）时，
+  // `route.name` / `meta.public` 都是空的。此时若判成"要布局"，匿名访客打开分享链接
+  // 会先挂上 AppLayout —— 它的接管心跳（`reportPresence`）没有 `__silent`，401 会触发
+  // 全局拦截器 `location.href='/login?redirect=...'`，落地页就这样被"强制登录"了。
+  // 未匹配时不挂布局：宁可空一帧，也不要在公开页上建立需要身份的轮询。
+  () =>
+    route.matched.length > 0 &&
+    !['Login', 'Register', 'ChangePassword'].includes(route.name as string) &&
+    route.meta.public !== true,
 )
 
 const themeConfig = computed(() => ({
@@ -50,17 +59,30 @@ watchEffect(() => {
   else root.classList.remove('dark')
 })
 
-// F10：全局快捷键「快速提问」。IPC 到达时先切到聊天页并置位，ChatView 挂载后聚焦输入框。
+// F10：全局快捷键「快速提问」。
+// - 迷你输入框（F10 后半）提交后带文本：先切到聊天页再置位，ChatView 挂载后**直接发送**；
+// - 旧信号（降级路径）只要求聚焦输入框。
 let unsubQuickAsk: (() => void) | undefined
+let unsubQuickAskText: (() => void) | undefined
 onMounted(() => {
-  unsubQuickAsk = desktopHost()?.onQuickAsk?.(() => {
+  const host = desktopHost()
+  unsubQuickAsk = host?.onQuickAsk?.(() => {
     requestQuickAsk()
     if (route.path !== '/chat') void router.push('/chat')
+  })
+  unsubQuickAskText = host?.onQuickAskText?.((text) => {
+    if (!text) return
+    // 顺序不能反：先导航（ChatView 挂载时消费待发送文本），再置位。
+    // 已在聊天页时 push 不会触发重挂载，事件监听会立即消费。
+    if (route.path !== '/chat') void router.push('/chat')
+    submitQuickAskText(text)
   })
 })
 onUnmounted(() => {
   unsubQuickAsk?.()
   unsubQuickAsk = undefined
+  unsubQuickAskText?.()
+  unsubQuickAskText = undefined
 })
 </script>
 

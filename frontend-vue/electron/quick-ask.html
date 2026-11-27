@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="./quick-ask.css" />
+    <title>快速提问</title>
+  </head>
+  <body>
+    <main class="qa">
+      <label class="qa-label" for="qa-input">快速提问</label>
+      <textarea
+        id="qa-input"
+        rows="2"
+        placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"
+        spellcheck="false"
+        autocomplete="off"
+      ></textarea>
+      <footer class="qa-footer">
+        <span class="qa-hint"><kbd>Esc</kbd> 关闭</span>
+        <button id="qa-send" type="button" class="qa-send">发送</button>
+      </footer>
+    </main>
+    <script src="./quick-ask.js"></script>
+  </body>
+</html>

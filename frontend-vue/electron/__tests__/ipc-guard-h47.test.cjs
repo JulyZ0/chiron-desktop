@@ -101,6 +101,21 @@ test('辅助页保留它真正需要的能力', () => {
   assert.equal(guard.canCall('error', 'desktop:get-app-info'), true)
 })
 
+test('迷你输入框只拿到提交/关闭两条通道', () => {
+  assert.equal(guard.canCall('quickAsk', 'desktop:quick-ask-submit'), true)
+  assert.equal(guard.canCall('quickAsk', 'desktop:quick-ask-cancel'), true)
+  for (const ch of [
+    'desktop:get-token',
+    'desktop:save-token',
+    'desktop:clear-token',
+    'desktop:wipe-data',
+    'desktop:open-path',
+    'desktop:pick-directory',
+  ]) {
+    assert.equal(guard.canCall('quickAsk', ch), false, `quickAsk 不该能调 ${ch}`)
+  }
+})
+
 test('未知窗口种类/通道一律拒绝（默认关闭）', () => {
   assert.equal(guard.canCall('', 'desktop:get-app-info'), false)
   assert.equal(guard.canCall('weird', 'desktop:get-app-info'), false)

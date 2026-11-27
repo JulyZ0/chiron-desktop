@@ -238,4 +238,53 @@ describe('transcriptProjection（已完成回合缓存）', () => {
     const after = second.rows.find(row => row.key === itemKey(items[6]!, 6))
     expect(after).not.toBe(before)
   })
+
+  // L31：流式期间只允许**活跃轮**重投影。上一轮虽然还留在尾部常驻，但它已经定稿，
+  // 每个 token 都重算它等于把长回合的表整片重投影一遍。
+  it('流式 token 只更新活跃轮，常驻的上一轮复用行对象', () => {
+    const items = sample()
+    items.push(user('m4', 'turn-3'), assistant('m5', 'turn-3'))
+    const cache: TurnProjectionCache = new Map()
+    const first = projectTranscript({
+      items, mode: 'grouped', residentTailTurns: 2, running: true, cache,
+    })
+    const prevTurn = first.rows.filter(row => row.turnKey === 't:turn-2')
+    expect(prevTurn.length).toBeGreaterThan(0)
+
+    // 模拟流式：只改最后一轮（turn-3）的正文，其它 item 一律不动。
+    ;(items[items.length - 1] as { content: string }).content = 'a much longer streaming answer'
+    const second = projectTranscript({
+      items, mode: 'grouped', residentTailTurns: 2, running: true, cache,
+    })
+    const prevTurnAfter = second.rows.filter(row => row.turnKey === 't:turn-2')
+    expect(prevTurnAfter.map(row => row.key)).toEqual(prevTurn.map(row => row.key))
+    // 引用相等 ⇒ Vue 子组件 props 不变 ⇒ 不重渲染
+    expect(prevTurnAfter.every((row, i) => row === prevTurn[i])).toBe(true)
+
+    const activeItem = second.rows.find(
+      row => row.turnKey === 't:turn-3' && row.item?.kind === 'text' && row.item.role === 'assistant',
+    )?.item
+    expect(activeItem && 'content' in activeItem ? String(activeItem.content) : '')
+      .toContain('streaming')
+  })
+
+  it('常驻轮退出尾部时校正 resident 标记，且只复制一次', () => {
+    const items = sample()
+    items.push(user('m4', 'turn-3'), assistant('m5', 'turn-3'))
+    const cache: TurnProjectionCache = new Map()
+    // 3 轮 + 尾部常驻 2 ⇒ turn-2 既常驻又已完成 ⇒ 会被缓存，行上写着 resident=true。
+    projectTranscript({ items, mode: 'grouped', residentTailTurns: 2, cache })
+    expect(cache.get('t:turn-2')?.rows.every(row => row.resident)).toBe(true)
+
+    items.push(user('m6', 'turn-4'), assistant('m7', 'turn-4'))
+    const second = projectTranscript({ items, mode: 'grouped', residentTailTurns: 2, cache })
+    const turn2 = second.rows.filter(row => row.turnKey === 't:turn-2')
+    expect(turn2.length).toBeGreaterThan(0)
+    expect(turn2.every(row => row.resident === false)).toBe(true)
+    // 校正结果写回缓存：下一帧不能再生成新对象（否则这一轮每帧都重渲染）。
+    expect(cache.get('t:turn-2')?.rows.every(row => row.resident === false)).toBe(true)
+    const third = projectTranscript({ items, mode: 'grouped', residentTailTurns: 2, cache })
+    const turn2Again = third.rows.filter(row => row.turnKey === 't:turn-2')
+    expect(turn2Again.every((row, i) => row === turn2[i])).toBe(true)
+  })
 })

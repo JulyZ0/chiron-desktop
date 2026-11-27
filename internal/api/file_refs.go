@@ -675,7 +675,7 @@ func projectRootFromLocator(claims *auth.Claims, loc projectLocator, ok bool) (s
 	}
 	// 团队模式：项目根被改到用户隔离目录之外时，@ 引用一律不展开。
 	// 不报错 —— 这层不是"消息非法"，而是"这条上下文不可用"。
-	if !projectRootAllowed(smTenant(claims), claims.UserID, loc.RootPath) {
+	if !projectRootAllowed(smTenant(claims), claims.UserID, claims.Role, loc.RootPath) {
 		slog.Warn("project root outside user isolation; refs skipped",
 			"user_id", claims.UserID, "root_path", loc.RootPath)
 		return "", false

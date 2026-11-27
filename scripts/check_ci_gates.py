@@ -37,6 +37,12 @@ GATES: list[tuple[str, str]] = [
     # ── H21：文档必须被 CI 守住 ──
     ("文档断链检查", r"run:\s*python scripts/check_doc_links\.py"),
     ("Markdown 表格结构检查", r"run:\s*python scripts/check_md_tables\.py"),
+    # ── L29：供应链 ──
+    ("供应链依赖审计独立 job", r"^\s{2}supply-chain:\s*$"),
+    ("pip-audit（版本显式固定）", r"pip-audit==\d+\.\d+\.\d+"),
+    ("SBOM 工具（syft，版本显式固定）", r"anchore/syft/main/install\.sh[\s\S]{0,120}v\d+\.\d+\.\d+"),
+    ("SBOM / 审计报告归档", r"supply-chain-reports"),
+    ("镜像扫描（可修复 CRITICAL 阻塞）", r"--severity CRITICAL --exit-code 1"),
 ]
 
 

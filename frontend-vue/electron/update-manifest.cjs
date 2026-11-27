@@ -81,8 +81,17 @@ function validateLatestManifest(parsed, options = {}) {
   if (lower.includes('arm64') && !wantsArm) errors.push('arch-mismatch')
   if (lower.includes('x64') && wantsArm) errors.push('arch-mismatch')
 
-  const size = Number(file.size)
-  if (!Number.isInteger(size) || size <= 0) errors.push('size-invalid')
+  // 大小是**可选**字段：electron-builder 26 起 `files[]` 只写 `url` + `sha512`
+  // （见 app-builder-lib `out/publish/updateInfoBuilder.js::createUpdateInfo`），
+  // 真实清单里根本没有 size。缺省时不算错误 —— 完整性由强制的 sha512 兜底；
+  // 但**显式写了**非正整数（0、负数、小数、垃圾字符串）仍然拒绝。
+  const hasSize =
+    file.size !== undefined && file.size !== null && String(file.size).trim() !== ''
+  let size = null
+  if (hasSize) {
+    size = Number(file.size)
+    if (!Number.isInteger(size) || size <= 0) errors.push('size-invalid')
+  }
 
   const sha512 = String(file.sha512 || '').trim()
   if (!sha512) {

@@ -190,8 +190,16 @@ func pathWithin(base, target string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-// projectRootAllowed 判断某个项目根是否允许当前用户使用。
-func projectRootAllowed(tenant, userID, root string) bool {
+// projectRootAllowed 判断某个项目根是否允许当前用户**读取/使用**。
+//
+// 判定必须与 `ensureUserProjectDir`（创建路径）保持同一口径：那里对 owner 豁免
+// PROJECTS_ROOT 隔离，这里若仍按隔离根拦截，就会出现"项目建得出来、侧边栏也列得出来，
+// 点进去文件/改动/还原点/提交全部 404"——本地桌面以 owner 身份运行，一旦打开
+// 「服务模式」就会踩到（读路径不豁免，写路径豁免）。
+func projectRootAllowed(tenant, userID, role, root string) bool {
+	if role == "owner" {
+		return true
+	}
 	base := userProjectBase(tenant, userID)
 	if base == "" {
 		return true

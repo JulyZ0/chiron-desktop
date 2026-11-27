@@ -180,3 +180,15 @@ def test_agent_tools_are_not_exposed() -> None:
     provider = registry.build_provider("selfhosted")
     assert provider.agent_tools(_ctx()) == []
     assert provider.agent_instructions(_ctx()) == ""
+
+
+def test_ctx_payload_tenant_id_is_string() -> None:
+    """pageindex-service 的 ``ContextBody.tenant_id`` 是 str（pydantic 严格模式）。
+
+    引擎的 ``ProviderContext.tenant_id`` 是 int；直接透传会让答题/检索请求在请求体
+    校验阶段 422（``string_type`` / ``['body','tenant_id']``），用户看到的是
+    "查知识库时 service_error"。这里钉住序列化口径：始终给字符串，0 收敛成空串。
+    """
+    provider = registry.build_provider("selfhosted")
+    assert provider._ctx_payload(_ctx(tenant_id=1))["tenant_id"] == "1"
+    assert provider._ctx_payload(_ctx(tenant_id=0))["tenant_id"] == ""

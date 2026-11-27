@@ -24,14 +24,27 @@ func TestProjectRootAllowedInsideUserDirectory(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(base, "repo"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if !projectRootAllowed("1", "u1", filepath.Join(base, "repo")) {
+	if !projectRootAllowed("1", "u1", "user", filepath.Join(base, "repo")) {
 		t.Fatal("用户自己的目录应允许")
 	}
-	if projectRootAllowed("1", "u2", filepath.Join(base, "repo")) {
+	if projectRootAllowed("1", "u2", "user", filepath.Join(base, "repo")) {
 		t.Fatal("不能指向别的用户目录")
 	}
-	if projectRootAllowed("1", "u1", filepath.Join(root, "2", "u9")) {
+	if projectRootAllowed("1", "u1", "user", filepath.Join(root, "2", "u9")) {
 		t.Fatal("不能指向别的租户目录")
+	}
+}
+
+// 读路径必须与写路径同一口径：owner 在 ensureUserProjectDir 里被豁免，
+// 这里若仍按 PROJECTS_ROOT 拦截，项目会"建得出来但四个页签全部 404"。
+func TestProjectRootAllowedOwnerBypassesIsolation(t *testing.T) {
+	withProjectIsolationRoot(t, t.TempDir())
+	outside := filepath.Join(t.TempDir(), "my-code")
+	if !projectRootAllowed("1", "u1", "owner", outside) {
+		t.Fatal("owner 不应被 PROJECTS_ROOT 限制")
+	}
+	if projectRootAllowed("1", "u1", "user", outside) {
+		t.Fatal("普通成员仍必须限制在自有目录内")
 	}
 }
 
@@ -42,7 +55,7 @@ func TestProjectRootAllowedRejectsDotDotEscape(t *testing.T) {
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if projectRootAllowed("1", "u1", filepath.Join(base, "..", "..")) {
+	if projectRootAllowed("1", "u1", "user", filepath.Join(base, "..", "..")) {
 		t.Fatal(".. 逃逸必须拒绝")
 	}
 }
@@ -68,7 +81,7 @@ func TestEnsureUserProjectDirCreatesAndRejects(t *testing.T) {
 
 func TestProjectIsolationDisabledAllowsAnyPath(t *testing.T) {
 	withProjectIsolationRoot(t, "")
-	if !projectRootAllowed("1", "u1", filepath.Join(t.TempDir(), "anything")) {
+	if !projectRootAllowed("1", "u1", "user", filepath.Join(t.TempDir(), "anything")) {
 		t.Fatal("桌面模式（未配 PROJECTS_ROOT）不应限制")
 	}
 	if err := ensureUserProjectDir(&auth.Claims{UserID: "u1", TenantID: 1}, "/tmp/x"); err != nil {

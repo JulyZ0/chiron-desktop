@@ -134,6 +134,19 @@ contextBridge.exposeInMainWorld('chironDesktop', {
     ipcRenderer.on(shared.QUICK_ASK_CHANNEL, handler)
     return () => ipcRenderer.removeListener(shared.QUICK_ASK_CHANNEL, handler)
   },
+  /**
+   * 迷你输入框提交的文本（F10 后半）：主进程已把主窗口拉到前台，
+   * 这里把文本交给聊天页直接发送。返回取消订阅函数。
+   */
+  onQuickAskText: callback => {
+    if (typeof callback !== 'function') return () => {}
+    const handler = (_event, payload) => {
+      const text = typeof payload?.text === 'string' ? payload.text : ''
+      if (text) callback(text)
+    }
+    ipcRenderer.on(shared.QUICK_ASK_TEXT_CHANNEL, handler)
+    return () => ipcRenderer.removeListener(shared.QUICK_ASK_TEXT_CHANNEL, handler)
+  },
   onAutoLock: callback => {
     if (typeof callback !== 'function') return () => {}
     const handler = (_event, payload) => callback(payload || {})

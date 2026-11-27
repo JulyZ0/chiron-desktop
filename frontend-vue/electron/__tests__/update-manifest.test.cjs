@@ -118,12 +118,34 @@ test('文件名带路径片段 ⇒ 拒绝（防目录穿越落盘）', () => {
   assert.equal(r.ok, false)
 })
 
-test('大小非正整数 ⇒ 拒绝', () => {
-  for (const size of [0, -1, 1.5, undefined, 'x']) {
+test('大小非正整数 ⇒ 拒绝（显式写了才校验）', () => {
+  for (const size of [0, -1, 1.5, 'x']) {
     const r = gate.validateLatestManifest(manifest({ file: { size } }), { platform: 'win32' })
     assert.equal(r.ok, false, `应拒绝 size=${size}`)
     assert.ok(r.errors.includes('size-invalid'))
   }
+})
+
+test('缺 size 的清单通过（electron-builder 26 的真实形状）', () => {
+  // electron-builder 26 起 latest.yml 的 files[] 只有 url + sha512，没有 size
+  // （app-builder-lib out/publish/updateInfoBuilder.js::createUpdateInfo）。
+  // 若把缺省 size 判成非法，每一次更新检查都会失败（线上表现为 size-invalid）。
+  const { parseLatestYml } = require('../update-check.cjs')
+  const text = [
+    'version: 0.261127.2',
+    'files:',
+    '  - url: Chiron-0.261127.2-win-x64.exe',
+    `    sha512: ${SHA}`,
+    'path: Chiron-0.261127.2-win-x64.exe',
+    `sha512: ${SHA}`,
+    "releaseDate: '2026-11-27T08:34:24.711Z'",
+  ].join('\n')
+  const r = gate.validateLatestManifest(parseLatestYml(text), {
+    platform: 'win32',
+    arch: 'x64',
+  })
+  assert.equal(r.ok, true, JSON.stringify(r.errors))
+  assert.equal(r.manifest.file.url, 'Chiron-0.261127.2-win-x64.exe')
 })
 
 test('架构不匹配 ⇒ 拒绝（避免装错包）', () => {

@@ -44,7 +44,13 @@ fi
 note "Node (pnpm audit --prod)"
 if command -v pnpm >/dev/null 2>&1; then
   ran=$((ran + 1))
-  ( cd "$ROOT/frontend-vue" && pnpm audit --prod ) || failed=$((failed + 1))
+  # **显式指定审计端点所在的 registry**：公司/国内镜像（npmmirror 等）大多没有实现
+  # `/-/npm/v1/security/audits/quick`，`pnpm audit` 会回 ERR_PNPM_AUDIT_ENDPOINT_NOT_EXISTS。
+  # 那是"镜像不支持审计"，不是"依赖有漏洞" —— 让脚本跟着失败只会训练人忽略这条检查。
+  # CI 用默认值（npmjs），本地可用 NPM_AUDIT_REGISTRY 覆盖。
+  ( cd "$ROOT/frontend-vue" \
+      && pnpm audit --prod --registry "${NPM_AUDIT_REGISTRY:-https://registry.npmjs.org}" ) \
+    || failed=$((failed + 1))
 else
   skip "pnpm 未安装"
 fi

@@ -36,6 +36,8 @@ type auditLogTask struct {
 var (
 	auditLogCh   = make(chan auditLogTask, 4096) // 缓冲通道，防背压时丢弃
 	auditLogOnce sync.Once
+	// L08：停机时要等 worker 退出后再把通道里剩下的条目写完（见 DrainAuditLogs）。
+	auditLogWG sync.WaitGroup
 )
 
 // StartAuditLogWorker 启动审计日志 worker（main.go 中调用一次）
@@ -43,24 +45,77 @@ func StartAuditLogWorker(ctx context.Context) {
 	auditLogOnce.Do(func() {
 		const workerCount = 4
 		for i := 0; i < workerCount; i++ {
+			auditLogWG.Add(1)
 			go func(id int) {
+				defer auditLogWG.Done()
 				slog.Debug("audit log worker started", "id", id)
 				for {
 					select {
 					case <-ctx.Done():
+						// 这里**不**顺手排空：此刻 srv.Shutdown 可能还在处理在途请求，
+						// 它们会继续往通道里塞审计；真正的收尾由 DrainAuditLogs 在
+						// HTTP 停接之后统一做（否则 worker 与 drain 抢同一条通道）。
 						return
 					case task := <-auditLogCh:
-						meta := map[string]interface{}{
-							"status": task.status,
-							"method": task.method,
-							"path":   task.path,
-						}
-						db.AuditLog(task.ctx, task.userID, task.tenantID, task.method, task.path, "", task.remoteAddr, meta)
+						writeAuditTask(task)
 					}
 				}
 			}(i)
 		}
 	})
+}
+
+// writeAuditTask 把一条审计写进 Redis Stream。
+//
+// 用**脱钩**的 context：任务是异步处理的，而 `task.ctx` 是 HTTP 请求的 context ——
+// `ServeHTTP` 返回后它就被取消。直接把取消了的 ctx 交给 XAdd，写会失败且只在
+// Redis 客户端层面可见，表现为"审计时有时无"（这是 L08「最终 flush」的另一半：
+// 先保证写本身不会因为 ctx 取消而必然失败）。
+func writeAuditTask(task auditLogTask) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(task.ctx), 3*time.Second)
+	defer cancel()
+	meta := map[string]interface{}{
+		"status": task.status,
+		"method": task.method,
+		"path":   task.path,
+	}
+	db.AuditLog(ctx, task.userID, task.tenantID, task.method, task.path, "", task.remoteAddr, meta)
+}
+
+// DrainAuditLogs 停机收尾：先等 worker 退出（ctx 取消后它们会返回），再把缓冲里
+// 剩下的条目同步写完。超出 ctx 预算就明确记录**丢弃条数**，而不是静默消失。
+//
+// 顺序必须是"先等 worker、再排空"：反过来的话，还活着的 worker 与这里会并发消费
+// 同一条通道，虽然不会重复写，但"还剩多少没写"就无法用 len 判断了。
+func DrainAuditLogs(ctx context.Context) {
+	workersDone := make(chan struct{})
+	go func() {
+		auditLogWG.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+	case <-ctx.Done():
+		slog.Warn("audit log workers did not stop before shutdown deadline", "buffered", len(auditLogCh))
+		return
+	}
+
+	drained := 0
+	for {
+		select {
+		case task := <-auditLogCh:
+			writeAuditTask(task)
+			drained++
+		case <-ctx.Done():
+			slog.Warn("audit log drain incomplete: entries will be lost", "drained", drained, "remaining", len(auditLogCh))
+			return
+		default:
+			if drained > 0 {
+				slog.Info("audit log drain complete", "entries", drained)
+			}
+			return
+		}
+	}
 }
 
 type responseWriter struct {

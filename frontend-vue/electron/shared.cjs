@@ -126,6 +126,16 @@ const ENGINE_CRASH_CHANNEL = 'desktop:engine-crash'
 const QUICK_ASK_CHANNEL = 'desktop:quick-ask'
 
 /**
+ * 迷你输入框提交后，主进程把文本转发给主界面。
+ *
+ * 为什么要经过主进程而不是迷你窗口直接调用渲染层接口：两个窗口是**不同的
+ * webContents**，没有共享 JS 上下文；也只有主进程同时持有两者的引用。
+ * 通道名必须与 preload 的 `onQuickAskText` 逐字一致 —— 拼错不会报错，只会
+ * 让"在迷你框里回车"看起来毫无反应。
+ */
+const QUICK_ASK_TEXT_CHANNEL = 'desktop:quick-ask-text'
+
+/**
  * 主进程建窗时把「这个窗口有没有系统标题栏」告诉 preload。
  *
  * 取值 `custom` | `inset` | `native`（见 preload 的 titleBar.mode 注释）。
@@ -330,6 +340,7 @@ module.exports = {
   AUTO_LOCK_CHANNEL,
   ENGINE_CRASH_CHANNEL,
   QUICK_ASK_CHANNEL,
+  QUICK_ASK_TEXT_CHANNEL,
   TITLEBAR_ARG_PREFIX,
   WINDOW_CHANNELS,
   PIP_INDEX_MIRRORS,

@@ -811,3 +811,117 @@ jobs:
           fi
 
           exit "$fail"
+
+  # ── 供应链（L29）───────────────────────────────────────────────────────────
+  #
+  # 口径：
+  #   · 依赖审计（govulncheck / pip-audit / pnpm audit）与 SBOM **每次 PR/push 都跑**，
+  #     报告 + SBOM 统一归档为 artifact；
+  #   · 依赖审计目前是 **advisory**（continue-on-error）：存量依赖里还没清零的漏洞
+  #     一旦设为阻塞，这条门禁会被立刻关掉（H18 说的正是这种失败形态）。清零后
+  #     把 `continue-on-error: true` 去掉即可，脚本本身已经是"有漏洞退出 1"；
+  #   · 镜像扫描只对**可修复的 CRITICAL** 阻塞（`--ignore-unfixed`），且只在
+  #     push / tag / 手动时跑：PR 里重复构建镜像会把反馈时间翻倍。
+  supply-chain:
+    name: Supply chain (audit + SBOM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: .go-version
+          cache: true
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend-vue/pnpm-lock.yaml
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      # 三个工具的版本都**显式固定**：审计工具自身入供应链，浮动版本等于把
+      # "这次为什么红/绿"交给上游（与 govulncheck 在 go job 里的口径一致）。
+      - name: Install audit tools (pinned)
+        run: |
+          python -m pip install --upgrade pip "pip-audit==2.10.1"
+          go install "golang.org/x/vuln/cmd/govulncheck@v1.1.4"
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin v1.57.2
+
+      - name: Install frontend deps (audit needs the lockfile graph)
+        working-directory: frontend-vue
+        run: pnpm install --frozen-lockfile
+
+      - name: Dependency audit + SBOM
+        continue-on-error: true
+        run: |
+          mkdir -p .artifacts/sbom
+          set -o pipefail
+          bash scripts/dep_audit.sh --sbom .artifacts/sbom 2>&1 | tee .artifacts/audit.log
+
+      - name: Upload audit reports and SBOM
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: supply-chain-reports
+          if-no-files-found: warn
+          path: |
+            .artifacts/audit.log
+            .artifacts/sbom/**
+
+  # 镜像扫描：对外唯一入口（Go 网关）+ 数据面（Python 引擎）。
+  # 构建失败本身就让这一步红 —— 镜像建不出来时，"扫不到漏洞"不是通过。
+  container-scan:
+    name: Container image scan
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install trivy (pinned)
+        run: |
+          curl -sSfL -o /tmp/trivy.tgz \
+            https://github.com/aquasecurity/trivy/releases/download/v0.76.2/trivy_0.76.2_Linux-64bit.tar.gz
+          tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy
+          trivy --version
+
+      - name: Build gateway image
+        run: docker build -f scripts/integration/Dockerfile.gateway -t chiron-gateway:ci .
+
+      - name: Build python engine image
+        run: docker build -t chiron-engine:ci python-engine
+
+      - name: Prepare report dir
+        run: mkdir -p .artifacts
+
+      # 阻塞门槛：**有修复版本的 CRITICAL**。`--ignore-unfixed` 是必须的 ——
+      # 基础镜像里"上游还没发补丁"的 CVE 我们无法在本仓修，卡在这里只会让人
+      # 把整条扫描关掉；它仍然会出现在下面的全量报告里。
+      - name: Scan (fail on fixable CRITICAL)
+        run: |
+          for image in chiron-gateway:ci chiron-engine:ci; do
+            echo "== $image"
+            trivy image --quiet --scanners vuln --ignore-unfixed \
+              --severity CRITICAL --exit-code 1 "$image"
+          done
+
+      - name: Full report (non-blocking)
+        if: always()
+        run: |
+          for image in chiron-gateway:ci chiron-engine:ci; do
+            name="${image%%:*}"
+            trivy image --quiet --scanners vuln --format json \
+              -o ".artifacts/trivy-${name#chiron-}.json" "$image" || true
+          done
+
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-scan-reports
+          if-no-files-found: warn
+          path: .artifacts/trivy-*.json

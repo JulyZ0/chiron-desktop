@@ -31,7 +31,7 @@ import { privateKey } from '../utils/privateStorage'
 import { playUiSound } from '../utils/uiSounds'
 import { planReconnect } from '../utils/streamReattach'
 import { notify } from '../utils/notify'
-import { consumeQuickAsk, onQuickAsk } from '../utils/quickAsk'
+import { consumeQuickAsk, consumeQuickAskText, onQuickAsk, onQuickAskText } from '../utils/quickAsk'
 import { useThemeStore } from '../stores/theme'
 import { useChatSessionStore } from '../stores/chatSession'
 import { useChatRunState } from '../composables/useChatRunState'
@@ -507,6 +507,8 @@ const sseLastIdBySession = new Map<string, string>()
 // so the reset is registered as a hook and released on unmount.
 let unregisterAuthScopedReset: (() => void) | undefined
 let unsubQuickAsk: (() => void) | undefined
+/** 迷你输入框提交（F10 后半）：与本页已挂载时直接发送的通道。 */
+let unsubQuickAskText: (() => void) | undefined
 
 /** 该会话是否有一条本页的会话流（子 Agent 通道据此决定同一帧交给谁） */
 function hasSessionStream(sid: string): boolean {
@@ -1899,6 +1901,9 @@ onMounted(async () => {
   const focusComposer = () => { void nextTick(() => chatInputRef.value?.focus?.()) }
   if (consumeQuickAsk()) focusComposer()
   unsubQuickAsk = onQuickAsk(focusComposer)
+  // 迷你输入框提交（F10 后半）：本页已挂载时直接发送；挂载前到达的那条由下面的
+  // `consumeQuickAskText()` 在会话恢复之后消费。
+  unsubQuickAskText = onQuickAskText(text => { void sendMessage(text) })
   unregisterAuthScopedReset = registerAuthScopedReset(() => {
     // 认证切换：续传游标与全部会话流一起作废（旧身份的事件流不该在新身份下继续被消费）
     sseLastIdBySession.clear()
@@ -1923,6 +1928,10 @@ onMounted(async () => {
   if (!unifiedMode.value && sessions.value.length > 0) {
     await switchSession(sessions.value[0].id)
   }
+  // 迷你输入框提交（F10 后半）：**等会话恢复完**再发。提前发会在 activeSessionId
+  // 仍为空时新建一个会话，与正在恢复的历史会话并存 —— 用户看到的是"多出一个空会话"。
+  const pendingAsk = consumeQuickAskText()
+  if (pendingAsk) void sendMessage(pendingAsk)
   // 互联互通：同一路由下 query 变化（如 WorkstationNav 再次跳转）
   watch(() => route.query, () => applyRouteQuery())
   // 监听网络在线/离线状态
@@ -1939,6 +1948,8 @@ onMounted(async () => {
 onUnmounted(() => {
   unsubQuickAsk?.()
   unsubQuickAsk = undefined
+  unsubQuickAskText?.()
+  unsubQuickAskText = undefined
   unregisterAuthScopedReset?.()
   unregisterAuthScopedReset = undefined
   stopTurnTimer()
