@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -382,11 +384,12 @@ func (h *UploadHandler) Complete(w http.ResponseWriter, r *http.Request) {
 	// assetID 仅在 purpose=media 时由 finalizeMedia 返回（其余用途不落 media_assets）
 	var fileURL string
 	var assetID string
+	duplicateDoc := false
 	switch up.Purpose {
 	case "media":
 		assetID, fileURL, err = h.finalizeMedia(r, tenantStr(claims.TenantID), up, stream)
 	case "kb_doc":
-		fileURL, err = h.finalizeKBDoc(r, tenantStr(claims.TenantID), up, stream)
+		fileURL, duplicateDoc, err = h.finalizeKBDoc(r, tenantStr(claims.TenantID), up, stream)
 	default:
 		fileURL, err = h.finalizeGeneric(up, stream)
 	}
@@ -416,6 +419,8 @@ func (h *UploadHandler) Complete(w http.ResponseWriter, r *http.Request) {
 	OK(w, map[string]interface{}{
 		"upload_id": uploadID, "file_url": fileURL, "asset_id": assetID,
 		"purpose": up.Purpose, "name": up.Name, "size": up.Size,
+		// duplicate=true：内容已在库里，本次没有新增文档（分片/upload 行仍正常收尾）。
+		"duplicate": duplicateDoc,
 	})
 }
 
@@ -586,45 +591,59 @@ func (h *UploadHandler) finalizeKBDoc(r *http.Request, tenantID string, up struc
 	ChunkSize int
 	ChunkCnt  int
 	Received  []string
-}, stream io.Reader) (string, error) {
+}, stream io.Reader) (string, bool, error) {
 	if up.ParentID == "" {
-		return "", fmt.Errorf("kb_doc upload requires parent_id (kb_id)")
+		return "", false, fmt.Errorf("kb_doc upload requires parent_id (kb_id)")
 	}
 	// 校验 KB 存在且归属当前租户当前用户，同时取出 provider 用于类型校验
 	var owner, provider string
 	if err := db.GlobalDBManager.QueryRow(r.Context(),
 		`SELECT user_id, provider FROM knowledge_bases WHERE id = $1 AND tenant_id = $2`, up.ParentID, tenantID).Scan(&owner, &provider); err != nil || owner != up.UserID {
-		return "", fmt.Errorf("knowledge base not found or not owned")
+		return "", false, fmt.Errorf("knowledge base not found or not owned")
 	}
 	// 类型必须在**落库前**拒绝（原因见 kb_file_types.go 顶部）：
 	// 这条路径不经过 Python 引擎，provider.supports() 管不到这里。
 	// 旧的 `ext == "" → txt` 兜底也一并去掉 —— 它等于给任意文件开后门。
 	if !kbSuffixAllowed(provider, up.Name) {
-		return "", kbUnsupportedTypeError{msg: kbTypeRejection(provider, up.Name)}
+		return "", false, kbUnsupportedTypeError{msg: kbTypeRejection(provider, up.Name)}
 	}
 	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(up.Name)), ".")
 	docID, err := id.UUID()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	tenant := parseTenantID(tenantID)
 	// 与 Python `blob.build_key` 同形的 key；前缀 `knowledge/` 对齐
 	// `KNOWLEDGE_LOCAL_PATH` / `KNOWLEDGE_S3_PREFIX` 的存储根。
 	storageKey := kbStorageKey(tenant, up.ParentID, docID, up.Name)
 	objectPath := kbBlobPrefix + storageKey
-	// 流式写入：不再把整份文件读进内存（旧实现为拼 SQL 参数必须整体驻留）。
-	if err := h.store.WriteStream(r.Context(), objectPath, stream, up.Size, 0o644); err != nil {
-		return "", fmt.Errorf("store knowledge blob: %w", err)
+	// 流式写入并**顺带**算内容哈希：不额外读一遍文件（最大 64MB）。
+	hasher := sha256.New()
+	if err := h.store.WriteStream(r.Context(), objectPath, io.TeeReader(stream, hasher), up.Size, 0o644); err != nil {
+		return "", false, fmt.Errorf("store knowledge blob: %w", err)
 	}
+	contentSHA := hex.EncodeToString(hasher.Sum(nil)) // 64 位十六进制
+
+	// 跨会话/跨批次去重：同一租户、同一知识库、内容哈希相同 ⇒ 已经有这份文档。
+	// 查询失败（迁移未跑/列不存在）时 continue 而不是失败：去重是优化，不是上传前提。
+	var existingDocID string
+	if err := db.GlobalDBManager.QueryRow(r.Context(),
+		`SELECT id FROM knowledge_documents
+		  WHERE tenant_id = $1 AND knowledge_base_id = $2 AND content_sha256 = $3
+		  LIMIT 1`, tenantID, up.ParentID, contentSHA).Scan(&existingDocID); err == nil && existingDocID != "" {
+		_ = h.store.Delete(r.Context(), objectPath)
+		return fmt.Sprintf("/kb/%s/documents/%s", up.ParentID, existingDocID), true, nil
+	}
+
 	_, err = db.GlobalDBManager.Exec(r.Context(),
-		`INSERT INTO knowledge_documents (id, tenant_id, knowledge_base_id, user_id, name, file_type, file_size_bytes, storage_key, status, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NOW(), NOW())`,
-		docID, tenantID, up.ParentID, up.UserID, up.Name, ext, up.Size, storageKey)
+		`INSERT INTO knowledge_documents (id, tenant_id, knowledge_base_id, user_id, name, file_type, file_size_bytes, storage_key, content_sha256, status, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', NOW(), NOW())`,
+		docID, tenantID, up.ParentID, up.UserID, up.Name, ext, up.Size, storageKey, contentSHA)
 	if err != nil {
 		// 落库失败就把刚写的原文删掉，否则对象存储里会攒下没有行引用的孤儿文件
 		// （没有任何路径能再找到它们，只能靠离线巡检）。
 		_ = h.store.Delete(r.Context(), objectPath)
-		return "", err
+		return "", false, err
 	}
 	// 重算 KB 统计（带 tenant_id 限制）
 	// `SUM(...)::bigint`：`file_size_bytes` 是 bigint，`SUM` 返回 numeric；赋值给
@@ -635,7 +654,7 @@ func (h *UploadHandler) finalizeKBDoc(r *http.Request, tenantID string, up struc
 		 SET document_count = (SELECT COUNT(*) FROM knowledge_documents WHERE knowledge_base_id = $1 AND tenant_id = $2),
 		     total_size_bytes = COALESCE((SELECT SUM(file_size_bytes) FROM knowledge_documents WHERE knowledge_base_id = $1 AND tenant_id = $2)::bigint, 0),
 		     updated_at = NOW() WHERE id = $1 AND tenant_id = $2`, up.ParentID, tenantID)
-	return fmt.Sprintf("/kb/%s/documents/%s", up.ParentID, docID), nil
+	return fmt.Sprintf("/kb/%s/documents/%s", up.ParentID, docID), false, nil
 }
 
 // finalizeGeneric 合并文件写入通用目录并返回可访问 URL。

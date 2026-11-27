@@ -448,8 +448,10 @@ async function handleUpload(info: UploadRequestOptions) {
   await acquireUploadSlot()
   try {
     const handle = await createChunkUpload(file, { purpose: 'kb_doc', parentId: kbId })
-    await handle.done
-    uploadBatch.ok++
+    const result = await handle.done
+    // 服务端按内容 sha256 判重：内容已在库里就不新增文档，也不重复建索引。
+    if (result?.duplicate) uploadBatch.skipped++
+    else uploadBatch.ok++
     info.onSuccess?.({})
   } catch (error) {
     uploadBatch.failed++

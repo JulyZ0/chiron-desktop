@@ -38,7 +38,7 @@ export interface ChunkUploadHandle {
   resume: () => void
   abort: () => void
   /** asset_id 仅在 purpose=media 时由服务端返回（落 media_assets 后可用它换签名 URL） */
-  done: Promise<{ file_url: string; upload_id: string; size: number; asset_id?: string }>
+  done: Promise<{ file_url: string; upload_id: string; size: number; asset_id?: string; duplicate?: boolean }>
 }
 
 const DEFAULT_CHUNK = 2 * 1024 * 1024
@@ -193,7 +193,7 @@ export async function createChunkUpload(file: File, opts: ChunkUploadOptions): P
     localStorage.removeItem(storageKey)
     const data = res.data?.data
     progressFns.forEach(fn => fn(100))
-    return data as { file_url: string; upload_id: string; size: number; asset_id?: string }
+    return data as { file_url: string; upload_id: string; size: number; asset_id?: string; duplicate?: boolean }
   })()
 
   return {
