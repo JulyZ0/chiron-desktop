@@ -1,5 +1,9 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
+  budget_scope_user: "个人",
+  budget_scope_tenant: "团队",
+  budget_near: "{scope}今日费用已用到 {pct}%（{used}/{limit} 元）",
+  budget_reached: "{scope}今日费用已达上限（{used}/{limit} 元），后续请求会被拒绝",
   help_me_make_a_project_plan: "帮我做一个项目计划",
   planning: "方案策划",
   session_stats_tokens_cost_cache_hits_throughput_popover: "会话统计：tokens / 费用 / 缓存命中 / 吞吐（悬浮窗）",

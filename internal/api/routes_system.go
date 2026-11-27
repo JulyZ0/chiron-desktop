@@ -35,6 +35,8 @@ func registerSystemRoutes(
 	// 逐组件健康态：客户端状态栏需要它把"已连接"落到实处（此前只看 navigator.onLine）。
 	// 回的是各依赖的可用性与失败原因，不含全局计数/评分，故按登录用户开放即可。
 	mux.Handle("GET /v1/system/components", authMW(rlMW(http.HandlerFunc(systemHandler.ComponentsHealth))))
+	// F12：当前用户的日费用/预算读数（只读；管理端配额仍是唯一写入口）。
+	mux.Handle("GET /v1/usage/budget", authMW(rlMW(http.HandlerFunc(GetUsageBudget))))
 	mux.Handle("GET /v1/system/spans", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(systemHandler.Spans)))))
 	mux.Handle("GET /v1/system/traces", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(systemHandler.Traces)))))
 	mux.Handle("GET /v1/metrics", authMW(rlMW(RequirePermission(auth.PermAdminRead)(http.HandlerFunc(systemHandler.Metrics)))))

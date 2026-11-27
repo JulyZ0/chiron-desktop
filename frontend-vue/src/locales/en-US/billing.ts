@@ -1,5 +1,9 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
+  budget_scope_user: "Personal",
+  budget_scope_tenant: "Team",
+  budget_near: "{scope} daily budget is {pct}% used ({used}/{limit})",
+  budget_reached: "{scope} daily budget has been reached ({used}/{limit}); further requests will be rejected",
   help_me_make_a_project_plan: "Help me make a project plan",
   planning: "Planning",
   session_stats_tokens_cost_cache_hits_throughput_popover: "Session stats: tokens / cost / cache hits / throughput (popover)",

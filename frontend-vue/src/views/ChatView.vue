@@ -96,6 +96,8 @@ import { HistoryOutlined, ExportOutlined, BulbOutlined, BulbFilled, MoreOutlined
 import { splitThinking, stripUserInputTag, formatClock, formatSize, countItemsAfter, mergeTurnStats } from '../components/chat/chat-types'
 import { normalizeMeta } from '../components/chat/chat-history'
 import { describeApiError } from '../utils/apiError'
+import { getUsageBudget } from '../api/usage'
+import { evaluateBudget } from '../utils/budgetWarning'
 import { buildWorkbenchContext, chipsFromWorkbenchContext, clampKbWeight, CONTEXT_QUERY_KEYS, DEFAULT_KB_WEIGHT, parseContextQuery, type ContextChip } from '../components/chat/contextChips'
 import type { ChatItem, ChatSession, ChatAttachment, TurnStatsItem, TextItem } from '../components/chat/chat-types'
 
@@ -796,6 +798,45 @@ async function refreshSessionCost() {
   } catch {
     // 拉不到就不显示 —— 这是展示信息，不该打断对话
     sessionCostCents.value = null
+  }
+  void checkBudgetWarning()
+}
+
+// ── F12：日费用预算提醒（80% / 100% 各一次，不自动中断） ──
+let budgetCheckedAt = 0
+
+function budgetWarnKey(scope: string, level: number): string {
+  const day = new Date().toISOString().slice(0, 10)
+  return `chiron:budget-warn:${day}:${scope}:${level}`
+}
+
+async function checkBudgetWarning(): Promise<void> {
+  // 每 5 分钟最多查一次：refreshSessionCost 在每段 `done` 都会触发。
+  if (Date.now() - budgetCheckedAt < 5 * 60 * 1000) return
+  budgetCheckedAt = Date.now()
+  let b
+  try {
+    b = await getUsageBudget()
+  } catch {
+    return // 读不到就不提醒；这是辅助信息
+  }
+  for (const w of evaluateBudget(b)) {
+    const key = budgetWarnKey(w.scope, w.level)
+    try {
+      if (localStorage.getItem(key)) continue
+      localStorage.setItem(key, '1')
+    } catch {
+      // 存不下就每次都提示：宁可重复，也不要静默
+    }
+    const scopeLabel = t(w.scope === 'user' ? 'billing.budget_scope_user' : 'billing.budget_scope_tenant')
+    notify.warning(
+      t(w.level >= 100 ? 'billing.budget_reached' : 'billing.budget_near', {
+        scope: scopeLabel,
+        pct: w.pct,
+        used: (w.usedCents / 100).toFixed(2),
+        limit: (w.limitCents / 100).toFixed(2),
+      }),
+    )
   }
 }
 
@@ -1795,6 +1836,7 @@ onMounted(async () => {
   })
   // 互联互通：解析 /chat query（task / error / kb / agent / skill）
   await applyRouteQuery()
+  void checkBudgetWarning()
   await loadSessions()
   void loadPersonas()
   // 统一任务模式不自动切换普通会话；其余保持原有行为

@@ -1,5 +1,9 @@
 // 从 legacy 迁移的语义化 key（L1-4）
 export default {
+  budget_scope_user: "شخصي",
+  budget_scope_tenant: "الفريق",
+  budget_near: "استُهلك {pct}% من ميزانية {scope} اليومية ({used}/{limit})",
+  budget_reached: "تم بلوغ ميزانية {scope} اليومية ({used}/{limit})؛ ستُرفض الطلبات التالية",
   help_me_make_a_project_plan: "ساعدني في وضع خطة مشروع",
   planning: "تخطيط",
   session_stats_tokens_cost_cache_hits_throughput_popover: "إحصائيات الجلسة: الرموز / التكلفة / إصابات الذاكرة المؤقتة / الإنتاجية (نافذة منبثقة)",
