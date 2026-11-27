@@ -419,6 +419,8 @@ export default {
   workbench_tab_checkpoints: "还原点",
   workbench_tab_history: "提交",
   workbench_search_content_placeholder: "在项目文件中搜索内容（回车）",
+  workbench_turn_changes: "本回合改动 {n} 个文件",
+  workbench_turn_changes_checkpoints: "还原点",
   workbench_search_content_action: "搜索",
   workbench_search_content_empty: "没有匹配的内容",
   workbench_search_content_unsupported: "当前项目文件在设备上，暂不支持内容搜索",

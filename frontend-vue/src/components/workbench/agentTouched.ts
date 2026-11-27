@@ -50,6 +50,12 @@ export function normalizeForCompare(path: string): string {
  * 返回的是**原始路径字符串**而不是归一化后的：调用方要用它去读文件或做绝对路径
  * 映射，归一化只该用于比较。比较时各自调用 `normalizeForCompare`。
  */
+/** 一条工具调用是否写文件，以及写给哪个路径（非写工具返回空串）。 */
+export function writePathOfToolCall(name: string, args: unknown): string {
+  if (!WRITE_TOOL_NAMES.has(name)) return ''
+  return toolTargetPath(name, typeof args === 'string' ? args : String(args ?? ''))
+}
+
 export function collectAgentWrittenPaths(items: ChatItem[]): string[] {
   const seen = new Set<string>()
   const out: string[] = []

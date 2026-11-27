@@ -29,7 +29,7 @@ const net = vi.hoisted(() => ({
   calls: [] as Array<{ projectId: string; path: string; resolve: (v: unknown) => void }>,
   /** `readProjectFile` 的返回值：二进制预览那个分支要能构造出 `binary: true` */
   readResult: { path: '', binary: false, size: 0, content: '' },
-  searchResult: { files: [], truncated: false, unsupported: false },
+  searchResult: { files: [] as Array<{ path: string; line: number; text: string }>, truncated: false, unsupported: false },
 }))
 
 vi.mock('../../../api/projectFiles', () => ({
@@ -471,5 +471,29 @@ describe('工作台的内容搜索（F6）', () => {
     await flush()
 
     expect(wrapper.text()).toContain('暂不支持内容搜索')
+  })
+})
+
+
+describe('工作台的「本回合改动」（F4）', () => {
+  it('用回合级路径列出改动，点开复用单文件 diff', async () => {
+    net.calls.length = 0
+    const wrapper = mountPanel({ projectId: 'p1', turnWrittenPaths: ['C:/p1/src/a.ts'] })
+    await flush()
+    net.calls[0].resolve(listing('C:/p1', 'a.ts'))
+    await flush()
+
+    const tabs = wrapper.findAll('.wb-tab')
+    await tabs[1].trigger('click') // 改动页签
+    await flush()
+
+    const turn = wrapper.find('.wb-turn')
+    expect(turn.exists()).toBe(true)
+    expect(turn.text()).toContain('本回合改动')
+    expect(turn.text()).toContain('src/a.ts')
+
+    await turn.find('.wb-change').trigger('click')
+    await flush()
+    expect(changesNet.diffs.at(-1)?.path).toBe('src/a.ts')
   })
 })

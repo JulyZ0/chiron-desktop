@@ -83,11 +83,13 @@ const props = withDefaults(
      * 也看不到"改了又改回去"的文件，而用户仍然想知道它碰过哪里。
      */
     agentWrittenPaths?: string[]
+    /** 本回合 agent 写过的路径（F4：回合级审阅） */
+    turnWrittenPaths?: string[]
   }>(),
   // `handleSide` 兜底 'right'：默认布局下工作台在**最左**，与主会话相邻的是它的
   // 右边缘，手柄就该贴右边。兜底反了的话，只要调用方漏传，手柄会跑到窗口外缘，
   // 用户就再也拖不动这一栏了。
-  { projectId: '', projectName: '', handleSide: 'right', agentWrittenPaths: () => [] },
+  { projectId: '', projectName: '', handleSide: 'right', agentWrittenPaths: () => [], turnWrittenPaths: () => [] },
 )
 
 const emit = defineEmits<{
@@ -330,6 +332,30 @@ const changeCount = computed(() => {
   const data = changesData.value
   if (!data?.repo) return 0
   return changeRows.value.filter(r => !r.agentOnly).length
+})
+
+/** 本回合改动的行：路径来自实时工具事件，状态尽量复用 git 列表里那一行。 */
+const turnRows = computed<ChangeRow[]>(() => {
+  const gitRows = new Map(changeRows.value.map(r => [pathKey(r.path), r]))
+  const out: ChangeRow[] = []
+  const seen = new Set<string>()
+  for (const raw of props.turnWrittenPaths ?? []) {
+    const { rel, inside } = projectRelative(raw, rootPath.value)
+    if (!inside || !rel) continue
+    const key = pathKey(rel)
+    if (seen.has(key)) continue
+    seen.add(key)
+    const matched = gitRows.get(key)
+    out.push({
+      path: rel,
+      status: matched?.status || '',
+      insertions: matched?.insertions,
+      deletions: matched?.deletions,
+      agentTouched: true,
+      agentOnly: matched?.agentOnly ?? false,
+    })
+  }
+  return out
 })
 
 // H60：改动列表与文件预览都按 (project, path) 取。切项目后旧响应回来会把
@@ -1207,6 +1233,36 @@ async function openWithSystem(entry: ProjectFileEntry) {
             v-if="changesData?.head"
             class="wb-changes-head"
           >{{ tr('chat.workbench_changes_head', { head: changesData.head }) }}</div>
+          <!-- F4：本回合改动（会话级实时数据，不依赖 git 是否记录） -->
+          <div
+            v-if="turnRows.length"
+            class="wb-turn"
+          >
+            <div class="wb-turn-head">
+              <span>{{ tr('chat.workbench_turn_changes', { n: turnRows.length }) }}</span>
+              <button
+                type="button"
+                class="wb-btn"
+                @click="selectTab('checkpoints')"
+              >{{ tr('chat.workbench_turn_changes_checkpoints') }}</button>
+            </div>
+            <div
+              v-for="row in turnRows"
+              :key="`turn-${row.path}`"
+              class="wb-row wb-change"
+              role="treeitem"
+              tabindex="0"
+              :title="row.path"
+              @click="openChange(row)"
+              @keydown.enter.prevent="openChange(row)"
+            >
+              <span
+                class="wb-status"
+                :class="`st-${row.status || 'x'}`"
+              >{{ row.status || '•' }}</span>
+              <span class="wb-name">{{ row.path }}</span>
+            </div>
+          </div>
           <div
             v-if="!changeRows.length"
             class="wb-empty"
@@ -1800,4 +1856,11 @@ async function openWithSystem(entry: ProjectFileEntry) {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .wb-code :deep(.code-line.line-focus) { background: var(--warning-bg, var(--primary-bg)); }
+/* F4：本回合改动 */
+.wb-turn { border-bottom: var(--hairline-width) solid var(--border-subtle); padding-bottom: 4px; }
+.wb-turn-head {
+  display: flex; align-items: center; gap: 6px; padding: 4px 10px;
+  font-size: var(--fs-xs); color: var(--text-tertiary);
+}
+.wb-turn-head > span { flex: 1; min-width: 0; }
 </style>

@@ -47,7 +47,7 @@ import ChatEmptyHero from '../components/chat/ChatEmptyHero.vue'
 import ChatInput from '../components/chat/ChatInput.vue'
 import WorkbenchPanel from '../components/workbench/WorkbenchPanel.vue'
 import { toggleWorkbench, workbenchOpen } from '../components/workbench/useWorkbench'
-import { collectAgentWrittenPaths } from '../components/workbench/agentTouched'
+import { collectAgentWrittenPaths, normalizeForCompare, writePathOfToolCall } from '../components/workbench/agentTouched'
 import SessionMapView from './sessionmap/SessionMapView.vue'
 import { pickStreamPreview } from './sessionmap/streamPreview'
 import ChatSetupTour from '../components/chat/ChatSetupTour.vue'
@@ -431,6 +431,21 @@ const {
  * 纯函数，那里写明了两条数据源为什么要分开。
  */
 const agentWrittenPaths = computed(() => collectAgentWrittenPaths(items.value))
+
+/**
+ * 本回合 agent 写过的文件（F4）。与 `agentWrittenPaths`（整场会话）分开：
+ * 审阅"这一轮改了什么"必须是回合级；整场列表会把上一轮的改动也混进来。
+ * 发送新消息时重置；tool_call 帧到达时追加（去重按归一化路径）。
+ */
+const turnWrittenPaths = ref<string[]>([])
+function noteTurnWrite(d: Record<string, unknown>): void {
+  const path = writePathOfToolCall(String(d.name ?? ''), d.arguments)
+  if (!path) return
+  const key = normalizeForCompare(path)
+  if (!key) return
+  if (turnWrittenPaths.value.some(p => normalizeForCompare(p) === key)) return
+  turnWrittenPaths.value = [...turnWrittenPaths.value, path]
+}
 /**
  * ── SSE 连接**按会话**持有（H59）──
  *
@@ -2299,6 +2314,7 @@ const onSSEMessage = createSseDispatcher({
   runOf,
   onTextChunk,
   onThinkingChunk,
+  onToolCall: noteTurnWrite,
   flushStreamingFlags,
   applyTodos: (sid, todos, revision) => {
     todoPanel.applyEvent(sid, todos as never, revision as never)
@@ -2479,6 +2495,8 @@ async function sendMessage(
   // H69：本轮的回合序号。gap 重拉提交前拿它做 CAS —— 即使新一轮**已经跑完**
   // （loading 回到 false），这个数也变了，旧快照不会把这一轮的产出盖掉。
   runOf(sessionId).turnSeq += 1
+  // 新一轮开始：本回合改动从空开始（上一轮已审阅完，保留只会混淆）。
+  turnWrittenPaths.value = []
   currentTraceId.value = ''
   try {
     // H59/H60：与断线重连共用**同一套**装配（attachSessionStream），否则两处
@@ -2714,6 +2732,7 @@ function continueGeneration() {
         :project-name="activeProject?.name || ''"
         :project-error="activeProjectError"
         :agent-written-paths="agentWrittenPaths"
+        :turn-written-paths="turnWrittenPaths"
         :handle-side="layoutSwapped ? 'left' : 'right'"
         @close="toggleWorkbench()"
         @reference="onWorkbenchReference"

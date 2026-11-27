@@ -416,6 +416,8 @@ export default {
   workbench_tab_checkpoints: "Restore points",
   workbench_tab_history: "Commits",
   workbench_search_content_placeholder: "Search file contents (press Enter)",
+  workbench_turn_changes: "{n} file(s) changed this turn",
+  workbench_turn_changes_checkpoints: "Restore points",
   workbench_search_content_action: "Search",
   workbench_search_content_empty: "No matching content",
   workbench_search_content_unsupported: "Content search is not available for device-hosted projects yet",

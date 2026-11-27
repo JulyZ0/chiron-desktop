@@ -62,3 +62,14 @@ describe('workbench/agentTouched（agent 写过的文件）', () => {
     expect(normalizeForCompare('D:\\Proj\\Src\\A.ts')).toBe('d:/proj/src/a.ts')
   })
 })
+
+
+describe('writePathOfToolCall', () => {
+  it('只认写工具；读工具返回空串', async () => {
+    const { writePathOfToolCall } = await import('../agentTouched')
+    expect(writePathOfToolCall('write_file', '{"path":"src/a.ts"}')).toBe('src/a.ts')
+    expect(writePathOfToolCall('edit_file', '{"path":"src/b.ts"}')).toBe('src/b.ts')
+    expect(writePathOfToolCall('read_file', '{"path":"src/c.ts"}')).toBe('')
+    expect(writePathOfToolCall('TodoWrite', '{}')).toBe('')
+  })
+})

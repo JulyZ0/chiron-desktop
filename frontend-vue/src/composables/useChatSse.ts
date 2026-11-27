@@ -55,6 +55,8 @@ export interface ChatSsePorts {
   runOf: (sid: string) => SessionRunState
   onTextChunk: (text: string) => void
   onThinkingChunk: (text: string) => void
+  /** 工具调用事件 → 视图侧附加动作（F4：本回合写过的文件）；投影本身仍在这里。 */
+  onToolCall?: (d: Record<string, unknown>) => void
   flushStreamingFlags: () => void
   applyTodos: (sid: string, todos: unknown[], revision: unknown) => void
   mergeStats: (
@@ -112,6 +114,7 @@ export function createSseDispatcher(ports: ChatSsePorts) {
       ports.onThinkingChunk(String(d.content ?? evt.content ?? ''))
     } else if (type === 'tool_call') {
       projectToolCall(ports.items.value, d)
+      ports.onToolCall?.(d)
     } else if (type === 'tool_result') {
       projectToolResult(ports.items.value, d)
     } else if (type === 'todo_updated') {

@@ -419,6 +419,8 @@ export default {
   workbench_tab_checkpoints: "نقاط الاستعادة",
   workbench_tab_history: "الالتزامات",
   workbench_search_content_placeholder: "ابحث في محتوى الملفات (اضغط Enter)",
+  workbench_turn_changes: "تغيّر {n} ملف في هذه الجولة",
+  workbench_turn_changes_checkpoints: "نقاط الاستعادة",
   workbench_search_content_action: "بحث",
   workbench_search_content_empty: "لا يوجد محتوى مطابق",
   workbench_search_content_unsupported: "البحث في المحتوى غير متاح بعد للمشاريع المستضافة على الجهاز",

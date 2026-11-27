@@ -94,6 +94,16 @@ function makePorts(overrides: Partial<ChatSsePorts> = {}) {
 }
 
 describe('createSseDispatcher：事件 → 生命周期', () => {
+  it('tool_call 同时通知视图侧（F4 记录本回合写过的文件）', () => {
+    const { ports } = makePorts()
+    const onToolCall = vi.fn()
+    const onSSE = createSseDispatcher({ ...ports, onToolCall })
+    onSSE({ type: 'tool_call', data: { id: 'tc1', name: 'write_file', arguments: '{"path":"a.ts"}' } }, 's1')
+    expect(onToolCall).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'write_file', arguments: '{"path":"a.ts"}' }),
+    )
+  })
+
   it('tool_call / tool_result 走纯投影', () => {
     const { ports, items } = makePorts()
     const onSSE = createSseDispatcher(ports)
