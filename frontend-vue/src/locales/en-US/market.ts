@@ -61,6 +61,7 @@ export default {
   installing: 'Installing…',
   install_confirm_title: 'Install “{name}”?',
   install_confirm_hint: 'You can uninstall it at any time. If it needs credentials, fill in the environment variables below first.',
+  install_confirm_permissions: "Permissions required: {summary}",
   uninstall: 'Uninstall',
   uninstalling: 'Uninstalling…',
   uninstall_confirm_title: 'Uninstall “{name}”?',

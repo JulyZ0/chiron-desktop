@@ -507,3 +507,34 @@ describe('SubAgentPanel 的父→子 steer（F1）', () => {
     expect((wrapper.find('.steer-input').element as HTMLInputElement).value).toBe('late')
   })
 })
+
+
+describe('SubAgentPanel 的看板视图（F3）', () => {
+  it('按运行中/完成/失败分列，卡片可点开', async () => {
+    subagentApi.listSubagentRuns.mockResolvedValue({
+      runs: [
+        { run_id: 'rs_run', depth: 1, status: 'running', profile: 'worker' },
+        { run_id: 'rs_ok', depth: 1, status: 'completed', profile: 'reviewer' },
+        { run_id: 'rs_bad', depth: 1, status: 'failed', profile: 'tester' },
+      ],
+      source: 'redis',
+    })
+    subagentApi.getSubagentRunEvents.mockResolvedValue({ events: [], source: 'redis' })
+    const wrapper = mount(SubAgentPanel, { props: { sessionId: 's1', liveEvents: [] as never } })
+    await flushPromises()
+
+    await wrapper.find('.sa-mode').trigger('click')
+    await flushPromises()
+
+    const cols = wrapper.findAll('.sa-board-col')
+    expect(cols).toHaveLength(3)
+    expect(cols[0].text()).toContain('运行中')
+    expect(cols[0].findAll('.sa-board-card')).toHaveLength(1)
+    expect(cols[1].findAll('.sa-board-card')).toHaveLength(1)
+    expect(cols[2].findAll('.sa-board-card')).toHaveLength(1)
+
+    await cols[1].find('.sa-board-card').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.output').isVisible()).toBe(true)
+  })
+})

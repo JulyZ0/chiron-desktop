@@ -61,6 +61,7 @@ export default {
   installing: 'جارٍ التثبيت…',
   install_confirm_title: 'تثبيت «{name}»؟',
   install_confirm_hint: 'يمكنك إلغاء التثبيت في أي وقت. إذا احتاج العنصر إلى بيانات اعتماد، فاملأ متغيّرات البيئة أدناه أولًا.',
+  install_confirm_permissions: "الأذونات المطلوبة: {summary}",
   uninstall: 'إلغاء التثبيت',
   uninstalling: 'جارٍ إلغاء التثبيت…',
   uninstall_confirm_title: 'إلغاء تثبيت «{name}»؟',

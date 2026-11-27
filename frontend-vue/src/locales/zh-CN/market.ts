@@ -69,6 +69,7 @@ export default {
   installing: '安装中…',
   install_confirm_title: '确认安装「{name}」？',
   install_confirm_hint: '安装后可随时卸载；需要凭据的条目请先在下方填写环境变量。',
+  install_confirm_permissions: "将需要的权限：{summary}",
   uninstall: '卸载',
   uninstalling: '卸载中…',
   uninstall_confirm_title: '确认卸载「{name}」？',

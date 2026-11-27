@@ -394,7 +394,9 @@ function askInstall(it: MarketItem) {
 function confirmInstall(it: MarketItem, env: Record<string, string>) {
   Modal.confirm({
     title: tr('market.install_confirm_title', { name: it.name }),
-    content: tr('market.install_confirm_hint'),
+    // F13：安装前把"这条内容要什么权限"逐项摆出来（详情页已有摘要，确认框不该只剩一句泛化提示）。
+    content: `${tr('market.install_confirm_hint')}
+${tr('market.install_confirm_permissions', { summary: permissionSummary(it) })}`,
     okText: tr('market.install'),
     cancelText: tr('common.cancel'),
     onOk: () => doInstall(it, env),

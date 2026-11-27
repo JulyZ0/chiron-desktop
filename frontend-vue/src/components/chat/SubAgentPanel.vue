@@ -285,6 +285,26 @@ const liveTail = computed(() => liveScan.value.tails)
 /** 已到终态的 run 状态（这些状态之后不再有增量，只补一次尾巴） */
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'killed', 'stopped', 'lost', 'done'])
 
+/** F3：运行列表的呈现方式（列表 / 看板列视图）。看板不新增数据，只换分组方式。 */
+const saMode = ref<'list' | 'board'>('list')
+
+const boardColumns = computed(() => {
+  const running: SubagentRunView[] = []
+  const done: SubagentRunView[] = []
+  const failed: SubagentRunView[] = []
+  for (const run of displayRuns.value) {
+    const st = String(run.status)
+    if (!TERMINAL_STATUSES.has(st)) running.push(run)
+    else if (st === 'completed' || st === 'done') done.push(run)
+    else failed.push(run)
+  }
+  return [
+    { id: 'running', label: 'agent.subagent_board_running', runs: running },
+    { id: 'done', label: 'agent.subagent_board_done', runs: done },
+    { id: 'failed', label: 'agent.subagent_board_failed', runs: failed },
+  ]
+})
+
 /** 是否还有运行中的 run（决定「全部停止」是否出现） */
 const hasRunning = computed(() => displayRuns.value.some(r => !TERMINAL_STATUSES.has(r.status)))
 
@@ -1086,6 +1106,13 @@ onBeforeUnmount(() => {
         class="sa-tab sa-dispatch"
         @click="openDispatch"
       >＋ {{ $t('agent.subagent_dispatch') }}</button>
+      <button
+        v-if="saTab === 'runs'"
+        type="button"
+        class="sa-tab sa-mode"
+        :title="$t('agent.subagent_board_toggle')"
+        @click="saMode = saMode === 'list' ? 'board' : 'list'"
+      >{{ saMode === 'list' ? '▦' : '☰' }}</button>
     </nav>
 
     <Spin
@@ -1097,6 +1124,62 @@ onBeforeUnmount(() => {
         :description="$t('agent.no_sub_agent_has_run_in_this_session_yet')"
         :image="Empty.PRESENTED_IMAGE_SIMPLE"
       />
+      <!-- F3：看板列视图（运行中 / 完成 / 失败）——数据与列表完全同源。 -->
+      <div
+        v-else-if="saMode === 'board'"
+        class="sa-board"
+      >
+        <section
+          v-for="col in boardColumns"
+          :key="col.id"
+          class="sa-board-col"
+        >
+          <h4 class="sa-board-title">
+            {{ $t(col.label) }}<span class="sa-board-count">{{ col.runs.length }}</span>
+          </h4>
+          <div
+            v-for="run in col.runs"
+            :key="run.run_id"
+            class="sa-board-card"
+            role="button"
+            tabindex="0"
+            :title="run.summary || run.run_id"
+            @click="openRunDetails(run.run_id)"
+            @keydown.enter.prevent="openRunDetails(run.run_id)"
+          >
+            <div class="sa-board-card-head">
+              <span class="sa-board-name">{{ run.profile || run.run_id.slice(-6) }}</span>
+              <Tag :color="STATUS_COLOR[run.status] || 'default'">
+                {{ run.status }}
+              </Tag>
+            </div>
+            <div class="sa-board-meta">
+              {{ $t('workflow.steps') }} {{ run.usage?.steps || 0 }}
+              · ↑{{ run.usage?.input_tokens || 0 }}/↓{{ run.usage?.output_tokens || 0 }}
+            </div>
+            <div class="sa-board-actions">
+              <button
+                v-if="!TERMINAL_STATUSES.has(String(run.status))"
+                type="button"
+                class="sa-board-btn"
+                :disabled="cancelling.has(run.run_id)"
+                @click.stop="stopRun(run.run_id)"
+              >{{ $t('common.stop') }}</button>
+              <button
+                v-else-if="run.status === 'failed' || run.status === 'lost'"
+                type="button"
+                class="sa-board-btn"
+                :disabled="rerunning.has(run.run_id)"
+                @click.stop="rerunRun(run)"
+              >{{ $t('common.retry') }}</button>
+            </div>
+          </div>
+          <div
+            v-if="!col.runs.length"
+            class="sa-board-empty"
+          >—</div>
+        </section>
+      </div>
       <div
         v-else
         class="timeline"
@@ -1493,7 +1576,7 @@ onBeforeUnmount(() => {
     <Modal
       v-model:open="showDispatch"
       :title="$t('agent.subagent_dispatch')"
-      :ok-text="$t('common.send')"
+      :ok-text="$t('chat.input.send')"
       :cancel-text="$t('common.cancel')"
       :confirm-loading="dispatching"
       :ok-button-props="{ disabled: !dispatchTask.trim() }"
@@ -1730,6 +1813,38 @@ onBeforeUnmount(() => {
 }
 .art-item:hover { background: var(--surface-2, rgba(127, 127, 127, 0.08)); color: var(--text-primary, #262626); }
 .art-item.copied { color: var(--success, #16a34a); }
+/* F3：看板列视图 */
+.sa-board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.sa-board-col {
+  min-width: 0; padding: 6px; border-radius: var(--radius-md);
+  background: var(--surface-2, rgba(127, 127, 127, 0.06));
+}
+.sa-board-title {
+  margin: 0 0 6px; font-size: var(--fs-xs); color: var(--text-tertiary);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.sa-board-count { font-family: var(--font-mono); }
+.sa-board-card {
+  padding: 6px 8px; margin-bottom: 6px; border-radius: var(--radius-sm);
+  background: var(--bg-card); border: var(--hairline-width) solid var(--border-subtle);
+  cursor: pointer;
+}
+.sa-board-card:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: 1px; }
+.sa-board-card-head { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
+.sa-board-name {
+  font-size: var(--fs-xs); color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sa-board-meta { margin-top: 2px; font-size: var(--fs-xs); color: var(--text-tertiary); }
+.sa-board-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
+.sa-board-btn {
+  border: none; background: transparent; color: var(--primary);
+  font-size: var(--fs-xs); cursor: pointer; padding: 0 2px;
+}
+.sa-board-btn:disabled { opacity: .5; cursor: default; }
+.sa-board-empty { font-size: var(--fs-xs); color: var(--text-tertiary); text-align: center; padding: 4px; }
+.sa-mode { flex: none; min-width: 28px; }
+
 /* F3：委派表单 */
 .dispatch-form { display: flex; flex-direction: column; gap: 8px; }
 .dispatch-hint { margin: 0; font-size: var(--fs-xs); color: var(--text-tertiary); }
