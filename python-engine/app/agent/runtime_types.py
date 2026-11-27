@@ -134,6 +134,11 @@ class AgentEvent:
     #: 前缀缓存诊断：`{prefix_changed: ["system"|"tools", ...]}`。命中率掉下来时回答"为什么" ——
     #: 稳定前缀被打断通常就是这两处之一（空列表 = 与上一轮逐字相同，缓存应当命中）。
     cache: dict[str, Any] = field(default_factory=dict)
+    #: 本轮验证结论（仅 `done`）：`{status, command, kind, exit_code, wrote_files}`。
+    #: status = passed | failed | unverified | not-needed；由 `agent/verification.py`
+    #: 从本轮**真实执行过**的 shell_exec 结果里记账得出。前端据此显示"验证通过/失败/
+    #: 未验证"，而不是只看模型自己说"改完了"。
+    verification: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     timestamp: float = field(default_factory=time.time)
     # ── Trace ID (新增: 支持分布式链路追踪) ──

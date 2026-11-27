@@ -487,6 +487,11 @@ type PythonEvent struct {
 	Context map[string]any `json:"context,omitempty"`
 	Cache   map[string]any `json:"cache,omitempty"`
 
+	// Verification 是 `done` 事件上的本轮验证结论（N6）：
+	// `{status, command, kind, exit_code, wrote_files}`。不声明就会被重新序列化丢掉，
+	// 前端只能继续看模型自述"改完了" —— 与 Budget/Context/Cache 同一条教训。
+	Verification map[string]any `json:"verification,omitempty"`
+
 	// DurationMS 是这一步的耗时（`trace_span` 等事件带）。
 	//
 	// 前端的 `turn_stats` 汇总它来显示本轮耗时；漏声明时该字段恒为 0，

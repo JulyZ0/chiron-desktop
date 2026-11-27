@@ -25,6 +25,7 @@ import {
   projectToolCall,
   projectToolResult,
   projectUsage,
+  projectVerification,
 } from '../components/chat/sseProjection'
 import type { CompactionInfo } from '../components/chat/sseProjection'
 
@@ -170,6 +171,8 @@ export function createSseDispatcher(ports: ChatSsePorts) {
       ports.cacheSnapshot.value = (d.cache && typeof d.cache === 'object')
         ? (d.cache as CacheSnapshot)
         : null
+      // N6：本轮验证结论（只会在最终 done 上带）。`not-needed` 不插行。
+      projectVerification(ports.items.value, d.verification, ports.t)
       void ports.refreshSessionCost()
     } else if (type === 'turn_done') {
       ports.flushStreamingFlags()

@@ -2032,6 +2032,9 @@ def _event_payload(event: Any) -> dict[str, Any]:
         "budget": event.budget,
         "context": event.context,
         "cache": event.cache,
+        # 本轮验证结论（仅 done）：passed / failed / unverified / not-needed。
+        # 与 budget/context/cache 同属"引擎决定字段集合"的快照，用对象整体转发。
+        "verification": event.verification,
         # 任务清单修订号（仅 todo_updated 非 0）：前端据此**丢弃**乱序到达的旧事件。
         # 漏掉它，前端的 shouldApply 收到 undefined 就退化成"永远接受"，
         # 重连补发 / 多副本接力时面板倒退一格。

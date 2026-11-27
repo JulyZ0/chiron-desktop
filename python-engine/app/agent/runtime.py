@@ -144,6 +144,7 @@ from app.agent.tool_execution import (
     execute_tool,
     guarded_execute_tool,
 )
+from app.agent.verification import VerificationTracker, revision_nudge
 from app.config import settings
 from app.gateway.errors import is_context_overflow
 from app.gateway.router import GatewayRouter
@@ -3228,6 +3229,15 @@ class AgentRuntime:
                     + total_output_tokens
                 )
 
+            # ── N6：本次 run 的验证账本 ──
+            # 跨轮累计（一轮里可能先改文件、下一轮才跑测试）；只统计真实执行过的
+            # shell_exec（审批/护栏拦下的不算），以及是否改过文件。
+            # 结论随最终 `done` 事件回传，前端据此显示"通过/失败/未验证"。
+            verification = VerificationTracker()
+            #: 只补一次"先修好再收尾"：模型第二次仍不收口时按现状结束，
+            #: 不把一次未验证变成无限续轮。
+            verification_nudged = False
+
             for turn in range(start_turn, task.max_turns):
                 # 差距C：本轮在**执行图**里的节点 id（llm / tool 调用都挂在它下面）。
                 turn_span_id = f"{trace_id}:turn:{turn + 1}"
@@ -3966,6 +3976,15 @@ class AgentRuntime:
                             }
                             batch_results[call["id"]] = tool_result
 
+                        # N6：先于护栏记账 —— 护栏会替换 `tool_result`（放进"无进展"说明），
+                        # 但"这条验证命令执行过、exit code 是多少"是既成事实，不能被改掉。
+                        verification.note_execution(
+                            str(call.get("name", "")),
+                            call.get("arguments"),
+                            tool_result,
+                            executed=call["id"] in executed_ids,
+                        )
+
                         # 循环护栏（**执行后**）：换了工具/参数，结果却始终一样 → 无进展。
                         # 放在收尾而不是执行处：并发组没有"执行顺序"，统一在这里按原始顺序判定。
                         if call["id"] in executed_ids:
@@ -4301,6 +4320,30 @@ class AgentRuntime:
                         type="text",
                         content=reasoning_content,
                     )
+
+                # ── N6：收口前检查验证结论 ──
+                #
+                # 只在"改了文件"且"验证失败/未验证"时补一轮（见 VerificationTracker.needs_revision）：
+                # 模型已经准备结束，但本轮没有任何证据表明改动是好的。把事实回灌给它，
+                # 让它先修或先跑验证；**只补一次** —— 第二次仍不收口就按现状结束，
+                # 由 `done.verification` 如实告诉用户"未验证"，而不是继续烧预算。
+                if (
+                    not verification_nudged
+                    and not self._unattended
+                    and self._awaiting_input is None
+                    and verification.needs_revision()
+                ):
+                    verification_nudged = True
+                    _vsummary = verification.summary()
+                    logger.info(
+                        "verification closure: one more round (status=%s command=%s)",
+                        _vsummary.status,
+                        _vsummary.command or "-",
+                    )
+                    messages.append(
+                        _normalize_msg(role="user", content=revision_nudge(_vsummary))
+                    )
+                    continue
                 break
 
             # ── S6b：可选的 rubric 自查回合（默认关）──
@@ -4490,6 +4533,9 @@ class AgentRuntime:
                     model,
                     sections=_system_sections,
                 ),
+                # N6：本轮验证结论（passed / failed / unverified / not-needed）。
+                # 前端据此显示徽标；「未验证」也是**事实**，不装作通过。
+                verification=verification.summary().to_event(),
                 trace_id=trace_id,
             )
             logger.info(

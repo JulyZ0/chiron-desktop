@@ -8,6 +8,7 @@ import {
   projectToolCall,
   projectToolResult,
   projectUsage,
+  projectVerification,
 } from '../sseProjection'
 
 describe('SSE 纯投影', () => {
@@ -101,6 +102,46 @@ describe('SSE 纯投影', () => {
       tone: 'info',
       content: '已应用补充指令',
       id: 'steer:2000',
+    })
+  })
+
+  describe('N6 验证结论', () => {
+    const t = (key: string, params: Record<string, unknown> = {}) => {
+      if (key === 'common.verification_passed') return `通过:${params.command}`
+      if (key === 'common.verification_failed') return `失败:${params.command}:${params.code}`
+      if (key === 'common.verification_unverified') return '未验证'
+      return key
+    }
+
+    it('通过落 info，失败落 warning 并带退出码', () => {
+      const items: ChatItem[] = []
+      projectVerification(items, { status: 'passed', command: 'pnpm test' }, t, () => 1)
+      expect(items[0]).toMatchObject({ kind: 'notice', tone: 'info', content: '通过:pnpm test' })
+
+      const failed: ChatItem[] = []
+      projectVerification(
+        failed,
+        { status: 'failed', command: 'go test ./...', exit_code: 2 },
+        t,
+        () => 2,
+      )
+      expect(failed[0]).toMatchObject({
+        kind: 'notice',
+        tone: 'warning',
+        content: '失败:go test ./...:2',
+      })
+    })
+
+    it('未验证是 warning；not-needed 与缺字段都不插行', () => {
+      const items: ChatItem[] = []
+      projectVerification(items, { status: 'unverified', wrote_files: true }, t, () => 3)
+      expect(items[0]).toMatchObject({ kind: 'notice', tone: 'warning', content: '未验证' })
+
+      const quiet: ChatItem[] = []
+      projectVerification(quiet, { status: 'not-needed' }, t)
+      projectVerification(quiet, undefined, t)
+      projectVerification(quiet, {}, t)
+      expect(quiet).toHaveLength(0)
     })
   })
 })

@@ -145,6 +145,40 @@ export function projectKnowledgeRetrieval(
   })
 }
 
+/**
+ * 本轮验证结论（N6）：`done.verification` 转成一行 notice。
+ *
+ * 只展示三档真实状态：通过 / 失败 / 未验证。`not-needed`（没改文件也没跑验证）
+ * 不插行 —— 否则每个只读问答都会多一条"无需验证"的噪音。
+ */
+export function projectVerification(
+  items: ChatItem[],
+  verification: unknown,
+  t: (key: string, params?: Record<string, unknown>) => string,
+  now: () => number = Date.now,
+): void {
+  if (!verification || typeof verification !== 'object') return
+  const v = verification as Obj
+  const status = String(v.status ?? '')
+  if (status !== 'passed' && status !== 'failed' && status !== 'unverified') return
+  const command = String(v.command ?? '')
+  const code = v.exit_code
+  const content =
+    status === 'passed'
+      ? t('common.verification_passed', { command })
+      : status === 'failed'
+        ? t('common.verification_failed', { command, code: String(code ?? '?') })
+        : t('common.verification_unverified')
+  if (!content) return
+  items.push({
+    kind: 'notice',
+    // 通过是中性事实（info），失败/未验证需要用户注意（warning）。
+    tone: status === 'passed' ? 'info' : 'warning',
+    content,
+    id: `verify:${now()}`,
+  })
+}
+
 export interface CompactionInfo {
   beforeTokens: number
   afterTokens: number
