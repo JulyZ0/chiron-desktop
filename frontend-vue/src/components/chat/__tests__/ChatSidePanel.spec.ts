@@ -45,7 +45,7 @@ beforeEach(() => {
 /** open: false —— 活动轮询会直接返回，测试只关心「可用工具」区块 */
 function mountPanel(
   sessions: any[] = [],
-  view: 'trajectory' | 'sessions' | 'agents' | 'stats' = 'trajectory',
+  view: 'trajectory' | 'sessions' = 'trajectory',
   contextChips: Array<{ type: 'kb' | 'agent' | 'skill' | 'plugin' | 'memory'; label: string; value: string; weight?: number }> = [],
 ) {
   return mount(ChatSidePanel, {

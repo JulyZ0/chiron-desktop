@@ -243,3 +243,28 @@ describe('ChatInput（`@` 提及触发条件）', () => {
     expect(wrapper.find('.mention-menu').exists()).toBe(false)
   })
 })
+
+describe('ChatInput（运行中追加指令）', () => {
+  it('Ctrl/Cmd+Enter 在运行中走 steer，不打断、也不触发 send', async () => {
+    const wrapper = mountInput({ loading: true })
+    const ta = wrapper.find('textarea')
+
+    await ta.setValue('换个方向')
+    await ta.trigger('keydown', { key: 'Enter', ctrlKey: true })
+
+    expect(wrapper.emitted('steer')?.[0]?.[0]).toBe('换个方向')
+    expect(wrapper.emitted('send')).toBeUndefined()
+    expect(wrapper.emitted('stop')).toBeUndefined()
+  })
+
+  it('未运行时 Ctrl+Enter 仍按普通发送处理', async () => {
+    const wrapper = mountInput({ loading: false })
+    const ta = wrapper.find('textarea')
+
+    await ta.setValue('普通发送')
+    await ta.trigger('keydown', { key: 'Enter', ctrlKey: true })
+
+    expect(wrapper.emitted('send')?.[0]?.[0]).toBe('普通发送')
+    expect(wrapper.emitted('steer')).toBeUndefined()
+  })
+})

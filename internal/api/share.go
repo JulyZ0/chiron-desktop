@@ -33,6 +33,9 @@ type ShareHandler struct {
 	// access 记录一次成功访问（见 share_access.go）。抽成函数类型是为了单测注入，
 	// 且**不阻塞**响应：写入发生在响应之后的独立协程里。nil = 不统计（测试默认）。
 	access shareAccessWriter
+	// passwordGuard 记密码失败次数并在阈值后短锁（见 share_guard.go）。
+	// nil = 关闭计数（单测默认）；生产由 NewShareHandler 注入 Redis 实现。
+	passwordGuard sharePasswordGuard
 }
 
 // shareQuerier 收拢 `PublicGet` 需要的两个方法；`*db.DBManager` 天然满足。
@@ -42,7 +45,14 @@ type shareQuerier interface {
 }
 
 func NewShareHandler(a *auth.Authenticator, sm *session.Manager, cfg *config.Config) *ShareHandler {
-	return &ShareHandler{authenticator: a, sessionMgr: sm, cfg: cfg, store: db.GlobalDBManager, access: dbShareAccessWriter}
+	return &ShareHandler{
+		authenticator: a,
+		sessionMgr:    sm,
+		cfg:           cfg,
+		store:         db.GlobalDBManager,
+		access:        dbShareAccessWriter,
+		passwordGuard: redisSharePasswordGuard{},
+	}
 }
 
 // shareToken generates a random unguessable share id (80 bits entropy, base32
@@ -416,12 +426,39 @@ func (h *ShareHandler) PublicGet(w http.ResponseWriter, r *http.Request) {
 	}
 	// 密码在失效判断之后、取内容之前：撤销/过期的链接不该再暴露"它有密码"这一层
 	// （那是给仍然有效的链接才需要的提示）。
-	if passwordHash != "" && !sharePasswordMatches(passwordHash, r.Header.Get(sharePasswordHeader)) {
-		// 401 而不是 403：访客是**未通过这道门**，前端据此渲染密码输入框。
-		// 文案与响应体都不回显任何密码相关片段，避免错误的密码被反射进页面/日志。
-		JSONWithCode(w, http.StatusUnauthorized, CodeSharePasswordRequired,
-			map[string]interface{}{"password_required": true}, "share password required")
-		return
+	if passwordHash != "" {
+		ipHash := ""
+		if h.passwordGuard != nil {
+			ipHash = hashShareIP(remoteIP(r))
+		}
+		// 先看锁：锁定期间连 bcrypt 都不跑，否则短锁挡不住 CPU 消耗。
+		// ipHash 为空（拿不到来源 IP）时不计数 —— 把所有未知来源塞进同一个桶，
+		// 等于让一个人锁住全部分享。
+		if ipHash != "" {
+			if retry, locked := h.passwordGuard.locked(r.Context(), shareID, ipHash); locked {
+				rejectSharePasswordLocked(w, retry)
+				return
+			}
+		}
+		provided := r.Header.Get(sharePasswordHeader)
+		if !sharePasswordMatches(passwordHash, provided) {
+			// 只统计**提供了密码但错误**的尝试。首次打开时浏览器不带这个头，
+			// 把它也计入会让正常访客在第 5 次刷新后莫名被锁。
+			if ipHash != "" && strings.TrimSpace(provided) != "" {
+				if retry, locked := h.passwordGuard.recordFailure(r.Context(), shareID, ipHash); locked {
+					rejectSharePasswordLocked(w, retry)
+					return
+				}
+			}
+			// 401 而不是 403：访客是**未通过这道门**，前端据此渲染密码输入框。
+			// 文案与响应体都不回显任何密码相关片段，避免错误的密码被反射进页面/日志。
+			JSONWithCode(w, http.StatusUnauthorized, CodeSharePasswordRequired,
+				map[string]interface{}{"password_required": true}, "share password required")
+			return
+		}
+		if ipHash != "" {
+			h.passwordGuard.clearFailures(r.Context(), shareID, ipHash)
+		}
 	}
 	if maxViews != nil && views >= int64(*maxViews) {
 		JSONWithCode(w, http.StatusGone, CodeShareViewLimit,

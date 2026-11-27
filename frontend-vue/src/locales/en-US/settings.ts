@@ -266,24 +266,21 @@ export default {
   isolation_floor_badge: "Floor",
   isolation_active_badge: "Active",
   isolation_pick: "Choose a tier",
+  isolation_levels_hint: "Switching applies to processes started afterwards; already-running processes are unaffected.",
+  isolation_unavailable_badge: "Unavailable on this machine",
+  isolation_maintenance: "Maintenance & cleanup",
   isolation_reprobe: "Re-check local capabilities",
   isolation_reprobe_done: "Re-checked local isolation capabilities.",
   isolation_reprobe_failed: "Re-check failed.",
-  isolation_retry_unavailable: "This tier is currently unavailable. Enable the elevation helper or fix the missing mechanism first.",
+  isolation_retry_unavailable: "This tier is currently unavailable. Fix the missing mechanism first, then retry.",
 
   isolation_level_none: "No isolation",
-  isolation_level_none_desc: "Tools run with the same privileges as the main process. **Provides no boundary at all**; for troubleshooting only.",
+  isolation_level_none_desc: "Tools run with the same privileges as the main process. Provides no boundary at all; for troubleshooting only.",
   isolation_level_job: "Job object",
   isolation_level_job_desc: "Limits the process tree and resources so a timeout or revoke can end the whole group. Does not restrict file or network access.",
   isolation_level_low_il: "Low integrity",
   isolation_level_low_il_desc:
     "Windows low integrity level: writes to the user profile, credential stores and similar locations are denied. Files owned by the same user can still be read — it does not block reads.",
-  isolation_level_restricted: "Restricted token",
-  isolation_level_restricted_desc:
-    "Restricted token plus a dedicated desktop: admin groups and write-capable privileges are removed, so the process can only write the workspace. Requires the engine to run as administrator; falls back to Low integrity when unavailable.",
-  isolation_level_appcontainer: "App container",
-  isolation_level_appcontainer_desc:
-    "Strongest tier: its own container identity, with file and network access granted per-capability. Requires administrator rights to provision the container profile; unavailable in some environments.",
   isolation_level_container: "Container (Kiri)",
   isolation_level_container_desc:
     "Every command runs in a disposable container: own namespaces and cgroup, read-only root filesystem, no network, only the workspace mounted, default seccomp. The runtime (Kiri) is not bundled — download it below on demand. When it is missing, execution is refused rather than falling back.",
@@ -304,34 +301,12 @@ export default {
 
   isolation_revoke_title: "Remove isolation artifacts",
   isolation_revoke_body:
-    "Deletes the system objects created for isolation on this machine: the app container profile, directory grants, and the low-integrity label on the workspace. Leaving them behind keeps the workspace low-labelled, which affects later unisolated use.",
+    "Removes the Low-integrity label from the workspace and cleans up profiles/path grants left by the legacy container tier. Without this, the workspace can stay low-labeled and affect later unisolated use.",
   isolation_revoke_button: "Remove isolation artifacts",
   isolation_revoke_confirm: "Remove the on-device isolation artifacts? Running isolated processes are unaffected.",
   isolation_revoke_done: "Isolation artifacts removed.",
   isolation_revoke_partial: "Some artifacts could not be removed; see details: {detail}",
   isolation_revoke_failed: "Failed to remove isolation artifacts.",
-
-  isolation_helper_title: "Restricted-token execution helper",
-  isolation_helper_body:
-    "The \"restricted token\" tier needs processes created with a restricted token, and that step requires administrator rights. Rather than elevating the whole app, only a tiny helper process is elevated: its sole capability is \"start a process with a restricted token\", which is less privileged than the app itself. The helper exits automatically when the app exits.",
-  isolation_helper_enable: "Enable helper (requires administrator approval)",
-  isolation_helper_disable: "Disable helper",
-  isolation_helper_running: "Helper running",
-  isolation_helper_stopped: "Helper not running",
-  isolation_helper_blocked:
-    "The \"restricted token\" tier is therefore unavailable. Enable the helper to switch to it.",
-  isolation_helper_engine_elevated:
-    "The app is already running as administrator, so this tier needs no helper.",
-  isolation_helper_unsupported:
-    "This platform does not support the elevated helper, so this tier is unavailable.",
-  isolation_helper_confirm:
-    "A system authorization prompt (UAC) will appear next; choose \"Yes\". The helper gains exactly one capability — starting processes with a restricted token — and will not run your commands as administrator.",
-  isolation_helper_enabled: "Helper enabled; the \"restricted token\" tier is now available.",
-  isolation_helper_cancelled:
-    "Authorization cancelled: the system prompt was declined, so the helper did not start.",
-  isolation_helper_enable_failed: "Failed to enable the helper: {reason}",
-  isolation_helper_disabled: "Helper disabled.",
-  isolation_helper_disable_failed: "Failed to disable the helper: {reason}",
 
   isolation_load_failed: "Failed to read the isolation tier.",
   isolation_auth_pending:

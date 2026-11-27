@@ -119,7 +119,11 @@ async def handle_kb_index(
         api_key=api_key,
         # LLM 连接与模型同源（resolved 是 env → 网关 /models 的结果）：
         # 只取 cfg.llm_backend() 会漏掉"端点/key 只在网关里配过"的那份配置。
-        llm=(resolved.llm_backend() if mode == "selfhosted" else {}),
+        llm=(
+            resolved.llm_backend(session_id=f"chiron-kb-{kb_id}")
+            if mode == "selfhosted"
+            else {}
+        ),
     )
     adapter = Adapter(mode=mode, cfg=cfg, models=resolved)
     await store.set_kb_status(kb_id, "indexing")

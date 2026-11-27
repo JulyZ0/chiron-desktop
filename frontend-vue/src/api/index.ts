@@ -619,7 +619,8 @@ export const PUBLIC_SHARE_TIMEOUT_MS = 10_000
 
 /**
  * 公开分享读取（无鉴权；已撤销返回 410、已过期返回 410+`share_expired`、
- * 达到访问上限返回 410+`share_view_limit`、需要密码返回 401+`share_password_required`）。
+ * 达到访问上限返回 410+`share_view_limit`、需要密码返回 401+`share_password_required`、
+ * 密码连续错误触发短锁返回 429+`share_locked`）。
  * 走 /v1/share/{id} 与 SPA /s/:token 路由分离（S 修复 路径冲突）。
  *
  * 两个刻意的请求选项：
@@ -1724,14 +1725,12 @@ export async function setKBVisibility(id: string, visibility: 'private' | 'tenan
  * 隔离档位，由弱到强。
  *
  * 必须与后端 `app/isolation/__init__.py` 的 `Level` 枚举**逐项对齐**：
- * 少了哪一档，那一档在界面上就不存在（`restricted` 此前就是这样丢的）。
+ * 少了哪一档，那一档在界面上就不存在。
  */
 export type IsolationLevel =
   | 'none'
   | 'job'
   | 'low_il'
-  | 'restricted'
-  | 'appcontainer'
   | 'container'
 
 /** 单个档位的能力探测结果 */
@@ -1793,8 +1792,8 @@ export interface IsolationStatus {
    * 二次确认（见 `acknowledge_required`）。挡在墙外会让"关掉隔离"只能改代码。
    *
    * 注意它不等于"所有档位"：后端会端到端探测每一档（真的起一个子进程
-   * 读回输出），做不到的不列出来。否则面板会把 `restricted` 也标成可选，
-   * 用户选了却只落到 `low_il`（实测：非管理员下 `CreateProcessAsUserW` err=5）。
+   * 读回输出），做不到的不列出来。否则面板会把本机跑不了的档位标成可选，
+   * 用户选了却只得到一次降级。
    */
   selectable: IsolationLevel[]
   /**
@@ -1818,8 +1817,6 @@ export interface IsolationStatus {
    * 下载只落缓存并校验 SHA-256，安装/启用需要管理员动作（`install_hint`）。
    */
   container?: IsolationContainerRuntime
-  appcontainer_name: string
-  appcontainer_workspace: string
   /** 运行时覆盖值；null = 按配置文件走 */
   runtime_override: IsolationLevel | null
   /** 切换后已在跑的进程是否不受影响（切换只影响后续 spawn） */
@@ -1865,9 +1862,9 @@ export async function setIsolationLevel(
 /**
  * 强制重新探测本机档位能力（清掉引擎侧冒烟缓存后再查一次）。
  *
- * 为什么需要它：`selectable` 来自**端到端冒烟**（真的以受限令牌起一个子进程），
- * 结果有进程内缓存。用户启用提权助手（或安全软件放行）之后，旧缓存仍可能把
- * `restricted` 标成不可用 —— 界面表现为"档位永远灰着"，只能重启引擎。
+ * 为什么需要它：`selectable` 来自**端到端探测**（真的起子进程 / 探 Kiri socket），
+ * 结果有进程内缓存。安全软件放行或 Kiri 刚启动之后，旧缓存仍可能把对应档位标成
+ * 不可用 —— 界面表现为"档位永远灰着"，只能重启引擎。
  * 这个入口让用户当场复测，而不是去猜。
  */
 export async function probeIsolation(): Promise<IsolationStatus> {
@@ -1910,108 +1907,6 @@ export async function revokeIsolationArtifacts(): Promise<{
 }> {
   const resp = await api.post('/v1/system/isolation/revoke')
   return resp.data?.data ?? resp.data
-}
-
-// ── 提权助手（受限令牌的执行前置） ──
-
-/**
- * 提权助手的状态。
- *
- * 为什么 `restricted` 需要它：该档位要 `CreateProcessAsUserW`，而这需要
- * `SeIncreaseQuotaPrivilege` —— 只授予提权令牌。把整个引擎提权是反向做法
- * （引擎承载模型输出，爆炸半径最大），所以只提权一个"瘦"助手进程，
- * 它唯一的能力是用受限令牌起进程。
- */
-export interface IsolationHelperStatus {
-  /** 现在能不能用 —— `restricted` 可不可选就看它 */
-  available: boolean
-  /** 不能用的具体原因（缺端口文件 / 无响应 / UAC 未同意） */
-  detail: string
-  /** 引擎自己是否已提权。为真时 `restricted` 走本地路径，不需要这个助手 */
-  engine_elevated: boolean
-  /** 非 Windows 上恒为 false */
-  supported: boolean
-}
-
-/** 启停助手后的返回：既有结果，也有刷新后的完整状态（前端不必再拉两次）。 */
-export interface IsolationHelperResult extends IsolationStatus {
-  ok: boolean
-  /**
-   * 用户在 UAC 弹窗里点了「否」。
-   *
-   * 后端单独给这个字段，前端不解析 `reason` 文本：`reason` 是人类可读字符串、
-   * 措辞随版本变化，拿它做判断迟早失效。而且这两种情况的界面语言完全不同 ——
-   * 取消授权是用户的正常决定（不需要排障），启用失败才要展示原因。
-   */
-  cancelled: boolean
-  reason: string
-  /**
-   * 与 `reason` 并列的**可执行指引**（后端下发）。
-   *
-   * 为什么不把指引塞进 `reason`：`reason` 是"哪里失败了"的诊断串（可能带 Win32
-   * 错误码），指引是"你该做什么"（去 UAC 点一次「是」/ 用当前账户批准）。
-   * 两者混成一句后，界面要么把错误码念给用户听，要么把"点一次是"淹没在错误码里。
-   * 启用成功或用户主动取消时为**空串**。
-   */
-  hint: string
-  helper: IsolationHelperStatus
-}
-
-function toHelperStatus(payload: unknown): IsolationHelperStatus {
-  const d = (payload as { data?: IsolationHelperStatus } | undefined)?.data
-  const raw = d ?? (payload as IsolationHelperStatus)
-  return {
-    available: Boolean(raw?.available),
-    detail: String(raw?.detail || ''),
-    engine_elevated: Boolean(raw?.engine_elevated),
-    supported: raw?.supported !== false,
-  }
-}
-
-/** 查询提权助手状态。不弹 UAC，纯探测。 */
-export async function getIsolationHelper(): Promise<IsolationHelperStatus> {
-  const resp = await api.get('/v1/system/isolation/helper')
-  return toHelperStatus(resp.data)
-}
-
-/**
- * 启用提权助手 —— **会弹一次 UAC**。
- *
- * 只应由用户显式点击触发：用户同意的是"提权执行通道"，这件事不能被静默代劳。
- * UAC 被取消属于用户的正常选择，所以后端回 `{ok: false, reason}` 而不是抛错，
- * 前端要能把"你取消了"和"起不来"分开说。
- */
-export async function startIsolationHelper(): Promise<IsolationHelperResult> {
-  // UAC 等待（最多 20s）+ 启动后的端到端探测（又可能 20s）会超过默认 30s；
-  // 前端先超时会把一次成功的启用报成失败。
-  const resp = await api.post('/v1/system/isolation/helper', undefined, { timeout: 60_000 })
-  const raw = (resp.data?.data ?? resp.data) as IsolationHelperResult
-  return {
-    ...toIsolationStatus(raw),
-    ok: Boolean(raw?.ok),
-    // `cancelled` 是接口的必填字段（UAC 取消 ≠ 启动失败，界面文案完全不同）
-    cancelled: Boolean((raw as { cancelled?: boolean } | undefined)?.cancelled),
-    reason: raw?.reason || '',
-    // 后端没给就退空串：界面只在非空时渲染引导，空串等于"不需要额外指引"。
-    hint: raw?.hint || '',
-    helper: toHelperStatus(raw?.helper),
-  }
-}
-
-/** 停用提权助手。幂等：本来没在跑也算成功。 */
-export async function stopIsolationHelper(): Promise<IsolationHelperResult> {
-  const resp = await api.delete('/v1/system/isolation/helper', { timeout: 30_000 })
-  const raw = (resp.data?.data ?? resp.data) as IsolationHelperResult
-  return {
-    ...toIsolationStatus(raw),
-    ok: Boolean(raw?.ok),
-    // `cancelled` 是接口的必填字段（UAC 取消 ≠ 启动失败，界面文案完全不同）
-    cancelled: Boolean((raw as { cancelled?: boolean } | undefined)?.cancelled),
-    reason: raw?.reason || '',
-    // 后端没给就退空串：界面只在非空时渲染引导，空串等于"不需要额外指引"。
-    hint: raw?.hint || '',
-    helper: toHelperStatus(raw?.helper),
-  }
 }
 
 // ── Super-agent 接管（周期巡检 + 自主推进）──────────────────────────────

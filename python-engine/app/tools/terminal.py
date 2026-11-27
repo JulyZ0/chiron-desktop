@@ -101,30 +101,20 @@ class PersistentTerminal:
             return proc
         # 回收已退出进程，再创建新的（避免累积完成/崩溃的 shell）
         self._prune_procs()
-        # `restricted` 档走**受限常驻会话**（`win_launch.open_restricted_session`）：
-        # 受限令牌 + 独立桌面 + 自建可继承管道。此前的 fail-closed 是因为一次性
-        # `launch_restricted` 无法"常驻 + 增量写 stdin"，那个缺口已由常驻模式补上。
-        #
-        # 注意**不能**在这里退回普通 `create_subprocess_exec`：那会让 persistent_shell
-        # 成为绕过受限令牌的后门 —— "配置声称挡得住写、实际有一条路绕过去"。
+        # 档位判定只用于 `child_launch_argv`（low_il 由子进程入口自降级）。
         decision = None
         try:
-            from app.isolation import Level, resolve_level
+            from app.isolation import resolve_level
 
             decision = resolve_level()
         except Exception as exc:  # noqa: BLE001 — 隔离模块异常时按既有路径走
             logger.warning("persistent_shell: resolve_level failed: %s", exc)
-        if decision is not None and decision.effective in (
-            Level.RESTRICTED,
-            Level.APPCONTAINER,
-        ):
-            return await self._open_self_built_session(key, decision.effective)
         # S 修复：ws 用局部变量，避免写成实例属性后被并发请求覆盖导致跨会话串 cwd/cd
         ws = str(workspace_dir())
         shell_exe = _shell_command()
         # **按档位改变执行路径**：`low_il` 及以上必须由子进程自己降级（完整性级别
         # 改的是当前进程令牌且不可撤销，父进程一动手连引擎一起降）。此前这里直接
-        # 起 shell，于是 `job` / `low_il` / `appcontainer` 拿到的隔离措施完全相同 ——
+        # 起 shell，于是 `job` / `low_il` 拿到的隔离措施完全相同 ——
         # 用户切档位、面板也如实显示新档位，实际强度却没变。
         shell_argv = [shell_exe]
         if decision is not None:
@@ -187,71 +177,6 @@ class PersistentTerminal:
             self._jobs[key] = job
         return proc
 
-    async def _open_self_built_session(self, key: str, level: Any) -> Any:
-        """`restricted` / `appcontainer` 档：起一个**自建**常驻 shell。
-
-        这两档都必须自建进程，因为 `asyncio.create_subprocess_exec` 表达不了它们的
-        建进程参数（受限令牌要 `CreateProcessAsUserW`，AppContainer 要进程属性列表）。
-        起好之后对外暴露的接口与普通 `Process` 一致，后续 `execute` 走同一套逻辑。
-
-        内部全是同步 Win32 调用，必须丢线程，否则会卡住事件循环 ——
-        一次建进程就能拖住所有会话。
-        """
-        from app.isolation import SHELL_LIMITS, Level, win_launch, wrap_async_process
-
-        shell_exe = _shell_command()
-        ws = str(workspace_dir())
-        if level is Level.APPCONTAINER:
-            opener = win_launch.open_appcontainer_session
-            hint = "请改用 shell_exec，或把隔离档位调到 low_il。"
-        else:
-            opener = win_launch.open_restricted_session
-            hint = "请改用 shell_exec，或把隔离档位调到 low_il。"
-        session, err = await asyncio.to_thread(
-            opener,
-            [shell_exe],
-            cwd=ws,
-            env=await git_shell_env(sandboxed_env()),
-        )
-        if session is None:
-            # fail-closed：起不来就拒绝，**不**退回无隔离的普通 shell。
-            # 退回等于让 persistent_shell 成为绕过该档位的后门。
-            raise RuntimeError(
-                f"persistent_shell 在 {level.value} 档下无法启动受限进程：{err}。{hint}"
-            )
-
-        # Job Object 同样要挂：令牌/包 SID 只约束权限，不约束进程树规模。
-        job = None
-        try:
-            from app.isolation import resolve_level
-
-            job = wrap_async_process(session, resolve_level(), SHELL_LIMITS)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("persistent_shell(%s): job attach failed: %s", level.value, exc)
-
-        # 首命令 cd：shell 的起始目录已在 cwd 里给了，这里只是让后续
-        # 命令与普通路径保持同样的工作目录语义（用户可能 cd 到子目录）。
-        try:
-            session.stdin.write(f'cd /d "{ws}"\n'.encode())
-            await session.stdin.drain()
-        except Exception:
-            pass
-
-        stale = self._sessions.pop(key, None)
-        if stale is not None:
-            stale.close()
-        stale_job = self._jobs.pop(key, None)
-        if stale_job is not None:
-            stale_job.close()
-        self._procs[key] = session
-        self._sessions[key] = session
-        # 记录**实际**档位：`execute` 据此决定临时目录落在哪、以及是否需要
-        # 走 workspace 内的哨兵文件（low_il/appcontainer 写不了系统 %TEMP%）。
-        self._levels[key] = level
-        if job is not None:
-            self._jobs[key] = job
-        return session
-
     async def execute(
         self, key: str, command: str, timeout: int = DEFAULT_TIMEOUT_SECONDS
     ) -> dict[str, Any]:
@@ -272,10 +197,9 @@ class PersistentTerminal:
         #
         # **必须落在 workspace 内**，只要 shell 的档位在 `low_il` 及以上：
         #
-        # * `restricted`：受限进程只被授权写工作区；
         # * `low_il`：Windows 的完整性检查是 no-write-up —— Low IL 进程写不了 Medium
-        #   目录，而系统 `%TEMP%` 正是 Medium。此前这里只看 `key in self._sessions`
-        #   （即只照顾 restricted），于是 `low_il` 档下 `mkdtemp` 建在 `%TEMP%`，哨兵
+        #   目录，而系统 `%TEMP%` 正是 Medium。此前这里只看 `key in self._sessions`，
+        #   于是 `low_il` 档下 `mkdtemp` 建在 `%TEMP%`，哨兵
         #   写不出来 ⇒ `done_file` 永不出现 ⇒ 每条命令都跑满 timeout 才返回"超时"。
         #   命令本身其实成功了，输出却读不到，看起来像 shell 卡死。
         #

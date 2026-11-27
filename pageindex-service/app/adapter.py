@@ -38,6 +38,28 @@ _LOCAL_SUFFIXES = {".pdf"}
 _CLOUD_SUFFIXES = {".pdf", ".pptx", ".ppt", ".docx", ".doc"}
 
 
+class _ModelErrorCapture(logging.Handler):
+    """抓取 PageIndex/litellm 在摘要失败时打到 root logger 的真实错误。
+
+    PageIndex 把每个节点的异常吞成空摘要，最后只抛一句 "summary generation
+    failed"；真正的 429/上下文超限/401 只出现在 logging.error 里。索引失败时
+    把这句最近错误带出去，用户才不用去翻进程日志。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+        self.last = ""
+
+    def emit(self, record: logging.LogRecord) -> None:  # pragma: no cover - 纯旁路
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return
+        if "LLM completion failed" in msg or msg.startswith("Error:"):
+            # 错误串可能带 URL/模型名，但不该带凭据；保守地抹掉常见 key 形态。
+            self.last = re.sub(r"(sk-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+", r"***", msg)[-500:]
+
+
 class PageIndexError(RuntimeError):
     """适配器抛出的统一错误（服务侧映射成 HTTP 状态码）。"""
 
@@ -154,7 +176,7 @@ class Adapter:
 
     # ── 客户端 ──
 
-    def _selfhosted_models(self) -> tuple[str, str, dict[str, str]]:
+    def _selfhosted_models(self, *, session_id: str = "") -> tuple[str, str, dict[str, object]]:
         """自托管索引/问答模型与 LLM 连接（**唯一的取值口径**）。
 
         顺序：``models``（env → 网关 /models 解析结果）优先，回落到 ``cfg`` 的 env 直读值。
@@ -166,15 +188,15 @@ class Adapter:
             return (
                 models.index_model or models.chat_model,
                 models.chat_model,
-                models.llm_backend(),
+                models.llm_backend(session_id=session_id),
             )
         return (
             self._cfg.selfhosted_index_model,
             self._cfg.selfhosted_chat_model,
-            self._cfg.llm_backend(),
+            self._cfg.llm_backend(session_id=session_id),
         )
 
-    def _client(self, ctx: RequestContext) -> Any:
+    def _client(self, ctx: RequestContext, *, summary_concurrency: int | None = None) -> Any:
         if self._mode == "cloud":
             from pageindex import PageIndexClient
 
@@ -189,7 +211,9 @@ class Adapter:
 
         from pageindex import PageIndexLocalClient
 
-        index_model, chat_model, cfg_backend = self._selfhosted_models()
+        index_model, chat_model, cfg_backend = self._selfhosted_models(
+            session_id=f"chiron-kb-{ctx.kb_id or 'default'}"
+        )
         if not index_model or not chat_model:
             # 不把空模型名交给 SDK（它会在内部拼出一个 404 请求，报错点离原因很远）
             from app.models import unavailable_detail
@@ -218,6 +242,12 @@ class Adapter:
             # 显式传（0.4.4 起默认 "full" = 加一轮 LLM expand）：不显式传就会跟着默认值漂移，
             # 而默认值本身在版本间会变，索引成本与耗时也跟着变。
             optimize=self._cfg.selfhosted_optimize,
+            # PageIndex flash 默认 64 路并发摘要。本地网关/单模型端点扛不住：
+            # 全部请求 429/超时后 SDK 只会抛 "summary generation failed"，
+            # 真正的错误被聚合掉了。默认收到 4 路，可用 env 调整。
+            summary_concurrency=summary_concurrency or getattr(
+                self._cfg, "selfhosted_summary_concurrency", 4
+            ) or 4,
         )
 
     def storage_path(self, ctx: RequestContext) -> str:
@@ -287,10 +317,31 @@ class Adapter:
         stem = _UNSAFE_NAME_RE.sub("_", Path(filename).stem)[:60] or "doc"
         suffix = Path(filename).suffix.lower() or ".pdf"
         fd, path = tempfile.mkstemp(prefix=f"{doc_prefix(doc_id)}-", suffix=f"_{stem}{suffix}")
+        capture = _ModelErrorCapture()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(capture)
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
-            result = client.submit_document(path, folder_id=folder_id or None, wait=True)
+            try:
+                result = client.submit_document(path, folder_id=folder_id or None, wait=True)
+            except Exception as first_exc:  # noqa: BLE001
+                # 摘要聚合失败通常是并发打满：PageIndex 把所有单次错误吞成一句
+                # "summary generation failed"。退到单路重试一次，能救回 429/瞬时
+                # 超时；仍是上下文/凭据问题则第二次会给出同样的原因（由外层补全）。
+                if (
+                    self._mode == "selfhosted"
+                    and "Summary generation failed for all nodes" in str(first_exc)
+                    and (getattr(self._cfg, "selfhosted_summary_concurrency", 4) or 4) > 1
+                ):
+                    logger.warning(
+                        "pageindex summary failed with concurrency=%s; retrying serially",
+                        getattr(self._cfg, "selfhosted_summary_concurrency", 4),
+                    )
+                    client = self._client(ctx, summary_concurrency=1)
+                    result = client.submit_document(path, folder_id=folder_id or None, wait=True)
+                else:
+                    raise
             provider_doc_id = str((result or {}).get("doc_id") or "")
             page_count = 0
             try:
@@ -302,8 +353,20 @@ class Adapter:
         except PageIndexError:
             raise
         except Exception as exc:  # noqa: BLE001
-            raise PageIndexError(f"索引文档失败: {exc}") from exc
+            message = str(exc) or f"{type(exc).__name__}"
+            if "Summary generation failed for all nodes" in message:
+                model = self._selfhosted_models()[0] if self._mode != "cloud" else "cloud"
+                concurrency = getattr(self._cfg, "selfhosted_summary_concurrency", 4) or 4
+                message += (
+                    f"（索引模型 {model}，摘要并发 {concurrency}；"
+                    "请检查该模型端点/key 与上下文窗口，"
+                    "或调低 KNOWLEDGE_SUMMARY_CONCURRENCY 后重建索引）"
+                )
+            if capture.last and capture.last not in message:
+                message += f"；最近一次模型调用错误：{capture.last}"
+            raise PageIndexError(f"索引文档失败: {message}") from exc
         finally:
+            root_logger.removeHandler(capture)
             try:
                 os.unlink(path)
             except OSError:

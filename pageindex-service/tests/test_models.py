@@ -175,3 +175,42 @@ def test_negative_cache_expires(monkeypatch):
     # 强制刷新（模拟 TTL 过期后的下一次探测）→ 立刻恢复可用
     third = asyncio.run(models_mod.resolve(cfg, force=True))
     assert third.ready() and third.source == "gateway"
+
+
+def test_opencode_backend_carries_session_header():
+    """OpenCode（Zen / Go）缺 `x-opencode-session` 会直接 400；索引/检索都必须带上。"""
+    resolved = models_mod.ResolvedModels(
+        chat_model="deepseek-v4.1-flash",
+        index_model="deepseek-v4.1-flash",
+        provider="opencode-go",
+        base_url="https://opencode.ai/zen/go/v1",
+        api_key="key",
+    )
+    backend = resolved.llm_backend(session_id="chiron-kb-abc")
+    headers = backend["extra_headers"]
+    assert headers["x-opencode-session"] == "chiron-kb-abc"
+    assert "chiron-knowledge" in headers["User-Agent"]
+
+
+def test_env_only_opencode_backend_infers_from_base_url():
+    """没有 provider 字段（只 export 了 env）时也要按 base_url 识别 OpenCode。"""
+    cfg = _cfg(
+        selfhosted_chat_model="deepseek-v4.1-flash",
+        selfhosted_index_model="deepseek-v4.1-flash",
+        selfhosted_llm_base_url="https://opencode.ai/zen/go/v1",
+        selfhosted_llm_api_key="key",
+    )
+    resolved = models_mod.from_env(cfg)
+    headers = resolved.llm_backend(session_id="chiron-kb-env")["extra_headers"]
+    assert headers["x-opencode-session"] == "chiron-kb-env"
+
+
+def test_non_opencode_backend_has_no_extra_headers():
+    resolved = models_mod.ResolvedModels(
+        chat_model="gpt-4o-mini",
+        index_model="gpt-4o-mini",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-test",
+    )
+    assert "extra_headers" not in resolved.llm_backend(session_id="x")

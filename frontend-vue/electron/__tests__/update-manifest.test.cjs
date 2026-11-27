@@ -39,6 +39,42 @@ test('合格清单通过校验', () => {
   assert.equal(r.manifest.version, '1.2.3')
 })
 
+test('electron-builder 的相对文件名清单也通过（URL 由可信 repo 拼接）', () => {
+  const r = gate.validateLatestManifest(
+    manifest({ file: { url: 'Chiron-1.2.3-win-x64.exe' } }),
+    { platform: 'win32', arch: 'x64' },
+  )
+  assert.equal(r.ok, true, JSON.stringify(r.errors))
+})
+
+test('真实 latest.yml 形状（files[].url 为文件名）能通过完整解析+校验', () => {
+  const { parseLatestYml } = require('../update-check.cjs')
+  const text = [
+    'version: 0.261127.01',
+    'files:',
+    '  - url: Chiron-Setup-0.261127.01.exe',
+    `    sha512: ${SHA}`,
+    '    size: 123456',
+    'path: Chiron-Setup-0.261127.01.exe',
+    `sha512: ${SHA}`,
+    'releaseDate: 2026-11-27T00:00:00.000Z',
+  ].join('\n')
+  const r = gate.validateLatestManifest(parseLatestYml(text), {
+    platform: 'win32',
+    arch: 'x64',
+  })
+  assert.equal(r.ok, true, JSON.stringify(r.errors))
+  assert.equal(r.manifest.version, '0.261127.01')
+})
+
+test('相对文件名带路径穿越 ⇒ 拒绝', () => {
+  for (const url of ['../evil.exe', 'sub/../../evil.exe', '..%2Fevil.exe']) {
+    const r = gate.validateLatestManifest(manifest({ file: { url } }), { platform: 'win32' })
+    assert.equal(r.ok, false, url)
+    assert.ok(r.errors.includes('installer-name-unsafe'), `${url}: ${r.errors}`)
+  }
+})
+
 test('缺 sha512 ⇒ 拒绝（这是本条的核心）', () => {
   const r = gate.validateLatestManifest(manifest({ file: { sha512: '' } }), { platform: 'win32' })
   assert.equal(r.ok, false)
@@ -212,8 +248,19 @@ test('main.cjs 的缓存包复用路径必须要求摘要存在', () => {
   const fs = require('node:fs')
   const path = require('node:path')
   const src = fs.readFileSync(path.resolve(__dirname, '..', 'main.cjs'), 'utf8')
-  assert.ok(src.includes('validateLatestManifest'), '清单必须过 schema 校验')
-  assert.ok(src.includes('gateInstallerLaunch'), '启动安装器前必须过门禁')
+  // 只查字符串会被"从错误模块解构"骗过：函数名出现在 require 列表里，运行时却是
+  // undefined（线上表现为 `validateLatestManifest is not a function`）。这里必须
+  // 确认两个函数是从**定义它们的模块**取出来的。
+  const block = src.match(
+    /const\s*\{([\s\S]*?)\}\s*=\s*require\('\.\/update-manifest\.cjs'\)/,
+  )
+  assert.ok(block, 'main.cjs 必须从 update-manifest.cjs 取真实性门禁')
+  assert.ok(block[1].includes('validateLatestManifest'), '清单校验必须来自 update-manifest.cjs')
+  assert.ok(block[1].includes('gateInstallerLaunch'), '安装门禁必须来自 update-manifest.cjs')
+  assert.ok(
+    !/const\s*\{[\s\S]*?validateLatestManifest[\s\S]*?\}\s*=\s*require\('\.\/update-check\.cjs'\)/.test(src),
+    'update-check.cjs 不导出 validateLatestManifest，不得从那里解构',
+  )
   assert.ok(
     !/if \(!job\.sha512 \|\| \(await sha512File\(final\)\) === job\.sha512\)/.test(src),
     '不得保留「没有摘要也放行」的旧判据',

@@ -26,6 +26,10 @@
 | `STORAGE_BACKEND` / `MEDIA_STORE_BACKEND` | 生产用 `s3`；两者必须同值 |
 | 配额 | 后台「配额」默认 0=不限且读库失败 fail-open；团队模式必须设租户/用户日费用上限 |
 
+引擎实例的直连提交与自动续跑共享 `ENGINE_MAX_CONCURRENT_RUNS`（默认 16，0=关闭）；
+超限时直连返回 429、自动续跑跳过本轮。队列 worker 的并发另由
+`QUEUE_WORKER_CONCURRENCY` / `QUEUE_WORKER_GLOBAL_CONCURRENCY` 控制。
+
 反向代理的 SSE 配置见 `team-domain-deployment.md`（关闭缓冲、放宽读写超时）。
 
 ## 3. 备份与恢复（上线前必须演练一次）
@@ -83,6 +87,7 @@ DLQ 增长、限流降级、内存异常）。先接这组，再按事故复盘�
 | 任务消失/重复 | DLQ、`claim_count`、幂等键 | `queue_dlq_total`、worker 日志；重投走 DLQ 接口，不要手工 XADD |
 | 上传失败 | 反代 `client_max_body_size`、读超时 | 反代与网关 `READ_TIMEOUT` 都要放宽；分片上传受每片限制 |
 | 磁盘涨 | 检查点/媒体/知识库/日志 | 后台 retention 只覆盖 usage/shares/checkpoints/turns；其余按第 8 节手工治理 |
+| 知识库索引失败（`summary generation failed` / `MissingSessionID`） | 索引模型端点 / 摘要并发 / provider 头 | OpenCode 系 provider 必须带 `x-opencode-session`（适配器已自动注入）；默认摘要并发 4，可把 `KNOWLEDGE_SUMMARY_CONCURRENCY` 降到 1–2 后重建；仍失败则查模型上下文窗口 |
 
 ## 7. 密钥轮换
 

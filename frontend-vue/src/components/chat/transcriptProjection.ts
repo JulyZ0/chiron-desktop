@@ -54,6 +54,23 @@ export interface TurnSlice {
   resident: boolean
 }
 
+/**
+ * 已完成回合的投影缓存。
+ *
+ * 流式期间每个 token 都会更新当前回合的正文；已完成的回合不会被修改，没必要
+ * 每帧重新分组、生成摘要字符串与行对象。键是 `TurnSlice.key`，调用方在
+ * 切会话 / 改折叠 / 语言变化时必须清空。
+ */
+export interface TurnProjectionCacheEntry {
+  from: number
+  to: number
+  version: string
+  rows: ProjectedRow[]
+  folds: Map<FoldKey, boolean>
+}
+
+export type TurnProjectionCache = Map<string, TurnProjectionCacheEntry>
+
 export interface ProjectionInput {
   items: readonly ChatItem[]
   folds?: ReadonlyMap<FoldKey, boolean>
@@ -73,6 +90,8 @@ export interface ProjectionInput {
    * 缺省 `false` ⇒ **历史**（没有正在跑的回合）里不该有任何回合是"活跃"的 ✓。
    */
   running?: boolean
+  /** 已完成回合的缓存；省略则每次全量投影（测试与一次性调用）。 */
+  cache?: TurnProjectionCache
 }
 
 export interface ProjectionResult {
@@ -313,6 +332,26 @@ function firstNonUserIndex(items: readonly ChatItem[], from: number, to: number)
   return from
 }
 
+/**
+ * 回合版本：只覆盖会影响投影结构的字段。
+ *
+ * 不拼接整段正文（流式正文可能很长、每 token 变化）；长度 + 前 16 字符足以识别
+ * “已完成回合被重试/编辑”这一类变化，而普通流式更新只发生在当前回合（不缓存）。
+ */
+function turnVersion(items: readonly ChatItem[], from: number, to: number): string {
+  let out = ''
+  for (let i = from; i < to; i++) {
+    const item = items[i]
+    if (!item) continue
+    const text = 'content' in item ? String(item.content ?? '') : ''
+    const args = 'arguments' in item ? String(item.arguments ?? '') : ''
+    const name = 'name' in item ? String(item.name ?? '') : ''
+    const status = 'status' in item ? String(item.status ?? '') : ''
+    out += `${item.kind}:${item.id || ''}:${name}:${status}:${text.length}:${text.slice(0, 16)}:${args.length};`
+  }
+  return out
+}
+
 export function projectTranscript(input: ProjectionInput): ProjectionResult {
   const items = input.items
   const mode = input.mode ?? 'flat'
@@ -346,6 +385,22 @@ export function projectTranscript(input: ProjectionInput): ProjectionResult {
   const rows: ProjectedRow[] = []
 
   for (const turn of turns) {
+    const cacheable = Boolean(input.cache) && turn.to < items.length && !turn.resident
+    const version = cacheable ? turnVersion(items, turn.from, turn.to) : ''
+    const cached = cacheable ? input.cache!.get(turn.key) : undefined
+    if (
+      cached &&
+      cached.from === turn.from &&
+      cached.to === turn.to &&
+      cached.version === version
+    ) {
+      rows.push(...cached.rows)
+      for (const [key, open] of cached.folds) folds.set(key, open)
+      continue
+    }
+    const rowStart = rows.length
+    const madeFolds = new Map<FoldKey, boolean>()
+
     // 活跃 = **仍在运行** 且是最后一段（§4.7：不能只看位置，否则不带 token 的 done 会让它永远 running）
     const active = Boolean(input.running) && turn.to === items.length
     const foldable = hasFoldableSegment(items, turn.from, turn.to)
@@ -365,6 +420,7 @@ export function projectTranscript(input: ProjectionInput): ProjectionResult {
 
       if (foldable && i === headAt) {
         folds.set(turn.key, turnOpen)
+        madeFolds.set(turn.key, turnOpen)
         rows.push({
           key: headerKey(turn.key),
           kind: 'turn_header',
@@ -391,6 +447,7 @@ export function projectTranscript(input: ProjectionInput): ProjectionResult {
           // 完成的回合里工具组默认收起（保留摘要），活跃回合默认展开
           const open = resolveOpen(folds, group.key, active)
           folds.set(group.key, open)
+          madeFolds.set(group.key, open)
           groupOpen.set(group.key, open)
           rows.push({
             key: headerKey(group.key),
@@ -421,6 +478,15 @@ export function projectTranscript(input: ProjectionInput): ProjectionResult {
         turnKey: turn.key,
         groupKey: group?.key,
         resident: turn.resident,
+      })
+    }
+    if (cacheable) {
+      input.cache!.set(turn.key, {
+        from: turn.from,
+        to: turn.to,
+        version,
+        rows: rows.slice(rowStart),
+        folds: madeFolds,
       })
     }
   }

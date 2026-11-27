@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -415,6 +416,13 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 		// 没有归属就不落库：宁可这次保存失败，也不能把一条"说不清是谁的"画布写进 PG。
 		return fmt.Errorf("sessionmap: refuse to persist workspace %q without owner", ws.ID)
 	}
+	// 归属在结构体里是字符串（热层 JSON / 前端兼容），但 SQL 列是 smallint。
+	// 直接把字符串传给 `tenant_id = $N` 会让 pgx 找不到编码计划，整条 UPDATE 报错 ——
+	// 表现就是"保存一直失败、PG 永远为空"。在这里显式转一次，坏值也要显式拒绝。
+	tenantID, err := strconv.ParseInt(ws.TenantID, 10, 16)
+	if err != nil {
+		return fmt.Errorf("sessionmap: invalid tenant %q: %w", ws.TenantID, err)
+	}
 	viewport, _ := json.Marshal(ws.Viewport)
 	// 必须整体在**一个事务**里：先 DELETE 全部节点、再逐条 INSERT。
 	// 此前每条语句各自提交，于是"DELETE 成功、第 7 条 INSERT 失败"时，画布在 PG 里
@@ -432,7 +440,7 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 			`UPDATE session_map_workspaces
 			    SET name = $2, viewport = $3::jsonb, root_path = $4, sort_index = $5, updated_at = NOW()
 			  WHERE id = $1 AND tenant_id = $6 AND user_id = $7`,
-			ws.ID, ws.Name, string(viewport), ws.RootPath, ws.SortIndex, ws.TenantID, ws.UserID)
+			ws.ID, ws.Name, string(viewport), ws.RootPath, ws.SortIndex, tenantID, ws.UserID)
 		if err != nil {
 			return err
 		}
@@ -453,7 +461,7 @@ func smPersist(ctx context.Context, ws *SessionMapWorkspace) error {
 			  USING session_map_workspaces w
 			  WHERE n.workspace_id = $1 AND n.edge_kind <> 'project'
 			    AND w.id = n.workspace_id AND w.tenant_id = $2 AND w.user_id = $3`,
-			ws.ID, ws.TenantID, ws.UserID); err != nil {
+			ws.ID, tenantID, ws.UserID); err != nil {
 			return err
 		}
 		for _, n := range ws.Nodes {
@@ -492,7 +500,7 @@ func smLoadWorkspaceOwner(ctx context.Context, workspaceID string) (smWorkspaceO
 		return smWorkspaceOwner{}, false, fmt.Errorf("sessionmap: database unavailable")
 	}
 	row, err := db.GlobalDBManager.FetchOne(ctx,
-		`SELECT COALESCE(tenant_id,'') AS tenant_id, COALESCE(user_id,'') AS user_id
+		`SELECT tenant_id::text AS tenant_id, COALESCE(user_id,'') AS user_id
 		   FROM session_map_workspaces WHERE id = $1`, workspaceID)
 	if err != nil {
 		return smWorkspaceOwner{}, false, err
@@ -503,7 +511,7 @@ func smLoadWorkspaceOwner(ctx context.Context, workspaceID string) (smWorkspaceO
 	return smWorkspaceOwner{Tenant: stringOf(row["tenant_id"]), User: stringOf(row["user_id"])}, true, nil
 }
 
-func smLoadFromPG(ctx context.Context, workspaceID, tenant, userID string) (*SessionMapWorkspace, error) {
+func smLoadFromPG(ctx context.Context, workspaceID string, tenant int16, userID string) (*SessionMapWorkspace, error) {
 	if db.GlobalDBManager == nil {
 		return nil, nil
 	}
@@ -520,7 +528,7 @@ func smLoadFromPG(ctx context.Context, workspaceID, tenant, userID string) (*Ses
 	ws := &SessionMapWorkspace{
 		ID: stringOf(row["id"]), Name: stringOf(row["name"]), Nodes: []SessionMapNode{},
 		RootPath: stringOf(row["root_path"]), SortIndex: intOf(row["sort_index"]),
-		TenantID: tenant, UserID: userID,
+		TenantID: tenantStr(tenant), UserID: userID,
 	}
 	_ = json.Unmarshal([]byte(stringOf(row["viewport"])), &ws.Viewport)
 	if ws.Viewport == nil {
@@ -673,7 +681,7 @@ func (h *SessionMapHandler) ListWorkspaces(w http.ResponseWriter, r *http.Reques
 			`SELECT id, COALESCE(name,'') AS name, updated_at FROM session_map_workspaces
 			  WHERE tenant_id = $1 AND user_id = $2 AND COALESCE(root_path,'') = ''
 			  ORDER BY updated_at DESC LIMIT 50`,
-			smTenant(claims), claims.UserID)
+			smTenantID(claims), claims.UserID)
 		if err == nil {
 			for _, row := range rows {
 				out = append(out, map[string]interface{}{
@@ -707,13 +715,13 @@ func (h *SessionMapHandler) CreateWorkspace(w http.ResponseWriter, r *http.Reque
 	if _, err := db.GlobalDBManager.Exec(r.Context(),
 		`INSERT INTO session_map_workspaces (id, tenant_id, user_id, name, viewport, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, '{}'::jsonb, NOW(), NOW())`,
-		wsID, smTenant(claims), claims.UserID, strings.TrimSpace(body.Name)); err != nil {
+		wsID, smTenantID(claims), claims.UserID, strings.TrimSpace(body.Name)); err != nil {
 		slog.Error("create sessionmap workspace failed", "error", err)
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "create failed"})
 		return
 	}
 	ws := &SessionMapWorkspace{ID: wsID, Name: body.Name, Viewport: map[string]interface{}{}, Nodes: []SessionMapNode{},
-		TenantID: smTenant(claims), UserID: claims.UserID}
+		TenantID: tenantStr(smTenantID(claims)), UserID: claims.UserID}
 	smCachePut(r.Context(), ws)
 	JSON(w, http.StatusCreated, APIResponse{Success: true, Data: ws})
 }
@@ -732,14 +740,14 @@ func (h *SessionMapHandler) GetWorkspace(w http.ResponseWriter, r *http.Request)
 	// 热层优先；miss 再回源 PG 并回填（布局是"看地图的姿势"，热层丢了不影响数据）
 	// 热层 key 只含 workspaceID，命中后**必须**校验归属，否则任何人凭 wsID 即读到他人画布。
 	if ws, ok := smCacheGet(r.Context(), wsID); ok {
-		if ws.TenantID == smTenant(claims) && ws.UserID == claims.UserID {
+		if ws.TenantID == tenantStr(smTenantID(claims)) && ws.UserID == claims.UserID {
 			OK(w, smPruneMissingSessions(r.Context(), ws))
 			return
 		}
 		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "workspace not found"})
 		return
 	}
-	ws, err := smLoadFromPG(r.Context(), wsID, smTenant(claims), claims.UserID)
+	ws, err := smLoadFromPG(r.Context(), wsID, smTenantID(claims), claims.UserID)
 	if err != nil {
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "load failed"})
 		return
@@ -800,11 +808,11 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "save failed"})
 		return
 	}
-	if !found || owner.Tenant != smTenant(claims) || owner.User != claims.UserID {
+	if !found || owner.Tenant != tenantStr(smTenantID(claims)) || owner.User != claims.UserID {
 		JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "workspace not found"})
 		return
 	}
-	body.TenantID = smTenant(claims)
+	body.TenantID = tenantStr(smTenantID(claims))
 	body.UserID = claims.UserID
 	// **root_path 不接受客户端提交的值**。
 	//
@@ -821,7 +829,7 @@ func (h *SessionMapHandler) SaveWorkspace(w http.ResponseWriter, r *http.Request
 		`SELECT COALESCE(root_path,'') AS root_path, COALESCE(sort_index,0) AS sort_index
 		   FROM session_map_workspaces
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-		wsID, smTenant(claims), claims.UserID); err == nil && row != nil {
+		wsID, smTenantID(claims), claims.UserID); err == nil && row != nil {
 		body.RootPath = stringOf(row["root_path"])
 		body.SortIndex = intOf(row["sort_index"])
 	}
@@ -856,7 +864,7 @@ func (h *SessionMapHandler) DeleteWorkspace(w http.ResponseWriter, r *http.Reque
 	}
 	if _, err := db.GlobalDBManager.Exec(r.Context(),
 		`DELETE FROM session_map_workspaces WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-		wsID, smTenant(claims), claims.UserID); err != nil {
+		wsID, smTenantID(claims), claims.UserID); err != nil {
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "delete failed"})
 		return
 	}

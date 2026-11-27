@@ -380,7 +380,7 @@ func registerProxyRoutes(
 	// 改了会作用于该引擎上所有后续执行 —— 它不是 per-user 偏好。桌面端是单用户
 	// 本地实例，用户即 owner，不受影响；多租户 SaaS 部署下这个限制是必要的。
 	//
-	// 读也要求 admin：响应里有本机路径（工作区、AppContainer 名）与能力矩阵，
+	// 读也要求 admin：响应里有本机路径（工作区）与能力矩阵，
 	// 属于内部运行信息，与同组 /v1/system/health 口径一致。
 	isoP := newProxy("", proxyOpt{logTag: "isolation"})
 	mux.Handle("GET /v1/system/isolation", authMW(rlMW(RequirePermission(auth.PermAdminRead)(isoP(pathFn("/v1/system/isolation"))))))
@@ -393,28 +393,6 @@ func registerProxyRoutes(
 	// 容器挡位的运行时**按需获取**：下载固定版本的 Kiri 包并校验 SHA-256（不安装）。
 	// 属于运维/安全管理动作（会触达外网、在磁盘落安装包），用写权限。
 	mux.Handle("POST /v1/system/isolation/container/prepare", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(pathFn("/v1/system/isolation/container/prepare"))))))
-
-	// 提权助手（`restricted` 档的执行前置）：查询 / 启用（**会弹一次 UAC**）/ 停用。
-	//
-	// 这三条此前**没有注册**，于是设置页每次点「启用助手」都在网关拿到 404，
-	// 前端 `catch` 落到兜底文案 —— 用户看到的是
-	// 「受限令牌执行助手：启用助手失败：本机无法启用此档位」。
-	// 它与管理员身份、令牌权限、`SeAssignPrimaryTokenPrivilege` **全都无关**：
-	// 引擎侧的 `/v1/system/isolation/helper` 早就实现了，缺的只是网关这一跳。
-	// 也就是说任何机器上都必然失败，而排障线索（"404"）被前端的兜底文案吃掉了。
-	//
-	// 三条都必须注册，缺任何一条都会退化成不同的假象：
-	//   * 缺 GET ⇒ `loadHelper()` 失败，`helperStatus` 恒为 null，界面既不显示
-	//     "助手挡住了 restricted"，也永远不会出现「启用助手」按钮；
-	//   * 缺 POST ⇒ 点了也只会得到上面那句兜底文案；
-	//   * 缺 DELETE ⇒ "停用助手"同样 404，用户无法撤销这条提权通道。
-	//
-	// 鉴权口径与同组隔离端点一致：读要 admin:read（响应里有本机路径与能力矩阵），
-	// 启停要 admin:write（它是能改安全边界的动作）。
-	helperPath := pathFn("/v1/system/isolation/helper")
-	mux.Handle("GET /v1/system/isolation/helper", authMW(rlMW(RequirePermission(auth.PermAdminRead)(isoP(helperPath)))))
-	mux.Handle("POST /v1/system/isolation/helper", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(helperPath)))))
-	mux.Handle("DELETE /v1/system/isolation/helper", authMW(rlMW(RequirePermission(auth.PermAdminWrite)(isoP(helperPath)))))
 
 	// 还原点回滚：把某个检查点重新应用到项目工作区。
 	//

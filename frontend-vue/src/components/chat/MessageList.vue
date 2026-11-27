@@ -23,12 +23,13 @@ import {
   projectTranscript,
   type FoldKey,
   type ProjectedRow,
+  type TurnProjectionCache,
 } from './transcriptProjection'
 import { readFolds, writeFold } from './transcriptFolds'
 
 import { useI18n } from 'vue-i18n'
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 
 const props = defineProps<{
   items: ChatItem[]
@@ -125,6 +126,20 @@ let coverFailures = 0
    两条额外规则：① 一次性冒出很多 id（切会话 / 载入历史）不播 —— 那是换了页面而不是来了新消息；
    ② 只看 id 不看内容，所以流式期间对同一行的内容更新不会反复触发。 */
 const seenIds = new Set<string>(props.items.map(i => i.id).filter((x): x is string => !!x))
+// seenIds 只用于"别重播入场动画"，不需要永久保存。长会话里无上限增长会随消息数
+// 线性吃内存；超过上限时按插入顺序丢最早的（Set 保序），代价只是很久以后滚回
+// 旧行可能重播一次动画。
+const SEEN_IDS_LIMIT = 4000
+function trimSeenIds() {
+  if (seenIds.size <= SEEN_IDS_LIMIT) return
+  const drop = seenIds.size - SEEN_IDS_LIMIT
+  let n = 0
+  for (const id of seenIds) {
+    seenIds.delete(id)
+    if (++n >= drop) break
+  }
+}
+trimSeenIds()
 const enteringIds = ref<Set<string>>(new Set())
 let enterTimer: ReturnType<typeof setTimeout> | null = null
 function noteEnteringRows() {
@@ -134,6 +149,7 @@ function noteEnteringRows() {
   }
   if (fresh.length === 0) return
   for (const id of fresh) seenIds.add(id)
+  trimSeenIds()
   if (fresh.length > 3) return   // 批量替换：不播
   const next = new Set(enteringIds.value)
   for (const id of fresh) next.add(id)
@@ -175,13 +191,21 @@ function isUserAnchor(item: ChatItem | undefined): boolean {
 // 渲染行序列由 projection 产出（key 规则、回合与工具组结构都在那里定义）。
 // grouped 模式注入折叠头并剔除被折叠的行；窗口几何只认「行序列 + key」，无需改动。
 const folds = ref<Map<FoldKey, boolean>>(readFolds(props.sessionKey ?? ''))
-watch(() => props.sessionKey, key => { folds.value = readFolds(key ?? '') })
+// 已完成回合的投影缓存：流式只更新最后一轮，前面的回合不必每 token 重投影。
+// 会话、折叠、语言任一变化都可能改变行结构/文案 ⇒ 整表失效。
+const projectionCache: TurnProjectionCache = new Map()
+watch(() => props.sessionKey, key => {
+  folds.value = readFolds(key ?? '')
+  projectionCache.clear()
+})
+watch(locale, () => projectionCache.clear())
 
 const projection = computed(() => projectTranscript({
   items: props.items,
   mode: 'grouped',
   folds: folds.value,
   residentTailTurns: props.residentTailTurns ?? DEFAULT_RESIDENT_TAIL_TURNS,
+  cache: projectionCache,
   // 生命周期信号（§4.7）：`loading` 为 false 时**没有**活跃回合 ——
   // 否则"不带 token 的 done"会让最后一轮永远显示 running。
   running: props.loading,
@@ -202,6 +226,7 @@ async function toggleFold(fold: FoldKey) {
   const open = projection.value.folds.get(fold) ?? false
   const next = new Map(folds.value)
   next.set(fold, !open)
+  projectionCache.clear()
   const anchor = el ? captureAnchor(collectRows(el)) : null
   folds.value = next
   writeFold(props.sessionKey ?? '', fold, !open)

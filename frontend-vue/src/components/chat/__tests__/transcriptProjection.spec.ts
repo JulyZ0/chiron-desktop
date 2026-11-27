@@ -6,6 +6,7 @@ import {
   projectTranscript,
   toolGroupKind,
   toolGroupSummary,
+  type TurnProjectionCache,
 } from '../transcriptProjection'
 import type { ChatItem } from '../chat-types'
 
@@ -206,5 +207,35 @@ describe('工具语义分组（对应 python-engine 工具注册表）', () => {
     expect(toolGroupSummary('modify', ['write_file', 'edit_file'])).toBe('写入 1 编辑 1')
     expect(toolGroupSummary('delegate', ['subagent', 'graph_run'])).toBe('委派 2')
     expect(toolGroupSummary('shell', ['shell_exec', 'run_in_background'])).toBe('命令 1 作业 1')
+  })
+})
+
+describe('transcriptProjection（已完成回合缓存）', () => {
+  it('追加新一轮时复用已完成回合的行对象', () => {
+    const items = sample()
+    const cache: TurnProjectionCache = new Map()
+    const first = projectTranscript({ items, mode: 'grouped', residentTailTurns: 1, cache })
+    const before = first.rows.find(row => row.key === headerKey('t:turn-1'))
+    expect(before).toBeTruthy()
+
+    items.push(user('m4', 'turn-3'), assistant('m5', 'turn-3'))
+    const second = projectTranscript({ items, mode: 'grouped', residentTailTurns: 1, cache })
+    const after = second.rows.find(row => row.key === headerKey('t:turn-1'))
+    expect(after).toBe(before)
+    // 每轮缓存只保存自己的行，不把后面回合的内容算进来
+    expect(cache.get('t:turn-1')?.rows.every(row => row.turnKey === 't:turn-1')).toBe(true)
+  })
+
+  it('已完成回合被编辑后失效并重算', () => {
+    const items = sample()
+    const cache: TurnProjectionCache = new Map()
+    const first = projectTranscript({ items, mode: 'grouped', residentTailTurns: 1, cache })
+    const before = first.rows.find(row => row.key === itemKey(items[6]!, 6))
+
+    items[6] = assistant('m1', 'turn-1') as ChatItem
+    ;(items[6] as { content: string }).content = 'a much longer edited answer'
+    const second = projectTranscript({ items, mode: 'grouped', residentTailTurns: 1, cache })
+    const after = second.rows.find(row => row.key === itemKey(items[6]!, 6))
+    expect(after).not.toBe(before)
   })
 })

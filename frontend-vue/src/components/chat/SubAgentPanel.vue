@@ -12,7 +12,7 @@
  */
 import { copyTextOrThrow } from '../../utils/clipboard'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Checkbox, Empty, Input, Modal, Spin, Tag, Tooltip, message } from 'ant-design-vue'
+import { Empty, Modal, Spin, Tag, Tooltip, message } from 'ant-design-vue'
 import { submitAnswer, submitApproval } from '../../api'
 import {
   cancelSessionSubagents,
@@ -26,6 +26,11 @@ import {
   type SubagentRunView,
 } from '../../api/subagent'
 import SubAgentApprovalCard from './SubAgentApprovalCard.vue'
+import SubAgentUsage from './SubAgentUsage.vue'
+import SubAgentEvents from './SubAgentEvents.vue'
+import SubAgentOutput from './SubAgentOutput.vue'
+import SubAgentBoard from './SubAgentBoard.vue'
+import SubAgentDispatchModal from './SubAgentDispatchModal.vue'
 import AskCard from './AskCard.vue'
 import SubagentRunCard from '../agent/SubagentRunCard.vue'
 // 与主对话流**同一套**工具渲染：子 Agent 的工具调用同样是"调了什么 + 结果如何"，
@@ -1125,61 +1130,16 @@ onBeforeUnmount(() => {
         :image="Empty.PRESENTED_IMAGE_SIMPLE"
       />
       <!-- F3：看板列视图（运行中 / 完成 / 失败）——数据与列表完全同源。 -->
-      <div
+      <SubAgentBoard
         v-else-if="saMode === 'board'"
-        class="sa-board"
-      >
-        <section
-          v-for="col in boardColumns"
-          :key="col.id"
-          class="sa-board-col"
-        >
-          <h4 class="sa-board-title">
-            {{ $t(col.label) }}<span class="sa-board-count">{{ col.runs.length }}</span>
-          </h4>
-          <div
-            v-for="run in col.runs"
-            :key="run.run_id"
-            class="sa-board-card"
-            role="button"
-            tabindex="0"
-            :title="run.summary || run.run_id"
-            @click="openRunDetails(run.run_id)"
-            @keydown.enter.prevent="openRunDetails(run.run_id)"
-          >
-            <div class="sa-board-card-head">
-              <span class="sa-board-name">{{ run.profile || run.run_id.slice(-6) }}</span>
-              <Tag :color="STATUS_COLOR[run.status] || 'default'">
-                {{ run.status }}
-              </Tag>
-            </div>
-            <div class="sa-board-meta">
-              {{ $t('workflow.steps') }} {{ run.usage?.steps || 0 }}
-              · ↑{{ run.usage?.input_tokens || 0 }}/↓{{ run.usage?.output_tokens || 0 }}
-            </div>
-            <div class="sa-board-actions">
-              <button
-                v-if="!TERMINAL_STATUSES.has(String(run.status))"
-                type="button"
-                class="sa-board-btn"
-                :disabled="cancelling.has(run.run_id)"
-                @click.stop="stopRun(run.run_id)"
-              >{{ $t('common.stop') }}</button>
-              <button
-                v-else-if="run.status === 'failed' || run.status === 'lost'"
-                type="button"
-                class="sa-board-btn"
-                :disabled="rerunning.has(run.run_id)"
-                @click.stop="rerunRun(run)"
-              >{{ $t('common.retry') }}</button>
-            </div>
-          </div>
-          <div
-            v-if="!col.runs.length"
-            class="sa-board-empty"
-          >—</div>
-        </section>
-      </div>
+        :columns="boardColumns"
+        :cancelling="cancelling"
+        :rerunning="rerunning"
+        @open="openRunDetails"
+        @stop="stopRun"
+        @rerun="rerunRun"
+      />
+
       <div
         v-else
         class="timeline"
@@ -1222,68 +1182,17 @@ onBeforeUnmount(() => {
     </Spin>
 
     <!-- 用量：按 run 列明细。会话语义在「统计」浮层，这里是**子 Agent 粒度**，两者不重复 -->
-    <div
+    <SubAgentUsage
       v-show="saTab === 'usage'"
-      class="usage"
-    >
-      <div
-        v-if="runs.length"
-        class="usage-grid"
-      >
-        <div class="usage-row usage-head">
-          <span>{{ $t('common.run') }}</span>
-          <span>{{ $t('common.status') }}</span>
-          <span class="num">in</span>
-          <span class="num">out</span>
-          <span class="num">{{ $t('workflow.steps') }}</span>
-        </div>
-        <div
-          v-for="run in runs"
-          :key="run.run_id"
-          class="usage-row"
-        >
-          <span class="u-name">{{ run.profile || run.run_id }}</span>
-          <Tag :color="STATUS_COLOR[run.status] || 'default'">
-            {{ run.status }}
-          </Tag>
-          <span class="num">{{ run.usage?.input_tokens || 0 }}</span>
-          <span class="num">{{ run.usage?.output_tokens || 0 }}</span>
-          <span class="num">{{ run.usage?.steps || 0 }}</span>
-        </div>
-      </div>
-      <div
-        v-else
-        class="sa-empty"
-      >
-        {{ $t('agent.no_sub_agent_has_run_yet_so_there_is_no_usage_to_compute') }}
-      </div>
-      <p class="usage-note">
-        {{ $t('agent.sub_agents_consume_tokens_independently_cost_multiplies_when_several_run_in_parallel') }}
-      </p>
-    </div>
+      :runs="runs"
+    />
 
     <!-- 事件流：**原始** subagent.* 事件（未按语义分组），排查"到底发生了什么"时用；
          「输出」tab 才是给人读的结构化过程。 -->
-    <div
+    <SubAgentEvents
       v-show="saTab === 'events'"
-      class="events"
-    >
-      <div
-        v-for="(e, i) in liveEvents"
-        :key="(e.id as string) || i"
-        class="ev-row"
-      >
-        <span class="ev-type">{{ e.type }}</span>
-        <span class="ev-run">{{ e.run_id }}</span>
-        <span class="ev-text">{{ e.content || '' }}</span>
-      </div>
-      <div
-        v-if="!liveEvents.length"
-        class="sa-empty"
-      >
-        {{ $t('agent.no_sub_agent_events_received_in_this_session_yet') }}
-      </div>
-    </div>
+      :events="liveEvents"
+    />
 
     <!-- 产物：这次运行**写入了哪些文件**（`write_paths`）。
          按目录分组 —— 一屏几十个路径平铺是读不出来的，归拢后能一眼看出"动了哪几处"。
@@ -1330,277 +1239,44 @@ onBeforeUnmount(() => {
     </div>
 
     <!-- 输出区：**与主 Agent 同一套渲染**（工具调用卡 + 工具结果块），
-         再加一条多个 run 的并列 tab 条。
-         外层的 v-show 负责 tab 切换；内层 v-if 负责"无选中不渲染"（同时让 TS 把
-         selectedRun 收窄为非空）。 -->
-    <div
+         再加一条多个 run 的并列 tab 条。 -->
+    <SubAgentOutput
       v-show="saTab === 'output'"
-      class="output"
-    >
-      <!-- 层级面包屑：子 Agent 可以嵌套，「输出」区又只显示一个 run —— 这条链回答
-           "它在替谁干活、上面还有几层"，祖先可点、根节点回运行列表。 -->
-      <nav
-        v-if="runBreadcrumbs.length"
-        class="run-breadcrumb"
-        data-testid="run-breadcrumb"
-        :aria-label="$t('agent.subagent_breadcrumb_aria')"
-      >
-        <button
-          type="button"
-          class="crumb crumb-root"
-          @click="backToRunList()"
-        >
-          {{ $t('agent.subagent_breadcrumb_root') }}
-        </button>
-        <template
-          v-for="(crumb, index) in runBreadcrumbs"
-          :key="crumb.runId"
-        >
-          <span
-            class="crumb-sep"
-            aria-hidden="true"
-          >›</span>
-          <span
-            v-if="index === runBreadcrumbs.length - 1"
-            class="crumb crumb-current"
-            aria-current="page"
-          >{{ crumb.label }}</span>
-          <button
-            v-else
-            type="button"
-            class="crumb"
-            :disabled="!crumb.known"
-            :title="crumb.label"
-            @click="goRunCrumb(crumb)"
-          >
-            {{ crumb.label }}
-          </button>
-        </template>
-      </nav>
-      <!-- 多个子 Agent **并列成 tab**：一个会话里常有多个 run（并行委派、嵌套子代理），
-           一次只看一个就逼用户回「运行」页来回点。tab 条让"切到那一个"只需一次点击，
-           与"同一类东西并排摆放"的直觉一致。
-           只有一个 run 时不画这条：多一行 tab 只是噪音。 -->
-      <div
-        v-if="outputTabs.length > 1"
-        class="output-tabs"
-        role="tablist"
-        :aria-label="$t('agent.sub_agent_view')"
-      >
-        <button
-          v-for="run in outputTabs"
-          :key="run.run_id"
-          type="button"
-          role="tab"
-          class="output-tab"
-          :class="{ active: run.run_id === selectedRunId }"
-          :aria-selected="run.run_id === selectedRunId"
-          :title="`${run.profile || run.run_id} · ${run.status}`"
-          @click="selectRun(run.run_id)"
-        >
-          <span
-            class="output-tab-dot"
-            :data-state="TERMINAL_STATUSES.has(run.status) ? 'done' : 'live'"
-            aria-hidden
-          />
-          <span class="output-tab-name">{{ run.profile || run.run_id.slice(0, 8) }}</span>
-          <!-- 待处理（审批/提问）的 run 必须在 tab 上就看得出来：
-               否则用户要逐个点开才知道"哪个在等我"。 -->
-          <span
-            v-if="pendingByRun[run.run_id]"
-            class="output-tab-pending"
-            :title="$t('agent.sub_agent_is_waiting_for_your_confirmation_or_answer')"
-          >⚠{{ pendingByRun[run.run_id] > 1 ? pendingByRun[run.run_id] : '' }}</span>
-        </button>
-      </div>
-
-      <template v-if="selectedRun">
-        <div class="output-head">
-          <span>{{ selectedRun.profile || selectedRun.run_id }}</span>
-          <span class="output-meta">
-            {{ $t('workflow.steps') }} {{ selectedRun.usage?.steps || 0 }}
-          </span>
-        </div>
-        <div class="output-summary">
-          {{ selectedRun.summary || $t('common.running_no_summary_yet') }}
-        </div>
-        <!-- F1：运行中的子 Agent 可直接补一句（不打断当前 run，下一轮生效） -->
-        <div
-          v-if="canSteer"
-          class="steer-box"
-        >
-          <input
-            v-model="steerText"
-            class="steer-input"
-            type="text"
-            maxlength="2000"
-            :placeholder="$t('agent.subagent_steer_placeholder')"
-            :disabled="steering"
-            @keydown.enter.prevent="sendSteer"
-          >
-          <button
-            type="button"
-            class="steer-send"
-            :disabled="steering || !steerText.trim()"
-            @click="sendSteer"
-          >
-            {{ steering ? $t('agent.subagent_steer_sending') : $t('agent.subagent_steer_send') }}
-          </button>
-        </div>
-        <Spin :spinning="historyLoading">
-          <!-- 被行数上限折叠掉的部分要如实说明：静默截断会让用户以为
-               "它只做了这么多"，而「事件流」tab 里明明还有更早的内容。 -->
-          <div
-            v-if="outputHiddenRows"
-            class="output-hidden"
-          >
-            {{ $t('common.n_more_items_above', { n: outputHiddenRows }) }}
-          </div>
-          <div class="stream">
-            <template
-              v-for="row in outputRows"
-              :key="row.key"
-            >
-              <div
-                v-if="row.kind === 'reasoning'"
-                class="line reasoning"
-              >
-                <span class="line-tag">{{ $t('chat.reasoning') }}</span>{{ row.content }}
-              </div>
-              <div
-                v-else-if="row.kind === 'text'"
-                class="line text"
-              >
-                {{ row.content }}
-              </div>
-              <div
-                v-else-if="row.kind === 'notice'"
-                class="line notice"
-              >
-                {{ row.content }}
-              </div>
-              <!-- 工具过程：**复用主对话流的组件**。摘要、参数展开、失败配色
-                   都只有一份实现，两个界面不可能漂移。 -->
-              <div
-                v-else-if="row.kind === 'tool'"
-                class="line tool"
-              >
-                <ToolCallCard
-                  v-if="row.call"
-                  :item="row.call"
-                />
-                <ToolResultBlock
-                  v-if="row.result"
-                  :item="row.result"
-                  :session-id="sessionId"
-                />
-              </div>
-              <div
-                v-else-if="row.kind === 'approval'"
-                class="line approval"
-              >
-                <SubAgentApprovalCard
-                  :tool-name="row.event.tool_name || ''"
-                  :args="row.event.tool_arguments || ''"
-                  :content="row.event.content || ''"
-                  :submitting="approvalSubmitting.has(row.event.tool_call_id || '')"
-                  :decision="approvalDecisions[row.event.tool_call_id || ''] || ''"
-                  :error="approvalErrors[row.event.tool_call_id || ''] || ''"
-                  @decide="(approved: boolean) => resolveApproval({ toolCallId: row.event.tool_call_id || '' }, approved)"
-                  @edit="(args: string) => resolveApproval({ toolCallId: row.event.tool_call_id || '' }, true, args)"
-                />
-              </div>
-              <div
-                v-else-if="row.kind === 'ask'"
-                class="line ask"
-              >
-                <AskCard
-                  :question="row.event.question || row.event.content || ''"
-                  :options="row.event.options || []"
-                  :allow-free-text="row.event.allow_free_text !== false"
-                  :expired="!!askErrors[row.event.tool_call_id || '']"
-                  @answer="(value: string) => resolveAsk(row.event.tool_call_id || '', value)"
-                />
-                <div
-                  v-if="askAnswers[row.event.tool_call_id || '']"
-                  class="ask-done"
-                >
-                  {{ $t('chat.replied') }}：{{ askAnswers[row.event.tool_call_id || ''] }}
-                </div>
-                <div
-                  v-if="askErrors[row.event.tool_call_id || '']"
-                  class="approval-error"
-                >
-                  {{ askErrors[row.event.tool_call_id || ''] }}
-                </div>
-              </div>
-              <div
-                v-else-if="row.kind === 'status'"
-                class="line status"
-              >
-                {{ row.event.status }}<span v-if="row.event.truncated"> {{ $t('common.preview_truncated') }}</span>
-              </div>
-              <!-- G7：过程事件被丢弃时必须说出来（否则"少了几行"看起来像"模型没做"） -->
-              <div
-                v-else-if="row.kind === 'done' && droppedNote"
-                class="line dropped"
-              >
-                {{ $t('chat.subagent_events_dropped', { n: droppedNote }) }}
-              </div>
-              <div
-                v-else-if="row.kind === 'done'"
-                class="line done"
-              >
-                {{ $t('common.end') }}：{{ row.event.status }}
-                <span v-if="row.event.usage"> · ↑{{ row.event.usage.input_tokens || 0 }}/↓{{ row.event.usage.output_tokens || 0 }}</span>
-              </div>
-            </template>
-            <div
-              v-if="!outputRows.length"
-              class="stream-empty"
-            >
-              {{ $t('errors.no_output_yet_running_or_process_expired') }}
-            </div>
-          </div>
-        </Spin>
-      </template>
-      <div
-        v-else
-        class="sa-empty"
-      >
-        {{ $t('agent.select_a_sub_agent_in_run_first') }}
-      </div>
-    </div>
+      v-model:steer-text="steerText"
+      :session-id="sessionId"
+      :selected-run="selectedRun"
+      :selected-run-id="selectedRunId"
+      :output-tabs="outputTabs"
+      :rows="outputRows"
+      :hidden-rows="outputHiddenRows"
+      :dropped-note="droppedNote"
+      :breadcrumbs="runBreadcrumbs"
+      :history-loading="historyLoading"
+      :can-steer="canSteer"
+      :steering="steering"
+      :pending-by-run="pendingByRun"
+      :approval-submitting="approvalSubmitting"
+      :approval-decisions="approvalDecisions"
+      :approval-errors="approvalErrors"
+      :ask-answers="askAnswers"
+      :ask-errors="askErrors"
+      @select-run="selectRun"
+      @back="backToRunList"
+      @crumb="goRunCrumb"
+      @steer="sendSteer"
+      @approval="(p) => resolveApproval({ toolCallId: p.toolCallId }, p.approved, p.args)"
+      @answer="(p) => resolveAsk(p.toolCallId, p.value)"
+    />
 
     <!-- F3：直接委派（与模型自己调 subagent 同一条后台路径） -->
-    <Modal
+    <SubAgentDispatchModal
       v-model:open="showDispatch"
-      :title="$t('agent.subagent_dispatch')"
-      :ok-text="$t('chat.input.send')"
-      :cancel-text="$t('common.cancel')"
-      :confirm-loading="dispatching"
-      :ok-button-props="{ disabled: !dispatchTask.trim() }"
-      @ok="submitDispatch"
-    >
-      <div class="dispatch-form">
-        <Input.TextArea
-          v-model:value="dispatchTask"
-          :rows="4"
-          :maxlength="4000"
-          :placeholder="$t('agent.subagent_dispatch_placeholder')"
-        />
-        <Input
-          v-model:value="dispatchProfile"
-          :placeholder="$t('agent.subagent_dispatch_profile')"
-        />
-        <Checkbox v-model:checked="dispatchAllowWrite">
-          {{ $t('agent.subagent_dispatch_allow_write') }}
-        </Checkbox>
-        <p class="dispatch-hint">
-          {{ $t('agent.subagent_dispatch_hint') }}
-        </p>
-      </div>
-    </Modal>
+      v-model:task="dispatchTask"
+      v-model:profile="dispatchProfile"
+      v-model:allow-write="dispatchAllowWrite"
+      :dispatching="dispatching"
+      @submit="submitDispatch"
+    />
   </div>
 </template>
 
@@ -1674,87 +1350,6 @@ onBeforeUnmount(() => {
 .run-approval:hover { filter: brightness(0.92); }
 
 /* 子 Agent 审批卡片的视觉在 SubAgentApprovalCard.vue（与主对话区的确认卡片同一套） */
-.line.approval { width: 100%; }
-/* 提问卡片复用主对话流的 AskCard —— 只要撑满宽度 */
-.line.ask { width: 100%; }
-.ask-done { margin-top: 6px; font-size: var(--fs-xs); color: var(--success, #16a34a); }
-
-.output { border-top: var(--hairline-width) solid var(--border-color, rgba(127, 127, 127, 0.24)); padding-top: 10px; }
-/* 层级面包屑：一行、可横向收缩（深层嵌套时截断的是中间标签，不是整条链）。
-   祖先可点 → 直接切过去比对；根节点回运行列表。 */
-.run-breadcrumb {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 2px;
-  margin-bottom: 8px; font-size: var(--fs-xs); color: var(--text-secondary, #595959);
-  min-width: 0;
-}
-.run-breadcrumb .crumb {
-  max-width: 14em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  padding: 1px 4px; border: none; background: none; border-radius: var(--radius-sm, 4px);
-  font-size: var(--fs-xs); color: var(--text-secondary, #595959); cursor: pointer;
-  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease;
-}
-.run-breadcrumb .crumb:hover:not(:disabled) { color: var(--primary-color, #1677ff); background: var(--bg-hover, rgba(0, 0, 0, 0.03)); }
-.run-breadcrumb .crumb:disabled { cursor: default; opacity: 0.7; }
-.run-breadcrumb .crumb-current { color: var(--text-primary); font-weight: var(--fw-medium); cursor: default; }
-.run-breadcrumb .crumb-root { font-weight: var(--fw-medium); }
-.run-breadcrumb .crumb-sep { color: var(--text-tertiary, #8c8c8c); flex: none; }
-.output-head { display: flex; justify-content: space-between; font-weight: var(--fw-semibold); }
-.output-meta { font-size: var(--fs-xs); color: var(--text-tertiary, #8c8c8c); }
-
-/* 多个 run 的并列 tab 条：横向滚动而不是换行 —— 换行会把过程视图挤下去，
-   而这里每一格都只是"切到谁"的入口。 */
-.output-tabs {
-  display: flex; gap: 4px; margin-bottom: 8px;
-  overflow-x: auto; scrollbar-width: thin;
-}
-.output-tab {
-  flex: none; display: inline-flex; align-items: center; gap: 5px;
-  max-width: 180px; padding: 3px 8px;
-  border: var(--hairline-width) solid var(--border-subtle);
-  border-radius: var(--radius-full);
-  background: transparent; color: var(--text-secondary, #595959);
-  font-size: var(--fs-xs); cursor: pointer;
-  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
-}
-.output-tab:hover { background: var(--bg-hover); color: var(--text-primary); }
-.output-tab.active { background: var(--primary-bg); border-color: var(--primary); color: var(--primary); }
-.output-tab-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* 运行中/已结束的状态点：一点颜色差就能看出"还剩几个在跑" */
-.output-tab-dot {
-  flex: none; width: 6px; height: 6px; border-radius: var(--radius-full);
-  background: var(--text-tertiary, #8c8c8c);
-}
-.output-tab-dot[data-state='live'] { background: var(--primary); animation: sa-pulse var(--dur-pulse) ease-in-out infinite; }
-@keyframes sa-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-@media (prefers-reduced-motion: reduce) {
-  .output-tab-dot[data-state='live'] { animation: none; }
-}
-/* 待处理角标：哪个 run 在等我，必须在 tab 上就能看出来 */
-.output-tab-pending { flex: none; color: var(--warning, #d97706); font-weight: var(--fw-semibold); }
-
-/* 被行数上限折叠掉的部分：如实说明，而不是静默截断 */
-.output-hidden {
-  margin-bottom: 6px; padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  background: var(--surface-2, rgba(127, 127, 127, 0.06));
-  color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs);
-}
-.output-summary {
-  margin: 6px 0; padding: 8px; border-radius: var(--radius-md);
-  background: var(--surface-2, rgba(127, 127, 127, 0.06));
-  white-space: pre-wrap; max-height: 160px; overflow: auto;
-}
-.stream { max-height: 320px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
-.line { white-space: pre-wrap; line-height: 1.5; }
-.line.reasoning { color: var(--text-tertiary, #8c8c8c); font-style: italic; }
-.line.notice { color: var(--warning, var(--warning)); }
-.line.status, .line.done { color: var(--text-secondary, #595959); font-size: var(--fs-xs); }
-.line-tag {
-  display: inline-block; margin-inline-end: 4px; padding: 0 4px; border-radius: var(--radius-sm); font-size: var(--fs-xs);
-  background: var(--surface-2, rgba(127, 127, 127, 0.12));
-}
-.stream-empty { color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); }
-
 /* ── 内部 tab（运行 · 输出 · 用量 · 事件流）── */
 .sa-tabs {
   display: flex; gap: 2px; margin: 8px 0 10px;
@@ -1779,28 +1374,6 @@ onBeforeUnmount(() => {
 }
 .sa-empty { padding: 10px 2px; color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); }
 
-/* 用量表：数字列右对齐 + tabular-nums，便于竖排比对 */
-.usage-grid { display: flex; flex-direction: column; }
-.usage-row {
-  display: grid; grid-template-columns: 1fr auto 56px 56px 48px;
-  align-items: center; gap: 6px; padding: 4px 2px;
-  border-bottom: var(--hairline-width) solid var(--border-color, rgba(127, 127, 127, 0.12));
-  font-size: var(--fs-xs);
-}
-.usage-head { color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); }
-.usage-row .num { text-align: end; font-variant-numeric: tabular-nums; }
-.u-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.usage-note { margin: 10px 0 0; color: var(--text-tertiary, #8c8c8c); font-size: var(--fs-xs); }
-
-/* 事件流：原始事件，等宽 + 紧凑行（--font-mono 已含 CJK 字体栈，中文不会掉宋体） */
-.events { display: flex; flex-direction: column; gap: 2px; max-height: 320px; overflow: auto; }
-.ev-row { display: grid; grid-template-columns: 132px 96px 1fr; gap: 6px; font-size: var(--fs-xs); }
-.ev-type { color: var(--primary, #1677ff); font-family: var(--font-mono); }
-.ev-run { color: var(--text-tertiary, #8c8c8c); font-family: var(--font-mono); }
-.ev-text {
-  color: var(--text-secondary, #595959);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
 /* 产物 tab：按目录分组 + 点击复制（空态复用 .sa-empty） */
 .artifacts { display: flex; flex-direction: column; gap: 8px; }
 .art-group { display: flex; flex-direction: column; gap: 2px; }
@@ -1813,60 +1386,8 @@ onBeforeUnmount(() => {
 }
 .art-item:hover { background: var(--surface-2, rgba(127, 127, 127, 0.08)); color: var(--text-primary, #262626); }
 .art-item.copied { color: var(--success, #16a34a); }
-/* F3：看板列视图 */
-.sa-board { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
-.sa-board-col {
-  min-width: 0; padding: 6px; border-radius: var(--radius-md);
-  background: var(--surface-2, rgba(127, 127, 127, 0.06));
-}
-.sa-board-title {
-  margin: 0 0 6px; font-size: var(--fs-xs); color: var(--text-tertiary);
-  display: flex; align-items: center; justify-content: space-between;
-}
-.sa-board-count { font-family: var(--font-mono); }
-.sa-board-card {
-  padding: 6px 8px; margin-bottom: 6px; border-radius: var(--radius-sm);
-  background: var(--bg-card); border: var(--hairline-width) solid var(--border-subtle);
-  cursor: pointer;
-}
-.sa-board-card:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: 1px; }
-.sa-board-card-head { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
-.sa-board-name {
-  font-size: var(--fs-xs); color: var(--text-primary);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.sa-board-meta { margin-top: 2px; font-size: var(--fs-xs); color: var(--text-tertiary); }
-.sa-board-actions { display: flex; justify-content: flex-end; margin-top: 4px; }
-.sa-board-btn {
-  border: none; background: transparent; color: var(--primary);
-  font-size: var(--fs-xs); cursor: pointer; padding: 0 2px;
-}
-.sa-board-btn:disabled { opacity: .5; cursor: default; }
-.sa-board-empty { font-size: var(--fs-xs); color: var(--text-tertiary); text-align: center; padding: 4px; }
 .sa-mode { flex: none; min-width: 28px; }
 
-/* F3：委派表单 */
-.dispatch-form { display: flex; flex-direction: column; gap: 8px; }
-.dispatch-hint { margin: 0; font-size: var(--fs-xs); color: var(--text-tertiary); }
 .sa-dispatch { flex: none; color: var(--primary); }
 
-/* F1：子 Agent steer 输入条 */
-.steer-box {
-  display: flex; gap: 6px; padding: 6px 10px;
-  border-top: var(--hairline-width) solid var(--border-subtle);
-  background: var(--bg-secondary);
-}
-.steer-input {
-  flex: 1; min-width: 0; font-size: var(--fs-xs);
-  padding: 4px 8px; border-radius: var(--radius-sm);
-  border: var(--hairline-width) solid var(--border-subtle);
-  background: var(--bg-card); color: var(--text-primary);
-}
-.steer-input:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: 1px; }
-.steer-send {
-  flex: none; font-size: var(--fs-xs); padding: 4px 10px;
-  border-radius: var(--radius-sm); border: none;
-  background: var(--primary); color: var(--on-primary); cursor: pointer;
-}
-.steer-send:disabled { opacity: .5; cursor: default; }
 </style>

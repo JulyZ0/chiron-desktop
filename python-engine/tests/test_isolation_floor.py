@@ -44,6 +44,12 @@ def windows_healthy(monkeypatch):
 # ── 第一层：请求值低于底线 → 按底线执行，不报错 ──
 
 
+def test_removed_levels_fall_back_to_low_il():
+    """旧配置里的 restricted / appcontainer 不再让引擎起不来，映射到 low_il。"""
+    assert iso.parse_level("restricted") is Level.LOW_IL
+    assert iso.parse_level("appcontainer") is Level.LOW_IL
+
+
 @pytest.mark.parametrize("low", [Level.NONE, Level.JOB])
 def test_low_request_is_raised_to_floor(windows_healthy, low):
     """显式请求 `none`/`job`，Windows 上实际生效值必须顶到 `FLOOR_LEVEL`。"""
@@ -65,13 +71,12 @@ def test_floor_itself_is_accepted(windows_healthy):
     assert not decision.below_floor
 
 
-def test_request_above_floor_still_honored(windows_healthy):
-    """底线不能反过来削掉更高的请求（appcontainer 仍要尝试）。"""
-    decision = resolve_level(Level.APPCONTAINER)
+def test_floor_is_honored_without_extra_reasons(windows_healthy):
+    """高于等于底线的请求不会被底线逻辑改写。"""
+    decision = resolve_level(Level.LOW_IL)
 
-    # APPCONTAINER 需要 profile 授权，这里未 mock，允许降级到 low_il ——
-    # 但要确认没有因为底线逻辑被错误地压到更低。
-    assert decision.effective.rank >= FLOOR_LEVEL.rank
+    assert decision.effective is Level.LOW_IL
+    assert not decision.degraded
 
 
 # ── 第二层：机制缺失 → below_floor，且开关放不过去 ──
@@ -123,10 +128,10 @@ def test_below_floor_cannot_be_waived_by_downgrade_switch(windows_healthy, monke
 
 
 def test_ordinary_degradation_still_needs_permission(windows_healthy, monkeypatch):
-    """`appcontainer → low_il` 这类降级：默认拒绝。"""
+    """`low_il → job` 这类降级：默认拒绝。"""
     monkeypatch.setattr(windows_healthy, "downgrade_allowed", lambda: False)
 
-    decision = IsolationDecision(Level.APPCONTAINER, Level.LOW_IL, ["AppContainer 不可用"])
+    decision = IsolationDecision(Level.LOW_IL, Level.JOB, ["Low 完整性级别不可设置"])
 
     with pytest.raises(RuntimeError) as exc:
         require_or_raise(decision)
@@ -137,7 +142,7 @@ def test_ordinary_degradation_allowed_when_permitted(windows_healthy, monkeypatc
     """底线之上的降级，开关有效 —— 否则开发机无法使用。"""
     monkeypatch.setattr(windows_healthy, "downgrade_allowed", lambda: True)
 
-    decision = IsolationDecision(Level.APPCONTAINER, Level.LOW_IL, ["AppContainer 不可用"])
+    decision = IsolationDecision(Level.LOW_IL, Level.JOB, ["Low 完整性级别不可设置"])
 
     require_or_raise(decision)  # 不抛
 
@@ -178,37 +183,25 @@ def test_status_reports_floor_and_selectable(monkeypatch):
 
 
 def test_selectable_excludes_tiers_this_machine_cannot_run(monkeypatch):
-    """★★ 面板不能把**本机做不到**的档位列成可选。
+    """面板不能把**本机做不到**的档位列成可选。
 
-    缺陷形态（真机实测，非管理员账户）：
-
-        selectable = ["low_il", "restricted", "appcontainer"]
-        PUT restricted → requested=restricted, effective=low_il
-        reasons: 受限令牌执行层不可用（CreateProcessAsUserW 失败 err=5）
-
-    用户选了"受限令牌"、界面回一句"已切换"，实际强度一点没变 ——
-    这就是「无法真实切换受限令牌」的全部原因。`selectable` 必须同时满足
-    「不低于底线」与「本机真能执行」。
+    Windows 上容器档位需要 Kiri 的 Unix socket；本版没有 Windows 驱动，
+    因此即使引擎探测正常，`container` 也不能出现在 `selectable` 里。
     """
     monkeypatch.setattr(iso.win, "IS_WINDOWS", True)
     monkeypatch.setattr(iso, "_probe_job", lambda: True)
     monkeypatch.setattr(iso, "_probe_low_il", lambda: True)
     monkeypatch.setattr(iso, "_ensure_workspace_low_label", lambda _p: (True, ""))
-    # 本机能做 low_il / appcontainer，做不了 restricted（模拟缺 SeIncreaseQuotaPrivilege）
-    monkeypatch.setattr(iso, "_probe_restricted", lambda: False)
-    monkeypatch.setattr(iso, "_probe_appcontainer", lambda: True)
     monkeypatch.setattr(iso, "configured_level", lambda: FLOOR_LEVEL)
 
     payload = iso.status()
 
-    assert Level.RESTRICTED.value not in payload["selectable"], (
-        "本机做不到 restricted 却列成可选 —— 用户选了只会静默落到 low_il"
+    assert Level.CONTAINER.value not in payload["selectable"], (
+        "Windows 本机做不到 container 却列成可选 —— 用户选了只会被拒绝"
     )
     assert Level.LOW_IL.value in payload["selectable"]
-    assert Level.APPCONTAINER.value in payload["selectable"]
-    # 不可选的原因要能说清"缺机制"，而不是笼统的"低于底线"
-    reason = payload["unavailable_reasons"].get(Level.RESTRICTED.value, "")
-    assert reason, "缺机制却没有给出原因，用户无从知道该去提权"
+    reason = payload["unavailable_reasons"].get(Level.CONTAINER.value, "")
+    assert reason, "缺机制却没有给出原因，用户无从知道该去装什么"
 
 
 def test_unavailable_reason_is_empty_for_below_floor_tiers(monkeypatch):

@@ -632,7 +632,7 @@ func projectLocatorForSession(ctx context.Context, sessionID string) (projectLoc
 		   JOIN session_map_workspaces w ON w.id = n.workspace_id
 		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
 		    AND w.tenant_id = $2 AND w.user_id = $3
-		  LIMIT 1`, sessionID, smTenant(claims), claims.UserID)
+		  LIMIT 1`, sessionID, smTenantID(claims), claims.UserID)
 	if err != nil || row == nil {
 		return projectLocator{}, false
 	}

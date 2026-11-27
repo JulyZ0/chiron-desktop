@@ -64,13 +64,58 @@ func (m *DBManager) GetReadPool() (*pgxpool.Pool, error) {
 	return p, nil
 }
 
+// defaultDBOpTimeout 是调用方**没有** deadline 时的兜底上限。
+//
+// PG 侧的 statement_timeout=30s 只管"语句开始执行之后"；连接池耗尽时
+// `pool.Query` 会停在 acquire 上，调用方的 ctx 又没有 deadline —— 请求会一直
+// 挂着，池里的槽位也一直不释放。给 acquire+执行一个统一上限，让它在预算内
+// 失败（503 / 超时），而不是把 goroutine 与连接一起拖死。
+//
+// 调用方已有 deadline 时不覆盖：那是上游显式给的请求预算。
+const defaultDBOpTimeout = 30 * time.Second
+
+func dbOpContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, defaultDBOpTimeout)
+}
+
+// cancelOnCloseRows 在 rows 关闭时释放超时 ctx；否则定时器会一直挂到超时。
+type cancelOnCloseRows struct {
+	pgx.Rows
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnCloseRows) Close() {
+	r.Rows.Close()
+	r.cancel()
+}
+
+// cancelOnScanRow 在 Scan 返回后释放超时 ctx。QueryRow 的 Scan 是唯一的消费点。
+type cancelOnScanRow struct {
+	pgx.Row
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnScanRow) Scan(dest ...any) error {
+	defer r.cancel()
+	return r.Row.Scan(dest...)
+}
+
 // Query 执行查询并返回结果集
 func (m *DBManager) Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
 	pool, err := m.GetReadPool()
 	if err != nil {
 		return nil, fmt.Errorf("db manager: %w", err)
 	}
-	return pool.Query(ctx, sql, args...)
+	ctx, cancel := dbOpContext(ctx)
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &cancelOnCloseRows{Rows: rows, cancel: cancel}, nil
 }
 
 // QueryRow 执行查询并返回单行结果
@@ -79,7 +124,8 @@ func (m *DBManager) QueryRow(ctx context.Context, sql string, args ...interface{
 	if err != nil {
 		return errorRow{err: err}
 	}
-	return pool.QueryRow(ctx, sql, args...)
+	ctx, cancel := dbOpContext(ctx)
+	return &cancelOnScanRow{Row: pool.QueryRow(ctx, sql, args...), cancel: cancel}
 }
 
 // Exec 执行写操作（INSERT/UPDATE/DELETE）
@@ -88,6 +134,8 @@ func (m *DBManager) Exec(ctx context.Context, sql string, args ...interface{}) (
 	if err != nil {
 		return pgconn.CommandTag{}, fmt.Errorf("db manager: %w", err)
 	}
+	ctx, cancel := dbOpContext(ctx)
+	defer cancel()
 	return pool.Exec(ctx, sql, args...)
 }
 
@@ -124,11 +172,14 @@ func (m *DBManager) FetchOne(ctx context.Context, sql string, args ...interface{
 		return nil, fmt.Errorf("db manager: %w", err)
 	}
 
+	ctx, cancel := dbOpContext(ctx)
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 	defer rows.Close()
+	defer cancel()
 
 	if !rows.Next() {
 		return nil, nil
@@ -163,7 +214,7 @@ func (m *DBManager) FetchOne(ctx context.Context, sql string, args ...interface{
 // （调用方写 `row["root_path"]`），重名列会让其中一个**静默消失**，取值方拿到 nil
 // 之后通常会当成"该字段是空的"继续往下走。
 //
-// 真实事故：`SELECT COALESCE(name,''), COALESCE(root_path,'')` 没写 AS 别名时，
+// 真实事故：`SELECT COALESCE(name,”), COALESCE(root_path,”)` 没写 AS 别名时，
 // Postgres 给这两列的名字都是 `coalesce`。于是 `row["root_path"]` 永远是 nil，
 // 项目被判定成"没有绑定文件夹"，界面一直显示「无法加载项目文件列表」，
 // 而且日志里一片安静 —— 查了很久才发现是列名的问题。
@@ -190,11 +241,14 @@ func (m *DBManager) FetchAll(ctx context.Context, sql string, args ...interface{
 		return nil, fmt.Errorf("db manager: %w", err)
 	}
 
+	ctx, cancel := dbOpContext(ctx)
 	rows, err := pool.Query(ctx, sql, args...)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
 	defer rows.Close()
+	defer cancel()
 
 	var results []map[string]interface{}
 	columns := rows.FieldDescriptions()
@@ -231,6 +285,8 @@ func (m *DBManager) Execute(ctx context.Context, sql string, args ...interface{}
 		return 0, fmt.Errorf("db manager: %w", err)
 	}
 
+	ctx, cancel := dbOpContext(ctx)
+	defer cancel()
 	tag, err := pool.Exec(ctx, sql, args...)
 	if err != nil {
 		return 0, fmt.Errorf("exec failed: %w", err)
@@ -338,7 +394,8 @@ func (m *DBManager) QueryRowWithScan(ctx context.Context, dest interface{}, sql 
 		return fmt.Errorf("db manager: %w", err)
 	}
 
-	row := pool.QueryRow(ctx, sql, args...)
+	ctx, cancel := dbOpContext(ctx)
+	row := &cancelOnScanRow{Row: pool.QueryRow(ctx, sql, args...), cancel: cancel}
 	return row.Scan(dest)
 }
 
@@ -348,7 +405,13 @@ func (m *DBManager) QueryWithRows(ctx context.Context, sql string, args ...inter
 	if err != nil {
 		return nil, fmt.Errorf("db manager: %w", err)
 	}
-	return pool.Query(ctx, sql, args...)
+	ctx, cancel := dbOpContext(ctx)
+	rows, err := pool.Query(ctx, sql, args...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &cancelOnCloseRows{Rows: rows, cancel: cancel}, nil
 }
 
 // ExecWithResult 执行 SQL 并返回 CommandTag
@@ -357,6 +420,8 @@ func (m *DBManager) ExecWithResult(ctx context.Context, sql string, args ...inte
 	if err != nil {
 		return pgconn.CommandTag{}, fmt.Errorf("db manager: %w", err)
 	}
+	ctx, cancel := dbOpContext(ctx)
+	defer cancel()
 	return pool.Exec(ctx, sql, args...)
 }
 

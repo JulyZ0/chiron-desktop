@@ -162,10 +162,19 @@ async def _auto_resume_runner(task: Any) -> None:
             logger.warning("auto-resume skipped: run ownership already replaced")
             return
         context_token = activate_run_fence(fence)
+    # 实例级并发闸：拿不到槽位就**跳过本轮**（不排队 —— reconciler 是串行的，
+    # 等槽位会把它钉住）。直连提交在超限时直接 429，见 agent_submit。
+    from app.run_gate import instance_run_gate
+
+    gate = instance_run_gate()
+    if not gate.try_acquire():
+        logger.warning("auto-resume skipped: engine concurrency limit reached")
+        return
     try:
         async for _ev in resume_runtime.run(task):
             pass  # 事件无人订阅；结论经 session_store / subagent_runs 落库
     finally:
+        gate.release()
         if context_token is not None:
             deactivate_run_fence(context_token)
         if lease is not None:
@@ -2570,8 +2579,31 @@ async def agent_submit(
             if context_token is not None:
                 deactivate_run_fence(context_token)
 
+    # 实例级并发闸：直连提交与自动续跑共享同一计数（队列 worker 另有自己的并发配置）。
+    # 超限立即 429 而不是排队：SSE 客户端拿到 200 后才发现被排队，超时语义会更糟。
+    from app.run_gate import instance_run_gate
+
+    gate = instance_run_gate()
+    if not gate.try_acquire():
+        return JSONResponse(
+            status_code=429,
+            content={
+                "code": "engine_busy",
+                "detail": "engine concurrency limit reached",
+                "limit": gate.limit,
+            },
+            headers={"Retry-After": "2"},
+        )
+
+    async def _guarded_stream() -> AsyncIterator[str]:
+        try:
+            async for chunk in event_generator():
+                yield chunk
+        finally:
+            gate.release()
+
     return StreamingResponse(
-        event_generator(),
+        _guarded_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { Button, Dropdown, Menu, MenuItem, MenuDivider, SubMenu, Modal, Input } from 'ant-design-vue'
 import {
   SearchOutlined, CloseOutlined, LeftOutlined, DownOutlined,
@@ -23,7 +23,7 @@ const props = withDefaults(defineProps<{
   selectedIndex: number | null
   open: boolean
   /** 面板视图：trajectory（主）/ sessions（从，会话历史列表）/ agents（子 Agent 层级）/ stats（会话统计）/ map（会话地图，见 internal/session/manager_branch.go） */
-  view: 'trajectory' | 'sessions' | 'agents' | 'stats' | 'map'
+  view: 'trajectory' | 'sessions'
   sessions: ChatSession[]
   activeSessionId: string
   /** 当前会话上下文芯片（知识库/Agent/技能/工作流，可移除） */
@@ -38,7 +38,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   (e: 'focus', index: number): void
   (e: 'close'): void
-  (e: 'update:view', view: 'trajectory' | 'sessions' | 'agents' | 'stats'): void
+  (e: 'update:view', view: 'trajectory' | 'sessions'): void
   /** 打开会话地图（整屏大窗格；由 ChatView 渲染，不在侧栏内嵌） */
   (e: 'open-map'): void
   (e: 'create', projectId?: string): void
@@ -296,19 +296,84 @@ watch(
 )
 
 // 选中会话：切到该会话轨迹（父级 switchSession 加载消息）
+/** 会话列表的方向键导航：Tab 逐个走太慢，↑/↓/Home/End 在行间移动。 */
+function onSessionListKeydown(e: KeyboardEvent) {
+  if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) return
+  const rows = Array.from(
+    (e.currentTarget as HTMLElement).querySelectorAll<HTMLElement>('.session-row'),
+  )
+  if (!rows.length) return
+  const current = rows.indexOf(document.activeElement as HTMLElement)
+  let next = current
+  if (e.key === 'Home') next = 0
+  else if (e.key === 'End') next = rows.length - 1
+  else if (e.key === 'ArrowDown') next = current < 0 ? 0 : Math.min(rows.length - 1, current + 1)
+  else next = current < 0 ? 0 : Math.max(0, current - 1)
+  e.preventDefault()
+  rows[next]?.focus()
+}
+
 function pickSession(id: string) {
   emit('switch', id)
   emit('update:view', 'trajectory')
+}
+
+// ── 抽屉模式的焦点陷阱 ──
+// 桌面常驻侧栏不抢焦点；≤1024px 打开时把焦点送进面板，Tab 在面板内循环，
+// 关闭后还给触发按钮。否则键盘用户会 tab 到被遮罩的正文。
+const panelRef = ref<HTMLElement | null>(null)
+let focusBeforeTrap: HTMLElement | null = null
+
+function focusableInPanel(): HTMLElement[] {
+  const root = panelRef.value
+  if (!root) return []
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter(el => el.offsetParent !== null || el === document.activeElement)
+}
+
+watch(
+  [() => props.open, isDrawerMode],
+  ([open, drawer]) => {
+    if (open && drawer) {
+      focusBeforeTrap = document.activeElement as HTMLElement | null
+      void nextTick(() => focusableInPanel()[0]?.focus())
+    } else if (focusBeforeTrap) {
+      focusBeforeTrap.focus()
+      focusBeforeTrap = null
+    }
+  },
+  { immediate: true },
+)
+
+function onPanelKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Tab' || !props.open || !isDrawerMode.value) return
+  const items = focusableInPanel()
+  if (!items.length) return
+  const first = items[0]
+  const last = items[items.length - 1]
+  const current = document.activeElement as HTMLElement | null
+  if (e.shiftKey && (current === first || !panelRef.value?.contains(current))) {
+    e.preventDefault()
+    last.focus()
+  } else if (!e.shiftKey && current === last) {
+    e.preventDefault()
+    first.focus()
+  }
 }
 </script>
 
 <template>
   <div
+    ref="panelRef"
     class="side-panel"
     :class="{ open, dragging }"
     :style="panelStyle"
     role="complementary"
     :aria-hidden="!open"
+    @keydown="onPanelKeydown"
     @touchstart.passive="onTouchStart"
     @touchmove.passive="onTouchMove"
     @touchend.passive="onTouchEnd"
@@ -562,7 +627,10 @@ function pickSession(id: string) {
         </div>
       </div>
 
-      <div class="session-list scroll-fade">
+      <div
+        class="session-list scroll-fade"
+        @keydown="onSessionListKeydown"
+      >
         <div
           v-if="filteredSessions.length === 0"
           class="list-empty"
@@ -900,6 +968,9 @@ function pickSession(id: string) {
 .session-branch { display: inline-block; padding: 0 6px; border-radius: var(--sig-radius-card); background: var(--primary-bg); color: var(--primary); font-size: var(--fs-xs); line-height: 16px; margin-inline-start: 4px; flex-shrink: 0; }
 .session-group-label { font-size: var(--fs-xs); font-weight: var(--fw-semibold); color: var(--text-tertiary); padding: 12px 8px 4px; text-transform: uppercase; letter-spacing: 0.5px; }
 .session-row {
+  /* 长会话列表：渲染视口外的行先跳过布局/绘制，滚动时按记忆尺寸补齐。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 44px;
   display: flex; align-items: center; gap: 4px;
   padding: 0 10px; height: 40px; border-radius: var(--sig-radius-card);
   cursor: pointer; margin-bottom: 1px;

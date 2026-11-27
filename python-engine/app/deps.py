@@ -206,7 +206,7 @@ def verify_isolation_level() -> None:
     #
     # 此前这里手写 `os.getenv("SANDBOX_ISOLATION_LEVEL")`，于是 `.env` 里配的档位对
     # **启动门禁完全无效**：用户写了 `SANDBOX_ISOLATION_LEVEL=low_il`，门禁照默认
-    # `restricted` 判定，普通账户下必然"降级"，再被 `allow_downgrade=false` 拒绝启动。
+    # 档位判定，可能把一次合法配置误判成"降级"再被 `allow_downgrade=false` 拒绝启动。
     # 配置写了却没人读，正是这个仓库反复踩的坑（见 `_apply_sandbox_service_branch` 注释）。
     #
     # `configured_level()` 内部已是"拼错就抛"，所以不必在这里重复解析。

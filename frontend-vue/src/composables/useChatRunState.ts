@@ -73,6 +73,16 @@ export interface SessionRunState {
  * `getActiveSessionId` 用 getter 而不是值：会话切换是视图层的输入，组合式函数
  * 在 setup 里只创建一次，必须在读取时取最新值。
  */
+/**
+ * 会话运行时的保留上限：长会话在侧栏来回切换时，`runtimes` 会按会话持续增长，
+ * 每个条目都持有完整消息数组（items）。没有上限时内存只增不减 —— 用户切过
+ * 几十个会话后，旧会话的 items 永远不会被回收。
+ *
+ * 淘汰只在"新会话首次进入"时发生，且绝不淘汰当前会话、运行中的会话、或仍有
+ * 子 Agent 事件待消费的会话；被淘汰的会话再次打开时会从服务端重新加载。
+ */
+export const RUNTIME_CACHE_LIMIT = 8
+
 export function useChatRunState(getActiveSessionId: () => string) {
   /**
    * ⚠️ 必须是**响应式** Map：`items` / `loading` 是从这里派生的 computed，
@@ -98,8 +108,21 @@ export function useChatRunState(getActiveSessionId: () => string) {
       // 必须取回 `runtimes.get()` 的**代理**，而不是刚构造的原始对象 ——
       // 原始对象不在响应式系统里，后续 push 不会触发更新。
       run = runtimes.get(sid)!
+      evictIdleRuns(RUNTIME_CACHE_LIMIT, sid)
     }
     return run
+  }
+
+  function evictIdleRuns(limit: number, protect: string): void {
+    if (runtimes.size <= limit) return
+    const active = getActiveSessionId()
+    for (const [sid, run] of runtimes) {
+      if (runtimes.size <= limit) return
+      if (sid === protect || sid === active) continue
+      // 运行中或还有子 Agent 事件待消费：淘汰会让下一次事件写进一个空状态。
+      if (run.loading || run.subagentEvents.length > 0) continue
+      runtimes.delete(sid)
+    }
   }
 
   /** 当前视图所属会话的运行时（空会话用占位键，保持既有"无会话"行为）。 */

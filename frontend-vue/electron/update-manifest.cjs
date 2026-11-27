@@ -64,10 +64,16 @@ function validateLatestManifest(parsed, options = {}) {
   }
 
   const url = String(file.url)
-  if (!isAllowedHost(url)) errors.push('installer-host-not-allowed')
+  // electron-builder 的 latest.yml 里 `files[].url` **只是文件名**（下载地址由
+  // 客户端用可信 repo/tag 拼出来）；只有显式写了绝对 URL 时才做域名白名单。
+  // 相对名同样不能带路径分隔符 —— 否则拼接后会跳出 release 目录。
+  const absolute = /^[a-z][a-z0-9+.-]*:/i.test(url)
+  if (absolute && !isAllowedHost(url)) errors.push('installer-host-not-allowed')
   const name = url.split('?')[0].split('/').pop() || ''
   if (platform === 'win32' && !/\.(exe|msi)$/i.test(name)) errors.push('installer-extension')
-  if (name.includes('..') || name.includes('/') || name.includes('\\')) errors.push('installer-name-unsafe')
+  if (url.includes('..') || url.includes('\\') || name.includes('/') || name.includes('\\')) {
+    errors.push('installer-name-unsafe')
+  }
 
   // 架构：清单里带 x64/arm64 标记时必须与当前进程一致，避免装错包。
   const lower = name.toLowerCase()

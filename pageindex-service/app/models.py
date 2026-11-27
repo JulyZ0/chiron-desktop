@@ -55,6 +55,8 @@ class ResolvedModels:
 
     chat_model: str = ""
     index_model: str = ""
+    #: 提供商 id（gateway 解析时给出；env 直读时为空，靠 base_url 推断）
+    provider: str = ""
     base_url: str = ""
     api_key: str = field(default="", repr=False)  # 明文不进 repr/日志
     #: env | gateway | none —— 排障时先看这个：它决定"该改哪一处"
@@ -65,13 +67,30 @@ class ResolvedModels:
     def ready(self) -> bool:
         return bool(self.chat_model and self.index_model)
 
-    def llm_backend(self) -> dict[str, str]:
-        out: dict[str, str] = {}
+    def llm_backend(self, *, session_id: str = "") -> dict[str, object]:
+        """litellm 的连接覆盖。
+
+        OpenCode（Zen / Go）**强制要求** ``x-opencode-session``，缺失直接
+        400 ``MissingSessionID`` —— 索引摘要走的是 pageindex → litellm，不经过
+        引擎 provider 的那层注入，因此必须在这里补。同一个库用同一个 id，
+        路由与 prompt 缓存都能命中。
+        """
+        out: dict[str, object] = {}
         if self.api_key:
             out["api_key"] = self.api_key
         if self.base_url:
             out["base_url"] = self.base_url
+        if self.provider.startswith("opencode") or "opencode.ai" in self.base_url:
+            out["extra_headers"] = {
+                "x-opencode-session": session_id or "chiron-knowledge",
+                "User-Agent": "chiron-knowledge/1.0",
+            }
         return out
+
+
+def _infer_provider(base_url: str) -> str:
+    """env 直读时没有 provider 字段，用端点反推 OpenCode（唯一需要额外头的场景）。"""
+    return "opencode" if "opencode.ai" in (base_url or "") else ""
 
 
 def from_env(cfg: Any) -> ResolvedModels:
@@ -86,13 +105,19 @@ def from_env(cfg: Any) -> ResolvedModels:
     api_key = str(getattr(cfg, "selfhosted_llm_api_key", "") or "").strip()
     if chat and index:
         return ResolvedModels(
-            chat_model=chat, index_model=index, base_url=base_url, api_key=api_key, source="env"
+            chat_model=chat,
+            index_model=index,
+            provider=_infer_provider(base_url),
+            base_url=base_url,
+            api_key=api_key,
+            source="env",
         )
     if chat or index:
         missing = "INDEX_MODEL" if chat else "CHAT_MODEL"
         return ResolvedModels(
             chat_model=chat,
             index_model=index,
+            provider=_infer_provider(base_url),
             base_url=base_url,
             api_key=api_key,
             source="none",
@@ -147,6 +172,7 @@ def _fetch_from_gateway(cfg: Any) -> ResolvedModels:
         chat_model=chat,
         # 索引模型与问答模型同源（单机只有一份模型配置）：网关只给一个名字时两边都用它。
         index_model=str(payload.get("index_model") or chat).strip(),
+        provider=str(payload.get("provider") or "").strip().lower(),
         base_url=str(payload.get("base_url") or "").strip(),
         api_key=str(payload.get("api_key") or "").strip(),
         source="gateway",
@@ -249,6 +275,7 @@ def apply_overrides(models: "ResolvedModels", overrides: dict[str, str] | None) 
     return ResolvedModels(
         chat_model=chat_model,
         index_model=index_model,
+        provider=models.provider,
         base_url=models.base_url,
         api_key=models.api_key,
         source="kb",

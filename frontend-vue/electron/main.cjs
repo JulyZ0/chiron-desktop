@@ -95,13 +95,15 @@ const openPathGuard = require('./open-path-guard.cjs')
 const { createMountDeps } = require('./mount-deps.cjs')
 const {
   parseLatestYml,
-  validateLatestManifest,
-  gateInstallerLaunch,
   compareVersions,
   pickLatestRelease,
   manifestUrlForTag,
   installerUrlForTag,
 } = require('./update-check.cjs')
+const {
+  validateLatestManifest,
+  gateInstallerLaunch,
+} = require('./update-manifest.cjs')
 
 /** 开发模式：`electron . --dev` 时连 Vite dev server，否则加载 dist/ */
 const isDev = process.argv.includes('--dev')

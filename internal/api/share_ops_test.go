@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -477,5 +478,146 @@ func TestAdminListShares_IncludesViewStats(t *testing.T) {
 	}
 	if !strings.HasSuffix(it.URL, "/s/shr1") {
 		t.Fatalf("后台链接也必须是 /s/ 前缀, got %q", it.URL)
+	}
+}
+
+// ── 密码失败短锁（L07）──────────────────────────────────────────────
+
+// fakeShareGuard 用内存模拟 Redis 计数，避免单测依赖真实 Redis。
+type fakeShareGuard struct {
+	mu        sync.Mutex
+	fails     map[string]int
+	lockedFor map[string]time.Duration
+	max       int
+	lock      time.Duration
+}
+
+func newFakeShareGuard(max int, lock time.Duration) *fakeShareGuard {
+	return &fakeShareGuard{fails: map[string]int{}, lockedFor: map[string]time.Duration{}, max: max, lock: lock}
+}
+
+func shareGuardKey(shareID, ipHash string) string { return shareID + "|" + ipHash }
+
+func (g *fakeShareGuard) locked(_ context.Context, shareID, ipHash string) (time.Duration, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	d, ok := g.lockedFor[shareGuardKey(shareID, ipHash)]
+	return d, ok
+}
+
+func (g *fakeShareGuard) recordFailure(_ context.Context, shareID, ipHash string) (time.Duration, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	k := shareGuardKey(shareID, ipHash)
+	g.fails[k]++
+	if g.fails[k] >= g.max {
+		delete(g.fails, k)
+		g.lockedFor[k] = g.lock
+		return g.lock, true
+	}
+	return 0, false
+}
+
+func (g *fakeShareGuard) clearFailures(_ context.Context, shareID, ipHash string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.fails, shareGuardKey(shareID, ipHash))
+}
+
+func (g *fakeShareGuard) failureCount(shareID, ipHash string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fails[shareGuardKey(shareID, ipHash)]
+}
+
+// 连续错误达到阈值 → 429 + share_locked + Retry-After；锁定期内正确密码也不放行。
+func TestSharePublicGet_PasswordFailuresTripShortLock(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("s3cret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	guard := newFakeShareGuard(sharePasswordMaxFailures, sharePasswordLockTTL)
+	h := &ShareHandler{store: passwordShareStore(t, string(hash)), passwordGuard: guard}
+
+	wrong := func() *httptest.ResponseRecorder {
+		req := accessRequest()
+		req.Header.Set(sharePasswordHeader, "not-it")
+		rec := httptest.NewRecorder()
+		h.PublicGet(rec, req)
+		return rec
+	}
+
+	for i := 1; i < sharePasswordMaxFailures; i++ {
+		if rec := wrong(); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("第 %d 次错误应为 401, got %d", i, rec.Code)
+		}
+	}
+	rec := wrong()
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("达到阈值应为 429, got %d (body=%s)", rec.Code, rec.Body.String())
+	}
+	if resp := decodeShareResponse(t, rec); resp.Code != CodeShareLocked {
+		t.Fatalf("code 应为 %q, got %q", CodeShareLocked, resp.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got == "" || got == "0" {
+		t.Fatalf("429 必须带 Retry-After，got %q", got)
+	}
+
+	// 锁定期内即使密码正确也拒绝：否则短锁只挡住了错误尝试，挡不住脚本重试。
+	req := accessRequest()
+	req.Header.Set(sharePasswordHeader, "s3cret")
+	locked := httptest.NewRecorder()
+	h.PublicGet(locked, req)
+	if locked.Code != http.StatusTooManyRequests {
+		t.Fatalf("锁定期内正确密码也应为 429, got %d", locked.Code)
+	}
+}
+
+// 未提供密码（首次打开）不计失败：否则正常访客刷新几次就被锁。
+func TestSharePublicGet_MissingPasswordDoesNotCount(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("s3cret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	guard := newFakeShareGuard(sharePasswordMaxFailures, sharePasswordLockTTL)
+	h := &ShareHandler{store: passwordShareStore(t, string(hash)), passwordGuard: guard}
+
+	for i := 0; i < sharePasswordMaxFailures+1; i++ {
+		rec := httptest.NewRecorder()
+		h.PublicGet(rec, accessRequest())
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("未提供密码应为 401, got %d", rec.Code)
+		}
+	}
+	if n := guard.failureCount("tok123", hashShareIP("203.0.113.7")); n != 0 {
+		t.Fatalf("未提供密码不应计数，got %d", n)
+	}
+}
+
+// 密码正确后清空失败计数：之前输错 4 次不该在下次成功后被"记仇"。
+func TestSharePublicGet_PasswordSuccessClearsFailures(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("s3cret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	guard := newFakeShareGuard(sharePasswordMaxFailures, sharePasswordLockTTL)
+	h := &ShareHandler{store: passwordShareStore(t, string(hash)), passwordGuard: guard}
+
+	bad := accessRequest()
+	bad.Header.Set(sharePasswordHeader, "not-it")
+	h.PublicGet(httptest.NewRecorder(), bad)
+	if n := guard.failureCount("tok123", hashShareIP("203.0.113.7")); n != 1 {
+		t.Fatalf("错误密码应记 1 次，got %d", n)
+	}
+
+	good := accessRequest()
+	good.Header.Set(sharePasswordHeader, "s3cret")
+	goodRec := httptest.NewRecorder()
+	h.PublicGet(goodRec, good)
+	if goodRec.Code != http.StatusOK {
+		t.Fatalf("正确密码应为 200, got %d", goodRec.Code)
+	}
+	if n := guard.failureCount("tok123", hashShareIP("203.0.113.7")); n != 0 {
+		t.Fatalf("正确密码后应清空计数，got %d", n)
 	}
 }

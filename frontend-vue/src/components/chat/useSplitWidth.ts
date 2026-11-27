@@ -11,12 +11,13 @@
  * 「内容决定宽度」。这样老用户零观感变化，双击重置也有明确语义。
  */
 import { computed, onUnmounted, ref } from 'vue'
+import { CHAT_DOCK_MIN_WIDTH, CHAT_DOCK_MAX_RATIO, clampDockWidth } from './chatLayout'
 
 /** 指针死区（CDS v1 §5.3.2 的 `qM = 4px`）：轻点手柄或手抖不该被当成拖拽 */
 const DEAD_ZONE_PX = 4
-const MIN_WIDTH = 260
-/** 上限 = 容器宽度的这个比例：保证主区域永远留得下可用宽度 */
-const MAX_RATIO = 0.6
+const MIN_WIDTH = CHAT_DOCK_MIN_WIDTH
+/** 上限与总预算见 `chatLayout.ts`：单栏比例 + 主区最小宽度必须同时满足。 */
+const MAX_RATIO = CHAT_DOCK_MAX_RATIO
 
 export interface SplitWidthOptions {
   /** localStorage 键（每栏独立） */
@@ -42,9 +43,12 @@ export function useSplitWidth(opts: SplitWidthOptions) {
   const resizing = ref(false)
 
   function clampWidth(px: number): number {
-    const container = paneRef.value?.parentElement?.clientWidth || 0
-    const max = container > 0 ? Math.max(MIN_WIDTH, Math.round(container * MAX_RATIO)) : 900
-    return Math.min(Math.max(Math.round(px), MIN_WIDTH), max)
+    return clampDockWidth({
+      next: px,
+      pane: paneRef.value,
+      minWidth: MIN_WIDTH,
+      maxRatio: MAX_RATIO,
+    })
   }
 
   function persistWidth() {

@@ -87,6 +87,11 @@ const (
 	// 与 `share_expired` 分开：上限是"已经被看过 N 次"，求创建者重发时对方需要知道
 	// 该调高限额，而不是单纯"再发一条"。
 	CodeShareViewLimit = "share_view_limit"
+	// CodeShareLocked 表示同一 (分享, 来源) 的密码失败次数过多，进入短暂锁定（429）。
+	//
+	// 与 `share_password_required` 分开：后者是"密码不对/没提供"，访客重试即可；
+	// 前者是"现在别试了"，前端必须禁用输入并展示等待时间，否则用户会继续撞锁。
+	CodeShareLocked = "share_locked"
 )
 
 // knownMessageCodes 已知文案 → 错误码（键为小写原文）。

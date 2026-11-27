@@ -89,7 +89,7 @@ func (h *SessionMapHandler) ListProjectCheckpoints(w http.ResponseWriter, r *htt
 
 	// 参数顺序固定为 workspace / tenant / user / [session] / limit，
 	// 与下面的 SQL 占位符一一对应。
-	args := []interface{}{wsID, smTenant(claims), claims.UserID}
+	args := []interface{}{wsID, smTenantID(claims), claims.UserID}
 	// `COALESCE(user_id,'')`：该列可空（写入侧 `NULLIF($3,'')`），而 `user_id = ''`
 	// 永不匹配 NULL ⇒ 没有 user_id 的检查点会在列表里"消失"，但它在库里。
 	// 与回滚入口（`CheckpointRestoreHandler`）保持同一判据，否则会出现

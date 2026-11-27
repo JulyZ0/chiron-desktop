@@ -368,6 +368,11 @@ class Settings(BaseSettings):
     # 0 = 关闭全局门控(仅每实例 concurrency)。
     queue_worker_global_concurrency: int = 10
 
+    # 引擎实例级 run 并发上限：直连 `/v1/agent/submit` 与 reconciler 自动续跑共享。
+    # 直连超限立即 429（不排队）；自动续跑拿不到槽位就跳过本轮。0 = 关闭。
+    # 队列 worker 另有自己的并发配置，不共用这个计数。
+    engine_max_concurrent_runs: int = 16
+
     # ── JWT ──
     # 默认空：未显式配置时若存在 APP_SECRET，则由其派生（与 Go 网关 deriveSubsecret 一致），
     # 保证引擎签发的 token 与 Go 网关共享同一密钥
@@ -415,18 +420,14 @@ class Settings(BaseSettings):
     #: 取值参考 `scripts/bench_sandbox.py` 实测出的"每实例安全并发数"。
     sandbox_service_max_concurrency: int = 0
 
-    #: Windows 原生执行隔离档位（`none` / `job` / `low_il` / `restricted` / `appcontainer`）。
+    #: 执行隔离档位（`none` / `job` / `low_il` / `container`）。
     #:
-    #: 本仓库是桌面端（Electron + 内嵌 PG/Redis），不该要求用户装 Docker，所以隔离
-    #: 落在 Windows 自带机制上。实测（零提权）：`job` 能拦内存爆炸，`low_il` 还能
-    #: 挡住写用户目录；`restricted` 要 `SeIncreaseQuotaPrivilege`
-    #: （`CreateProcessAsUserW`），非提权账户恒 `err=5`；`appcontainer` 零提权可用，
-    #: 但包 SID 读不到 CPython 安装目录 ⇒ `python.exe` 起不来
-    #: （`0xC0000135`/`STATUS_DLL_NOT_FOUND`），因此**只适合跑原生命令**，
-    #: `run_code` 的 Python worker 会如实折算到 `low_il`（见 `child_applicable_level`）。
+    #: 本仓库是桌面端（Electron + 内嵌 PG/Redis），不该要求用户装 Docker，所以
+    #: Windows 上的三档用系统自带机制：`job` 拦内存/进程树，`low_il` 再挡住写用户
+    #: 目录；第四档 `container` 走 Kiri（按需下载，不内置），只支持 Linux/macOS。
     #:
-    #: 空值 ⇒ 用 `app.isolation.DEFAULT_LEVEL`（Windows 上是 `restricted`，不可达时
-    #: 由 `resolve_level` 如实降级并在 `reasons` 里说明）；非 Windows 上自然退化为
+    #: 空值 ⇒ 用 `app.isolation.DEFAULT_LEVEL`（`low_il`；机制不可用时由
+    #: `resolve_level` 如实降级并在 `reasons` 里说明）；非 Windows 上自然退化为
     #: `none`，POSIX 继续走 `setrlimit`。**拼错会拒绝启动** —— 一个字母之差就等于
     #: 关掉隔离，不能猜。
     sandbox_isolation_level: str = ""

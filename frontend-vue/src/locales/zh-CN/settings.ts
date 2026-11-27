@@ -266,24 +266,21 @@ export default {
   isolation_floor_badge: "底线",
   isolation_active_badge: "生效中",
   isolation_pick: "选择档位",
+  isolation_levels_hint: "切换只影响之后启动的进程；已经在跑的进程不受影响。",
+  isolation_unavailable_badge: "本机不可用",
+  isolation_maintenance: "维护与清理",
   isolation_reprobe: "重新检测本机能力",
   isolation_reprobe_done: "已重新检测本机隔离能力。",
   isolation_reprobe_failed: "重新检测失败。",
-  isolation_retry_unavailable: "该档位当前不可选，请先按提示启用提权助手或修复缺失机制。",
+  isolation_retry_unavailable: "该档位当前不可选，请按提示修复缺失机制后重试。",
 
   isolation_level_none: "无隔离",
-  isolation_level_none_desc: "工具与主进程同权限直跑。**不提供任何边界**，仅用于排障。",
+  isolation_level_none_desc: "工具与主进程同权限直跑。不提供任何边界，仅用于排障。",
   isolation_level_job: "作业对象",
   isolation_level_job_desc: "限制进程树与资源，可在超时或撤销时整组结束。不限制文件与网络访问。",
   isolation_level_low_il: "低完整性",
   isolation_level_low_il_desc:
     "Windows 低完整性级别：对用户配置文件、凭据等位置的写入被拒绝。可读取同用户文件，挡不住读取。",
-  isolation_level_restricted: "受限令牌",
-  isolation_level_restricted_desc:
-    "受限令牌 + 独立桌面：去掉管理员组与写入类权限，进程只能写工作区。需要引擎以管理员身份运行才能启用；不可用时自动降为低完整性。",
-  isolation_level_appcontainer: "应用容器",
-  isolation_level_appcontainer_desc:
-    "最强档位：独立容器身份，文件与网络按授权放行。需要管理员权限预置容器配置，部分环境不可用。",
   isolation_level_container: "容器（Kiri）",
   isolation_level_container_desc:
     "每条命令在一次性容器里执行：独立命名空间与 cgroup、只读根文件系统、无网络、只挂工作区、默认 seccomp。运行时（Kiri）不内置，可在下方按需下载；依赖缺失时直接拒绝执行，不回退。",
@@ -304,30 +301,12 @@ export default {
 
   isolation_revoke_title: "清除隔离痕迹",
   isolation_revoke_body:
-    "删除本机为隔离创建的系统对象：应用容器配置、目录授权、以及工作区上的低完整性标签。不清理会让工作区长期处于低标签状态，影响后续未隔离的使用。",
+    "删除本机为低完整性档位留下的目录标签，以及旧版本容器档位遗留的配置与目录授权。不清理会让工作区长期处于低标签状态，影响后续未隔离的使用。",
   isolation_revoke_button: "清除隔离痕迹",
   isolation_revoke_confirm: "确认清除本机隔离痕迹？正在运行的隔离进程不受影响。",
   isolation_revoke_done: "隔离痕迹已清除。",
   isolation_revoke_partial: "部分痕迹未能清除，请查看详情：{detail}",
   isolation_revoke_failed: "清除隔离痕迹失败。",
-
-  isolation_helper_title: "受限令牌执行助手",
-  isolation_helper_body:
-    "「受限令牌」档位需要以受限令牌创建进程，而这一步要求管理员权限。为了让主程序不必整体提权，这里只提权一个功能极小的助手进程：它唯一能做的是「用受限令牌起进程」，权限比主程序更低。助手随主程序退出而自动结束。",
-  isolation_helper_enable: "启用助手（需要管理员授权）",
-  isolation_helper_disable: "停用助手",
-  isolation_helper_running: "助手运行中",
-  isolation_helper_stopped: "助手未运行",
-  isolation_helper_blocked: "「受限令牌」档位因此不可选。启用助手后即可切换。",
-  isolation_helper_engine_elevated: "主程序已以管理员身份运行，本档位无需助手。",
-  isolation_helper_unsupported: "当前平台不支持提权助手，本档位不可用。",
-  isolation_helper_confirm:
-    "接下来会弹出系统授权窗口（UAC），请选择「是」。助手只获得「用受限令牌起进程」这一项能力，不会以管理员权限执行你的任何命令。",
-  isolation_helper_enabled: "助手已启用，「受限令牌」档位现在可选。",
-  isolation_helper_cancelled: "已取消授权：系统授权窗口未同意，助手没有启动。",
-  isolation_helper_enable_failed: "启用助手失败：{reason}",
-  isolation_helper_disabled: "助手已停用。",
-  isolation_helper_disable_failed: "停用助手失败：{reason}",
 
   isolation_load_failed: "读取隔离档位失败。",
   isolation_auth_pending: "本机会话尚未就绪，暂时读不到隔离档位。确认本地服务已启动后重试。",

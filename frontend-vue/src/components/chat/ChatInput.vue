@@ -17,6 +17,10 @@ import { fileTypeBadge } from '../../utils/fileName'
 
 import { useI18n } from 'vue-i18n'
 const { t: tr } = useI18n()
+
+const VISIBLE_CONTEXT_CHIPS = 3
+const visibleContextChips = computed(() => (props.contextChips ?? []).slice(0, VISIBLE_CONTEXT_CHIPS))
+const hiddenContextChips = computed(() => (props.contextChips ?? []).slice(VISIBLE_CONTEXT_CHIPS))
 const props = defineProps<{
   loading: boolean
   mode: string
@@ -93,6 +97,8 @@ const emit = defineEmits<{
 
 const input = ref('')
 const textareaRef = ref()
+/** 输入框是否聚焦：提示文案只在聚焦且为空时显示，避免长期占位。 */
+const composerFocused = ref(false)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const dragOver = ref(false)
 
@@ -734,6 +740,13 @@ function onKeydown(e: KeyboardEvent) {
     }
   }
   if (e.key === 'Escape' && cancelRecall()) return
+  // Cmd/Ctrl+Enter：运行中追加指令（steer），不打断当前回合。
+  // 与 Enter（打断并发送）刻意分开 —— 两者语义相反，不能共用一个无修饰键。
+  if (e.key === 'Enter' && !e.shiftKey && (e.ctrlKey || e.metaKey) && props.loading) {
+    e.preventDefault()
+    steerSubmit()
+    return
+  }
   // Enter 发送（无修饰键）；Shift+Enter 换行；Cmd/Ctrl+Enter 也发送（兼容）
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
@@ -1024,6 +1037,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
       <!-- `@` 提及面板：与斜杠命令同一套交互与样式，数据源换成可引用资源 -->
       <div
         v-if="mentionOpen"
+        id="chat-mention-listbox"
         class="slash-menu mention-menu"
         role="listbox"
         :aria-label="$t('common.reference_resource')"
@@ -1053,6 +1067,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
             <div
               v-for="entry in group.entries"
               :key="`${entry.item.type}:${entry.item.id}`"
+              :id="`chat-mention-option-${entry.flatIndex}`"
               class="slash-item"
               :class="{ active: entry.flatIndex === mentionIndex }"
               role="option"
@@ -1069,11 +1084,13 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
       <!-- 斜杠命令面板 -->
       <div
         v-if="showSlashMenu"
+        id="chat-slash-listbox"
         class="slash-menu"
         role="listbox"
       >
         <div
           v-for="(c, i) in filteredCommands"
+          :id="`chat-slash-option-${i}`"
           :key="c.cmd"
           class="slash-item"
           :class="{ active: i === slashIndex }"
@@ -1095,7 +1112,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
         :aria-label="$t('chat.context_of_this_conversation')"
       >
         <span
-          v-for="chip in contextChips"
+          v-for="chip in visibleContextChips"
           :key="`${chip.type}:${chip.value}`"
           class="context-chip"
         >
@@ -1110,6 +1127,39 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
             <CloseOutlined />
           </button>
         </span>
+        <Popover
+          v-if="hiddenContextChips.length"
+          trigger="click"
+          placement="topLeft"
+        >
+          <template #content>
+            <div class="context-pop">
+              <div
+                v-for="chip in hiddenContextChips"
+                :key="`${chip.type}:${chip.value}`"
+                class="context-pop__row"
+              >
+                <span class="context-pop__label">{{ chip.label }}</span>
+                <button
+                  type="button"
+                  class="context-chip__x"
+                  :title="$t('common.remove')"
+                  :aria-label="`${$t('common.remove')} ${chip.label}`"
+                  @click="emit('remove-context-chip', chip)"
+                >
+                  <CloseOutlined />
+                </button>
+              </div>
+            </div>
+          </template>
+          <button
+            type="button"
+            class="context-chip context-chip--more"
+            :aria-label="$t('chat.context_of_this_conversation')"
+          >
+            +{{ hiddenContextChips.length }}
+          </button>
+        </Popover>
       </div>
       <!-- 附件预览区 -->
       <div
@@ -1146,6 +1196,19 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
         </div>
       </div>
       <Input.TextArea
+        role="combobox"
+        aria-autocomplete="list"
+        :aria-expanded="mentionOpen || showSlashMenu"
+        :aria-controls="mentionOpen ? 'chat-mention-listbox' : showSlashMenu ? 'chat-slash-listbox' : undefined"
+        :aria-activedescendant="
+          mentionOpen
+            ? `chat-mention-option-${mentionIndex}`
+            : showSlashMenu
+              ? `chat-slash-option-${slashIndex}`
+              : undefined
+        "
+        @focus="composerFocused = true"
+        @blur="composerFocused = false"
         ref="textareaRef"
         v-model:value="input"
         :data-tour="TOUR_ANCHORS.input"
@@ -1324,6 +1387,20 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
                     @update:value="(v: any) => emit('update:reasoningLanguage', String(v))"
                   />
                 </label>
+                <label
+                  v-if="personaOptions?.length"
+                  class="settings-pop__row"
+                >
+                  <span class="settings-pop__label">{{ $t('chat.persona') }}</span>
+                  <Select
+                    :model-value="persona || ''"
+                    :options="[{ label: $t('chat.persona_default'), value: '' }, ...personaOptions]"
+                    size="small"
+                    style="width: 150px"
+                    :title="$t('chat.persona_title')"
+                    @change="(v: any) => emit('persona-change', String(v ?? ''))"
+                  />
+                </label>
               </div>
             </template>
             <Button
@@ -1352,19 +1429,6 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
             :title="$t('chat.input.modelTitle', { model: modelValue || $t('chat.input.modelDefault') })"
             @update:value="onModelChange"
           />
-          <!-- 人格：来自后台「人格管理」，只列启用条目。空 = 跟随默认人格。
-               服务端按 id 解析提示词，这里只负责"选谁"。 -->
-          <template v-if="personaOptions?.length">
-            <span class="mode-label">{{ $t('chat.persona') }}</span>
-            <Select
-              class="model-select persona-select"
-              :model-value="persona || ''"
-              :options="[{ label: $t('chat.persona_default'), value: '' }, ...personaOptions]"
-              size="small"
-              :title="$t('chat.persona_title')"
-              @change="(v: any) => emit('persona-change', String(v ?? ''))"
-            />
-          </template>
 <!--          <Button-->
 <!--            type="text"-->
 <!--            size="small"-->
@@ -1386,7 +1450,10 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
             <span class="run-dot" />
             {{ $t('common.generating') }}<span class="tnum-fixed">{{ elapsed }}s</span>
           </span>
-          <span class="input-hint">{{ $t('common.enter_to_send_shift_enter_for_newline') }}</span>
+          <span
+            v-if="composerFocused && !input.trim()"
+            class="input-hint"
+          >{{ $t('common.enter_to_send_shift_enter_for_newline') }}</span>
           <!-- 运行中补充指令（steer，P0-3）：只在"正在跑 + 手上有草稿"时出现。
                此时 Enter 是"打断并发送"、停止按钮是"停"，两条路都会丢掉这一轮已跑的部分；
                这里给第三条：话带到了，回合接着跑。 -->
@@ -1607,6 +1674,10 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
 /* 附件预览区 */
 .attachment-preview { display: flex; flex-wrap: wrap; gap: 8px; padding: 4px 0 8px; }
 /* 上下文 chip 行：把"沉默生效"的绑定显式呈现（对齐 reasonix 的 composer-context） */
+.context-chip--more { cursor: pointer; }
+.context-pop { display: flex; flex-direction: column; gap: 6px; max-width: 280px; }
+.context-pop__row { display: flex; align-items: center; gap: 8px; }
+.context-pop__label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-xs); }
 .context-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 0 8px; }
 .context-chip {
   display: inline-flex; align-items: center; gap: 4px; max-width: 220px;

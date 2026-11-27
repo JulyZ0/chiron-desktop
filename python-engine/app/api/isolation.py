@@ -5,19 +5,9 @@
 - ``GET    /v1/system/isolation``         当前档位：请求值 / 实际值 / 能力矩阵 / 可选档位
 - ``PUT    /v1/system/isolation``         切换档位（**只在进程内生效，不写 .env**）
 - ``DELETE /v1/system/isolation``         撤销运行时覆盖，回到配置文件的值
-- ``POST   /v1/system/isolation/revoke``  撤销**磁盘产物**（AppContainer profile、目录标签）
-- ``GET    /v1/system/isolation/helper``  提权助手状态（``restricted`` 档的执行前置）
-- ``POST   /v1/system/isolation/helper``  启用提权助手（**弹一次 UAC**）
-- ``DELETE /v1/system/isolation/helper``  停用提权助手
-
-## 关于 `/isolation/helper` 的三条
-
-网关（`internal/api/routes_proxy.go`）**必须**同时注册这三条。缺 GET，前端
-``helperStatus`` 恒为 null，界面既不提示"助手挡住了 restricted"，也不会出现
-「启用助手」按钮；缺 POST，点了只会拿到前端兜底文案
-（真机事故：界面显示「启用助手失败：本机无法启用此档位」，而那不是引擎说的
-任何一句话，是网关 404 被前端兜底文案盖住了）；缺 DELETE，用户无法撤销这条
-提权通道。
+- ``POST   /v1/system/isolation/revoke``  撤销**磁盘产物**（历史容器配置、目录标签）
+- ``POST   /v1/system/isolation/probe``   清探测缓存并重新实测
+- ``POST   /v1/system/isolation/container/prepare`` 下载并校验 Kiri 运行时包
 
 ## 为什么切换不写 .env
 
@@ -33,7 +23,7 @@
 用户要求"随时能够撤销或更改隔离程度"。这句话拆开是两件事：
 
 1. **改回来**（``DELETE``）：撤销设置，恢复配置档位。
-2. **擦掉痕迹**（``POST /revoke``）：AppContainer profile 与工作区完整性标签会
+2. **擦掉痕迹**（``POST /revoke``）：历史容器 profile 与工作区完整性标签会
    **留在磁盘上**，不撤销会让目录长期处于 Low 标签，影响后续未隔离使用。
 
 只做第一件是不够的 —— 那是"设置撤销"，不是"副作用撤销"。
@@ -114,7 +104,7 @@ class LevelChange(BaseModel):
     实际跑 low_il"这条重要信息。
     """
 
-    level: str = Field(..., description="none | job | low_il | restricted | appcontainer")
+    level: str = Field(..., description="none | job | low_il | container")
     reason: str = Field("", max_length=500, description="为什么改，写进审计")
     #: "我确实要这个低于安全底线的档位"的显式声明。
     #:
@@ -134,7 +124,7 @@ async def get_isolation(request: Request) -> dict[str, Any]:
     两者不同就是发生了降级 —— 前端必须把这件事显示出来，否则就是"静默降级"。
 
     ``status()`` 里的可用性判定是**端到端冒烟**（真的起一个子进程），首次调用
-    可能要数秒（`restricted` 走 helper 时要多一跳 HTTP）。所以它必须放到线程里跑：
+    可能要数秒（端到端起子进程 / 探测 Kiri socket）。所以它必须放到线程里跑：
     这是一条 ``async`` 端点，同步探测会把整个引擎事件循环堵住 —— 同进程里正在
     流式输出的对话、正在轮询的会话全都会跟着卡住，而用户只是打开了设置页。
     """
@@ -155,7 +145,7 @@ async def reprobe_isolation(request: Request) -> dict[str, Any]:
     """清掉档位探测缓存并**立刻重新实测**，返回最新状态。
 
     `selectable` 是端到端冒烟结果（真的以受限令牌起子进程），结果缓存在进程内。
-    用户启用提权助手或安全软件放行之后，旧缓存仍可能把 `restricted` 标成不可用 ——
+    安全软件放行或 Kiri 刚启动之后，旧缓存仍可能把对应档位标成不可用 ——
     设置页看起来"永远灰着"，唯一的出路是重启引擎。这个端点就是那条出路：
     它不改任何档位，只让下一次判定重新实测。
     """
@@ -213,6 +203,23 @@ async def set_isolation(body: LevelChange, request: Request) -> dict[str, Any]:
     return result
 
 
+def _degrade_audit_reason(state: dict[str, Any]) -> str:
+    """档位没生效时，给审计流水一条**非空**的机器原因。
+
+    降级本身是允许的，但**静默**降级会让用户与运维都无从下手：审计里只剩
+    ``requested=low_il effective=job reason=""``，看起来一切正常。
+    原因直接取自 ``unavailable_reasons[requested]``，那里已经有"缺哪个机制"的细节。
+    """
+    requested = str(state.get("requested") or "")
+    effective = str(state.get("effective") or "")
+    if not requested or not effective or requested == effective:
+        return ""
+    reasons = state.get("unavailable_reasons") or {}
+    detail = str(reasons.get(requested) or "").strip()
+    head = f"档位未生效：{requested} → {effective}"
+    return f"{head}；原因：{detail}" if detail else head
+
+
 def _switch_level(
     level: iso.Level,
     acknowledge: bool,
@@ -237,15 +244,6 @@ def _switch_level(
     before = iso.status()
 
     iso.set_runtime_level(level, acknowledge_below_floor=acknowledge)
-    # 受限令牌：探活缓存可能是"助手启动前"的负结果（引擎启动门禁先探过一次）。
-    # 用户点切档时若助手现在可用，必须重探一次再判定 —— 否则会把一次成功切换
-    # 报成 requested=restricted / effective=low_il。
-    if level is iso.Level.RESTRICTED:
-        from app.isolation import win_launch
-
-        helper_ok, _helper_reason = win_launch.helper_available()
-        if helper_ok:
-            iso.reset_probes()
     state = iso.status()
     decision = iso.resolve_level()
 
@@ -256,7 +254,7 @@ def _switch_level(
         previous=previous.value if previous is not None else None,
         actor=actor,
         # 用户没写理由时，若档位被降级，就把**机器原因**写进审计。
-        # 否则这条流水只剩 "requested=restricted effective=low_il"，事后无解。
+        # 否则这条流水只剩 "requested=low_il effective=job"，事后无解。
         reason=reason or _degrade_audit_reason(state),
     )
 
@@ -327,159 +325,3 @@ async def revoke_isolation(request: Request) -> dict[str, Any]:
         reason="撤销磁盘产物",
     )
     return {"ok": True, **result}
-
-
-# ── 提权 helper（受限令牌的执行前置） ─────────────────────────────
-#
-# 为什么这必须是一个**用户显式触发**的端点：它弹一次 UAC，而用户同意的是
-# "提权执行通道"。引擎自己在启动时静默弹窗是不可接受的 —— 用户不知道自己在
-# 同意什么。所以这条路只能由设置页的按钮走到这里。
-#
-# 为什么不需要额外做"仅本地可调"限制：`_verify_gateway_key` 已经要求网关凭据，
-# 而网关本身只听本机回环（桌面端形态）。
-
-#: 启用助手失败时的**兜底**原因。
-#:
-#: 必须是一句能让用户动手的话，而不是"本机无法启用此档位"那种把三种事故
-#: （用户取消 / 真的起不来 / 网关不通）混成一句的空话 —— 那句话此前还会因为
-#: 网关缺路由而在**任何**机器上稳定出现。
-HELPER_START_FALLBACK_REASON = "未能启动提权助手（原因未上报）"
-
-#: 与失败原因并列给前端的**可执行指引**，前端单独渲染，不与 reason 混排。
-#:
-#: 放在后端而不是前端文案里：这条指引与"实际要发生什么"强绑定（弹一次 UAC、
-#: 用哪个账户批准），改动它们的是引擎侧的启动逻辑。
-HELPER_START_HINT = (
-    "启用「受限令牌」档需要在系统授权（UAC）窗口点一次「是」。"
-    "若窗口没有出现，请检查安全软件是否拦住了提权进程；"
-    "若你用非管理员账户登录，请在窗口里输入任意管理员账户的凭据。"
-)
-
-
-def _degrade_audit_reason(state: dict[str, Any]) -> str:
-    """档位没生效时，给审计流水一条**非空**的机器原因。
-
-    ## 为什么必须补这一条
-
-    真机审计里出现过这样的行：``action=helper_start requested=restricted
-    effective=low_il reason=""`` —— 助手启用成功、档位却仍在 `low_il`，而
-    `reason` 为空，事后只剩"看起来正常"这一条线索。降级本身是允许的
-    （fail-closed 执行仍然成立），但**静默**降级会让用户与运维都无从下手。
-
-    原因直接取自 `status()["unavailable_reasons"][requested]`：那里已经有
-    "缺哪个特权 / 哪个 API 名"这一层细节（如 `CreateProcessAsUserW 失败 err=5`
-    或 `无法启用 … SeIncreaseQuotaPrivilege`），不必在这里重新拼一遍。
-    """
-    requested = str(state.get("requested") or "")
-    effective = str(state.get("effective") or "")
-    if not requested or not effective or requested == effective:
-        return ""
-    reasons = state.get("unavailable_reasons") or {}
-    detail = str(reasons.get(requested) or "").strip()
-    head = f"档位未生效：{requested} → {effective}"
-    return f"{head}；原因：{detail}" if detail else head
-
-
-@router.get("/isolation/helper")
-async def get_helper(request: Request) -> dict[str, Any]:
-    """提权 helper 的当前状态。
-
-    单列一个端点而不是塞进 ``GET /isolation``：``status()`` 会被高频调用
-    （面板每次刷新、档位每次解析），而 helper 探测要发一次 HTTP ping，
-    混进去会让本来常数时间的状态查询多一跳网络。
-    """
-    _verify_gateway_key(request)
-    return await asyncio.to_thread(_helper_status_payload)
-
-
-def _helper_status_payload() -> dict[str, Any]:
-    from app.isolation import win_launch
-
-    return win_launch.helper_status()
-
-
-@router.post("/isolation/helper")
-async def start_helper(request: Request) -> dict[str, Any]:
-    """启动提权 helper（**会弹一次 UAC**），等它就绪后返回最新状态。
-
-    失败不抛 500：UAC 被取消是用户的正常选择，不是服务器错误。回
-    ``{ok: false, reason}`` 让前端能把"你取消了"与"起不来"分开说。
-
-    启动成功后必须清探测缓存 —— 否则 ``selectable`` 里依旧没有 ``restricted``，
-    用户会看到"授权成功了但档位还是灰的"。
-    """
-    _verify_gateway_key(request)
-
-    from app.isolation import win_launch
-
-    ok, reason, cancelled = await asyncio.to_thread(win_launch.helper_start)
-    if ok:
-        # 两份缓存（本包的 `_restricted_ok` 与 win_launch 的 `_smoke_ok`）一起清。
-        iso.reset_probes()
-
-    # **一次**探测同时供三处使用：返回给前端的档位状态、审计里的 effective、
-    # 以及 helper 最新状态。探测是端到端冒烟（真起一个受限进程），重复探测
-    # 既慢又可能给出前后不一致的结论（"界面说可用、审计说降级"）。
-    state = await asyncio.to_thread(_status_payload)
-
-    # 审计的 `reason` 三态互斥：
-    #   * 成功但档位没生效（降级）⇒ 写机器原因，别让审计出现 reason=""；
-    #   * 用户取消 UAC ⇒ 如实记，不需要排障；
-    #   * 真的失败 ⇒ 带 `reason`，缺省也要有兜底文案。
-    if ok:
-        audit_reason = _degrade_audit_reason(state)
-    elif cancelled:
-        audit_reason = "用户取消 UAC"
-    else:
-        audit_reason = f"失败：{reason or HELPER_START_FALLBACK_REASON}"
-
-    iso.record_level_change(
-        action="helper_start",
-        requested=state["requested"],
-        effective=state["effective"],
-        previous=None,
-        actor=_actor(request),
-        reason=audit_reason,
-    )
-    return {
-        "ok": ok,
-        # `cancelled` 单独给一个字段而不是靠解析 `reason` 文本：前端要据此选
-        # 「你取消了授权」还是「启用失败」两种完全不同的提示，而 `reason` 是
-        # 人类可读字符串、措辞会随版本变化。
-        "cancelled": cancelled,
-        "reason": "" if ok else (reason or HELPER_START_FALLBACK_REASON),
-        "hint": "" if ok else HELPER_START_HINT,
-        "helper": await asyncio.to_thread(_helper_status_payload),
-        **state,
-    }
-
-
-@router.delete("/isolation/helper")
-async def stop_helper(request: Request) -> dict[str, Any]:
-    """停用提权 helper（由它自己退出，引擎无权杀 High IL 进程）。
-
-    幂等：本来没在跑也返回 ``ok: true``。
-    """
-    _verify_gateway_key(request)
-
-    from app.isolation import win_launch
-
-    ok, reason = await asyncio.to_thread(win_launch.helper_stop)
-    iso.reset_probes()
-
-    state = await asyncio.to_thread(_status_payload)
-    iso.record_level_change(
-        action="helper_stop",
-        requested=state["requested"],
-        effective=state["effective"],
-        previous=None,
-        actor=_actor(request),
-        reason="" if ok else f"失败：{reason}",
-    )
-    return {
-        "ok": ok,
-        "reason": "" if ok else (reason or "提权助手未能退出"),
-        "helper": await asyncio.to_thread(_helper_status_payload),
-        **state,
-    }
-

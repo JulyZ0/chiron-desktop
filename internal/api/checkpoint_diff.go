@@ -145,7 +145,7 @@ func CheckpointDiffHandler(python *engine.PythonClient) http.HandlerFunc {
 		// `COALESCE(user_id,'')` 与回滚端点同口径：该列可空，`user_id = ''` 不匹配
 		// NULL，少了包裹会让"创建时没有 user_id"的点永远预览不了。
 		owned, err := db.GlobalDBManager.FetchOne(r.Context(), checkpointDiffOwnershipSQL,
-			cid, smTenant(claims), claims.UserID)
+			cid, smTenantID(claims), claims.UserID)
 		if err != nil {
 			slog.Error("checkpoint diff: ownership lookup failed", "error", err, "id", cid)
 			InternalError(w, "lookup failed")

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, reactive, shallowRef, onMounted, onUnmounted, nextTick, watch, h } from 'vue'
+import { narrowSidebarQuery } from '../composables/layoutBreakpoints'
 import { Button, Input, Modal, Checkbox, Alert, Dropdown, Menu, MenuItem, MenuDivider } from 'ant-design-vue'
 import { MenuOutlined, CopyOutlined, LinkOutlined, CloseOutlined } from '@ant-design/icons-vue'
 import {
@@ -24,7 +25,7 @@ import {
 import SessionStatsPanel from '../components/chat/SessionStatsPanel.vue'
 import ChatHealthPanel from '../components/chat/ChatHealthPanel.vue'
 import { fetchComponentsHealth, isComponentUp, type ComponentsHealth } from '../api/systemHealth'
-import SessionPreviewPane from '../components/chat/SessionPreviewPane.vue'
+import ChatReferenceDock from '../components/chat/ChatReferenceDock.vue'
 import { useAuthStore } from '../stores/auth'
 import { privateKey } from '../utils/privateStorage'
 import { playUiSound } from '../utils/uiSounds'
@@ -47,7 +48,7 @@ import MessageItem from '../components/chat/MessageItem.vue'
 import ChatEmptyHero from '../components/chat/ChatEmptyHero.vue'
 import ChatInput from '../components/chat/ChatInput.vue'
 import WorkbenchPanel from '../components/workbench/WorkbenchPanel.vue'
-import { toggleWorkbench, workbenchOpen } from '../components/workbench/useWorkbench'
+import { setWorkbenchOpen, toggleWorkbench, workbenchOpen } from '../components/workbench/useWorkbench'
 import { collectAgentWrittenPaths, normalizeForCompare, writePathOfToolCall } from '../components/workbench/agentTouched'
 import SessionMapView from './sessionmap/SessionMapView.vue'
 import { pickStreamPreview } from './sessionmap/streamPreview'
@@ -89,6 +90,7 @@ import { sessionToAgent, agentBindingsFromContext } from '../utils/sessionAgent'
 import ChatStatusBar from '../components/chat/ChatStatusBar.vue'
 import ChatDisplaySettings from '../components/chat/ChatDisplaySettings.vue'
 import AskCard from '../components/chat/AskCard.vue'
+import ChatAttentionTray from '../components/chat/ChatAttentionTray.vue'
 import InteractionInbox from '../components/chat/InteractionInbox.vue'
 import InteractionBadge from '../components/chat/InteractionBadge.vue'
 import CallChainTimeline from '../components/CallChainTimeline.vue'
@@ -296,7 +298,45 @@ const statsOpen = ref(false)
  * 那是一次状态归属重构。而"边跑子 Agent 边看另一个会话"这个高频需求只读就够，
  * 且**完全不触碰现有状态模型**（零回归风险）。可写双栏属 6b 之后。
  */
-const splitSessionId = ref('')
+const SPLIT_SESSION_KEY = 'chiron:chat-split-session:v1'
+
+function readSplitSession(): string {
+  try {
+    return globalThis.localStorage?.getItem(SPLIT_SESSION_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+const splitSessionId = ref(readSplitSession())
+watch(splitSessionId, (id) => {
+  try {
+    if (id) globalThis.localStorage?.setItem(SPLIT_SESSION_KEY, id)
+    else globalThis.localStorage?.removeItem(SPLIT_SESSION_KEY)
+  } catch {
+    /* 隐私模式：只在本次运行内生效 */
+  }
+})
+
+// 右侧对照 Dock：参考会话与子 Agent 共用一栏，同时打开时用 tab 切换。
+const RIGHT_DOCK_TAB_KEY = 'chiron:chat-right-dock:v1'
+function readRightDockTab(): 'reference' | 'subagent' {
+  try {
+    return globalThis.localStorage?.getItem(RIGHT_DOCK_TAB_KEY) === 'subagent' ? 'subagent' : 'reference'
+  } catch {
+    return 'reference'
+  }
+}
+const rightDockTab = ref<'reference' | 'subagent'>(readRightDockTab())
+watch(rightDockTab, (tab) => {
+  try {
+    globalThis.localStorage?.setItem(RIGHT_DOCK_TAB_KEY, tab)
+  } catch {
+    /* 存不下不影响使用 */
+  }
+})
+watch(splitSessionId, (id) => { if (id) rightDockTab.value = 'reference' })
+watch(subagentDockOpen, (open) => { if (open) rightDockTab.value = 'subagent' })
 
 /** 工具栏按钮：开/关参考栏 */
 function toggleSplit() {
@@ -1575,7 +1615,30 @@ const { open: panelOpen } = usePanelCollapse({
   defaultOpen: () => window.matchMedia('(min-width: 1025px)').matches,
   narrowQuery: '(max-width: 1024px)',
 })
-const panelView = ref<'trajectory' | 'sessions' | 'agents' | 'stats'>('trajectory')
+const PANEL_VIEW_KEY = 'chiron:chat-panel-view:v1'
+function readPanelView(): 'trajectory' | 'sessions' {
+  try {
+    const raw = globalThis.localStorage?.getItem(PANEL_VIEW_KEY)
+    return raw === 'sessions' ? 'sessions' : 'trajectory'
+  } catch {
+    return 'trajectory'
+  }
+}
+const panelView = ref<'trajectory' | 'sessions'>(readPanelView())
+watch(panelView, (view) => {
+  try {
+    globalThis.localStorage?.setItem(PANEL_VIEW_KEY, view)
+  } catch {
+    /* 存不下不影响使用 */
+  }
+})
+
+// 窄屏侧栏是抽屉：打开时主区必须 inert，键盘/读屏不能穿透到被遮罩的正文。
+const narrowSidePanel = ref(false)
+let narrowSideQuery: MediaQueryList | null = null
+function syncNarrowSidePanel() {
+  narrowSidePanel.value = narrowSideQuery?.matches ?? false
+}
 /**
  * 会话地图：**独立的整屏大窗格**（不是侧栏里的一个小视图 —— 侧栏太窄，
  * 放不下"空间化排布"这件事本身）。位置稳定性是它的立身之本，
@@ -1686,7 +1749,7 @@ function onTrajectoryFocus(index: number) {
 }
 
 // 打开面板并直达指定视图；点击已激活的入口则收起
-function openPanel(view: 'trajectory' | 'sessions' | 'agents' | 'stats') {
+function openPanel(view: 'trajectory' | 'sessions') {
   if (panelOpen.value && panelView.value === view) {
     panelOpen.value = false
     return
@@ -1814,8 +1877,16 @@ useKeyboardShortcuts({
     },
     {
       ...specOf('close-panel'),
-      when: () => panelOpen.value,
-      handler: () => { panelOpen.value = false },
+      // 所有“辅助面板”共用一个 Esc 语义：子 Agent 栏 > 分屏参考 > 工作台 > 侧栏。
+      // 顺序按“打开后离用户当前任务最近”排，而不是按打开时间。
+      when: () =>
+        panelOpen.value || workbenchOpen.value || !!splitSessionId.value || subagentDockOpen.value,
+      handler: () => {
+        if (subagentDockOpen.value) setSubagentDockOpen(false)
+        else if (splitSessionId.value) splitSessionId.value = ''
+        else if (workbenchOpen.value) setWorkbenchOpen(false)
+        else panelOpen.value = false
+      },
       preventDefault: false,
     },
   ],
@@ -1834,10 +1905,19 @@ onMounted(async () => {
     closeAllSessionStreams()
     interactionScope.clear()
   })
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    narrowSideQuery = window.matchMedia(narrowSidebarQuery())
+    syncNarrowSidePanel()
+    narrowSideQuery.addEventListener('change', syncNarrowSidePanel)
+  }
   // 互联互通：解析 /chat query（task / error / kb / agent / skill）
   await applyRouteQuery()
   void checkBudgetWarning()
   await loadSessions()
+  // 持久化的参考栏目标可能已被删除：列表加载后校验一次，避免恢复出一个空参考栏。
+  if (splitSessionId.value && !sessions.value.some(s => s.id === splitSessionId.value)) {
+    splitSessionId.value = ''
+  }
   void loadPersonas()
   // 统一任务模式不自动切换普通会话；其余保持原有行为
   if (!unifiedMode.value && sessions.value.length > 0) {
@@ -1869,6 +1949,7 @@ onUnmounted(() => {
   if (healthTimer) { clearInterval(healthTimer); healthTimer = null }
   window.removeEventListener('online', onOnline)
   window.removeEventListener('offline', onOffline)
+  narrowSideQuery?.removeEventListener('change', syncNarrowSidePanel)
 })
 
 // 离线监听 + 自动重连
@@ -2789,30 +2870,29 @@ function continueGeneration() {
         @retry-project="refreshActiveProject"
       />
     </Transition>
-    <SessionPreviewPane
-      v-if="splitSessionId"
-      :session-id="splitSessionId"
-      :title="splitTitle"
+    <ChatReferenceDock
+      v-if="splitSessionId || subagentDockOpen"
+      v-model:active="rightDockTab"
+      :reference-open="!!splitSessionId"
+      :subagent-open="subagentDockOpen"
+      :session-id="activeSessionId"
+      :reference-session-id="splitSessionId"
+      :reference-title="splitTitle"
       :sessions="sessions"
       :exclude-session-id="activeSessionId"
       :handle-side="layoutSwapped ? 'left' : 'right'"
-      @update:session-id="splitSessionId = $event"
-    />
-    <!-- 子 Agent **对照栏**（取代此前的右下角浮卡）。
-         位置与参考栏同级：两者都是"读的东西并排摆"，所以留在布局里、不盖正文。
-         可以一直开着：子 Agent 跑着的时候，用户要能一边写主会话一边看它的过程与审批。
-         `focus-*` 来自「对话流里点某条子 Agent 结果」的定位请求（见 useSubAgentDock）。 -->
-    <SubAgentPane
-      v-if="subagentDockOpen"
-      :session-id="activeSessionId"
       :live-events="subagentLiveEvents"
-      :handle-side="layoutSwapped ? 'left' : 'right'"
       :focus-run-id="subagentFocusRequest?.runId || ''"
       :focus-seq="subagentFocusRequest?.seq || 0"
+      @update:session-id="splitSessionId = $event"
+      @close-reference="splitSessionId = ''"
+      @close-subagent="setSubagentDockOpen(false)"
       @retry-run="onSubagentRetry"
-      @close="setSubagentDockOpen(false)"
     />
-    <div class="chat-main">
+    <div
+      class="chat-main"
+      :inert="panelOpen && narrowSidePanel"
+    >
       <div
         v-if="connectionLost"
         class="connection-banner"
@@ -3167,107 +3247,20 @@ function continueGeneration() {
            它控制的是"工具执行是否需要确认"，与「对话模式」是两个维度，
            但占用工具栏一整行会让视觉权重过高、且离输入区太远。 -->
 
-      <div
-        v-if="pendingApprovals.length"
-        class="approval-zone"
-      >
-        <div
-          v-for="a in pendingApprovals"
-          :key="a.id"
-          class="approval-card"
-        >
-          <div class="approval-info">
-            <span class="approval-tag">{{ $t('agent.tool_confirmation') }}</span>
-            <span class="approval-name">{{ a.toolName }}</span>
-            <span
-              v-if="approvalRemain(a) > 0"
-              class="approval-countdown"
-            >{{ $t('errors.auto_reject_in_n_s', { n: approvalRemain(a) }) }}</span>
-          </div>
-          <div class="approval-args">
-            {{ a.arguments }}
-          </div>
-          <!-- H61：提交失败**票不摘**，错误写在卡片上、按钮可再点（旧实现吞错后照样删卡片 ->
-               用户以为批过了，而引擎一直等到 300s 超时按拒绝处理）。 -->
-          <div
-            v-if="a.error"
-            class="approval-edit-error"
-          >
-            {{ a.error }}
-          </div>
-          <div
-            v-if="approvalEdit(a)?.open"
-            class="approval-edit"
-          >
-            <textarea
-              class="approval-edit-text"
-              :value="approvalEdit(a)?.text || ''"
-              rows="5"
-              spellcheck="false"
-              :aria-label="$t('agent.edit_arguments')"
-              @input="onApprovalEditInput(a, ($event.target as HTMLTextAreaElement).value)"
-            />
-            <div
-              v-if="approvalEdit(a)?.error"
-              class="approval-edit-error"
-            >
-              {{ approvalEdit(a)?.error }}
-            </div>
-          </div>
-          <div class="approval-actions">
-            <button
-              class="approval-btn danger"
-              type="button"
-              :disabled="!!a.busy"
-              @click="resolveApproval(a, false)"
-            >
-              {{ $t('errors.reject') }}
-            </button>
-            <button
-              class="approval-link"
-              type="button"
-              @click="toggleApprovalEdit(a)"
-            >
-              {{ approvalEdit(a)?.open ? $t('common.cancel') : $t('agent.edit_arguments') }}
-            </button>
-            <button
-              v-if="approvalEdit(a)?.open"
-              class="approval-btn allow"
-              type="button"
-              :disabled="!!approvalEdit(a)?.error"
-              @click="submitApprovalEdit(a)"
-            >
-              {{ $t('agent.approve_with_edited_arguments') }}
-            </button>
-            <button
-              v-else
-              class="approval-btn allow"
-              type="button"
-              :disabled="!!a.busy"
-              @click="resolveApproval(a, true)"
-            >
-              {{ $t('common.allow_execution') }}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div
-        v-if="pendingQuestions.length"
-        class="ask-zone"
-      >
-        <AskCard
-          v-for="q in pendingQuestions"
-          :key="q.id"
-          :question="q.question"
-          :options="q.options"
-          :allow-free-text="q.allowFreeText"
-          :expired="!!q.expired"
-          @answer="(value: string) => answerQuestion(q, value)"
-          @decline="() => declineQuestion(q)"
-          @drafting="(active: boolean) => { q.drafting = active }"
-        />
-      </div>
+      <ChatAttentionTray
+        :approvals="pendingApprovals"
+        :questions="pendingQuestions"
+        :remaining-of="approvalRemain"
+        :edit-of="approvalEdit"
+        @approve="(a) => resolveApproval(a, true)"
+        @reject="(a) => resolveApproval(a, false)"
+        @toggle-edit="toggleApprovalEdit"
+        @edit-input="onApprovalEditInput"
+        @submit-edit="submitApprovalEdit"
+        @answer="answerQuestion"
+        @decline="declineQuestion"
+        @drafting="(q, active) => { q.drafting = active }"
+      />
 
       <!-- 人工介入待办：只在有跨进程遗留的待答项时出现（列表为空即整块不渲染）。
            答复成功即发 `wake`，由 wakeFromInbox 顺手提交一轮让引擎从暂停处接手。 -->
@@ -3444,7 +3437,7 @@ function continueGeneration() {
       :active-session-id="activeSessionId"
       :context-chips="contextChips"
       :running-session-ids="sidebarRunningIds"
-      @update:view="(v: 'trajectory' | 'sessions' | 'agents' | 'stats') => (panelView = v)"
+      @update:view="(v: 'trajectory' | 'sessions') => (panelView = v)"
       @open-map="synapseMapOpen = true"
       @focus="onTrajectoryFocus"
       @close="panelOpen = false"
@@ -3626,7 +3619,7 @@ function continueGeneration() {
    :deep() 让作用域 id 落在 .chat-layout（父组件自己的元素）上，从而真正命中。 */
 .chat-layout.is-swapped :deep(.side-panel) { order: -1; }
 .chat-layout.is-swapped :deep(.workbench-panel) { order: 2; }
-.chat-layout.is-swapped :deep(.preview-pane) { order: 1; }
+.chat-layout.is-swapped :deep(.reference-dock) { order: 1; }
 .chat-body { position: relative; flex: 1; display: flex; flex-direction: column; min-height: 0; }
 /* 任务清单挂在输入区正上方：与输入框留一点呼吸，但不占满整行宽度 */
 .chat-todo-panel { flex: none; margin: 0 16px 6px; }
@@ -3704,54 +3697,10 @@ function continueGeneration() {
   .chat-toolbar { padding: 0 6px; }
   .toolbar-title { max-width: 24vw; font-size: 12px; }
   .toolbar-mode { display: none; }
-  .approval-zone { padding: 0 12px 8px; }
+
   .turn-status { margin: 8px auto 0; padding: 0 12px; }
 }
-.approval-zone { padding: 0 20px 8px; display: flex; flex-direction: column; gap: 8px; }
 /* 结构化提问卡片区：与审批卡同样贴输入区上方 */
-.ask-zone { padding: 0 20px 8px; display: flex; flex-direction: column; gap: 8px; }
-.approval-card { background: var(--bg-card); border: var(--hairline-width) solid var(--border); border-inline-start: 3px solid var(--primary); border-radius: var(--sig-radius-card); padding: 10px 14px; }
-/* 工具授权模式栏（与「对话模式」并列但语义独立的第二个维度） */
-/* 工具授权已内联到输入区底栏（模型选择器右侧），样式见 ChatInput.vue 的
-   `.tools-mode-select` —— 这里不再需要独立的 `.tools-mode-bar`。 */
-.approval-countdown { margin-inline-start: auto; font-size: var(--fs-xs); color: var(--warning, var(--warning)); }
-.approval-info { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
-.approval-tag { font-size: var(--fs-xs); color: var(--primary); background: var(--primary-bg); padding: 2px 8px; border-radius: var(--sig-radius-card); }
-.approval-name { font-weight: var(--fw-semibold); font-size: 13px; color: var(--text-primary); }
-.approval-args { font-family: var(--font-mono); font-size: 12px; color: var(--text-muted); word-break: break-all; margin-bottom: 8px; }
-.approval-edit { margin-bottom: 8px; }
-.approval-edit-text {
-  width: 100%;
-  box-sizing: border-box;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-primary);
-  background: var(--bg-card);
-  border: var(--hairline-width) solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 6px 8px;
-  resize: vertical;
-}
-.approval-edit-text:focus { outline: none; border-color: var(--primary); }
-.approval-edit-error { margin-top: 4px; font-size: 12px; color: var(--danger, var(--error)); }
-.approval-link {
-  border: none;
-  background: none;
-  color: var(--primary);
-  font-size: 13px;
-  cursor: pointer;
-  padding: 6px 4px;
-  border-radius: var(--radius-md);
-  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
-}
-.approval-link:hover { text-decoration: underline; }
-.approval-actions { display: flex; gap: 8px; }
-.approval-btn { border: none; border-radius: var(--radius-lg); padding: 6px 16px; font-size: 13px; cursor: pointer; transition: transform var(--dur-fast) ease, opacity var(--dur-fast) ease, background var(--dur-fast) ease; }
-.approval-btn:active { transform: scale(0.97); }
-.approval-btn.allow { background: var(--primary); color: var(--on-solid); }
-.approval-btn.allow:hover { opacity: 0.9; }
-.approval-btn.danger { background: var(--bg-hover); color: var(--text-primary); }
-.approval-btn.danger:hover { background: var(--danger-bg, rgba(239,68,68,.12)); color: var(--danger, var(--error)); }
 .connection-banner {
   /* 让开自绘标题栏：它是 fixed 且层级更高（--z-page-bar > --z-drawer），
      贴 top:0 会把最小化/关闭那一栏一起盖住，窗口按钮直接点不到。 */
@@ -3848,8 +3797,7 @@ function continueGeneration() {
   transition: box-shadow var(--dur-fast), color var(--dur-fast);
 }
 .ub-btn:focus-visible,
-.ueb-close:focus-visible,
-.approval-btn:focus-visible {
+.ueb-close:focus-visible {
   outline: var(--focus-ring-width) solid var(--focus-ring-color);
   outline-offset: var(--focus-ring-offset);
 }

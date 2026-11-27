@@ -211,7 +211,12 @@ async function loadShare() {
     if (seq !== loadSeq) return
     const status = errorStatus(e)
     const code = errorCode(e)
-    if (code === 'share_password_required') {
+    if (code === 'share_locked') {
+      // 失败次数过多：仍是"等待输入"态，但文案要说清是暂时锁定 ——
+      // 继续显示"密码不对"会让用户反复重试，把锁拖得更久。
+      passwordRequired.value = true
+      passwordError.value = t('errors.share_locked')
+    } else if (code === 'share_password_required') {
       // 需要密码（含密码错误）：停在"等待输入"态，不把访客赶到错误页。
       passwordRequired.value = true
       if (password.value) passwordError.value = t('errors.share_password_wrong')

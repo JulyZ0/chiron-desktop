@@ -66,7 +66,7 @@ func CheckpointRestoreHandler(python *engine.PythonClient) http.HandlerFunc {
 			   FROM project_checkpoints c
 			   LEFT JOIN session_map_workspaces w ON w.id = c.workspace_id AND w.tenant_id = c.tenant_id
 			  WHERE c.id = $1 AND c.tenant_id = $2 AND COALESCE(c.user_id,'') = $3`,
-			cid, smTenant(claims), claims.UserID)
+			cid, smTenantID(claims), claims.UserID)
 		if err != nil {
 			slog.Error("checkpoint restore: ownership lookup failed", "error", err, "id", cid)
 			InternalError(w, "lookup failed")

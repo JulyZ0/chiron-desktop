@@ -105,7 +105,7 @@ func writableClientProject(r *http.Request, claims *auth.Claims) (string, bool) 
 		`SELECT COALESCE(provider,'server') AS provider
 		   FROM session_map_workspaces
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-		id, smTenant(claims), claims.UserID)
+		id, smTenantID(claims), claims.UserID)
 	if err != nil || row == nil || stringOf(row["provider"]) != smProviderClient {
 		return "", false
 	}

@@ -413,7 +413,7 @@ func rootKeyHash(key string) string {
 // `d:\repo` 仍要判重。历史行 root_key 为空时按行内 root_path 现算，并顺手回填。
 //
 // excludeID 传自身（改名/改路径场景），使"路径不动"不会被自己挡住。
-func projectLocatorTaken(ctx context.Context, tenant, userID, provider, deviceID, rootKey, excludeID string) (bool, error) {
+func projectLocatorTaken(ctx context.Context, tenant int16, userID, provider, deviceID, rootKey, excludeID string) (bool, error) {
 	if db.GlobalDBManager == nil || rootKey == "" {
 		return false, nil
 	}
@@ -524,7 +524,7 @@ func (h *SessionMapHandler) ListProjects(w http.ResponseWriter, r *http.Request)
 			   FROM session_map_workspaces w
 			  WHERE w.tenant_id = $1 AND w.user_id = $2 AND COALESCE(w.root_path,'') <> ''
 			  ORDER BY COALESCE(w.sort_index,0), COALESCE(w.name,''), w.id`,
-			smTenant(claims), claims.UserID)
+			smTenantID(claims), claims.UserID)
 		if err != nil {
 			slog.Error("list projects failed", "error", err)
 		} else {
@@ -658,7 +658,7 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 	}
 	// 同一目录只允许建一个项目。判重对象是 locator：
 	// `(provider, device_id, root_key)` —— 不同设备上的同路径互不冲突。
-	taken, err := projectLocatorTaken(r.Context(), smTenant(claims), claims.UserID, provider, deviceID, rootKey, "")
+	taken, err := projectLocatorTaken(r.Context(), smTenantID(claims), claims.UserID, provider, deviceID, rootKey, "")
 	if err != nil {
 		slog.Error("check duplicate project root failed", "error", err)
 		JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "create failed"})
@@ -684,7 +684,7 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 		`INSERT INTO session_map_workspaces
 		   (id, tenant_id, user_id, name, root_path, provider, device_id, root_key, root_key_hash, sort_index, viewport, created_at, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, '{}'::jsonb, NOW(), NOW())`,
-		wsID, smTenant(claims), claims.UserID, name, rootPath, provider, deviceID, rootKey, rootKeyHash(rootKey)); err != nil {
+		wsID, smTenantID(claims), claims.UserID, name, rootPath, provider, deviceID, rootKey, rootKeyHash(rootKey)); err != nil {
 		// 唯一索引是并发下的最后一道防线：两个请求同时通过上面的判重时，
 		// 后到的 INSERT 会撞 23505，同样按"重复项目"返回，而不是 500。
 		if isUniqueViolation(err) {
@@ -700,7 +700,7 @@ func (h *SessionMapHandler) CreateProject(w http.ResponseWriter, r *http.Request
 	// 热层同步一份空快照：随后进画布视图时直接命中，不必回源。
 	smCachePut(r.Context(), &SessionMapWorkspace{
 		ID: wsID, Name: name, RootPath: rootPath, Viewport: map[string]interface{}{},
-		Nodes: []SessionMapNode{}, TenantID: smTenant(claims), UserID: claims.UserID,
+		Nodes: []SessionMapNode{}, TenantID: tenantStr(smTenantID(claims)), UserID: claims.UserID,
 	})
 	JSON(w, http.StatusCreated, APIResponse{Success: true, Data: map[string]interface{}{
 		"id": wsID, "name": name, "root_path": rootPath, "sort_index": 0,
@@ -737,7 +737,7 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	sets := []string{"updated_at = NOW()"}
-	args := []interface{}{wsID, smTenant(claims), claims.UserID}
+	args := []interface{}{wsID, smTenantID(claims), claims.UserID}
 	arg := func(v interface{}) string {
 		args = append(args, v)
 		return fmt.Sprintf("$%d", len(args))
@@ -757,7 +757,7 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 			`SELECT COALESCE(provider,'server') AS provider, COALESCE(device_id,'') AS device_id
 			   FROM session_map_workspaces
 			  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-			wsID, smTenant(claims), claims.UserID)
+			wsID, smTenantID(claims), claims.UserID)
 		if rowErr != nil || row == nil {
 			JSON(w, http.StatusNotFound, APIResponse{Success: false, Error: "project not found"})
 			return
@@ -810,7 +810,7 @@ func (h *SessionMapHandler) PatchProject(w http.ResponseWriter, r *http.Request)
 		}
 		// 与 CreateProject 同一条判据：把项目改指到另一个项目已在用的目录同样要拒。
 		// excludeID 传自身，否则「只改名字、路径不动」会被自己挡住。
-		taken, err := projectLocatorTaken(r.Context(), smTenant(claims), claims.UserID, provider, deviceID, rootKey, wsID)
+		taken, err := projectLocatorTaken(r.Context(), smTenantID(claims), claims.UserID, provider, deviceID, rootKey, wsID)
 		if err != nil {
 			slog.Error("check duplicate project root failed", "error", err)
 			JSON(w, http.StatusInternalServerError, APIResponse{Success: false, Error: "update failed"})
@@ -975,7 +975,7 @@ func (h *SessionMapHandler) BindProjectSession(w http.ResponseWriter, r *http.Re
 			  USING session_map_workspaces w
 			  WHERE n.session_id = $1 AND n.edge_kind = 'project' AND n.workspace_id <> $2
 			    AND w.id = n.workspace_id AND w.tenant_id = $3 AND w.user_id = $4`,
-			sessionID, wsID, smTenant(claims), claims.UserID); err != nil {
+			sessionID, wsID, smTenantID(claims), claims.UserID); err != nil {
 			return err
 		}
 		_, err := tx.Exec(r.Context(),
@@ -1054,7 +1054,7 @@ func (h *SessionMapHandler) SessionProject(w http.ResponseWriter, r *http.Reques
 		   JOIN session_map_workspaces w ON w.id = n.workspace_id
 		  WHERE n.session_id = $1 AND n.edge_kind = 'project'
 		    AND w.tenant_id = $2 AND w.user_id = $3
-		  LIMIT 1`, sessionID, smTenant(claims), claims.UserID)
+		  LIMIT 1`, sessionID, smTenantID(claims), claims.UserID)
 	if err != nil {
 		slog.Error("session project lookup failed", "error", err)
 	}

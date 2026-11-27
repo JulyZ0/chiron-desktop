@@ -13,7 +13,6 @@
 | `none` | 什么都不挡（仅保留 `sandbox.py` 的命令白名单/逃逸正则） | 无 |
 | `job` | 内存/CPU 打爆、进程数失控、退出后子孙进程残留 | 无 |
 | `low_il` | 以上 + **写**用户目录/注册表等中完整性对象 | 无（实测零提权可用） |
-| `appcontainer` | 以上 + 文件系统按包 SID 白名单、可断网 | 需 `icacls` 授权路径 |
 | `container` | 以上所有 + 独立 namespaces/cgroup/caps/seccomp，只挂工作区、无网络 | 需 Kiri（按需下载，不内置） |
 
 实测依据（本机，非管理员账户）：
@@ -41,7 +40,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.isolation import win, win_token
+from app.isolation import win
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +54,6 @@ class Level(enum.StrEnum):
     NONE = "none"
     JOB = "job"
     LOW_IL = "low_il"
-    RESTRICTED = "restricted"
-    APPCONTAINER = "appcontainer"
     #: 一次性容器（Kiri 的 Docker Engine API）：独立 namespaces/cgroup、
     #: 只读根文件系统、CAP_DROP=ALL、seccomp 默认档、无网络。
     #: 跨平台可用的"最强"档位；依赖缺失即拒跑（见 `kiri.py`）。
@@ -71,21 +68,15 @@ _ORDER = [
     Level.NONE,
     Level.JOB,
     Level.LOW_IL,
-    Level.RESTRICTED,
-    Level.APPCONTAINER,
     Level.CONTAINER,
 ]
 
-#: 默认档位：`restricted`（受限令牌 + 合成 SID + 一条可撤销 ACE）。
+#: 默认档位：`low_il`（Windows 原生档位里最强的一档）。
 #:
-#: 为什么默认它而不是 `low_il`：`low_il` 要先给目录授当前用户完全控制才能打 Low
-#: 标签，对用户资产是**实质且不可逆**的改动（`set_path_integrity` 打回去也换不回
-#: 继承来的原始 ACE）。`restricted` 只在根目录加一条 ACE，撤销即删除 —— 同一档
-#: 强度，代价却是可逆的，所以没有理由让默认值停在更脏的那个。
-#:
-#: `low_il` 保留为**可选**档位（老配置、或 restricted 机制在本机不可用时回落）。
+#: 当前产品支持的四个档位是 none / job / low_il / container；其中 low_il 是
+#: Windows 上零提权可用的最高档，也正好是安全底线（见 `FLOOR_LEVEL`）。
 #: 非 Windows 上自然退化为 `none`（POSIX 继续走 setrlimit）。
-DEFAULT_LEVEL = Level.RESTRICTED
+DEFAULT_LEVEL = Level.LOW_IL
 
 #: **安全底线**：低于它的档位需要用户**显式确认**才能生效。
 #:
@@ -105,7 +96,7 @@ DEFAULT_LEVEL = Level.RESTRICTED
 #:
 #: 与 `DEFAULT_LEVEL` 的区别仍然关键：默认值可以被配置改掉，底线不会。
 #: `SANDBOX_ISOLATION_ALLOW_DOWNGRADE` 的语义也没有变宽：它只放宽"稍弱的隔离"
-#: （如 `appcontainer → low_il`），从不让**配置**降到"没有隔离"。
+#: （如 `low_il → job`），从不让**配置**降到"没有隔离"。
 #:
 #: 为什么底线选 `low_il` 而不是 `job`：实测（零提权）`job` 只能拦内存爆炸，
 #: 挡不住写用户目录；`low_il` 是**当前这台机器上唯一既零提权又真能挡写**的档位。
@@ -120,6 +111,17 @@ def parse_level(value: str | None, *, default: Level = DEFAULT_LEVEL) -> Level:
     if not value or not value.strip():
         return default
     raw = value.strip().lower()
+    # 已移除的历史档位：升级时旧 .env 里可能还写着 restricted / appcontainer。
+    # 直接报错会让引擎起不来，而它们早已没有执行路径 —— 映射到当前最强的
+    # Windows 原生档（low_il），并留一条 warning，别让配置悄悄失效。
+    removed = {"restricted": Level.LOW_IL, "appcontainer": Level.LOW_IL}
+    if raw in removed:
+        logger.warning(
+            "isolation level %r has been removed; falling back to %s",
+            raw,
+            removed[raw].value,
+        )
+        return removed[raw]
     try:
         return Level(raw)
     except ValueError:
@@ -371,90 +373,13 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
         reasons.append("Low 完整性级别不可设置")
         return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
 
-    # Low 完整性标签是 `low_il` / `appcontainer` 的必需前置，但**不是** `restricted`
-    # 的前置：受限令牌靠 restricting SIDs 判写，与完整性级别无关。原来这里用
-    # `>= LOW_IL` 会把 `restricted` 也拉进"必须给整目录打 Low 标签"，
-    # 等于把代价更小的方案按更脏的那条实现 —— 所以按档位精确判断。
-    if want in (Level.LOW_IL, Level.APPCONTAINER):
-        ws = appcontainer_workspace()
-        labeled, lerr = _ensure_workspace_low_label(ws)
+    # Low 完整性标签是 `low_il` 的必需前置：打不上标签时子进程写不了工作区，
+    # 降级到 `job` 比留在一个“看起来有隔离、实际不可用”的档位更诚实。
+    if want is Level.LOW_IL:
+        labeled, lerr = _ensure_workspace_low_label(appcontainer_workspace())
         if not labeled:
             reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
             return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
-
-    if want is Level.RESTRICTED:
-        if not _probe_safely(_probe_restricted, "restricted"):
-            # 把**具体**原因写进 reasons：`exec_unavailable_reason()` 会说清是
-            # "未以管理员身份运行"还是"令牌造不出来"。只写"不可用"等于让用户
-            # 去查 Win32 错误码才知道该做什么。
-            if _probe_safely(win_token.probe, "restricted-token"):
-                reasons.append(
-                    win_token.exec_unavailable_reason() or "受限令牌执行层不可用（原因未知）"
-                )
-            else:
-                reasons.append("受限令牌无法创建（缺少 logon SID，或 advapi32 不可用）")
-            # 降级到 `low_il` 前**必须**补打 Low 标签：那是 low_il 的必需前置，
-            # 漏掉它会让"降级"变成"降级到一个根本写不了工作区的档位"。
-            labeled, lerr = _ensure_workspace_low_label(appcontainer_workspace())
-            if not labeled:
-                reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
-                return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
-            return IsolationDecision(want, Level.LOW_IL, reasons)
-        ws = appcontainer_workspace()
-        granted, gerr = win_token.grant_path(ws)
-        if not granted:
-            reasons.append(f"工作区无法授权给合成 SID: {gerr}")
-            labeled, lerr = _ensure_workspace_low_label(ws)
-            if not labeled:
-                reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
-                return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
-            return IsolationDecision(want, Level.LOW_IL, reasons)
-        if not win_token.desktop_isolation_ready():
-            # 已知缺口，告警但**不降级**：low_il 要改用户资产，比"缺桌面隔离"更重。
-            # 把丑陋但真实的状态说清楚，好过换一个更脏的档位假装更安全。
-            reasons.append(
-                "受限进程仍运行在默认桌面（官方建议独立桌面以阻断 PostMessage 跨进程攻击）"
-            )
-
-    if want is Level.APPCONTAINER:
-        ok, sid, err = win.ensure_appcontainer(win.appcontainer_name("default"))
-        if not ok:
-            reasons.append(f"AppContainer 不可用: {err or '未知'}")
-            return IsolationDecision(want, Level.LOW_IL, reasons)
-        uri = appcontainer_workspace()
-        granted, gerr = win.grant_appcontainer_path(sid, uri)
-        if not granted:
-            reasons.append(f"AppContainer 路径授权失败: {gerr}")
-            return IsolationDecision(want, Level.LOW_IL, reasons)
-        # 刚往工作区写了包 SID ACE ⇒ 缓存失效。
-        #
-        # `_ensure_workspace_low_label()` 会缓存"已验证过"的路径并跳过后续检查；
-        # 若不清掉这个键，`appcontainer → low_il` 的切换会跳过残留 ACE 清理，
-        # 于是 low_il 带着一条写不动的 ACL 静默上线（这正是实测到的缺陷）。
-        _labeled_workspaces.discard(uri)
-
-        # 执行层是**实测**判定的，不是开关：`appcontainer_exec_ready()` 会真的在
-        # 包 SID 下起一个进程并读回输出（`win_launch.appcontainer_smoke_test`）。
-        #
-        # 此前这里无条件降级，理由是"建 AppContainer 进程需要进程属性列表，
-        # `subprocess` 表达不了" —— 那个缺口现由 `win_launch.launch_appcontainer`
-        # / `open_appcontainer_session` 补上（`STARTUPINFOEXW` + `CreateProcessW`）。
-        #
-        # 与 `restricted` 的关键差异：AppContainer **不需要另一个用户令牌**，
-        # 因此不要求 `SeIncreaseQuotaPrivilege` —— 普通（非提权）账户也能用。
-        # 本机实测：非提权下 `restricted` 恒 `err=5`（`CreateProcessAsUserW` 起不来），
-        # 而 AppContainer 冒烟测试通过。所以它才是这台机器上真正可达的高档位。
-        if not _probe_safely(_probe_appcontainer, "appcontainer"):
-            reasons.append(
-                _appcontainer_probe_error() or "AppContainer 执行层不可用（原因未知）"
-            )
-            labeled, lerr = _ensure_workspace_low_label(uri)
-            if not labeled:
-                reasons.append(f"工作区无法打 Low 完整性标签: {lerr}")
-                return IsolationDecision(want, Level.JOB, reasons, below_floor=True)
-            return IsolationDecision(want, Level.LOW_IL, reasons)
-
-        return IsolationDecision(want, want, reasons)
 
     # 走到这里说明请求的档位如实生效了（没有发生降级）。
     #
@@ -472,9 +397,6 @@ def resolve_level(requested: Level | None = None) -> IsolationDecision:
 
 _job_ok: bool | None = None
 _low_il_ok: bool | None = None
-_restricted_ok: bool | None = None
-#: `appcontainer` 执行层是否可用（端到端冒烟结果，不是配置项）。
-_appcontainer_ok: bool | None = None
 #: 已打过标签的 workspace 路径（避免每次 resolve 都跑一次 icacls）
 _labeled_workspaces: set[str] = set()
 
@@ -482,38 +404,25 @@ _labeled_workspaces: set[str] = set()
 def reset_probes() -> None:
     """清掉**档位可用性**的探测缓存，让下一次 `status()` 重新实测。
 
-    为什么需要：本模块的 `_restricted_ok` 与 `win_launch` 的 `_smoke_ok` 是
-    **两份独立缓存**。用户点"启用受限令牌助手"之后，helper 起来了、
-    `win_launch` 那边也清过了，但这里的 `_restricted_ok` 仍是 `False` ——
-    于是 `selectable` 里依旧没有 `restricted`，界面上表现成
-    "UAC 授权成功了，档位却还是灰的"。
-
-    同样的道理适用于撤销授权（helper 停了要立刻变回不可选）。所以两个方向
-    都在改动后调一次，而不是只清一边。
+    设置页的「重新检测」与容器运行时下载完成后都会调用它。Job/Low IL 的探测
+    结果缓存与 Kiri 的 socket 探测不是同一份，必须一起清，否则界面会停留在
+    上一次的旧结论。
     """
-    global _job_ok, _low_il_ok, _restricted_ok, _appcontainer_ok
+    global _job_ok, _low_il_ok
     _job_ok = None
     _low_il_ok = None
-    _restricted_ok = None
-    _appcontainer_ok = None
     try:
         from app.isolation import kiri
 
         kiri.reset_probe()
     except Exception as exc:  # noqa: BLE001 — 运行时探测复位失败不影响其它档位
         logger.warning("kiri probe reset failed: %s", exc)
-    try:
-        from app.isolation import win_launch
-
-        win_launch.reset_probe()
-    except Exception as exc:  # noqa: BLE001 — 复位失败不该让状态查询整个失败
-        logger.warning("isolation probe cache reset failed: %s", exc)
 
 
 def _ensure_workspace_low_label(path: str) -> tuple[bool, str]:
     """确保工作区带 Low 完整性标签（幂等，结果缓存）。
 
-    这是 `low_il` / `appcontainer` 档位能正常工作的前提：完整性检查是
+    这是 `low_il` 档位能正常工作的前提：完整性检查是
     **no-write-up**，Low IL 子进程写不了 Medium 对象 —— 包括它自己的工作区。
     """
     if not win.IS_WINDOWS:
@@ -527,7 +436,7 @@ def _ensure_workspace_low_label(path: str) -> tuple[bool, str]:
             _os.makedirs(path, exist_ok=True)
         except OSError as exc:
             return False, f"无法创建工作区 {path}: {exc}"
-    # 先清掉**上一个档位**（appcontainer）留下的包 SID ACE。
+    # 先清掉**历史档位**（已移除的 appcontainer）留下的包 SID ACE。
     #
     # 实测：带这条 ACE 的目录上，Low IL 子进程创建/修改文件一律 PermissionError；
     # `icacls /remove:g *<包SID>` 之后立即恢复可写。也就是说只要切过 appcontainer
@@ -574,64 +483,6 @@ def _probe_low_il() -> bool:
     return _low_il_ok
 
 
-def _probe_restricted() -> bool:
-    """`restricted` 档能否**真正执行**（不只是"令牌造得出来"）。
-
-    两个条件缺一不可：
-
-    1. `win_token.probe()` —— 受限令牌能创建（logon SID 与 advapi32 都在）；
-    2. `win_token.exec_ready()` —— 执行层能真的**以该受限令牌拉起进程**
-       并取回 stdout/stderr（`win_launch.smoke_test()` 端到端实测）。
-
-    第 2 条是实测而非开关。本机零点提权的普通账户上它恒为假：
-    `CreateProcessAsUserW` 需要 `SeIncreaseQuotaPrivilege`（未分配，err=5），
-    `CreateProcessWithTokenW` 需要 `SeImpersonatePrivilege`（未分配，err=1314）。
-    此时 `resolve_level` 降级到 `low_il`（仍在底线上，不拒绝启动），
-    并把具体原因（`win_token.exec_unavailable_reason()`）写进 `reasons`。
-    """
-    global _restricted_ok
-    if _restricted_ok is None:
-        _restricted_ok = win_token.probe() and win_token.exec_ready()
-    return _restricted_ok
-
-
-def _probe_appcontainer() -> bool:
-    """`appcontainer` 档能否**真正执行** —— 端到端实测，不是开关。
-
-    判据是 `win_launch.appcontainer_smoke_test()`：真的在包 SID 下起一个进程
-    并把 stdout/stderr 读回来。只验证"profile 建得出来"远远不够 ——
-    attribute list、环境块、管道继承、路径授权任一处错了，进程都起不来。
-
-    关键事实：这条路**不需要提权**。`CreateProcessW` + `STARTUPINFOEXW` 不涉及
-    `SeIncreaseQuotaPrivilege`，所以普通账户可用；而 `restricted` 走的
-    `CreateProcessAsUserW` 需要该特权，非提权下恒 `err=5`。本机实测：
-    appcontainer 冒烟通过、restricted 起不来 —— 因此 appcontainer 是本机
-    **真正可达**的高档位。
-
-    `win_launch` 反向 import 本模块，所以只能在这里延迟导入（顶层导入会成环）。
-    """
-    global _appcontainer_ok
-    if _appcontainer_ok is None:
-        try:
-            from app.isolation import win_launch
-
-            _appcontainer_ok = win_launch.appcontainer_exec_ready()
-        except Exception as exc:  # noqa: BLE001 — 探测本身失败按"不可用"
-            logger.warning("appcontainer probe failed: %s", exc)
-            _appcontainer_ok = False
-    return _appcontainer_ok
-
-
-def _appcontainer_probe_error() -> str:
-    """AppContainer 探测失败的具体原因（给 `reasons` 用，避免只说"不可用"）。"""
-    try:
-        from app.isolation import win_launch
-
-        return win_launch.appcontainer_exec_error()
-    except Exception:  # noqa: BLE001
-        return ""
-
-
 def appcontainer_workspace() -> str:
     """AppContainer 需要授权的那个目录（工作区根）。
 
@@ -649,23 +500,11 @@ def appcontainer_workspace() -> str:
 # ── 子进程侧：把自己降级 ────────────────────────────────────────────
 
 def child_applicable_level(level: Level) -> Level:
-    """子进程**实际**能达到的档位（不等于请求档位）。
+    """子进程**实际**能达到的档位（当前与请求档位一致）。
 
-    为什么需要这个函数：`restricted` 靠 **restricting SID 建令牌**，而那必须发生在
-    `CreateProcessAsUserW` 建进程的那一刻（父进程侧）。子进程自己启动后再怎么改令牌
-    也无法获得 restricting SID —— 所以子进程入口只能做到 Low IL。
-
-    `appcontainer` 同理：包 SID 由**父进程**在 `CreateProcessW` 的
-    `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 里指定，子进程无法给自己套包。
-    `run_code` 的 worker 是普通 `Popen` + 子进程自降级，因此真实强度只到 `low_il`
-    （Low IL 仍在硬底线之上：写不了工作区之外，不是"无隔离"）。
-
-    把它说成 `restricted` / `appcontainer` 就是谎报：配置、`/v1/system/isolation`、
-    日志三处都会声称比实际更强。所以把"子进程能到哪一档"收成单一事实源，供
-    `apply_in_child()` 与调用方共同引用。
+    保留这个函数作为单一事实源：`apply_in_child()` 与调用方都从这里取，未来若
+    再引入需要父进程建令牌的档位，只需改这一处，不会出现"配置声称 A、子进程实际 B"。
     """
-    if level in (Level.RESTRICTED, Level.APPCONTAINER):
-        return Level.LOW_IL
     return level
 
 
@@ -676,20 +515,12 @@ def apply_in_child(level: Level) -> None:
     没有撤销 API（这是设计而非缺陷 —— 它保证降级不可逆）。父进程若调用，
     引擎自身就被降级了。
 
-    传入 `RESTRICTED` 时会降到 `LOW_IL`（见 `child_applicable_level` 的说明），
-    并在 stderr 留一行说明 —— 不静默。仍然**高于硬底线**：Low IL 挡得住写工作区
-    之外，所以这不是"退回无隔离"。
+    `low_il` 是子进程入口真正能施加的边界；`job` 由父进程的 Job Object 负责。
 
     失败时不抛异常而是 `os._exit(9)`：一个"以为自己被隔离"的子进程比没有
     隔离更危险。
     """
     applied = child_applicable_level(level)
-    if level is Level.RESTRICTED and applied is not level:
-        sys.stderr.write(
-            "[isolation] restricted 需要父进程建受限令牌，子进程只能做到 low_il；"
-            "按 low_il 执行（仍拒绝写工作区之外）\n"
-        )
-        sys.stderr.flush()
     if applied.rank < Level.LOW_IL.rank or not win.IS_WINDOWS:
         return
     if not win.set_integrity_level(win.INTEGRITY_LOW):
@@ -712,9 +543,9 @@ def child_launch_argv(
     ## 为什么需要这一层
 
     `low_il` 只能由**子进程自己**降级（完整性级别改的是当前进程令牌，且不可撤销）。
-    但 `shell_exec` 原来只是把进程挂进 Job Object —— 那一步对 `job` / `low_il` /
-    `appcontainer` 三档**完全一样**（都只判 `rank < Level.JOB`）。结果就是用户切了
-    档位、`/v1/system/isolation` 也如实报告了新档位，可实际执行强度一点没变。
+    但 `shell_exec` 原来只是把进程挂进 Job Object —— 那一步对 `job` / `low_il`
+    两档**完全一样**（都只判 `rank < Level.JOB`）。结果就是用户切了档位、
+    `/v1/system/isolation` 也如实报告了新档位，可实际执行强度一点没变。
 
     这里把档位变成**命令行的差异**：`low_il` 及更高档位走自降级入口，`job`/`none`
     保持原样。这样"切换档位"与"执行路径改变"是同一件事。
@@ -723,11 +554,7 @@ def child_launch_argv(
 
     * `none` / `job`：原样返回，只挂 Job Object。
     * `low_il`：走 `_low_il_launcher`，子进程先降到 Low 完整性级别再 exec。
-    * `restricted` / `appcontainer`：**赢不过它们各自的父侧机制**，见下。
-
-    `restricted` 由 `shell_exec` 的独立路径（`win_launch.launch_restricted`）处理，
-    调用方在进入本函数前已分流；`appcontainer` 的执行层尚未接入，
-    `resolve_level` 会先如实降级到 `low_il`，因此到这里只会看到 `low_il`。
+    * `container`：不经过这里（由 `container.py` 直接起一次性容器）。
     """
     if decision.effective.rank < Level.LOW_IL.rank:
         return list(command)
@@ -750,20 +577,11 @@ def child_launch_argv(
 def spawn_kwargs(decision: IsolationDecision) -> dict[str, Any]:
     """给 `asyncio.create_subprocess_exec` / `subprocess.Popen` 的额外参数。
 
-    **恒为空字典**，这是刻意的：两档自建路径都无法用 `subprocess` 表达。
+    **恒为空字典**，这是刻意的：
 
     * `low_il` / `job`：子进程启动后自己降级（见 `apply_in_child`），父侧没有参数 ——
       Windows 没有 `preexec_fn` 的等价物。
-    * `restricted`：要受限令牌，必须 `CreateProcessAsUserW`
-      （`win_launch.launch_restricted` / `open_restricted_session`）。
-    * `appcontainer`：要进程属性列表（`STARTUPINFOEXW` +
-      `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`），必须 `CreateProcessW`
-      （`win_launch.launch_appcontainer` / `open_appcontainer_session`）。
-
-    此前这里塞了一个 `_appcontainer=True` 键，**没有任何消费者** ——
-    一旦有人把它展开进 `create_subprocess_exec(...)`，会直接
-    `TypeError: unexpected keyword argument`；更糟的是如果被某个 `**kwargs` 吞掉，
-    档位显示 appcontainer 而进程根本不在包里。宁可不返回键，也不留这个陷阱。
+    * `container`：完全不走 `subprocess`，由 Kiri 的 Engine API 起容器。
     """
     _ = decision  # 签名保留：调用方按 decision 决策，语义仍要一致
     return {}
@@ -857,7 +675,7 @@ def require_or_raise(decision: IsolationDecision) -> None:
       `allow_downgrade` —— 那个开关的语义是"接受稍弱"，不是"接受没有"。
       这种"谁都没同意"的降级正是 README 里「沙箱不可用时拒绝启动，不偷偷回退」
       要挡的情况。
-    * 普通 `degraded` 且未允许：`appcontainer → low_il` 这类，可经配置放行。
+    * 普通 `degraded` 且未允许：`low_il → job` 这类，可经配置放行。
     """
     if decision.below_floor and not decision.user_selected:
         raise RuntimeError(
@@ -928,40 +746,21 @@ def record_level_change(
 def _level_executable(level: Level) -> bool:
     """本机能否**真正执行**该档位（不只是"高于底线"）。
 
-    ## 为什么必须单独判一次
-
-    `selectable` 此前只按 `rank >= FLOOR_LEVEL` 过滤，于是面板把本机**根本做不到**
-    的档位也列成"可选"。真机实测（非管理员账户）：
-
-        selectable = ["low_il", "restricted", "appcontainer"]
-        PUT restricted → requested=restricted, effective=low_il
-        reasons: 受限令牌执行层不可用（CreateProcessAsUserW 失败 err=5）；
-                 需要以管理员身份运行引擎以获得 SeIncreaseQuotaPrivilege
-
-    用户选了"受限令牌"，界面回一句"已切换"，实际强度一点没变 —— 这就是
-    「无法真实切换受限令牌」的全部原因。让 UI 只列出** attainable** 的档位，
-    比事后解释"你选的那个没生效"要诚实得多。
-
-    探测本身是端到端冒烟（`_probe_restricted` / `_probe_appcontainer` 会真的起一个
-    子进程读回输出），但结果都有缓存（`_restricted_ok` / `_appcontainer_ok`），
-    所以只有第一次查询稍慢，后续是常数时间。
+    只列 attainable 的档位：做不到的档位即使出现在 UI 里，用户选了也只会得到
+    「requested=X, effective=Y」的降级提示。Job / Low IL 的判定都是端到端冒烟
+    （Low IL 读的是 `capability_report`，Job 真的创建一个 Job Object），结果有缓存。
     """
     if level is Level.CONTAINER:
         from app.isolation import kiri
 
         return (not win.IS_WINDOWS) and kiri.available()
     if not win.IS_WINDOWS:
-        # 非 Windows：只有 `none`（setrlimit 基线）与 `container` 是本机真能执行的；
-        # Windows 原生机（job/low_il/restricted/appcontainer）在这里没有实现。
+        # 非 Windows：只有 `none`（setrlimit 基线）与 `container` 是本机真能执行的。
         return level is Level.NONE
     if level.rank < Level.JOB.rank:
         # none：没有可"执行"的机制，它本身就是"不隔离"
         return True
     try:
-        if level is Level.APPCONTAINER:
-            return _probe_appcontainer()
-        if level is Level.RESTRICTED:
-            return _probe_restricted()
         if level is Level.LOW_IL:
             return _probe_low_il()
         return _probe_job()
@@ -973,12 +772,8 @@ def _level_executable(level: Level) -> bool:
 def _level_unavailable_reason(level: Level) -> str:
     """该档位不可选的**机器原因**（前端悬停/置灰时显示）。
 
-    这里**只**回答"本机缺什么机制"。低于安全底线不再等于不可选 —— 用户可以在
-    设置页显式选择（`job` 直接生效，`none` 需二次确认），所以低于底线本身
-    不是"不可选"的理由，也不需要文案。
-
-    反过来，某个低档位若真的**不可执行**（如 Job Object 创建失败），仍要给机器
-    原因，否则用户会以为只是策略限制。
+    这里**只**回答"本机缺什么机制"。低于安全底线不是"不可选"的理由 —— 用户可以
+    在设置页显式选择（`job` 直接生效，`none` 需二次确认）。
     """
     if level is Level.CONTAINER:
         from app.isolation import kiri
@@ -989,10 +784,6 @@ def _level_unavailable_reason(level: Level) -> str:
     if not win.IS_WINDOWS:
         return ""
     try:
-        if level is Level.RESTRICTED:
-            return win_token.exec_unavailable_reason() or "受限令牌执行层不可用"
-        if level is Level.APPCONTAINER:
-            return _appcontainer_probe_error() or "AppContainer 执行层不可用"
         if level is Level.LOW_IL:
             return "Low 完整性级别不可设置"
         return "Job Object 不可用"
@@ -1024,18 +815,6 @@ def status() -> dict[str, Any]:
     caps = win.capability_report()
     want = configured_level()
     decision = resolve_level(want)
-    # 受限令牌的探活缓存可能是负结果（引擎启动时 helper 还没起）。若请求 restricted
-    # 却降级、而 helper 现在可用，重探一次再出结论 —— 否则用户"启用助手成功"后
-    # 面板会一直显示档位不可选，直到某次端点恰好清了缓存。
-    if want is Level.RESTRICTED and decision.effective is not Level.RESTRICTED:
-        try:
-            from app.isolation import win_launch
-
-            if win_launch.helper_available()[0]:
-                reset_probes()
-                decision = resolve_level(want)
-        except Exception as exc:  # noqa: BLE001 — 重探失败沿用原结论
-            logger.warning("isolation restricted re-probe skipped: %s", exc)
     # 只列**本机真能做到**的档位。低于安全底线的档位也列出来 —— 它们现在
     # 可以在设置页被显式选择（`job` 直接生效，`none` 需二次确认）；
     # 挡在墙外会让"关掉隔离"变成一个只能改代码才可达的选项。
@@ -1075,8 +854,6 @@ def status() -> dict[str, Any]:
         #: 容器挡位的运行时快照（是否装了 Kiri、socket、可下载资产、安装命令）。
         #: 前端据此显示"未安装/可下载/已就绪"，而不是只给一个灰掉的档位。
         "container": _container_status(),
-        "appcontainer_name": win.appcontainer_name("default"),
-        "appcontainer_workspace": appcontainer_workspace(),
     }
 
 

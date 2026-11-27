@@ -106,7 +106,7 @@ def _context(**overrides: Any) -> str:
         "sandbox": cc.SandboxState(
             mode=cc.SANDBOX_WORKSPACE_WRITE,
             writable_paths=("D:/ws",),
-            isolation_level="restricted",
+            isolation_level="low_il",
         ),
         "approval": cc.ApprovalState(prompts_enabled=True, tools_mode="ask"),
         "identity": cc.ChildIdentity(

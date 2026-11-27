@@ -51,6 +51,7 @@ import { notify } from '../../utils/notify'
 import { desktopHost } from '../../stores/device'
 import { useAuthStore } from '../../stores/auth'
 import { revealRequest, WORKBENCH_WIDTH_KEY } from './useWorkbench'
+import { clampDockWidth, CHAT_DOCK_MIN_WIDTH, CHAT_DOCK_MAX_RATIO } from '../chat/chatLayout'
 import { createKeyedGuard } from '../../utils/staleGuard'
 
 const { t: tr } = useI18n()
@@ -106,9 +107,9 @@ const emit = defineEmits<{
 }>()
 
 // ── 分栏宽度（与 SessionPreviewPane 同一套交互约定） ──
-const MIN_WIDTH = 300
-/** 上限取容器的一半：工作台与参考分屏可能同时打开，各占一半才都还能用 */
-const MAX_RATIO = 0.5
+const MIN_WIDTH = Math.max(300, CHAT_DOCK_MIN_WIDTH)
+/** 上限由 `chatLayout` 统一约束：单栏比例 + 主区最小宽度 */
+const MAX_RATIO = CHAT_DOCK_MAX_RATIO
 const DEAD_ZONE_PX = 4
 
 const paneRef = ref<HTMLElement | null>(null)
@@ -136,9 +137,12 @@ function persistWidth() {
 }
 
 function clampWidth(next: number): number {
-  const container = paneRef.value?.parentElement?.getBoundingClientRect().width ?? 1200
-  const max = Math.max(MIN_WIDTH, Math.floor(container * MAX_RATIO))
-  return Math.min(max, Math.max(MIN_WIDTH, Math.round(next)))
+  return clampDockWidth({
+    next,
+    pane: paneRef.value,
+    minWidth: MIN_WIDTH,
+    maxRatio: MAX_RATIO,
+  })
 }
 
 let pressing = false

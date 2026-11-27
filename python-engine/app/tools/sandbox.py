@@ -1167,70 +1167,21 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
 
     # S5-2：统一资源限制（POSIX 由 fork 后的子进程施加；Windows 无 resource，靠超时兜底）
     #
-    # `restricted` 档走**完全不同的创建路径**：受限令牌 + 独立桌面 + 自建可继承管道
-    # （`win_launch.launch_restricted`）。它挡得住写，但也因此不能用
-    # `create_subprocess_exec` —— asyncio 的管道不可继承，句柄传不进子进程。
-    # 该路径是同步阻塞的（ReadFile + WaitForSingleObject），必须丢进线程，
-    # 否则一次 `npm run build` 会卡死整个事件循环。
+    # 档位判定只用于 `child_launch_argv`（把 low_il 变成子进程入口的参数）；
+    # 探测失败按"无隔离"兜底，由后续既有路径执行 —— 这条路径本身仍有命令白名单。
     try:
-        from app.isolation import Level, resolve_level
+        from app.isolation import resolve_level
 
         _decision = resolve_level()
-    except Exception as exc:  # noqa: BLE001 — 探测失败按"无隔离"降级，由下面既有路径兜底
+    except Exception as exc:  # noqa: BLE001 — 探测失败按"无隔离"降级
         logger.warning("shell_exec: resolve_level failed: %s", exc)
         _decision = None
-
-    if _decision is not None and _decision.effective in (
-        Level.RESTRICTED,
-        Level.APPCONTAINER,
-    ):
-        from app.isolation import win_launch
-
-        # 这两档都必须**自建进程**，因为 `create_subprocess_exec` 表达不了它们的
-        # 建进程参数：`restricted` 要另一个令牌（`CreateProcessAsUserW`），
-        # `appcontainer` 要进程属性列表（`STARTUPINFOEXW` + `CreateProcessW`）。
-        # 建法不同，但"起不来就拒绝执行"的语义完全一致。
-        launcher = (
-            win_launch.launch_appcontainer
-            if _decision.effective is Level.APPCONTAINER
-            else win_launch.launch_restricted
-        )
-        result = await asyncio.to_thread(
-            launcher,
-            [prog, *rest],
-            cwd=str(workspace_dir()),
-            env=child_env,
-            timeout=float(timeout),
-        )
-        if not result.started:
-            # 起不来就**拒绝执行**，不退回无隔离路径 ——
-            # 悄悄降级正是"看起来有隔离"的老问题。
-            return {
-                "error": (
-                    f"sandbox unavailable: {_decision.effective.value} exec failed — "
-                    f"{result.spawn_error}"
-                ),
-            }
-        stdout_text, stdout_truncated, stdout_log = offload_execute_output(
-            result.stdout, "stdout"
-        )
-        stderr_text, stderr_truncated, stderr_log = offload_execute_output(
-            result.stderr, "stderr"
-        )
-        payload: dict[str, Any] = {
-            "exit_code": result.exit_code,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "truncated": stdout_truncated or stderr_truncated,
-        }
-        _attach_log_paths(payload, stdout_log, stderr_log)
-        return payload
 
     # **按档位改变执行路径**：`low_il` 及以上必须由**子进程自己**降级 —— 完整性级别
     # 改的是当前进程令牌，且 Windows 没有撤销 API，父进程一旦调用会连引擎一起降级。
     #
-    # 原来这里直接把 `prog` 交给 `create_subprocess_exec`，于是 `job` / `low_il` /
-    # `appcontainer` 三档走的是**同一行代码**（`wrap_async_process` 只判
+    # 原来这里直接把 `prog` 交给 `create_subprocess_exec`，于是 `job` / `low_il`
+    # 两档走的是**同一行代码**（`wrap_async_process` 只判
     # `rank < Level.JOB`），用户切档位、状态接口也如实报告新档位，实际执行强度却
     # 一点没变。`child_launch_argv` 把档位变成 argv 的差异，让"切换档位"真正
     # 等于"改变执行路径"。
@@ -1242,7 +1193,7 @@ async def _run_in_sandbox_impl(command: str, timeout: int = 120) -> dict[str, An
             exec_argv = child_launch_argv(_decision, exec_argv)
         except Exception as exc:  # noqa: BLE001
             # fail-closed：需要隔离却装不上隔离层时拒绝执行，不退回无隔离路径。
-            # 悄悄降级正是"看起来有隔离"的老问题（与上面 restricted 分支同一口径）。
+            # 悄悄降级正是"看起来有隔离"的老问题。
             return {"error": f"sandbox unavailable: isolation launcher failed — {exc}"}
 
     proc = await asyncio.create_subprocess_exec(

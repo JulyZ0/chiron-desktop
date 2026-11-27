@@ -77,16 +77,24 @@ class Config:
     selfhosted_llm_api_key: str
     # 0.4.4 起 optimize 默认 "full"（加一轮 LLM expand）：显式配置，免得跟着默认值漂移
     selfhosted_optimize: str
+    # 摘要并发（PageIndex flash 默认 64）。本地网关/小模型承受不了 64 路并发，
+    # 全部 429/超时后 PageIndex 只会回一句 "summary generation failed"，看不出原因。
+    selfhosted_summary_concurrency: int
 
     # ── 用户级 Cloud key 的解密（与引擎 internal/settings 同算法）──
     app_secret: str
 
-    def llm_backend(self) -> dict[str, str]:
-        out: dict[str, str] = {}
+    def llm_backend(self, *, session_id: str = "") -> dict[str, object]:
+        out: dict[str, object] = {}
         if self.selfhosted_llm_api_key:
             out["api_key"] = self.selfhosted_llm_api_key
         if self.selfhosted_llm_base_url:
             out["base_url"] = self.selfhosted_llm_base_url
+        if "opencode.ai" in (self.selfhosted_llm_base_url or ""):
+            out["extra_headers"] = {
+                "x-opencode-session": session_id or "chiron-knowledge",
+                "User-Agent": "chiron-knowledge/1.0",
+            }
         return out
 
     @classmethod
@@ -124,6 +132,7 @@ class Config:
             selfhosted_llm_base_url=_env("KNOWLEDGE_SELFHOSTED_LLM_BASE_URL"),
             selfhosted_llm_api_key=_env("KNOWLEDGE_SELFHOSTED_LLM_API_KEY"),
             selfhosted_optimize=_env("KNOWLEDGE_SELFHOSTED_OPTIMIZE", "full"),
+            selfhosted_summary_concurrency=_env_int("KNOWLEDGE_SUMMARY_CONCURRENCY", 4),
             app_secret=_env("APP_SECRET"),
         )
 

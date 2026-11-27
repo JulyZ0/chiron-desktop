@@ -763,7 +763,7 @@ func projectLocatorOf(r *http.Request, wsID string, claims *auth.Claims) (projec
 		        COALESCE(root_key,'') AS root_key
 		   FROM session_map_workspaces
 		  WHERE id = $1 AND tenant_id = $2 AND user_id = $3`,
-		wsID, smTenant(claims), claims.UserID)
+		wsID, smTenantID(claims), claims.UserID)
 	if err != nil || row == nil {
 		return projectLocator{}, errors.New("project not found")
 	}
