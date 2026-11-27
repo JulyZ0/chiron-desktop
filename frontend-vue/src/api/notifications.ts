@@ -85,7 +85,9 @@ export async function listNotifications(
 
 /** 只取未读数（角标轮询用）。单独一条 `COUNT(*)`，不拉全量行。 */
 export async function fetchUnreadCount(): Promise<number> {
-  const { data } = await api.get('/v1/notifications/unread')
+  // `__silent`：这是后台轮询，登录态尚未建立/刚失效时必然 401。交给全局拦截器
+  // 就会登出并跳登录页 —— 轮询不该有这种副作用；失败保留旧值即可。
+  const { data } = await api.get('/v1/notifications/unread', { __silent: true })
   const n = data?.data?.unread_count
   return typeof n === 'number' ? n : 0
 }

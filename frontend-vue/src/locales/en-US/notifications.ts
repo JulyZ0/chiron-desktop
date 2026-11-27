@@ -25,6 +25,7 @@ export default {
   title: 'Notifications',
   subtitle: 'Failed sub-agents and share takedowns show up here.',
   unread_badge: 'Unread notifications',
+  native_body: '{n} new unread notification | {n} new unread notifications',
   empty: 'No notifications yet',
   empty_unread: 'No unread notifications',
   filter_all: 'All',

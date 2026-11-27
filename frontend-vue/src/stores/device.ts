@@ -97,6 +97,10 @@ export interface ChironDesktopHost {
   onQuickAsk?: (callback: () => void) => () => void
   /** 迷你输入框提交的文本（F10 后半）；返回取消订阅函数 */
   onQuickAskText?: (callback: (text: string) => void) => () => void
+  /** 托盘未读计数（F10 后半）：把轮询到的未读通知数推给主进程显示 */
+  setTrayUnread?: (count: number) => void
+  /** 系统通知（新未读且窗口在后台时）：文案已由渲染层按界面语言渲染 */
+  notifyNative?: (payload: { title: string; body: string }) => void
   /**
    * 订阅**引擎崩溃取证**（崩溃自愈放弃时由主进程推送）。
    *

@@ -147,6 +147,24 @@ contextBridge.exposeInMainWorld('chironDesktop', {
     ipcRenderer.on(shared.QUICK_ASK_TEXT_CHANNEL, handler)
     return () => ipcRenderer.removeListener(shared.QUICK_ASK_TEXT_CHANNEL, handler)
   },
+  /**
+   * 托盘未读计数（F10 后半）：登录后的界面把轮询到的未读通知数推给主进程。
+   * 是纯展示通道（send，不等回包）；老外壳没有这个方法时调用点用可选链降级。
+   */
+  setTrayUnread: count => {
+    const n = Number(count)
+    ipcRenderer.send('desktop:tray-unread', { count: Number.isFinite(n) && n > 0 ? n : 0 })
+  },
+  /**
+   * 弹一条**系统**通知（新未读通知且窗口在后台时由渲染层触发）。
+   * title/body 由渲染层按当前界面语言渲染好 —— 主进程拿不到 i18n。
+   */
+  notifyNative: payload => {
+    const title = typeof payload?.title === 'string' ? payload.title : ''
+    const body = typeof payload?.body === 'string' ? payload.body : ''
+    if (!title && !body) return
+    ipcRenderer.send('desktop:notify-native', { title, body })
+  },
   onAutoLock: callback => {
     if (typeof callback !== 'function') return () => {}
     const handler = (_event, payload) => callback(payload || {})

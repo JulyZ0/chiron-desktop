@@ -35,6 +35,7 @@ import {
   type NotificationItem,
 } from '../api/notifications'
 import { serverErrorMessage } from '../utils/apiError'
+import { announceNotificationsChanged } from '../composables/useUnreadNotifications'
 
 const { t } = useI18n()
 const router = useRouter()
@@ -156,6 +157,7 @@ async function markOne(item: NotificationItem) {
       item.read = true
       item.read_at = new Date().toISOString()
       unreadCount.value = Math.max(0, unreadCount.value - updated)
+      announceNotificationsChanged()
       // 在"仅未读"筛选下，标完的这一条已不属于当前视图 —— 就地移除。
       if (filter.value === 'unread') {
         items.value = items.value.filter(it => it.id !== item.id)
@@ -177,6 +179,7 @@ async function markAll() {
       return
     }
     message.success(t('notifications.marked_read', { n: updated }))
+    announceNotificationsChanged()
     await load()
   } catch (err) {
     message.error(serverErrorMessage(err, t('notifications.mark_read_failed')))
@@ -193,6 +196,7 @@ async function removeOne(item: NotificationItem) {
     if (deleted > 0) {
       items.value = items.value.filter(it => it.id !== item.id)
       if (!item.read) unreadCount.value = Math.max(0, unreadCount.value - 1)
+      announceNotificationsChanged()
       message.success(t('notifications.deleted'))
     }
   } catch (err) {
@@ -209,6 +213,7 @@ async function clearRead() {
     const deleted = await clearNotifications('read')
     if (deleted > 0) message.success(t('notifications.cleared', { n: deleted }))
     else message.info(t('notifications.nothing_to_delete'))
+    if (deleted > 0) announceNotificationsChanged()
     await load()
   } catch (err) {
     message.error(serverErrorMessage(err, t('notifications.delete_failed')))

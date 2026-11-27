@@ -37,6 +37,7 @@ import BrandMark from './shell/BrandMark.vue'
 import SettingsPanel from './settings/SettingsPanel.vue'
 import { buildAccountMenuItems, accountMenuRoute, type AccountMenuItem } from './accountMenu'
 import { executeQuickCommand } from "@/components/WorkstationNav.vue"
+import { useUnreadNotifications } from '../composables/useUnreadNotifications'
 import {
   WORKSTATION_DESCRIPTIONS,
   WORKSTATION_LABELS,
@@ -50,6 +51,10 @@ import { SHORTCUT_CATALOG, type ShortcutId } from '../config/shortcutCatalog'
 const { t: tr } = useI18n()
 // Super-agent 接管的让步信号之一：让引擎知道"我还在这一页"，避免在打字间隙被抢走会话
 useTakeoverPresence()
+// 未读通知（角标/托盘计数）：登录态下的后台轮询，卸载时清零托盘数字。
+const unreadNotifications = useUnreadNotifications()
+// 顶层 ref 才能在模板里自动解包（模板不会穿透普通对象里的 ref）。
+const unreadCount = unreadNotifications.unread
 const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
@@ -78,11 +83,14 @@ onMounted(() => {
   if (authStore.token) {
     authStore.fetchProfile()
   }
+  // 未读通知轮询 + 托盘计数（F10 后半）：只在登录后的应用壳里跑。
+  unreadNotifications.start()
 })
 onUnmounted(() => {
   window.removeEventListener('api:error', handleApiError)
   document.removeEventListener('click', onQuickDocClick)
   window.removeEventListener('keydown', onQuickKeydown)
+  unreadNotifications.stop()
 })
 
 // 导航菜单（品牌下拉）
@@ -373,6 +381,24 @@ async function runQuickCommand() {
       v-if="!isChatPage"
       class="topbar-actions"
     >
+      <!-- 通知入口：之前只剩 CSS（.topbar-notify）与两个未使用的 import，
+           页面上没有任何入口能到 /notifications。角标数字与托盘共用同一条轮询。 -->
+      <button
+        v-if="authStore.user"
+        type="button"
+        class="topbar-notify"
+        :title="$t('notifications.title')"
+        :aria-label="$t('notifications.title')"
+        @click="router.push('/notifications')"
+      >
+        <Badge
+          :count="unreadCount"
+          :overflow-count="99"
+          size="small"
+        >
+          <BellOutlined class="topbar-notify-icon" />
+        </Badge>
+      </button>
       <div
         v-if="authStore.user"
         class="user-fab"

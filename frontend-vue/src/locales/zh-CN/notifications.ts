@@ -22,6 +22,7 @@ export default {
   title: '通知中心',
   subtitle: '子 Agent 失败与分享处置会出现在这里。',
   unread_badge: '未读通知',
+  native_body: '有 {n} 条新的未读通知',
   empty: '暂无通知',
   empty_unread: '没有未读通知',
   filter_all: '全部',

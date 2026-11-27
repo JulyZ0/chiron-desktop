@@ -29,6 +29,7 @@ const {
   session,
   dialog,
   Tray,
+  Notification,
   globalShortcut,
   nativeImage,
   clipboard,
@@ -106,6 +107,7 @@ const {
   validateLatestManifest,
   gateInstallerLaunch,
 } = require('./update-manifest.cjs')
+const { normalizeUnread, trayTooltip, showWindowLabel } = require('./tray-badge.cjs')
 
 /** 开发模式：`electron . --dev` 时连 Vite dev server，否则加载 dist/ */
 const isDev = process.argv.includes('--dev')
@@ -258,6 +260,14 @@ function holdingWindowQuota(fn) {
  * （用户不会想到去托盘里找一个配置窗口）。
  */
 let tray = null
+/**
+ * 托盘计数：**未读站内通知数**（F10 后半）。
+ *
+ * 由渲染层（登录后的 AppLayout 每 30s 轮询 `GET /v1/notifications/unread`）通过
+ * `desktop:tray-unread` 推进来；主进程不自己发 HTTP —— token 只在渲染层的请求层里，
+ * 在这里再实现一套鉴权/刷新等于把登录态复制一份。
+ */
+let trayUnreadCount = 0
 
 /** 迷你输入框尺寸（F10）。quick-ask.css 的版心按这里的高度排版，改一处要同时看另一边。 */
 const QUICK_ASK_WINDOW_SIZE = { width: 560, height: 172 }
@@ -380,6 +390,33 @@ function registerQuickAskShortcut() {
 }
 
 /**
+ * 托盘菜单。计数变化时要整块重建 —— Electron 的 MenuItem.label 不支持原地改。
+ * 纯函数化的文案在 `tray-badge.cjs`，这里只做菜单结构。
+ */
+function buildTrayMenu() {
+  return Menu.buildFromTemplate([
+    { label: showWindowLabel(trayUnreadCount), click: () => showMainWindow() },
+    {
+      label: '快速提问',
+      accelerator: 'CommandOrControl+Alt+Space',
+      click: () => {
+        if (!showQuickAskWindow()) showMainWindow()
+      },
+    },
+    { type: 'separator' },
+    {
+      label: '退出 Chiron',
+      click: () => {
+        // 只有这里（以及系统关机）算"真的要退出"。关窗只是收进托盘，
+        // 不设这个标志，close 拦截会把退出流程也拦下来。
+        isQuitting = true
+        app.quit()
+      },
+    },
+  ])
+}
+
+/**
  * 创建托盘图标（只创建一次；createWindow 会被 relaunch* 多次调用）。
  *
  * 图标缺失时**不建托盘也不报错退出**：托盘是增强功能，缺它只是退化成
@@ -394,31 +431,10 @@ function createTray() {
     return
   }
   tray = new Tray(image)
-  tray.setToolTip('Chiron')
+  tray.setToolTip(trayTooltip(trayUnreadCount))
   tray.on('click', () => showMainWindow())
   tray.on('double-click', () => showMainWindow())
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: '显示主窗口', click: () => showMainWindow() },
-      {
-        label: '快速提问',
-        accelerator: 'CommandOrControl+Alt+Space',
-        click: () => {
-          if (!showQuickAskWindow()) showMainWindow()
-        },
-      },
-      { type: 'separator' },
-      {
-        label: '退出 Chiron',
-        click: () => {
-          // 只有这里（以及系统关机）算"真的要退出"。关窗只是收进托盘，
-          // 不设这个标志，close 拦截会把退出流程也拦下来。
-          isQuitting = true
-          app.quit()
-        },
-      },
-    ]),
-  )
+  tray.setContextMenu(buildTrayMenu())
 }
 
 /**
@@ -3132,6 +3148,38 @@ if (!gotLock) {
     ipcMain.on('desktop:quick-ask-cancel', event => {
       if (!isQuickAskSender(event)) return
       quickAskWindow.hide()
+    })
+
+    // 托盘未读计数（F10 后半）：渲染层轮询后推过来，主进程只负责显示。
+    //
+    // 用 `on` 而不是 `invoke`：这是纯展示型遥测，界面不需要等确认；每秒一次也不会
+    // （30s 轮询）。未知/越界值由 `normalizeUnread` 收敛，不让一个脏数字把 tooltip 刷成 NaN。
+    ipcMain.on('desktop:tray-unread', (event, payload) => {
+      assertTrustedSender(event)
+      const next = normalizeUnread(payload?.count)
+      if (next === trayUnreadCount) return
+      trayUnreadCount = next
+      if (!tray) return // 托盘还没建（首次启动/图标缺失）：值先记着，createTray 会用上
+      tray.setToolTip(trayTooltip(trayUnreadCount))
+      tray.setContextMenu(buildTrayMenu())
+    })
+
+    // 系统通知（新未读且窗口在后台）。只在渲染层判定"变多 + hidden"后触发，
+    // 主进程不重复判断业务条件；这里只做长度收敛与"平台不支持时安静跳过"。
+    ipcMain.on('desktop:notify-native', (event, payload) => {
+      assertTrustedSender(event)
+      if (!Notification.isSupported()) return
+      const title = String(payload?.title || 'Chiron').slice(0, 120)
+      const body = String(payload?.body || '').slice(0, 500)
+      if (!body) return
+      try {
+        const notice = new Notification({ title, body })
+        notice.on('click', () => showMainWindow())
+        notice.show()
+      } catch (err) {
+        // 系统通知是旁路：托盘角标已经更新，弹不出来只记一条 warn。
+        logMain('warn', `native notification failed: ${err && err.message}`)
+      }
     })
 
     /**
