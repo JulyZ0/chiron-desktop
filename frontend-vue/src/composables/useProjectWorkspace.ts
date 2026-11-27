@@ -151,6 +151,17 @@ export function projectWorkbenchOpen(projectId: string): boolean {
   return state.workbench[projectId] === true
 }
 
+/**
+ * 该项目是否**明确记录过**工作台开合。
+ *
+ * 与 `projectWorkbenchOpen` 的区别在 `false` 的二义性：从未打开过与主动关闭过都是
+ * false。启动恢复只在"记录过"时应用 —— 否则一个刚打开工作台、还没产生任何记录就
+ * 离开聊天页的用户，下次回来会被强制关掉。
+ */
+export function hasProjectWorkbench(projectId: string): boolean {
+  return Object.prototype.hasOwnProperty.call(state.workbench, projectId)
+}
+
 /** 组件用：同一份模块级状态。 */
 export function useProjectWorkspace(): ProjectWorkspaceState {
   return state

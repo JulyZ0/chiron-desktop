@@ -5,6 +5,7 @@ import {
   activateProjectTab,
   closeProjectTab,
   ensureProjectTab,
+  hasProjectWorkbench,
   lastProjectSession,
   loadProjectWorkspace,
   projectWorkbenchOpen,
@@ -85,5 +86,15 @@ describe('useProjectWorkspace（N7 项目标签）', () => {
     resetProjectWorkspace()
     expect(useProjectWorkspace().open).toEqual([])
     expect(localStorage.getItem('chiron.project-workspace.v1:u1')).toContain('"open":[]')
+  })
+
+  it('hasProjectWorkbench 区分"从未记录"与"主动关闭"', () => {
+    loadProjectWorkspace('u1')
+    expect(hasProjectWorkbench('p1')).toBe(false)
+    expect(projectWorkbenchOpen('p1')).toBe(false)
+
+    setProjectWorkbench('p1', false)
+    expect(hasProjectWorkbench('p1')).toBe(true)
+    expect(projectWorkbenchOpen('p1')).toBe(false)
   })
 })

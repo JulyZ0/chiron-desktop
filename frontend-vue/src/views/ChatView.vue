@@ -54,6 +54,7 @@ import {
   activateProjectTab,
   closeProjectTab,
   ensureProjectTab,
+  hasProjectWorkbench,
   lastProjectSession,
   loadProjectWorkspace,
   projectWorkbenchOpen,
@@ -466,6 +467,14 @@ const projectNames = ref<Record<string, string>>({})
  * 状态写回去。等 activeProject 真的落到目标项目，再由 watcher 恢复。
  */
 let pendingWorkbenchRestore = ''
+/**
+ * 启动后是否已经按项目恢复过一次工作台开合。
+ *
+ * 只做一次：activeProject 会随会话切换反复变化，每次都恢复等于把用户刚关掉的工作台
+ * 又打开。`hasProjectWorkbench` 用来区分"从未打开过"与"主动关闭过"。
+ */
+let initialWorkbenchRestored = false
+const projectTabsRef = ref<HTMLElement | null>(null)
 
 /** 标签展示用：本地还没拿到项目名时退回 id，绝不显示空白标签。 */
 const openProjectTabs = computed(() =>
@@ -530,6 +539,26 @@ function onProjectPickerClick(info: { key: string | number }): void {
   void switchProjectTab(id)
 }
 
+/**
+ * 标签键盘导航（N7 尾巴）：左右方向键在**打开的项目**之间循环切换，并把焦点带到
+ * 新标签上。循环而不是在两端停住 —— 标签是环形列表，停在两端会让"再按一下"变成
+ * 无反馈的空操作。
+ */
+async function focusAdjacentProjectTab(delta: number): Promise<void> {
+  const ids = projectWorkspace.open
+  if (ids.length < 2) return
+  const current = Math.max(0, ids.indexOf(projectWorkspace.active))
+  const next = ids[(current + delta + ids.length) % ids.length]
+  if (next === projectWorkspace.active) return
+  await switchProjectTab(next)
+  await nextTick()
+  const el = projectTabsRef.value?.querySelector<HTMLElement>(
+    `[data-project-id="${next}"]`,
+  )
+  el?.focus()
+  el?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+}
+
 // 当前会话属于哪个项目：自动化地保证该项目的标签存在并激活，同时记住会话。
 watch(
   () => [activeProject.value?.id || '', activeSessionId.value] as const,
@@ -541,6 +570,12 @@ watch(
     if (pendingWorkbenchRestore === projectId) {
       pendingWorkbenchRestore = ''
       workbenchOpen.value = projectWorkbenchOpen(projectId)
+    } else if (!initialWorkbenchRestored) {
+      // 启动恢复：只在项目**记录过**工作台状态时应用（见 hasProjectWorkbench 的注释）。
+      initialWorkbenchRestored = true
+      if (hasProjectWorkbench(projectId)) {
+        workbenchOpen.value = projectWorkbenchOpen(projectId)
+      }
     }
   },
 )
@@ -3062,6 +3097,7 @@ function continueGeneration() {
            关掉标签不会删项目/会话，只是不再占一个入口。 -->
       <div
         v-if="openProjectTabs.length"
+        ref="projectTabsRef"
         class="project-tabs"
         role="tablist"
         :aria-label="$t('chat.project_tabs')"
@@ -3072,11 +3108,14 @@ function continueGeneration() {
           class="project-tab"
           :class="{ active: projectWorkspace.active === tab.id }"
           role="tab"
+          :data-project-id="tab.id"
           :aria-selected="projectWorkspace.active === tab.id"
           :title="tab.name"
           @click="switchProjectTab(tab.id)"
           @keydown.enter="switchProjectTab(tab.id)"
-          tabindex="0"
+          @keydown.left.prevent="focusAdjacentProjectTab(-1)"
+          @keydown.right.prevent="focusAdjacentProjectTab(1)"
+          :tabindex="projectWorkspace.active === tab.id ? 0 : -1"
         >
           <span class="project-tab-name">{{ tab.name }}</span>
           <button
@@ -3859,6 +3898,10 @@ function continueGeneration() {
   white-space: nowrap;
 }
 .project-tab:hover { color: var(--text-primary); }
+.project-tab:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
 .project-tab.active {
   color: var(--text-primary);
   font-weight: 600;
