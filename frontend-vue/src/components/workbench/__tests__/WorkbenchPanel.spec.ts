@@ -63,6 +63,9 @@ vi.mock('../../../api/checkpoints', () => ({
  */
 const changesNet = vi.hoisted(() => ({
   diffs: [] as Array<{ projectId: string; path: string; resolve: (v: unknown) => void }>,
+  /** N5 P1：stage/unstage 调用记录与返回的下一份 status */
+  indexCalls: [] as Array<{ action: 'stage' | 'unstage'; projectId: string; body: unknown }>,
+  nextChanges: null as Record<string, unknown> | null,
   changes: {
     repo: true,
     branch: 'main',
@@ -77,6 +80,14 @@ const changesNet = vi.hoisted(() => ({
 
 vi.mock('../../../api/projectChanges', () => ({
   listProjectChanges: () => Promise.resolve(changesNet.changes),
+  stageProjectPaths: (projectId: string, body: unknown) => {
+    changesNet.indexCalls.push({ action: 'stage', projectId, body })
+    return Promise.resolve(changesNet.nextChanges ?? changesNet.changes)
+  },
+  unstageProjectPaths: (projectId: string, body: unknown) => {
+    changesNet.indexCalls.push({ action: 'unstage', projectId, body })
+    return Promise.resolve(changesNet.nextChanges ?? changesNet.changes)
+  },
   readProjectDiff: (projectId: string, path: string) =>
     new Promise(resolve => {
       changesNet.diffs.push({ projectId, path, resolve })
@@ -265,6 +276,8 @@ describe('改动页签的单文件 diff', () => {
   beforeEach(() => {
     net.calls.length = 0
     changesNet.diffs.length = 0
+    changesNet.indexCalls.length = 0
+    changesNet.nextChanges = null
   })
 
   async function openChangesTab() {
@@ -380,6 +393,30 @@ describe('改动页签的单文件 diff', () => {
     // 从 add[1] 反向 Shift 到 del[0]：区间覆盖 del/add，中间连续行全选
     await dels[0].trigger('click', { shiftKey: true })
     expect(wrapper.findAll('.wb-diff-line.selected')).toHaveLength(4)
+  })
+
+  it('勾选改动行会调用 stage，并用返回的 status 更新列表（N5 P1）', async () => {
+    changesNet.nextChanges = {
+      ...(changesNet.changes as Record<string, unknown>),
+      changes: [
+        { path: 'src/a.ts', status: 'M', staged: true, unstaged: false, insertions: 1, deletions: 1 },
+        { path: 'new.txt', status: '?', staged: false, unstaged: true },
+      ],
+    }
+    const wrapper = await openChangesTab()
+    const first = wrapper.findAll('.wb-change')[0]
+    const checkbox = first.find('input[type="checkbox"]')
+    expect((checkbox.element as HTMLInputElement).checked).toBe(false)
+
+    await checkbox.trigger('change')
+    await flush()
+
+    expect(changesNet.indexCalls).toEqual([
+      { action: 'stage', projectId: 'p1', body: { paths: ['src/a.ts'] } },
+    ])
+    expect(
+      (wrapper.findAll('.wb-change')[0].find('input[type="checkbox"]').element as HTMLInputElement).checked,
+    ).toBe(true)
   })
 
   it('未跟踪文件不渲染假 diff，给出打开文件的入口', async () => {

@@ -2,11 +2,14 @@ package api
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/athenavi/chiron/internal/db"
 )
 
 // gitTestRepo 建一个临时仓库并配置提交身份。
@@ -173,4 +176,124 @@ func TestAllowedGitPathsOnlyCurrentChanges(t *testing.T) {
 			t.Fatalf("paths %v should be rejected", requested)
 		}
 	}
+}
+
+// ── N5 P1：stage / unstage ──────────────────────────────────────────────
+
+func TestStageAndUnstagePaths(t *testing.T) {
+	root := gitTestRepo(t)
+	ctx := context.Background()
+	writeFile(t, root, "a.txt", "one")
+	writeFile(t, root, "dir/b.txt", "two")
+
+	before, err := collectProjectChanges(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range before.Changes {
+		if change.Staged {
+			t.Fatalf("%s should not be staged before", change.Path)
+		}
+	}
+
+	if err := stageGitPaths(ctx, root, []string{"a.txt", "dir/b.txt"}); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	staged, err := collectProjectChanges(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range staged.Changes {
+		if !change.Staged {
+			t.Fatalf("%s should be staged after add", change.Path)
+		}
+	}
+
+	if err := unstageGitPaths(ctx, root, []string{"a.txt"}); err != nil {
+		t.Fatalf("unstage: %v", err)
+	}
+	after, err := collectProjectChanges(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range after.Changes {
+		switch change.Path {
+		case "a.txt":
+			if change.Staged {
+				t.Fatal("a.txt should be unstaged")
+			}
+		case "dir/b.txt":
+			if !change.Staged {
+				t.Fatal("dir/b.txt should stay staged")
+			}
+		}
+	}
+}
+
+// 新仓库（尚无提交）里第一次暂存后撤回：`git reset --` 必须可用。
+func TestUnstageOnUnbornBranch(t *testing.T) {
+	root := gitTestRepo(t)
+	ctx := context.Background()
+	writeFile(t, root, "first.txt", "x")
+	if err := stageGitPaths(ctx, root, []string{"first.txt"}); err != nil {
+		t.Fatalf("stage: %v", err)
+	}
+	if err := unstageGitPaths(ctx, root, []string{"first.txt"}); err != nil {
+		t.Fatalf("unstage on unborn branch: %v", err)
+	}
+	changes, err := collectProjectChanges(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range changes.Changes {
+		if change.Path == "first.txt" && change.Staged {
+			t.Fatal("first.txt should be unstaged")
+		}
+	}
+}
+
+func TestGitIndexPathsSelection(t *testing.T) {
+	changes := ProjectChanges{Changes: []ProjectChange{
+		{Path: "a.txt", Staged: true},
+		{Path: "b.txt", Staged: false},
+		{Path: "c.txt", Staged: true},
+	}}
+	// stage all：包含未暂存
+	got, err := gitIndexPaths(gitPathsRequest{All: true}, changes, true)
+	if err != nil || len(got) != 3 {
+		t.Fatalf("stage all = %v, %v", got, err)
+	}
+	// unstage all：只包含已暂存
+	got, err = gitIndexPaths(gitPathsRequest{All: true}, changes, false)
+	if err != nil || len(got) != 2 || got[0] != "a.txt" || got[1] != "c.txt" {
+		t.Fatalf("unstage all = %v, %v", got, err)
+	}
+	// 显式 unstage 未暂存路径必须被拒
+	if _, err := gitIndexPaths(gitPathsRequest{Paths: []string{"b.txt"}}, changes, false); err == nil {
+		t.Fatal("unstage of unstaged path should fail")
+	}
+	// 显式 stage 未暂存路径可以
+	if got, err := gitIndexPaths(gitPathsRequest{Paths: []string{"b.txt"}}, changes, true); err != nil || len(got) != 1 {
+		t.Fatalf("stage b.txt = %v, %v", got, err)
+	}
+}
+
+func TestAcquireProjectGitLockIsExclusive(t *testing.T) {
+	if db.Redis != nil {
+		t.Skip("redis configured; covered by integration environment")
+	}
+	ctx := context.Background()
+	release, err := acquireProjectGitLock(ctx, "p-lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireProjectGitLock(ctx, "p-lock"); !errors.Is(err, errGitWriteBusy) {
+		t.Fatalf("second acquire should be busy, got %v", err)
+	}
+	release()
+	release2, err := acquireProjectGitLock(ctx, "p-lock")
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	release2()
 }

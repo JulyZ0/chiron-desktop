@@ -80,6 +80,10 @@ func registerConversationRoutes(
 	// 项目改动（只读 Git 视图）：与文件端点同组、同鉴权 —— 它读的是同一个项目根，
 	// 只是经 git 而不是文件系统。只执行只读子命令，见 project_git.go 开头。
 	mux.Handle("GET /v1/session-map/projects/{id}/changes", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectChanges))))
+	// Git 写操作（N5）：P1 只开 stage/unstage（提交前可撤销的一步）。
+	// 安全基座（禁 hook/filter/签名、路径白名单、项目写锁）见 project_git_write.go。
+	mux.Handle("POST /v1/session-map/projects/{id}/git/stage", authMW(rlMW(http.HandlerFunc(smHandler.StageProjectGit))))
+	mux.Handle("POST /v1/session-map/projects/{id}/git/unstage", authMW(rlMW(http.HandlerFunc(smHandler.UnstageProjectGit))))
 	// 单文件 diff：改动列表点开一条时用。同样是只读 git 子命令，路径必须落在项目内。
 	mux.Handle("GET /v1/session-map/projects/{id}/diff", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectDiff))))
 	// F5：最近提交与单条提交 diff（只读）。

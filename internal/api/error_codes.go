@@ -92,6 +92,15 @@ const (
 	// 与 `share_password_required` 分开：后者是"密码不对/没提供"，访客重试即可；
 	// 前者是"现在别试了"，前端必须禁用输入并展示等待时间，否则用户会继续撞锁。
 	CodeShareLocked = "share_locked"
+	// CodeGitBusy 表示项目下还有活跃 run，或另一个 git 写操作正在进行（409）。
+	// 两者都**可重试**：等这一轮/另一个操作结束后再点一次即可。
+	CodeGitBusy = "git_busy"
+	// CodeGitNotRepo 表示项目目录不是 git 工作树（409）。
+	// 用户能做的事是"启用版本控制"，而不是改请求参数。
+	CodeGitNotRepo = "git_not_repo"
+	// CodeGitClientUnsupported 表示设备项目暂不支持 git 写操作（409）。
+	// 与"没有权限"分开：这不是授权问题，是能力尚未接入设备桥。
+	CodeGitClientUnsupported = "git_client_unsupported"
 )
 
 // knownMessageCodes 已知文案 → 错误码（键为小写原文）。

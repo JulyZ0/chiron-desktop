@@ -1,11 +1,11 @@
 /**
- * 项目改动文件的数据面（只读 Git 视图）。
+ * 项目改动文件的数据面（只读 Git 视图 + N5 索引写操作）。
  *
  * **为什么由后端跑 git**：渲染层既拿不到项目根，也不该执行外部进程 —— 详见
  * `internal/api/project_git.go` 文件头。
  *
- * **为什么没有暂存 / 丢弃 / 提交**：这三个都会写用户的仓库，其中"丢弃"还会真的
- * 回退工作区。写操作需要撤销设计与二次确认，不在只读视图的范围内。
+ * **写操作只开放 stage/unstage（N5 P1）**：两者都不改工作区内容，误点可以反向撤销；
+ * commit/discard/分支在后续阶段，且必须带二次确认。
  */
 import { api } from './index'
 
@@ -60,16 +60,44 @@ export async function listProjectChanges(projectId: string): Promise<ProjectChan
   const { data } = await api.get(
     `/v1/session-map/projects/${encodeURIComponent(projectId)}/changes`,
   )
-  const payload = data?.data ?? {}
-  const list: unknown[] = Array.isArray(payload.changes) ? payload.changes : []
+  return normalizeChanges(data?.data)
+}
+
+function normalizeChanges(payload: unknown): ProjectChanges {
+  const p = (payload ?? {}) as Partial<ProjectChanges>
+  const list: unknown[] = Array.isArray(p.changes) ? p.changes : []
   return {
-    repo: !!payload.repo,
-    git_missing: !!payload.git_missing,
-    branch: typeof payload.branch === 'string' ? payload.branch : undefined,
-    head: typeof payload.head === 'string' ? payload.head : undefined,
+    repo: !!p.repo,
+    git_missing: !!p.git_missing,
+    branch: typeof p.branch === 'string' ? p.branch : undefined,
+    head: typeof p.head === 'string' ? p.head : undefined,
     changes: list.map(normalizeChange).filter((c): c is ProjectChange => c !== null),
-    truncated: !!payload.truncated,
+    truncated: !!p.truncated,
   }
+}
+
+/** 暂存路径（N5 P1）。`all=true` 时暂存当前全部改动。 */
+export async function stageProjectPaths(
+  projectId: string,
+  body: { paths?: string[]; all?: boolean },
+): Promise<ProjectChanges> {
+  const { data } = await api.post(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/git/stage`,
+    body.all ? { all: true } : { paths: body.paths || [] },
+  )
+  return normalizeChanges(data?.data)
+}
+
+/** 取消暂存（N5 P1）。工作区内容不动。 */
+export async function unstageProjectPaths(
+  projectId: string,
+  body: { paths?: string[]; all?: boolean },
+): Promise<ProjectChanges> {
+  const { data } = await api.post(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/git/unstage`,
+    body.all ? { all: true } : { paths: body.paths || [] },
+  )
+  return normalizeChanges(data?.data)
 }
 
 /** 单个文件的统一 diff（只读）。 */

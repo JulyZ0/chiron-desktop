@@ -36,6 +36,8 @@ import {
   readCommitDiff,
   readProjectDiff,
   readProjectLog,
+  stageProjectPaths,
+  unstageProjectPaths,
   type ProjectChange,
   type ProjectChanges,
   type ProjectCommit,
@@ -314,6 +316,10 @@ interface ChangeRow {
   agentTouched: boolean
   /** git 没有记录，只凭 agent 的写入记录出现 */
   agentOnly: boolean
+  /** 索引里有这个文件的改动（N5 P1：暂存勾选） */
+  staged: boolean
+  /** 工作区与索引不同 */
+  unstaged: boolean
 }
 
 const changeRows = computed<ChangeRow[]>(() => {
@@ -332,6 +338,8 @@ const changeRows = computed<ChangeRow[]>(() => {
       deletions: c.deletions,
       agentTouched: agent.has(key),
       agentOnly: false,
+      staged: c.staged,
+      unstaged: c.unstaged,
     })
   }
 
@@ -343,7 +351,14 @@ const changeRows = computed<ChangeRow[]>(() => {
     const key = pathKey(rel)
     if (seen.has(key)) continue
     seen.add(key)
-    rows.push({ path: rel, status: '', agentTouched: true, agentOnly: true })
+    rows.push({
+      path: rel,
+      status: '',
+      agentTouched: true,
+      agentOnly: true,
+      staged: false,
+      unstaged: false,
+    })
   }
   return rows
 })
@@ -374,6 +389,8 @@ const turnRows = computed<ChangeRow[]>(() => {
       deletions: matched?.deletions,
       agentTouched: true,
       agentOnly: matched?.agentOnly ?? false,
+      staged: matched?.staged ?? false,
+      unstaged: matched?.unstaged ?? false,
     })
   }
   return out
@@ -402,6 +419,50 @@ async function loadChanges() {
     if (changesGuard.isValid(ticket)) changesLoading.value = false
   }
 }
+
+// ── N5 P1：staged / unstaged ──────────────────────────────────────────────
+// 只做索引操作，不改工作区。两个按钮都不会"丢东西"：暂存可撤销，取消暂存也不会
+// 动文件内容 —— 所以这里不需要二次确认（commit/discard 才需要）。
+const indexBusy = ref(false)
+/** 后端每次写操作都返回最新 status：直接替换，避免再发一次 GET 引起闪烁。 */
+function applyChanges(next: ProjectChanges): void {
+  changesData.value = next
+  changesError.value = ''
+}
+
+async function toggleStage(row: ChangeRow): Promise<void> {
+  if (!props.projectId || row.agentOnly || indexBusy.value) return
+  indexBusy.value = true
+  try {
+    const next = row.staged
+      ? await unstageProjectPaths(props.projectId, { paths: [row.path] })
+      : await stageProjectPaths(props.projectId, { paths: [row.path] })
+    applyChanges(next)
+  } catch (e) {
+    notify.error(describeApiError(e))
+  } finally {
+    indexBusy.value = false
+  }
+}
+
+async function stageAllChanges(stage: boolean): Promise<void> {
+  if (!props.projectId || indexBusy.value) return
+  indexBusy.value = true
+  try {
+    const next = stage
+      ? await stageProjectPaths(props.projectId, { all: true })
+      : await unstageProjectPaths(props.projectId, { all: true })
+    applyChanges(next)
+  } catch (e) {
+    notify.error(describeApiError(e))
+  } finally {
+    indexBusy.value = false
+  }
+}
+
+/** 已暂存数量：头部按钮据此决定是否可用（没有可暂存的就不显示按钮）。 */
+const stagedCount = computed(() => changeRows.value.filter(r => !r.agentOnly && r.staged).length)
+const stageableCount = computed(() => changeRows.value.filter(r => !r.agentOnly).length)
 
 /**
  * 打开一条改动。
@@ -1404,6 +1465,28 @@ async function openWithSystem(entry: ProjectFileEntry) {
             v-if="changesData?.head"
             class="wb-changes-head"
           >{{ tr('chat.workbench_changes_head', { head: changesData.head }) }}</div>
+          <!-- N5 P1：索引操作。只改暂存区，不动工作区文件。 -->
+          <div
+            v-if="changesData?.repo && stageableCount"
+            class="wb-index-actions"
+          >
+            <button
+              type="button"
+              class="wb-btn"
+              :disabled="indexBusy"
+              @click="stageAllChanges(true)"
+            >{{ tr('chat.workbench_stage_all') }}</button>
+            <button
+              type="button"
+              class="wb-btn"
+              :disabled="indexBusy || !stagedCount"
+              @click="stageAllChanges(false)"
+            >{{ tr('chat.workbench_unstage_all') }}</button>
+            <span
+              v-if="indexBusy"
+              class="wb-index-busy"
+            >{{ tr('common.loading') }}</span>
+          </div>
           <!-- F4：本回合改动（会话级实时数据，不依赖 git 是否记录） -->
           <div
             v-if="turnRows.length"
@@ -1450,6 +1533,22 @@ async function openWithSystem(entry: ProjectFileEntry) {
             @keydown.enter.prevent="openChange(row)"
             @keydown.space.prevent="openChange(row)"
           >
+            <span
+              v-if="!row.agentOnly"
+              class="wb-stage"
+              @click.stop
+            >
+              <input
+                type="checkbox"
+                :checked="row.staged"
+                :disabled="indexBusy"
+                :aria-label="tr('chat.workbench_stage_toggle', { path: row.path })"
+                :title="row.staged && row.unstaged
+                  ? tr('chat.workbench_stage_partial')
+                  : tr('chat.workbench_stage_toggle', { path: row.path })"
+                @change="toggleStage(row)"
+              >
+            </span>
             <span
               class="wb-status"
               :class="`st-${row.status || 'x'}`"
@@ -2081,6 +2180,13 @@ async function openWithSystem(entry: ProjectFileEntry) {
 }
 .wb-verify-badge.ok { color: var(--success); border-color: var(--success); }
 .wb-verify-badge.warn { color: var(--warning); border-color: var(--warning); }
+
+/* N5 P1：暂存勾选与批量操作 */
+.wb-index-actions { display: flex; align-items: center; gap: 6px; padding: 6px 0; }
+.wb-index-busy { font-size: 12px; color: var(--text-tertiary); }
+.wb-stage { display: inline-flex; align-items: center; }
+.wb-stage input { cursor: pointer; }
+.wb-stage input:disabled { cursor: progress; }
 
 /* 分栏手柄：平时不可见，悬停/拖动/聚焦时才显形（与 SessionPreviewPane 一致） */
 .wb-resize {

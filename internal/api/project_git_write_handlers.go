@@ -1,0 +1,266 @@
+// project_git_write_handlers.go —— Git 写操作的 HTTP 层（N5 P1）。
+//
+// 本阶段只开放 **stage / unstage**：它们是"提交前可撤销"的一步，失败代价最低，
+// 也足以把权限、锁、审计、路径校验这条链路跑通。commit/discard/分支在 P2/P3。
+//
+// 每个写请求的顺序是固定的：
+//
+//  1. 项目归属与根可用（`requireProject`，含隔离根校验）
+//  2. client 项目直接拒绝（设备桥没有 git 写实现）
+//  3. 必须是 git 工作树
+//  4. 项目下没有活跃 run（否则会把"写了一半的回合"冻进索引）
+//  5. 抢项目级写锁（多副本用 Redis；单机回落到进程内互斥）
+//  6. 路径只取当前 status 条目（`allowedGitPaths`）
+//  7. 执行 → 重新读改动 → 审计
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/athenavi/chiron/internal/auth"
+	"github.com/athenavi/chiron/internal/db"
+	"github.com/redis/go-redis/v9"
+)
+
+// errGitWriteBusy 表示同一项目的另一个写操作正在进行。
+var errGitWriteBusy = errors.New("another git write is in progress for this project")
+
+// gitWriteLockTTL 覆盖一次写命令的最长耗时；进程崩溃时锁会自动过期。
+const gitWriteLockTTL = 45 * time.Second
+
+// localGitLocks 是 Redis 不可用时的进程内兜底（桌面单机就是这种形态）。
+var localGitLocks sync.Map // projectID -> *sync.Mutex
+
+const releaseGitLockLua = `if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("del", KEYS[1])
+end
+return 0`
+
+// acquireProjectGitLock 抢项目级写锁，返回释放函数。
+//
+// 多副本必须用 Redis：否则 A 副本在 commit、B 副本在 discard，同一个 index 会被
+// 两条命令交叉改写。单机（Redis 未配置）用进程内 Mutex，语义一样但只对一个进程有效。
+func acquireProjectGitLock(ctx context.Context, projectID string) (func(), error) {
+	if db.Redis == nil {
+		value, _ := localGitLocks.LoadOrStore(projectID, &sync.Mutex{})
+		mu := value.(*sync.Mutex)
+		if !mu.TryLock() {
+			return nil, errGitWriteBusy
+		}
+		return mu.Unlock, nil
+	}
+	key := db.RedisKey("git:write:lock:" + projectID)
+	token := newUUID()
+	// RedisClient 没有 SetNX：用 SET NX PX 走 Do。NX 失败时 Redis 返回 nil，
+	// go-redis 表现为 redis.Nil —— 那是"锁已被占"，不是故障。
+	res := db.Redis.Do(ctx, "SET", key, token, "NX", "PX",
+		int64(gitWriteLockTTL/time.Millisecond))
+	if err := res.Err(); err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, errGitWriteBusy
+		}
+		return nil, err
+	}
+	return func() {
+		// 释放用独立的短超时：请求 ctx 可能已经被取消，而锁必须还回去。
+		releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = db.Redis.Eval(releaseCtx, releaseGitLockLua, []string{key}, token).Err()
+	}, nil
+}
+
+// projectHasActiveRuns 判断项目下是否有未终态的 run。
+//
+// 用 DB 而不是网关内存里的 InFlight：后者只看得见**本副本**受理的 run，多副本部署时
+// 另一台的 run 会让这里误判为"空闲"。agent_runs 是引擎写入的权威状态（终态必落库）。
+func projectHasActiveRuns(ctx context.Context, projectID string) (bool, error) {
+	if db.GlobalDBManager == nil {
+		return false, nil
+	}
+	row, err := db.GlobalDBManager.FetchOne(ctx,
+		`SELECT 1 AS active
+		   FROM agent_runs r
+		   JOIN session_map_nodes n ON n.session_id = r.session_id
+		  WHERE n.workspace_id = $1 AND n.edge_kind = 'project'
+		    AND r.status IN ('running', 'checkpointed', 'resuming')
+		  LIMIT 1`, projectID)
+	if err != nil {
+		return false, err
+	}
+	return row != nil, nil
+}
+
+type gitPathsRequest struct {
+	Paths []string `json:"paths"`
+	// All 表示"当前改动里的全部条目"，省去前端把路径全传一遍。
+	All bool `json:"all"`
+}
+
+// StageProjectGit POST /v1/session-map/projects/{id}/git/stage
+func (h *SessionMapHandler) StageProjectGit(w http.ResponseWriter, r *http.Request) {
+	h.projectGitIndexAction(w, r, true)
+}
+
+// UnstageProjectGit POST /v1/session-map/projects/{id}/git/unstage
+func (h *SessionMapHandler) UnstageProjectGit(w http.ResponseWriter, r *http.Request) {
+	h.projectGitIndexAction(w, r, false)
+}
+
+// projectGitIndexAction 是 stage / unstage 的共用实现。`stage=false` 表示反向操作。
+func (h *SessionMapHandler) projectGitIndexAction(w http.ResponseWriter, r *http.Request, stage bool) {
+	loc, ok := h.requireProject(w, r)
+	if !ok {
+		return
+	}
+	if loc.Provider == smProviderClient {
+		JSONWithCode(w, http.StatusConflict, CodeGitClientUnsupported, nil,
+			"git write operations are not supported for device projects")
+		return
+	}
+	if !projectVCS(r.Context(), loc.RootPath).Repo {
+		JSONWithCode(w, http.StatusConflict, CodeGitNotRepo, nil,
+			"project is not a git work tree")
+		return
+	}
+
+	var body gitPathsRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024)).Decode(&body); err != nil {
+		BadRequest(w, "invalid request body")
+		return
+	}
+	if !body.All && len(body.Paths) == 0 {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil,
+			"paths or all is required")
+		return
+	}
+
+	active, err := projectHasActiveRuns(r.Context(), loc.ID)
+	if err != nil {
+		logAndRespond(w, err, http.StatusServiceUnavailable, ErrDBUnavailable)
+		return
+	}
+	if active {
+		// 等这一轮跑完就能写：明确告诉客户端"可重试"。
+		JSONWithRetryable(w, http.StatusConflict, CodeGitBusy, nil,
+			"an agent run is still active for this project", true)
+		return
+	}
+
+	release, err := acquireProjectGitLock(r.Context(), loc.ID)
+	if err != nil {
+		if errors.Is(err, errGitWriteBusy) {
+			JSONWithRetryable(w, http.StatusConflict, CodeGitBusy, nil,
+				"another git write is in progress for this project", true)
+			return
+		}
+		logAndRespond(w, err, http.StatusServiceUnavailable, ErrDBUnavailable)
+		return
+	}
+	defer release()
+
+	before, err := collectProjectChanges(r.Context(), loc.RootPath)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git changes")
+		return
+	}
+
+	paths, err := gitIndexPaths(body, before, stage)
+	if err != nil {
+		JSONWithCode(w, http.StatusBadRequest, CodeInvalidRequest, nil, err.Error())
+		return
+	}
+
+	if stage {
+		err = stageGitPaths(r.Context(), loc.RootPath, paths)
+	} else {
+		err = unstageGitPaths(r.Context(), loc.RootPath, paths)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, errGitMissing):
+			JSONWithCode(w, http.StatusConflict, CodeServiceUnavailable, nil, "git is not installed")
+		case errors.Is(err, errGitFailed):
+			// git 的 stderr 常带绝对路径：只进日志。
+			logAndRespond(w, err, http.StatusInternalServerError, "git index operation failed")
+		default:
+			logAndRespond(w, err, http.StatusInternalServerError, "git index operation failed")
+		}
+		return
+	}
+
+	after, err := collectProjectChanges(r.Context(), loc.RootPath)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git changes")
+		return
+	}
+
+	if claims := auth.GetClaims(r.Context()); claims != nil {
+		action := "project.git.stage"
+		if !stage {
+			action = "project.git.unstage"
+		}
+		db.AuditLog(r.Context(), claims.UserID, smTenantID(claims), action,
+			"session_map_workspaces:"+loc.ID,
+			fmt.Sprintf("files=%d", len(paths)), r.RemoteAddr,
+			map[string]interface{}{"project_id": loc.ID, "file_count": len(paths)})
+	}
+	OK(w, after)
+}
+
+// gitIndexPaths 决定本次要操作的路径。
+//
+// `all` 取当前 status 的全部条目（unstage 只取已暂存的）；显式路径必须落在允许集合里。
+func gitIndexPaths(body gitPathsRequest, changes ProjectChanges, stage bool) ([]string, error) {
+	if body.All {
+		paths := make([]string, 0, len(changes.Changes))
+		for _, change := range changes.Changes {
+			if !stage && !change.Staged {
+				continue
+			}
+			if change.Path != "" {
+				paths = append(paths, change.Path)
+			}
+		}
+		if len(paths) == 0 {
+			return nil, errors.New("nothing to stage")
+		}
+		return paths, nil
+	}
+	if stage {
+		return allowedGitPaths(body.Paths, changes)
+	}
+	// unstage：只允许"当前确实已暂存"的路径，避免把未暂存路径传给 git reset 造成误解。
+	staged := ProjectChanges{Changes: make([]ProjectChange, 0, len(changes.Changes))}
+	for _, change := range changes.Changes {
+		if change.Staged {
+			staged.Changes = append(staged.Changes, change)
+		}
+	}
+	return allowedGitPaths(body.Paths, staged)
+}
+
+// stageGitPaths 把路径加入索引。
+//
+// `-A` 必须带：删除的文件在工作区已不存在，裸 `git add -- <path>` 会报
+// "pathspec did not match"，用户看到的会是"删掉的文件永远无法暂存"。
+func stageGitPaths(ctx context.Context, root string, paths []string) error {
+	args := append([]string{"add", "-A"}, gitPathsArgs(paths)...)
+	_, err := gitWrite(ctx, root, args...)
+	return err
+}
+
+// unstageGitPaths 把路径移出索引（工作区不动）。
+//
+// 用 `git reset --` 而不是 `git restore --staged`：后者在**尚无提交**的新仓库里
+// 会失败（没有 HEAD 可比较），而"刚 init 的项目第一次暂存后想撤回"是真实场景。
+func unstageGitPaths(ctx context.Context, root string, paths []string) error {
+	args := append([]string{"reset", "-q"}, gitPathsArgs(paths)...)
+	_, err := gitWrite(ctx, root, args...)
+	return err
+}

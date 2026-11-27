@@ -52,6 +52,9 @@ export default {
   // fix the project path vs. pick another file / open it with a system app. Merging
   // them into one "failed" message would send the user to the wrong place.
   project_root_unavailable: 'The folder this project points to is not available — it may have been moved, renamed, or deleted. Pick the folder again in the project settings.',
+  git_busy: 'This project still has a running turn or another git operation in progress. Try again when it finishes.',
+  git_not_repo: 'This project is not a git repository yet. Enable version control in Checkpoints first.',
+  git_client_unsupported: 'Device projects do not support staging/commits yet. Operate on the device that owns the project.',
   file_too_large: 'This file is too large to preview here. Open it with a system app instead.',
   // Network & client-side (fallback when backend sends no code)
   timeout: 'Request timed out. Please try again.',
