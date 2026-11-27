@@ -144,7 +144,7 @@ from app.agent.tool_execution import (
     execute_tool,
     guarded_execute_tool,
 )
-from app.agent.verification import VerificationTracker, revision_nudge
+from app.agent.verification import VerificationTracker, load_verify_config, revision_nudge
 from app.config import settings
 from app.gateway.errors import is_context_overflow
 from app.gateway.router import GatewayRouter
@@ -3233,7 +3233,15 @@ class AgentRuntime:
             # 跨轮累计（一轮里可能先改文件、下一轮才跑测试）；只统计真实执行过的
             # shell_exec（审批/护栏拦下的不算），以及是否改过文件。
             # 结论随最终 `done` 事件回传，前端据此显示"通过/失败/未验证"。
-            verification = VerificationTracker()
+            #
+            # N6.1：项目可以在 `<root>/.chiron/verify.json` 声明验证命令。只在
+            # **服务端项目**读取 —— client 项目的 root 在用户设备上，引擎这边读到的
+            # 是一条无意义路径；那种情况回落到关键字识别。
+            _vlocator = _project_locator_of(task.workbench_context)
+            _vconfig: tuple[str, ...] = ()
+            if _vlocator.get("provider") != "client" and _vlocator.get("root"):
+                _vconfig = load_verify_config(_vlocator["root"])
+            verification = VerificationTracker(configured=_vconfig)
             #: 只补一次"先修好再收尾"：模型第二次仍不收口时按现状结束，
             #: 不把一次未验证变成无限续轮。
             verification_nudged = False

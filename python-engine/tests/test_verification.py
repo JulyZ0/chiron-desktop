@@ -108,3 +108,92 @@ def test_nudge_text_states_facts() -> None:
     _note(tracker, "shell_exec", {"command": "pnpm test"}, {"exit_code": 2})
     failed = revision_nudge(tracker.summary())
     assert "pnpm test" in failed and "exit 2" in failed
+
+
+# ── N6.1：项目级验证命令配置 ─────────────────────────────────────────────
+
+
+def test_load_verify_config_reads_commands(tmp_path) -> None:
+    from app.agent.verification import load_verify_config
+
+    cfg = tmp_path / ".chiron"
+    cfg.mkdir()
+    (cfg / "verify.json").write_text(
+        '{"commands": ["pnpm test", "pnpm test", " ", "go test ./..."]}',
+        encoding="utf-8",
+    )
+    assert load_verify_config(str(tmp_path)) == ("pnpm test", "go test ./...")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not json",
+        '{"commands": "pnpm test"}',
+        '{"commands": [1, null, {"x": 1}]}',
+        "{}",
+        "",
+    ],
+)
+def test_load_verify_config_is_fail_open(tmp_path, body: str) -> None:
+    from app.agent.verification import load_verify_config
+
+    cfg = tmp_path / ".chiron"
+    cfg.mkdir()
+    (cfg / "verify.json").write_text(body, encoding="utf-8")
+    assert load_verify_config(str(tmp_path)) == ()
+
+
+def test_load_verify_config_missing_file_and_root(tmp_path) -> None:
+    from app.agent.verification import load_verify_config
+
+    assert load_verify_config(str(tmp_path)) == ()
+    assert load_verify_config("") == ()
+
+
+def test_load_verify_config_rejects_oversized_file(tmp_path) -> None:
+    from app.agent.verification import load_verify_config
+
+    cfg = tmp_path / ".chiron"
+    cfg.mkdir()
+    (cfg / "verify.json").write_text(
+        '{"commands": ["' + "x" * (70 * 1024) + '"]}',
+        encoding="utf-8",
+    )
+    assert load_verify_config(str(tmp_path)) == ()
+
+
+def test_command_matches_config_prefix_and_cd() -> None:
+    from app.agent.verification import command_matches_config
+
+    configured = ("pnpm test", "go test ./...")
+    assert command_matches_config("pnpm test", configured) == "pnpm test"
+    assert command_matches_config("pnpm test -- --run", configured) == "pnpm test"
+    assert command_matches_config("cd frontend && pnpm test", configured) == "pnpm test"
+    # 冒号不是参数分隔符：test:unit 不是 test
+    assert command_matches_config("pnpm test:unit", configured) == ""
+    assert command_matches_config("pytest -q", configured) == ""
+
+
+def test_tracker_with_config_only_counts_declared_commands() -> None:
+    tracker = VerificationTracker(configured=("pnpm test",))
+    _note(tracker, "write_file", {"path": "a.ts"}, {"ok": True})
+    # 随手跑的 pytest 不算：项目声明的是 pnpm test
+    _note(tracker, "shell_exec", {"command": "pytest -q"}, {"exit_code": 0})
+    assert tracker.summary().status == "unverified"
+    assert tracker.summary().source == "config"
+    assert tracker.needs_revision() is True
+
+    _note(tracker, "shell_exec", {"command": "pnpm test -- --run"}, {"exit_code": 1})
+    summary = tracker.summary()
+    assert summary.status == "failed"
+    assert summary.source == "config"
+    assert summary.command == "pnpm test -- --run"
+
+
+def test_tracker_with_custom_command_gets_custom_kind() -> None:
+    tracker = VerificationTracker(configured=("make verify",))
+    _note(tracker, "write_file", {"path": "a.py"}, {"ok": True})
+    _note(tracker, "shell_exec", {"command": "make verify"}, {"exit_code": 0})
+    assert tracker.summary().status == "passed"
+    assert tracker.summary().kind == "custom"

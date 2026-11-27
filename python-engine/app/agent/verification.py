@@ -24,12 +24,21 @@ Agent 说"改完了"不等于改对了。产品需要一个**诚实的结论**�
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 #: 会被视为"改了工作区"的工具。删除也算：删错了同样需要验证。
 _WRITE_TOOLS = frozenset({"write_file", "edit_file", "delete_file"})
+
+#: 项目级验证配置（N6.1）。放在仓库里而不是服务端数据库：
+#: 它描述的是"这个代码库怎么验证自己"，与代码一起版本化、跟着分支走。
+VERIFY_CONFIG_PATH = os.path.join(".chiron", "verify.json")
+#: 配置文件上限：它只是几十条命令，读 64KB 已经非常宽松；超限按"没有配置"处理。
+_MAX_CONFIG_BYTES = 64 * 1024
+#: 命令条数上限：防止一个坏文件把每轮记账变成 O(n) 扫描。
+_MAX_CONFIG_COMMANDS = 50
 
 #: 验证命令类别（顺序即优先级：同一条命令只归一类）。
 #: 只放**明确用于质量门禁**的模式；`go run`、`npm start` 这类不算。
@@ -94,6 +103,82 @@ def _command_of(arguments: Any) -> str:
     return ""
 
 
+def _normalize_command(command: str) -> str:
+    """归一化用于比较的命令。
+
+    - 折叠空白（`go  test` 与 `go test` 视为同一条）；
+    - 去掉前置 `cd <path> &&`：模型的常见写法，与配置里的裸命令是同一个动作；
+    - 不做 shell 解析 —— 这里只用于**识别**，不执行，过度解析反而会误判。
+    """
+    text = " ".join(str(command or "").split()).strip()
+    previous = None
+    while text and text != previous:
+        previous = text
+        match = re.match(r"^cd\s+[^&;]+\s*&&\s*", text, re.IGNORECASE)
+        if match:
+            text = text[match.end():].strip()
+    return text
+
+
+def command_matches_config(command: str, configured: tuple[str, ...]) -> str:
+    """命令是否命中项目配置；命中返回配置里的那条（便于事件里展示），否则空串。
+
+    用"前缀 + 分隔符"而不是子串：`pnpm test` 应命中 `pnpm test -- --run`，
+    但 `pnpm test:unit` 不该被当成 `pnpm test`（冒号不是参数分隔符）。
+    """
+    text = _normalize_command(command)
+    if not text:
+        return ""
+    for item in configured:
+        want = _normalize_command(item)
+        if not want:
+            continue
+        if text == want or text.startswith(want + " "):
+            return item
+    return ""
+
+
+def load_verify_config(root: str) -> tuple[str, ...]:
+    """读取 `<项目根>/.chiron/verify.json` 里的验证命令。
+
+    格式：`{"commands": ["pnpm test", "pnpm -r typecheck"]}`。
+    任何异常（文件缺失、JSON 坏、结构不对、超限）都返回空元组 —— 配置是**增强**，
+    读不到就回落到启发式识别，绝不能让一个坏配置文件阻断对话。
+    """
+    project_root = str(root or "").strip()
+    if not project_root:
+        return ()
+    try:
+        base = os.path.realpath(project_root)
+        path = os.path.realpath(os.path.join(base, VERIFY_CONFIG_PATH))
+        # 符号链接不能跳出项目根：`.chiron/verify.json -> /etc/xxx` 不该被读。
+        if path != base and not path.startswith(base + os.sep):
+            return ()
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read(_MAX_CONFIG_BYTES + 1)
+    except OSError:
+        return ()
+    if len(raw) > _MAX_CONFIG_BYTES:
+        return ()
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return ()
+    commands = data.get("commands") if isinstance(data, dict) else None
+    if not isinstance(commands, list):
+        return ()
+    out: list[str] = []
+    for item in commands:
+        if not isinstance(item, str):
+            continue
+        command = " ".join(item.split()).strip()
+        if command and command not in out:
+            out.append(command)
+        if len(out) >= _MAX_CONFIG_COMMANDS:
+            break
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class VerificationRecord:
     command: str
@@ -111,6 +196,9 @@ class VerificationSummary:
     kind: str = ""
     exit_code: int | None = None
     wrote_files: bool = False
+    #: 判定来源：config（项目配置声明过验证命令）| heuristic（按关键字识别）。
+    #: 只用于诊断与文案，不影响三档结论。
+    source: str = "heuristic"
 
     def to_event(self) -> dict[str, Any]:
         """`done` 事件里的 `verification` 字段（体积很小，可以每轮都带）。"""
@@ -120,6 +208,7 @@ class VerificationSummary:
             "kind": self.kind,
             "exit_code": self.exit_code,
             "wrote_files": self.wrote_files,
+            "source": self.source,
         }
 
 
@@ -129,6 +218,9 @@ class VerificationTracker:
 
     records: list[VerificationRecord] = field(default_factory=list)
     wrote_files: bool = False
+    #: 项目声明的验证命令（N6.1）。非空时**只认**这些命令：
+    #: 否则"配置了却没跑"会被别的 test 命令掩盖，配置就失去意义。
+    configured: tuple[str, ...] = ()
 
     def note_execution(
         self,
@@ -153,9 +245,17 @@ class VerificationTracker:
         if isinstance(raw_code, bool) or not isinstance(raw_code, int):
             return
         command = _command_of(arguments)
-        kind = classify_verification_command(command)
-        if not kind:
-            return
+        if self.configured:
+            # N6.1：配置优先。命中配置的命令才记账；没命中就当"没验证过"，
+            # 否则模型随手跑一个 `pytest` 就能绕过项目声明的质量门禁。
+            matched = command_matches_config(command, self.configured)
+            if not matched:
+                return
+            kind = classify_verification_command(command) or "custom"
+        else:
+            kind = classify_verification_command(command)
+            if not kind:
+                return
         self.records.append(
             VerificationRecord(
                 command=command.strip(),
@@ -166,6 +266,7 @@ class VerificationTracker:
         )
 
     def summary(self) -> VerificationSummary:
+        source = "config" if self.configured else "heuristic"
         if self.records:
             failed = next((r for r in self.records if not r.passed), None)
             last = self.records[-1]
@@ -176,10 +277,11 @@ class VerificationTracker:
                 kind=chosen.kind,
                 exit_code=chosen.exit_code,
                 wrote_files=self.wrote_files,
+                source=source,
             )
         if self.wrote_files:
-            return VerificationSummary(status="unverified", wrote_files=True)
-        return VerificationSummary(status="not-needed")
+            return VerificationSummary(status="unverified", wrote_files=True, source=source)
+        return VerificationSummary(status="not-needed", source=source)
 
     def needs_revision(self) -> bool:
         """是否值得追加一轮"先修好再收尾"。
