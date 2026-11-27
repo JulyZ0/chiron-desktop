@@ -42,6 +42,8 @@ export default {
   confirm_deleting_this_knowledge_base: "确认删除此知识库？",
   delete_document: "删除文档",
   upload_document: "上传文档",
+  import_folder: "导入文件夹",
+  skipped_n_duplicate_files: "已跳过 {n} 个重复文件",
   unsupported_file_type: "不支持的文件类型：{name}（当前支持 {supported}）",
   not_importable_to_knowledge_base: "不可导入",
   media_file_has_no_url: "该媒体文件没有可下载的地址",

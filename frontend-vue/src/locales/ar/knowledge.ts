@@ -42,6 +42,8 @@ export default {
   confirm_deleting_this_knowledge_base: "تأكيد حذف قاعدة المعرفة هذه؟",
   delete_document: "حذف المستند",
   upload_document: "رفع مستند",
+  import_folder: "استيراد مجلد",
+  skipped_n_duplicate_files: "تم تخطي {n} ملف مكرر",
   unsupported_file_type: "نوع الملف غير مدعوم: {name} (المدعوم: {supported})",
   not_importable_to_knowledge_base: "غير قابل للاستيراد",
   media_file_has_no_url: "لا يوجد عنوان قابل للتنزيل لهذا الملف",

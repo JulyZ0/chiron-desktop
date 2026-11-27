@@ -6,7 +6,8 @@ import {
   Progress, message, Modal, Input, Checkbox, Popconfirm,
 } from 'ant-design-vue'
 import {
-  ArrowLeftOutlined, CloudUploadOutlined, DeleteOutlined, FolderOutlined,
+  ArrowLeftOutlined, CloudUploadOutlined,
+  FolderOpenOutlined, DeleteOutlined, FolderOutlined,
   PlayCircleOutlined, PictureOutlined, SearchOutlined,
   MessageOutlined, EyeOutlined, ReloadOutlined,
 } from '@ant-design/icons-vue'
@@ -424,12 +425,24 @@ function releaseUploadSlot(): void {
 }
 
 /** 本批次统计：inFlight 归零时才汇总提示 + 刷新列表 */
-const uploadBatch = { inFlight: 0, ok: 0, failed: 0 }
+const uploadBatch = { inFlight: 0, ok: 0, failed: 0, skipped: 0 }
+/** 同批去重键：同名+同大小+同修改时间（批量选文件夹时最常见的重复来源）。 */
+const batchSeenFiles = new Set<string>()
 
 async function handleUpload(info: UploadRequestOptions) {
   // antd 的 file 允许多态（string/Blob，用于受控 fileList）；本视图只接真实上传文件
   const { file } = info
   if (!(file instanceof File)) return
+
+  const batchKey = `${file.name}:${file.size}:${file.lastModified}`
+  if (batchSeenFiles.has(batchKey)) {
+    // 同一批次里重复选中同一个文件（常见于多选 + 文件夹叠加）：
+    // 静默跳过并在批次汇总里报数，不重复上传、也不报错。
+    uploadBatch.skipped++
+    info.onSuccess?.({})
+    return
+  }
+  batchSeenFiles.add(batchKey)
 
   uploadBatch.inFlight++
   await acquireUploadSlot()
@@ -453,9 +466,11 @@ async function handleUpload(info: UploadRequestOptions) {
 
 /** 一个批次结束：汇总提示 + 刷新一次列表（而不是每个文件各刷一次） */
 async function flushUploadBatch() {
-  const { ok, failed } = uploadBatch
+  const { ok, failed, skipped } = uploadBatch
   uploadBatch.ok = 0
   uploadBatch.failed = 0
+  uploadBatch.skipped = 0
+  batchSeenFiles.clear()
   if (ok > 0) {
     message.success(t('knowledge.uploaded_n_files_to_the_knowledge_base', { n: ok }))
     await loadKnowledgeBase()
@@ -463,6 +478,9 @@ async function flushUploadBatch() {
   }
   if (failed > 0) {
     message.error(t('errors.n_files_failed_to_upload', { n: failed }))
+  }
+  if (skipped > 0) {
+    message.info(t('knowledge.skipped_n_duplicate_files', { n: skipped }))
   }
 }
 
@@ -1242,6 +1260,21 @@ function formatSize(bytes: number): string {
                     <CloudUploadOutlined />
                   </template>
                   {{ $t('knowledge.upload_document') }}
+                </Button>
+              </Upload>
+              <Upload
+                multiple
+                directory
+                :show-upload-list="false"
+                :custom-request="handleUpload"
+                :before-upload="beforeKbUpload"
+                :accept="kbAccept"
+              >
+                <Button size="small">
+                  <template #icon>
+                    <FolderOpenOutlined />
+                  </template>
+                  {{ $t('knowledge.import_folder') }}
                 </Button>
               </Upload>
             </Space>

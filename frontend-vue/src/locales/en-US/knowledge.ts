@@ -42,6 +42,8 @@ export default {
   confirm_deleting_this_knowledge_base: "Confirm deleting this knowledge base?",
   delete_document: "Delete document",
   upload_document: "Upload document",
+  import_folder: "Import folder",
+  skipped_n_duplicate_files: "Skipped {n} duplicate file(s)",
   unsupported_file_type: "Unsupported file type: {name} (supported: {supported})",
   not_importable_to_knowledge_base: "Not importable",
   media_file_has_no_url: "This media file has no downloadable URL",
