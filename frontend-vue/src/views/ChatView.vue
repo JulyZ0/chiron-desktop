@@ -37,7 +37,7 @@ import { useChatSessionStore } from '../stores/chatSession'
 import { useChatRunState } from '../composables/useChatRunState'
 import { useChatStreamText } from '../composables/useChatStreamText'
 import { createSseDispatcher } from '../composables/useChatSse'
-import type { CompactionInfo } from '../components/chat/sseProjection'
+import type { CompactionInfo, VerificationSnapshot } from '../components/chat/sseProjection'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import type { LocationQuery } from 'vue-router'
@@ -591,16 +591,20 @@ const workbenchRef = ref<InstanceType<typeof WorkbenchPanel> | null>(null)
 /** 发过修复请求后等本回合结束，再把当前 diff 重拉一次。 */
 let pendingDiffRefresh = false
 
-function onWorkbenchFixRequest(payload: { path: string; comment: string; lines: string[] }) {
-  const comment = String(payload.comment || '').trim()
-  if (!comment) return
-  // 围栏里出现 ``` 会把提示词的代码块提前闭合；替换掉比"拼一个更长的围栏"简单可靠。
-  const diffText = payload.lines.join('\n').replaceAll('```', '`` `')
-  const prompt = t('chat.workbench_review_prompt', {
-    path: payload.path,
-    comment,
-    diff: diffText,
-  })
+function onWorkbenchFixRequest(payload: {
+  items: Array<{ path: string; comment: string; lines: string[] }>
+}) {
+  const items = (payload?.items || []).filter(item => String(item.comment || '').trim())
+  if (!items.length) return
+  // 多条意见拼成**一条**消息：会话里保持"一次审阅 = 一条输入"，Agent 也拿到完整上下文。
+  const prompt = items
+    .map(item => t('chat.workbench_review_prompt', {
+      path: item.path,
+      comment: String(item.comment).trim(),
+      // 围栏里出现 ``` 会把提示词的代码块提前闭合；替换掉比"拼一个更长的围栏"简单可靠。
+      diff: item.lines.join('\n').replaceAll('```', '`` `'),
+    }))
+    .join('\n\n')
   pendingDiffRefresh = true
   void sendMessage(prompt)
 }
@@ -921,6 +925,8 @@ const sessionCostCents = ref<number | null>(null)
 const contextSnapshot = ref<{ used?: number; limit?: number; compact_ratio?: number; breakdown?: Record<string, number>; largest?: Array<{ class?: string; role?: string; tokens?: number }>; estimated?: boolean } | null>(null)
 // 前缀缓存诊断（引擎 `done` 带 `cache={prefix_changed: ["system"|"tools"]}`）。空数组 = 逐字未变。
 const cacheSnapshot = ref<{ prefix_changed?: string[]; first_turn?: boolean } | null>(null)
+/** 本轮验证结论（N6）：工作台 diff 徽标与消息流提示共用。 */
+const verificationSnapshot = ref<VerificationSnapshot | null>(null)
 
 // 提问的等待上限，与后端 `runtime.ASK_ANSWER_TTL_SECONDS = 300` 对齐。
 // 超时后后端把 `{"error": "user did not answer in time"}` 当**工具结果**回给模型，
@@ -2672,6 +2678,7 @@ const onSSEMessage = createSseDispatcher({
   budgetSnapshot,
   contextSnapshot,
   cacheSnapshot,
+  verificationSnapshot,
   pushSubagentEvent,
   notify,
   offerSetupTour,
@@ -2816,6 +2823,7 @@ async function sendMessage(
   loading.value = true
   startTurnTimer()
   resetStreamState()
+  verificationSnapshot.value = null
   connectionLost.value = false
   appendUserText(text, attachments)
   const userItemId = items.value[items.value.length - 1]?.id
@@ -3063,6 +3071,7 @@ function continueGeneration() {
         :project-error="activeProjectError"
         :agent-written-paths="agentWrittenPaths"
         :turn-written-paths="turnWrittenPaths"
+        :verification="verificationSnapshot"
         :handle-side="layoutSwapped ? 'left' : 'right'"
         @close="toggleWorkbench()"
         @reference="onWorkbenchReference"

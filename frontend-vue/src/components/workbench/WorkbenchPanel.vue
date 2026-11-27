@@ -86,12 +86,23 @@ const props = withDefaults(
     agentWrittenPaths?: string[]
     /** 本回合 agent 写过的路径（F4：回合级审阅） */
     turnWrittenPaths?: string[]
+    /**
+     * 本回合的验证结论（N6）。只用于在 diff 头部提示"改动是否验证过"，
+     * 不改变任何写路径。`null`/缺省 = 未知，不显示徽标。
+     */
+    verification?: { status: string; command?: string; exitCode?: number | null } | null
   }>(),
   // `handleSide` 兜底 'right'：默认布局下工作台在**最左**，与主会话相邻的是它的
   // 右边缘，手柄就该贴右边。兜底反了的话，只要调用方漏传，手柄会跑到窗口外缘，
   // 用户就再也拖不动这一栏了。
-  { projectId: '', projectName: '', handleSide: 'right', agentWrittenPaths: () => [], turnWrittenPaths: () => [] },
+  { projectId: '', projectName: '', handleSide: 'right', agentWrittenPaths: () => [], turnWrittenPaths: () => [], verification: null },
 )
+
+interface ReviewItem {
+  path: string
+  comment: string
+  lines: string[]
+}
 
 const emit = defineEmits<{
   (e: 'close'): void
@@ -100,8 +111,9 @@ const emit = defineEmits<{
   /**
    * 审阅意见（N2）：把选中的 diff 行 + 用户意见交给父组件，由它拼成一条会话消息
    * 并发给 Agent。面板**不直接发消息** —— 它拿不到 sendMessage 与当前会话。
+   * 一次可带多条（跨文件攒批），顺序 = 加入托盘的顺序。
    */
-  (e: 'fix-request', payload: { path: string; comment: string; lines: string[] }): void
+  (e: 'fix-request', payload: { items: ReviewItem[] }): void
   /**
    * 重新反查会话归属。
    *
@@ -450,29 +462,51 @@ const diffLines = computed<DiffLine[]>(() => toDiffLines(diffData.value?.diff ??
 const selectedDiffLines = ref<Set<number>>(new Set())
 const diffCommentOpen = ref(false)
 const diffCommentText = ref('')
+/** Shift 连选的锚点（最近一次单击的行号）。 */
+let diffSelectAnchor: number | null = null
+/**
+ * 本次审阅托盘（N2 v2）：跨文件攒意见，最后一次性发给 Agent。
+ *
+ * 只存在面板内存里：它是"发送前的一次草稿"，不是需要跨会话持久化的事实。
+ * 刷新后丢掉是预期行为 —— 真正发出去的意见已经是会话消息。
+ */
+const reviewTray = ref<ReviewItem[]>([])
 
 /** 元信息/hunk 头不可选：它们不是"代码行"，拿它们去让 Agent 修没有意义。 */
 function diffLineSelectable(line: DiffLine | undefined): boolean {
   return !!line && line.cls !== 'meta' && line.cls !== 'hunk'
 }
 
-function toggleDiffLine(index: number): void {
+function toggleDiffLine(index: number, event?: MouseEvent): void {
   if (!diffLineSelectable(diffLines.value[index])) return
   const next = new Set(selectedDiffLines.value)
-  if (next.has(index)) next.delete(index)
-  else next.add(index)
+  if (event?.shiftKey && diffSelectAnchor !== null) {
+    // Shift 连选：锚点到当前行之间的**可选中**行全部加入（不切换已有选择）。
+    const from = Math.min(diffSelectAnchor, index)
+    const to = Math.max(diffSelectAnchor, index)
+    for (let i = from; i <= to; i++) {
+      if (diffLineSelectable(diffLines.value[i])) next.add(i)
+    }
+  } else if (next.has(index)) {
+    next.delete(index)
+  } else {
+    next.add(index)
+  }
+  diffSelectAnchor = index
   selectedDiffLines.value = next
 }
 
 function clearDiffSelection(): void {
   selectedDiffLines.value = new Set()
+  diffSelectAnchor = null
   diffCommentOpen.value = false
   diffCommentText.value = ''
 }
 
 const selectedDiffCount = computed(() => selectedDiffLines.value.size)
 
-function submitDiffComment(): void {
+/** 意见进入托盘；**不立即发送** —— 用户通常会先看完多个文件。 */
+function addDiffCommentToTray(): void {
   const row = diffRow.value
   const comment = diffCommentText.value.trim()
   if (!row || !comment || !selectedDiffCount.value) return
@@ -481,9 +515,41 @@ function submitDiffComment(): void {
     .sort((a, b) => a - b)
     .slice(0, 40)
     .map(i => diffLines.value[i]?.text ?? '')
-  emit('fix-request', { path: row.path, comment, lines })
+  reviewTray.value = [...reviewTray.value, { path: row.path, comment, lines }]
   clearDiffSelection()
 }
+
+function removeReviewItem(index: number): void {
+  reviewTray.value = reviewTray.value.filter((_, i) => i !== index)
+}
+
+function clearReviewTray(): void {
+  reviewTray.value = []
+}
+
+function sendReviewTray(): void {
+  if (!reviewTray.value.length) return
+  emit('fix-request', { items: reviewTray.value.slice() })
+  reviewTray.value = []
+}
+
+/** 本回合验证结论的展示文案（N6 联动）。只提示事实，不阻止审阅/发送。 */
+const verificationBadge = computed(() => {
+  const v = props.verification
+  if (!v) return null
+  const command = String(v.command || '')
+  if (v.status === 'passed') {
+    return { tone: 'ok', text: tr('chat.workbench_verify_passed'), title: command }
+  }
+  if (v.status === 'failed') {
+    const code = v.exitCode === null || v.exitCode === undefined ? '' : ` (exit ${v.exitCode})`
+    return { tone: 'warn', text: tr('chat.workbench_verify_failed'), title: command + code }
+  }
+  if (v.status === 'unverified') {
+    return { tone: 'warn', text: tr('chat.workbench_verify_unverified'), title: '' }
+  }
+  return null
+})
 
 async function loadDiff(row: ChangeRow) {
   diffRow.value = row
@@ -1298,6 +1364,42 @@ async function openWithSystem(entry: ProjectFileEntry) {
           class="wb-empty"
         >{{ changesData.git_missing ? tr('chat.workbench_git_missing') : tr('chat.workbench_no_vcs') }}</div>
         <template v-else>
+          <!-- N2 v2：跨文件审阅托盘。意见先攒在这里，最后一次发给 Agent。 -->
+          <div
+            v-if="reviewTray.length"
+            class="wb-review-tray"
+          >
+            <div class="wb-review-tray-head">
+              <span>{{ tr('chat.workbench_review_tray', { n: reviewTray.length }) }}</span>
+              <span class="wb-review-tray-actions">
+                <button
+                  type="button"
+                  class="wb-btn"
+                  @click="clearReviewTray"
+                >{{ tr('chat.workbench_review_tray_clear') }}</button>
+                <button
+                  type="button"
+                  class="wb-btn wb-btn-primary"
+                  @click="sendReviewTray"
+                >{{ tr('chat.workbench_review_tray_send') }}</button>
+              </span>
+            </div>
+            <ul class="wb-review-tray-list">
+              <li
+                v-for="(item, idx) in reviewTray"
+                :key="`${item.path}:${idx}`"
+              >
+                <span class="wb-review-tray-path">{{ item.path }}</span>
+                <span class="wb-review-tray-comment">{{ item.comment }}</span>
+                <button
+                  type="button"
+                  class="wb-btn"
+                  :aria-label="tr('common.remove')"
+                  @click="removeReviewItem(idx)"
+                >×</button>
+              </li>
+            </ul>
+          </div>
           <div
             v-if="changesData?.head"
             class="wb-changes-head"
@@ -1382,6 +1484,12 @@ async function openWithSystem(entry: ProjectFileEntry) {
             class="wb-preview-path"
             :title="diffRow.path"
           >{{ diffRow.path }}</span>
+          <span
+            v-if="verificationBadge"
+            class="wb-verify-badge"
+            :class="verificationBadge.tone"
+            :title="verificationBadge.title"
+          >{{ verificationBadge.text }}</span>
           <button
             type="button"
             class="wb-btn"
@@ -1464,15 +1572,15 @@ async function openWithSystem(entry: ProjectFileEntry) {
                   v-model="diffCommentText"
                   rows="2"
                   :placeholder="tr('chat.workbench_review_placeholder')"
-                  @keydown.ctrl.enter.prevent="submitDiffComment"
-                  @keydown.meta.enter.prevent="submitDiffComment"
+                  @keydown.ctrl.enter.prevent="addDiffCommentToTray"
+                  @keydown.meta.enter.prevent="addDiffCommentToTray"
                 />
                 <button
                   type="button"
                   class="wb-btn wb-btn-primary"
                   :disabled="!diffCommentText.trim()"
-                  @click="submitDiffComment"
-                >{{ tr('chat.workbench_review_send') }}</button>
+                  @click="addDiffCommentToTray"
+                >{{ tr('chat.workbench_review_add_to_tray') }}</button>
               </div>
             </div>
             <pre class="wb-diff"><code><span
@@ -1487,7 +1595,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
                 },
               ]"
               :title="diffLineSelectable(line) ? tr('chat.workbench_review_pick') : ''"
-              @click="toggleDiffLine(i)"
+              @click="toggleDiffLine(i, $event)"
             >{{ line.text || ' ' }}</span></code></pre>
             <div
               v-if="diffData.truncated"
@@ -1947,6 +2055,32 @@ async function openWithSystem(entry: ProjectFileEntry) {
 }
 .wb-review-box .wb-btn { align-self: flex-end; }
 .wb-review-box .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* N2 v2：跨文件审阅托盘 */
+.wb-review-tray {
+  margin: 6px 0 8px;
+  padding: 8px;
+  border: var(--hairline-width) solid var(--border-default);
+  border-radius: var(--sig-radius-button);
+  background: var(--panel-bg);
+}
+.wb-review-tray-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.wb-review-tray-actions { display: inline-flex; gap: 6px; }
+.wb-review-tray-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.wb-review-tray-list li { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.wb-review-tray-path { color: var(--text-primary); font-family: var(--font-mono, monospace); }
+.wb-review-tray-comment { flex: 1; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* N6 联动：diff 头部的验证徽标 */
+.wb-verify-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: var(--hairline-width) solid var(--border-default);
+}
+.wb-verify-badge.ok { color: var(--success); border-color: var(--success); }
+.wb-verify-badge.warn { color: var(--warning); border-color: var(--warning); }
 
 /* 分栏手柄：平时不可见，悬停/拖动/聚焦时才显形（与 SessionPreviewPane 一致） */
 .wb-resize {

@@ -26,8 +26,9 @@ import {
   projectToolResult,
   projectUsage,
   projectVerification,
+  normalizeVerification,
 } from '../components/chat/sseProjection'
-import type { CompactionInfo } from '../components/chat/sseProjection'
+import type { CompactionInfo, VerificationSnapshot } from '../components/chat/sseProjection'
 
 type Obj = Record<string, unknown>
 
@@ -92,6 +93,8 @@ export interface ChatSsePorts {
   budgetSnapshot: Ref<BudgetSnapshot | null>
   contextSnapshot: Ref<ContextSnapshot | null>
   cacheSnapshot: Ref<CacheSnapshot | null>
+  /** 本轮验证结论（N6）：工作台 diff 头部的徽标用它，与消息流提示同源。 */
+  verificationSnapshot: Ref<VerificationSnapshot | null>
   // ── 子 Agent ──
   pushSubagentEvent: (event: SubagentEvent, frameId: string) => void
   // ── UI ──
@@ -173,6 +176,11 @@ export function createSseDispatcher(ports: ChatSsePorts) {
         : null
       // N6：本轮验证结论（只会在最终 done 上带）。`not-needed` 不插行。
       projectVerification(ports.items.value, d.verification, ports.t)
+      // 只有**带这个字段**的终态帧才更新快照：一段结束的 done 不带 verification，
+      // 不能把上一段的结论清掉。
+      if (Object.prototype.hasOwnProperty.call(d, 'verification')) {
+        ports.verificationSnapshot.value = normalizeVerification(d.verification)
+      }
       void ports.refreshSessionCost()
     } else if (type === 'turn_done') {
       ports.flushStreamingFlags()

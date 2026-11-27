@@ -82,6 +82,7 @@ function makePorts(overrides: Partial<ChatSsePorts> = {}) {
     budgetSnapshot: ref(null),
     contextSnapshot: ref(null),
     cacheSnapshot: ref(null),
+    verificationSnapshot: ref(null),
     pushSubagentEvent: calls.pushSubagent,
     notify: { warning: calls.notifyWarning, error: calls.notifyError },
     offerSetupTour: calls.setupTour,

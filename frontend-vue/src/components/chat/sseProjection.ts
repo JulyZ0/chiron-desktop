@@ -146,6 +146,33 @@ export function projectKnowledgeRetrieval(
 }
 
 /**
+ * 本轮验证结论（N6）：`done.verification` 的规范化形态。
+ *
+ * 与 `projectVerification` 共用同一份解析：徽标（工作台）与提示行（消息流）
+ * 必须对同一帧得出相同结论，否则会出现"消息流说失败、diff 说通过"。
+ */
+export interface VerificationSnapshot {
+  status: 'passed' | 'failed' | 'unverified' | 'not-needed'
+  command: string
+  exitCode: number | null
+}
+
+export function normalizeVerification(value: unknown): VerificationSnapshot | null {
+  if (!value || typeof value !== 'object') return null
+  const v = value as Obj
+  const status = String(v.status ?? '')
+  if (status !== 'passed' && status !== 'failed' && status !== 'unverified' && status !== 'not-needed') {
+    return null
+  }
+  const rawCode = v.exit_code
+  return {
+    status,
+    command: String(v.command ?? ''),
+    exitCode: typeof rawCode === 'number' ? rawCode : null,
+  }
+}
+
+/**
  * 本轮验证结论（N6）：`done.verification` 转成一行 notice。
  *
  * 只展示三档真实状态：通过 / 失败 / 未验证。`not-needed`（没改文件也没跑验证）
@@ -157,23 +184,22 @@ export function projectVerification(
   t: (key: string, params?: Record<string, unknown>) => string,
   now: () => number = Date.now,
 ): void {
-  if (!verification || typeof verification !== 'object') return
-  const v = verification as Obj
-  const status = String(v.status ?? '')
-  if (status !== 'passed' && status !== 'failed' && status !== 'unverified') return
-  const command = String(v.command ?? '')
-  const code = v.exit_code
+  const snapshot = normalizeVerification(verification)
+  if (!snapshot || snapshot.status === 'not-needed') return
   const content =
-    status === 'passed'
-      ? t('common.verification_passed', { command })
-      : status === 'failed'
-        ? t('common.verification_failed', { command, code: String(code ?? '?') })
+    snapshot.status === 'passed'
+      ? t('common.verification_passed', { command: snapshot.command })
+      : snapshot.status === 'failed'
+        ? t('common.verification_failed', {
+          command: snapshot.command,
+          code: String(snapshot.exitCode ?? '?'),
+        })
         : t('common.verification_unverified')
   if (!content) return
   items.push({
     kind: 'notice',
     // 通过是中性事实（info），失败/未验证需要用户注意（warning）。
-    tone: status === 'passed' ? 'info' : 'warning',
+    tone: snapshot.status === 'passed' ? 'info' : 'warning',
     content,
     id: `verify:${now()}`,
   })

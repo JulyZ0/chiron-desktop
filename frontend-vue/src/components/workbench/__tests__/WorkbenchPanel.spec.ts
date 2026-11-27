@@ -332,13 +332,54 @@ describe('改动页签的单文件 diff', () => {
     await wrapper.find('.wb-review-box textarea').setValue('把 new 改成 new2')
     await wrapper.find('.wb-review-box .wb-btn-primary').trigger('click')
 
+    // N2 v2：先进入托盘，不立即发送
+    expect(wrapper.emitted('fix-request')).toBeUndefined()
+    expect(wrapper.find('.wb-review-tray').exists()).toBe(true)
+    expect(wrapper.find('.wb-review-tray').text()).toContain('src/a.ts')
+    // 加入托盘后选择态清空，避免同一批意见被重复加入
+    expect(wrapper.find('.wb-review').exists()).toBe(false)
+
+    await wrapper.find('.wb-review-tray .wb-btn-primary').trigger('click')
     const emitted = wrapper.emitted('fix-request')
     expect(emitted).toHaveLength(1)
-    expect(emitted?.[0]?.[0]).toMatchObject({ path: 'src/a.ts', comment: '把 new 改成 new2' })
+    const payload = emitted?.[0]?.[0] as {
+      items: Array<{ path: string; comment: string; lines: string[] }>
+    }
+    expect(payload.items).toHaveLength(1)
+    expect(payload.items[0]).toMatchObject({ path: 'src/a.ts', comment: '把 new 改成 new2' })
     // 按 diff 顺序取行，而不是按点击顺序
-    expect((emitted?.[0]?.[0] as { lines: string[] }).lines).toEqual(['-old', '+new'])
-    // 提交后选择态清空，避免同一批意见被重复发送
-    expect(wrapper.find('.wb-review').exists()).toBe(false)
+    expect(payload.items[0].lines).toEqual(['-old', '+new'])
+    // 发送后托盘清空
+    expect(wrapper.find('.wb-review-tray').exists()).toBe(false)
+  })
+
+  it('Shift 连选把锚点到当前行之间的可选中行一起加入（N2 v2）', async () => {
+    const wrapper = await openChangesTab()
+    await wrapper.findAll('.wb-change')[0].trigger('click')
+    await flush()
+    changesNet.diffs[0].resolve({
+      repo: true,
+      path: 'src/a.ts',
+      untracked: false,
+      binary: false,
+      truncated: false,
+      diff: 'diff --git a/src/a.ts b/src/a.ts\n@@ -1,2 +1,2 @@\n-old1\n-old2\n+new1\n+new2\n',
+    })
+    await flush()
+
+    const dels = wrapper.findAll('.wb-diff-line.del')
+    const adds = wrapper.findAll('.wb-diff-line.add')
+    expect(dels).toHaveLength(2)
+    expect(adds).toHaveLength(2)
+
+    await adds[0].trigger('click')
+    await adds[1].trigger('click', { shiftKey: true })
+    // 锚点 add[0] 到 add[1] 之间只有这两行 add
+    expect(wrapper.findAll('.wb-diff-line.selected')).toHaveLength(2)
+
+    // 从 add[1] 反向 Shift 到 del[0]：区间覆盖 del/add，中间连续行全选
+    await dels[0].trigger('click', { shiftKey: true })
+    expect(wrapper.findAll('.wb-diff-line.selected')).toHaveLength(4)
   })
 
   it('未跟踪文件不渲染假 diff，给出打开文件的入口', async () => {
