@@ -50,6 +50,20 @@ import ChatInput from '../components/chat/ChatInput.vue'
 import WorkbenchPanel from '../components/workbench/WorkbenchPanel.vue'
 import { setWorkbenchOpen, toggleWorkbench, workbenchOpen } from '../components/workbench/useWorkbench'
 import { collectAgentWrittenPaths, normalizeForCompare, writePathOfToolCall } from '../components/workbench/agentTouched'
+import {
+  activateProjectTab,
+  closeProjectTab,
+  ensureProjectTab,
+  lastProjectSession,
+  loadProjectWorkspace,
+  projectWorkbenchOpen,
+  pruneProjectWorkspace,
+  rememberProjectSession,
+  setProjectWorkbench,
+  useProjectWorkspace,
+} from '../composables/useProjectWorkspace'
+import { listProjects, listProjectSessions } from './sessionmap/projectsApi'
+import type { ProjectSummary } from './sessionmap/types'
 import SessionMapView from './sessionmap/SessionMapView.vue'
 import { pickStreamPreview } from './sessionmap/streamPreview'
 import ChatSetupTour from '../components/chat/ChatSetupTour.vue'
@@ -437,6 +451,104 @@ const {
 // 项目归属的解析（含失败原因、晚到结果丢弃）已抽到 `stores/chatSession.ts`。
 // 这里只保留 UI 直接消费的派生 id。
 const activeProjectId = computed(() => activeProject.value?.id || '')
+
+// ── N7 v1：项目标签 ────────────────────────────────────────────────────────
+// 每个项目记住自己的活跃会话与工作台开合；切换标签 = 恢复现场。
+// 状态在 composable 里是模块级的，离开聊天页再回来不丢。
+const projectWorkspace = useProjectWorkspace()
+const allProjects = ref<ProjectSummary[]>([])
+const projectNames = ref<Record<string, string>>({})
+/**
+ * 待恢复工作台状态的项目 id。
+ *
+ * 不能在 `switchProjectTab` 里"切完会话就立刻设 workbenchOpen"：`activeProject` 是
+ * 异步反查的（`switchSession` 返回时它还指着旧项目），那时赋值会把**旧项目**的开合
+ * 状态写回去。等 activeProject 真的落到目标项目，再由 watcher 恢复。
+ */
+let pendingWorkbenchRestore = ''
+
+/** 标签展示用：本地还没拿到项目名时退回 id，绝不显示空白标签。 */
+const openProjectTabs = computed(() =>
+  projectWorkspace.open.map(id => ({ id, name: projectNames.value[id] || id })),
+)
+/** "+" 里只列**还没打开**的项目。 */
+const projectPickerOptions = computed(() =>
+  allProjects.value.filter(p => !projectWorkspace.open.includes(p.id)),
+)
+
+async function refreshProjectCatalogue(): Promise<boolean> {
+  try {
+    const list = await listProjects()
+    allProjects.value = list
+    projectNames.value = Object.fromEntries(
+      list.map(p => [p.id, p.name || p.root_path || p.id]),
+    )
+    return true
+  } catch {
+    /* 项目列表是标签的增强数据：拉不到就沿用本地已知的名字 */
+    return false
+  }
+}
+
+/** 打开/切换到一个项目标签。 */
+async function switchProjectTab(projectId: string): Promise<void> {
+  if (!projectId) return
+  activateProjectTab(projectId)
+  const remembered = lastProjectSession(projectId)
+  // 工作台开合按项目恢复（默认关）；等 activeProject 落定后再应用，避免写到旧项目上。
+  pendingWorkbenchRestore = projectId
+  if (remembered && sessions.value.some(s => s.id === remembered)) {
+    await switchSession(remembered)
+  } else {
+    // 本地没记过/记的会话已删：退到服务端列表里的第一个，再不行就新建（归属会写进后端）。
+    let target = ''
+    try {
+      const list = await listProjectSessions(projectId)
+      target = list[0]?.id || ''
+    } catch {
+      target = ''
+    }
+    if (target) await switchSession(target)
+    else await createSession(projectId)
+  }
+}
+
+/** 关闭标签；关的是当前标签时按浏览器习惯切到右邻/左邻。 */
+function closeProjectTabAndMaybeSwitch(projectId: string): void {
+  const wasActive = projectWorkspace.active === projectId
+  const next = closeProjectTab(projectId)
+  if (wasActive && next) void switchProjectTab(next)
+}
+
+function onProjectPickerOpenChange(open: boolean): void {
+  if (open) void refreshProjectCatalogue()
+}
+
+function onProjectPickerClick(info: { key: string | number }): void {
+  const id = String(info?.key || '')
+  if (!id || id === '__empty') return
+  void switchProjectTab(id)
+}
+
+// 当前会话属于哪个项目：自动化地保证该项目的标签存在并激活，同时记住会话。
+watch(
+  () => [activeProject.value?.id || '', activeSessionId.value] as const,
+  ([projectId, sessionId]) => {
+    if (!projectId) return
+    ensureProjectTab(projectId)
+    activateProjectTab(projectId)
+    if (sessionId) rememberProjectSession(projectId, sessionId)
+    if (pendingWorkbenchRestore === projectId) {
+      pendingWorkbenchRestore = ''
+      workbenchOpen.value = projectWorkbenchOpen(projectId)
+    }
+  },
+)
+
+// 工作台开合记到当前项目上；切换项目时由 switchProjectTab 恢复。
+watch(workbenchOpen, open => {
+  if (activeProjectId.value) setProjectWorkbench(activeProjectId.value, open)
+})
 
 /**
  * 任务清单面板（长任务防跑偏）。
@@ -1897,6 +2009,8 @@ useKeyboardShortcuts({
 // ── 会话 CRUD（保留原逻辑） ──
 onMounted(async () => {
   unregisterAuthScopedReset?.()
+  // N7：标签状态按账号隔离；先载入再做任何项目解析，否则首个会话会写进上一个账号的键。
+  loadProjectWorkspace(authStore.user?.id || '')
   // F10：从全局快捷键/其它页面跳来时，挂载后聚焦输入框；已在聊天页时由 onQuickAsk 处理。
   const focusComposer = () => { void nextTick(() => chatInputRef.value?.focus?.()) }
   if (consumeQuickAsk()) focusComposer()
@@ -1924,8 +2038,16 @@ onMounted(async () => {
     splitSessionId.value = ''
   }
   void loadPersonas()
-  // 统一任务模式不自动切换普通会话；其余保持原有行为
-  if (!unifiedMode.value && sessions.value.length > 0) {
+  // N7：项目目录用于标签名与失效校正；不阻塞首屏（拉不到就沿用本地记录）。
+  void refreshProjectCatalogue().then(ok => {
+    if (ok) pruneProjectWorkspace(allProjects.value.map(p => p.id))
+  })
+  // 统一任务模式不自动切换普通会话；其余保持原有行为。
+  // N7：优先恢复当前项目标签上次停留的会话；它已删则退回最近会话。
+  const rememberedSession = projectWorkspace.active ? lastProjectSession(projectWorkspace.active) : ''
+  if (!unifiedMode.value && rememberedSession && sessions.value.some(s => s.id === rememberedSession)) {
+    await switchSession(rememberedSession)
+  } else if (!unifiedMode.value && sessions.value.length > 0) {
     await switchSession(sessions.value[0].id)
   }
   // 迷你输入框提交（F10 后半）：**等会话恢复完**再发。提前发会在 activeSessionId
@@ -2904,6 +3026,66 @@ function continueGeneration() {
       class="chat-main"
       :inert="panelOpen && narrowSidePanel"
     >
+      <!-- N7 v1：项目标签。每个标签记住自己的活跃会话与工作台开合；
+           关掉标签不会删项目/会话，只是不再占一个入口。 -->
+      <div
+        v-if="openProjectTabs.length"
+        class="project-tabs"
+        role="tablist"
+        :aria-label="$t('chat.project_tabs')"
+      >
+        <div
+          v-for="tab in openProjectTabs"
+          :key="tab.id"
+          class="project-tab"
+          :class="{ active: projectWorkspace.active === tab.id }"
+          role="tab"
+          :aria-selected="projectWorkspace.active === tab.id"
+          :title="tab.name"
+          @click="switchProjectTab(tab.id)"
+          @keydown.enter="switchProjectTab(tab.id)"
+          tabindex="0"
+        >
+          <span class="project-tab-name">{{ tab.name }}</span>
+          <button
+            type="button"
+            class="project-tab-close"
+            :aria-label="$t('chat.close_project_tab')"
+            @click.stop="closeProjectTabAndMaybeSwitch(tab.id)"
+          >×</button>
+        </div>
+        <Dropdown
+          trigger="click"
+          placement="bottomLeft"
+          @open-change="onProjectPickerOpenChange"
+        >
+          <button
+            type="button"
+            class="project-tab-add"
+            :aria-label="$t('chat.open_project_tab')"
+            :title="$t('chat.open_project_tab')"
+          >
+            ＋
+          </button>
+          <template #overlay>
+            <Menu @click="onProjectPickerClick">
+              <MenuItem
+                v-for="p in projectPickerOptions"
+                :key="p.id"
+              >
+                {{ p.name || p.root_path }}
+              </MenuItem>
+              <MenuItem
+                v-if="!projectPickerOptions.length"
+                key="__empty"
+                disabled
+              >
+                {{ $t('chat.no_project_to_open') }}
+              </MenuItem>
+            </Menu>
+          </template>
+        </Dropdown>
+      </div>
       <div
         v-if="connectionLost"
         class="connection-banner"
@@ -3615,6 +3797,67 @@ function continueGeneration() {
 <style scoped>
 .chat-layout { position: relative; display: flex; height: 100%; background: var(--bg-page); overflow: hidden; }
 .chat-main { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; }
+/* N7 v1：项目标签栏。
+   横向滚动而不是换行：标签数取决于用户打开过多少项目，换行会把消息区整体下推。
+   视觉重量刻意低于主工具栏：它是"切换入口"，不是当前会话的标题。 */
+.project-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 0 0 auto;
+}
+.project-tabs::-webkit-scrollbar { display: none; }
+.project-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 200px;
+  padding: 4px 8px 4px 10px;
+  border: var(--hairline-width) solid var(--border-default);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: var(--panel-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.project-tab:hover { color: var(--text-primary); }
+.project-tab.active {
+  color: var(--text-primary);
+  font-weight: 600;
+  border-color: var(--primary);
+  background: var(--bg-page);
+}
+.project-tab-name { overflow: hidden; text-overflow: ellipsis; }
+.project-tab-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  font-size: 14px;
+}
+.project-tab-close:hover { opacity: 1; }
+.project-tab-add {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  margin-left: 2px;
+  border: var(--hairline-width) dashed var(--border-default);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  line-height: 1;
+}
+.project-tab-add:hover { color: var(--text-primary); border-color: var(--primary); }
 /* 交换布局：侧边栏移到左侧、分屏移到右侧。
    用 flex `order` 而不是改 DOM —— 组件的挂载位置不动，只是视觉顺序变化，
    所以不影响任何依赖 DOM 顺序的逻辑（焦点流、SSR、既有测试）。
