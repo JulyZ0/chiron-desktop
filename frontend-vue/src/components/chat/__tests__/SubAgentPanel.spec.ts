@@ -20,6 +20,7 @@ const subagentApi = vi.hoisted(() => ({
   cancelSubagentRun: vi.fn(),
   cancelSessionSubagents: vi.fn(),
   rerunSubagentRun: vi.fn(),
+  steerSubagentRun: vi.fn(),
 }))
 vi.mock('../../../api/subagent', () => subagentApi)
 
@@ -47,6 +48,7 @@ beforeEach(() => {
   subagentApi.getSubagentRunEvents.mockResolvedValue({ events: [APPROVAL_EVENT], source: 'redis' })
   api.submitApproval.mockResolvedValue(true)
   api.submitAnswer.mockResolvedValue(true)
+  subagentApi.steerSubagentRun.mockResolvedValue({ delivery: 'shared' })
 })
 
 describe('SubAgentPanel 的审批链路', () => {
@@ -450,5 +452,56 @@ describe('SubAgentPanel 的「查看」与层级面包屑', () => {
     const missing = crumbs[1]
     expect(missing.attributes('disabled')).toBeDefined()
     expect(missing.text()).toContain('rs_gone'.slice(-6))
+  })
+})
+
+
+describe('SubAgentPanel 的父→子 steer（F1）', () => {
+  function mountWithStatus(status: string) {
+    subagentApi.listSubagentRuns.mockResolvedValue({
+      runs: [{ run_id: 'rs_live', depth: 1, status, profile: 'reviewer' }],
+      source: 'redis',
+    })
+    subagentApi.getSubagentRunEvents.mockResolvedValue({ events: [], source: 'redis' })
+    return mount(SubAgentPanel, { props: { sessionId: 's1', liveEvents: [] as never } })
+  }
+
+  it('运行中的 run 可以追加指令，送达后清空输入', async () => {
+    const wrapper = mountWithStatus('running')
+    await flushPromises()
+    await wrapper.find('.run-open').trigger('click')
+    await flushPromises()
+
+    const input = wrapper.find('.steer-input')
+    expect(input.exists()).toBe(true)
+    await input.setValue('先跑单测再改')
+    await wrapper.find('.steer-send').trigger('click')
+    await flushPromises()
+
+    expect(subagentApi.steerSubagentRun).toHaveBeenCalledWith('rs_live', '先跑单测再改')
+    expect((wrapper.find('.steer-input').element as HTMLInputElement).value).toBe('')
+  })
+
+  it('终态 run 不显示 steer 输入', async () => {
+    const wrapper = mountWithStatus('completed')
+    await flushPromises()
+    await wrapper.find('.run-open').trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.steer-input').exists()).toBe(false)
+  })
+
+  it('未送达必须显式报错，而不是假装成功', async () => {
+    subagentApi.steerSubagentRun.mockRejectedValueOnce({ response: { status: 409 } })
+    const wrapper = mountWithStatus('running')
+    await flushPromises()
+    await wrapper.find('.run-open').trigger('click')
+    await flushPromises()
+
+    await wrapper.find('.steer-input').setValue('late')
+    await wrapper.find('.steer-send').trigger('click')
+    await flushPromises()
+
+    // 失败时输入保留（用户可以重试/复制），且没有清空 —— 清空会让人以为已送出。
+    expect((wrapper.find('.steer-input').element as HTMLInputElement).value).toBe('late')
   })
 })

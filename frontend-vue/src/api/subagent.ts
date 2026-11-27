@@ -177,3 +177,21 @@ export async function rerunSubagentRun(runId: string): Promise<SubagentRerunResu
     depth: d.depth,
   }
 }
+
+/**
+ * 给**运行中**的子 Agent 追加一条指令（父→子 steer，F1）。
+ *
+ * 语义与顶层 steer 一致：只入队、不打断；子 Agent 在下一轮开头取走。
+ * 后端保证"没送到就报错"（409 已结束 / 429 队列满 / 503 通道不可用），
+ * 调用方不要把失败显示成"已发送"。
+ */
+export async function steerSubagentRun(
+  runId: string,
+  text: string,
+): Promise<{ delivery: string }> {
+  const { data } = await api.post(
+    `/v1/subagent/runs/${encodeURIComponent(runId)}/steer`,
+    { text },
+  )
+  return { delivery: data?.data?.delivery || 'shared' }
+}

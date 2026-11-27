@@ -20,6 +20,7 @@ import {
   getSubagentRunEvents,
   listSubagentRuns,
   rerunSubagentRun,
+  steerSubagentRun,
   type SubagentEvent,
   type SubagentRunView,
 } from '../../api/subagent'
@@ -52,6 +53,40 @@ const { t } = useI18n()
 const emit = defineEmits<{
   (e: 'retry-run', payload: { runId: string; text: string }): void
 }>()
+
+/** F1：给选中且仍在跑的 run 追加指令 */
+const steerText = ref('')
+const steering = ref(false)
+const canSteer = computed(() => {
+  const run = selectedRun.value
+  return !!run && !TERMINAL_STATUSES.has(String(run.status))
+})
+
+async function sendSteer(): Promise<void> {
+  const run = selectedRun.value
+  const text = steerText.value.trim()
+  if (!run || !text || steering.value) return
+  steering.value = true
+  try {
+    await steerSubagentRun(run.run_id, text)
+    steerText.value = ''
+    void message.success(t('agent.subagent_steer_sent'))
+  } catch (e) {
+    // 失败必须显式说出来：这条通道的全部价值就是"让用户相信话带到了"。
+    void message.error(t('agent.subagent_steer_failed', { reason: describeSteerError(e) }))
+  } finally {
+    steering.value = false
+  }
+}
+
+function describeSteerError(e: unknown): string {
+  const err = e as { response?: { status?: number } }
+  const status = err?.response?.status
+  if (status === 409) return t('agent.subagent_steer_finished')
+  if (status === 429) return t('agent.subagent_steer_queue_full')
+  if (status === 503) return t('agent.subagent_steer_unavailable')
+  return t('errors.request_failed_2')
+}
 
 /** 统一时钟：只在有活跃 run 时每秒推进（父面板只有一个定时器，卡片共用这个值）。 */
 const nowTick = ref(Date.now())
@@ -1257,6 +1292,29 @@ onBeforeUnmount(() => {
         <div class="output-summary">
           {{ selectedRun.summary || $t('common.running_no_summary_yet') }}
         </div>
+        <!-- F1：运行中的子 Agent 可直接补一句（不打断当前 run，下一轮生效） -->
+        <div
+          v-if="canSteer"
+          class="steer-box"
+        >
+          <input
+            v-model="steerText"
+            class="steer-input"
+            type="text"
+            maxlength="2000"
+            :placeholder="$t('agent.subagent_steer_placeholder')"
+            :disabled="steering"
+            @keydown.enter.prevent="sendSteer"
+          >
+          <button
+            type="button"
+            class="steer-send"
+            :disabled="steering || !steerText.trim()"
+            @click="sendSteer"
+          >
+            {{ steering ? $t('agent.subagent_steer_sending') : $t('agent.subagent_steer_send') }}
+          </button>
+        </div>
         <Spin :spinning="historyLoading">
           <!-- 被行数上限折叠掉的部分要如实说明：静默截断会让用户以为
                "它只做了这么多"，而「事件流」tab 里明明还有更早的内容。 -->
@@ -1593,4 +1651,23 @@ onBeforeUnmount(() => {
 }
 .art-item:hover { background: var(--surface-2, rgba(127, 127, 127, 0.08)); color: var(--text-primary, #262626); }
 .art-item.copied { color: var(--success, #16a34a); }
+/* F1：子 Agent steer 输入条 */
+.steer-box {
+  display: flex; gap: 6px; padding: 6px 10px;
+  border-top: var(--hairline-width) solid var(--border-subtle);
+  background: var(--bg-secondary);
+}
+.steer-input {
+  flex: 1; min-width: 0; font-size: var(--fs-xs);
+  padding: 4px 8px; border-radius: var(--radius-sm);
+  border: var(--hairline-width) solid var(--border-subtle);
+  background: var(--bg-card); color: var(--text-primary);
+}
+.steer-input:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: 1px; }
+.steer-send {
+  flex: none; font-size: var(--fs-xs); padding: 4px 10px;
+  border-radius: var(--radius-sm); border: none;
+  background: var(--primary); color: var(--on-primary); cursor: pointer;
+}
+.steer-send:disabled { opacity: .5; cursor: default; }
 </style>

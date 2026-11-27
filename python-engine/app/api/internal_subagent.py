@@ -284,3 +284,55 @@ async def internal_subagent_rerun(
         run_id, new_run_id, session_id,
     )
     return {"ok": True, **payload}
+
+
+class InternalSubagentSteerRequest(BaseModel):
+    """给运行中的子 Agent 追加一条指令（父→子 steer，功能 F1）。"""
+
+    text: str
+    sender: str = "user"
+    user_id: str = ""
+
+
+@router.post("/v1/internal/subagent/runs/{run_id}/steer")
+async def internal_subagent_steer(
+    run_id: str, body: InternalSubagentSteerRequest
+) -> dict[str, Any]:
+    """把指令投到**运行中**子 Agent 的轮次边界（不停 run，不插工具调用中间）。
+
+    网关已做归属校验（run 属于调用者），这里只负责投递并把引擎的稳定错误码映射成
+    HTTP 状态 —— 前端据此区分"该重试"与"不该重试"。
+
+    =========  ==========================================================
+    404        该 run 不在本实例（未注册/已收尾/已轮转）
+    409        run 已结束（明确"话没送到"，绝不静默成功）
+    400        文本非法（空/超长）
+    429        该 run 的待注入队列已满
+    503        投递通道不可用（Redis 故障等）
+    =========  ==========================================================
+    """
+    from app.agent import steer as steer_mod
+
+    result = await steer_mod.steer(
+        run_id, body.text, sender=(body.sender or "user")
+    )
+    if result.ok:
+        logger.info(
+            "subagent steer accepted run=%s child_session=%s sender=%s",
+            run_id,
+            result.child_session[:12],
+            body.sender or "user",
+        )
+        return {"ok": True, "delivery": result.reason or "shared"}
+
+    status = {
+        steer_mod.CODE_RUN_NOT_FOUND: 404,
+        steer_mod.CODE_RUN_FINISHED: 409,
+        steer_mod.CODE_INVALID_MESSAGE: 400,
+        steer_mod.CODE_QUEUE_FULL: 429,
+        steer_mod.CODE_DELIVERY_FAILED: 503,
+    }.get(result.code, 400)
+    raise HTTPException(
+        status_code=status,
+        detail={"code": result.code, "error": result.reason},
+    )

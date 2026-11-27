@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -869,6 +870,27 @@ func (c *PythonClient) PostResponse(ctx context.Context, path string, body []byt
 // 流式端点不能用同步客户端的整体超时：`http.Client.Timeout` 覆盖到读完 body，
 // 会把长回答硬截断。这里改由 `ResponseHeaderTimeout` + 调用方 ctx 约束，
 // 与 `/v1/agent/submit` 等既有 SSE 路径一致。
+// PostResponseTo 把请求发到**指定实例**（而不是按会话哈希/地址池选一个）。
+//
+// 用于必须打到"持有该 run 的实例"的写操作（如子 Agent steer）：run 的注册表是进程内的，
+// 发给别的副本只会得到 run_not_found。调用方负责先用 SubagentRunOwnerURL 解析归属；
+// 不可达时返回错误，由调用方给出 503，而不是回退到随机实例制造假失败。
+func (c *PythonClient) PostResponseTo(
+	ctx context.Context, baseURL, path string, body []byte,
+) (*http.Response, error) {
+	base := strings.TrimRight(baseURL, "/")
+	if base == "" {
+		return nil, errors.New("engine: empty target address")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.injectInternalToken(req)
+	return c.do(req)
+}
+
 func (c *PythonClient) PostStreamResponse(ctx context.Context, path string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.addressFor(ctx)+path, bytes.NewReader(body))
 	if err != nil {

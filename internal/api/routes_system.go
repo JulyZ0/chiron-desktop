@@ -74,4 +74,7 @@ func registerSubagentRoutes(
 	// P0-2 重跑：按**原任务描述**重新派发一个新 run（立即返回新 run_id）。
 	// 这是「重试」按钮的真实通道 —— 网关校验权限/会话归属/终态后转发给引擎。
 	mux.Handle("POST /v1/subagent/runs/{run_id}/rerun", authMW(rlMW(http.HandlerFunc(h.RerunRun))))
+	// F1 父→子 steer：只允许本会话的子 run；网关校验归属后按 run 归属转发到
+	// **持有它的引擎实例**（run 注册表是进程内的，不能随机打副本）。
+	mux.Handle("POST /v1/subagent/runs/{run_id}/steer", authMW(rlMW(http.HandlerFunc(h.SteerRun))))
 }
