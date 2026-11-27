@@ -12,13 +12,14 @@
  */
 import { copyTextOrThrow } from '../../utils/clipboard'
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Empty, Spin, Tag, Tooltip, message } from 'ant-design-vue'
+import { Checkbox, Empty, Input, Modal, Spin, Tag, Tooltip, message } from 'ant-design-vue'
 import { submitAnswer, submitApproval } from '../../api'
 import {
   cancelSessionSubagents,
   cancelSubagentRun,
   getSubagentRunEvents,
   listSubagentRuns,
+  dispatchSubagent,
   rerunSubagentRun,
   steerSubagentRun,
   type SubagentEvent,
@@ -327,6 +328,49 @@ async function stopRun(runId: string) {
     const next = new Set(cancelling.value)
     next.delete(runId)
     cancelling.value = next
+  }
+}
+
+// F3：从界面直接委派（多条任务并行由用户连续提交；进度/取消复用现有看板）
+const showDispatch = ref(false)
+const dispatchTask = ref('')
+const dispatchProfile = ref('')
+const dispatchAllowWrite = ref(false)
+const dispatching = ref(false)
+
+function openDispatch(): void {
+  dispatchTask.value = ''
+  dispatchProfile.value = ''
+  dispatchAllowWrite.value = false
+  showDispatch.value = true
+}
+
+async function submitDispatch(): Promise<void> {
+  const task = dispatchTask.value.trim()
+  if (!props.sessionId || !task || dispatching.value) return
+  dispatching.value = true
+  try {
+    const res = await dispatchSubagent(props.sessionId, {
+      task,
+      profile: dispatchProfile.value.trim(),
+      allowWrite: dispatchAllowWrite.value,
+    })
+    showDispatch.value = false
+    void message.success(t('agent.subagent_dispatched', { run: res.run_id.slice(-6) }))
+    await loadRuns()
+    if (res.run_id) {
+      saTab.value = 'output'
+      void selectRun(res.run_id)
+    }
+  } catch (e) {
+    const err = e as { response?: { status?: number } }
+    void message.error(
+      err?.response?.status === 404
+        ? t('agent.subagent_dispatch_not_found')
+        : t('agent.subagent_dispatch_failed'),
+    )
+  } finally {
+    dispatching.value = false
   }
 }
 
@@ -1037,6 +1081,11 @@ onBeforeUnmount(() => {
           class="sa-tab-count"
         >{{ liveEvents.length }}</span>
       </button>
+      <button
+        type="button"
+        class="sa-tab sa-dispatch"
+        @click="openDispatch"
+      >＋ {{ $t('agent.subagent_dispatch') }}</button>
     </nav>
 
     <Spin
@@ -1439,6 +1488,36 @@ onBeforeUnmount(() => {
         {{ $t('agent.select_a_sub_agent_in_run_first') }}
       </div>
     </div>
+
+    <!-- F3：直接委派（与模型自己调 subagent 同一条后台路径） -->
+    <Modal
+      v-model:open="showDispatch"
+      :title="$t('agent.subagent_dispatch')"
+      :ok-text="$t('common.send')"
+      :cancel-text="$t('common.cancel')"
+      :confirm-loading="dispatching"
+      :ok-button-props="{ disabled: !dispatchTask.trim() }"
+      @ok="submitDispatch"
+    >
+      <div class="dispatch-form">
+        <Input.TextArea
+          v-model:value="dispatchTask"
+          :rows="4"
+          :maxlength="4000"
+          :placeholder="$t('agent.subagent_dispatch_placeholder')"
+        />
+        <Input
+          v-model:value="dispatchProfile"
+          :placeholder="$t('agent.subagent_dispatch_profile')"
+        />
+        <Checkbox v-model:checked="dispatchAllowWrite">
+          {{ $t('agent.subagent_dispatch_allow_write') }}
+        </Checkbox>
+        <p class="dispatch-hint">
+          {{ $t('agent.subagent_dispatch_hint') }}
+        </p>
+      </div>
+    </Modal>
   </div>
 </template>
 
@@ -1651,6 +1730,11 @@ onBeforeUnmount(() => {
 }
 .art-item:hover { background: var(--surface-2, rgba(127, 127, 127, 0.08)); color: var(--text-primary, #262626); }
 .art-item.copied { color: var(--success, #16a34a); }
+/* F3：委派表单 */
+.dispatch-form { display: flex; flex-direction: column; gap: 8px; }
+.dispatch-hint { margin: 0; font-size: var(--fs-xs); color: var(--text-tertiary); }
+.sa-dispatch { flex: none; color: var(--primary); }
+
 /* F1：子 Agent steer 输入条 */
 .steer-box {
   display: flex; gap: 6px; padding: 6px 10px;

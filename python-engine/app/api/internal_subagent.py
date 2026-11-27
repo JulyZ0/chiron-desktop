@@ -336,3 +336,99 @@ async def internal_subagent_steer(
         status_code=status,
         detail={"code": result.code, "error": result.reason},
     )
+
+
+class InternalSubagentDispatchRequest(BaseModel):
+    """从界面直接发起一次后台委派（F3）。"""
+
+    task: str
+    session_id: str
+    tenant_id: int = 0
+    user_id: str = ""
+    profile: str = ""
+    allow_write: bool = False
+    max_turns: int = 10
+
+
+@router.post("/v1/internal/subagent/dispatch")
+async def internal_subagent_dispatch(
+    body: InternalSubagentDispatchRequest,
+) -> dict[str, Any]:
+    """在**当前会话**下直接启动一个后台子 Agent（不经过父模型的一次 turn）。
+
+    网关已校验会话归属；这里复用 `subagent` 工具的完整后台路径（注册表 / 预算 /
+    落库 / 事件旁路），因此界面发起的委派与模型自己 `subagent(...)` 完全同源。
+
+    审批/提问仍会走 `subagent.*` 事件回到界面；与"无人值守重跑"不同，这里
+    `unattended=False`，用户可以在面板里批准子 Agent 的请求。
+    """
+    if not (body.task or "").strip():
+        raise HTTPException(status_code=400, detail={"code": "task_required", "error": "task is required"})
+    if not (body.session_id or "").strip() or not body.tenant_id or not (body.user_id or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "identity_required", "error": "session_id, tenant_id and user_id are required"},
+        )
+    try:
+        from app.main import get_gateway
+
+        gateway = await get_gateway()
+    except Exception:  # noqa: BLE001
+        gateway = None
+    if gateway is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "engine_unavailable", "error": "engine gateway unavailable"},
+        )
+
+    from app.agent.event_sink import EventSink
+    from app.subagent.runtime_cache import get_runtime_cache
+    from app.tools.context import get_all, restore_context, set_tool_context
+    from app.tools.subagent import MAX_TURNS_CAP, subagent
+
+    session_id = body.session_id.strip()
+    sink = EventSink(session_id=session_id)
+    runtime_cache = None
+    try:
+        runtime_cache = await get_runtime_cache()
+    except Exception as exc:  # noqa: BLE001 - 缓存不可用不影响委派
+        logger.debug("subagent dispatch: runtime cache unavailable: %s", str(exc)[:160])
+    sink.attach_persistent(
+        lambda payload: _deliver_rerun_event(payload, runtime_cache, str(body.tenant_id))
+    )
+
+    snapshot = get_all()
+    try:
+        set_tool_context(
+            session_id=session_id,
+            tenant_id=str(body.tenant_id),
+            user_id=body.user_id,
+            gateway=gateway,
+            event_sink=sink,
+            subagent_depth=0,
+            unattended=False,
+        )
+        result = await subagent(
+            task=body.task,
+            profile=body.profile or "",
+            run_in_background=True,
+            allow_write=bool(body.allow_write),
+            max_turns=max(1, min(int(body.max_turns or MAX_TURNS_CAP), MAX_TURNS_CAP)),
+        )
+    finally:
+        restore_context(snapshot)
+
+    run_id = str(result.get("run_id") or "") if isinstance(result, dict) else ""
+    if not run_id:
+        err = result.get("error") if isinstance(result, dict) else "dispatch failed"
+        logger.warning("subagent dispatch refused (session=%s): %s", session_id, str(err)[:200])
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "dispatch_refused", "error": str(err or "dispatch refused")[:300]},
+        )
+
+    task = asyncio.create_task(_drain_sink_until_done(sink, run_id))
+    _RERUN_TASKS.add(task)
+    task.add_done_callback(_RERUN_TASKS.discard)
+    logger.info("subagent dispatch accepted: run=%s session=%s", run_id, session_id)
+    return {"ok": True, "run_id": run_id, "status": "running"}

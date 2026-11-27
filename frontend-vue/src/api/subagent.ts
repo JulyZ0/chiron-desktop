@@ -195,3 +195,25 @@ export async function steerSubagentRun(
   )
   return { delivery: data?.data?.delivery || 'shared' }
 }
+
+/**
+ * 在当前会话下**直接**启动一个后台子 Agent（F3）。
+ *
+ * 与模型自己调用 `subagent(...)` 完全同源（注册表 / 预算 / 落库 / 事件旁路），
+ * 区别只是发起者是人。返回新 run 的 id；进度走 `subagent.*` 事件。
+ */
+export async function dispatchSubagent(
+  sessionId: string,
+  input: { task: string; profile?: string; allowWrite?: boolean; maxTurns?: number },
+): Promise<{ run_id: string }> {
+  const { data } = await api.post(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/subagents`,
+    {
+      task: input.task,
+      profile: input.profile || '',
+      allow_write: !!input.allowWrite,
+      max_turns: input.maxTurns || 10,
+    },
+  )
+  return { run_id: String(data?.data?.run_id || '') }
+}

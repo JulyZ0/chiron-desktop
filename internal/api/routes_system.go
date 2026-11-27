@@ -77,4 +77,6 @@ func registerSubagentRoutes(
 	// F1 父→子 steer：只允许本会话的子 run；网关校验归属后按 run 归属转发到
 	// **持有它的引擎实例**（run 注册表是进程内的，不能随机打副本）。
 	mux.Handle("POST /v1/subagent/runs/{run_id}/steer", authMW(rlMW(http.HandlerFunc(h.SteerRun))))
+	// F3：界面直接发起后台委派（会话归属校验后转引擎，与模型自己调 subagent 同源）。
+	mux.Handle("POST /v1/sessions/{session_id}/subagents", authMW(rlMW(http.HandlerFunc(h.DispatchSubagent))))
 }

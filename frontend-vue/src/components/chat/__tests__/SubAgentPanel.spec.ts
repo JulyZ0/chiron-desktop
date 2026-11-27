@@ -21,6 +21,7 @@ const subagentApi = vi.hoisted(() => ({
   cancelSessionSubagents: vi.fn(),
   rerunSubagentRun: vi.fn(),
   steerSubagentRun: vi.fn(),
+  dispatchSubagent: vi.fn(),
 }))
 vi.mock('../../../api/subagent', () => subagentApi)
 
@@ -49,6 +50,7 @@ beforeEach(() => {
   api.submitApproval.mockResolvedValue(true)
   api.submitAnswer.mockResolvedValue(true)
   subagentApi.steerSubagentRun.mockResolvedValue({ delivery: 'shared' })
+  subagentApi.dispatchSubagent.mockResolvedValue({ run_id: 'rs_new' })
 })
 
 describe('SubAgentPanel 的审批链路', () => {
