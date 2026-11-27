@@ -29,7 +29,17 @@ import {
 // 不另写一份：同一仓里两套高亮必然在语言映射与转义上漂移。
 import { highlightCodeBlocks } from '../chat/codeHighlighter'
 import { langOf, truncatePreview } from './previewCode'
-import { listProjectChanges, readProjectDiff, type ProjectChange, type ProjectChanges, type ProjectDiff } from '../../api/projectChanges'
+import {
+  listProjectChanges,
+  readCommitDiff,
+  readProjectDiff,
+  readProjectLog,
+  type ProjectChange,
+  type ProjectChanges,
+  type ProjectCommit,
+  type ProjectDiff,
+  type ProjectLog,
+} from '../../api/projectChanges'
 // 还原点时间线独立成组件：回滚是写磁盘的操作，自带确认与结果展开，
 // 塞进这个已经千余行的面板只会让两边都难改。
 import CheckpointTimeline from './CheckpointTimeline.vue'
@@ -254,7 +264,7 @@ const selected = ref<ProjectFileEntry | null>(null)
 //
 // 这里**没有**暂存 / 丢弃 / 提交：它们都会写用户的仓库，其中"丢弃"真的会回退
 // 工作区。只读视图不提供需要撤销设计的按钮。
-const activeTab = ref<'files' | 'changes' | 'checkpoints'>('files')
+const activeTab = ref<'files' | 'changes' | 'checkpoints' | 'history'>('files')
 const changesLoading = ref(false)
 const changesError = ref('')
 const changesData = ref<ProjectChanges | null>(null)
@@ -369,8 +379,7 @@ interface DiffLine {
   text: string
   cls: '' | 'add' | 'del' | 'hunk' | 'meta'
 }
-const diffLines = computed<DiffLine[]>(() => {
-  const text = diffData.value?.diff ?? ''
+function toDiffLines(text: string): DiffLine[] {
   if (!text) return []
   return text.split('\n').map((line) => {
     if (line.startsWith('@@')) return { text: line, cls: 'hunk' }
@@ -391,7 +400,9 @@ const diffLines = computed<DiffLine[]>(() => {
     if (line.startsWith('-')) return { text: line, cls: 'del' }
     return { text: line, cls: '' }
   })
-})
+}
+
+const diffLines = computed<DiffLine[]>(() => toDiffLines(diffData.value?.diff ?? ''))
 
 async function loadDiff(row: ChangeRow) {
   diffRow.value = row
@@ -409,6 +420,56 @@ async function loadDiff(row: ChangeRow) {
   } finally {
     if (diffGuard.isValid(ticket)) diffLoading.value = false
   }
+}
+
+// ── F5：提交历史 ──
+const historyLoading = ref(false)
+const historyError = ref('')
+const historyData = ref<ProjectLog | null>(null)
+const historyGuard = createKeyedGuard(() => String(props.projectId || ''))
+const selectedCommit = ref<ProjectCommit | null>(null)
+const commitDiff = ref<ProjectDiff | null>(null)
+const commitDiffLoading = ref(false)
+const commitDiffError = ref('')
+
+const commitDiffLines = computed<DiffLine[]>(() => toDiffLines(commitDiff.value?.diff ?? ''))
+
+async function loadHistory() {
+  if (!props.projectId || historyLoading.value) return
+  const ticket = historyGuard.ticket(String(props.projectId || ''))
+  historyLoading.value = true
+  historyError.value = ''
+  try {
+    const fetched = await readProjectLog(props.projectId)
+    if (!historyGuard.isValid(ticket)) return
+    historyData.value = fetched
+  } catch (e) {
+    historyError.value = describeApiError(e)
+  } finally {
+    if (historyGuard.isValid(ticket)) historyLoading.value = false
+  }
+}
+
+async function openCommit(commit: ProjectCommit) {
+  if (!props.projectId) return
+  selectedCommit.value = commit
+  commitDiff.value = null
+  commitDiffError.value = ''
+  commitDiffLoading.value = true
+  try {
+    const fetched = await readCommitDiff(props.projectId, commit.sha)
+    commitDiff.value = fetched
+  } catch (e) {
+    commitDiffError.value = describeApiError(e)
+  } finally {
+    commitDiffLoading.value = false
+  }
+}
+
+function closeCommitDiff() {
+  selectedCommit.value = null
+  commitDiff.value = null
+  commitDiffError.value = ''
 }
 
 function closeDiff() {
@@ -488,15 +549,19 @@ function reload() {
   // 点进去会得到"文件不在项目内"—— 比空列表更让人困惑。
   changesData.value = null
   changesError.value = ''
+  historyData.value = null
+  historyError.value = ''
+  closeCommitDiff()
   closeDiff()
   void loadDir('')
   if (activeTab.value === 'changes') void loadChanges()
 }
 
 /** 切页签：改动页签首次进入时才请求（用户不开这一页就不该有这次 git 调用） */
-function selectTab(tab: 'files' | 'changes' | 'checkpoints') {
+function selectTab(tab: 'files' | 'changes' | 'checkpoints' | 'history') {
   activeTab.value = tab
   if (tab === 'changes' && !changesData.value && !changesLoading.value) void loadChanges()
+  if (tab === 'history' && !historyData.value && !historyLoading.value) void loadHistory()
 }
 
 /**
@@ -947,6 +1012,14 @@ async function openWithSystem(entry: ProjectFileEntry) {
           :aria-selected="activeTab === 'checkpoints'"
           @click="selectTab('checkpoints')"
         >{{ tr('chat.workbench_tab_checkpoints') }}</button>
+        <button
+          type="button"
+          role="tab"
+          class="wb-tab"
+          :class="{ active: activeTab === 'history' }"
+          :aria-selected="activeTab === 'history'"
+          @click="selectTab('history')"
+        >{{ tr('chat.workbench_tab_history') }}</button>
       </div>
 
       <div
@@ -1138,6 +1211,116 @@ async function openWithSystem(entry: ProjectFileEntry) {
             >{{ line.text || ' ' }}</span></code></pre>
             <div
               v-if="diffData.truncated"
+              class="wb-empty"
+            >{{ tr('chat.workbench_diff_truncated') }}</div>
+          </template>
+        </div>
+      </div>
+
+      <!-- F5：提交历史（只读）。分支/领先落后 + 最近提交 + 单条提交 diff。 -->
+      <div
+        v-if="activeTab === 'history'"
+        class="wb-tree"
+      >
+        <div
+          v-if="historyError"
+          class="wb-error"
+        >
+          {{ historyError }}
+          <button
+            type="button"
+            class="wb-btn"
+            @click="loadHistory"
+          >{{ tr('common.retry') }}</button>
+        </div>
+        <div
+          v-else-if="historyLoading"
+          class="wb-empty"
+        >{{ tr('common.loading') }}</div>
+        <div
+          v-else-if="historyData && !historyData.repo"
+          class="wb-empty"
+        >{{ historyData.git_missing ? tr('chat.workbench_git_missing') : tr('chat.workbench_no_vcs') }}</div>
+        <template v-else-if="historyData">
+          <div class="wb-history-head">
+            <span class="wb-branch">{{ historyData.branch || 'HEAD' }}</span>
+            <span
+              v-if="historyData.upstream"
+              class="wb-sync"
+            >
+              <span class="ins">↑{{ historyData.ahead }}</span>
+              <span class="del">↓{{ historyData.behind }}</span>
+            </span>
+            <span
+              v-else
+              class="wb-sync muted"
+            >{{ tr('chat.workbench_no_upstream') }}</span>
+          </div>
+          <div
+            v-if="!historyData.commits.length"
+            class="wb-empty"
+          >{{ tr('chat.workbench_history_empty') }}</div>
+          <div
+            v-for="commit in historyData.commits"
+            :key="commit.sha"
+            class="wb-row wb-commit"
+            :class="{ active: selectedCommit?.sha === commit.sha }"
+            role="treeitem"
+            tabindex="0"
+            :title="commit.sha"
+            @click="openCommit(commit)"
+            @keydown.enter.prevent="openCommit(commit)"
+          >
+            <span class="wb-commit-sha">{{ commit.short }}</span>
+            <span class="wb-name">{{ commit.subject }}</span>
+            <span class="wb-commit-author">{{ commit.author }}</span>
+          </div>
+        </template>
+      </div>
+
+      <!-- 提交 diff：与工作区 diff 同一套行分类，只是数据源换成 `git show`。 -->
+      <div
+        v-if="selectedCommit && activeTab === 'history'"
+        class="wb-preview wb-diff-panel"
+      >
+        <div class="wb-preview-head">
+          <span
+            class="wb-preview-path"
+            :title="`${selectedCommit.sha} ${selectedCommit.subject}`"
+          >{{ selectedCommit.short }} · {{ selectedCommit.subject }}</span>
+          <button
+            type="button"
+            class="wb-btn"
+            :title="tr('common.close')"
+            @click="closeCommitDiff"
+          >×</button>
+        </div>
+        <div class="wb-preview-body">
+          <div
+            v-if="commitDiffLoading"
+            class="wb-empty"
+          >{{ tr('common.loading') }}</div>
+          <div
+            v-else-if="commitDiffError"
+            class="wb-error"
+          >{{ commitDiffError }}</div>
+          <div
+            v-else-if="commitDiff?.binary"
+            class="wb-empty"
+          >{{ tr('chat.workbench_diff_binary') }}</div>
+          <div
+            v-else-if="commitDiff && !commitDiffLines.length"
+            class="wb-empty"
+          >{{ tr('chat.workbench_diff_empty') }}</div>
+          <template v-else-if="commitDiff">
+            <pre class="wb-diff"><code><span
+              v-for="(line, i) in commitDiffLines"
+              :key="i"
+              class="wb-diff-line"
+              :class="line.cls"
+            >{{ line.text || ' ' }}</span></code></pre>
+            <div
+              v-if="commitDiff.truncated"
               class="wb-empty"
             >{{ tr('chat.workbench_diff_truncated') }}</div>
           </template>
@@ -1470,4 +1653,22 @@ async function openWithSystem(entry: ProjectFileEntry) {
 .workbench-panel.resizing .wb-resize { background: var(--primary-bg); }
 .wb-resize:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
 .workbench-panel.resizing { user-select: none; }
+/* F5：提交历史 */
+.wb-history-head {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  font-size: var(--fs-xs); color: var(--text-tertiary);
+  border-bottom: var(--hairline-width) solid var(--border-subtle);
+}
+.wb-branch { font-family: var(--font-mono, monospace); color: var(--text-secondary); }
+.wb-sync { display: inline-flex; gap: 6px; }
+.wb-sync.muted { font-style: italic; }
+.wb-commit { gap: 8px; }
+.wb-commit-sha {
+  flex: none; font-family: var(--font-mono, monospace);
+  font-size: var(--fs-xs); color: var(--text-tertiary);
+}
+.wb-commit-author {
+  flex: none; margin-inline-start: auto;
+  font-size: var(--fs-xs); color: var(--text-tertiary);
+}
 </style>

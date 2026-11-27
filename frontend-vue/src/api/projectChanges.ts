@@ -93,7 +93,29 @@ export async function readProjectDiff(projectId: string, path: string): Promise<
     `/v1/session-map/projects/${encodeURIComponent(projectId)}/diff`,
     { params: { path } },
   )
-  const payload = data?.data ?? {}
+  return normalizeDiff(data?.data ?? {}, path)
+}
+
+/** F5：一条提交（只读展示）。 */
+export interface ProjectCommit {
+  sha: string
+  short: string
+  subject: string
+  author: string
+  date: string
+}
+
+export interface ProjectLog {
+  repo: boolean
+  git_missing?: boolean
+  branch?: string
+  upstream?: string
+  ahead: number
+  behind: number
+  commits: ProjectCommit[]
+}
+
+function normalizeDiff(payload: Record<string, unknown>, path: string): ProjectDiff {
   return {
     repo: !!payload.repo,
     git_missing: !!payload.git_missing,
@@ -103,4 +125,41 @@ export async function readProjectDiff(projectId: string, path: string): Promise<
     truncated: !!payload.truncated,
     diff: typeof payload.diff === 'string' ? payload.diff : '',
   }
+}
+
+/** 最近提交 + 分支领先/落后（只读）。 */
+export async function readProjectLog(projectId: string, limit = 30): Promise<ProjectLog> {
+  const { data } = await api.get(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/git-log`,
+    { params: { limit } },
+  )
+  const payload: Record<string, unknown> = data?.data ?? {}
+  const rows = Array.isArray(payload.commits) ? payload.commits : []
+  return {
+    repo: !!payload.repo,
+    git_missing: !!payload.git_missing,
+    branch: typeof payload.branch === 'string' ? payload.branch : undefined,
+    upstream: typeof payload.upstream === 'string' ? payload.upstream : undefined,
+    ahead: typeof payload.ahead === 'number' ? payload.ahead : 0,
+    behind: typeof payload.behind === 'number' ? payload.behind : 0,
+    commits: rows.map((raw) => {
+      const c = (raw ?? {}) as Partial<ProjectCommit>
+      return {
+        sha: typeof c.sha === 'string' ? c.sha : '',
+        short: typeof c.short === 'string' ? c.short : '',
+        subject: typeof c.subject === 'string' ? c.subject : '',
+        author: typeof c.author === 'string' ? c.author : '',
+        date: typeof c.date === 'string' ? c.date : '',
+      }
+    }).filter(c => c.sha !== ''),
+  }
+}
+
+/** 某次提交的 diff（只读）。 */
+export async function readCommitDiff(projectId: string, sha: string): Promise<ProjectDiff> {
+  const { data } = await api.get(
+    `/v1/session-map/projects/${encodeURIComponent(projectId)}/commit`,
+    { params: { sha } },
+  )
+  return normalizeDiff(data?.data ?? {}, sha)
 }

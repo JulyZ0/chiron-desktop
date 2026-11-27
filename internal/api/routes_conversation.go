@@ -80,6 +80,9 @@ func registerConversationRoutes(
 	mux.Handle("GET /v1/session-map/projects/{id}/changes", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectChanges))))
 	// 单文件 diff：改动列表点开一条时用。同样是只读 git 子命令，路径必须落在项目内。
 	mux.Handle("GET /v1/session-map/projects/{id}/diff", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectDiff))))
+	// F5：最近提交与单条提交 diff（只读）。
+	mux.Handle("GET /v1/session-map/projects/{id}/git-log", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectLog))))
+	mux.Handle("GET /v1/session-map/projects/{id}/commit", authMW(rlMW(http.HandlerFunc(smHandler.ShowProjectCommit))))
 	// 检查点时间线（只读）：回答"过去哪些时刻可以回滚回去"。
 	// 与 /changes 分开是因为数据源不同 —— 那条读用户仓库，这条读 Chiron 自己记的表。
 	mux.Handle("GET /v1/session-map/projects/{id}/checkpoints", authMW(rlMW(http.HandlerFunc(smHandler.ListProjectCheckpoints))))

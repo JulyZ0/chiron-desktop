@@ -414,6 +414,9 @@ export default {
   workbench_diff_truncated: "The diff is too large; only part of it is shown",
   // ── Restore points (checkpoint timeline + rollback) ──
   workbench_tab_checkpoints: "Restore points",
+  workbench_tab_history: "Commits",
+  workbench_history_empty: "No commits yet",
+  workbench_no_upstream: "No upstream configured",
   checkpoint_empty: "No restore points yet. One is recorded automatically at the start and end of every turn.",
   checkpoint_need_vcs: "This project folder is not under version control, so restore points cannot be recorded. Enabling creates a .git directory at the project root (it only creates the directory — nothing is committed and no file contents change), and restore points are recorded from the next turn on.",
   checkpoint_enable_vcs: "Enable version tracking",

@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -207,4 +208,81 @@ func clientProjectDiff(r *http.Request, loc projectLocator, rel string) (Project
 func respondClientGitError(w http.ResponseWriter, err error) {
 	JSONWithCode(w, http.StatusBadGateway, CodeRequestFailed,
 		map[string]interface{}{"reason": err.Error()}, "device git failed")
+}
+
+// clientProjectLog 是 collectProjectLog 的设备版本（只读命令，参数仍由服务端构造）。
+func clientProjectLog(r *http.Request, loc projectLocator, limit int) (ProjectLog, error) {
+	result := ProjectLog{Commits: []ProjectCommit{}}
+	if limit <= 0 || limit > maxProjectCommits {
+		limit = 30
+	}
+	resp, err := clientGit(r, loc, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		return result, err
+	}
+	if clientGitMissing(resp) {
+		result.GitMissing = true
+		return result, nil
+	}
+	if resp.Code != 0 || strings.TrimSpace(resp.Stdout) != "true" {
+		return result, nil
+	}
+	result.Repo = true
+	if br, err := clientGit(r, loc, "symbolic-ref", "--short", "-q", "HEAD"); err == nil && br.Code == 0 {
+		result.Branch = strings.TrimSpace(br.Stdout)
+	}
+	if up, err := clientGit(r, loc, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"); err == nil && up.Code == 0 {
+		result.Upstream = strings.TrimSpace(up.Stdout)
+	}
+	if result.Upstream != "" {
+		if counts, err := clientGit(r, loc, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"); err == nil && counts.Code == 0 {
+			parts := strings.Fields(counts.Stdout)
+			if len(parts) == 2 {
+				result.Behind, _ = strconv.Atoi(parts[0])
+				result.Ahead, _ = strconv.Atoi(parts[1])
+			}
+		}
+	}
+	logResp, err := clientGit(r, loc, "log", "--no-show-signature",
+		fmt.Sprintf("-n%d", limit), "--format=%H%x00%h%x00%an%x00%aI%x00%s")
+	if err != nil {
+		return result, err
+	}
+	if logResp.Code == 0 {
+		result.Commits = parseGitLog(logResp.Stdout)
+	}
+	return result, nil
+}
+
+// clientCommitDiff 是 collectCommitDiff 的设备版本。
+func clientCommitDiff(r *http.Request, loc projectLocator, sha string) (ProjectDiff, error) {
+	result := ProjectDiff{Diff: ""}
+	if !validCommitSHA(sha) {
+		return result, errPathNotRelative
+	}
+	resp, err := clientGit(r, loc, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		return result, err
+	}
+	if clientGitMissing(resp) {
+		result.GitMissing = true
+		return result, nil
+	}
+	if resp.Code != 0 || strings.TrimSpace(resp.Stdout) != "true" {
+		return result, nil
+	}
+	result.Repo = true
+	diff, err := clientGit(r, loc, "show", "--no-ext-diff",
+		"--unified="+gitDiffContextLines, "--format=", sha, "--")
+	if err != nil {
+		return result, err
+	}
+	if diff.Code != 0 {
+		return result, fmt.Errorf("%w: show exit %d", errGitFailed, diff.Code)
+	}
+	if strings.Contains(diff.Stdout, "Binary files ") {
+		result.Binary = true
+	}
+	result.Diff, result.Truncated = cappedDiff(diff.Stdout)
+	return result, nil
 }

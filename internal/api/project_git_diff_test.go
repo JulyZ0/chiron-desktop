@@ -121,3 +121,63 @@ func TestCappedDiffKeepsSmallInput(t *testing.T) {
 		t.Fatalf("小 diff 被改动: %q truncated=%v", out, truncated)
 	}
 }
+
+func TestCollectProjectLogAndCommitDiff(t *testing.T) {
+	root := initDiffRepo(t)
+	file := filepath.Join(root, "a.txt")
+	if err := os.WriteFile(file, []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"add", "a.txt"},
+		{"-c", "user.email=a@b", "-c", "user.name=a", "commit", "-qm", "add a.txt"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		cmd.Env = gitEnv()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	log, err := collectProjectLog(context.Background(), root, 10)
+	if err != nil {
+		t.Fatalf("collectProjectLog: %v", err)
+	}
+	if !log.Repo || log.Branch == "" {
+		t.Fatalf("repo/branch 缺失: %+v", log)
+	}
+	if len(log.Commits) < 2 {
+		t.Fatalf("提交数不足: %+v", log.Commits)
+	}
+	head := log.Commits[0]
+	if head.Subject != "add a.txt" || head.Author != "a" || len(head.SHA) < 7 {
+		t.Fatalf("最新提交解析错: %+v", head)
+	}
+
+	diff, err := collectCommitDiff(context.Background(), root, head.SHA)
+	if err != nil {
+		t.Fatalf("collectCommitDiff: %v", err)
+	}
+	if !diff.Repo || !strings.Contains(diff.Diff, "+hello") {
+		t.Fatalf("提交 diff 内容不对: %+v", diff)
+	}
+}
+
+func TestCommitSHARejectsOptionInjection(t *testing.T) {
+	for _, sha := range []string{"--upload-pack=evil", "HEAD~1", "abc", strings.Repeat("a", 41)} {
+		if validCommitSHA(sha) {
+			t.Errorf("sha %q 应被拒绝", sha)
+		}
+	}
+	if !validCommitSHA("0123456") {
+		t.Error("合法短 sha 被拒绝")
+	}
+}
+
+func TestShowProjectCommitRejectsBadSHA(t *testing.T) {
+	root := initDiffRepo(t)
+	if _, err := collectCommitDiff(context.Background(), root, "--output=/tmp/x"); err == nil {
+		t.Fatal("非法 sha 未被拒绝")
+	}
+}

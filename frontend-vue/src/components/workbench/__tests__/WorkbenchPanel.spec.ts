@@ -13,7 +13,7 @@
  * jsdom 下无法构造出「起始窄于上限」的矩形，硬测只会得到脆弱断言。
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
 
 import WorkbenchPanel from '../WorkbenchPanel.vue'
@@ -79,6 +79,25 @@ vi.mock('../../../api/projectChanges', () => ({
     new Promise(resolve => {
       changesNet.diffs.push({ projectId, path, resolve })
     }),
+  readProjectLog: () => Promise.resolve({
+    repo: true,
+    branch: 'main',
+    upstream: 'origin/main',
+    ahead: 2,
+    behind: 1,
+    commits: [
+      { sha: 'aaaaaaaaaaaaaaaa', short: 'aaaaaaa', subject: 'feat: one', author: 'A', date: '2026-11-27T00:00:00Z' },
+      { sha: 'bbbbbbbbbbbbbbbb', short: 'bbbbbbb', subject: 'fix: two', author: 'B', date: '2026-11-26T00:00:00Z' },
+    ],
+  }),
+  readCommitDiff: () => Promise.resolve({
+    repo: true,
+    path: 'aaaaaaa',
+    untracked: false,
+    binary: false,
+    truncated: false,
+    diff: 'diff --git a/a b/a\n+from-commit\n',
+  }),
 }))
 
 /** 让 resolve 之后串起来的微任务与 Vue 的下一次渲染跑完 */
@@ -361,7 +380,8 @@ describe('回滚后文件树失效', () => {
 
     // 切到还原点页签，让 CheckpointTimeline 真正挂载
     const tabs = wrapper.findAll('.wb-tab')
-    await tabs[tabs.length - 1].trigger('click')
+    // 页签顺序：文件 / 改动 / 还原点 / 提交 —— 还原点是第 3 个（index 2）。
+    await tabs[2].trigger('click')
     await flush()
 
     const timeline = wrapper.findComponent(CheckpointTimeline)
@@ -385,5 +405,29 @@ describe('回滚后文件树失效', () => {
     await flush()
     expect(wrapper.text()).toContain('NEW.ts')
     expect(wrapper.text()).not.toContain('OLD.ts')
+  })
+})
+
+
+describe('工作台的提交历史（F5）', () => {
+  it('显示分支/领先落后与提交，点开看提交 diff', async () => {
+    const wrapper = mountPanel({ projectId: 'p1' })
+    await flushPromises()
+    // 四个页签：文件 / 改动 / 还原点 / 提交
+    const tabs = wrapper.findAll('.wb-tab')
+    expect(tabs).toHaveLength(4)
+    await tabs[3].trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('.wb-branch').text()).toBe('main')
+    expect(wrapper.find('.wb-sync').text()).toContain('↑2')
+    expect(wrapper.find('.wb-sync').text()).toContain('↓1')
+    const commits = wrapper.findAll('.wb-commit')
+    expect(commits).toHaveLength(2)
+    expect(commits[0].text()).toContain('feat: one')
+
+    await commits[0].trigger('click')
+    await flushPromises()
+    expect(wrapper.find('.wb-diff-panel').text()).toContain('+from-commit')
   })
 })

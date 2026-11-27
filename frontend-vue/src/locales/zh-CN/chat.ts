@@ -417,6 +417,9 @@ export default {
   workbench_diff_truncated: "差异过大，只显示了一部分",
   // ── 还原点（检查点时间线 + 回滚）──
   workbench_tab_checkpoints: "还原点",
+  workbench_tab_history: "提交",
+  workbench_history_empty: "还没有提交",
+  workbench_no_upstream: "当前分支没有上游",
   checkpoint_empty: "还没有还原点。每次回合开始与结束时都会自动记录一个。",
   checkpoint_need_vcs: "这个项目目录还没有纳入版本控制，还原点无法记录。启用后会在项目根创建一个 .git 目录（只建目录，不提交、不改动任何文件内容），从下一轮对话开始正常记录还原点。",
   checkpoint_enable_vcs: "启用版本跟踪",

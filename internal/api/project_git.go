@@ -737,3 +737,197 @@ func (h *SessionMapHandler) ListProjectChanges(w http.ResponseWriter, r *http.Re
 	}
 	OK(w, result)
 }
+
+// ── F5：提交历史 / 分支领先落后（只读） ──
+
+// ProjectCommit 是一条提交的展示信息（不含 diff）。
+type ProjectCommit struct {
+	SHA     string `json:"sha"`
+	Short   string `json:"short"`
+	Subject string `json:"subject"`
+	Author  string `json:"author"`
+	Date    string `json:"date"`
+}
+
+// ProjectLog 是「提交」页的数据。
+type ProjectLog struct {
+	Repo       bool            `json:"repo"`
+	GitMissing bool            `json:"git_missing,omitempty"`
+	Branch     string          `json:"branch,omitempty"`
+	// Upstream 为空表示当前分支没有上游（本地仓库或未 push 过）；这时 Ahead/Behind 无意义。
+	Upstream string          `json:"upstream,omitempty"`
+	Ahead    int             `json:"ahead"`
+	Behind   int             `json:"behind"`
+	Commits  []ProjectCommit `json:"commits"`
+}
+
+const maxProjectCommits = 100
+
+// collectProjectLog 读取最近提交与分支领先/落后。
+func collectProjectLog(ctx context.Context, root string, limit int) (ProjectLog, error) {
+	result := ProjectLog{Commits: []ProjectCommit{}}
+	if limit <= 0 || limit > maxProjectCommits {
+		limit = 30
+	}
+	overrides := repoFilterOverrides(ctx, root)
+	out, err := gitReadWith(ctx, root, overrides, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		if errors.Is(err, errGitMissing) {
+			result.GitMissing = true
+		}
+		return result, nil
+	}
+	if strings.TrimSpace(out) != "true" {
+		return result, nil
+	}
+	result.Repo = true
+
+	if branch, err := gitReadWith(ctx, root, overrides, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
+		result.Branch = strings.TrimSpace(branch)
+	}
+	if upstream, err := gitReadWith(ctx, root, overrides,
+		"rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"); err == nil {
+		result.Upstream = strings.TrimSpace(upstream)
+	}
+	if result.Upstream != "" {
+		// `@{upstream}...HEAD` 的 left/right 计数：left=上游独有（落后），right=本地独有（领先）。
+		if counts, err := gitReadWith(ctx, root, overrides,
+			"rev-list", "--left-right", "--count", "@{upstream}...HEAD"); err == nil {
+			parts := strings.Fields(counts)
+			if len(parts) == 2 {
+				result.Behind, _ = strconv.Atoi(parts[0])
+				result.Ahead, _ = strconv.Atoi(parts[1])
+			}
+		}
+	}
+
+	logOut, err := gitReadWith(ctx, root, overrides,
+		"log", "--no-show-signature", fmt.Sprintf("-n%d", limit),
+		"--format=%H%x00%h%x00%an%x00%aI%x00%s")
+	if err != nil {
+		// 空仓库（还没有首个提交）不是错误：返回空列表 + repo=true。
+		return result, nil
+	}
+	result.Commits = parseGitLog(logOut)
+	return result, nil
+}
+
+// parseGitLog 解析 `%H\x00%h\x00%an\x00%aI\x00%s`（每行一条）；坏行跳过而不是报错。
+func parseGitLog(out string) []ProjectCommit {
+	commits := make([]ProjectCommit, 0)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\x00")
+		if len(parts) < 5 {
+			continue
+		}
+		commits = append(commits, ProjectCommit{
+			SHA: parts[0], Short: parts[1], Author: parts[2], Date: parts[3], Subject: parts[4],
+		})
+	}
+	return commits
+}
+
+// ListProjectLog 返回最近提交 + 分支领先/落后（只读）。
+func (h *SessionMapHandler) ListProjectLog(w http.ResponseWriter, r *http.Request) {
+	loc, ok := h.requireProject(w, r)
+	if !ok {
+		return
+	}
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			limit = n
+		}
+	}
+	if loc.Provider == smProviderClient {
+		result, err := clientProjectLog(r, loc, limit)
+		if err != nil {
+			respondClientGitError(w, err)
+			return
+		}
+		OK(w, result)
+		return
+	}
+	result, err := collectProjectLog(r.Context(), loc.RootPath, limit)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read git log")
+		return
+	}
+	OK(w, result)
+}
+
+// ProjectCommitDiff 是某次提交的只读 diff（结构复用 ProjectDiff）。
+func collectCommitDiff(ctx context.Context, root, sha string) (ProjectDiff, error) {
+	result := ProjectDiff{Diff: ""}
+	if !validCommitSHA(sha) {
+		return result, errPathNotRelative
+	}
+	overrides := repoFilterOverrides(ctx, root)
+	out, err := gitReadWith(ctx, root, overrides, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		if errors.Is(err, errGitMissing) {
+			result.GitMissing = true
+		}
+		return result, nil
+	}
+	if strings.TrimSpace(out) != "true" {
+		return result, nil
+	}
+	result.Repo = true
+	diff, err := gitReadWith(ctx, root, overrides,
+		"show", "--no-ext-diff", "--unified="+gitDiffContextLines,
+		"--format=", sha, "--")
+	if err != nil {
+		return result, err
+	}
+	if strings.Contains(diff, "Binary files ") {
+		result.Binary = true
+	}
+	result.Diff, result.Truncated = cappedDiff(diff)
+	return result, nil
+}
+
+// validCommitSHA 只接受 7–40 位十六进制：sha 来自前端，绝不能变成 git 的选项注入面。
+func validCommitSHA(sha string) bool {
+	if len(sha) < 7 || len(sha) > 40 {
+		return false
+	}
+	for _, c := range sha {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// ShowProjectCommit 返回某次提交的 diff（只读）。
+func (h *SessionMapHandler) ShowProjectCommit(w http.ResponseWriter, r *http.Request) {
+	loc, ok := h.requireProject(w, r)
+	if !ok {
+		return
+	}
+	sha := strings.TrimSpace(r.URL.Query().Get("sha"))
+	if !validCommitSHA(sha) {
+		BadRequest(w, "invalid sha")
+		return
+	}
+	if loc.Provider == smProviderClient {
+		result, err := clientCommitDiff(r, loc, sha)
+		if err != nil {
+			respondClientGitError(w, err)
+			return
+		}
+		OK(w, result)
+		return
+	}
+	result, err := collectCommitDiff(r.Context(), loc.RootPath, sha)
+	if err != nil {
+		logAndRespond(w, err, http.StatusInternalServerError, "could not read commit diff")
+		return
+	}
+	OK(w, result)
+}
