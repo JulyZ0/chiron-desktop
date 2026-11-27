@@ -19,14 +19,19 @@
 
 ## 2. 不变量（有守卫，别绕过）
 
-四个守卫都在 `npm run check:ui`，都是**棘轮**（存量记在基线里容忍、**只许下调**）：
+守卫全部在 `npm run check:ui`（多数是**棘轮**：存量记在基线里容忍、只许下调）：
 
 | 守卫 | 管什么 |
 |---|---|
-| `scripts/check-theme-token-parity.mjs` | 8 个 `[data-theme]` 块共享同一套 token 名；`stores/theme.ts` 的 8 个 `*Tokens` 对象共享同一套键 |
-| `scripts/check-theme-token-contract.mjs` | 组件里**硬编码色值**（`#fff`、`rgba(0,0,0,.04)` …）⇒ 换主题时不跟着变 |
-| `scripts/check-z-index-tokens.mjs` | 组件里**裸 `z-index` 数字** ⇒ 层叠关系不可推理 |
-| `scripts/check-motion-tokens.mjs` | 组件里**硬编码动效时长**（`transition: opacity 0.2s`）⇒ 节奏无法统一调 |
+| `check-theme-token-parity.mjs` | 8 个 `[data-theme]` 块共享同一套 token 名；`stores/theme.ts` 的 8 个 `*Tokens` 对象共享同一套键 |
+| `check-theme-token-contract.mjs` | 组件里**硬编码色值**（`#fff`、`rgba(0,0,0,.04)` …）⇒ 换主题时不跟着变 |
+| `check-z-index-tokens.mjs` | 组件里**裸 `z-index` 数字** ⇒ 层叠关系不可推理 |
+| `check-motion-tokens.mjs` | 组件里**硬编码动效时长** ⇒ 节奏无法统一调 |
+| `check-font-size-ratchet.mjs` | 组件里**裸 px 字号** ⇒ 不跟随字号缩放（`components/chat` 已归零） |
+| `check-i18n.mjs` / `check-i18n-keys.mjs` | 禁止新增硬编码中文；三语言键集对齐 |
+| `check-a11y.mjs` | 静态可访问性契约（ARIA/键盘/语义） |
+| `check-transcript-scroll.mjs` | transcript 滚动单写者 |
+| `check-rtl-logical.mjs` | 物理方向属性（应使用逻辑属性） |
 
 **违反的后果**：前两条 ⇒ 某主题下组件拿到未定义变量 / 回退色，界面上只是"某个角落颜色不对"；
 后两条 ⇒ 想统一调层级或节奏时得逐处找。
