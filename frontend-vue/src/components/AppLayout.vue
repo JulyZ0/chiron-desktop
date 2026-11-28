@@ -1,9 +1,9 @@
 <script lang="ts" setup>
-import { computed, h, nextTick, onMounted, onUnmounted, ref, watch, type Component as VueComponent, type VNode } from 'vue'
+import { computed, h, nextTick, onMounted, onUnmounted, provide, ref, watch, type Component as VueComponent, type VNode } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useThemeStore } from '../stores/theme'
 import { useAuthStore } from '../stores/auth'
-import { useDeviceStore } from '../stores/device'
+import { desktopHost, useDeviceStore } from '../stores/device'
 
 // Ant Design Vue 组件
 import {
@@ -34,6 +34,7 @@ import {
 } from '@ant-design/icons-vue'
 import CommandPalette from './CommandPalette.vue'
 import BrandMark from './shell/BrandMark.vue'
+import { TOPBAR_SLOTS } from './shell/topbarSlots'
 import SettingsPanel from './settings/SettingsPanel.vue'
 import { buildAccountMenuItems, accountMenuRoute, type AccountMenuItem } from './accountMenu'
 import { executeQuickCommand } from "@/components/WorkstationNav.vue"
@@ -63,12 +64,36 @@ const themeStore = useThemeStore()
 const deviceStore = useDeviceStore()
 
 /**
- * 聊天页：右上角这个**固定定位**胶囊（top:12 / right:12 / 落在 --z-drawer 层）会盖住
- * ChatView 消息区工具栏右端的「更多操作」。
+ * 聊天页把自己的导航控件 Teleport 到标题栏的两个落点里。
  *
- * 侧栏在右侧时 chat-main 变窄、两者不重叠，所以平时看不出来；一旦交换布局把
- * 侧栏移到左侧，chat-main 变宽、工具栏右端顶到页面右边缘，就正好被它盖住。
- * 该页的主题 / 用户入口改由侧栏底部（ChatSidePanel 的 .panel-foot）承载。
+ * 为什么由这里提供落点、而不是 ChatView 自己 `getElementById`：单测会直接挂载
+ * ChatView（没有布局层），注入为空时 ChatView 用 `<Teleport :disabled>` 原位渲染，
+ * 不依赖 DOM 查询时序，也不会打 "Invalid Teleport target" 告警。
+ */
+const chatTopbarLeft = ref<HTMLElement | null>(null)
+const chatTopbarRight = ref<HTMLElement | null>(null)
+provide(TOPBAR_SLOTS, { left: chatTopbarLeft, right: chatTopbarRight })
+
+/**
+ * 是否真的有一条自绘标题栏（frameless 桌面壳）。
+ *
+ * 有：顶栏可以横向铺满到窗口三键之前，背景不透明，整条仍是拖拽区。
+ * 没有（浏览器预览 / 老外壳）：`--app-titlebar-h` 为 0，内容从视口顶端开始，
+ * 顶栏只能是一个"看不见的浮层" —— 背景透明、自身不拦截指针，否则满宽 32px
+ * 会把页面顶部整条内容挡住。
+ */
+const hasFrameTitlebar = computed(() => {
+  const mode = desktopHost()?.titleBar?.mode
+  return mode === 'custom' || mode === 'inset'
+})
+
+/**
+ * 聊天页：右上角的用户/通知胶囊隐藏。
+ *
+ * 原先的理由是它（fixed top:12 / right:12）会盖住 ChatView 工具条右端的「更多操作」；
+ * 现在聊天页的「更多操作」已经上收到标题栏右插槽，与窗口三键各有独立位置，
+ * 但胶囊仍会与插槽抢同一段竖向空间 —— 而且该页的主题 / 用户入口本来就在
+ * 侧栏底部（ChatSidePanel 的 .panel-foot），保持隐藏。
  */
 const isChatPage = computed(() => route.path === '/chat')
 
@@ -130,16 +155,11 @@ const menuItems = computed<MenuItem[]>(() => {
   return items
 })
 
-const currentLabel = computed(() => {
-  const hit = menuItems.value.find(m => route.path === m.key || route.path.startsWith(m.key + '/'))
-  return hit?.label || ''
-})
-
 const selectedKeys = computed(() => {
   const exact = menuItems.value.find(m => route.path === m.key)
   if (exact) return [exact.key]
   // 子页面（如 /billing/prices）高亮它的父菜单项：否则进到子页左侧导航会整列失焦，
-  // 看起来像"当前在哪一节"都不见了。与上面 currentLabel 用同一套前缀判定。
+  // 看起来像"当前在哪一节"都不见了。
   const parent = menuItems.value.find(m => route.path.startsWith(m.key + '/'))
   return [parent?.key ?? route.path]
 })
@@ -304,10 +324,11 @@ async function runQuickCommand() {
   <div class="app-shell">
     <!-- 标题栏行内的左侧区：品牌胶囊 + 工作台菜单按钮。
          两者都在自绘标题栏那一条里（与右侧最小化/最大化/关闭同高），
-         不再是浮在内容上方的独立胶囊 —— 那样会遮挡页面顶部操作。 -->
+         不再是浮在内容上方的独立胶囊 —— 那样会遮挡页面顶部操作。
+         聊天页的项目标签与右侧导航由 ChatView 通过 Teleport 提供（见 topbarSlots.ts）。 -->
     <header
-      :title="currentLabel || $t('common.navigation_menu')"
       class="topbar"
+      :class="{ 'topbar--floating': !hasFrameTitlebar }"
     >
       <Dropdown
         placement="bottomLeft"
@@ -372,6 +393,29 @@ async function runQuickCommand() {
       >
         {{ $t('auth.api_key_session') }}
       </span>
+
+      <!-- 聊天页左插槽：项目标签 + 当前会话名（ChatView Teleport 进来）。
+           没有布局层时 ChatView 会原位渲染，这里保持空节点即可。
+           `topbar-chat--off`：离开聊天页时立即淡出。ChatView 在路由过渡里要淡出
+           200ms，而 Teleport 出去的内容不在那个过渡元素里，不加这层会"先亮着再消失"。 -->
+      <div
+        id="app-topbar-chat-left"
+        ref="chatTopbarLeft"
+        class="topbar-chat-left"
+        :class="{ 'topbar-chat--off': !isChatPage }"
+      />
+      <!-- 弹性占位：把右插槽顶到标题栏最右端（窗口三键之前） -->
+      <div
+        class="topbar-grow"
+        aria-hidden="true"
+      />
+      <!-- 聊天页右插槽：会话 / 轨迹 / 地图 / 搜索 / 分屏 / 项目文件 / 更多 -->
+      <div
+        id="app-topbar-chat-right"
+        ref="chatTopbarRight"
+        class="topbar-chat-right"
+        :class="{ 'topbar-chat--off': !isChatPage }"
+      />
     </header>
 
     <!-- 右上角用户胶囊（聊天页隐藏，理由见 isChatPage 的注释）。
@@ -490,16 +534,73 @@ async function runQuickCommand() {
   position: fixed;
   top: 0;
   inset-inline-start: 0;
+  /* 横向铺满到窗口三键之前：聊天页的项目标签与右侧导航都在这一条里，
+     不提前收口就会被最小化/关闭覆盖（TitleBar 与本条同一层级，本组件在 DOM 中更靠后）。 */
+  inset-inline-end: var(--app-titlebar-controls-w, 0px);
   z-index: var(--z-drawer);
   height: max(var(--app-titlebar-h), 32px);
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
   padding-inline: 6px;
   /* 容器仍是拖拽区：这样品牌胶囊与按钮之间的空隙照样能拖动窗口 ——
      整块设 no-drag 会把标题栏左半截变成"死区"，那里既不能拖也不能点。
      真正要点击的按钮各自退出拖拽（见 .brand-btn / .dock-item）。 */
   -webkit-app-region: drag;
+}
+
+/* 没有自绘标题栏（浏览器预览 / 老外壳）：内容从视口顶端开始，顶栏只能当浮层。
+   透明 + 自身不拦截指针 ⇒ 满宽 32px 不会挡住宿主页面的顶部内容；
+   真正的控件（品牌/停靠坞/两个聊天插槽）再各自恢复指针。 */
+.topbar--floating {
+  background: transparent;
+  pointer-events: none;
+  -webkit-app-region: no-drag;
+}
+
+.topbar--floating > .brand-btn,
+.topbar--floating > .dock,
+.topbar--floating > .api-key-badge,
+.topbar--floating > .topbar-chat-left,
+.topbar--floating > .topbar-chat-right {
+  pointer-events: auto;
+}
+
+/* 弹性占位：把聊天页右插槽顶到标题栏最右端 */
+.topbar-grow {
+  flex: 1 1 auto;
+  min-width: 8px;
+}
+
+/* 聊天页的两个 Teleport 落点。控件本身的样式由 ChatView 提供（Teleport 保留
+   data-v 作用域），这里只负责"落在标题栏的哪一段"以及尺寸约束。 */
+.topbar-chat-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.topbar-chat-right {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  /* 插槽在拖拽区内：不退出拖拽的话按钮按下会被当成拖窗口，永远点不到 */
+  -webkit-app-region: no-drag;
+}
+
+/* 离开聊天页立即隐藏（路由过渡期间 Teleport 内容还在，见模板注释） */
+.topbar-chat-left,
+.topbar-chat-right {
+  transition: opacity var(--dur-fast) ease;
+}
+
+.topbar-chat--off {
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* 受限会话标识：说明管理入口为何不可见，而不是让它们"凭空消失" */
@@ -737,7 +838,7 @@ async function runQuickCommand() {
   border: var(--hairline-width) solid var(--panel-border);
   box-shadow: var(--sig-shadow-card);
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   white-space: nowrap;
   opacity: 0;

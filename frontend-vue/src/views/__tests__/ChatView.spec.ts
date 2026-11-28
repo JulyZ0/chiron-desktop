@@ -2,6 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { createPinia } from 'pinia'
 import { mount, flushPromises } from '@vue/test-utils'
 import { createRouter, createMemoryHistory } from 'vue-router'
+import { defineComponent, h, provide, ref } from 'vue'
+import { TOPBAR_SLOTS } from '../../components/shell/topbarSlots'
 
 /**
  * ChatView 的**冒烟网**（3429 行、此前**零测试**）。
@@ -133,6 +135,40 @@ describe('ChatView 冒烟（3429 行、此前零测试）', () => {
       wrapper.unmount()
     }
     expect(apiMocks.api.get.mock.calls.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('顶栏插槽：会话身份与右组控件 Teleport 到布局层提供的落点', async () => {
+    const left = document.createElement('div')
+    const right = document.createElement('div')
+    document.body.append(left, right)
+
+    // 模拟 AppLayout：provide 两个落点元素（真实布局里由模板 ref 提供）
+    const Host = defineComponent({
+      setup(_, { slots }) {
+        provide(TOPBAR_SLOTS, {
+          left: ref<HTMLElement | null>(left),
+          right: ref<HTMLElement | null>(right),
+        })
+        return () => slots.default?.()
+      },
+    })
+
+    const wrapper = mount(Host, {
+      slots: { default: () => h(ChatView) },
+      global: { plugins: [router, createPinia()], stubs: HEAVY_CHILDREN },
+    })
+    await flushPromises()
+
+    // 未归属项目时左插槽显示兜底的会话名，而不是什么都不留
+    expect(left.querySelector('.project-tab-solo')).not.toBeNull()
+    // 会话 / 轨迹 / 地图 / 搜索 / 分屏 / 项目文件 / 更多 全在右插槽
+    const actions = right.querySelector('.topbar-chat-actions')
+    expect(actions).not.toBeNull()
+    expect(actions!.querySelectorAll('.toolbar-btn').length).toBeGreaterThanOrEqual(6)
+
+    wrapper.unmount()
+    left.remove()
+    right.remove()
   })
 
   it('会话列表非空时按契约取消息（或明确不乱取）', async () => {

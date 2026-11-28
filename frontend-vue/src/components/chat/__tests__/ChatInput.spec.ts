@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
 
 vi.mock('../../api', () => ({
@@ -19,6 +19,8 @@ vi.mock('../../api', () => ({
 }))
 
 import ChatInput from '../ChatInput.vue'
+import { Select } from 'ant-design-vue'
+import { EFFORT_DEFAULT } from '../effort'
 import { useAuthStore } from '../../../stores/auth'
 import { privateKey } from '../../../utils/privateStorage'
 
@@ -266,5 +268,33 @@ describe('ChatInput（运行中追加指令）', () => {
 
     expect(wrapper.emitted('send')?.[0]?.[0]).toBe('普通发送')
     expect(wrapper.emitted('steer')).toBeUndefined()
+  })
+})
+
+describe('ChatInput（对话设置）', () => {
+  it('思考档位收在「对话设置」里：选中后 emit update:effort', async () => {
+    const wrapper = mountInput({ effort: 'low' })
+    await wrapper.find('.settings-btn').trigger('click')
+    await flushPromises()
+
+    const effortSelect = wrapper
+      .findAllComponents(Select)
+      .find(c => c.props('value') === 'low')
+    expect(effortSelect).toBeTruthy()
+
+    effortSelect!.vm.$emit('update:value', 'high')
+    expect(wrapper.emitted('update:effort')?.[0]).toEqual(['high'])
+  })
+
+  it('哨兵值映射回空串：选「关」时 emit 空字符串', async () => {
+    const wrapper = mountInput({ effort: 'max' })
+    await wrapper.find('.settings-btn').trigger('click')
+    await flushPromises()
+
+    const effortSelect = wrapper.findAllComponents(Select).find(c => c.props('value') === 'max')
+    expect(effortSelect).toBeTruthy()
+
+    effortSelect!.vm.$emit('update:value', EFFORT_DEFAULT)
+    expect(wrapper.emitted('update:effort')?.[0]).toEqual([''])
   })
 })

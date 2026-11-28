@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, reactive, shallowRef, onMounted, onUnmounted, nextTick, watch, h } from 'vue'
+import { ref, computed, reactive, shallowRef, inject, onMounted, onUnmounted, nextTick, watch, h } from 'vue'
 import { narrowSidebarQuery } from '../composables/layoutBreakpoints'
 import { Button, Input, Modal, Checkbox, Alert, Dropdown, Menu, MenuItem, MenuDivider } from 'ant-design-vue'
 import { MenuOutlined, CopyOutlined, LinkOutlined, CloseOutlined } from '@ant-design/icons-vue'
@@ -14,6 +14,8 @@ import { getSessionMetrics, getSessionRuntime, putSessionRuntime, type SessionRu
 import { getProjectVcs, initProjectVcs } from '../api/projectVcs'
 import { listPersonas, type Persona } from '../api/personas'
 import FloatingPanel from '../components/common/FloatingPanel.vue'
+import MarqueeText from '../components/common/MarqueeText.vue'
+import { TOPBAR_SLOTS, type TopbarSlots } from '../components/shell/topbarSlots'
 import SubAgentPane from '../components/chat/SubAgentPane.vue'
 import {
   openSubagentDock,
@@ -109,7 +111,8 @@ import ChatAttentionTray from '../components/chat/ChatAttentionTray.vue'
 import InteractionInbox from '../components/chat/InteractionInbox.vue'
 import InteractionBadge from '../components/chat/InteractionBadge.vue'
 import CallChainTimeline from '../components/CallChainTimeline.vue'
-import { HistoryOutlined, ExportOutlined, BulbOutlined, BulbFilled, MoreOutlined, FontSizeOutlined, SearchOutlined, PartitionOutlined, RobotOutlined, DatabaseOutlined, SwapOutlined } from '@ant-design/icons-vue'
+import { HistoryOutlined, ExportOutlined, BulbOutlined, BulbFilled, MoreOutlined, FontSizeOutlined, SearchOutlined, PartitionOutlined, RobotOutlined, DatabaseOutlined, SwapOutlined, SplitCellsOutlined, FolderOpenOutlined } from '@ant-design/icons-vue'
+import { effortLabelOf, normalizeEffort } from '../components/chat/effort'
 import { splitThinking, stripUserInputTag, formatClock, formatSize, countItemsAfter, mergeTurnStats } from '../components/chat/chat-types'
 import { normalizeMeta } from '../components/chat/chat-history'
 import { describeApiError } from '../utils/apiError'
@@ -125,7 +128,16 @@ const themeStore = useThemeStore()
 const route = useRoute()
 const router = useRouter()
 
-// 工具条低频操作（导出/主题）收进溢出菜单：条上只留「会话/轨迹」两个高频入口。
+/**
+ * 标题栏的两个落点（由 AppLayout provide）。
+ *
+ * 为空 = 没有布局层（单测直接挂载本组件）：下面的 `<Teleport :disabled>` 会让
+ * 控件原位渲染，测试与独立使用都不受影响。
+ */
+const topbarSlots = inject<TopbarSlots | null>(TOPBAR_SLOTS, null)
+
+// 低频操作（导出/沉淀/显示设置/主题）收进标题栏右端的溢出菜单：
+// 那条只有 36px 高，常驻项只留会话导航与两个视图开关。
 // 菜单项在渲染时求值，故与 themeStore 的初始化顺序无关。
 const toolbarMenuItems = computed(() => [
   { key: 'export', label: t('common.export_as_markdown'), icon: () => h(ExportOutlined), disabled: !items.value.length },
@@ -384,11 +396,9 @@ const splitTitle = computed(() => {
  */
 const floatingBottomInset = 160
 
-/** 当前模式的显示名 */
-const modeLabel = computed(() => modeOptions.find(o => o.value === mode.value)?.label || t('common.normal'))
-
-// 注意：模式不再有"来源"后缀。它不再是会话/服务端状态，也没有回落到谁的默认值一说 ——
+// 模式不再有"来源"后缀。它不再是会话/服务端状态，也没有回落到谁的默认值一说 ——
 // 界面上的模式就是用户当前的选择（全局单一状态），随本次提交下发。
+// 顶部标题栏也不再挂只读的模式胶囊：模式的唯一入口是输入区的「对话设置」。
 
 // 上下文占用环的分母：模型上限来自 /v1/models 的 context_window（拿不到就不显示比例）
 const availableModels = ref<LlmModel[]>([])
@@ -476,9 +486,25 @@ let pendingWorkbenchRestore = ''
 let initialWorkbenchRestored = false
 const projectTabsRef = ref<HTMLElement | null>(null)
 
-/** 标签展示用：本地还没拿到项目名时退回 id，绝不显示空白标签。 */
+/**
+ * 当前会话名：统一任务模式显示固定文案，否则用会话标题（新会话还没标题时退回品牌名）。
+ * 它会**合并进当前项目标签**（`项目名 · 对话名`），所以不再单独占一个标题元素。
+ */
+const convTitle = computed(() =>
+  unifiedMode.value ? t('workflow.unified_task') : (activeSession.value?.title || 'Chiron'),
+)
+
+/** 标签展示用：本地还没拿到项目名时退回 id，绝不显示空白标签。
+ *  激活标签额外带上当前会话名（项目 → 对话 的上下文）；其它标签保持项目名，
+ *  宽度上限不变，超长部分交给 MarqueeText 滚动播放。 */
 const openProjectTabs = computed(() =>
-  projectWorkspace.open.map(id => ({ id, name: projectNames.value[id] || id })),
+  projectWorkspace.open.map((id) => {
+    const name = projectNames.value[id] || id
+    const merged = projectWorkspace.active === id && convTitle.value
+      ? `${name} · ${convTitle.value}`
+      : name
+    return { id, name, label: merged }
+  }),
 )
 /** "+" 里只列**还没打开**的项目。 */
 const projectPickerOptions = computed(() =>
@@ -1201,30 +1227,19 @@ const MODE_PRESETS = computed<Record<string, { temperature: number; note?: strin
 /**
  * 思考档位：`disabled / low / high / max`（与后端 `app/providers/effort.py` 的归一化表对齐）。
  * 空串 = 不携带 —— 是否真正发送由后端归一化决定（各家词表不一致，见该文件注释）。
+ *
+ * 控件在「对话设置」弹层里（ChatInput）；档位顺序/标签与响应归一化由
+ * `components/chat/effort.ts` 统一提供，避免两处各写一份后漂移。
  */
 const effort = ref('')
 
-/** 档位循环顺序（点击按钮依次切换 —— ZCode 的 `ThoughtLevelCycleControl` 同款交互，比下拉省空间） */
-const EFFORT_ORDER = ['', 'low', 'high', 'max'] as const
-const EFFORT_LABEL = computed<Record<string, string>>(() => ({ '': t('common.off'), low: t('common.low'), high: t('common.high'), max: t('common.highest') }))
-// 模板不直接做两层索引：EFFORT_LABEL 与 effort 各自都可能为空，一旦编译产物出现不一致
-// （排查过：HMR 增量重编译后 setup 绑定表与 render 不同步），EFFORT_LABEL[effort] 会炸成
-// undefined[undefined]，整个 ChatView 被 ErrorBoundary 接管。收进 computed 后取值路径只有一条。
-const effortLabel = computed(() => EFFORT_LABEL.value[effort.value] || t('common.off'))
-
 /** 思考档位切换：与模型/模式同一套持久化（走 buildLlmConfig → 会话 llm_config） */
 function onEffortChange(v: string) {
-  effort.value = (EFFORT_ORDER as readonly string[]).includes(v) ? v : ''
+  effort.value = normalizeEffort(v)
   persistRuntime({})
   notify.info(
-    effort.value ? t('chat.reasoning_level_level', { level: EFFORT_LABEL.value[effort.value] }) : t('auth.reasoning_level_reset_to_default'),
+    effort.value ? t('chat.reasoning_level_level', { level: effortLabelOf(t, effort.value) }) : t('auth.reasoning_level_reset_to_default'),
   )
-}
-
-/** 点按循环：关 → 低 → 高 → 最高 → 关 */
-function cycleEffort() {
-  const order = EFFORT_ORDER as readonly string[]
-  onEffortChange(order[(order.indexOf(effort.value) + 1) % order.length])
 }
 
 /** 构建 llm_config：mode + 对应预设 temperature/max_tokens + 模型路由 model + 思考档位 */
@@ -3102,70 +3117,92 @@ function continueGeneration() {
       class="chat-main"
       :inert="panelOpen && narrowSidePanel"
     >
-      <!-- N7 v1：项目标签。每个标签记住自己的活跃会话与工作台开合；
-           关掉标签不会删项目/会话，只是不再占一个入口。 -->
-      <div
-        v-if="openProjectTabs.length"
-        ref="projectTabsRef"
-        class="project-tabs"
-        role="tablist"
-        :aria-label="$t('chat.project_tabs')"
+      <!-- N7 v1：项目标签 + 当前会话身份，Teleport 到标题栏左插槽（停靠坞右侧）。
+           只换 DOM 落点：每个标签记住的活跃会话 / 工作台开合、键盘左右切换、
+           关闭与"＋"选项目仍由本组件持有，逻辑未动。
+           激活标签把会话名合并进标签文本（`项目 · 对话`），标签宽度上限不变，
+           超长由 MarqueeText 滚动播放。 -->
+      <Teleport
+        :to="topbarSlots?.left?.value || 'body'"
+        :disabled="!topbarSlots?.left?.value"
       >
-        <div
-          v-for="tab in openProjectTabs"
-          :key="tab.id"
-          class="project-tab"
-          :class="{ active: projectWorkspace.active === tab.id }"
-          role="tab"
-          :data-project-id="tab.id"
-          :aria-selected="projectWorkspace.active === tab.id"
-          :title="tab.name"
-          @click="switchProjectTab(tab.id)"
-          @keydown.enter="switchProjectTab(tab.id)"
-          @keydown.left.prevent="focusAdjacentProjectTab(-1)"
-          @keydown.right.prevent="focusAdjacentProjectTab(1)"
-          :tabindex="projectWorkspace.active === tab.id ? 0 : -1"
-        >
-          <span class="project-tab-name">{{ tab.name }}</span>
-          <button
-            type="button"
-            class="project-tab-close"
-            :aria-label="$t('chat.close_project_tab')"
-            @click.stop="closeProjectTabAndMaybeSwitch(tab.id)"
-          >×</button>
-        </div>
-        <Dropdown
-          trigger="click"
-          placement="bottomLeft"
-          @open-change="onProjectPickerOpenChange"
-        >
-          <button
-            type="button"
-            class="project-tab-add"
-            :aria-label="$t('chat.open_project_tab')"
-            :title="$t('chat.open_project_tab')"
+        <div class="topbar-cluster">
+          <div
+            v-if="openProjectTabs.length"
+            ref="projectTabsRef"
+            class="project-tabs"
+            role="tablist"
+            :aria-label="$t('chat.project_tabs')"
           >
-            ＋
-          </button>
-          <template #overlay>
-            <Menu @click="onProjectPickerClick">
-              <MenuItem
-                v-for="p in projectPickerOptions"
-                :key="p.id"
+            <div
+              v-for="tab in openProjectTabs"
+              :key="tab.id"
+              class="project-tab"
+              :class="{ active: projectWorkspace.active === tab.id }"
+              role="tab"
+              :data-project-id="tab.id"
+              :aria-selected="projectWorkspace.active === tab.id"
+              :title="tab.label"
+              @click="switchProjectTab(tab.id)"
+              @keydown.enter="switchProjectTab(tab.id)"
+              @keydown.left.prevent="focusAdjacentProjectTab(-1)"
+              @keydown.right.prevent="focusAdjacentProjectTab(1)"
+              :tabindex="projectWorkspace.active === tab.id ? 0 : -1"
+            >
+              <MarqueeText
+                class="project-tab-name"
+                :text="tab.label"
+              />
+              <button
+                type="button"
+                class="project-tab-close"
+                :aria-label="$t('chat.close_project_tab')"
+                @click.stop="closeProjectTabAndMaybeSwitch(tab.id)"
+              >×</button>
+            </div>
+            <Dropdown
+              trigger="click"
+              placement="bottomLeft"
+              @open-change="onProjectPickerOpenChange"
+            >
+              <button
+                type="button"
+                class="project-tab-add"
+                :aria-label="$t('chat.open_project_tab')"
+                :title="$t('chat.open_project_tab')"
               >
-                {{ p.name || p.root_path }}
-              </MenuItem>
-              <MenuItem
-                v-if="!projectPickerOptions.length"
-                key="__empty"
-                disabled
-              >
-                {{ $t('chat.no_project_to_open') }}
-              </MenuItem>
-            </Menu>
-          </template>
-        </Dropdown>
-      </div>
+                ＋
+              </button>
+              <template #overlay>
+                <Menu @click="onProjectPickerClick">
+                  <MenuItem
+                    v-for="p in projectPickerOptions"
+                    :key="p.id"
+                  >
+                    {{ p.name || p.root_path }}
+                  </MenuItem>
+                  <MenuItem
+                    v-if="!projectPickerOptions.length"
+                    key="__empty"
+                    disabled
+                  >
+                    {{ $t('chat.no_project_to_open') }}
+                  </MenuItem>
+                </Menu>
+              </template>
+            </Dropdown>
+          </div>
+          <!-- 会话不属于任何项目时没有标签可合并 —— 至少让对话名在标题栏可见，
+               否则新会话（未归入项目）会连"我在哪个对话"都看不出来。 -->
+          <span
+            v-else
+            class="project-tab-solo"
+            :title="convTitle"
+          >
+            <MarqueeText :text="convTitle" />
+          </span>
+        </div>
+      </Teleport>
       <div
         v-if="connectionLost"
         class="connection-banner"
@@ -3173,67 +3210,60 @@ function continueGeneration() {
         {{ isOnline ? $t('common.disconnected_from_server_attempting_to_reconnect') : $t('common.network_disconnected_please_check_your_connection') }}
       </div>
       <div class="chat-body">
-        <!-- 内容区工具条 -->
-        <div class="chat-toolbar">
+        <!-- 会话 / 轨迹 / 地图 / 搜索 + 分屏 / 项目文件，Teleport 到标题栏右插槽
+             （窗口三键之前）。始终纯图标：标题栏只有 36px，文字标签会把项目标签与
+             会话名挤没；可发现性由 title tooltip 与 aria-label 承担。 -->
+        <Teleport
+          :to="topbarSlots?.right?.value || 'body'"
+          :disabled="!topbarSlots?.right?.value"
+        >
           <div
-            class="toolbar-side"
-            aria-hidden="true"
-          />
-          <div class="toolbar-center">
-            <span class="toolbar-title">{{ unifiedMode ? $t('workflow.unified_task') : (activeSession?.title || 'Chiron') }}</span>
-            <!-- 当前对话模式：前端实时状态（全局单一），随每条消息经 llm_config.mode 下发。
-                 不再显示"来源"后缀 —— 模式没有服务端/会话一层可言，"是谁定的"答案永远是
-                 "你当前的选择"。 -->
-            <span
-              class="toolbar-mode"
-              :title="$t('chat.current_conversation_mode')"
-            >{{ modeLabel }}</span>
-            <!-- 思考档位：点按循环（关 → 低 → 高 → 最高）。
-                 与"模式"同类信息（都是"这次怎么回答"），所以并排放；用循环按钮而不是下拉 ——
-                 只有 4 档，比下拉省一次点击和一块浮层。
-                 值最终要经后端 app/providers/effort.py **归一化**才可能发送
-                 （各家词表不一致，直接透传会 400 —— 我们踩过 UNSUPPORTED_REASONING_EFFORT）。 -->
-            <!-- 分屏 6a：并排参考另一个会话（只读）。
-                 默认取"上一个访问过的会话"，所以不必先做选择器就能立即有用。 -->
-            <button
-              type="button"
-              class="toolbar-mode split-toggle"
-              :class="{ active: !!splitSessionId }"
-              :title="$t('chat.side_by_side_reference_to_another_session_read_only')"
-              @click="toggleSplit()"
-            >
-              {{ splitSessionId ? $t('common.collapse_reference') : $t('common.split_view') }}
-            </button>
-            <!-- 工作台开关：与分屏一样是"并排看别的东西"的维度，所以并排放在这里。
-                 `aria-expanded` + `aria-controls`：折叠态由 CSS/Transition 表达，
-                 读屏只能从这里知道"现在是开还是关"。 -->
-            <button
-              type="button"
-              class="toolbar-mode"
-              :class="{ active: workbenchOpen }"
-              :title="$t('chat.workbench_title')"
-              :aria-expanded="workbenchOpen"
-              aria-controls="workbench-panel"
-              @click="toggleWorkbench()"
-            >
-              {{ $t('chat.workbench_title') }}
-            </button>
-            <button
-              type="button"
-              class="toolbar-mode toolbar-effort"
-              :class="{ active: !!effort }"
-              :title="$t('chat.reasoning_level_tap_to_cycle_off_low_high_max')"
-              @click="cycleEffort()"
-            >
-              {{ $t('chat.reasoning') }} {{ effortLabel }}
-            </button>
-          </div>
-          <div class="toolbar-side toolbar-actions">
+            class="topbar-chat-actions"
+            role="toolbar"
+            :aria-label="$t('chat.session_actions')"
+          >
             <!-- M21：跨会话待办角标 —— 任何页面都能看到"我还欠哪些答复"，点一下跳过去。
                  M7 的收件箱只在打开那个会话时可见，这条补的正是"不知道哪个会话欠答复"。 -->
             <InteractionBadge
               :live-ids="livePendingIds"
               @select="switchSession"
+            />
+            <!-- 分屏 6a：并排参考另一个会话（只读）。与"项目文件"同属视图开关，
+                 所以排在会话导航之前。 -->
+            <Button
+              type="text"
+              size="small"
+              class="toolbar-btn"
+              :class="{ active: !!splitSessionId }"
+              :title="$t('chat.side_by_side_reference_to_another_session_read_only')"
+              :aria-label="splitSessionId ? $t('common.collapse_reference') : $t('common.split_view')"
+              :aria-pressed="!!splitSessionId"
+              @click="toggleSplit()"
+            >
+              <template #icon>
+                <SplitCellsOutlined />
+              </template>
+            </Button>
+            <!-- 工作台（项目文件）：`aria-expanded` + `aria-controls` —— 折叠态由
+                 CSS/Transition 表达，读屏只能从这里知道"现在是开还是关"。 -->
+            <Button
+              type="text"
+              size="small"
+              class="toolbar-btn"
+              :class="{ active: workbenchOpen }"
+              :title="$t('chat.workbench_title')"
+              :aria-label="$t('chat.workbench_title')"
+              :aria-expanded="workbenchOpen"
+              aria-controls="workbench-panel"
+              @click="toggleWorkbench()"
+            >
+              <template #icon>
+                <FolderOpenOutlined />
+              </template>
+            </Button>
+            <span
+              class="topbar-actions-divider"
+              aria-hidden="true"
             />
             <Button
               type="text"
@@ -3241,6 +3271,7 @@ function continueGeneration() {
               class="toolbar-btn"
               :class="{ active: panelOpen && panelView === 'sessions' }"
               :title="panelOpen && panelView === 'sessions' ? $t('chat.collapse_session_list') : $t('chat.conversation_history')"
+              :aria-label="panelOpen && panelView === 'sessions' ? $t('chat.collapse_session_list') : $t('chat.conversation_history')"
               :aria-expanded="panelOpen && panelView === 'sessions'"
               aria-controls="chat-side-panel"
               @click="openPanel('sessions')"
@@ -3248,7 +3279,6 @@ function continueGeneration() {
               <template #icon>
                 <MenuOutlined />
               </template>
-              <span class="toolbar-label">{{ $t('chat.session') }}</span>
             </Button>
             <Button
               type="text"
@@ -3256,6 +3286,7 @@ function continueGeneration() {
               class="toolbar-btn"
               :class="{ active: panelOpen && panelView === 'trajectory' }"
               :title="panelOpen && panelView === 'trajectory' ? $t('common.collapse_trace') : $t('common.view_past_questions')"
+              :aria-label="panelOpen && panelView === 'trajectory' ? $t('common.collapse_trace') : $t('common.view_past_questions')"
               :aria-expanded="panelOpen && panelView === 'trajectory'"
               aria-controls="chat-side-panel"
               @click="openPanel('trajectory')"
@@ -3263,7 +3294,6 @@ function continueGeneration() {
               <template #icon>
                 <HistoryOutlined />
               </template>
-              <span class="toolbar-label">{{ $t('common.trace') }}</span>
             </Button>
             <Button
               type="text"
@@ -3271,12 +3301,12 @@ function continueGeneration() {
               class="toolbar-btn"
               :class="{ active: synapseMapOpen }"
               :title="$t('chat.open_session_map')"
+              :aria-label="$t('chat.open_session_map')"
               @click="synapseMapOpen = true"
             >
               <template #icon>
                 <PartitionOutlined />
               </template>
-              <span class="toolbar-label">{{ $t('common.map') }}</span>
             </Button>
             <Button
               type="text"
@@ -3284,12 +3314,12 @@ function continueGeneration() {
               class="toolbar-btn"
               :class="{ active: searchOpen }"
               :title="searchOpen ? $t('common.close_search') : $t('chat.search_in_this_session_text_and_reasoning')"
+              :aria-label="searchOpen ? $t('common.close_search') : $t('chat.search_in_this_session_text_and_reasoning')"
               @click="searchOpen ? closeSearch() : openSearch()"
             >
               <template #icon>
                 <SearchOutlined />
               </template>
-              <span class="toolbar-label">{{ $t('common.search') }}</span>
             </Button>
             <!-- 用 #overlay + <Menu>，与 ChatSidePanel 里那个**确实可用**的会话菜单保持一致。
                  此前这里用 :menu="{ items, onClick }"，表现是**点击完全不弹菜单**：
@@ -3304,6 +3334,7 @@ function continueGeneration() {
                 size="small"
                 class="toolbar-btn"
                 :title="$t('common.more_actions')"
+                :aria-label="$t('common.more_actions')"
                 @click.stop
               >
                 <template #icon>
@@ -3330,7 +3361,7 @@ function continueGeneration() {
               </template>
             </Dropdown>
           </div>
-        </div>
+        </Teleport>
 
         <!-- 会话内检索条：Enter/↓ 下一个、Shift+Enter/↑ 上一个、Esc 关闭 -->
         <div
@@ -3568,6 +3599,7 @@ function continueGeneration() {
         :output-style="outputStyle"
         :language="language"
         :reasoning-language="reasoningLanguage"
+        :effort="effort"
         :context-chips="contextChips"
         :project-id="activeProjectId"
         @send="sendMessage"
@@ -3583,6 +3615,7 @@ function continueGeneration() {
         @update:outputStyle="onOutputStyleChange"
         @update:language="onLanguageChange"
         @update:reasoningLanguage="onReasoningLanguageChange"
+        @update:effort="onEffortChange"
         @remove-context-chip="(c: ContextChip) => removeContextChip(c.type, c.value)"
         :failed-queue-count="outbox.length"
         :outbox-items="outboxPreview"
@@ -3877,71 +3910,124 @@ function continueGeneration() {
 <style scoped>
 .chat-layout { position: relative; display: flex; height: 100%; background: var(--bg-page); overflow: hidden; }
 .chat-main { position: relative; flex: 1; display: flex; flex-direction: column; min-width: 0; }
-/* N7 v1：项目标签栏。
-   横向滚动而不是换行：标签数取决于用户打开过多少项目，换行会把消息区整体下推。
-   视觉重量刻意低于主工具栏：它是"切换入口"，不是当前会话的标题。 */
+/* N7 v1：项目标签 —— 现在住在标题栏左插槽（停靠坞右侧）。
+   横向滚动而不是换行：标签数取决于用户打开过多少项目，换行会把标题栏撑高。
+   `min-width: 0` 让它能在窄窗口里让位给右侧导航，而不是把右组顶出可视区。 */
 .project-tabs {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 6px 10px 0;
+  min-width: 0;
+  max-width: min(46vw, 560px);
   overflow-x: auto;
   scrollbar-width: none;
-  flex: 0 0 auto;
+  flex: 0 1 auto;
 }
 .project-tabs::-webkit-scrollbar { display: none; }
 .project-tab {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  flex: none;
+  height: 24px;
   max-width: 200px;
-  padding: 4px 8px 4px 10px;
+  padding: 0 4px 0 8px;
   border: var(--hairline-width) solid var(--border-default);
-  border-bottom: none;
-  border-radius: 8px 8px 0 0;
-  background: var(--panel-bg);
+  border-radius: var(--radius-md);
+  background: transparent;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
+  /* 落在标题栏拖拽区里：不退出拖拽的话按下会被当成拖动窗口，标签永远点不到 */
+  -webkit-app-region: no-drag;
 }
-.project-tab:hover { color: var(--text-primary); }
+.project-tab:hover { color: var(--text-primary); background: var(--bg-surface-hover); }
 .project-tab:focus-visible {
   outline: var(--focus-ring-width) solid var(--focus-ring-color);
   outline-offset: var(--focus-ring-offset);
 }
 .project-tab.active {
-  color: var(--text-primary);
-  font-weight: 600;
+  color: var(--primary);
+  font-weight: var(--fw-semibold);
   border-color: var(--primary);
-  background: var(--bg-page);
+  background: var(--primary-bg);
 }
-.project-tab-name { overflow: hidden; text-overflow: ellipsis; }
+/* 跑马灯自己负责溢出：不要再给 ellipsis，否则两份文本的轨道量不出真实宽度 */
+.project-tab-name { flex: 0 1 auto; min-width: 0; }
 .project-tab-close {
+  flex: none;
   border: 0;
   background: transparent;
   color: inherit;
-  opacity: 0.55;
+  opacity: 0;
+  /* 不可见时同时不可点：否则标签右端会藏着一个"看不见的关闭键"，误点即关 */
+  pointer-events: none;
   cursor: pointer;
   padding: 0 2px;
   line-height: 1;
-  font-size: 14px;
+  font-size: var(--fs-sm);
+  transition: opacity var(--dur-fast) ease;
 }
+/* 关闭键只在 hover / 激活 / 键盘焦点时出现：标签栏在标题栏里，宽度是最稀缺资源 */
+.project-tab:hover .project-tab-close,
+.project-tab.active .project-tab-close,
+.project-tab:focus-within .project-tab-close { opacity: 0.65; pointer-events: auto; }
 .project-tab-close:hover { opacity: 1; }
+.project-tab-close:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
 .project-tab-add {
   flex: 0 0 auto;
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   margin-inline-start: 2px;
   border: var(--hairline-width) dashed var(--border-default);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
   line-height: 1;
+  -webkit-app-region: no-drag;
 }
 .project-tab-add:hover { color: var(--text-primary); border-color: var(--primary); }
+/* 没有项目标签时的兜底：单枚不可交互的"对话名"标签，保证当前对话在标题栏可见 */
+.project-tab-solo {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  max-width: min(32vw, 320px);
+  height: 24px;
+  padding-inline: 8px;
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}
+.topbar-cluster { display: flex; align-items: center; gap: 8px; min-width: 0; }
+
+/* 标题栏右插槽里的会话导航：始终纯图标，26px 见方，靠 title/aria-label 说明 */
+.topbar-chat-actions { display: flex; align-items: center; gap: 2px; }
+.topbar-actions-divider {
+  flex: none;
+  width: var(--hairline-width);
+  height: 16px;
+  margin-inline: 4px;
+  background: var(--border);
+}
+.toolbar-btn.ant-btn {
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  padding: 0;
+  color: var(--text-secondary);
+  border-radius: var(--radius-md);
+}
+.toolbar-btn:hover { color: var(--text-primary) !important; background: var(--bg-hover) !important; }
+.toolbar-btn.active { color: var(--primary); background: var(--primary-bg); }
+.toolbar-btn:not(:disabled):active { transform: scale(0.94); }
 /* 交换布局：侧边栏移到左侧、分屏移到右侧。
    用 flex `order` 而不是改 DOM —— 组件的挂载位置不动，只是视觉顺序变化，
    所以不影响任何依赖 DOM 顺序的逻辑（焦点流、SSR、既有测试）。
@@ -3961,47 +4047,8 @@ function continueGeneration() {
 .chat-body { position: relative; flex: 1; display: flex; flex-direction: column; min-height: 0; }
 /* 任务清单挂在输入区正上方：与输入框留一点呼吸，但不占满整行宽度 */
 .chat-todo-panel { flex: none; margin: 0 16px 6px; }
-.chat-toolbar {
-  flex: none;
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
-  align-items: center;
-  height: 40px;
-  padding: 0 16px;
-  border-bottom: var(--hairline-width) solid var(--border);
-}
-.toolbar-side { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.toolbar-center {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  justify-content: center;
-}
-.toolbar-title {
-  max-width: 40vw;
-  font-size: 13px;
-  font-weight: var(--fw-semibold);
-  color: var(--text-primary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.toolbar-mode { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); background: var(--bg-secondary); padding: 2px 8px; border-radius: var(--radius-full); }
-/* 思考档位按钮：复用 .toolbar-mode 的胶囊外观，只重置 button 默认样式 */
-.toolbar-effort {
- border: none; cursor: pointer; font: inherit; font-size: var(--fs-xs); 
-  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
-}
-.toolbar-effort:hover { color: var(--text-primary); }
-.toolbar-effort.active { color: var(--primary); }
-.toolbar-actions { justify-content: flex-end; gap: 2px; }
-.toolbar-btn { color: var(--text-secondary); border-radius: var(--radius-md); }
-.toolbar-btn:hover { color: var(--text-primary) !important; background: var(--bg-hover) !important; }
-.toolbar-btn.active { color: var(--primary); background: var(--primary-bg); }
-.toolbar-btn:not(:disabled):active { transform: scale(0.94); }
 
-/* 会话内检索条：贴在工具条下方，不占用消息区高度（无结果时只显示输入框） */
+/* 会话内检索条：标题栏下沉到页内，不占用消息区高度（无结果时只显示输入框） */
 .chat-search {
   flex: none;
   display: flex; align-items: center; gap: 8px;
@@ -4020,21 +4067,26 @@ function continueGeneration() {
 .chat-search-btn:hover:not(:disabled) { background: var(--bg-hover); color: var(--text-primary); }
 .chat-search-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .chat-search-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
-@media (max-width: 576px) { .chat-search { margin: 6px 12px 0; } .chat-search-input { font-size: 12px; } }
+@media (max-width: 576px) { .chat-search { margin: 6px 12px 0; } .chat-search-input { font-size: var(--fs-sm); } }
+/* 标题栏空间按优先级让位：先收窄项目标签，再缩短兜底会话名；右侧永远是纯图标，
+   不需要在这里做折叠 —— 它们本来就只有 26px 一个按钮的宽度。 */
+@media (max-width: 1280px) {
+  .project-tabs { max-width: min(40vw, 420px); }
+  .project-tab { max-width: 160px; }
+  .project-tab-solo { max-width: 220px; }
+}
 @media (max-width: 1024px) {
-  .chat-toolbar { padding: 0 10px; }
-  .toolbar-title { max-width: 32vw; }
+  .project-tabs { max-width: 32vw; }
+  .project-tab { max-width: 132px; }
+  .project-tab-solo { max-width: 160px; }
 }
 @media (max-width: 768px) {
-  .chat-toolbar { padding: 0 8px; }
-  .toolbar-actions { gap: 0; }
-  .toolbar-btn.ant-btn { height: 36px; min-width: 36px; padding: 0 8px; }
-  .toolbar-label { display: none; }
+  .project-tabs { max-width: 28vw; }
+  .project-tab { max-width: 112px; }
+  .project-tab-solo { max-width: 132px; }
 }
 @media (max-width: 576px) {
-  .chat-toolbar { padding: 0 6px; }
-  .toolbar-title { max-width: 24vw; font-size: 12px; }
-  .toolbar-mode { display: none; }
+  .project-tab-solo { display: none; }
 
   .turn-status { margin: 8px auto 0; padding: 0 12px; }
 }
@@ -4044,7 +4096,7 @@ function continueGeneration() {
      贴 top:0 会把最小化/关闭那一栏一起盖住，窗口按钮直接点不到。 */
   position: fixed; top: var(--app-titlebar-h); left: 0; right: 0; z-index: var(--z-page-bar);
   padding: 4px 12px; text-align: center;
-  font-size: 12px; line-height: 18px;
+  font-size: var(--fs-sm); line-height: 18px;
   background: var(--error); color: var(--on-solid);
 }
 .share-risk { margin-bottom: 14px; }
@@ -4052,7 +4104,7 @@ function continueGeneration() {
 .share-link-row { display: flex; gap: 10px; margin-top: 14px; }
 .share-link-input { flex: 1; }
 .share-manage { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; }
-.share-manage-hint { font-size: 12px; color: var(--text-tertiary); }
+.share-manage-hint { font-size: var(--fs-sm); color: var(--text-tertiary); }
 .share-select-title { font-size: 13px; font-weight: var(--fw-semibold); color: var(--text-primary); margin: 14px 0 8px; }
 .share-select-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; width: 100%; }
 .share-select-item {
@@ -4065,7 +4117,7 @@ function continueGeneration() {
 .share-select-role.user { color: var(--primary); background: var(--primary-bg); }
 .share-select-role.assistant { color: var(--text-secondary); background: var(--bg-secondary); }
 .share-select-preview { flex: 1; min-width: 0; font-size: 13px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.share-error { margin-top: 10px; font-size: 12px; color: var(--error); }
+.share-error { margin-top: 10px; font-size: var(--fs-sm); color: var(--error); }
 .share-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 .turn-status {
   align-self: flex-start; margin: 10px auto 0; max-width: min(var(--chat-content-width), 92%); padding: 0 24px;
@@ -4097,7 +4149,7 @@ function continueGeneration() {
 }
 .ueb-text { flex: 1; min-width: 0; line-height: 1.5; }
 .ueb-close {
- flex: none; cursor: pointer; opacity: 0.7; font-size: 12px; 
+ flex: none; cursor: pointer; opacity: 0.7; font-size: var(--fs-sm);
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .ueb-close:hover { opacity: 1; }
@@ -4147,7 +4199,7 @@ function continueGeneration() {
 .unified-exec-hint {
   flex: none; display: inline-flex; align-items: center; gap: 6px;
   align-self: center; margin: 10px auto 0;
-  font-size: 12px; color: var(--text-tertiary);
+  font-size: var(--fs-sm); color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
 }
 .ueh-dot {
@@ -4187,8 +4239,8 @@ function continueGeneration() {
 
 /* ── 存为 Agent 弹窗 ── */
 .save-agent-form { display: flex; flex-direction: column; gap: 6px; }
-.save-agent-label { font-size: 12px; font-weight: var(--fw-semibold); color: var(--text-secondary); }
-.save-agent-hint { margin: 8px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-secondary); }
+.save-agent-label { font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-secondary); }
+.save-agent-hint { margin: 8px 0 0; font-size: var(--fs-sm); line-height: 1.6; color: var(--text-secondary); }
 
 @media (max-width: 768px) {
   .map-overlay {

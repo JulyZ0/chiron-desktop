@@ -14,6 +14,7 @@ import { notify } from '../../utils/notify'
 import { TOUR_ANCHORS } from '../../composables/useOnboardingTour'
 import { classifyEnter } from './ime'
 import { fileTypeBadge } from '../../utils/fileName'
+import { EFFORT_DEFAULT, effortFromSelect, effortSelectOptions } from './effort'
 
 import { useI18n } from 'vue-i18n'
 const { t: tr } = useI18n()
@@ -21,6 +22,8 @@ const { t: tr } = useI18n()
 const VISIBLE_CONTEXT_CHIPS = 3
 const visibleContextChips = computed(() => (props.contextChips ?? []).slice(0, VISIBLE_CONTEXT_CHIPS))
 const hiddenContextChips = computed(() => (props.contextChips ?? []).slice(VISIBLE_CONTEXT_CHIPS))
+/** 思考档位选项：「关 / 低 / 高 / 最高」。顺序与标签的唯一事实源在 ./effort.ts */
+const effortOptions = computed(() => effortSelectOptions(tr))
 const props = defineProps<{
   loading: boolean
   mode: string
@@ -42,6 +45,8 @@ const props = defineProps<{
   language?: string
   /** 思考语言（D2）：与"回复语言"分开设置 —— 有人要"用英文思考、用中文回答" */
   reasoningLanguage?: string
+  /** 思考档位（空串 = 关）：与模式/工具授权同属请求级参数，所以收进「对话设置」。 */
+  effort?: string
   /** 已带入本次对话的上下文（知识库 / Agent / 技能 / 工作流 / 插件 / 记忆分类）。
       对齐 reasonix 的 `composer-context`：绑定是"沉默生效"的，不显式呈现就是幽灵行为。 */
   contextChips?: ContextChip[]
@@ -76,6 +81,8 @@ const emit = defineEmits<{
   (e: 'update:language', lang: string): void
   /** 思考语言（D2）：auto/zh-CN/en-US/ar */
   (e: 'update:reasoningLanguage', lang: string): void
+  /** 思考档位：'' / low / high / max */
+  (e: 'update:effort', level: string): void
   /** 移除一个上下文 chip（点输入区上方 chip 行的 × ） */
   (e: 'remove-context-chip', chip: ContextChip): void
   /** 重发暂存队列（横幅上的「立即重发」） */
@@ -1337,7 +1344,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
                 <label class="settings-pop__row">
                   <span class="settings-pop__label">{{ $t('common.mode') }}</span>
                   <Select
-                    :model-value="mode"
+                    :value="mode"
                     :options="modeOptions"
                     size="small"
                     style="width: 150px"
@@ -1347,7 +1354,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
                 <label class="settings-pop__row">
                   <span class="settings-pop__label">{{ $t('agent.tool_authorization') }}</span>
                   <Select
-                    :model-value="toolsMode || 'auto'"
+                    :value="toolsMode || 'auto'"
                     :options="toolsModeOptions"
                     size="small"
                     style="width: 150px"
@@ -1359,7 +1366,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
                 <label class="settings-pop__row">
                   <span class="settings-pop__label">{{ $t('chat.output_style') }}</span>
                   <Select
-                    :model-value="outputStyle || 'default'"
+                    :value="outputStyle || 'default'"
                     :options="outputStyleOptions"
                     size="small"
                     style="width: 150px"
@@ -1369,7 +1376,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
                 <label class="settings-pop__row">
                   <span class="settings-pop__label">{{ $t('chat.language_preference') }}</span>
                   <Select
-                    :model-value="language || 'auto'"
+                    :value="language || 'auto'"
                     :options="languageOptions"
                     size="small"
                     style="width: 150px"
@@ -1380,11 +1387,24 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
                 <label class="settings-pop__row">
                   <span class="settings-pop__label">{{ $t('chat.reasoning_language') }}</span>
                   <Select
-                    :model-value="reasoningLanguage || 'auto'"
+                    :value="reasoningLanguage || 'auto'"
                     :options="thinkLanguageOptions"
                     size="small"
                     style="width: 150px"
                     @update:value="(v: any) => emit('update:reasoningLanguage', String(v))"
+                  />
+                </label>
+                <!-- 思考档位：从顶部工具条的"点按循环"按钮搬进来。
+                     它与模式/工具授权/风格/语言一样是**请求级参数**，收在同一层才有
+                     "这次怎么答"的完整视图；也避免顶栏常驻一个只有 4 档的循环按钮。 -->
+                <label class="settings-pop__row">
+                  <span class="settings-pop__label">{{ $t('chat.reasoning') }}</span>
+                  <Select
+                    :value="effort || EFFORT_DEFAULT"
+                    :options="effortOptions"
+                    size="small"
+                    style="width: 150px"
+                    @update:value="(v: any) => emit('update:effort', effortFromSelect(v))"
                   />
                 </label>
                 <label
@@ -1393,7 +1413,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
                 >
                   <span class="settings-pop__label">{{ $t('chat.persona') }}</span>
                   <Select
-                    :model-value="persona || ''"
+                    :value="persona || ''"
                     :options="[{ label: $t('chat.persona_default'), value: '' }, ...personaOptions]"
                     size="small"
                     style="width: 150px"
@@ -1420,7 +1440,7 @@ defineExpose({ focus, insertText, setCommandDraft, setDraft, restoreDraft, attac
           <Select
             class="model-select"
             :data-tour="TOUR_ANCHORS.modelPicker"
-            :model-value="modelValue"
+            :value="modelValue"
             :options="modelOptions"
             :loading="modelsLoading"
             size="small"
