@@ -3933,7 +3933,7 @@ function continueGeneration() {
   flex: 0 0 auto;
   width: 24px;
   height: 24px;
-  margin-left: 2px;
+  margin-inline-start: 2px;
   border: var(--hairline-width) dashed var(--border-default);
   border-radius: 6px;
   background: transparent;

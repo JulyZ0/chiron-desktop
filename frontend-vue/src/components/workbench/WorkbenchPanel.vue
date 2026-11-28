@@ -666,7 +666,7 @@ function diffLineSelectable(line: DiffLine | undefined): boolean {
   return !!line && line.cls !== 'meta' && line.cls !== 'hunk'
 }
 
-function toggleDiffLine(index: number, event?: MouseEvent): void {
+function toggleDiffLine(index: number, event?: MouseEvent | KeyboardEvent): void {
   if (!diffLineSelectable(diffLines.value[index])) return
   const next = new Set(selectedDiffLines.value)
   if (event?.shiftKey && diffSelectAnchor !== null) {
@@ -1857,7 +1857,12 @@ async function openWithSystem(entry: ProjectFileEntry) {
                 },
               ]"
               :title="diffLineSelectable(line) ? tr('chat.workbench_review_pick') : ''"
+              :role="diffLineSelectable(line) ? 'button' : undefined"
+              :tabindex="diffLineSelectable(line) ? 0 : undefined"
+              :aria-pressed="diffLineSelectable(line) ? selectedDiffLines.has(i) : undefined"
               @click="toggleDiffLine(i, $event)"
+              @keydown.enter.prevent="toggleDiffLine(i, $event)"
+              @keydown.space.prevent="toggleDiffLine(i, $event)"
             >{{ line.text || ' ' }}</span></code></pre>
             <div
               v-if="diffData.truncated"
@@ -2329,7 +2334,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
   border-radius: var(--sig-radius-button);
   background: var(--panel-bg);
 }
-.wb-review-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.wb-review-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--fs-sm); color: var(--text-secondary); }
 .wb-review-box { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .wb-review-box textarea {
   width: 100%;
@@ -2341,7 +2346,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
   background: var(--bg-page);
   color: var(--text-primary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wb-review-box .wb-btn { align-self: flex-end; }
 .wb-review-box .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -2354,10 +2359,10 @@ async function openWithSystem(entry: ProjectFileEntry) {
   border-radius: var(--sig-radius-button);
   background: var(--panel-bg);
 }
-.wb-review-tray-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.wb-review-tray-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--fs-sm); color: var(--text-secondary); }
 .wb-review-tray-actions { display: inline-flex; gap: 6px; }
 .wb-review-tray-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.wb-review-tray-list li { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.wb-review-tray-list li { display: flex; align-items: center; gap: 6px; font-size: var(--fs-sm); }
 .wb-review-tray-path { color: var(--text-primary); font-family: var(--font-mono, monospace); }
 .wb-review-tray-comment { flex: 1; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -2366,7 +2371,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
   flex: 0 0 auto;
   padding: 1px 6px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   border: var(--hairline-width) solid var(--border-default);
 }
 .wb-verify-badge.ok { color: var(--success); border-color: var(--success); }
@@ -2374,7 +2379,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
 
 /* N5 P1：暂存勾选与批量操作 */
 .wb-index-actions { display: flex; align-items: center; gap: 6px; padding: 6px 0; }
-.wb-index-busy { font-size: 12px; color: var(--text-tertiary); }
+.wb-index-busy { font-size: var(--fs-sm); color: var(--text-tertiary); }
 .wb-stage { display: inline-flex; align-items: center; }
 .wb-stage input { cursor: pointer; }
 .wb-stage input:disabled { cursor: progress; }
@@ -2389,15 +2394,15 @@ async function openWithSystem(entry: ProjectFileEntry) {
   background: var(--bg-page);
   color: var(--text-primary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wb-commit-actions { display: flex; align-items: center; gap: 8px; }
-.wb-commit-hint { font-size: 12px; color: var(--text-secondary); }
-.wb-commit-warn { font-size: 12px; color: var(--warning); }
-.wb-commit-actions .wb-btn-primary { margin-left: auto; }
+.wb-commit-hint { font-size: var(--fs-sm); color: var(--text-secondary); }
+.wb-commit-warn { font-size: var(--fs-sm); color: var(--warning); }
+.wb-commit-actions .wb-btn-primary { margin-inline-start: auto; }
 .wb-commit-actions .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 /* N5 P3：分支栏 */
-.wb-branch-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 0; font-size: 12px; }
+.wb-branch-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 6px 0; font-size: var(--fs-sm); }
 .wb-branch-current { color: var(--text-secondary); }
 .wb-branch-bar select,
 .wb-branch-new {
@@ -2407,7 +2412,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
   background: var(--bg-page);
   color: var(--text-primary);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wb-branch-new { width: 140px; }
 .wb-branch-bar .wb-btn:disabled { opacity: 0.5; cursor: not-allowed; }
