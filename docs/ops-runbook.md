@@ -92,6 +92,14 @@ DLQ 增长、限流降级、内存异常）。先接这组，再按事故复盘�
 | 上传失败 | 反代 `client_max_body_size`、读超时 | 反代与网关 `READ_TIMEOUT` 都要放宽；分片上传受每片限制 |
 | 磁盘涨 | 检查点/媒体/知识库/日志 | 后台 retention 只覆盖 usage/shares/checkpoints/turns；其余按第 8 节手工治理 |
 | 知识库索引失败（`summary generation failed` / `MissingSessionID`） | 索引模型端点 / 摘要并发 / provider 头 | OpenCode 系 provider 必须带 `x-opencode-session`（适配器已自动注入）；默认摘要并发 4，可把 `KNOWLEDGE_SUMMARY_CONCURRENCY` 降到 1–2 后重建；仍失败则查模型上下文窗口 |
+| 工作台 Git 写入返回 `git_busy` | 项目写锁 / 活跃 run | 写操作与 Agent 回合互斥：等本轮 run 结束再试；锁带 TTL，不要手工删锁 |
+| 工作台 Git 写入返回 `git_dirty` / `git_not_repo` / `git_client_unsupported` | 工作区状态 / 项目类型 | 切分支要求工作区干净（先提交或丢弃）；client 项目与团队普通成员当前不开放写操作 |
+
+**Git 写操作（N5）补充**：全部由用户触发，审计事件为
+`project.git.stage/unstage/commit/discard/branch`（只记项目与文件数，不记改动内容）；
+执行时禁用仓库 hook/filter/签名，路径只接受当前 status 条目；**不提供 push**。
+丢弃（discard）先 `stash push --keep-index` 再回退工作区，误丢可用 `git stash list` 找回；
+未跟踪文件不提供丢弃（无基线可回退）。
 
 ## 7. 密钥轮换
 
