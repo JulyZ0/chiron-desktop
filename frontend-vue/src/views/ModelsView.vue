@@ -626,8 +626,8 @@ onMounted(async () => {
   display: flex; align-items: flex-start; justify-content: space-between;
   gap: 16px; flex-wrap: wrap; margin-bottom: 12px;
 }
-.mv-title { margin: 0; font-size: 16px; font-weight: var(--fw-semibold); }
-.mv-sub { margin: 4px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.mv-title { margin: 0; font-size: var(--fs-lg); font-weight: var(--fw-semibold); }
+.mv-sub { margin: 4px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .mv-actions { display: flex; align-items: center; gap: 8px; }
 .mv-search { width: 220px; }
 
@@ -636,9 +636,9 @@ onMounted(async () => {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   padding: 8px 10px; margin-bottom: 8px;
   border: var(--hairline-width) solid var(--border-subtle); border-radius: var(--radius-lg);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
-.mv-picked { font-size: 12px; color: var(--text-tertiary); }
+.mv-picked { font-size: var(--fs-sm); color: var(--text-tertiary); }
 .mv-grow { flex: 1; }
 
 /* 行 = CSS grid：分组后每组各自成块，用 grid 而不是多个 <table> 才能保持列对齐 */
@@ -648,10 +648,10 @@ onMounted(async () => {
   align-items: center; gap: 8px;
   padding: 6px 10px;
   border-bottom: var(--hairline-width) solid var(--border-subtle);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 .mv-row:last-child { border-bottom: 0; }
-.mv-row-head { color: var(--text-tertiary); font-size: 12px; font-weight: var(--fw-medium); border-bottom: var(--hairline-width) solid var(--border-subtle); }
+.mv-row-head { color: var(--text-tertiary); font-size: var(--fs-sm); font-weight: var(--fw-medium); border-bottom: var(--hairline-width) solid var(--border-subtle); }
 .mv-name { font-family: var(--font-mono, monospace); overflow-wrap: anywhere; }
 .mv-display { color: var(--text-secondary); overflow-wrap: anywhere; }
 /* 失活行（CDS v2 §2.2）：文字降级，而行内的开关/输入框仍保持满亮度 ——
@@ -681,13 +681,13 @@ onMounted(async () => {
 }
 .mv-toggle:hover { color: var(--primary); }
 .mv-provider { margin: 0; }
-.mv-sub-label { font-family: var(--font-mono, monospace); font-size: 12px; }
-.mv-sum { font-size: 12px; color: var(--text-tertiary); white-space: nowrap; }
+.mv-sub-label { font-family: var(--font-mono, monospace); font-size: var(--fs-sm); }
+.mv-sum { font-size: var(--fs-sm); color: var(--text-tertiary); white-space: nowrap; }
 .mv-quick { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
 .mv-quick :deep(.ant-btn) { padding-inline: 4px; }
 
 .mv-form { display: flex; flex-direction: column; gap: 6px; }
-.mv-form label { font-size: 12px; color: var(--text-tertiary); margin-top: 6px; }
+.mv-form label { font-size: var(--fs-sm); color: var(--text-tertiary); margin-top: 6px; }
 .mv-full { width: 100%; }
-.mv-hint { margin: 8px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.mv-hint { margin: 8px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); }
 </style>

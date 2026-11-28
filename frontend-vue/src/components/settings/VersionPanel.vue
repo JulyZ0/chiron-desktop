@@ -228,15 +228,15 @@ async function install() {
 .version-title { font-weight: var(--fw-semibold); color: var(--text-primary); margin-bottom: 12px; }
 .version-line { display: flex; align-items: center; gap: 10px; }
 .version-badge {
-  font-size: 12px; color: var(--text-secondary);
+  font-size: var(--fs-sm); color: var(--text-secondary);
   border: 1px solid var(--border-card, var(--border));
   border-radius: 999px; padding: 2px 8px;
 }
-.version-number { font-size: 22px; font-variant-numeric: tabular-nums; }
-.version-meta { margin-top: 6px; font-size: 12px; color: var(--text-tertiary); }
-.version-hint { margin: 0 0 12px; color: var(--text-secondary); font-size: 13px; line-height: 1.7; }
+.version-number { font-size: var(--fs-2xl); font-variant-numeric: tabular-nums; }
+.version-meta { margin-top: 6px; font-size: var(--fs-sm); color: var(--text-tertiary); }
+.version-hint { margin: 0 0 12px; color: var(--text-secondary); font-size: var(--fs-sm); line-height: 1.7; }
 .version-actions { display: flex; gap: 10px; flex-wrap: wrap; }
-.version-result { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--text-secondary); }
+.version-result { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; font-size: var(--fs-sm); color: var(--text-secondary); }
 .version-result a { color: var(--primary); }
 .version-progress { margin-top: 14px; }
 .version-progress :deep(.ant-progress) { margin-bottom: 6px; }

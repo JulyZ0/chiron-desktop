@@ -569,7 +569,7 @@ function todoStatusLabel(status?: string): string {
   font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-tertiary);
 }
 .result-head {
- display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 0; border: none; background: none; color: var(--text-tertiary); cursor: pointer; font-size: var(--fs-xs); 
+ display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 0; border: none; background: none; color: var(--text-tertiary); cursor: pointer; font-size: var(--fs-xs);
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .result-head:hover { color: var(--primary); }
@@ -613,7 +613,7 @@ function todoStatusLabel(status?: string): string {
 .diff-line.file { color: var(--text-tertiary); background: var(--bg-secondary); }
 .diff-line.context { color: var(--text-secondary); }
 .diff-more {
- width: 100%; padding: 6px; border: none; border-top: var(--hairline-width) solid var(--border-card); background: var(--bg-secondary); color: var(--text-secondary); font-size: var(--fs-xs); cursor: pointer; 
+ width: 100%; padding: 6px; border: none; border-top: var(--hairline-width) solid var(--border-card); background: var(--bg-secondary); color: var(--text-secondary); font-size: var(--fs-xs); cursor: pointer;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .diff-more:hover { color: var(--primary); }

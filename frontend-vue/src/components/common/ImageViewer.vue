@@ -332,14 +332,14 @@ onBeforeUnmount(() => {
   background: var(--viewer-scrim);
   color: var(--on-solid);
 }
-.viewer-name { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-.viewer-count { font-size: 12px; font-variant-numeric: tabular-nums; opacity: 0.75; }
-.viewer-percent { min-width: 44px; text-align: end; font-size: 12px; font-variant-numeric: tabular-nums; opacity: 0.75; }
+.viewer-name { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
+.viewer-count { font-size: var(--fs-sm); font-variant-numeric: tabular-nums; opacity: 0.75; }
+.viewer-percent { min-width: 44px; text-align: end; font-size: var(--fs-sm); font-variant-numeric: tabular-nums; opacity: 0.75; }
 .viewer-btn {
   display: inline-flex; align-items: center; justify-content: center;
   min-width: 28px; height: 28px; padding: 0 6px;
   border: none; border-radius: var(--radius-sm);
-  background: none; color: inherit; font-size: 12px; cursor: pointer;
+  background: none; color: inherit; font-size: var(--fs-sm); cursor: pointer;
   text-decoration: none;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
@@ -377,7 +377,7 @@ onBeforeUnmount(() => {
   width: 40px; height: 40px; padding: 0;
   border: none; border-radius: var(--radius-full);
   background: var(--viewer-scrim); color: var(--on-solid);
-  font-size: 16px; cursor: pointer;
+  font-size: var(--fs-lg); cursor: pointer;
   transform: translateY(-50%);
   opacity: 0.6; transition: opacity var(--dur-fast) var(--ease-out);
 }

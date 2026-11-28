@@ -115,13 +115,13 @@ const wrapClass = computed(() => [
 .empty-state--page .empty-state-icon :deep(svg) { width: 36px; height: 36px; }
 
 .empty-state-desc {
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-medium);
   color: var(--text-secondary);
 }
 .empty-state-hint {
   margin-top: 4px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   max-width: 360px;
   line-height: 20px;

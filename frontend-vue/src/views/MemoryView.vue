@@ -1037,12 +1037,12 @@ function pct(n: number): string {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 24px;
+  font-size: var(--fs-3xl);
   font-weight: var(--fw-bold);
   letter-spacing: -0.01em;
 }
 .title .subtitle {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-regular);
   color: var(--text-secondary, #888);
 }
@@ -1051,7 +1051,7 @@ function pct(n: number): string {
 }
 .result-section-title {
   margin: 18px 0 8px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--text-secondary, #888);
 }
@@ -1076,7 +1076,7 @@ function pct(n: number): string {
   line-height: 1.5;
 }
 .entry-meta {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary, #888);
 }
 
@@ -1089,7 +1089,7 @@ function pct(n: number): string {
     width: 100% !important;
   }
   .title {
-    font-size: 20px;
+    font-size: var(--fs-2xl);
   }
   .title .subtitle {
     display: none;

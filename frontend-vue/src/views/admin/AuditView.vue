@@ -222,7 +222,7 @@ onMounted(load)
   height: 32px;
   padding-inline: 10px;
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   background: var(--bg-card);
   border: var(--hairline-width) solid var(--border);
@@ -235,7 +235,7 @@ onMounted(load)
   text-overflow: ellipsis;
   white-space: nowrap;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 </style>

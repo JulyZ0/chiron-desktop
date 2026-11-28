@@ -549,28 +549,28 @@ defineExpose({ refresh })
 <style scoped>
 .proj-panel { display: flex; flex-direction: column; min-height: 0; flex: 1; }
 .proj-toolbar { flex: none; display: flex; align-items: center; justify-content: space-between; padding: 6px 12px 2px; }
-.proj-heading { font-size: 12px; font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
+.proj-heading { font-size: var(--fs-sm); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
 .proj-scroll { flex: 1; overflow-y: auto; padding: 4px 6px 12px; scrollbar-width: thin; scrollbar-color: var(--text-disabled) transparent; }
-.proj-empty { padding: 16px 10px; text-align: center; color: var(--text-tertiary); font-size: 12px; }
+.proj-empty { padding: 16px 10px; text-align: center; color: var(--text-tertiary); font-size: var(--fs-sm); }
 .proj-empty.is-inline { padding: 8px 10px; text-align: start; }
 .proj-group { margin-bottom: 2px; }
 .proj-row { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: var(--radius-sm, 6px); cursor: pointer; }
 .proj-row:hover { background: var(--bg-hover); }
 .proj-row.is-static { cursor: default; }
-.proj-caret { width: 12px; flex: none; font-size: 10px; color: var(--text-tertiary); }
+.proj-caret { width: 12px; flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); }
 .proj-icon { flex: none; color: var(--text-secondary); }
 .proj-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-.proj-name { font-size: 13px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.proj-path { font-size: 11px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: ltr; }
-.proj-count { flex: none; font-size: 11px; color: var(--text-tertiary); min-width: 16px; text-align: center; }
-.proj-act { flex: none; font-size: 11px; padding: 0 4px; color: var(--text-secondary); }
+.proj-name { font-size: var(--fs-sm); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-path { font-size: var(--fs-xs); color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: ltr; }
+.proj-count { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); min-width: 16px; text-align: center; }
+.proj-act { flex: none; font-size: var(--fs-xs); padding: 0 4px; color: var(--text-secondary); }
 .proj-act.is-danger { color: var(--color-danger, var(--text-secondary)); }
 .proj-children { padding-inline-start: 24px; }
 .proj-session { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: var(--radius-sm, 6px); cursor: pointer; }
 .proj-session:hover { background: var(--bg-hover); }
-.proj-session-title { flex: 1; min-width: 0; font-size: 12px; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.proj-session-time { flex: none; font-size: 11px; color: var(--text-tertiary); }
-.proj-new-session { padding-inline-start: 4px; font-size: 12px; }
-.proj-assign { flex: none; max-width: 84px; font-size: 11px; color: var(--text-secondary); background: transparent; border: 1px solid var(--border-color); border-radius: var(--radius-sm, 6px); padding: 1px 2px; }
-.proj-hint { margin-top: 8px; font-size: 12px; color: var(--text-tertiary); }
+.proj-session-title { flex: 1; min-width: 0; font-size: var(--fs-sm); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-session-time { flex: none; font-size: var(--fs-xs); color: var(--text-tertiary); }
+.proj-new-session { padding-inline-start: 4px; font-size: var(--fs-sm); }
+.proj-assign { flex: none; max-width: 84px; font-size: var(--fs-xs); color: var(--text-secondary); background: transparent; border: 1px solid var(--border-color); border-radius: var(--radius-sm, 6px); padding: 1px 2px; }
+.proj-hint { margin-top: 8px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 </style>

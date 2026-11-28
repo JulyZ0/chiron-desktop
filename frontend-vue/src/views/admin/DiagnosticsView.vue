@@ -399,11 +399,11 @@ onMounted(load)
 
 <style scoped>
 .diagnostics-view { padding: 4px; }
-.page-desc { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
+.page-desc { margin: 4px 0 0; font-size: var(--fs-sm); color: var(--text-secondary); }
 .summary { margin-bottom: 16px; }
 .summary-section { margin-bottom: 18px; }
 .summary-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-.summary-desc { font-size: 12px; color: var(--text-secondary); }
+.summary-desc { font-size: var(--fs-sm); color: var(--text-secondary); }
 /* auto-fit + minmax：窄屏自动降成单列，不需要媒体查询；RTL 下 grid 顺序自动镜像。 */
 .summary-grid {
   display: grid;
@@ -426,10 +426,10 @@ onMounted(load)
 .summary-card--unknown { border-inline-start-color: var(--text-secondary); }
 .summary-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .summary-card-title { font-weight: var(--fw-medium); }
-.summary-card-detail { font-size: 12px; color: var(--text-secondary); margin-top: 4px; word-break: break-word; }
-.summary-card-fix { display: flex; gap: 6px; font-size: 12px; margin-top: 6px; padding: 6px 8px; border-radius: var(--radius-md); border: 1px dashed var(--border); }
+.summary-card-detail { font-size: var(--fs-sm); color: var(--text-secondary); margin-top: 4px; word-break: break-word; }
+.summary-card-fix { display: flex; gap: 6px; font-size: var(--fs-sm); margin-top: 6px; padding: 6px 8px; border-radius: var(--radius-md); border: 1px dashed var(--border); }
 .group { margin-bottom: 18px; }
-.group-title { font-size: 13px; font-weight: var(--fw-semibold); margin: 0 0 8px; color: var(--text-secondary); }
+.group-title { font-size: var(--fs-sm); font-weight: var(--fw-semibold); margin: 0 0 8px; color: var(--text-secondary); }
 .check-row { display: flex; gap: 10px; padding: 10px 12px; border: var(--hairline-width) solid var(--border); border-radius: var(--radius-lg); margin-bottom: 8px; background: var(--bg-card); }
 .check-status { flex: 0 0 auto; width: 18px; text-align: center; font-weight: var(--fw-bold); line-height: 20px; }
 .check-row--ok .check-status { color: var(--success); }
@@ -438,9 +438,9 @@ onMounted(load)
 .check-body { flex: 1 1 auto; min-width: 0; }
 .check-head { display: flex; align-items: center; gap: 8px; }
 .check-title { font-weight: var(--fw-medium); }
-.check-detail { font-size: 12px; color: var(--text-secondary); margin-top: 2px; word-break: break-word; }
-.check-fix { display: flex; gap: 6px; font-size: 12px; margin-top: 6px; padding: 6px 8px; border-radius: var(--radius-md); background: var(--bg-subtle, transparent); border: 1px dashed var(--border); }
-.group-desc { margin: 0 0 8px; font-size: 12px; color: var(--text-secondary); }
+.check-detail { font-size: var(--fs-sm); color: var(--text-secondary); margin-top: 2px; word-break: break-word; }
+.check-fix { display: flex; gap: 6px; font-size: var(--fs-sm); margin-top: 6px; padding: 6px 8px; border-radius: var(--radius-md); background: var(--bg-subtle, transparent); border: 1px dashed var(--border); }
+.group-desc { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-secondary); }
 /* 五行定宽用 grid：各行的状态 Tag 才能上下对齐（flex + 不等宽内容会错位）。
    `text-align: end` 等逻辑值在 RTL 下自动翻转，不用写 right/left。 */
 .breaker-row {
@@ -458,10 +458,10 @@ onMounted(load)
   border-color: transparent;
   background: transparent;
   margin-bottom: 4px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 .breaker-provider { font-weight: var(--fw-medium); word-break: break-all; }
-.breaker-latency { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.breaker-latency { font-size: var(--fs-sm); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 .breaker-action { text-align: end; }
 </style>

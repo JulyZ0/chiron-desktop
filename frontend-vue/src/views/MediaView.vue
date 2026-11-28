@@ -2215,7 +2215,7 @@ onUnmounted(() => {
           v-if="uploadingFiles.size > 0"
           class="upload-progress-list"
         >
-          <h4 style="margin: 16px 0 8px; font-size: 14px;">
+          <h4 style="margin: 16px 0 8px; font-size: var(--fs-base);">
             {{ $t('common.upload_progress') }}
           </h4>
           <div 
@@ -2333,35 +2333,35 @@ onUnmounted(() => {
       <p>{{ $t('common.will_be') }} <strong>{{ selectedIds.size }}</strong> {{ $t('media.files_with_the_following_rules') }}</p>
       <div style="margin-top: 16px; display: flex; flex-direction: column; gap: 12px;">
         <div>
-          <label style="display: block; margin-bottom: 4px; font-size: 13px; color: var(--text-muted);">{{ $t('common.prefix') }}</label>
+          <label style="display: block; margin-bottom: 4px; font-size: var(--fs-sm); color: var(--text-muted);">{{ $t('common.prefix') }}</label>
           <Input
             v-model:value="renamePrefix"
             :placeholder="$t('common.e_g_project_a')"
           />
         </div>
         <div>
-          <label style="display: block; margin-bottom: 4px; font-size: 13px; color: var(--text-muted);">{{ $t('common.suffix') }}</label>
+          <label style="display: block; margin-bottom: 4px; font-size: var(--fs-sm); color: var(--text-muted);">{{ $t('common.suffix') }}</label>
           <Input
             v-model:value="renameSuffix"
             :placeholder="$t('common.e_g_v2')"
           />
         </div>
         <div>
-          <label style="display: block; margin-bottom: 4px; font-size: 13px; color: var(--text-muted);">{{ $t('common.find_text') }}</label>
+          <label style="display: block; margin-bottom: 4px; font-size: var(--fs-sm); color: var(--text-muted);">{{ $t('common.find_text') }}</label>
           <Input
             v-model:value="renameFindText"
             :placeholder="$t('common.text_to_replace_regex_supported')"
           />
         </div>
         <div>
-          <label style="display: block; margin-bottom: 4px; font-size: 13px; color: var(--text-muted);">{{ $t('common.replace_with') }}</label>
+          <label style="display: block; margin-bottom: 4px; font-size: var(--fs-sm); color: var(--text-muted);">{{ $t('common.replace_with') }}</label>
           <Input
             v-model:value="renameReplaceText"
             :placeholder="$t('common.replaced_text')"
           />
         </div>
       </div>
-      <div style="margin-top: 12px; padding: 8px; background: var(--bg-secondary); border-radius: var(--radius-sm); font-size: 12px; color: var(--text-tertiary);">
+      <div style="margin-top: 12px; padding: 8px; background: var(--bg-secondary); border-radius: var(--radius-sm); font-size: var(--fs-sm); color: var(--text-tertiary);">
         <strong>{{ $t('common.example') }}</strong>{{ $t('media.original_report_pdf_prefix_2024_suffix_final_2024_report_final_pdf') }}
       </div>
     </Modal>
@@ -2382,7 +2382,7 @@ onUnmounted(() => {
           @press-enter="submitBatchTags"
         />
       </div>
-      <div style="margin-top: 8px; font-size: 12px; color: var(--text-tertiary);">
+      <div style="margin-top: 8px; font-size: var(--fs-sm); color: var(--text-tertiary);">
         {{ $t('media.tip_if_the_file_already_has_this_tag_it_will_be_skipped_automatically') }}
       </div>
     </Modal>
@@ -2399,7 +2399,7 @@ onUnmounted(() => {
   justify-content: center;
   gap: 6px;
   padding: 2px 6px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 16px;
   color: var(--scrim-text, var(--text-inverse));
   background: var(--bg-overlay);
@@ -2408,7 +2408,7 @@ onUnmounted(() => {
 }
 .thumb-retry {
   padding: 0 4px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: inherit;
   background: transparent;
   border: 1px solid currentColor;
@@ -2422,7 +2422,7 @@ onUnmounted(() => {
 .media-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .breadcrumb { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .crumb {
- font-size: 14px; color: var(--text-secondary); cursor: pointer; white-space: nowrap; 
+ font-size: var(--fs-base); color: var(--text-secondary); cursor: pointer; white-space: nowrap;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .crumb:hover { color: var(--primary); }
@@ -2443,9 +2443,9 @@ onUnmounted(() => {
 .file-card.selected { box-shadow: inset 0 0 0 2px var(--primary); background: var(--primary-bg); }
 .card-thumb { height: 84px; display: flex; align-items: center; justify-content: center; border-radius: var(--radius-md); background: var(--bg-secondary); overflow: hidden; }
 .card-thumb img { max-width: 100%; max-height: 100%; object-fit: cover; }
-.thumb-icon { font-size: 32px; color: var(--text-tertiary); }
+.thumb-icon { font-size: var(--fs-5xl); color: var(--text-tertiary); }
 .thumb-icon.folder { color: var(--primary); }
-.card-name { font-size: 13px; color: var(--text-primary); display: flex; min-width: 0; }
+.card-name { font-size: var(--fs-sm); color: var(--text-primary); display: flex; min-width: 0; }
 /* 中间截断：卡片只有 140px 宽，尾部截断会把扩展名整个吃掉（`report-2024-final.pdf`
    → `report-202…`），一眼看不出是什么文件。让尾部（含扩展名）固定不缩、头部先缩，
    于是显示成 `report-2…pdf`。头部的省略号由自己承担，不再用父级的 text-overflow。 */
@@ -2455,26 +2455,26 @@ onUnmounted(() => {
 .pagination-bar { display: flex; justify-content: flex-end; padding-top: 8px; border-top: var(--hairline-width) solid var(--border); }
 :deep(.row-selected) { background: var(--primary-bg) !important; }
 .batch-bar { position: sticky; top: 0; z-index: var(--z-sticky); display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: var(--bg-card); border: var(--hairline-width) solid var(--primary); border-radius: var(--radius-md); box-shadow: var(--shadow-md); }
-.batch-count { font-size: 13px; color: var(--text-primary); }
+.batch-count { font-size: var(--fs-sm); color: var(--text-primary); }
 .card-check { position: absolute; top: 6px; left: 6px; }
 .file-card { position: relative; }
 .detail-thumb { height: 160px; display: flex; align-items: center; justify-content: center; background: var(--bg-secondary); border-radius: var(--radius-lg); margin-bottom: 16px; overflow: hidden; }
 .detail-thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
 .detail-info { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
-.detail-row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+.detail-row { display: flex; justify-content: space-between; gap: 12px; font-size: var(--fs-sm); }
 .detail-row .label { color: var(--text-muted); flex-shrink: 0; }
 .url-text { word-break: break-all; color: var(--text-secondary); }
 .detail-actions { display: flex; flex-direction: column; gap: 8px; }
 .share-row { display: flex; gap: 8px; }
-.share-expires { margin-top: 8px; font-size: 12px; color: var(--text-muted); }
+.share-expires { margin-top: 8px; font-size: var(--fs-sm); color: var(--text-muted); }
 .preview-shell { height: 75vh; min-height: 400px; border-radius: var(--radius-sm); overflow: hidden; }
 /* 新功能样式：总数/标签/移动树/灯箱/新建文件夹 */
-.media-total { margin-inline-start: auto; font-size: 12px; color: var(--text-tertiary); white-space: nowrap; }
+.media-total { margin-inline-start: auto; font-size: var(--fs-sm); color: var(--text-tertiary); white-space: nowrap; }
 .tag-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-.no-tags { font-size: 12px; color: var(--text-muted); }
+.no-tags { font-size: var(--fs-sm); color: var(--text-muted); }
 .tag-add { margin-top: 6px; }
 .move-tree { max-height: 320px; overflow-y: auto; border: var(--hairline-width) solid var(--border); border-radius: var(--radius-lg); padding: 8px; }
-.folder-hint { margin-top: 8px; font-size: 12px; color: var(--text-tertiary); }
+.folder-hint { margin-top: 8px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .lightbox { position: relative; display: flex; align-items: center; justify-content: center; min-height: 60vh; }
 .lb-img { max-width: 82%; max-height: 72vh; object-fit: contain; border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); }
 .lb-btn {
@@ -2484,7 +2484,7 @@ onUnmounted(() => {
 .lb-prev { left: 8px; }
 .lb-next { right: 8px; }
 .lb-btn:hover { color: var(--primary); border-color: var(--primary); }
-.lb-meta { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 4px 12px; border-radius: var(--radius-full); background: var(--bg-overlay); color: var(--on-solid); font-size: 12px; }
+.lb-meta { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 4px 12px; border-radius: var(--radius-full); background: var(--bg-overlay); color: var(--on-solid); font-size: var(--fs-sm); }
 .lb-name { max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lb-count { color: var(--on-viewer-strong); }
 .lb-close {
@@ -2538,8 +2538,8 @@ onUnmounted(() => {
   text-align: center;
 }
 .drop-overlay-icon { font-size: 40px; color: var(--primary); }
-.drop-overlay-title { font-size: 16px; font-weight: var(--fw-semibold); color: var(--text-primary); }
-.drop-overlay-hint { font-size: 12px; color: var(--text-tertiary); }
+.drop-overlay-title { font-size: var(--fs-lg); font-weight: var(--fw-semibold); color: var(--text-primary); }
+.drop-overlay-hint { font-size: var(--fs-sm); color: var(--text-tertiary); }
 
 /* 上传进度列表样式 */
 .upload-container { display: flex; flex-direction: column; gap: 12px; }
@@ -2558,7 +2558,7 @@ onUnmounted(() => {
   margin-bottom: 6px; 
 }
 .upload-filename { 
-  font-size: 13px; 
+  font-size: var(--fs-sm);
   color: var(--text-primary); 
   white-space: nowrap; 
   overflow: hidden; 
@@ -2566,7 +2566,7 @@ onUnmounted(() => {
   max-width: 70%;
 }
 .upload-status { 
-  font-size: 12px; 
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
 }
 .upload-status.uploading { color: var(--primary); }
@@ -2574,7 +2574,7 @@ onUnmounted(() => {
 .upload-status.error { color: var(--error); }
 .upload-error-detail { 
   margin-top: 6px; 
-  font-size: 12px; 
+  font-size: var(--fs-sm);
   color: var(--error); 
   padding: 4px 8px; 
   background: var(--error-bg); 

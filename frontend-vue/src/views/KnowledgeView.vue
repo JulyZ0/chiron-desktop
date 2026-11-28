@@ -707,11 +707,11 @@ function statusLabel(status: string): string {
 
 <style scoped>
 .kb-page { max-width: 1080px; margin: 0 auto; padding: 28px 24px 60px; }
-.page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: 13px; }
+.page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: var(--fs-sm); }
 .list-toolbar { margin-bottom: 16px; }
 .page-empty { padding: 60px 0; }
 .kb-sections { display: flex; flex-direction: column; gap: 24px; }
-.section-title { font-size: 15px; font-weight: var(--fw-semibold); color: var(--text-secondary); margin: 0 0 10px; }
+.section-title { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--text-secondary); margin: 0 0 10px; }
 .kb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
 .kb-card {
   display: flex; flex-direction: column; gap: 10px;
@@ -725,9 +725,9 @@ function statusLabel(status: string): string {
 }
 .kb-card:hover { transform: translateY(-2px); border-color: var(--primary); box-shadow: var(--shadow-lg); }
 .kb-card.public { border-inline-start: 3px solid var(--warning); }
-.kb-name { display: block; font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+.kb-name { display: block; font-size: var(--fs-base); font-weight: var(--fw-semibold); color: var(--text-primary); }
 .kb-desc {
-  display: block; margin-top: 3px; font-size: 12px; color: var(--text-tertiary);
+  display: block; margin-top: 3px; font-size: var(--fs-sm); color: var(--text-tertiary);
   line-height: 1.5; overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
   -webkit-line-clamp: 2; -webkit-box-orient: vertical;
 }
@@ -735,8 +735,8 @@ function statusLabel(status: string): string {
 .kb-stats { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 /* 命中率是唯一带数字结论的统计项：字色稍深，避免和"文档数/体积"混成一片灰 */
 .kb-hit-rate { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
-.stat { font-size: 12px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
-.stat :deep(svg) { font-size: 12px; color: var(--text-tertiary); }
+.stat { font-size: var(--fs-sm); color: var(--text-secondary); display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
+.stat :deep(svg) { font-size: var(--fs-sm); color: var(--text-tertiary); }
 /* 启用开关：与其它 stat 同一行时垂直居中，文字与开关之间留一点呼吸 */
 .kb-enabled-toggle { gap: 6px; cursor: pointer; user-select: none; }
 .kb-footer { display: flex; justify-content: space-between; align-items: center; border-top: var(--hairline-width) solid var(--border-card); padding-top: 10px; }

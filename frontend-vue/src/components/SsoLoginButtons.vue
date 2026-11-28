@@ -90,7 +90,7 @@ function startSso(p: SsoPublicProvider) {
   gap: 12px;
   margin: 16px 0;
   color: var(--text-tertiary, var(--bg-overlay));
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .sso-divider::before,
@@ -120,7 +120,7 @@ function startSso(p: SsoPublicProvider) {
   border-radius: var(--radius-lg);
   background: var(--bg-card, var(--on-solid));
   color: var(--text-primary, rgba(0, 0, 0, 0.88));
-  font-size: 14px;
+  font-size: var(--fs-base);
   cursor: pointer;
   transition: border-color var(--dur-normal), box-shadow var(--dur-normal);
 }

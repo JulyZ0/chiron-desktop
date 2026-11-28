@@ -52,13 +52,13 @@ const router = useRouter()
 }
 .nf-title {
   margin: 0;
-  font-size: 20px;
+  font-size: var(--fs-2xl);
   color: var(--text-primary);
 }
 .nf-desc {
   margin: 0 0 16px;
   color: var(--text-tertiary);
-  font-size: 14px;
+  font-size: var(--fs-base);
 }
 .nf-actions {
   display: flex;

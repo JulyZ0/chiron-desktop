@@ -325,7 +325,7 @@ function formatSize(bytes: number): string {
 }
 .doc-name {
   font-weight: var(--fw-semibold);
-  font-size: 15px;
+  font-size: var(--fs-md);
   color: var(--text-primary);
 }
 .doc-type {
@@ -337,7 +337,7 @@ function formatSize(bytes: number): string {
   color: var(--text-secondary);
 }
 .doc-size {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 .doc-content {
@@ -352,7 +352,7 @@ function formatSize(bytes: number): string {
   padding: 10px 14px;
   background: var(--bg-secondary);
   border-bottom: var(--hairline-width) solid var(--border-card);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 .content-label {
   font-weight: var(--fw-medium);
@@ -360,18 +360,18 @@ function formatSize(bytes: number): string {
 }
 .content-chunks {
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .content-truncated {
   margin: 6px 0 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary, #8a8f98);
 }
 
 .content-body {
   margin: 0;
   padding: 14px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-primary);
   white-space: pre-wrap;
@@ -392,12 +392,12 @@ function formatSize(bytes: number): string {
 }
 .content-more-error {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--color-danger, var(--text-secondary));
 }
 .content-more-btn {
   padding: 4px 14px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--text-primary);
   background: var(--bg-card);
@@ -413,7 +413,7 @@ function formatSize(bytes: number): string {
   opacity: 0.6;
 }
 .content-more-loading {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 </style>

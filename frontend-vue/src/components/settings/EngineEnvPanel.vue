@@ -255,7 +255,7 @@ onMounted(() => {
 }
 
 .engine-env-restart-text {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--chiron-text-secondary, rgba(0, 0, 0, 0.65));
 }
@@ -277,12 +277,12 @@ onMounted(() => {
 }
 
 .engine-env-label {
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: 500;
 }
 
 .engine-env-desc {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.55;
   color: var(--chiron-text-secondary, rgba(0, 0, 0, 0.65));
 }
@@ -295,7 +295,7 @@ onMounted(() => {
 }
 
 .engine-env-default {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--chiron-text-tertiary, rgba(0, 0, 0, 0.45));
 }
 
@@ -306,7 +306,7 @@ onMounted(() => {
 }
 
 .engine-env-name {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--chiron-text-tertiary, rgba(0, 0, 0, 0.45));
   user-select: text;
 }

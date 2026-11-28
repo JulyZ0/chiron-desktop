@@ -174,13 +174,13 @@ async function logout() {
 
 .password-title {
   margin: 0 0 8px;
-  font-size: 22px;
+  font-size: var(--fs-2xl);
   color: var(--text-primary);
 }
 
 .password-subtitle {
   margin: 0 0 20px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
@@ -191,7 +191,7 @@ async function logout() {
 }
 
 .password-label {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--text-primary);
 }

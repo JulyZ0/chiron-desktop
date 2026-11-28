@@ -1053,7 +1053,7 @@ async function installDiscovered(item: DiscoveredSkill) {
 
 <style scoped>
 .skills-page { max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }
-.page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: 13px; }
+.page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: var(--fs-sm); }
 .skills-tabs :deep(.ant-tabs-nav) { margin-bottom: 16px; }
 
 /* ── 两栏工作台（与 Agents 页同构）── */
@@ -1132,7 +1132,7 @@ async function installDiscovered(item: DiscoveredSkill) {
 .item-icon {
   flex: none; width: 30px; height: 30px; border-radius: var(--radius-md);
   display: inline-flex; align-items: center; justify-content: center;
-  background: var(--primary-bg); color: var(--primary); font-size: 15px;
+  background: var(--primary-bg); color: var(--primary); font-size: var(--fs-md);
 }
 .item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .item-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -1167,7 +1167,7 @@ async function installDiscovered(item: DiscoveredSkill) {
 .detail-icon {
   flex: none; width: 42px; height: 42px; border-radius: var(--sig-radius-card);
   display: inline-flex; align-items: center; justify-content: center;
-  background: var(--primary-bg); color: var(--primary); font-size: 20px;
+  background: var(--primary-bg); color: var(--primary); font-size: var(--fs-2xl);
 }
 .detail-titles { flex: 1; min-width: 0; }
 .detail-name {
@@ -1234,21 +1234,21 @@ async function installDiscovered(item: DiscoveredSkill) {
 .detail-meta { font-size: var(--fs-xs); color: var(--text-tertiary); }
 .detail-tags { display: flex; flex-wrap: wrap; gap: 4px; }
 .card-menu { min-width: 140px; border-radius: var(--sig-radius-card); padding: 4px; box-shadow: var(--shadow-lg); }
-.card-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: var(--radius-md); }
-.menu-icon { font-size: 14px; }
+.card-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); border-radius: var(--radius-md); }
+.menu-icon { font-size: var(--fs-base); }
 
 /* ── 安装 / 发现 / 生成（保持原样，仅统一 token）── */
 .card-name-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.card-name { font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-name { font-size: var(--fs-base); font-weight: var(--fw-semibold); color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .exec-tag { flex: none; }
-.card-desc { display: block; margin-top: 3px; font-size: 12px; color: var(--text-tertiary); line-height: 1.5; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.card-desc { display: block; margin-top: 3px; font-size: var(--fs-sm); color: var(--text-tertiary); line-height: 1.5; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .card-meta { display: flex; flex-wrap: wrap; gap: 4px; }
 .detail-label { font-size: var(--fs-xs); color: var(--text-tertiary); font-weight: var(--fw-medium); }
 
 .panel-card { max-width: 640px; border: var(--hairline-width) solid var(--border-card); border-radius: var(--radius-lg); background: var(--bg-card); box-shadow: var(--shadow-md); padding: 20px; }
-.panel-title { font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+.panel-title { font-size: var(--fs-base); font-weight: var(--fw-semibold); color: var(--text-primary); margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
 .or-divider { text-align: center; color: var(--text-tertiary); margin: 14px 0; }
-.mono-input :deep(textarea) { font-family: var(--font-mono); font-size: 12px; }
+.mono-input :deep(textarea) { font-family: var(--font-mono); font-size: var(--fs-sm); }
 .install-btn { margin-top: 14px; }
 .panel-hint { margin: 8px 0 0; font-size: var(--fs-xs); color: var(--text-tertiary); line-height: 1.5; }
 
@@ -1271,17 +1271,17 @@ async function installDiscovered(item: DiscoveredSkill) {
 .gen-alert { margin-top: 14px; }
 .gen-pre { margin: 12px 0 0; padding: 10px; background: var(--bg-secondary); border-radius: var(--radius-lg); font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-secondary); white-space: pre-wrap; max-height: 260px; overflow-y: auto; }
 
-.run-desc { font-size: 13px; color: var(--text-secondary); margin-bottom: 14px; }
+.run-desc { font-size: var(--fs-sm); color: var(--text-secondary); margin-bottom: 14px; }
 .run-form { display: flex; flex-direction: column; gap: 12px; }
 .run-field { display: flex; flex-direction: column; gap: 6px; }
-.field-label { font-size: 12px; color: var(--text-secondary); font-weight: var(--fw-medium); display: flex; align-items: center; gap: 6px; }
+.field-label { font-size: var(--fs-sm); color: var(--text-secondary); font-weight: var(--fw-medium); display: flex; align-items: center; gap: 6px; }
 .required { color: var(--error); }
 .field-type { font-size: var(--fs-xs); color: var(--text-tertiary); background: var(--bg-secondary); padding: 1px 6px; border-radius: var(--radius-sm); }
-.run-empty { color: var(--text-tertiary); font-size: 13px; padding: 8px 0; }
+.run-empty { color: var(--text-tertiary); font-size: var(--fs-sm); padding: 8px 0; }
 .run-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 .run-result { margin-top: 14px; border: var(--hairline-width) solid var(--border-card); border-radius: var(--sig-radius-card); overflow: hidden; }
-.result-label { padding: 8px 12px; font-size: 12px; color: var(--text-tertiary); background: var(--bg-secondary); border-bottom: var(--hairline-width) solid var(--border-card); }
-.result-pre { margin: 0; padding: 12px; font-family: var(--font-mono); font-size: 12px; line-height: 1.6; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
+.result-label { padding: 8px 12px; font-size: var(--fs-sm); color: var(--text-tertiary); background: var(--bg-secondary); border-bottom: var(--hairline-width) solid var(--border-card); }
+.result-pre { margin: 0; padding: 12px; font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.6; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
 
 /* ── 窄屏：单栏，列表为主；选中后进详情并带返回 ── */
 @media (max-width: 900px) {

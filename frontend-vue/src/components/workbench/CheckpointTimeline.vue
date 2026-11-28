@@ -808,7 +808,7 @@ async function doDeleteNew() {
 </template>
 
 <style scoped>
-.cp-empty { padding: 10px 12px; font-size: 12px; color: var(--text-tertiary); }
+.cp-empty { padding: 10px 12px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 /* 版本控制提示块：它是"还原点为什么记不下来"的唯一解释，视觉上不能与普通空态
    混在一起。用逻辑属性写内外边距，RTL 下同样成立。 */
 .cp-vcs {
@@ -817,18 +817,18 @@ async function doDeleteNew() {
   padding: 8px 10px;
   border-radius: 4px;
   background: var(--bg-card);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .cp-vcs-text {
   color: var(--text-secondary);
   line-height: 1.5;
 }
 .cp-vcs .cp-btn-primary { margin-block-start: 6px; }
-.cp-error { padding: 10px 12px; font-size: 12px; color: var(--danger); }
+.cp-error { padding: 10px 12px; font-size: var(--fs-sm); color: var(--danger); }
 .cp-row {
   padding: 6px 12px;
   border-bottom: var(--hairline-width) solid var(--border-subtle);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .cp-head { display: flex; align-items: center; gap: 6px; }
 .cp-seq { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
@@ -836,7 +836,7 @@ async function doDeleteNew() {
 .cp-label { color: var(--text-secondary); }
 .cp-time { margin-inline-start: auto; color: var(--text-tertiary); }
 .cp-badge {
-  padding: 0 4px; border-radius: 3px; font-size: 11px;
+  padding: 0 4px; border-radius: 3px; font-size: var(--fs-xs);
   background: var(--bg-card); color: var(--text-secondary);
 }
 .cp-badge-warn { color: var(--danger); }
@@ -853,7 +853,7 @@ async function doDeleteNew() {
 .cp-actions { margin-top: 4px; }
 .cp-btn {
   border: none; background: transparent; cursor: pointer;
-  padding: 2px 0; font-size: 12px; color: var(--text-secondary);
+  padding: 2px 0; font-size: var(--fs-sm); color: var(--text-secondary);
 }
 .cp-btn:hover:not(:disabled) { color: var(--text-primary); }
 .cp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
@@ -865,7 +865,7 @@ async function doDeleteNew() {
 }
 .cp-result {
   margin: 8px 12px; padding: 8px;
-  border-radius: 4px; font-size: 12px;
+  border-radius: 4px; font-size: var(--fs-sm);
   background: var(--bg-card); color: var(--text-secondary);
 }
 .cp-result.is-bad { color: var(--danger); }
@@ -877,14 +877,14 @@ async function doDeleteNew() {
 .cp-stats {
   display: flex; flex-wrap: wrap; gap: 8px;
   padding: 6px 12px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
   border-bottom: var(--hairline-width) solid var(--border-subtle);
 }
 /* 预览面板：单独一块，展开时不挤动上面的行 */
 .cp-preview {
   margin: 8px 12px; padding: 8px;
-  border-radius: 4px; font-size: 12px;
+  border-radius: 4px; font-size: var(--fs-sm);
   background: var(--bg-card); color: var(--text-secondary);
 }
 .cp-preview.is-bad { color: var(--danger); }
@@ -903,6 +903,6 @@ async function doDeleteNew() {
 .cp-gc {
   padding: 8px 12px;
   border-top: var(--hairline-width) solid var(--border-subtle);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 </style>

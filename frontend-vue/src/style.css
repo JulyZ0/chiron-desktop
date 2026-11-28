@@ -1750,7 +1750,7 @@ body {
   background: none;
   color: var(--text-secondary);
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   text-align: start;
   border-radius: var(--sig-radius-button);
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
@@ -2392,8 +2392,8 @@ html[data-density='comfortable'] :where(.ant-table-tbody > tr > td, .ant-table-t
    .page-title-sm（20px / semibold）：admin 密集表格页的收敛标题。
    **刻意保留两个规格而不是合成一个** —— 密集页要把标题压下去让数据上位，卡片页要靠标题
    立住信息层级，这是两个场景的两套设计意图，合成会毁掉其中一边。 */
-.page-title { font-size: 24px; font-weight: var(--fw-bold); margin: 0; letter-spacing: -0.01em; color: var(--text-primary); }
-.page-title-sm { font-size: 20px; font-weight: var(--fw-semibold); margin: 0; letter-spacing: -0.01em; }
+.page-title { font-size: var(--fs-3xl); font-weight: var(--fw-bold); margin: 0; letter-spacing: -0.01em; color: var(--text-primary); }
+.page-title-sm { font-size: var(--fs-2xl); font-weight: var(--fw-semibold); margin: 0; letter-spacing: -0.01em; }
 /* flex-wrap 是必需的：窄屏下标题与筛选栏要换行，而不是互相挤压。 */
 .page-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 /* 窄屏：头部允许换行、行间留 12px，按钮撑到触控目标 40px。
@@ -2407,7 +2407,7 @@ html[data-density='comfortable'] :where(.ant-table-tbody > tr > td, .ant-table-t
      且小字号配轻字重更清晰（大字号配 bold、小字号配 semibold 是常规的字号-字重配对）。
      这条规则此前只在 4 个管理页里各自写过一遍（各带一个 .xxx-management 前缀），
      现在提升为所有页面标题的统一行为 —— 卡片页此前在窄屏下仍是 24px，现在一起收敛。 */
-  .page-header .page-title { font-size: 20px; font-weight: var(--fw-semibold); }
+  .page-header .page-title { font-size: var(--fs-2xl); font-weight: var(--fw-semibold); }
 }
 
 /* ── 设计系统原子（卡片头部 / 表单行 / 说明文字）──────────────────────
@@ -2427,11 +2427,11 @@ html[data-density='comfortable'] :where(.ant-table-tbody > tr > td, .ant-table-t
 .card-icon-tile {
   flex: none; width: 36px; height: 36px; border-radius: var(--sig-radius-card);
   background: var(--primary-bg); color: var(--primary);
-  display: inline-flex; align-items: center; justify-content: center; font-size: 17px;
+  display: inline-flex; align-items: center; justify-content: center; font-size: var(--fs-xl);
 }
 .form-row { display: flex; flex-direction: column; gap: 6px; }
-.form-label { font-size: 12px; color: var(--text-secondary); font-weight: var(--fw-medium); }
-.config-note { margin-top: 8px; color: var(--text-tertiary); font-size: 12px; line-height: 1.5; }
+.form-label { font-size: var(--fs-sm); color: var(--text-secondary); font-weight: var(--fw-medium); }
+.config-note { margin-top: 8px; color: var(--text-tertiary); font-size: var(--fs-sm); line-height: 1.5; }
 .search-input { max-width: 320px; }
 
 /* ============================================================ */

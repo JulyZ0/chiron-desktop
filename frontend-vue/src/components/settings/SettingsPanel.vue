@@ -372,20 +372,20 @@ onMounted(async () => {
 .os-account-hint {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
 }
 
 .setting-title {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  font-size: 14px; font-weight: var(--fw-semibold); margin-bottom: 12px;
+  font-size: var(--fs-base); font-weight: var(--fw-semibold); margin-bottom: 12px;
 }
-.setting-hint { font-size: 12px; font-weight: var(--fw-regular); color: var(--text-tertiary); }
+.setting-hint { font-size: var(--fs-sm); font-weight: var(--fw-regular); color: var(--text-tertiary); }
 
 .setting-form { max-width: 360px; }
 
 .appearance-row { display: flex; align-items: center; gap: 16px; padding: 6px 0; flex-wrap: wrap; }
-.appearance-label { font-size: 13px; color: var(--text-secondary); min-width: 72px; }
+.appearance-label { font-size: var(--fs-sm); color: var(--text-secondary); min-width: 72px; }
 .accent-picker { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .accent-swatch {
   width: 26px; height: 26px; border-radius: 50%; box-shadow: inset 0 0 0 2px transparent;
@@ -400,10 +400,10 @@ onMounted(async () => {
 .accent-custom input { position: absolute; inset: -6px; width: 42px; height: 42px; opacity: 0; cursor: pointer; }
 
 .bind-section { margin-top: 16px; }
-.bind-title { font-size: 13px; color: var(--text-tertiary); margin-bottom: 8px; }
+.bind-title { font-size: var(--fs-sm); color: var(--text-tertiary); margin-bottom: 8px; }
 .bind-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 
-.legal-body { font-size: 13px; line-height: 1.7; color: var(--text-secondary); }
+.legal-body { font-size: var(--fs-sm); line-height: 1.7; color: var(--text-secondary); }
 .legal-body p { margin: 0 0 10px; }
 
 /* 窄屏：表单占满宽度 */

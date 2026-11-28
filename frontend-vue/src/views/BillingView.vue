@@ -674,7 +674,7 @@ async function confirmProviderBackfill() {
 <template>
   <div class="billing-container">
     <div class="billing-header">
-      <CreditCardOutlined style="font-size: 26px; color: var(--warning)" />
+      <CreditCardOutlined style="font-size: var(--fs-3xl); color: var(--warning)" />
       <h1>{{ $t('billing.billing_management') }}</h1>
       <!-- 价格一览表：与"我用掉了多少"是两件事，独立成页，这里只放入口 -->
       <Button
@@ -1137,7 +1137,7 @@ async function confirmProviderBackfill() {
 <style scoped>
 .billing-container { padding: 24px; max-width: 1080px; margin: 0 auto; }
 .billing-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-.billing-header h1 { margin: 0; font-size: 24px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+.billing-header h1 { margin: 0; font-size: var(--fs-3xl); font-weight: var(--fw-semibold); color: var(--text-primary); }
 /* 入口按钮推到最右：标题区左对齐、动作右对齐，窄屏折行时不挤压标题 */
 .billing-header-action { margin-inline-start: auto; }
 .loading-state { padding: 0; }
@@ -1145,14 +1145,14 @@ async function confirmProviderBackfill() {
 /* 使用统计：auto-fill 自适应列数（窄屏自动降列） */
 .usage-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 12px; }
 .stat-item { text-align: center; padding: 14px 8px; background: var(--bg-secondary, rgba(0,0,0,0.02)); border-radius: var(--radius-lg); }
-.stat-label { display: block; color: var(--text-tertiary); font-size: 12px; margin-bottom: 6px; }
-.stat-value { font-size: 22px; font-weight: var(--fw-semibold); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.stat-label { display: block; color: var(--text-tertiary); font-size: var(--fs-sm); margin-bottom: 6px; }
+.stat-value { font-size: var(--fs-2xl); font-weight: var(--fw-semibold); color: var(--text-primary); font-variant-numeric: tabular-nums; }
 .stat-spent { color: var(--colorError, var(--error)); }
 
 /* 分组/区间切换条：窄屏自动折行，不挤压卡片 */
 .usage-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 16px; }
-.filter-label { font-size: 13px; color: var(--text-tertiary); }
-.breakdown-hint { margin-top: 10px; font-size: 12px; color: var(--text-tertiary); }
+.filter-label { font-size: var(--fs-sm); color: var(--text-tertiary); }
+.breakdown-hint { margin-top: 10px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 /* 缺价标注用"提醒"色而不是错误色：数据是真的，只是金额不完整 */
 .breakdown-unpriced { color: var(--colorWarning, var(--warning)); }
 
@@ -1160,7 +1160,7 @@ async function confirmProviderBackfill() {
    中断与上游缺口用中性色（不是故障，也不是用户的问题）。 */
 .zero-token-block { margin-top: 10px; }
 .zero-token-hint { margin-bottom: 6px; }
-.zero-token-list { margin: 0; padding-inline-start: 18px; font-size: 12px; color: var(--text-tertiary); }
+.zero-token-list { margin: 0; padding-inline-start: 18px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .zero-token-item { margin-top: 3px; }
 .zero-token-label { font-weight: var(--fw-medium, 500); color: var(--text-secondary); }
 .zero-token-failed { color: var(--colorWarning, var(--warning)); }
@@ -1170,33 +1170,33 @@ async function confirmProviderBackfill() {
 .provider-missing-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .provider-missing-text { flex: 1; min-width: 180px; }
 .provider-backfill-action { padding: 0 8px; height: auto; }
-.provider-backfill-hint { margin: 0 0 10px; font-size: 12px; color: var(--text-tertiary); }
-.provider-backfill-summary { margin: 0 0 8px; font-size: 13px; color: var(--text-primary); }
-.provider-backfill-list { margin: 0 0 8px; padding-inline-start: 18px; font-size: 12px; color: var(--text-tertiary); max-height: 220px; overflow-y: auto; }
-.provider-backfill-unresolved { margin: 0; font-size: 12px; color: var(--colorWarning, var(--warning)); }
+.provider-backfill-hint { margin: 0 0 10px; font-size: var(--fs-sm); color: var(--text-tertiary); }
+.provider-backfill-summary { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-primary); }
+.provider-backfill-list { margin: 0 0 8px; padding-inline-start: 18px; font-size: var(--fs-sm); color: var(--text-tertiary); max-height: 220px; overflow-y: auto; }
+.provider-backfill-unresolved { margin: 0; font-size: var(--fs-sm); color: var(--colorWarning, var(--warning)); }
 .usage-export-action { margin-inline-start: auto; }
 
 /* 价格覆盖率：一行三项，窄屏折行 */
 .coverage-card { margin-top: 16px; }
 .coverage-row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
-.coverage-rate { font-size: 22px; font-weight: var(--fw-semibold); color: var(--text-primary); font-variant-numeric: tabular-nums; }
-.coverage-text { flex: 1; min-width: 200px; font-size: 13px; color: var(--text-secondary); }
-.coverage-list { margin: 10px 0 0; padding-inline-start: 18px; font-size: 12px; color: var(--text-tertiary); }
+.coverage-rate { font-size: var(--fs-2xl); font-weight: var(--fw-semibold); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.coverage-text { flex: 1; min-width: 200px; font-size: var(--fs-sm); color: var(--text-secondary); }
+.coverage-list { margin: 10px 0 0; padding-inline-start: 18px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .coverage-list li { margin-top: 2px; }
 /* 未定价行：文案在左、设置单价在右（窄屏自动折行，不挤成一列） */
 .coverage-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .coverage-item-text { flex: 1; min-width: 160px; }
 .coverage-item-action { padding: 0 4px; height: auto; }
-.price-dialog-hint { margin: 0 0 12px; font-size: 12px; color: var(--text-tertiary); }
+.price-dialog-hint { margin: 0 0 12px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 
 /* 价格源状态：接在未定价列表之后，同一张卡片里回答"缺多少"与"为什么缺" */
 .price-sources { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--border-secondary, rgba(0, 0, 0, 0.08)); }
 .price-sources-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
-.price-sources-title { font-size: 12px; font-weight: var(--fw-semibold); color: var(--text-secondary); }
-.price-sources-summary { flex: 1; min-width: 200px; font-size: 12px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
-.price-sources-stale { margin: 6px 0 0; font-size: 12px; color: var(--colorWarning, var(--warning)); }
+.price-sources-title { font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-secondary); }
+.price-sources-summary { flex: 1; min-width: 200px; font-size: var(--fs-sm); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.price-sources-stale { margin: 6px 0 0; font-size: var(--fs-sm); color: var(--colorWarning, var(--warning)); }
 .price-sources-list { margin: 6px 0 0; padding: 0; list-style: none; }
-.price-source-item { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 2px 0; font-size: 12px; }
+.price-source-item { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 2px 0; font-size: var(--fs-sm); }
 .price-source-tag { margin-inline-end: 0; }
 .price-source-name { color: var(--text-secondary); font-family: var(--font-mono, monospace); }
 .price-source-meta { color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
@@ -1216,10 +1216,10 @@ async function confirmProviderBackfill() {
 /* 窄屏（≤576px，与 .u-hide-sm 断点一致）：卡片贴边、iOS 防缩放 */
 @media (max-width: 576px) {
   .billing-container { padding: 12px; }
-  .billing-header h1 { font-size: 20px; }
-  .stat-value { font-size: 18px; }
+  .billing-header h1 { font-size: var(--fs-2xl); }
+  .stat-value { font-size: var(--fs-xl); }
   .billing-container :deep(.ant-card-body) { padding: 16px; }
-  .billing-container :deep(.ant-input) { font-size: 16px; }
+  .billing-container :deep(.ant-input) { font-size: var(--fs-lg); }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -308,14 +308,14 @@ watch(
 
 .lock-title {
   margin: 0 0 8px;
-  font-size: 18px;
+  font-size: var(--fs-xl);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
 
 .lock-hint {
   margin: 0 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-secondary);
 }
@@ -330,7 +330,7 @@ watch(
 .lock-account {
   margin: 0 0 18px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 
@@ -342,7 +342,7 @@ watch(
 .lock-label {
   display: block;
   margin-bottom: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
@@ -368,7 +368,7 @@ watch(
 
 .lock-error {
   margin: 0 0 12px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--warning);
 }

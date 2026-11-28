@@ -430,13 +430,13 @@ onBeforeUnmount(() => {
 .mp-master { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .mp-master-text { min-width: 0; }
 .mp-master-label { font-weight: var(--fw-semibold); color: var(--text-primary); }
-.mp-master-hint { margin: 4px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-secondary); }
+.mp-master-hint { margin: 4px 0 0; font-size: var(--fs-sm); line-height: 1.6; color: var(--text-secondary); }
 .mp-master-ctrl { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .mp-unsaved { margin: 0; }
 
 .mp-section-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
-.mp-section-title { margin: 0; font-size: 13px; font-weight: var(--fw-semibold); color: var(--text-primary); }
-.mp-count { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.mp-section-title { margin: 0; font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-primary); }
+.mp-count { font-size: var(--fs-sm); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 
 .mp-list { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .mp-row {
@@ -452,20 +452,20 @@ onBeforeUnmount(() => {
 .mp-row-url {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   word-break: break-all;
   color: var(--text-primary);
   text-align: start;
 }
 .mp-row-remove { flex: 0 0 auto; }
 
-.mp-empty { margin: 0 0 8px; font-size: 12px; color: var(--text-tertiary); }
+.mp-empty { margin: 0 0 8px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 
 .mp-add { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .mp-add-input { flex: 1 1 240px; min-width: 0; }
 
-.mp-error { margin: 6px 0 0; font-size: 12px; color: var(--error); line-height: 1.5; }
-.mp-hint { margin: 6px 0 0; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+.mp-error { margin: 6px 0 0; font-size: var(--fs-sm); color: var(--error); line-height: 1.5; }
+.mp-hint { margin: 6px 0 0; font-size: var(--fs-sm); color: var(--text-secondary); line-height: 1.5; }
 
 .mp-switch-row {
   display: flex;
@@ -478,7 +478,7 @@ onBeforeUnmount(() => {
 .mp-switch-row:first-child { padding-block-start: 0; border-block-start: none; }
 .mp-switch-text { min-width: 0; }
 .mp-switch-label { font-weight: var(--fw-medium); color: var(--text-primary); }
-.mp-switch-hint { margin: 4px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-secondary); }
+.mp-switch-hint { margin: 4px 0 0; font-size: var(--fs-sm); line-height: 1.6; color: var(--text-secondary); }
 
 .mp-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 

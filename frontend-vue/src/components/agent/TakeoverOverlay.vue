@@ -270,13 +270,13 @@ onUnmounted(() => {
 
 .tk-overlay-title {
   margin: 0 0 6px;
-  font-size: 18px;
+  font-size: var(--fs-xl);
   font-weight: var(--fw-semibold, 600);
   color: var(--text-primary);
 }
 .tk-overlay-sub {
   margin: 0 0 18px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-secondary);
 }
@@ -291,8 +291,8 @@ onUnmounted(() => {
   border-bottom: var(--hairline-width) solid var(--border-card, var(--border));
 }
 .tk-overlay-stat { display: flex; flex-direction: column; gap: 4px; }
-.tk-overlay-stat dt { font-size: 11px; color: var(--text-secondary); }
-.tk-overlay-stat dd { margin: 0; font-size: 13px; color: var(--text-primary); }
+.tk-overlay-stat dt { font-size: var(--fs-xs); color: var(--text-secondary); }
+.tk-overlay-stat dd { margin: 0; font-size: var(--fs-sm); color: var(--text-primary); }
 .tk-mono { font-variant-numeric: tabular-nums; }
 
 .tk-overlay-stop {
@@ -302,7 +302,7 @@ onUnmounted(() => {
   border-radius: var(--radius-md, 8px);
   background: var(--danger, #d4380d);
   color: var(--takeover-stop-fg);
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-medium, 500);
   cursor: pointer;
   transition: opacity var(--dur-fast);
@@ -313,7 +313,7 @@ onUnmounted(() => {
 
 .tk-overlay-hint {
   margin: 10px 0 0;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 1.5;
   color: var(--text-secondary);
 }

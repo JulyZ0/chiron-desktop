@@ -1114,7 +1114,7 @@ async function doToggle(
   min-width: 0;
 }
 .card-name {
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
   white-space: nowrap;
@@ -1182,13 +1182,13 @@ async function doToggle(
   gap: 8px;
 }
 .detail-name {
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
 .detail-desc {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   line-height: 1.6;
   white-space: pre-wrap;
@@ -1211,7 +1211,7 @@ async function doToggle(
   font-weight: var(--fw-medium);
 }
 .detail-value {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   word-break: break-word;
 }
@@ -1226,7 +1226,7 @@ async function doToggle(
   gap: 6px;
 }
 .collection-item {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   word-break: break-word;
 }

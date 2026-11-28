@@ -609,7 +609,7 @@ onUnmounted(() => {
   flex: none;
 }
 .palette-search-icon {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   color: var(--text-tertiary);
   flex: none;
 }
@@ -620,7 +620,7 @@ onUnmounted(() => {
   outline: none;
   background: transparent;
   color: var(--text-primary);
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-family: inherit;
 }
 .palette-input::placeholder { color: var(--text-muted); }
@@ -679,7 +679,7 @@ onUnmounted(() => {
   border-radius: 7px;
   background: var(--bg-secondary);
   color: var(--text-secondary);
-  font-size: 14px;
+  font-size: var(--fs-base);
 }
 .palette-item.active .palette-item-icon {
   background: var(--primary);
@@ -693,14 +693,14 @@ onUnmounted(() => {
   gap: 1px;
 }
 .palette-item-label {
-  font-size: 13.5px;
+  font-size: var(--fs-base);
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .palette-item-desc {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   white-space: nowrap;
   overflow: hidden;
@@ -708,7 +708,7 @@ onUnmounted(() => {
 }
 .palette-item-go {
   flex: none;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-muted);
   opacity: 0;
   transition: opacity var(--dur-fast) ease;
@@ -722,7 +722,7 @@ onUnmounted(() => {
   justify-content: center;
   gap: 8px;
   padding: 36px 16px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 .palette-status-spinner {

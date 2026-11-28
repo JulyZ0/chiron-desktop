@@ -2162,46 +2162,46 @@ async function openWithSystem(entry: ProjectFileEntry) {
   flex: 1; min-width: 0; font-size: var(--fs-sm); font-weight: var(--fw-semibold);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.wb-toggle { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--text-tertiary); cursor: pointer; }
+.wb-toggle { display: inline-flex; align-items: center; gap: 3px; font-size: var(--fs-xs); color: var(--text-tertiary); cursor: pointer; }
 .wb-btn {
   flex: none; border: none; background: transparent; color: var(--text-tertiary);
-  cursor: pointer; font-size: 13px; padding: 0 5px; border-radius: var(--radius-sm);
+  cursor: pointer; font-size: var(--fs-sm); padding: 0 5px; border-radius: var(--radius-sm);
 }
 .wb-btn:hover { color: var(--text-primary); }
-.wb-btn-primary { color: var(--accent); font-size: 12px; }
+.wb-btn-primary { color: var(--accent); font-size: var(--fs-sm); }
 .wb-btn:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: var(--focus-ring-offset); }
 /* 只读横幅：信息性而非警告，所以用中性底色 */
 .wb-readonly {
-  flex: none; padding: 4px 10px; font-size: 11px; color: var(--text-tertiary);
+  flex: none; padding: 4px 10px; font-size: var(--fs-xs); color: var(--text-tertiary);
   background: var(--bg-secondary); border-bottom: var(--hairline-width) solid var(--border-subtle);
 }
 .wb-tree { flex: 1; min-height: 0; overflow: auto; padding: 4px 0; }
 .wb-row {
   display: flex; align-items: center; gap: 4px; padding: 2px 8px;
-  font-size: 12px; color: var(--text-secondary); cursor: pointer; white-space: nowrap;
+  font-size: var(--fs-sm); color: var(--text-secondary); cursor: pointer; white-space: nowrap;
 }
 .wb-row:hover { background: var(--bg-hover); }
 .wb-row.active { background: var(--primary-bg); color: var(--text-primary); }
 .wb-row:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: -2px; }
-.wb-caret { flex: none; width: 10px; color: var(--text-tertiary); font-size: 10px; }
+.wb-caret { flex: none; width: 10px; color: var(--text-tertiary); font-size: var(--fs-xs); }
 .wb-name { overflow: hidden; text-overflow: ellipsis; }
-.wb-empty { padding: 10px 12px; font-size: 12px; color: var(--text-tertiary); }
+.wb-empty { padding: 10px 12px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 /* 带操作的提示（如二进制文件）：文字与按钮并排，按钮不继承提示的灰色文字 */
 .wb-empty-action { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .wb-empty-action > span { flex: 1; min-width: 0; }
-.wb-error { padding: 10px 12px; font-size: 12px; color: var(--danger); }
+.wb-error { padding: 10px 12px; font-size: var(--fs-sm); color: var(--danger); }
 .wb-preview { flex: none; max-height: 55%; display: flex; flex-direction: column; border-top: var(--hairline-width) solid var(--border-subtle); }
 .wb-preview-head {
   flex: none; display: flex; align-items: center; gap: 6px; padding: 4px 10px;
   border-bottom: var(--hairline-width) solid var(--border-subtle);
 }
 .wb-preview-path {
-  flex: 1; min-width: 0; font-size: 11px; color: var(--text-tertiary);
+  flex: 1; min-width: 0; font-size: var(--fs-xs); color: var(--text-tertiary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: ltr;
 }
 .wb-preview-body { flex: 1; min-height: 0; overflow: auto; padding: 6px 10px; }
 .wb-text {
-  margin: 0; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5;
+  margin: 0; font-family: var(--font-mono, monospace); font-size: var(--fs-sm); line-height: 1.5;
   color: var(--text-secondary); white-space: pre-wrap; word-break: break-word;
 }
 /* 代码预览：滚动交给**外层** `.wb-preview-body` 负责。
@@ -2213,7 +2213,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
   min-width: max-content;
 }
 .wb-code pre {
-  margin: 0; font-family: var(--font-mono, monospace); font-size: 12px; line-height: 1.5;
+  margin: 0; font-family: var(--font-mono, monospace); font-size: var(--fs-sm); line-height: 1.5;
   color: var(--text-secondary); white-space: pre; tab-size: 4;
 }
 .wb-code code { font-family: inherit; }
@@ -2271,7 +2271,7 @@ async function openWithSystem(entry: ProjectFileEntry) {
 }
 .wb-tab {
   border: none; background: transparent; cursor: pointer;
-  padding: 5px 8px; font-size: 12px; color: var(--text-tertiary);
+  padding: 5px 8px; font-size: var(--fs-sm); color: var(--text-tertiary);
   border-bottom: 2px solid transparent; margin-bottom: calc(-1 * var(--hairline-width));
   display: inline-flex; align-items: center; gap: 4px;
 }
@@ -2279,32 +2279,32 @@ async function openWithSystem(entry: ProjectFileEntry) {
 .wb-tab.active { color: var(--text-primary); border-bottom-color: var(--primary); }
 .wb-tab:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: -2px; }
 .wb-tab-count {
-  font-size: 10px; padding: 0 4px; border-radius: var(--radius-sm);
+  font-size: var(--fs-xs); padding: 0 4px; border-radius: var(--radius-sm);
   background: var(--bg-secondary); color: var(--text-tertiary);
 }
 
 /* ── 改动列表 ── */
 .wb-changes-head {
-  padding: 4px 10px; font-size: 11px; color: var(--text-tertiary);
+  padding: 4px 10px; font-size: var(--fs-xs); color: var(--text-tertiary);
   font-family: var(--font-mono, monospace); direction: ltr;
 }
 .wb-change { gap: 6px; }
 /* 状态字母定宽等宽：不定宽的话 M / R / ? 宽度不同，右侧统计列会左右跳 */
 .wb-status {
   flex: none; width: 12px; text-align: center;
-  font-family: var(--font-mono, monospace); font-size: 11px; color: var(--text-tertiary);
+  font-family: var(--font-mono, monospace); font-size: var(--fs-xs); color: var(--text-tertiary);
 }
 /* 状态色只在能区分语义的地方用：新增绿、删除红，其余中立 —— 满屏彩色反而看不出重点 */
 .wb-status.st-A, .wb-status.st-\? { color: var(--success); }
 .wb-status.st-D { color: var(--danger); }
 .wb-status.st-U { color: var(--warning); }
 .wb-stat {
-  flex: none; display: inline-flex; gap: 4px; font-size: 11px;
+  flex: none; display: inline-flex; gap: 4px; font-size: var(--fs-xs);
   font-family: var(--font-mono, monospace); margin-inline-start: auto;
 }
 .wb-stat .ins { color: var(--success); }
 .wb-stat .del { color: var(--danger); }
-.wb-agent-dot { flex: none; color: var(--accent); font-size: 10px; }
+.wb-agent-dot { flex: none; color: var(--accent); font-size: var(--fs-xs); }
 /* 只在会话里出现、git 没记录的条目：用斜体而不是换颜色 —— 它仍然是一条改动 */
 .wb-change.agent-only .wb-name { font-style: italic; }
 

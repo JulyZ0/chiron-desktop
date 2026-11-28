@@ -633,7 +633,7 @@ onMounted(() => {
 .status-error { color: var(--error, var(--error)); }
 
 .provider-id {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, #8c8c8c);
 }
 
@@ -645,7 +645,7 @@ onMounted(() => {
   margin-bottom: 12px;
 }
 .provider-mode-hint {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, #8c8c8c);
 }
 .provider-group { margin-bottom: 14px; }
@@ -656,7 +656,7 @@ onMounted(() => {
   margin-bottom: 6px;
 }
 .provider-group-hint {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, #8c8c8c);
 }
 .provider-cards {
@@ -689,7 +689,7 @@ onMounted(() => {
   font-weight: var(--fw-semibold);
 }
 .provider-card-line {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, #8c8c8c);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -697,7 +697,7 @@ onMounted(() => {
 }
 .provider-card-line.endpoint { font-family: var(--font-mono, monospace); }
 .provider-card-state {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--success, var(--success));
 }
 .provider-empty {
@@ -708,7 +708,7 @@ onMounted(() => {
 .provider-form { margin-top: 12px; }
 .provider-custom-note {
   margin-top: 8px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-tertiary, #8c8c8c);
 }
@@ -727,7 +727,7 @@ onMounted(() => {
 }
 .provider-actions-hint {
   margin-inline-end: auto;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, #8c8c8c);
 }
 

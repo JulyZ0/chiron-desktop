@@ -507,20 +507,20 @@ onMounted(() => {
 }
 
 .tfa-icon {
-  font-size: 20px;
+  font-size: var(--fs-2xl);
   color: var(--primary);
   margin-block-start: 2px;
 }
 
 .tfa-title {
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
 
 .tfa-intro {
   margin: 4px 0 0;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-secondary);
 }
@@ -536,7 +536,7 @@ onMounted(() => {
 }
 
 .tfa-meta {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
 }
@@ -549,7 +549,7 @@ onMounted(() => {
 
 .tfa-modal-hint {
   margin: 0 0 10px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
   color: var(--text-secondary);
 }
@@ -580,13 +580,13 @@ onMounted(() => {
 }
 
 .tfa-secret-label {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
 .tfa-secret-value {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   word-break: break-all;
   color: var(--text-primary);
 }
@@ -599,13 +599,13 @@ onMounted(() => {
 .tfa-field-label {
   display: block;
   margin-bottom: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
 .tfa-error {
   margin: 8px 0 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--warning);
 }
 
@@ -627,7 +627,7 @@ onMounted(() => {
 
 .tfa-code {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   padding: 6px 8px;
   border: var(--hairline-width) solid var(--border-default);
   border-radius: var(--radius-sm);

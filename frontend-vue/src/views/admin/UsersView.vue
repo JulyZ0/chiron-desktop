@@ -539,14 +539,14 @@ onMounted(load)
 .users-hint { border-radius: var(--radius-lg); }
 .user-account { display: flex; flex-direction: column; gap: 2px; }
 .user-email { color: var(--text-primary); }
-.user-username { font-size: 12px; color: var(--text-tertiary); }
+.user-username { font-size: var(--fs-sm); color: var(--text-tertiary); }
 .form-grid {
   display: grid;
   grid-template-columns: 110px 1fr;
   gap: 10px 12px;
   align-items: center;
 }
-.form-grid label { font-size: 13px; color: var(--text-secondary); }
+.form-grid label { font-size: var(--fs-sm); color: var(--text-secondary); }
 .credential-box {
   margin-top: 12px;
   padding: 12px;
@@ -558,7 +558,7 @@ onMounted(load)
   gap: 8px;
 }
 .credential-row { display: flex; align-items: center; gap: 10px; }
-.credential-label { font-size: 12px; color: var(--text-tertiary); min-width: 72px; }
-.credential-hint { margin: 12px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.credential-label { font-size: var(--fs-sm); color: var(--text-tertiary); min-width: 72px; }
+.credential-hint { margin: 12px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .invite-text { word-break: break-all; }
 </style>

@@ -215,7 +215,7 @@ onMounted(load)
 .page-sub {
   margin: 4px 0 0;
   color: var(--ant-color-text-secondary, #8c8c8c);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 .page-alert {
   margin-bottom: 16px;
@@ -242,7 +242,7 @@ onMounted(load)
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 8%, transparent);
 }
 .provider-icon {
-  font-size: 20px;
+  font-size: var(--fs-2xl);
   margin-top: 2px;
 }
 .provider-title {
@@ -253,12 +253,12 @@ onMounted(load)
 }
 .provider-desc {
   margin: 6px 0 0;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--ant-color-text-secondary, #8c8c8c);
 }
 .provider-detail {
   margin: 6px 0 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--ant-color-warning, #d48806);
 }
 .key-block {
@@ -271,7 +271,7 @@ onMounted(load)
 }
 .key-hint {
   margin: 6px 0 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--ant-color-text-secondary, #8c8c8c);
 }
 .actions {

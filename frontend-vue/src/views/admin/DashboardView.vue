@@ -529,22 +529,22 @@ onUnmounted(() => {
   border-radius: var(--radius-lg);
   background: var(--primary-bg);
   color: var(--primary);
-  font-size: 16px;
+  font-size: var(--fs-lg);
   flex-shrink: 0;
 }
 .nav-card-body { flex: 1; min-width: 0; }
 .nav-card-label {
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
 .nav-card-desc {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   margin-top: 1px;
 }
 .nav-card-arrow {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-muted);
   transition: transform var(--dur-fast) ease, color var(--dur-fast) ease;
 }
@@ -564,11 +564,11 @@ onUnmounted(() => {
 }
 .stat-card :deep(.ant-card-body) { padding: 18px 20px; }
 .stat-card :deep(.ant-statistic-title) {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   margin-bottom: 6px;
 }
-.stat-icon { font-size: 18px; color: var(--primary); margin-inline-end: 4px; }
+.stat-icon { font-size: var(--fs-xl); color: var(--primary); margin-inline-end: 4px; }
 .stat-trend { font-size: var(--fs-xs); padding: 0 6px; border-radius: var(--radius-sm); margin-inline-start: 4px; }
 
 /* ── 图表卡片 ── */
@@ -588,11 +588,11 @@ onUnmounted(() => {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
-.chart-title-icon { color: var(--primary); font-size: 15px; }
+.chart-title-icon { color: var(--primary); font-size: var(--fs-md); }
 .chart-canvas { height: 280px; }
 
 /* ── 引导漏斗卡片 ── */
@@ -616,11 +616,11 @@ onUnmounted(() => {
 .funnel-step:last-child { border-bottom: none; padding-bottom: 0; }
 .funnel-step-name {
   flex: 1;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
 }
 .funnel-step-rate {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--primary);
   font-variant-numeric: tabular-nums;
@@ -649,14 +649,14 @@ onUnmounted(() => {
 }
 .alert-card :deep(.ant-table-thead > tr > th) {
   background: var(--bg-secondary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--text-tertiary);
   border-bottom: var(--hairline-width) solid var(--border-card);
 }
 .alert-card :deep(.ant-table-tbody > tr > td) {
   border-bottom: var(--hairline-width) solid var(--border-card);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 .alert-card :deep(.ant-table-tbody > tr:hover > td) {
   background: var(--bg-hover) !important;
@@ -671,7 +671,7 @@ onUnmounted(() => {
   .nav-grid { grid-template-columns: 1fr; }
   .chart-canvas { height: 200px; }
   .stat-card :deep(.ant-card-body) { padding: 14px 16px; }
-  .stat-card :deep(.ant-statistic-content-value) { font-size: 22px !important; }
+  .stat-card :deep(.ant-statistic-content-value) { font-size: var(--fs-2xl) !important; }
 }
 
 

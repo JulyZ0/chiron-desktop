@@ -406,7 +406,7 @@ async function handleUserAction(info: MenuClickInfo) {
   line-height: 36px;
   margin: 2px 0;
   border-radius: var(--radius-md);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 .sider-menu :deep(.ant-menu-item:hover) {
@@ -448,7 +448,7 @@ async function handleUserAction(info: MenuClickInfo) {
   white-space: nowrap;
 }
 .header-breadcrumb :deep(.ant-breadcrumb-link) {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   white-space: nowrap;
   overflow: hidden;
@@ -476,7 +476,7 @@ async function handleUserAction(info: MenuClickInfo) {
   border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   cursor: pointer;
 }
 .sider-user-btn:hover { color: var(--text-primary); background: var(--bg-hover); }

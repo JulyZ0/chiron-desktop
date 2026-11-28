@@ -295,7 +295,7 @@ onMounted(load)
 }
 .form-block label,
 .form-row label {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 .form-row {

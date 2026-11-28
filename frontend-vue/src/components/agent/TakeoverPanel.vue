@@ -699,12 +699,12 @@ onUnmounted(() => {
 <style scoped>
 .tk-block { padding: 4px 0 20px; }
 .tk-head { display: flex; gap: 10px; margin-bottom: 16px; }
-.tk-icon { font-size: 20px; color: var(--primary); margin-top: 2px; }
+.tk-icon { font-size: var(--fs-2xl); color: var(--primary); margin-top: 2px; }
 .tk-title { font-weight: var(--fw-semibold); color: var(--text-primary); }
-.tk-intro { margin: 4px 0 0; color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+.tk-intro { margin: 4px 0 0; color: var(--text-secondary); font-size: var(--fs-sm); line-height: 1.6; }
 .tk-alert { margin-bottom: 12px; }
 .tk-spin-placeholder { min-height: 120px; }
-.tk-hint { color: var(--text-secondary); font-size: 12px; }
+.tk-hint { color: var(--text-secondary); font-size: var(--fs-sm); }
 
 .tk-master {
   padding: 12px;
@@ -723,8 +723,8 @@ onUnmounted(() => {
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
 }
 .tk-field { display: flex; flex-direction: column; gap: 4px; }
-.tk-field-label { color: var(--text-secondary); font-size: 12px; }
-.tk-field-hint { color: var(--text-secondary); font-size: 11px; line-height: 1.5; }
+.tk-field-label { color: var(--text-secondary); font-size: var(--fs-sm); }
+.tk-field-hint { color: var(--text-secondary); font-size: var(--fs-xs); line-height: 1.5; }
 .tk-num { width: 100%; }
 .tk-select { width: 100%; }
 
@@ -732,7 +732,7 @@ onUnmounted(() => {
   padding: 24px;
   text-align: center;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   border: var(--hairline-width) dashed var(--border-card, var(--border));
   border-radius: var(--radius-md, 8px);
 }
@@ -750,9 +750,9 @@ onUnmounted(() => {
 .tk-row-spacer { flex: 1; }
 
 .tk-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-.tk-status-item { color: var(--text-secondary); font-size: 12px; }
+.tk-status-item { color: var(--text-secondary); font-size: var(--fs-sm); }
 .tk-status-bad { color: var(--danger, #d4380d); }
-.tk-melt-reason { margin: 0 0 10px; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
+.tk-melt-reason { margin: 0 0 10px; color: var(--text-secondary); font-size: var(--fs-sm); line-height: 1.5; }
 
 .tk-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 
@@ -761,6 +761,6 @@ onUnmounted(() => {
   border-top: var(--hairline-width) solid var(--border-card, var(--border));
 }
 .tk-add-title { font-weight: var(--fw-semibold); color: var(--text-primary); margin-bottom: 4px; }
-.tk-add-hint { margin: 0 0 10px; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
+.tk-add-hint { margin: 0 0 10px; color: var(--text-secondary); font-size: var(--fs-sm); line-height: 1.6; }
 .tk-add-select { width: 100%; margin-bottom: 10px; }
 </style>

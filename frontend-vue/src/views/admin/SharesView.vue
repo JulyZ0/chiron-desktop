@@ -439,7 +439,7 @@ onMounted(load)
 .share-name { color: var(--text-primary); margin-inline-end: 8px; }
 .share-tag {
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
 }
 .share-actions { display: flex; gap: 4px; }
@@ -485,6 +485,6 @@ onMounted(load)
 .share-trend { display: flex; flex-direction: column; gap: 6px; }
 .share-trend-head { font-size: var(--fs-sm); color: var(--text-secondary); }
 .share-spark { width: 100%; height: 48px; color: var(--primary); }
-.share-trend-days { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-muted); }
+.share-trend-days { display: flex; justify-content: space-between; font-size: var(--fs-xs); color: var(--text-muted); }
 .share-trend-day { min-width: 12px; text-align: center; }
 </style>

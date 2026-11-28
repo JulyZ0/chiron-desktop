@@ -232,7 +232,7 @@ defineExpose({
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
@@ -249,7 +249,7 @@ defineExpose({
   border-radius: var(--radius-md);
   background: var(--bg-card);
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   cursor: pointer;
   transition: border-color var(--dur-normal), color var(--dur-normal);
 }
@@ -310,7 +310,7 @@ defineExpose({
 }
 
 .agent-icon {
-  font-size: 20px;
+  font-size: var(--fs-2xl);
 }
 
 .status-ring {
@@ -332,14 +332,14 @@ defineExpose({
 }
 
 .agent-name {
-  font-size: 14px;
+  font-size: var(--fs-base);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
   margin-bottom: 2px;
 }
 
 .agent-role {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   margin-bottom: 4px;
 }
@@ -369,13 +369,13 @@ defineExpose({
 
 .check-icon {
   color: var(--success);
-  font-size: 18px;
+  font-size: var(--fs-xl);
   font-weight: var(--fw-bold);
 }
 
 .error-icon {
   color: var(--error);
-  font-size: 18px;
+  font-size: var(--fs-xl);
   font-weight: var(--fw-bold);
 }
 
@@ -391,7 +391,7 @@ defineExpose({
   margin: 0;
   padding: 8px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-all;
@@ -413,7 +413,7 @@ defineExpose({
 }
 
 .log-header span {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
@@ -440,7 +440,7 @@ defineExpose({
   max-height: 200px;
   overflow-y: auto;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 .log-entry {

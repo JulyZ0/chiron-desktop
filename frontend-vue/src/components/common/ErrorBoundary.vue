@@ -81,12 +81,12 @@ function reload() {
   color: var(--colorError, var(--error));
 }
 .error-title {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: var(--fw-semibold);
   color: var(--text-primary, #0f1115);
 }
 .error-message {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, #81858c);
   max-width: 420px;
   word-break: break-word;
@@ -99,7 +99,7 @@ function reload() {
   overflow: auto;
   padding: 10px 12px;
   font-family: var(--font-mono, monospace);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.55;
   color: var(--text-secondary, #4b5563);
   text-align: start;

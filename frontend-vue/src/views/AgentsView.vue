@@ -1383,7 +1383,7 @@ function toolCount(a: Agent): number {
 
 <style scoped>
 .agents-page { max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }
-.page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: 13px; }
+.page-sub { margin: 4px 0 0; color: var(--text-tertiary); font-size: var(--fs-sm); }
 .agents-tabs :deep(.ant-tabs-nav) { margin-bottom: 16px; }
 
 /* ── 两栏工作台 ── */
@@ -1461,7 +1461,7 @@ function toolCount(a: Agent): number {
 .item-avatar {
   flex: none; width: 30px; height: 30px; border-radius: var(--radius-md);
   display: inline-flex; align-items: center; justify-content: center;
-  background: var(--primary-bg); color: var(--primary); font-size: 15px;
+  background: var(--primary-bg); color: var(--primary); font-size: var(--fs-md);
 }
 .item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .item-title-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
@@ -1495,7 +1495,7 @@ function toolCount(a: Agent): number {
 .detail-avatar {
   flex: none; width: 42px; height: 42px; border-radius: var(--sig-radius-card);
   display: inline-flex; align-items: center; justify-content: center;
-  background: var(--primary-bg); color: var(--primary); font-size: 20px;
+  background: var(--primary-bg); color: var(--primary); font-size: var(--fs-2xl);
 }
 .detail-titles { flex: 1; min-width: 0; }
 .detail-name {
@@ -1511,8 +1511,8 @@ function toolCount(a: Agent): number {
 .detail-badges { display: flex; flex-wrap: wrap; gap: 4px; }
 .detail-feedback { margin: 0; }
 .card-menu { min-width: 150px; border-radius: var(--sig-radius-card); padding: 4px; box-shadow: var(--shadow-lg); }
-.card-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: 13px; border-radius: var(--radius-md); }
-.menu-icon { font-size: 14px; }
+.card-menu :deep(.ant-dropdown-menu-item) { display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); border-radius: var(--radius-md); }
+.menu-icon { font-size: var(--fs-base); }
 
 /* ── 表单 ── */
 .editor-form { display: flex; flex-direction: column; gap: 12px; }
@@ -1522,7 +1522,7 @@ function toolCount(a: Agent): number {
 .form-field { display: flex; flex-direction: column; gap: 6px; }
 .w-full { width: 100%; }
 .binding-select { width: 100%; }
-.tools-input :deep(textarea) { font-family: var(--font-mono); font-size: 12px; }
+.tools-input :deep(textarea) { font-family: var(--font-mono); font-size: var(--fs-sm); }
 .detail-footer {
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding-top: 12px;
@@ -1542,23 +1542,23 @@ function toolCount(a: Agent): number {
   background: var(--bg-card);
   box-shadow: var(--shadow-md);
 }
-.session-status-icon { flex: none; width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 14px; }
+.session-status-icon { flex: none; width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: var(--fs-base); }
 .session-status-icon.pending { background: var(--bg-secondary); color: var(--text-tertiary); }
 .session-status-icon.running { background: var(--primary-bg); color: var(--primary); }
 .session-status-icon.completed { background: var(--success-bg); color: var(--success); }
 .session-status-icon.failed { background: var(--error-bg); color: var(--error); }
 .session-main { flex: 1; min-width: 0; }
-.session-task { font-size: 13px; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-task { font-size: var(--fs-sm); color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .session-meta { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
-.session-agent { font-size: 12px; color: var(--text-secondary); }
-.session-time { font-size: 12px; color: var(--text-tertiary); }
+.session-agent { font-size: var(--fs-sm); color: var(--text-secondary); }
+.session-time { font-size: var(--fs-sm); color: var(--text-tertiary); }
 
 /* ── 运行结果 ── */
 .run-actions { display: flex; justify-content: flex-end; margin-top: 12px; }
 .run-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
 .result-block { border: var(--hairline-width) solid var(--border-card); border-radius: var(--sig-radius-card); background: var(--bg-secondary); overflow: hidden; }
-.result-label { padding: 8px 12px; font-size: 12px; color: var(--text-tertiary); border-bottom: var(--hairline-width) solid var(--border-card); }
-.result-output { margin: 0; padding: 12px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
+.result-label { padding: 8px 12px; font-size: var(--fs-sm); color: var(--text-tertiary); border-bottom: var(--hairline-width) solid var(--border-card); }
+.result-output { margin: 0; padding: 12px; font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.7; color: var(--text-primary); white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
 .result-meta { display: flex; flex-wrap: wrap; gap: 4px; }
 .result-actions { margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px; }
 

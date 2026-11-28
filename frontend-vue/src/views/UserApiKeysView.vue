@@ -177,7 +177,7 @@ onMounted(loadKeys)
 <template>
   <div class="keys-container">
     <div class="keys-header">
-      <KeyOutlined style="font-size: 26px; color: var(--primary)" />
+      <KeyOutlined style="font-size: var(--fs-3xl); color: var(--primary)" />
       <h1>{{ $t('settings.user_api_key_title') }}</h1>
     </div>
 
@@ -382,7 +382,7 @@ onMounted(loadKeys)
 
 .keys-header h1 {
   margin: 0;
-  font-size: 24px;
+  font-size: var(--fs-3xl);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
@@ -404,7 +404,7 @@ onMounted(loadKeys)
 }
 
 .usage-title {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--text-primary);
   margin-bottom: 6px;
@@ -413,7 +413,7 @@ onMounted(loadKeys)
 .usage-hint,
 .usage-note {
   margin: 0 0 8px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   line-height: 1.6;
 }
@@ -422,7 +422,7 @@ onMounted(loadKeys)
    "查清单"、哪段是"真跑一次推理"。 */
 .usage-subtitle {
   margin: 10px 0 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--text-primary);
 }
@@ -440,7 +440,7 @@ onMounted(loadKeys)
   background: var(--bg-base);
   color: var(--text-primary);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
 }
 
@@ -457,11 +457,11 @@ onMounted(loadKeys)
 
 .key-name {
   font-family: var(--font-mono, monospace);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 .key-time {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }
@@ -473,7 +473,7 @@ onMounted(loadKeys)
 .create-label {
   display: block;
   margin-bottom: 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
@@ -497,12 +497,12 @@ onMounted(loadKeys)
 .plain-key code {
   flex: 1;
   font-family: var(--font-mono, monospace);
-  font-size: 13px;
+  font-size: var(--fs-sm);
 }
 
 @media (max-width: 640px) {
   .keys-container { padding: 16px 12px; }
-  .keys-header h1 { font-size: 20px; }
+  .keys-header h1 { font-size: var(--fs-2xl); }
   .plain-key { flex-direction: column; align-items: flex-start; }
 }
 </style>

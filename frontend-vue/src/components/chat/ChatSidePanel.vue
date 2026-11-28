@@ -858,7 +858,7 @@ function onPanelKeydown(e: KeyboardEvent) {
 .ctx-chip:hover { box-shadow: inset 0 0 0 var(--hairline-width) var(--primary); color: var(--primary); }
 .ctx-chip-label { max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ctx-chip-remove {
- font-size: var(--fs-xs); color: var(--text-tertiary); cursor: pointer; 
+ font-size: var(--fs-xs); color: var(--text-tertiary); cursor: pointer;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .ctx-chip-remove:hover { color: var(--danger, var(--error)); }
@@ -889,7 +889,7 @@ function onPanelKeydown(e: KeyboardEvent) {
    此前这两处搜索框是**完全没有焦点指示**的（WCAG 2.4.7）。 */
 .panel-search:focus-within { box-shadow: 0 0 0 var(--focus-ring-width) var(--focus-ring-glow); }
 .search-clear {
- font-size: var(--fs-xs); color: var(--text-tertiary); cursor: pointer; 
+ font-size: var(--fs-xs); color: var(--text-tertiary); cursor: pointer;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .search-clear:hover { color: var(--primary); }

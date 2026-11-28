@@ -461,36 +461,36 @@ async function submitImport() {
 <style scoped>
 .prices-container { padding: 24px; max-width: 1180px; margin: 0 auto; }
 .prices-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
-.prices-header h1 { margin: 0; font-size: 24px; font-weight: var(--fw-semibold); color: var(--text-primary); }
-.prices-header-icon { font-size: 26px; color: var(--warning); }
-.prices-hint { margin: 0 0 16px; font-size: 13px; color: var(--text-tertiary); line-height: 1.6; }
+.prices-header h1 { margin: 0; font-size: var(--fs-3xl); font-weight: var(--fw-semibold); color: var(--text-primary); }
+.prices-header-icon { font-size: var(--fs-3xl); color: var(--warning); }
+.prices-hint { margin: 0 0 16px; font-size: var(--fs-sm); color: var(--text-tertiary); line-height: 1.6; }
 
 .prices-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 12px; }
 .prices-search { max-width: 280px; }
-.prices-count { font-size: 13px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.prices-count { font-size: var(--fs-sm); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
 
-.prices-footer { margin: 12px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.prices-footer { margin: 12px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); }
 
 /* 数字列等宽：价格纵向比较时数字必须对齐，否则一眼看不出量级差 */
 .prices-card :deep(td) { font-variant-numeric: tabular-nums; }
 
 /* 导入弹窗 */
-.prices-import-hint { margin: 0 0 10px; font-size: 12px; color: var(--text-tertiary); line-height: 1.6; }
-.prices-import-label { display: block; margin: 8px 0 4px; font-size: 12px; color: var(--text-secondary); }
-.prices-import-textarea { font-family: var(--font-mono, monospace); font-size: 12px; }
+.prices-import-hint { margin: 0 0 10px; font-size: var(--fs-sm); color: var(--text-tertiary); line-height: 1.6; }
+.prices-import-label { display: block; margin: 8px 0 4px; font-size: var(--fs-sm); color: var(--text-secondary); }
+.prices-import-textarea { font-family: var(--font-mono, monospace); font-size: var(--fs-sm); }
 .prices-import-file-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
-.prices-import-file { font-size: 12px; }
-.prices-import-filename { font-size: 12px; color: var(--text-secondary); }
+.prices-import-file { font-size: var(--fs-sm); }
+.prices-import-filename { font-size: var(--fs-sm); color: var(--text-secondary); }
 .prices-import-result { margin-top: 12px; padding: 10px; border-radius: 6px; background: var(--bg-secondary, rgba(0, 0, 0, 0.03)); }
-.prices-import-summary { font-size: 13px; color: var(--text-primary); font-variant-numeric: tabular-nums; }
-.prices-import-all-failed { margin: 8px 0 0; font-size: 12px; color: var(--colorWarning, var(--warning)); }
+.prices-import-summary { font-size: var(--fs-sm); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.prices-import-all-failed { margin: 8px 0 0; font-size: var(--fs-sm); color: var(--colorWarning, var(--warning)); }
 .prices-import-skips { margin: 8px 0 0; padding-inline-start: 18px; max-height: 180px; overflow-y: auto; }
-.prices-import-skip { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }
+.prices-import-skip { font-size: var(--fs-sm); color: var(--text-secondary); line-height: 1.6; }
 
 @media (max-width: 576px) {
   .prices-container { padding: 12px; }
-  .prices-header h1 { font-size: 20px; }
+  .prices-header h1 { font-size: var(--fs-2xl); }
   .prices-search { max-width: none; width: 100%; }
-  .prices-container :deep(.ant-input) { font-size: 16px; }
+  .prices-container :deep(.ant-input) { font-size: var(--fs-lg); }
 }
 </style>

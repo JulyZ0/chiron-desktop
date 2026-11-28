@@ -367,7 +367,7 @@ function onKeydown(e: KeyboardEvent) {
   border: none;
   background: transparent;
   color: var(--text-tertiary);
-  font-size: 9px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   border-radius: var(--radius-sm);
 }
@@ -383,7 +383,7 @@ function onKeydown(e: KeyboardEvent) {
   border: none;
   background: transparent;
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   text-align: start;
   white-space: nowrap;
@@ -394,8 +394,8 @@ function onKeydown(e: KeyboardEvent) {
 .run-name:hover { color: var(--primary); }
 .run-name:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: 1px; }
 
-.run-elapsed { font-size: 11px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
-.run-budget { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.run-elapsed { font-size: var(--fs-xs); color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.run-budget { font-size: var(--fs-xs); color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .run-budget.budget-hit { color: var(--warning); font-weight: var(--fw-medium); }
 .budget-tag { margin-inline-start: 2px; }
 
@@ -407,7 +407,7 @@ function onKeydown(e: KeyboardEvent) {
   border-radius: var(--radius-sm);
   background: var(--bg-card);
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   cursor: pointer;
   transition: border-color var(--dur-fast), color var(--dur-fast);
 }
@@ -420,7 +420,7 @@ function onKeydown(e: KeyboardEvent) {
 
 .card-summary {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--text-secondary);
   overflow: hidden;
@@ -437,7 +437,7 @@ function onKeydown(e: KeyboardEvent) {
   gap: 6px;
   margin: 0;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-tertiary);
   white-space: nowrap;
   overflow: hidden;
@@ -453,7 +453,7 @@ function onKeydown(e: KeyboardEvent) {
   animation: dot-pulse var(--dur-pulse) ease-in-out infinite;
 }
 
-.card-foot { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--text-muted); }
+.card-foot { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xs); color: var(--text-muted); }
 
 @media (prefers-reduced-motion: reduce) {
   .run-card, .card-actions button { transition: none; }

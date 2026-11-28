@@ -190,7 +190,7 @@ onMounted(load)
 .harness-form { display: flex; flex-direction: column; gap: 10px; }
 .harness-prefix { max-width: 320px; }
 .harness-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.harness-hint { color: var(--text-secondary); font-size: 12px; }
+.harness-hint { color: var(--text-secondary); font-size: var(--fs-sm); }
 .harness-count { margin-inline-start: auto; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
 .harness-count.over { color: var(--error, #ff4d4f); font-weight: var(--fw-semibold); }
 .harness-item { padding: 10px 0; border-bottom: 1px dashed var(--border-color, #f0f0f0); }
@@ -207,5 +207,5 @@ onMounted(load)
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .link-btn:hover { color: var(--primary); }
-.harness-item-body { margin-top: 6px; white-space: pre-wrap; font-size: 13px; color: var(--text-secondary); }
+.harness-item-body { margin-top: 6px; white-space: pre-wrap; font-size: var(--fs-sm); color: var(--text-secondary); }
 </style>

@@ -249,7 +249,7 @@ onUnmounted(() => {
   font-family: var(--font-mono, 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace);
 }
 .shortcut-key.recording { min-width: 160px; }
-.shortcut-hint-inline { color: var(--text-secondary); font-size: 12px; }
+.shortcut-hint-inline { color: var(--text-secondary); font-size: var(--fs-sm); }
 .shortcut-footer { margin-top: 8px; }
 
 @media (max-width: 576px) {

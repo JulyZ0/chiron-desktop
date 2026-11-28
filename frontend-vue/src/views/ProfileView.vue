@@ -16,7 +16,7 @@ const router = useRouter()
 <template>
   <div class="profile-container">
     <div class="profile-header">
-      <UserOutlined style="font-size: 24px; color: var(--primary)" />
+      <UserOutlined style="font-size: var(--fs-3xl); color: var(--primary)" />
       <h1>{{ $t('admin.user_settings') }}</h1>
       <Button
         class="password-entry"
@@ -45,7 +45,7 @@ const router = useRouter()
 
 .profile-header h1 {
   margin: 0;
-  font-size: 24px;
+  font-size: var(--fs-3xl);
   font-weight: var(--fw-semibold);
 }
 .password-entry { margin-inline-start: auto; }
@@ -53,7 +53,7 @@ const router = useRouter()
 @media (max-width: 640px) {
   .profile-container { padding: 16px 12px; }
   .profile-header { gap: 8px; margin-bottom: 16px; }
-  .profile-header h1 { font-size: 20px; }
+  .profile-header h1 { font-size: var(--fs-2xl); }
 }
 
 @media (max-width: 576px) {

@@ -227,7 +227,7 @@ function reloadApp(): void {
   display: inline-block;
   padding: 2px 8px;
   margin-bottom: 10px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--warning);
   background: var(--warning-bg);
@@ -235,13 +235,13 @@ function reloadApp(): void {
 }
 .sm-title {
   margin: 0 0 8px;
-  font-size: 20px;
+  font-size: var(--fs-2xl);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
 .sm-desc {
   margin: 0 0 20px;
-  font-size: 14px;
+  font-size: var(--fs-base);
   line-height: 1.6;
   color: var(--text-secondary);
 }
@@ -258,7 +258,7 @@ function reloadApp(): void {
 }
 .sm-row dt {
   flex: 0 0 96px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 .sm-row dd {
@@ -283,7 +283,7 @@ function reloadApp(): void {
 }
 .sm-fix-label {
   margin-bottom: 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 .sm-fix-row {
@@ -297,7 +297,7 @@ function reloadApp(): void {
 }
 .sm-note {
   margin: 0 0 16px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--warning);
 }
 .sm-actions {

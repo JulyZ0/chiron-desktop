@@ -208,7 +208,7 @@ function submitEdit() {
 }
 .approval-actions { display: flex; align-items: center; gap: 8px; }
 .approval-btn {
- border: none; border-radius: var(--radius-lg); padding: 4px 14px; font-size: var(--fs-sm); cursor: pointer; 
+ border: none; border-radius: var(--radius-lg); padding: 4px 14px; font-size: var(--fs-sm); cursor: pointer;
   transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease, border-color var(--dur-fast) ease;
 }
 .approval-btn:disabled { opacity: 0.5; cursor: default; }

@@ -595,7 +595,7 @@ function rangeLabel(r: MonitorWindow): string {
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border-subtle);
   border-radius: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .retention-preview__title {
   font-weight: 600;
@@ -631,11 +631,11 @@ function rangeLabel(r: MonitorWindow): string {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .retention-confirm__reason {
   padding: 4px 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   border: 1px solid var(--border-subtle);
   border-radius: 4px;
   background: transparent;
@@ -647,10 +647,10 @@ function rangeLabel(r: MonitorWindow): string {
 .retention-error {
   margin-top: 4px;
   color: var(--color-error);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .retention-meta {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 .monitor-toolbar {

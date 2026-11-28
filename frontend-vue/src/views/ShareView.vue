@@ -472,53 +472,53 @@ function formatDate(iso: string): string {
   --border: #30363d; --bubble-user: #1f6feb; --bubble-user-text: #ffffff;
 }
 .share-page[data-width="wide"] .share-main { max-width: 1080px; }
-.share-page[data-font="small"] .share-msg-text { font-size: 15px; line-height: 25px; }
-.share-page[data-font="small"] .share-msg.user .share-msg-bubble { font-size: 14px; line-height: 22px; }
-.share-page[data-font="large"] .share-msg-text { font-size: 18px; line-height: 31px; }
-.share-page[data-font="large"] .share-msg.user .share-msg-bubble { font-size: 17px; line-height: 26px; }
+.share-page[data-font="small"] .share-msg-text { font-size: var(--fs-md); line-height: 25px; }
+.share-page[data-font="small"] .share-msg.user .share-msg-bubble { font-size: var(--fs-base); line-height: 22px; }
+.share-page[data-font="large"] .share-msg-text { font-size: var(--fs-xl); line-height: 31px; }
+.share-page[data-font="large"] .share-msg.user .share-msg-bubble { font-size: var(--fs-xl); line-height: 26px; }
 .share-header { height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 24px; border-bottom: var(--hairline-width) solid var(--border); background: var(--bg-card); }
 .share-display { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .share-display-group { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border: var(--hairline-width) solid var(--border); border-radius: var(--radius-md); background: var(--bg-page); }
-.share-display-label { padding: 0 4px; font-size: 12px; color: var(--text-tertiary); }
+.share-display-label { padding: 0 4px; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .share-display button {
   min-height: 28px; padding: 4px 8px; cursor: pointer;
-  font-family: inherit; font-size: 12px; color: var(--text-secondary);
+  font-family: inherit; font-size: var(--fs-sm); color: var(--text-secondary);
   background: transparent; border: none; border-radius: calc(var(--radius-md) - 2px);
 }
 .share-display button:hover { background: var(--bg-hover); }
 .share-display button.active { background: var(--primary); color: var(--on-solid); }
 .share-display button:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
-.share-brand { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+.share-brand { display: flex; align-items: center; gap: 8px; font-size: var(--fs-base); font-weight: var(--fw-semibold); color: var(--text-primary); }
 .share-brand-mark { width: 22px; height: 22px; border-radius: var(--radius-md); background: linear-gradient(135deg, var(--primary), var(--primary-dark)); color: var(--on-solid); font-weight: var(--fw-bold); font-size: var(--fs-xs); display: inline-flex; align-items: center; justify-content: center; }
 .share-main { flex: 1; width: 100%; max-width: 748px; margin: 0 auto; padding: 32px 24px 60px; min-width: 0; }
 .share-head { margin-bottom: 24px; }
-.share-title { font-size: 22px; line-height: 30px; font-weight: var(--fw-bold); margin: 0 0 6px; word-break: break-word; }
-.share-meta { font-size: 12px; color: var(--text-tertiary); }
+.share-title { font-size: var(--fs-2xl); line-height: 30px; font-weight: var(--fw-bold); margin: 0 0 6px; word-break: break-word; }
+.share-meta { font-size: var(--fs-sm); color: var(--text-tertiary); }
 .share-thread { display: flex; flex-direction: column; gap: 18px; }
 .share-error { display: flex; flex-direction: column; align-items: center; gap: 16px; }
 /* 密码表单：与内容同宽上限，居中；输入框 16px 防止 iOS 聚焦时放大页面 */
 .share-password { max-width: 360px; margin: 48px auto 0; display: flex; flex-direction: column; gap: 10px; }
-.share-password-title { margin: 0; font-size: 18px; line-height: 26px; font-weight: var(--fw-semibold); color: var(--text-primary); }
-.share-password-hint { margin: 0; font-size: 13px; line-height: 20px; color: var(--text-secondary); }
+.share-password-title { margin: 0; font-size: var(--fs-xl); line-height: 26px; font-weight: var(--fw-semibold); color: var(--text-primary); }
+.share-password-hint { margin: 0; font-size: var(--fs-sm); line-height: 20px; color: var(--text-secondary); }
 .share-password-field { display: block; }
 .share-password-input {
   width: 100%; box-sizing: border-box; min-height: 40px; padding: 8px 12px;
-  font-family: inherit; font-size: 16px; color: var(--text-primary);
+  font-family: inherit; font-size: var(--fs-lg); color: var(--text-primary);
   background: var(--bg-card); border: var(--hairline-width) solid var(--border);
   border-radius: var(--radius-md);
 }
 .share-password-input:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; border-color: var(--primary); }
-.share-password-error { margin: 0; font-size: 13px; color: var(--danger, #d4380d); }
+.share-password-error { margin: 0; font-size: var(--fs-sm); color: var(--danger, #d4380d); }
 .share-password-submit {
   min-height: 40px; padding: 8px 18px; cursor: pointer;
-  font-family: inherit; font-size: 14px; font-weight: var(--fw-semibold); color: var(--on-solid);
+  font-family: inherit; font-size: var(--fs-base); font-weight: var(--fw-semibold); color: var(--on-solid);
   background: var(--primary); border: none; border-radius: var(--radius-md);
 }
 .share-password-submit:disabled { opacity: 0.6; cursor: default; }
 .share-password-submit:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 .share-retry {
   min-height: 36px; padding: 8px 18px; cursor: pointer;
-  font-family: inherit; font-size: 14px; color: var(--text-primary);
+  font-family: inherit; font-size: var(--fs-base); color: var(--text-primary);
   background: var(--bg-card); border: var(--hairline-width) solid var(--border);
   border-radius: var(--radius-md);
   transition: background-color var(--dur-normal), border-color var(--dur-normal);
@@ -533,14 +533,14 @@ function formatDate(iso: string): string {
   padding: 10px 16px;
   background: var(--bubble-user); color: var(--bubble-user-text);
   border-radius: 22px; border-bottom-right-radius: 6px;
-  font-size: 15px; line-height: 24px; white-space: pre-wrap; word-break: break-word;
+  font-size: var(--fs-md); line-height: 24px; white-space: pre-wrap; word-break: break-word;
 }
-.share-msg-text { font-size: 16px; line-height: 28px; color: var(--text-primary); word-break: break-word; }
+.share-msg-text { font-size: var(--fs-lg); line-height: 28px; color: var(--text-primary); word-break: break-word; }
 .share-msg-text :deep(p) { margin: 16px 0; }
 .share-msg-text :deep(p:first-child) { margin-top: 0; }
-.share-msg-text :deep(h1) { font-size: 24px; line-height: 34px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
-.share-msg-text :deep(h2) { font-size: 22px; line-height: 32px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
-.share-msg-text :deep(h3) { font-size: 20px; line-height: 30px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
+.share-msg-text :deep(h1) { font-size: var(--fs-3xl); line-height: 34px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
+.share-msg-text :deep(h2) { font-size: var(--fs-2xl); line-height: 32px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
+.share-msg-text :deep(h3) { font-size: var(--fs-2xl); line-height: 30px; font-weight: var(--fw-bold); margin: 32px 0 16px; }
 .share-msg-text :deep(ul), .share-msg-text :deep(ol) { padding-inline-start: 24px; margin: 16px 0; }
 .share-msg-text :deep(li) { margin: 4px 0; }
 .share-msg-text :deep(blockquote) { margin: 16px 0; padding: 6px 12px; border-inline-start: 3px solid var(--primary); background: var(--bg-hover); border-radius: var(--radius-md); }
@@ -549,8 +549,8 @@ function formatDate(iso: string): string {
 .share-msg-text :deep(code) { font-family: var(--font-mono); font-size: 0.9em; background: var(--bg-secondary); padding: 2px 6px; border-radius: var(--radius-md); }
 .share-msg-text :deep(.code-block) { margin: 16px 0; background: var(--bg-code); border-radius: var(--radius-xl); overflow: hidden; max-width: 100%; }
 .share-msg-text :deep(.code-block-head) { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; background: var(--bg-secondary); }
-.share-msg-text :deep(.code-lang) { font-family: var(--font-mono); font-size: 12px; color: var(--text-primary); }
-.share-msg-text :deep(.code-copy) { background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-family: inherit; font-size: 12px; padding: 4px 10px; min-height: 32px; border-radius: var(--radius-md); transition: color var(--dur-normal), background-color var(--dur-normal); }
+.share-msg-text :deep(.code-lang) { font-family: var(--font-mono); font-size: var(--fs-sm); color: var(--text-primary); }
+.share-msg-text :deep(.code-copy) { background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-family: inherit; font-size: var(--fs-sm); padding: 4px 10px; min-height: 32px; border-radius: var(--radius-md); transition: color var(--dur-normal), background-color var(--dur-normal); }
 .share-msg-text :deep(.code-copy:hover) { color: var(--primary); background: var(--bg-hover); }
 /* 代码块：横向滚动而非折行，长行不撑破页面 */
 .share-msg-text :deep(pre) { margin: 0 !important; padding: 16px; overflow-x: auto; white-space: pre; word-break: normal; -webkit-overflow-scrolling: touch; }
@@ -558,7 +558,7 @@ function formatDate(iso: string): string {
 .share-msg-text :deep(table) { border-collapse: collapse; margin: 16px 0; width: 100%; }
 .share-msg-text :deep(th), .share-msg-text :deep(td) { border: var(--hairline-width) solid var(--border); padding: 8px 12px; text-align: start; }
 .share-msg-text :deep(th) { background: var(--bg-secondary); font-weight: var(--fw-semibold); }
-.share-footer { padding: 18px 24px; text-align: center; font-size: 12px; color: var(--text-muted); border-top: var(--hairline-width) solid var(--border); }
+.share-footer { padding: 18px 24px; text-align: center; font-size: var(--fs-sm); color: var(--text-muted); border-top: var(--hairline-width) solid var(--border); }
 
 /* 移动端：小屏收紧 padding 和字号 */
 @media (max-width: 640px) {
@@ -566,13 +566,13 @@ function formatDate(iso: string): string {
   .share-display { justify-content: flex-start; }
   .share-display-label { display: none; }
   .share-main { padding: 20px 16px 40px; }
-  .share-title { font-size: 18px; line-height: 26px; }
-  .share-msg.user .share-msg-bubble { font-size: 14px; line-height: 22px; padding: 8px 12px; }
-  .share-msg-text { font-size: 15px; line-height: 26px; }
-  .share-msg-text :deep(h1) { font-size: 20px; line-height: 28px; margin: 24px 0 12px; }
-  .share-msg-text :deep(h2) { font-size: 18px; line-height: 26px; margin: 24px 0 12px; }
-  .share-msg-text :deep(h3) { font-size: 16px; line-height: 24px; margin: 24px 0 12px; }
-  .share-msg-text :deep(pre) { padding: 12px; font-size: 12px; }
+  .share-title { font-size: var(--fs-xl); line-height: 26px; }
+  .share-msg.user .share-msg-bubble { font-size: var(--fs-base); line-height: 22px; padding: 8px 12px; }
+  .share-msg-text { font-size: var(--fs-md); line-height: 26px; }
+  .share-msg-text :deep(h1) { font-size: var(--fs-2xl); line-height: 28px; margin: 24px 0 12px; }
+  .share-msg-text :deep(h2) { font-size: var(--fs-xl); line-height: 26px; margin: 24px 0 12px; }
+  .share-msg-text :deep(h3) { font-size: var(--fs-lg); line-height: 24px; margin: 24px 0 12px; }
+  .share-msg-text :deep(pre) { padding: 12px; font-size: var(--fs-sm); }
   /* 宽表格窄屏横向滚动，避免撑破页面 */
   .share-msg-text :deep(table) { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .share-footer { padding: 14px 16px; font-size: var(--fs-xs); }
@@ -580,7 +580,7 @@ function formatDate(iso: string): string {
 
 /* 窄屏（≤576px）：复制按钮触控目标 ≥ 40px */
 @media (max-width: 576px) {
-  .share-msg-text :deep(.code-copy) { min-height: 40px; padding: 8px 14px; font-size: 13px; }
+  .share-msg-text :deep(.code-copy) { min-height: 40px; padding: 8px 14px; font-size: var(--fs-sm); }
 }
 
 @media (prefers-reduced-motion: reduce) {

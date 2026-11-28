@@ -185,7 +185,7 @@ async function dismiss() {
 }
 
 .conflict-icon {
-  font-size: 18px;
+  font-size: var(--fs-xl);
 }
 
 .conflict-title {
@@ -195,7 +195,7 @@ async function dismiss() {
 }
 
 .conflict-time {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 
@@ -227,7 +227,7 @@ async function dismiss() {
 }
 
 .value-label {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   margin-bottom: 4px;
 }
@@ -238,12 +238,12 @@ async function dismiss() {
 }
 
 .value-arrow {
-  font-size: 20px;
+  font-size: var(--fs-2xl);
   color: var(--text-secondary);
 }
 
 .conflict-desc {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
@@ -258,7 +258,7 @@ async function dismiss() {
   border: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-base);
   transition: opacity var(--dur-normal);
 }
 

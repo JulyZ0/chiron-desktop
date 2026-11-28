@@ -95,13 +95,13 @@ async function submit() {
 }
 .invite-title {
   margin: 0 0 8px;
-  font-size: 22px;
+  font-size: var(--fs-2xl);
   color: var(--text-primary);
   text-align: center;
 }
 .invite-hint {
   margin: 0 0 20px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   text-align: center;
 }
@@ -111,7 +111,7 @@ async function submit() {
   gap: 10px;
 }
 .invite-label {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--text-primary);
 }

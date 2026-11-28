@@ -462,7 +462,7 @@ function capitalize(str: string): string {
   align-items: center;
   gap: 8px;
   padding: 3px 8px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .graph-kind {
   font-size: var(--fs-xs);
@@ -474,7 +474,7 @@ function capitalize(str: string): string {
 }
 .graph-empty {
   padding: 8px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 /* G10/G12：折叠提示与向前翻页入口 */
 .cap-notice {
@@ -484,7 +484,7 @@ function capitalize(str: string): string {
   gap: 8px;
   margin-bottom: 8px;
   padding: 6px 10px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   background: var(--bg-secondary);
   border: var(--hairline-width) solid var(--border);
@@ -500,7 +500,7 @@ function capitalize(str: string): string {
 .load-earlier {
   flex-shrink: 0;
   padding: 2px 8px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--primary);
   background: none;
   border: var(--hairline-width) solid var(--primary);
@@ -549,13 +549,13 @@ function capitalize(str: string): string {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
 
 .header-icon {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 
@@ -605,7 +605,7 @@ function capitalize(str: string): string {
 }
 
 .node-icon {
-  font-size: 18px;
+  font-size: var(--fs-xl);
 }
 
 .node-content {
@@ -621,7 +621,7 @@ function capitalize(str: string): string {
 }
 
 .node-name {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--text-primary);
   min-width: 0;
@@ -631,7 +631,7 @@ function capitalize(str: string): string {
 }
 
 .node-duration {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
@@ -646,7 +646,7 @@ function capitalize(str: string): string {
   padding: 8px 12px;
   border-radius: var(--radius-md);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.5;
   overflow-x: auto;
   max-height: 200px;
@@ -660,7 +660,7 @@ function capitalize(str: string): string {
 
 .details-toggle {
   padding: 4px 10px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--primary);
   background: none;
   border: var(--hairline-width) solid var(--primary);

@@ -1011,13 +1011,13 @@ onUnmounted(stopPolling)
 
 <style scoped>
 .deps-view { padding: 4px; }
-.page-desc { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); }
+.page-desc { margin: 4px 0 0; font-size: var(--fs-sm); color: var(--text-secondary); }
 .block { margin-bottom: 16px; }
 .block-tight { margin: 8px 0; }
-.card-desc { margin: 0 0 10px; font-size: 12px; color: var(--text-secondary); }
+.card-desc { margin: 0 0 10px; font-size: var(--fs-sm); color: var(--text-secondary); }
 
 /* 重启横幅 / 冲突文本：都属于"必须能被读完并照着做"的内容，不能省略换行 */
-.restart-desc { margin: 0 0 8px; font-size: 12px; }
+.restart-desc { margin: 0 0 8px; font-size: var(--fs-sm); }
 .conflict-log {
   margin: 0;
   padding: 8px 10px;
@@ -1025,7 +1025,7 @@ onUnmounted(stopPolling)
   overflow: auto;
   border-radius: var(--radius-md);
   background: var(--bg-subtle, transparent);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1037,7 +1037,7 @@ onUnmounted(stopPolling)
   align-items: center;
   gap: 8px;
   margin-bottom: 12px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 .engine-path {
@@ -1045,7 +1045,7 @@ onUnmounted(stopPolling)
   border-radius: var(--radius-md);
   background: var(--bg-subtle, transparent);
   border: var(--hairline-width) solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   word-break: break-all;
 }
 /* 包管理器标签：与 python 版本同一行，但更"硬"一点（它是排查装包问题的第一线索） */
@@ -1054,13 +1054,13 @@ onUnmounted(stopPolling)
   border-radius: var(--radius-md);
   background: var(--bg-subtle, transparent);
   border: var(--hairline-width) solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-variant-numeric: tabular-nums;
 }
 
 .job-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.job-target { font-size: 12px; color: var(--text-secondary); word-break: break-all; }
-.job-message { margin: 6px 0 0; font-size: 12px; color: var(--text-secondary); }
+.job-target { font-size: var(--fs-sm); color: var(--text-secondary); word-break: break-all; }
+.job-message { margin: 6px 0 0; font-size: var(--fs-sm); color: var(--text-secondary); }
 .job-log {
   margin: 8px 0 0;
   padding: 8px 10px;
@@ -1069,7 +1069,7 @@ onUnmounted(stopPolling)
   border-radius: var(--radius-lg);
   border: var(--hairline-width) solid var(--border);
   background: var(--bg-subtle, transparent);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1077,33 +1077,33 @@ onUnmounted(stopPolling)
 
 .filter-input { width: 220px; }
 .pkg-name { font-weight: var(--fw-medium); word-break: break-all; }
-.pkg-version { font-size: 12px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.pkg-version { font-size: var(--fs-sm); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
 
 .snapshot-trigger {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   word-break: break-all;
   font-variant-numeric: tabular-nums;
 }
-.snapshot-label { margin-top: 2px; font-size: 12px; color: var(--text-primary); word-break: break-word; }
+.snapshot-label { margin-top: 2px; font-size: var(--fs-sm); color: var(--text-primary); word-break: break-word; }
 
 /* Modal 内容（差异摘要）：Modal 走 Teleport 到 body，所以这些类不能依赖父级作用域变量 */
-.modal-line { margin: 0 0 6px; font-size: 12px; color: var(--text-secondary); }
+.modal-line { margin: 0 0 6px; font-size: var(--fs-sm); color: var(--text-secondary); }
 .modal-spec {
   margin: 0 0 10px;
   padding: 6px 10px;
   border-radius: var(--radius-md);
   border: var(--hairline-width) solid var(--border);
   background: var(--bg-subtle, transparent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   word-break: break-all;
   white-space: pre-wrap;
 }
-.modal-hint { margin: 8px 0 0; font-size: 12px; color: var(--text-tertiary); }
+.modal-hint { margin: 8px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); }
 .diff-block { margin-top: 10px; }
-.diff-title { margin-bottom: 4px; font-size: 12px; font-weight: var(--fw-medium); }
+.diff-title { margin-bottom: 4px; font-size: var(--fs-sm); font-weight: var(--fw-medium); }
 .diff-items { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-.diff-more { font-size: 12px; color: var(--text-tertiary); }
+.diff-more { font-size: var(--fs-sm); color: var(--text-tertiary); }
 
 .search-row, .cmd-row { display: flex; gap: 8px; align-items: center; }
 .search-row { margin-bottom: 10px; }
@@ -1113,12 +1113,12 @@ onUnmounted(stopPolling)
   border-radius: var(--radius-md);
   background: var(--bg-subtle, transparent);
   border: var(--hairline-width) solid var(--border);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 .cmd-input { flex: 1 1 auto; }
-.cmd-hint { margin: 8px 0 0; font-size: 12px; color: var(--text-tertiary); }
-.cmd-error { margin: 8px 0 0; font-size: 12px; color: var(--error); }
+.cmd-hint { margin: 8px 0 0; font-size: var(--fs-sm); color: var(--text-tertiary); }
+.cmd-error { margin: 8px 0 0; font-size: var(--fs-sm); color: var(--error); }
 
 .pypi-row {
   display: flex;
@@ -1134,7 +1134,7 @@ onUnmounted(stopPolling)
 .pypi-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .pypi-summary {
   margin-top: 2px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
   word-break: break-word;
 }

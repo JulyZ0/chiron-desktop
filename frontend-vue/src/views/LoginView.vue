@@ -217,13 +217,13 @@ onMounted(async () => {
 
 .login-title {
   margin: 0 0 8px;
-  font-size: 24px;
+  font-size: var(--fs-3xl);
   color: var(--text-primary);
 }
 
 .login-subtitle {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
@@ -238,7 +238,7 @@ onMounted(async () => {
 }
 
 .login-label {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   color: var(--text-primary);
 }
@@ -250,7 +250,7 @@ onMounted(async () => {
 .login-hint {
   margin: 16px 0 0;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
 }
 
@@ -263,7 +263,7 @@ onMounted(async () => {
 }
 
 .login-server-url {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary);
   word-break: break-all;
   text-align: center;

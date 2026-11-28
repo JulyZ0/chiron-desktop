@@ -318,7 +318,7 @@ defineExpose({ reset })
   border-radius: var(--radius-lg);
   background: var(--bg-card, var(--on-solid));
   color: var(--text-primary, rgba(0, 0, 0, 0.88));
-  font-size: 14px;
+  font-size: var(--fs-base);
   cursor: pointer;
   transition: border-color var(--dur-normal);
 }
@@ -336,7 +336,7 @@ defineExpose({ reset })
   padding: 10px 12px;
   border: 1px dashed var(--border-card, #d9d9d9);
   border-radius: var(--radius-lg);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, var(--bg-overlay));
   line-height: 1.6;
 }
@@ -344,7 +344,7 @@ defineExpose({ reset })
 .captcha-loading,
 .captcha-error {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   color: var(--text-tertiary, var(--bg-overlay));
 }
 

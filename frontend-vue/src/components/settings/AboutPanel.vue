@@ -61,8 +61,8 @@ const REPOS = [
 .about-block { padding-block: 4px 20px; }
 .about-block + .about-block { border-top: var(--hairline-width) solid var(--border-card, var(--border)); padding-top: 20px; }
 .about-title { font-weight: var(--fw-semibold); color: var(--text-primary); margin-bottom: 12px; }
-.about-desc { margin: 0 0 12px; color: var(--text-secondary); font-size: 13px; line-height: 1.7; }
-.about-links { margin: 0; padding-inline-start: 20px; color: var(--text-secondary); font-size: 13px; }
+.about-desc { margin: 0 0 12px; color: var(--text-secondary); font-size: var(--fs-sm); line-height: 1.7; }
+.about-links { margin: 0; padding-inline-start: 20px; color: var(--text-secondary); font-size: var(--fs-sm); }
 .about-links li { margin-bottom: 8px; }
 .about-link-label { margin-inline-end: 8px; color: var(--text-primary); }
 .about-link {

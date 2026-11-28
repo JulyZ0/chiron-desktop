@@ -364,12 +364,12 @@ onMounted(load)
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 20px;
+  font-size: var(--fs-2xl);
   font-weight: var(--fw-semibold);
 }
 
 .title .subtitle {
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: normal;
   color: var(--text-secondary);
   margin-inline-start: 4px;
@@ -413,13 +413,13 @@ onMounted(load)
 }
 
 .row-time {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-secondary);
 }
 
 .row-body {
   margin: 6px 0 0;
-  font-size: 14px;
+  font-size: var(--fs-base);
   line-height: 1.55;
   color: var(--text-primary);
   word-break: break-word;
