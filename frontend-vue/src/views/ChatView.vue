@@ -4056,8 +4056,8 @@ function continueGeneration() {
   border: var(--hairline-width) solid var(--border); border-radius: var(--radius-lg);
   background: var(--bg-card);
 }
-.chat-search-icon { flex: none; font-size: 13px; color: var(--text-tertiary); }
-.chat-search-input { flex: 1; min-width: 0; border: none; background: none; outline: none; color: var(--text-primary); font-size: 13px; }
+.chat-search-icon { flex: none; font-size: var(--fs-sm); color: var(--text-tertiary); }
+.chat-search-input { flex: 1; min-width: 0; border: none; background: none; outline: none; color: var(--text-primary); font-size: var(--fs-sm); }
 /* 输入框自己 outline: none，焦点提示交给整条检索栏（它的按钮已各自有 :focus-visible） */
 .chat-search:focus-within { box-shadow: 0 0 0 var(--focus-ring-width) var(--focus-ring-glow); }
 .chat-search-input::placeholder { color: var(--text-quaternary); }
@@ -4100,12 +4100,12 @@ function continueGeneration() {
   background: var(--error); color: var(--on-solid);
 }
 .share-risk { margin-bottom: 14px; }
-.share-guest-tip { padding: 20px 0; text-align: center; color: var(--text-secondary); font-size: 14px; }
+.share-guest-tip { padding: 20px 0; text-align: center; color: var(--text-secondary); font-size: var(--fs-base); }
 .share-link-row { display: flex; gap: 10px; margin-top: 14px; }
 .share-link-input { flex: 1; }
 .share-manage { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; }
 .share-manage-hint { font-size: var(--fs-sm); color: var(--text-tertiary); }
-.share-select-title { font-size: 13px; font-weight: var(--fw-semibold); color: var(--text-primary); margin: 14px 0 8px; }
+.share-select-title { font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-primary); margin: 14px 0 8px; }
 .share-select-list { display: flex; flex-direction: column; gap: 2px; max-height: 260px; overflow-y: auto; width: 100%; }
 .share-select-item {
   display: flex; align-items: center; gap: 8px;
@@ -4116,13 +4116,13 @@ function continueGeneration() {
 .share-select-role { flex: none; font-size: var(--fs-xs); font-weight: var(--fw-semibold); padding: 1px 7px; border-radius: var(--sig-radius-button); }
 .share-select-role.user { color: var(--primary); background: var(--primary-bg); }
 .share-select-role.assistant { color: var(--text-secondary); background: var(--bg-secondary); }
-.share-select-preview { flex: 1; min-width: 0; font-size: 13px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.share-select-preview { flex: 1; min-width: 0; font-size: var(--fs-sm); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .share-error { margin-top: 10px; font-size: var(--fs-sm); color: var(--error); }
 .share-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
 .turn-status {
   align-self: flex-start; margin: 10px auto 0; max-width: min(var(--chat-content-width), 92%); padding: 0 24px;
   height: 26px; display: inline-flex; align-items: center;
-  font-size: 13px; font-weight: var(--fw-semibold); white-space: nowrap;
+  font-size: var(--fs-sm); font-weight: var(--fw-semibold); white-space: nowrap;
   background: linear-gradient(90deg, var(--primary) 0%, var(--primary) 40%, var(--accent) 50%, var(--primary) 60%, var(--primary) 100%);
   background-position: 100% 0; background-size: 250% 100%; background-clip: text; -webkit-background-clip: text;
   color: transparent; -webkit-text-fill-color: transparent;
@@ -4145,7 +4145,7 @@ function continueGeneration() {
   flex: none; display: flex; align-items: center; gap: 8px;
   margin: 8px 20px 0; padding: 8px 12px;
   background: var(--error-bg); border: var(--hairline-width) solid var(--error);
-  border-radius: var(--sig-radius-card); color: var(--danger, var(--error)); font-size: 13px;
+  border-radius: var(--sig-radius-card); color: var(--danger, var(--error)); font-size: var(--fs-sm);
 }
 .ueb-text { flex: 1; min-width: 0; line-height: 1.5; }
 .ueb-close {
@@ -4216,7 +4216,7 @@ function continueGeneration() {
 }
 
 .unified-list { flex: 1; overflow-y: auto; padding: 12px 0 24px; scrollbar-width: thin; scrollbar-color: var(--text-disabled) transparent; }
-.unified-empty { padding: 40px 20px; text-align: center; color: var(--text-muted); font-size: 13px; }
+.unified-empty { padding: 40px 20px; text-align: center; color: var(--text-muted); font-size: var(--fs-sm); }
 .kb-hits-tag {
   display: flex; align-items: center;
   max-width: min(var(--chat-content-width), 92%); margin: 2px auto 6px;

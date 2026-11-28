@@ -610,7 +610,7 @@ async function runQuickCommand() {
   height: 22px;
   padding-inline: 8px;
   border-radius: var(--radius-md);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: var(--fw-semibold);
   color: var(--text-secondary);
   background: var(--bg-secondary);
@@ -694,7 +694,7 @@ async function runQuickCommand() {
 }
 
 .topbar-notify-icon {
-  font-size: 16px;
+  font-size: var(--fs-lg);
 }
 
 .user-fab-avatar {
@@ -723,7 +723,7 @@ async function runQuickCommand() {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   border-radius: var(--sig-radius-button);
   padding: 8px 12px !important;
 }
@@ -818,7 +818,7 @@ async function runQuickCommand() {
 }
 
 .dock-icon {
-  font-size: 16px;
+  font-size: var(--fs-lg);
 }
 
 /* 提示气泡：抽屉里弹在右侧，标题栏里改弹在下方 —— 上方是窗口边缘，右侧会盖住别的按钮 */
@@ -885,7 +885,7 @@ async function runQuickCommand() {
   border-radius: var(--sig-radius-button);
   background: var(--hover-bg);
   color: var(--text-secondary);
-  font-size: 17px;
+  font-size: var(--fs-xl);
   cursor: pointer;
   transition: color var(--dur-fast) ease, border-color var(--dur-fast) ease, background var(--dur-fast) ease;
 }
@@ -918,7 +918,7 @@ async function runQuickCommand() {
 
 .dock-popover-title {
   display: block;
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-semibold);
   color: var(--text-primary);
 }
@@ -945,7 +945,7 @@ async function runQuickCommand() {
   border-radius: var(--sig-radius-card);
   background: var(--bg-surface);
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   outline: none;
   transition: border-color var(--dur-normal) ease, box-shadow var(--dur-normal) ease;
 }
@@ -968,7 +968,7 @@ async function runQuickCommand() {
   border-radius: var(--sig-radius-card);
   background: var(--primary);
   color: var(--text-inverse);
-  font-size: 13px;
+  font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
   cursor: pointer;
   transition: background var(--dur-normal) ease, opacity var(--dur-normal) ease;

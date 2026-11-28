@@ -1,7 +1,5 @@
 {
-  "src/components/AppLayout.vue": 8,
   "src/components/common/ErrorBoundary.vue": 1,
-  "src/views/ChatView.vue": 8,
   "src/views/MediaView.vue": 1,
   "src/views/NotFoundView.vue": 1
 }
